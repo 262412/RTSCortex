@@ -12,6 +12,7 @@ Before a live run, provide all of the following:
   `~/fastscratch/envs/rtscortex-llm-pysc2/bin/python`, or set
   `RTSCORTEX_LLM_PYSC2_PYTHON`;
 - an executable `SC2_x64` below `SC2PATH`;
+- SC2 build 92440 (5.0.13) or newer for the fixed `pvz_task1_level1` map;
 - `Maps/llm_pysc2/pvz_task1_level1.SC2Map` below `SC2PATH`;
 - both reviewed patches from `integrations/llm_pysc2/patches` applied to the pinned
   LLM-PySC2 checkout (asynchronous waiting and deterministic SC2 seeding).
@@ -25,6 +26,11 @@ git -C third_party/LLM-PySC2 apply \
 git -C third_party/LLM-PySC2 apply \
   ../../integrations/llm_pysc2/patches/0002-pass-random-seed-to-sc2env.patch
 ```
+
+The Blizzard download page currently exposes Linux packages only through SC2 4.10
+(Base75689). That binary can run older maps, but the v0.1 PvZ maps were saved by build
+92440; a real create-game test shows Base75689 crashes while loading them. `doctor` and
+the live preflight therefore reject older builds instead of relying on path checks alone.
 
 Validate and launch the fixed Protoss PvZ scenario with:
 

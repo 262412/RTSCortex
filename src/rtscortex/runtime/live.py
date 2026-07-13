@@ -22,6 +22,7 @@ from rtscortex.contracts import EpisodeOutcome, EpisodeResult
 from rtscortex.runtime.engine import RuntimeEngine
 
 WORKER_AGENT = "rtscortex_llm_pysc2.worker.RTSCortexMainAgent"
+PVZ_TASK1_MINIMUM_SC2_BUILD = 92440
 
 
 class LiveEnvironmentError(RuntimeError):
@@ -109,6 +110,15 @@ def prepare_live_worker(
         executable = _find_sc2_executable(sc2_path)
         if executable is None:
             errors.append(f"no SC2_x64 executable found below {sc2_path}")
+        elif config.environment.scenario == "pvz_task1_level1":
+            build = sc2_build(executable)
+            if build is None:
+                errors.append(f"cannot determine the SC2 build from {executable}")
+            elif build < PVZ_TASK1_MINIMUM_SC2_BUILD:
+                errors.append(
+                    f"SC2 build {build} is older than required build "
+                    f"{PVZ_TASK1_MINIMUM_SC2_BUILD} for pvz_task1_level1"
+                )
         map_path = sc2_path / "Maps" / "llm_pysc2" / f"{config.environment.scenario}.SC2Map"
         if not map_path.is_file():
             errors.append(f"scenario map is missing: {map_path}")
@@ -411,14 +421,24 @@ def _sc2_path(
 
 
 def _find_sc2_executable(sc2_path: Path) -> Path | None:
+    candidates = [
+        candidate
+        for candidate in (sc2_path / "Versions").glob("Base*/SC2_x64")
+        if candidate.is_file() and os.access(candidate, os.X_OK)
+    ]
+    if candidates:
+        return max(candidates, key=lambda candidate: sc2_build(candidate) or -1)
     direct = sc2_path / "SC2_x64"
-    if direct.is_file() and os.access(direct, os.X_OK):
-        return direct
-    candidates = sorted((sc2_path / "Versions").glob("Base*/SC2_x64"))
-    return next(
-        (candidate for candidate in reversed(candidates) if os.access(candidate, os.X_OK)),
-        None,
-    )
+    return direct if direct.is_file() and os.access(direct, os.X_OK) else None
+
+
+def sc2_build(executable: Path) -> int | None:
+    """Read the numeric SC2 build from a standard ``Versions/Base*`` path."""
+
+    name = executable.parent.name
+    if not name.startswith("Base") or not name[4:].isdigit():
+        return None
+    return int(name[4:])
 
 
 def waiting_response_patch_is_applied(project_root: Path) -> bool:

@@ -99,7 +99,7 @@ def test_sc2_checks_executable_and_installed_scenario_map(
     source_map.parent.mkdir(parents=True)
     source_map.touch()
     sc2_path = tmp_path / "StarCraftII"
-    executable = sc2_path / "Versions/Base75689/SC2_x64"
+    executable = sc2_path / "Versions/Base92440/SC2_x64"
     executable.parent.mkdir(parents=True)
     executable.touch()
     installed_map = sc2_path / "Maps/llm_pysc2/pvz_task1_level1.SC2Map"
@@ -114,6 +114,28 @@ def test_sc2_checks_executable_and_installed_scenario_map(
         "starcraft_ii": "ok",
         "scenario_map_installed": "ok",
     }
+
+
+def test_sc2_checks_rejects_build_older_than_fixed_pvz_map(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_map = tmp_path / "third_party/LLM-PySC2/llm_pysc2/maps/llm_pysc2/pvz_task1_level1.SC2Map"
+    source_map.parent.mkdir(parents=True)
+    source_map.touch()
+    sc2_path = tmp_path / "StarCraftII"
+    executable = sc2_path / "Versions/Base75689/SC2_x64"
+    executable.parent.mkdir(parents=True)
+    executable.touch()
+    installed_map = sc2_path / "Maps/llm_pysc2/pvz_task1_level1.SC2Map"
+    installed_map.parent.mkdir(parents=True)
+    installed_map.touch()
+    monkeypatch.setenv("SC2PATH", str(sc2_path))
+
+    checks = _sc2_checks(tmp_path, required=True)
+    check = next(check for check in checks if check.name == "starcraft_ii")
+
+    assert check.status == "error"
+    assert "requires Base92440" in check.detail
 
 
 def test_sc2_checks_rejects_incomplete_configured_path(

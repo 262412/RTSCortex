@@ -19,7 +19,7 @@ def test_prepare_live_worker_builds_fixed_pysc2_command(tmp_path: Path) -> None:
     worker_python.symlink_to(base_python)
 
     sc2_path = tmp_path / "StarCraftII"
-    executable = sc2_path / "Versions/Base75689/SC2_x64"
+    executable = sc2_path / "Versions/Base92440/SC2_x64"
     executable.parent.mkdir(parents=True)
     executable.touch()
     executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
@@ -77,6 +77,14 @@ def test_prepare_live_worker_builds_fixed_pysc2_command(tmp_path: Path) -> None:
         "--random_seed",
         "0",
     )
+
+    executable.unlink()
+    old_executable = sc2_path / "Versions/Base75689/SC2_x64"
+    old_executable.parent.mkdir(parents=True)
+    old_executable.touch()
+    old_executable.chmod(old_executable.stat().st_mode | stat.S_IXUSR)
+    with pytest.raises(LiveEnvironmentError, match="older than required build 92440"):
+        prepare_live_worker(config, tmp_path, environment={})
 
 
 def test_prepare_live_worker_reports_all_missing_prerequisites(tmp_path: Path) -> None:

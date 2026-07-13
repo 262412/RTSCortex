@@ -11,7 +11,9 @@ from functools import lru_cache
 from pathlib import Path
 
 from rtscortex.runtime.live import (
+    PVZ_TASK1_MINIMUM_SC2_BUILD,
     random_seed_patch_is_applied,
+    sc2_build,
     waiting_response_patch_is_applied,
 )
 
@@ -170,13 +172,26 @@ def _sc2_checks(project_root: Path, *, required: bool) -> list[Check]:
         return checks
 
     sc2_path = Path(sc2_path_value).expanduser()
-    executables = sorted((sc2_path / "Versions").glob("Base*/SC2_x64"))
-    if (sc2_path / "SC2_x64").is_file():
-        executables.append(sc2_path / "SC2_x64")
+    executables = list((sc2_path / "Versions").glob("Base*/SC2_x64"))
+    direct_executable = sc2_path / "SC2_x64"
+    if direct_executable.is_file():
+        executables.append(direct_executable)
     if executables:
-        executable = executables[-1]
-        version = executable.parent.name if executable.parent.name.startswith("Base") else "unknown"
-        checks.append(Check("starcraft_ii", "ok", f"{executable} ({version})"))
+        executable = max(executables, key=lambda candidate: sc2_build(candidate) or -1)
+        build = sc2_build(executable)
+        if build is None:
+            checks.append(Check("starcraft_ii", "error", f"unknown SC2 build: {executable}"))
+        elif build < PVZ_TASK1_MINIMUM_SC2_BUILD:
+            checks.append(
+                Check(
+                    "starcraft_ii",
+                    "error",
+                    f"{executable} (Base{build}; pvz_task1_level1 requires "
+                    f"Base{PVZ_TASK1_MINIMUM_SC2_BUILD})",
+                )
+            )
+        else:
+            checks.append(Check("starcraft_ii", "ok", f"{executable} (Base{build})"))
     else:
         checks.append(Check("starcraft_ii", "error", f"no SC2_x64 below {sc2_path}"))
 
