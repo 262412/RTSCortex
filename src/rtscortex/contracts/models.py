@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class ContractModel(BaseModel):
@@ -19,6 +19,16 @@ class ActionSource(StrEnum):
     PLANNER = "planner"
     REFLEX = "reflex"
     FALLBACK = "fallback"
+
+
+class ActionArgumentType(StrEnum):
+    STRING = "string"
+    INTEGER = "integer"
+    NUMBER = "number"
+    BOOLEAN = "boolean"
+    POSITION = "position"
+    TAG = "tag"
+    ANY = "any"
 
 
 class EpisodeOutcome(StrEnum):
@@ -68,7 +78,14 @@ class SC2State(ContractModel):
 class AvailableAction(ContractModel):
     name: str
     argument_names: list[str] = Field(default_factory=list)
+    argument_types: list[ActionArgumentType] = Field(default_factory=list)
     actor_scopes: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_argument_schema(self) -> AvailableAction:
+        if self.argument_types and len(self.argument_types) != len(self.argument_names):
+            raise ValueError("argument_types must match argument_names")
+        return self
 
 
 class ObservationEnvelope(ContractModel):
@@ -133,3 +150,17 @@ class EpisodeResult(ContractModel):
     steps: int = Field(default=0, ge=0)
     metrics: dict[str, float] = Field(default_factory=dict)
     failure_reason: str | None = None
+
+
+class EpisodeSummary(ContractModel):
+    protocol_version: Literal["1.0"] = "1.0"
+    run_id: str
+    episode_id: str
+    scenario: str
+    seed: int | None = None
+    outcome: EpisodeOutcome
+    summary: str
+    lessons: list[str] = Field(default_factory=list)
+    source_step_id: int = Field(ge=0)
+    metrics: dict[str, float] = Field(default_factory=dict)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))

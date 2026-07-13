@@ -21,3 +21,28 @@ jobs:
       - run: uv run mypy
       - run: uv run pytest
       - run: uv run rtscortex doctor
+
+  worker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.9"
+      - run: uv venv --python 3.9 .worker-venv
+      - run: >-
+          uv pip install --python .worker-venv/bin/python
+          -e integrations/llm_pysc2
+          -e third_party/LLM-PySC2
+      - run: .worker-venv/bin/python -m compileall -q integrations/llm_pysc2/src
+      - run: >-
+          PYGAME_HIDE_SUPPORT_PROMPT=1 .worker-venv/bin/python -c
+          "import llm_pysc2.agents, pysc2, rtscortex_llm_pysc2.worker"
+      - run: >-
+          git -C third_party/LLM-PySC2 apply --check
+          ../../integrations/llm_pysc2/patches/0001-return-noop-while-awaiting-runtime.patch
+      - run: >-
+          git -C third_party/LLM-PySC2 apply --check
+          ../../integrations/llm_pysc2/patches/0002-pass-random-seed-to-sc2env.patch

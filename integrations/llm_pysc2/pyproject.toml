@@ -3,7 +3,10 @@ name = "rtscortex-llm-pysc2"
 version = "0.1.0"
 description = "LLM-PySC2 environment-worker bridge for RTSCortex"
 requires-python = ">=3.9,<3.11"
-dependencies = ["httpx>=0.27,<1"]
+dependencies = ["httpx>=0.27,<1", "sniffio>=1.3,<2"]
+
+[project.scripts]
+rtscortex-llm-pysc2-worker = "rtscortex_llm_pysc2.entrypoint:main"
 
 [build-system]
 requires = ["hatchling>=1.27"]

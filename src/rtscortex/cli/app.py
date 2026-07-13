@@ -19,6 +19,14 @@ from rtscortex.config import ExperimentConfig, load_config
 from rtscortex.evaluation import run_mock_episode, run_mock_suite
 from rtscortex.evaluation.replay import replay_event_log
 from rtscortex.runtime.factory import build_runtime
+from rtscortex.runtime.live import (
+    LiveEnvironmentError,
+    LiveProcessSupervisor,
+    LiveWorkerSpec,
+    WorkerProcessError,
+    live_socket_path,
+    prepare_live_worker,
+)
 
 app = typer.Typer(no_args_is_help=True, help="RTSCortex agent runtime")
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -60,27 +68,61 @@ def run_experiment(
     """Run one configured episode."""
 
     config = load_config(config_path)
-    if config.environment.adapter != "mock":
-        raise typer.BadParameter("The v0.1 core currently executes only the mock adapter.")
     run_id = _run_id(config.agent.variant)
+    episode_id = "episode-0"
     run_dir = config.run.output_root / run_id
+    live_worker: LiveWorkerSpec | None = None
+    runtime_socket: Path | None = None
+    if config.environment.adapter == "llm_pysc2":
+        try:
+            live_worker = prepare_live_worker(config, PROJECT_ROOT)
+            runtime_socket = live_socket_path(config.run.runtime_root, run_id)
+        except LiveEnvironmentError as error:
+            raise typer.BadParameter(str(error), param_hint="--config") from error
     _snapshot_config(config, run_dir)
 
     async def execute() -> str:
         runtime = build_runtime(config, run_dir)
+        if live_worker is not None:
+            assert runtime_socket is not None
+            supervisor = LiveProcessSupervisor(
+                runtime=runtime,
+                run_id=run_id,
+                episode_id=episode_id,
+                scenario=config.environment.scenario,
+                seed=config.run.seed,
+                socket_path=runtime_socket,
+                worker_command=live_worker.command,
+                worker_environment={"SC2PATH": str(live_worker.sc2_path)},
+                run_dir=run_dir,
+                server_ready_timeout_seconds=(config.environment.server_ready_timeout_seconds),
+                shutdown_timeout_seconds=config.environment.shutdown_timeout_seconds,
+            )
+            result = await supervisor.run()
+            return result.model_dump_json(indent=2)
         try:
             result = await run_mock_episode(
                 config=config,
                 runtime=runtime,
                 run_id=run_id,
-                episode_id="episode-0",
+                episode_id=episode_id,
                 seed=config.run.seed,
             )
             return result.model_dump_json(indent=2)
         finally:
             await runtime.close()
 
-    typer.echo(asyncio.run(execute()))
+    try:
+        output = asyncio.run(execute())
+    except WorkerProcessError as error:
+        typer.echo(error.result.model_dump_json(indent=2), err=True)
+        typer.echo(f"Artifacts: {run_dir}", err=True)
+        raise typer.Exit(code=1) from error
+    except LiveEnvironmentError as error:
+        typer.echo(f"Live run failed: {error}", err=True)
+        typer.echo(f"Artifacts: {run_dir}", err=True)
+        raise typer.Exit(code=1) from error
+    typer.echo(output)
     typer.echo(f"Artifacts: {run_dir}")
 
 
@@ -93,7 +135,10 @@ def evaluate(
 
     config = load_config(config_path)
     target = output_dir or config.run.output_root / _run_id("evaluation")
-    summary = asyncio.run(run_mock_suite(config, target.expanduser()))
+    try:
+        summary = asyncio.run(run_mock_suite(config, target.expanduser()))
+    except FileExistsError as error:
+        raise typer.BadParameter(str(error), param_hint="--output-dir") from error
     typer.echo(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
     typer.echo(f"Artifacts: {target.expanduser()}")
 

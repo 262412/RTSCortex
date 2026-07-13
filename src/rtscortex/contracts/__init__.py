@@ -14,6 +14,7 @@ from rtscortex.contracts.interfaces import (
     WorldModel,
 )
 from rtscortex.contracts.models import (
+    ActionArgumentType,
     ActionBatch,
     ActionCommand,
     ActionSource,
@@ -21,6 +22,7 @@ from rtscortex.contracts.models import (
     EconomyState,
     EpisodeOutcome,
     EpisodeResult,
+    EpisodeSummary,
     ExecutionReport,
     ObservationEnvelope,
     ProductionItem,
@@ -29,6 +31,7 @@ from rtscortex.contracts.models import (
 )
 
 __all__ = [
+    "ActionArgumentType",
     "ActionBatch",
     "ActionCommand",
     "ActionSource",
@@ -39,6 +42,7 @@ __all__ = [
     "EnvironmentAdapter",
     "EpisodeOutcome",
     "EpisodeResult",
+    "EpisodeSummary",
     "EpisodeSink",
     "ExecutionReport",
     "LLMProvider",

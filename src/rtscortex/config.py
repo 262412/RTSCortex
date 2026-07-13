@@ -24,6 +24,9 @@ class EnvironmentSettings(SettingsModel):
     scenario: str = "pvz_task1_level1"
     max_steps: int = Field(default=6, ge=1)
     sc2_path: Path | None = None
+    worker_python: Path = Path("~/fastscratch/envs/rtscortex-llm-pysc2/bin/python")
+    server_ready_timeout_seconds: float = Field(default=15.0, gt=0.0)
+    shutdown_timeout_seconds: float = Field(default=10.0, gt=0.0)
 
 
 class RuntimeSettings(SettingsModel):
@@ -61,10 +64,12 @@ class ProviderSettings(SettingsModel):
     base_url: str = "http://127.0.0.1:8000/v1"
     api_key_env: str = "RTSCORTEX_LLM_API_KEY"
     timeout_seconds: float = Field(default=30.0, gt=0.0)
+    prompt_cost_per_million_tokens: float = Field(default=0.0, ge=0.0)
+    completion_cost_per_million_tokens: float = Field(default=0.0, ge=0.0)
 
 
 class EvaluationSettings(SettingsModel):
-    seeds: list[int] = Field(default_factory=lambda: [0, 1, 2])
+    seeds: list[int] = Field(default_factory=lambda: [0, 1, 2], min_length=1)
 
 
 class ExperimentConfig(SettingsModel):
@@ -83,6 +88,7 @@ class ExperimentConfig(SettingsModel):
         data["run"]["runtime_root"] = self.run.runtime_root.expanduser()
         if self.environment.sc2_path is not None:
             data["environment"]["sc2_path"] = self.environment.sc2_path.expanduser()
+        data["environment"]["worker_python"] = self.environment.worker_python.expanduser()
         return ExperimentConfig.model_validate(data)
 
 

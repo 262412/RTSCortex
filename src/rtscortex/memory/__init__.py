@@ -1,7 +1,7 @@
 """Persistent event and lesson storage."""
 
 from rtscortex.memory.retrieval import DisabledMemoryRetriever, MemoryHit, MemoryRetriever
-from rtscortex.memory.store import EventStore, StoredEvent, read_event_log
+from rtscortex.memory.store import EventStore, StoredEvent, StoredLesson, read_event_log
 
 __all__ = [
     "DisabledMemoryRetriever",
@@ -9,5 +9,6 @@ __all__ = [
     "MemoryHit",
     "MemoryRetriever",
     "StoredEvent",
+    "StoredLesson",
     "read_event_log",
 ]

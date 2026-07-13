@@ -27,7 +27,17 @@ class MemoryModule:
             module=self.name,
             updates={
                 "recent_events": [event.__dict__ for event in recent],
-                "lessons": self.store.lessons(observation.run_id, observation.episode_id),
+                "lessons": [
+                    lesson.__dict__
+                    for lesson in self.store.lesson_records(
+                        observation.run_id,
+                        observation.episode_id,
+                    )
+                ],
+                "episode_summaries": [
+                    summary.model_dump(mode="json")
+                    for summary in self.store.recent_episode_summaries(observation.run_id)
+                ],
             },
         )
 
@@ -61,6 +71,7 @@ class ReflectionModule:
         return ModuleResult(
             module=self.name,
             updates={"reflection": output.summary, "lessons": output.lessons},
+            model_call=True,
         )
 
 
@@ -83,7 +94,11 @@ class PlanningModule:
             ),
             user_prompt=json.dumps(payload, ensure_ascii=False, sort_keys=True),
         )
-        return ModuleResult(module=self.name, updates={"plan": output.model_dump(mode="json")})
+        return ModuleResult(
+            module=self.name,
+            updates={"plan": output.model_dump(mode="json")},
+            model_call=True,
+        )
 
 
 class ActionModule:

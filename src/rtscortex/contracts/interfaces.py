@@ -30,6 +30,7 @@ class ModuleResult:
     module: str
     updates: dict[str, Any] = field(default_factory=dict)
     commands: list[ActionCommand] = field(default_factory=list)
+    model_call: bool = False
 
 
 class AgentModule(Protocol):

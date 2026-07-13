@@ -1,0 +1,12 @@
+diff --git a/llm_pysc2/agents/llm_pysc2_agent_main.py b/llm_pysc2/agents/llm_pysc2_agent_main.py
+--- a/llm_pysc2/agents/llm_pysc2_agent_main.py
++++ b/llm_pysc2/agents/llm_pysc2_agent_main.py
+@@ -452,5 +452,7 @@ class MainAgent(base_agent.BaseAgent):
+ 
+       elif not self._all_agent_waiting_response_finished():
+-        continue
++        func_id, func_call = (0, actions.FUNCTIONS.no_op())
++        self.func_id_history.append(func_id)
++        return func_call
+ 
+       elif not self._all_agent_executing_finished():

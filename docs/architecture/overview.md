@@ -22,6 +22,18 @@ semantic boundary needed by a future action-conditioned world model.
 - Reflex commands can preempt only commands for the same actor scope.
 - Every command has a priority, source, creation loop, and TTL.
 
+## Live process lifecycle
+
+For `environment.adapter: llm_pysc2`, the Python 3.11 CLI owns both sides of the live
+episode. It starts a per-run Unix-socket API, waits for `/healthz`, and only then launches
+the isolated Python 3.9 worker. The socket path and episode identity are passed through
+environment variables. Normal completion, worker failure, and cancellation all terminate
+the worker process group, stop the API, remove the socket, and close the runtime store.
+
+The worker must report `EpisodeResult` through `/v1/episode/end`. If it exits first, the
+supervisor records a synthetic `truncated` result for exit status zero or an `error` result
+for a non-zero status, so incomplete live runs remain visible in evaluation artifacts.
+
 ## Safety boundary
 
 Model responses are parsed into typed proposals. Only `ActionCommand` objects accepted by

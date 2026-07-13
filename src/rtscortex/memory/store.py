@@ -13,7 +13,7 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from rtscortex.contracts import EpisodeResult
+from rtscortex.contracts import EpisodeResult, EpisodeSummary
 
 
 @dataclass(frozen=True)
@@ -25,6 +25,16 @@ class StoredEvent:
     event_type: str
     created_at: str
     payload: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class StoredLesson:
+    lesson_id: int
+    run_id: str
+    episode_id: str
+    source_step_id: int
+    content: str
+    created_at: str
 
 
 def _json_payload(payload: BaseModel | dict[str, Any]) -> dict[str, Any]:
@@ -73,6 +83,14 @@ class EventStore:
                 episode_id TEXT NOT NULL,
                 payload_json TEXT NOT NULL,
                 PRIMARY KEY (run_id, episode_id)
+            );
+            CREATE TABLE IF NOT EXISTS episode_summaries (
+                summary_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL,
+                episode_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                UNIQUE (run_id, episode_id)
             );
             """
         )
@@ -172,15 +190,33 @@ class EventStore:
         self._connection.commit()
 
     def lessons(self, run_id: str, episode_id: str, limit: int = 10) -> list[str]:
+        return [lesson.content for lesson in self.lesson_records(run_id, episode_id, limit)]
+
+    def lesson_records(
+        self,
+        run_id: str,
+        episode_id: str,
+        limit: int = 10,
+    ) -> list[StoredLesson]:
         rows = self._connection.execute(
             """
-            SELECT content FROM lessons
+            SELECT * FROM lessons
             WHERE run_id = ? AND episode_id = ?
             ORDER BY lesson_id DESC LIMIT ?
             """,
             (run_id, episode_id, limit),
         ).fetchall()
-        return [str(row["content"]) for row in reversed(rows)]
+        return [
+            StoredLesson(
+                lesson_id=int(row["lesson_id"]),
+                run_id=str(row["run_id"]),
+                episode_id=str(row["episode_id"]),
+                source_step_id=int(row["source_step_id"]),
+                content=str(row["content"]),
+                created_at=str(row["created_at"]),
+            )
+            for row in reversed(rows)
+        ]
 
     def record_episode(self, result: EpisodeResult) -> None:
         encoded = result.model_dump_json()
@@ -200,6 +236,57 @@ class EventStore:
             event_type="episode_result",
             payload=result,
         )
+
+    def record_episode_summary(self, summary: EpisodeSummary) -> None:
+        self._connection.execute(
+            """
+            INSERT INTO episode_summaries (
+                run_id, episode_id, created_at, payload_json
+            ) VALUES (?, ?, ?, ?)
+            ON CONFLICT(run_id, episode_id) DO UPDATE SET
+                created_at = excluded.created_at,
+                payload_json = excluded.payload_json
+            """,
+            (
+                summary.run_id,
+                summary.episode_id,
+                summary.created_at.isoformat(),
+                summary.model_dump_json(),
+            ),
+        )
+        self._connection.commit()
+        self.append_event(
+            run_id=summary.run_id,
+            episode_id=summary.episode_id,
+            step_id=summary.source_step_id,
+            event_type="episode_summary",
+            payload=summary,
+        )
+
+    def episode_summary(self, run_id: str, episode_id: str) -> EpisodeSummary | None:
+        row = self._connection.execute(
+            """
+            SELECT payload_json FROM episode_summaries
+            WHERE run_id = ? AND episode_id = ?
+            """,
+            (run_id, episode_id),
+        ).fetchone()
+        if row is None:
+            return None
+        return EpisodeSummary.model_validate_json(str(row["payload_json"]))
+
+    def recent_episode_summaries(self, run_id: str, limit: int = 5) -> list[EpisodeSummary]:
+        rows = self._connection.execute(
+            """
+            SELECT payload_json FROM episode_summaries
+            WHERE run_id = ?
+            ORDER BY summary_id DESC LIMIT ?
+            """,
+            (run_id, limit),
+        ).fetchall()
+        return [
+            EpisodeSummary.model_validate_json(str(row["payload_json"])) for row in reversed(rows)
+        ]
 
     def close(self) -> None:
         self._connection.close()

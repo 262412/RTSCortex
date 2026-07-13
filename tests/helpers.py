@@ -25,12 +25,14 @@ def make_config(
     variant: AgentVariant = "planner_reflection_memory_reflex",
     deterministic: bool = True,
     planner_timeout_seconds: float = 1.0,
+    planning_interval_game_loops: int = 16,
 ) -> ExperimentConfig:
     return ExperimentConfig(
         run=RunSettings(output_root=tmp_path, runtime_root=tmp_path / "runtime"),
         runtime=RuntimeSettings(
             deterministic=deterministic,
             planner_timeout_seconds=planner_timeout_seconds,
+            planning_interval_game_loops=planning_interval_game_loops,
         ),
         agent=AgentSettings(variant=variant),
         provider=ProviderSettings(kind="fake"),
@@ -39,6 +41,8 @@ def make_config(
 
 def make_observation(
     *,
+    run_id: str = "run-1",
+    episode_id: str = "episode-1",
     step_id: int = 0,
     game_loop: int = 0,
     alerts: list[str] | None = None,
@@ -58,8 +62,8 @@ def make_observation(
         else []
     )
     return ObservationEnvelope(
-        run_id="run-1",
-        episode_id="episode-1",
+        run_id=run_id,
+        episode_id=episode_id,
         step_id=step_id,
         game_loop=game_loop,
         state=SC2State(

@@ -3,11 +3,14 @@ run:
   runtime_root: ~/fastscratch/rtscortex_runtime
   seed: 0
 environment:
-  adapter: mock
+  adapter: llm_pysc2
   scenario: pvz_task1_level1
-  max_steps: 6
+  max_steps: 1000
+  worker_python: ~/fastscratch/envs/rtscortex-llm-pysc2/bin/python
+  server_ready_timeout_seconds: 15.0
+  shutdown_timeout_seconds: 10.0
 runtime:
-  deterministic: true
+  deterministic: false
   planning_interval_game_loops: 16
   planner_timeout_seconds: 15.0
   max_actions: 5

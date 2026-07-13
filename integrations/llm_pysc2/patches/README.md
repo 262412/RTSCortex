@@ -1,5 +1,29 @@
 # Upstream hook patches
 
-Live integration patches will add only observation, plan-request, and execution-result hook
-points to the pinned LLM-PySC2 main loop. Environment semantics, camera control, team
-management, automatic economy, and PySC2 action validation must remain upstream-owned.
+The submodule remains pinned and read-only. Apply patches from inside the pinned checkout:
+
+```bash
+git -C third_party/LLM-PySC2 apply --check \
+  ../../integrations/llm_pysc2/patches/0001-return-noop-while-awaiting-runtime.patch
+git -C third_party/LLM-PySC2 apply \
+  ../../integrations/llm_pysc2/patches/0001-return-noop-while-awaiting-runtime.patch
+git -C third_party/LLM-PySC2 apply --check \
+  ../../integrations/llm_pysc2/patches/0002-pass-random-seed-to-sc2env.patch
+git -C third_party/LLM-PySC2 apply \
+  ../../integrations/llm_pysc2/patches/0002-pass-random-seed-to-sc2env.patch
+```
+
+`0001-return-noop-while-awaiting-runtime.patch` changes one branch in `MainAgent.step`.
+The upstream implementation currently spins inside its bounded `while` loop while an
+agent thread waits for a response. RTSCortex planning is asynchronous, so that branch
+returns a PySC2 no-op for the current environment tick instead. The next environment tick
+re-enters the normal upstream loop and observes the completed response when available.
+
+`0002-pass-random-seed-to-sc2env.patch` adds a `--random_seed` runner flag and passes it
+to `SC2Env`. This makes the seed recorded in experiment provenance control the actual
+game initialization as well.
+
+The patches deliberately do not change camera calibration, team collection and ordering,
+automatic economy, translator behavior, or PySC2 validation. Observation mapping,
+runtime calls, action routing, and execution feedback live in this bridge package rather
+than in the upstream checkout.

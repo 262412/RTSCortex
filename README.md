@@ -25,5 +25,10 @@ under `~/fastscratch`. StarCraft II is not installed or downloaded by the core p
 On Linux, `rtscortex serve` creates a per-run Unix socket under the configured runtime
 root. Pass `--tcp` to use loopback TCP instead.
 
+The live PvZ configuration is `configs/experiments/live_pvz.yaml`. A live `run` validates
+the Python 3.9 worker, SC2 installation, scenario map, and required upstream patches
+before it starts either process. See [live runtime setup](docs/live-runtime.md) for the
+required layout and launch command.
+
 See [the architecture overview](docs/architecture/overview.md) for the data flow and
 extension contracts.

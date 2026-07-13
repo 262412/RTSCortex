@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
+import json
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any
 
 from rtscortex.agents import ActionModule, MemoryModule, PlanningModule, ReflectionModule
@@ -15,6 +17,7 @@ from rtscortex.contracts import (
     ActionCommand,
     ActionSource,
     EpisodeResult,
+    EpisodeSummary,
     ExecutionReport,
     ObservationEnvelope,
 )
@@ -29,6 +32,8 @@ class PlanState:
     strategic_goal: str
     summary: str
     commands: list[ActionCommand]
+    source_step_id: int
+    created_game_loop: int
 
 
 class RuntimeEngine:
@@ -68,8 +73,11 @@ class RuntimeEngine:
         self._last_plan_game_loop: int | None = None
         self._last_decision: ActionBatch | None = None
         self._last_execution: ExecutionReport | None = None
+        self._episode_key: tuple[str, str] | None = None
 
     async def tick(self, observation: ObservationEnvelope) -> ActionBatch:
+        tick_started = time.perf_counter()
+        await self._activate_episode(observation)
         self.store.append_event(
             run_id=observation.run_id,
             episode_id=observation.episode_id,
@@ -104,17 +112,20 @@ class RuntimeEngine:
         reflex_latency_ms = (time.perf_counter() - reflex_started) * 1000
 
         planner_commands = [] if self._cached_plan is None else self._cached_plan.commands
-        merged = self.arbiter.merge(
+        arbitration = self.arbiter.arbitrate(
             planner_commands,
             reflex_commands,
             game_loop=observation.game_loop,
         )
+        merged = arbitration.selected
         if not merged:
             fallback = self._fallback(observation)
             if fallback is not None:
                 merged = [fallback]
         outcome = self.validator.validate(merged, observation)
-        plan = self._cached_plan or PlanState("", "", [])
+        plan = self._cached_plan or PlanState(
+            "", "", [], observation.step_id, observation.game_loop
+        )
         batch = ActionBatch(
             run_id=observation.run_id,
             episode_id=observation.episode_id,
@@ -136,6 +147,8 @@ class RuntimeEngine:
                 "batch": batch.model_dump(mode="json"),
                 "reflex_latency_ms": reflex_latency_ms,
                 "reflex_latency_target_ms": self.config.reflex.target_latency_ms,
+                "tick_latency_ms": (time.perf_counter() - tick_started) * 1000,
+                "preemptions": [asdict(record) for record in arbitration.preemptions],
             },
         )
         self._last_decision = batch
@@ -154,7 +167,8 @@ class RuntimeEngine:
 
     async def _run_deterministic_planner(self, context: AgentContext) -> None:
         try:
-            self._cached_plan = await self._deliberate_with_timeout(context)
+            plan = await self._deliberate_with_timeout(context)
+            self._accept_plan(plan, context.observation)
         except TimeoutError:
             self._record_planner_event(context.observation, "planner_timeout", {})
         except Exception as error:
@@ -168,7 +182,8 @@ class RuntimeEngine:
         if self._planner_task is None or not self._planner_task.done():
             return
         try:
-            self._cached_plan = self._planner_task.result()
+            plan = self._planner_task.result()
+            self._accept_plan(plan, observation)
         except TimeoutError:
             self._record_planner_event(observation, "planner_timeout", {})
         except Exception as error:
@@ -181,19 +196,47 @@ class RuntimeEngine:
             self._planner_task = None
 
     async def _deliberate_with_timeout(self, context: AgentContext) -> PlanState:
-        return await asyncio.wait_for(
-            self._deliberate(context),
-            timeout=self.config.runtime.planner_timeout_seconds,
+        started = time.perf_counter()
+        try:
+            plan = await asyncio.wait_for(
+                self._deliberate(context),
+                timeout=self.config.runtime.planner_timeout_seconds,
+            )
+        except TimeoutError:
+            self._record_planner_event(
+                context.observation,
+                "planner_cycle",
+                {
+                    "status": "timeout",
+                    "latency_ms": (time.perf_counter() - started) * 1000,
+                },
+            )
+            raise
+        except Exception as error:
+            self._record_planner_event(
+                context.observation,
+                "planner_cycle",
+                {
+                    "status": "error",
+                    "latency_ms": (time.perf_counter() - started) * 1000,
+                    "error_type": type(error).__name__,
+                },
+            )
+            raise
+        self._record_planner_event(
+            context.observation,
+            "planner_cycle",
+            {
+                "status": "success",
+                "latency_ms": (time.perf_counter() - started) * 1000,
+            },
         )
+        return plan
 
     async def _deliberate(self, context: AgentContext) -> PlanState:
         working_memory: dict[str, Any] = dict(context.memory)
         if self._reflection_enabled:
-            reflection = await self._run_module(
-                self.reflection_module,
-                context,
-                model_call=True,
-            )
+            reflection = await self._run_module(self.reflection_module, context)
             working_memory.update(reflection.updates)
             for lesson in reflection.updates.get("lessons", []):
                 self.store.add_lesson(
@@ -208,11 +251,7 @@ class RuntimeEngine:
             last_execution=context.last_execution,
             last_decision=context.last_decision,
         )
-        planning = await self._run_module(
-            self.planning_module,
-            planning_context,
-            model_call=True,
-        )
+        planning = await self._run_module(self.planning_module, planning_context)
         working_memory.update(planning.updates)
         action_context = AgentContext(
             observation=context.observation,
@@ -225,14 +264,124 @@ class RuntimeEngine:
             strategic_goal=str(action.updates["strategic_goal"]),
             summary=str(action.updates["plan_summary"]),
             commands=action.commands,
+            source_step_id=context.observation.step_id,
+            created_game_loop=context.observation.game_loop,
         )
+
+    async def _activate_episode(self, observation: ObservationEnvelope) -> None:
+        episode_key = (observation.run_id, observation.episode_id)
+        if self._episode_key == episode_key:
+            return
+        await self._cancel_planner()
+        self._episode_key = episode_key
+        self._cached_plan = None
+        self._last_plan_game_loop = None
+        self._last_decision = None
+        self._last_execution = None
+
+        decision_event = self.store.last_event(
+            observation.run_id,
+            observation.episode_id,
+            "decision",
+        )
+        if decision_event is not None:
+            self._last_decision = ActionBatch.model_validate(decision_event.payload["batch"])
+        execution_event = self.store.last_event(
+            observation.run_id,
+            observation.episode_id,
+            "execution",
+        )
+        if execution_event is not None:
+            self._last_execution = ExecutionReport.model_validate(execution_event.payload)
+
+        plan_event = self.store.last_event(
+            observation.run_id,
+            observation.episode_id,
+            "plan_accepted",
+        )
+        if plan_event is not None:
+            self._cached_plan = PlanState(
+                strategic_goal=str(plan_event.payload["strategic_goal"]),
+                summary=str(plan_event.payload["summary"]),
+                commands=[
+                    ActionCommand.model_validate(command)
+                    for command in plan_event.payload["commands"]
+                ],
+                source_step_id=int(plan_event.payload["source_step_id"]),
+                created_game_loop=int(plan_event.payload["created_game_loop"]),
+            )
+        elif self._last_decision is not None:
+            planner_commands = [
+                command
+                for command in self._last_decision.commands
+                if command.source is ActionSource.PLANNER
+            ]
+            if planner_commands:
+                self._cached_plan = PlanState(
+                    strategic_goal=self._last_decision.strategic_goal,
+                    summary=self._last_decision.summary,
+                    commands=planner_commands,
+                    source_step_id=self._last_decision.step_id,
+                    created_game_loop=max(
+                        command.created_game_loop for command in planner_commands
+                    ),
+                )
+        if self._cached_plan is not None:
+            self._last_plan_game_loop = self._cached_plan.created_game_loop
+
+    def _accept_plan(self, plan: PlanState, observation: ObservationEnvelope) -> None:
+        fingerprint = self._plan_fingerprint(plan)
+        previous_fingerprint = (
+            None if self._cached_plan is None else self._plan_fingerprint(self._cached_plan)
+        )
+        self._cached_plan = plan
+        self._last_plan_game_loop = plan.created_game_loop
+        self.store.append_event(
+            run_id=observation.run_id,
+            episode_id=observation.episode_id,
+            step_id=observation.step_id,
+            event_type="plan_accepted",
+            payload={
+                "strategic_goal": plan.strategic_goal,
+                "summary": plan.summary,
+                "commands": [command.model_dump(mode="json") for command in plan.commands],
+                "source_step_id": plan.source_step_id,
+                "created_game_loop": plan.created_game_loop,
+                "fingerprint": fingerprint,
+                "is_revision": (
+                    previous_fingerprint is not None and previous_fingerprint != fingerprint
+                ),
+            },
+        )
+
+    @staticmethod
+    def _plan_fingerprint(plan: PlanState) -> str:
+        semantic_commands = [
+            {
+                "actor": command.actor,
+                "name": command.name,
+                "arguments": command.arguments,
+                "priority": command.priority,
+                "ttl_game_loops": command.ttl_game_loops,
+                "preconditions": command.preconditions,
+            }
+            for command in plan.commands
+        ]
+        encoded = json.dumps(
+            {
+                "strategic_goal": plan.strategic_goal,
+                "summary": plan.summary,
+                "commands": semantic_commands,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        ).encode()
+        return hashlib.sha256(encoded).hexdigest()
 
     async def _run_module(
         self,
         module: AgentModule,
         context: AgentContext,
-        *,
-        model_call: bool = False,
     ) -> ModuleResult:
         started = time.perf_counter()
         try:
@@ -253,9 +402,9 @@ class RuntimeEngine:
             "module": module.name,
             "latency_ms": (time.perf_counter() - started) * 1000,
             "command_count": len(result.commands),
-            "model_call": model_call,
+            "model_call": result.model_call,
         }
-        if model_call:
+        if result.model_call:
             payload.update(
                 {
                     "provider": self.config.provider.kind,
@@ -279,13 +428,21 @@ class RuntimeEngine:
 
     @staticmethod
     def _fallback(observation: ObservationEnvelope) -> ActionCommand | None:
-        if not any(action.name == "No_Operation" for action in observation.available_actions):
+        action = next(
+            (
+                candidate
+                for candidate in observation.available_actions
+                if candidate.name == "No_Operation"
+            ),
+            None,
+        )
+        if action is None:
             return None
         return ActionCommand(
             command_id=(
                 f"{observation.run_id}:{observation.episode_id}:{observation.step_id}:fallback:0"
             ),
-            actor="global",
+            actor=action.actor_scopes[0] if action.actor_scopes else "global",
             name="No_Operation",
             arguments=[],
             priority=0,
@@ -306,13 +463,34 @@ class RuntimeEngine:
 
     def end_episode(self, result: EpisodeResult) -> None:
         self.store.record_episode(result)
+        lessons = self.store.lessons(result.run_id, result.episode_id)
+        self.store.record_episode_summary(
+            EpisodeSummary(
+                run_id=result.run_id,
+                episode_id=result.episode_id,
+                scenario=result.scenario,
+                seed=result.seed,
+                outcome=result.outcome,
+                summary=(
+                    f"{result.scenario} ended with {result.outcome.value} after "
+                    f"{result.steps} steps and score {result.score:.2f}."
+                ),
+                lessons=lessons,
+                source_step_id=result.steps,
+                metrics=result.metrics,
+            )
+        )
 
     async def close(self) -> None:
-        if self._planner_task is not None:
-            self._planner_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._planner_task
+        await self._cancel_planner()
         close = getattr(self.provider, "close", None)
         if close is not None:
             await close()
         self.store.close()
+
+    async def _cancel_planner(self) -> None:
+        if self._planner_task is not None:
+            self._planner_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._planner_task
+            self._planner_task = None

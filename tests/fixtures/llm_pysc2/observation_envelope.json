@@ -1,0 +1,92 @@
+{
+  "protocol_version": "1.0",
+  "run_id": "run-fixture",
+  "episode_id": "episode-pvz-task1",
+  "step_id": 7,
+  "game_loop": 224,
+  "observed_at": "2026-07-13T12:00:00Z",
+  "state": {
+    "economy": {
+      "minerals": 375,
+      "vespene": 100,
+      "supply_used": 34,
+      "supply_cap": 46,
+      "workers": 20,
+      "army_supply": 14
+    },
+    "production_queue": [
+      {
+        "name": "Adept",
+        "producer_id": "0x100000001",
+        "progress": 0.5
+      }
+    ],
+    "own_units": [
+      {
+        "unit_id": "0x100580001",
+        "unit_type": "Adept",
+        "alliance": "self",
+        "position": [42.0, 38.5],
+        "health_fraction": 0.8,
+        "energy": null,
+        "status": "idle"
+      }
+    ],
+    "own_structures": [
+      {
+        "unit_id": "0x100000001",
+        "unit_type": "Nexus",
+        "alliance": "self",
+        "position": [30.0, 30.0],
+        "health_fraction": 1.0,
+        "energy": 40.0,
+        "status": "training"
+      }
+    ],
+    "visible_enemies": [
+      {
+        "unit_id": "0x101480001",
+        "unit_type": "Drone",
+        "alliance": "enemy",
+        "position": [52.0, 32.0],
+        "health_fraction": 0.75,
+        "energy": null,
+        "status": "visible"
+      }
+    ],
+    "upgrades": ["WarpGateResearch"]
+  },
+  "text_observation": "Adept-1 sees an enemy Drone near the mineral line.",
+  "available_actions": [
+    {
+      "name": "No_Operation",
+      "argument_names": [],
+      "argument_types": [],
+      "actor_scopes": [
+        "CombatGroup7/Adept-1",
+        "CombatGroup7/AdeptPhase-1",
+        "CombatGroup7/DarkTemplar-1"
+      ]
+    },
+    {
+      "name": "Attack_Unit",
+      "argument_names": ["tag"],
+      "argument_types": ["tag"],
+      "actor_scopes": [
+        "CombatGroup7/Adept-1",
+        "CombatGroup7/DarkTemplar-1"
+      ]
+    },
+    {
+      "name": "Move_Screen",
+      "argument_names": ["screen"],
+      "argument_types": ["position"],
+      "actor_scopes": [
+        "CombatGroup7/Adept-1",
+        "CombatGroup7/AdeptPhase-1"
+      ]
+    }
+  ],
+  "alerts": ["enemy_worker_visible"],
+  "image_uri": null
+}
