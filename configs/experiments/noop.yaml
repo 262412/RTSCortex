@@ -1,0 +1,4 @@
+agent:
+  variant: noop
+provider:
+  kind: fake

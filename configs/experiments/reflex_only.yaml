@@ -1,0 +1,4 @@
+agent:
+  variant: reflex_only
+provider:
+  kind: fake
