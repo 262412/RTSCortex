@@ -34,11 +34,12 @@ class FakeProvider:
             )
         elif response_type is PlanningOutput:
             observation = payload["observation"]
-            available = {item["name"] for item in observation["available_actions"]}
+            available = {item["name"]: item for item in observation["available_actions"]}
             enemies = observation["state"]["visible_enemies"]
             if enemies and "Attack_Unit" in available:
+                actor_scopes = available["Attack_Unit"].get("actor_scopes", [])
                 proposal = ActionProposal(
-                    actor="army",
+                    actor=actor_scopes[0] if actor_scopes else "army",
                     name="Attack_Unit",
                     arguments=[enemies[0]["unit_id"]],
                     priority=60,

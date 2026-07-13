@@ -19,8 +19,11 @@ semantic boundary needed by a future action-conditioned world model.
 - Reflex policies run synchronously on every observation.
 - Planning runs in the background in live mode and on a fixed game-loop cadence.
 - The last valid plan remains active while a new plan is pending.
+- `ActionBatch.planner_pending` lets a simulation worker pace game steps for a slower
+  local model without blocking the runtime's reflex and fallback path.
 - Reflex commands can preempt only commands for the same actor scope.
-- Every command has a priority, source, creation loop, and TTL.
+- Every command has a priority, source, acceptance loop, and TTL; asynchronous plan TTLs
+  begin when the runtime accepts the finished plan rather than at the older source tick.
 
 ## Live process lifecycle
 
@@ -39,7 +42,8 @@ for a non-zero status, so incomplete live runs remain visible in evaluation arti
 Model responses are parsed into typed proposals. Only `ActionCommand` objects accepted by
 the action validator can cross the environment boundary. Unknown actions, invalid argument
 counts, invalid actor scopes, expired commands, and commands exceeding the action budget are
-recorded and rejected.
+recorded and rejected. Planner-generated `Attack_Unit` commands also require their target
+unit to remain present when the finished asynchronous plan is applied.
 
 ## Research provenance
 

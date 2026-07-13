@@ -123,6 +123,14 @@ class RuntimeEngine:
             if fallback is not None:
                 merged = [fallback]
         outcome = self.validator.validate(merged, observation)
+        accepted_commands = outcome.accepted
+        rejected_commands = outcome.rejected
+        if not accepted_commands:
+            fallback = self._fallback(observation)
+            if fallback is not None:
+                fallback_outcome = self.validator.validate([fallback], observation)
+                accepted_commands = fallback_outcome.accepted
+                rejected_commands = [*rejected_commands, *fallback_outcome.rejected]
         plan = self._cached_plan or PlanState(
             "", "", [], observation.step_id, observation.game_loop
         )
@@ -135,8 +143,9 @@ class RuntimeEngine:
             ),
             strategic_goal=plan.strategic_goal,
             summary=plan.summary,
-            commands=outcome.accepted,
-            rejected_commands=outcome.rejected,
+            planner_pending=self._planner_task is not None,
+            commands=accepted_commands,
+            rejected_commands=rejected_commands,
         )
         self.store.append_event(
             run_id=observation.run_id,
@@ -330,23 +339,36 @@ class RuntimeEngine:
             self._last_plan_game_loop = self._cached_plan.created_game_loop
 
     def _accept_plan(self, plan: PlanState, observation: ObservationEnvelope) -> None:
-        fingerprint = self._plan_fingerprint(plan)
+        accepted_plan = PlanState(
+            strategic_goal=plan.strategic_goal,
+            summary=plan.summary,
+            commands=[
+                command.model_copy(update={"created_game_loop": observation.game_loop})
+                for command in plan.commands
+            ],
+            source_step_id=plan.source_step_id,
+            created_game_loop=observation.game_loop,
+        )
+        fingerprint = self._plan_fingerprint(accepted_plan)
         previous_fingerprint = (
             None if self._cached_plan is None else self._plan_fingerprint(self._cached_plan)
         )
-        self._cached_plan = plan
-        self._last_plan_game_loop = plan.created_game_loop
+        self._cached_plan = accepted_plan
+        self._last_plan_game_loop = accepted_plan.created_game_loop
         self.store.append_event(
             run_id=observation.run_id,
             episode_id=observation.episode_id,
             step_id=observation.step_id,
             event_type="plan_accepted",
             payload={
-                "strategic_goal": plan.strategic_goal,
-                "summary": plan.summary,
-                "commands": [command.model_dump(mode="json") for command in plan.commands],
-                "source_step_id": plan.source_step_id,
-                "created_game_loop": plan.created_game_loop,
+                "strategic_goal": accepted_plan.strategic_goal,
+                "summary": accepted_plan.summary,
+                "commands": [command.model_dump(mode="json") for command in accepted_plan.commands],
+                "source_step_id": accepted_plan.source_step_id,
+                "created_game_loop": accepted_plan.created_game_loop,
+                "source_game_loop": plan.created_game_loop,
+                "accepted_game_loop": observation.game_loop,
+                "plan_age_game_loops": max(0, observation.game_loop - plan.created_game_loop),
                 "fingerprint": fingerprint,
                 "is_revision": (
                     previous_fingerprint is not None and previous_fingerprint != fingerprint
@@ -412,6 +434,8 @@ class RuntimeEngine:
                     "usage": getattr(self.provider, "last_usage", None),
                 }
             )
+        if module.name in {"reflection", "planning", "action"}:
+            payload["output"] = result.updates
         self._record_planner_event(context.observation, "module_result", payload)
         return result
 

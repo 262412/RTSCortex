@@ -119,6 +119,22 @@ def test_coordinator_calls_runtime_once_and_reports_execution() -> None:
     assert runtime.execution_reports == [report]
 
 
+def test_coordinator_reports_pending_commands_before_episode_end() -> None:
+    runtime = FakeRuntime(load_fixture("action_batch.json"))
+    coordinator = BridgeCoordinator(runtime)
+    coordinator.decide(load_fixture("observation_snapshot.json"), {"CombatGroup7": TEAM_ORDER})
+
+    coordinator.end_episode({"outcome": "defeat"})
+
+    assert len(runtime.execution_reports) == 3
+    assert all(report["success"] is False for report in runtime.execution_reports)
+    assert all(
+        report["failure_reason"] == "episode ended before command completion"
+        for report in runtime.execution_reports
+    )
+    assert runtime.episode_results == [{"outcome": "defeat"}]
+
+
 def _fixture_route() -> RoutedActionBatch:
     observation = load_fixture("observation_envelope.json")
     return ActionRouter().route(

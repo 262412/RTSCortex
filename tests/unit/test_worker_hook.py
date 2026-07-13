@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import json
 import threading
 from types import SimpleNamespace
@@ -11,7 +12,13 @@ from rtscortex_llm_pysc2.coordinator import BridgeCoordinator
 from rtscortex_llm_pysc2.extractor import TimeStepExtractor
 from rtscortex_llm_pysc2.hook import RuntimeDecisionBroker, RuntimeQueryMixin
 from rtscortex_llm_pysc2.observation import ObservationMapper
-from rtscortex_llm_pysc2.worker import WorkerSettings, _finish_terminal
+from rtscortex_llm_pysc2.worker import (
+    WorkerSettings,
+    _apply_scenario_bootstrap,
+    _finish_terminal,
+    _pending_plan_idle_delay,
+    _scenario_config,
+)
 
 from rtscortex.contracts import ObservationEnvelope
 
@@ -68,6 +75,7 @@ def test_shared_broker_calls_runtime_once_and_distributes_to_all_agents() -> Non
 
     assert all(not thread.is_alive() for thread in threads)
     assert runtime.tick_calls == 1
+    assert broker.planner_pending is False
     assert first.text_observation_calls == 1
     assert second.text_observation_calls == 1
     assert first.action_translation_calls == 1
@@ -146,12 +154,158 @@ def test_worker_settings_prefer_canonical_runtime_environment(
     monkeypatch.setenv("RTSCORTEX_SOCKET", "/tmp/legacy.sock")
     monkeypatch.setenv("RTSCORTEX_SCENARIO", "pvz_task1_level1")
     monkeypatch.setenv("RTSCORTEX_SEED", "17")
+    monkeypatch.setenv("RTSCORTEX_PENDING_PLAN_STEP_DELAY_SECONDS", "0.75")
 
     settings = WorkerSettings.from_environment()
 
     assert settings.socket_path == "/tmp/canonical.sock"
     assert settings.scenario == "pvz_task1_level1"
     assert settings.seed == 17
+    assert settings.pending_plan_step_delay_seconds == 0.75
+
+
+def test_shared_broker_exposes_pending_planner_state() -> None:
+    runtime = FakeRuntime(planner_pending=True)
+    broker = SharedDecisionBroker(
+        BridgeCoordinator(runtime),
+        TimeStepExtractor(
+            "run-worker",
+            "episode-worker",
+            unit_names={311: "Adept", 59: "Nexus", 104: "Drone"},
+            building_types=(59,),
+        ),
+    )
+    timestep = _fake_timestep()
+    agent = FakeAgent("AgentA", "A", timestep, broker)
+    broker.register(agent)
+
+    agent.query(timestep)
+
+    assert broker.planner_pending is True
+
+
+def test_pending_plan_pacing_only_delays_no_op() -> None:
+    assert (
+        _pending_plan_idle_delay(
+            SimpleNamespace(function=0),
+            planner_pending=True,
+            configured_delay_seconds=0.75,
+        )
+        == 0.75
+    )
+    assert (
+        _pending_plan_idle_delay(
+            SimpleNamespace(function=12),
+            planner_pending=True,
+            configured_delay_seconds=0.75,
+        )
+        == 0.0
+    )
+    assert (
+        _pending_plan_idle_delay(
+            SimpleNamespace(function=0),
+            planner_pending=False,
+            configured_delay_seconds=0.75,
+        )
+        == 0.0
+    )
+
+
+def test_timestep_extractor_maps_sc2_attack_alerts() -> None:
+    agent = FakeAgent("CombatGroupSmac", "Stalker-1", _fake_timestep(), StubBroker())
+    snapshot = TimeStepExtractor("run-worker", "episode-worker").extract(
+        _fake_timestep(alerts=[6, 19, 3]),
+        {"CombatGroupSmac": agent},
+        {"CombatGroupSmac": "under attack"},
+        step_id=1,
+    )
+
+    assert snapshot["alerts"] == ["building_under_attack", "unit_under_attack", "alert:3"]
+
+
+def test_worker_selects_2s3z_config_and_adds_no_operation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    no_op_function = object()
+
+    class FakeSmacConfig:
+        def __init__(self) -> None:
+            self.AGENTS = {
+                "CombatGroupSmac": {
+                    "team": [
+                        {"name": "Zealot-1"},
+                        {"name": "Zealot-2"},
+                        {"name": "Stalker-1"},
+                    ],
+                    "action": {
+                        "Zealot": [{"name": "Attack_Unit", "arg": ["tag"], "func": []}],
+                        "Stalker": [{"name": "Attack_Unit", "arg": ["tag"], "func": []}],
+                    },
+                }
+            }
+            self.reset_args: tuple[str, str, str] | None = None
+
+        def reset_llm(self, model_name: str, api_base: str, api_key: str) -> None:
+            self.reset_args = (model_name, api_base, api_key)
+
+    def fake_import(name: str) -> Any:
+        if name == "llm_pysc2.agents.configs.llm_smac":
+            return SimpleNamespace(ConfigSmac_2s3z=FakeSmacConfig)
+        if name == "pysc2.lib.actions":
+            return SimpleNamespace(FUNCTIONS=SimpleNamespace(no_op=no_op_function))
+        raise AssertionError(f"unexpected import: {name}")
+
+    monkeypatch.setattr(importlib, "import_module", fake_import)
+
+    config = _scenario_config("2s3z")
+
+    assert config.reset_args == ("gpt-3.5-turbo", "http://127.0.0.1", "rtscortex-unused")
+    assert [team["name"] for team in config.AGENTS["CombatGroupSmac"]["team"]] == [
+        "Zealot-1",
+        "Zealot-2",
+        "Stalker-1",
+    ]
+    for actions in config.AGENTS["CombatGroupSmac"]["action"].values():
+        assert actions[0] == {
+            "name": "No_Operation",
+            "arg": [],
+            "func": [(0, no_op_function, ())],
+        }
+
+
+def test_worker_rejects_unknown_scenario() -> None:
+    with pytest.raises(ValueError, match="unsupported worker scenario"):
+        _scenario_config("unknown")
+
+
+def test_2s3z_bootstrap_skips_unreachable_camera_calibration() -> None:
+    agent = SimpleNamespace(
+        world_range=0,
+        world_x_offset=7,
+        world_y_offset=9,
+        world_xy_calibration=False,
+    )
+
+    _apply_scenario_bootstrap(agent, "2s3z")
+
+    assert agent.world_range == 0
+    assert agent.world_x_offset == 7
+    assert agent.world_y_offset == 9
+    assert agent.world_xy_calibration is True
+
+
+def test_standard_scenario_keeps_upstream_camera_calibration() -> None:
+    agent = SimpleNamespace(
+        world_range=0,
+        world_x_offset=0,
+        world_y_offset=0,
+        world_xy_calibration=False,
+    )
+
+    _apply_scenario_bootstrap(agent, "pvz_task1_level1")
+
+    assert agent.world_range == 0
+    assert agent.world_xy_calibration is False
 
 
 class FakeAgent(RuntimeQueryMixin):
@@ -255,8 +409,9 @@ class TerminalAgent:
 
 
 class FakeRuntime:
-    def __init__(self) -> None:
+    def __init__(self, *, planner_pending: bool = False) -> None:
         self.tick_calls = 0
+        self.planner_pending = planner_pending
         self.execution_reports: list[dict[str, Any]] = []
         self.episode_results: list[dict[str, Any]] = []
 
@@ -274,6 +429,7 @@ class FakeRuntime:
             "decision_id": "decision-worker",
             "strategic_goal": "harass",
             "summary": "attack the visible worker",
+            "planner_pending": self.planner_pending,
             "commands": [
                 {
                     "command_id": "command-attack",
@@ -297,7 +453,7 @@ class FakeRuntime:
         self.episode_results.append(result)
 
 
-def _fake_timestep() -> Any:
+def _fake_timestep(*, alerts: list[int] | None = None) -> Any:
     available_actions = [0, 12]
     observation = SimpleNamespace(
         player=SimpleNamespace(
@@ -315,7 +471,7 @@ def _fake_timestep() -> Any:
         ],
         production_queue=[SimpleNamespace(ability_id=141, build_progress=50)],
         upgrades=[84],
-        alerts=[3],
+        alerts=[3] if alerts is None else alerts,
         available_actions=available_actions,
         game_loop=[224],
     )

@@ -105,3 +105,76 @@ def test_prepare_live_worker_reports_all_missing_prerequisites(tmp_path: Path) -
     assert "SC2PATH is unset" in message
     assert "waiting-response patch is not applied" in message
     assert "random-seed patch is not applied" in message
+
+
+def test_prepare_live_worker_accepts_2s3z_on_sc2_410(tmp_path: Path) -> None:
+    base_python = tmp_path / "python3.9"
+    base_python.write_text("#!/bin/sh\necho 'Python 3.9.99'\n", encoding="utf-8")
+    base_python.chmod(base_python.stat().st_mode | stat.S_IXUSR)
+    worker_python = tmp_path / "worker-venv/bin/python"
+    worker_python.parent.mkdir(parents=True)
+    worker_python.symlink_to(base_python)
+
+    sc2_path = tmp_path / "StarCraftII"
+    executable = sc2_path / "Versions/Base75689/SC2_x64"
+    executable.parent.mkdir(parents=True)
+    executable.touch()
+    executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
+    scenario_map = sc2_path / "Maps/llm_smac/2s3z.SC2Map"
+    scenario_map.parent.mkdir(parents=True)
+    scenario_map.touch()
+    _write_worker_patch_sources(tmp_path)
+
+    config = make_config(tmp_path).model_copy(
+        update={
+            "environment": EnvironmentSettings(
+                adapter="llm_pysc2",
+                scenario="2s3z",
+                sc2_path=sc2_path,
+                worker_python=worker_python,
+                max_steps=128,
+            )
+        }
+    )
+
+    spec = prepare_live_worker(config, tmp_path, environment={})
+
+    assert spec.sc2_path == sc2_path
+    assert spec.command[spec.command.index("--map") + 1] == "2s3z"
+    assert spec.command[spec.command.index("--max_agent_steps") + 1] == "128"
+
+
+def test_prepare_live_worker_rejects_unsupported_scenario(tmp_path: Path) -> None:
+    config = make_config(tmp_path).model_copy(
+        update={
+            "environment": EnvironmentSettings(
+                adapter="llm_pysc2",
+                scenario="unknown",
+                worker_python=tmp_path / "python",
+            )
+        }
+    )
+
+    with pytest.raises(LiveEnvironmentError, match="unsupported live scenario"):
+        prepare_live_worker(config, tmp_path, environment={})
+
+
+def _write_worker_patch_sources(project_root: Path) -> None:
+    upstream_source = (
+        project_root / "third_party/LLM-PySC2/llm_pysc2/agents/llm_pysc2_agent_main.py"
+    )
+    upstream_source.parent.mkdir(parents=True)
+    upstream_source.write_text(
+        "elif not self._all_agent_waiting_response_finished():\n"
+        "    func_id, func_call = (0, actions.FUNCTIONS.no_op())\n"
+        "    return func_call\n"
+        "elif not self._all_agent_executing_finished():\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
+    runner_source = project_root / "third_party/LLM-PySC2/pysc2/bin/agent.py"
+    runner_source.parent.mkdir(parents=True)
+    runner_source.write_text(
+        'flags.DEFINE_integer("random_seed", None, "Random seed")\nrandom_seed=FLAGS.random_seed\n',
+        encoding="utf-8",
+    )

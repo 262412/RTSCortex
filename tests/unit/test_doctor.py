@@ -4,16 +4,19 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 
 import rtscortex.cli.doctor as doctor_module
 from rtscortex.cli.doctor import (
+    _provider_check,
     _sc2_checks,
     _worker_packages_check,
     _worker_patch_check,
     _worker_python_check,
     run_doctor,
 )
+from rtscortex.config import ExperimentConfig, ProviderSettings
 
 
 def core_venv_status(project_root: Path) -> str:
@@ -34,6 +37,31 @@ def test_doctor_rejects_incomplete_virtualenv_directory(tmp_path: Path) -> None:
     (tmp_path / ".venv").mkdir()
 
     assert core_venv_status(tmp_path) == "error"
+
+
+def test_provider_check_requires_configured_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = ExperimentConfig(
+        provider=ProviderSettings(
+            kind="openai_compatible",
+            model="Qwen/Qwen3-8B",
+            base_url="http://model.test/v1",
+        )
+    )
+
+    def get(*args: Any, **kwargs: Any) -> httpx.Response:
+        del args, kwargs
+        return httpx.Response(
+            200,
+            request=httpx.Request("GET", "http://model.test/v1/models"),
+            json={"data": [{"id": "Qwen/Qwen3-8B"}]},
+        )
+
+    monkeypatch.setattr(httpx, "get", get)
+
+    check = _provider_check(config)
+
+    assert check.status == "ok"
+    assert "Qwen/Qwen3-8B" in check.detail
 
 
 def test_worker_python_requires_python_39(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -136,6 +164,30 @@ def test_sc2_checks_rejects_build_older_than_fixed_pvz_map(
 
     assert check.status == "error"
     assert "requires Base92440" in check.detail
+
+
+def test_sc2_checks_accepts_2s3z_on_base75689(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_map = tmp_path / "third_party/LLM-PySC2/llm_pysc2/maps/llm_smac/2s3z.SC2Map"
+    source_map.parent.mkdir(parents=True)
+    source_map.touch()
+    sc2_path = tmp_path / "StarCraftII"
+    executable = sc2_path / "Versions/Base75689/SC2_x64"
+    executable.parent.mkdir(parents=True)
+    executable.touch()
+    installed_map = sc2_path / "Maps/llm_smac/2s3z.SC2Map"
+    installed_map.parent.mkdir(parents=True)
+    installed_map.touch()
+    monkeypatch.setenv("SC2PATH", str(sc2_path))
+
+    checks = _sc2_checks(tmp_path, required=True, scenario="2s3z")
+
+    assert {check.name: check.status for check in checks} == {
+        "scenario_map_source": "ok",
+        "starcraft_ii": "ok",
+        "scenario_map_installed": "ok",
+    }
 
 
 def test_sc2_checks_rejects_incomplete_configured_path(

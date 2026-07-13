@@ -10,16 +10,18 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
+import httpx
+
+from rtscortex.config import ExperimentConfig
 from rtscortex.runtime.live import (
-    PVZ_TASK1_MINIMUM_SC2_BUILD,
+    LiveEnvironmentError,
+    live_scenario_spec,
     random_seed_patch_is_applied,
     sc2_build,
     waiting_response_patch_is_applied,
 )
 
 EXPECTED_LLM_PYSC2_COMMIT = "551c863475c0c4a96a181080974d24b59589e9f3"
-SCENARIO_MAP = "pvz_task1_level1.SC2Map"
-SCENARIO_MAP_RELATIVE = Path("llm_pysc2") / SCENARIO_MAP
 
 
 @dataclass(frozen=True)
@@ -29,7 +31,12 @@ class Check:
     detail: str
 
 
-def run_doctor(project_root: Path, *, require_sc2: bool = False) -> list[Check]:
+def run_doctor(
+    project_root: Path,
+    *,
+    require_sc2: bool = False,
+    config: ExperimentConfig | None = None,
+) -> list[Check]:
     checks = [
         Check(
             "python",
@@ -39,6 +46,8 @@ def run_doctor(project_root: Path, *, require_sc2: bool = False) -> list[Check]:
         Check("uv", "ok" if shutil.which("uv") else "error", shutil.which("uv") or "missing"),
     ]
     checks.append(_core_venv_check(project_root / ".venv"))
+    if config is not None and config.provider.kind == "openai_compatible":
+        checks.append(_provider_check(config))
     submodule = project_root / "third_party" / "LLM-PySC2"
     commit = _git_commit(submodule)
     checks.append(
@@ -52,14 +61,49 @@ def run_doctor(project_root: Path, *, require_sc2: bool = False) -> list[Check]:
     worker_python = (
         Path(worker_python_value).expanduser()
         if worker_python_value
-        else Path.home() / "fastscratch/envs/rtscortex-llm-pysc2/bin/python"
+        else (
+            config.environment.worker_python
+            if config is not None
+            else Path.home() / "fastscratch/envs/rtscortex-llm-pysc2/bin/python"
+        )
     )
     checks.append(_worker_python_check(worker_python, required=require_sc2))
     checks.append(_worker_packages_check(worker_python, required=require_sc2))
     checks.append(_worker_patch_check(project_root, required=require_sc2))
-    checks.extend(_sc2_checks(project_root, required=require_sc2))
+    checks.extend(
+        _sc2_checks(
+            project_root,
+            required=require_sc2,
+            scenario=(config.environment.scenario if config is not None else "pvz_task1_level1"),
+            configured_sc2_path=(config.environment.sc2_path if config is not None else None),
+        )
+    )
     checks.append(_socket_parent_check())
     return checks
+
+
+def _provider_check(config: ExperimentConfig) -> Check:
+    api_key = os.environ.get(config.provider.api_key_env, "")
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    url = f"{config.provider.base_url.rstrip('/')}/models"
+    try:
+        response = httpx.get(
+            url,
+            headers=headers,
+            timeout=min(config.provider.timeout_seconds, 5.0),
+        )
+        response.raise_for_status()
+        model_ids = [item["id"] for item in response.json()["data"]]
+    except (httpx.HTTPError, KeyError, TypeError, ValueError) as error:
+        return Check("llm_provider", "error", f"{url} ({type(error).__name__}: {error})")
+    if config.provider.model not in model_ids:
+        served = ", ".join(model_ids) or "none"
+        return Check(
+            "llm_provider",
+            "error",
+            f"model {config.provider.model!r} is unavailable; served: {served}",
+        )
+    return Check("llm_provider", "ok", f"{url} ({config.provider.model})")
 
 
 def _core_venv_check(venv: Path) -> Check:
@@ -155,13 +199,28 @@ def _probe_worker_packages(python: str) -> tuple[int, str]:
     return completed.returncode, output.splitlines()[-1] if output else ""
 
 
-def _sc2_checks(project_root: Path, *, required: bool) -> list[Check]:
-    source_map = project_root / "third_party/LLM-PySC2/llm_pysc2/maps" / SCENARIO_MAP_RELATIVE
+def _sc2_checks(
+    project_root: Path,
+    *,
+    required: bool,
+    scenario: str = "pvz_task1_level1",
+    configured_sc2_path: Path | None = None,
+) -> list[Check]:
+    try:
+        specification = live_scenario_spec(scenario)
+    except LiveEnvironmentError as error:
+        return [Check("live_scenario", "error", str(error))]
+    map_relative = Path(specification.map_directory) / f"{scenario}.SC2Map"
+    source_map = project_root / "third_party/LLM-PySC2/llm_pysc2/maps" / map_relative
     source_map_status = "ok" if source_map.is_file() else "error"
     checks = [Check("scenario_map_source", source_map_status, str(source_map))]
 
     sc2_path_value = os.environ.get("SC2PATH")
-    if not sc2_path_value:
+    if sc2_path_value:
+        sc2_path = Path(sc2_path_value).expanduser()
+    elif configured_sc2_path is not None:
+        sc2_path = configured_sc2_path.expanduser()
+    else:
         status = "error" if required else "optional"
         checks.extend(
             [
@@ -171,7 +230,6 @@ def _sc2_checks(project_root: Path, *, required: bool) -> list[Check]:
         )
         return checks
 
-    sc2_path = Path(sc2_path_value).expanduser()
     executables = list((sc2_path / "Versions").glob("Base*/SC2_x64"))
     direct_executable = sc2_path / "SC2_x64"
     if direct_executable.is_file():
@@ -181,13 +239,15 @@ def _sc2_checks(project_root: Path, *, required: bool) -> list[Check]:
         build = sc2_build(executable)
         if build is None:
             checks.append(Check("starcraft_ii", "error", f"unknown SC2 build: {executable}"))
-        elif build < PVZ_TASK1_MINIMUM_SC2_BUILD:
+        elif (
+            specification.minimum_sc2_build is not None and build < specification.minimum_sc2_build
+        ):
             checks.append(
                 Check(
                     "starcraft_ii",
                     "error",
-                    f"{executable} (Base{build}; pvz_task1_level1 requires "
-                    f"Base{PVZ_TASK1_MINIMUM_SC2_BUILD})",
+                    f"{executable} (Base{build}; {scenario} requires "
+                    f"Base{specification.minimum_sc2_build})",
                 )
             )
         else:
@@ -195,7 +255,7 @@ def _sc2_checks(project_root: Path, *, required: bool) -> list[Check]:
     else:
         checks.append(Check("starcraft_ii", "error", f"no SC2_x64 below {sc2_path}"))
 
-    installed_map = sc2_path / "Maps" / SCENARIO_MAP_RELATIVE
+    installed_map = sc2_path / "Maps" / map_relative
     checks.append(
         Check(
             "scenario_map_installed",

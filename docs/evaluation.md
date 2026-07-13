@@ -25,3 +25,19 @@ The plan revision rate is the number of semantically changed accepted plans divi
 by the number of opportunities after each episode's initial plan. Token cost uses the
 provider's configured prompt and completion prices per million tokens. Both prices
 default to zero, so cost remains explicit without assuming a vendor price.
+
+## Per-run timeline
+
+Generate a readable account of any live or Mock run directly from its append-only
+event journal:
+
+```bash
+uv run rtscortex report ~/scratch/outputs/RTSCortex/<run-directory>
+```
+
+The command writes `<run-directory>/timeline.md`. It summarizes each observation tick,
+typed model output, accepted plan, selected and rejected commands, reflex preemptions,
+execution feedback, latency, token use, and terminal result while preserving the JSONL
+event order. It intentionally omits the verbose raw text observation from Markdown; the
+complete source remains in `events.jsonl`. Running the command again deterministically
+replaces the derived timeline and does not modify the journal.

@@ -15,7 +15,7 @@ def main() -> None:
         "-m",
         "pysc2.bin.agent",
         "--map",
-        "pvz_task1_level1",
+        os.environ.get("RTSCORTEX_SCENARIO", "pvz_task1_level1"),
         "--agent_race",
         "protoss",
         "--parallel",

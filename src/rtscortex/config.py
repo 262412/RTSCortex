@@ -25,6 +25,7 @@ class EnvironmentSettings(SettingsModel):
     max_steps: int = Field(default=6, ge=1)
     sc2_path: Path | None = None
     worker_python: Path = Path("~/fastscratch/envs/rtscortex-llm-pysc2/bin/python")
+    pending_plan_step_delay_seconds: float = Field(default=0.0, ge=0.0)
     server_ready_timeout_seconds: float = Field(default=15.0, gt=0.0)
     shutdown_timeout_seconds: float = Field(default=10.0, gt=0.0)
 
@@ -64,6 +65,8 @@ class ProviderSettings(SettingsModel):
     base_url: str = "http://127.0.0.1:8000/v1"
     api_key_env: str = "RTSCORTEX_LLM_API_KEY"
     timeout_seconds: float = Field(default=30.0, gt=0.0)
+    max_tokens: int | None = Field(default=None, ge=1)
+    enable_thinking: bool | None = None
     prompt_cost_per_million_tokens: float = Field(default=0.0, ge=0.0)
     completion_cost_per_million_tokens: float = Field(default=0.0, ge=0.0)
 

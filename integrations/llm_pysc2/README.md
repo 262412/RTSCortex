@@ -37,19 +37,29 @@ requiring PySC2. Every available action carries explicit argument names and sema
 validator enough information to reject malformed arguments and keeps its fallback action
 routable to a canonical actor.
 
-The worker command is intentionally inert on import. To launch the fixed v0.1 scenario,
+The worker command is intentionally inert on import. To launch a supported live scenario,
 set `RTSCORTEX_RUN_ID` and `RTSCORTEX_EPISODE_ID`, then set either
 `RTSCORTEX_RUNTIME_SOCKET` or `RTSCORTEX_RUNTIME_URL` and run
 `rtscortex-llm-pysc2-worker`. The legacy `RTSCORTEX_SOCKET` name is also accepted.
 `RTSCORTEX_SEED` is optional and defaults to zero; with the reviewed runner patch it is
 passed into `SC2Env`, rather than only being recorded as metadata. The command launches
-`pvz_task1_level1`; installing SC2 and accepting its license remain separate operator
-steps.
+the scenario named by `RTSCORTEX_SCENARIO`, defaulting to `pvz_task1_level1`. The v0.1
+worker supports `pvz_task1_level1` and the Linux-compatible `2s3z` smoke scenario.
+Installing SC2 and accepting its license remain separate operator steps.
+
+For `2s3z`, the worker uses upstream `ConfigSmac_2s3z` and preserves its positional team
+order (`Zealot-1`, `Zealot-2`, `Stalker-1`). The bridge adds `No_Operation` to copied
+per-config action lists when upstream omits it; it does not mutate the shared upstream
+SMAC action constant. This keeps runtime fallback commands translatable and traceable to
+an `ExecutionReport`. It also skips the unreachable large-map centering condition caused
+by the small arena's camera boundary while leaving coordinate-range inference, grouping,
+observation collection, and action execution in the upstream main loop.
 
 ## Upstream ownership
 
 The upstream source is pinned at `third_party/LLM-PySC2`; do not edit the submodule
-directly. Required main-loop changes are small reviewed patches in `patches/`. Environment
+directly. Required main-loop changes are small reviewed patches in `patches/` and should
+only be applied for live sessions, then reversed to restore the clean gitlink. Environment
 semantics, camera control, team management, automatic economy, text-action translation,
 and PySC2 action validation remain upstream-owned.
 

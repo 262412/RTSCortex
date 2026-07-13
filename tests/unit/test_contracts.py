@@ -68,6 +68,7 @@ def test_action_contract_round_trip_and_version_check() -> None:
     )
 
     assert ActionBatch.model_validate_json(batch.model_dump_json()) == batch
+    assert batch.planner_pending is False
     payload = batch.model_dump(mode="json")
     payload["protocol_version"] = "2.0"
     with pytest.raises(ValidationError):

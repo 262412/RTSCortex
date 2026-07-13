@@ -12,8 +12,8 @@ class AgentOutput(BaseModel):
 
 
 class ReflectionOutput(AgentOutput):
-    summary: str
-    lessons: list[str] = Field(default_factory=list)
+    summary: str = Field(max_length=500)
+    lessons: list[str] = Field(default_factory=list, max_length=3)
 
 
 class ActionProposal(AgentOutput):
@@ -25,6 +25,6 @@ class ActionProposal(AgentOutput):
 
 
 class PlanningOutput(AgentOutput):
-    strategic_goal: str
-    steps: list[str] = Field(default_factory=list)
-    proposed_actions: list[ActionProposal] = Field(default_factory=list)
+    strategic_goal: str = Field(max_length=200)
+    steps: list[str] = Field(default_factory=list, max_length=3)
+    proposed_actions: list[ActionProposal] = Field(default_factory=list, max_length=3)

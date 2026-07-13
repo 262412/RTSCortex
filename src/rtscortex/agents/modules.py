@@ -6,9 +6,50 @@ import json
 from typing import Any
 
 from rtscortex.agents.models import PlanningOutput, ReflectionOutput
-from rtscortex.contracts import ActionCommand, ActionSource
+from rtscortex.contracts import ActionCommand, ActionSource, ObservationEnvelope
 from rtscortex.contracts.interfaces import AgentContext, LLMProvider, ModuleResult
-from rtscortex.memory import EventStore
+from rtscortex.memory import EventStore, StoredEvent
+
+
+def _model_observation(observation: ObservationEnvelope) -> dict[str, Any]:
+    """Project an observation into the compact, structured context used by an LLM."""
+
+    payload = observation.model_dump(mode="json")
+    payload.pop("observed_at")
+    payload.pop("text_observation")
+    payload.pop("image_uri")
+    return payload
+
+
+def _compact_event(event: StoredEvent) -> dict[str, Any] | None:
+    if event.event_type == "decision":
+        batch = event.payload["batch"]
+        return {
+            "event_type": event.event_type,
+            "step_id": event.step_id,
+            "strategic_goal": batch.get("strategic_goal", ""),
+            "summary": batch.get("summary", ""),
+            "commands": [
+                {
+                    "actor": command["actor"],
+                    "name": command["name"],
+                    "arguments": command.get("arguments", []),
+                    "source": command["source"],
+                }
+                for command in batch.get("commands", [])
+            ],
+            "rejected_commands": batch.get("rejected_commands", []),
+        }
+    if event.event_type == "execution":
+        return {
+            "event_type": event.event_type,
+            "step_id": event.step_id,
+            "command_id": event.payload.get("command_id"),
+            "success": event.payload.get("success"),
+            "failure_reason": event.payload.get("failure_reason"),
+            "pysc2_function": event.payload.get("pysc2_function"),
+        }
+    return None
 
 
 class MemoryModule:
@@ -23,12 +64,18 @@ class MemoryModule:
         recent = self.store.recent_events(
             observation.run_id, observation.episode_id, self.short_term_window
         )
+        compact_events = [
+            compact for event in recent if (compact := _compact_event(event)) is not None
+        ]
         return ModuleResult(
             module=self.name,
             updates={
-                "recent_events": [event.__dict__ for event in recent],
+                "recent_events": compact_events,
                 "lessons": [
-                    lesson.__dict__
+                    {
+                        "source_step_id": lesson.source_step_id,
+                        "content": lesson.content,
+                    }
                     for lesson in self.store.lesson_records(
                         observation.run_id,
                         observation.episode_id,
@@ -36,7 +83,7 @@ class MemoryModule:
                 ],
                 "episode_summaries": [
                     summary.model_dump(mode="json")
-                    for summary in self.store.recent_episode_summaries(observation.run_id)
+                    for summary in self.store.recent_episode_summaries(observation.run_id, limit=3)
                 ],
             },
         )
@@ -52,7 +99,7 @@ class ReflectionModule:
         if context.last_decision is None:
             return ModuleResult(module=self.name, updates={"reflection": None, "lessons": []})
         payload = {
-            "observation": context.observation.model_dump(mode="json"),
+            "observation": _model_observation(context.observation),
             "last_decision": context.last_decision.model_dump(mode="json"),
             "last_execution": (
                 None
@@ -83,14 +130,20 @@ class PlanningModule:
 
     async def run(self, context: AgentContext) -> ModuleResult:
         payload = {
-            "observation": context.observation.model_dump(mode="json"),
+            "observation": _model_observation(context.observation),
             "memory": context.memory,
         }
         output = await self.provider.generate(
             PlanningOutput,
             system_prompt=(
                 "Create a short-horizon StarCraft II plan using only the available actions. "
-                "Return typed action proposals; never emit raw PySC2 calls."
+                "Use an actor exactly as listed in the chosen action's actor_scopes. Return "
+                "typed action proposals; never emit raw PySC2 calls. The arguments field is "
+                "a positional JSON array in the exact argument_names order, and every value "
+                "must match the corresponding argument_types entry. For example, an action "
+                'with argument_names=["target"] receives arguments=["0x1001c0001"], '
+                "never a named {name, value} object. Return at most three concise plan steps "
+                "and three proposed actions, with no more than one action per actor."
             ),
             user_prompt=json.dumps(payload, ensure_ascii=False, sort_keys=True),
         )
@@ -123,6 +176,11 @@ class ActionModule:
                 ttl_game_loops=proposal.ttl_game_loops,
                 created_game_loop=context.observation.game_loop,
                 source=ActionSource.PLANNER,
+                preconditions=(
+                    {"unit_exists": str(proposal.arguments[0])}
+                    if proposal.name == "Attack_Unit" and proposal.arguments
+                    else {}
+                ),
             )
             for index, proposal in enumerate(plan.proposed_actions[: self.max_actions])
         ]

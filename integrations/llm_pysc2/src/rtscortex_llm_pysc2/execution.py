@@ -58,13 +58,46 @@ class ExecutionTracker:
         tracked = self._pending.pop(command_id, None)
         if tracked is None:
             raise KeyError(f"unknown command {command_id!r}")
+        return self._report(tracked, game_result=game_result)
 
+    def drain_pending(
+        self,
+        *,
+        failure_reason: str,
+        game_result: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        """Fail and remove commands that cannot complete after episode end."""
+
+        tracked_commands = list(self._pending.values())
+        self._pending.clear()
+        return [
+            self._report(
+                tracked,
+                game_result=game_result,
+                terminal_failure_reason=failure_reason,
+            )
+            for tracked in tracked_commands
+        ]
+
+    @staticmethod
+    def _report(
+        tracked: _TrackedCommand,
+        *,
+        game_result: Optional[str],
+        terminal_failure_reason: Optional[str] = None,
+    ) -> dict[str, Any]:
         primitives = tracked.primitives
-        success = bool(primitives) and all(item.success for item in primitives)
+        success = (
+            terminal_failure_reason is None
+            and bool(primitives)
+            and all(item.success for item in primitives)
+        )
         failure_reasons = [
             item.failure_reason for item in primitives if item.failure_reason is not None
         ]
-        if not primitives:
+        if terminal_failure_reason is not None:
+            failure_reasons.append(terminal_failure_reason)
+        elif not primitives:
             failure_reasons.append("no PySC2 primitive recorded")
 
         return {
@@ -72,7 +105,7 @@ class ExecutionTracker:
             "run_id": tracked.route.run_id,
             "episode_id": tracked.route.episode_id,
             "step_id": tracked.route.step_id,
-            "command_id": command_id,
+            "command_id": tracked.command.command_id,
             "success": success,
             "failure_reason": "; ".join(failure_reasons) if failure_reasons else None,
             "pysc2_function": " -> ".join(item.function_name for item in primitives) or None,

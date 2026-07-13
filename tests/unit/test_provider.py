@@ -8,7 +8,7 @@ import pytest
 from pydantic import ValidationError
 
 from rtscortex.agents import PlanningOutput
-from rtscortex.providers import OpenAICompatibleProvider
+from rtscortex.providers import FakeProvider, OpenAICompatibleProvider
 
 
 def make_provider(handler: httpx.AsyncBaseTransport) -> OpenAICompatibleProvider:
@@ -53,6 +53,48 @@ def test_openai_provider_parses_structured_output_and_usage() -> None:
                 "completion_tokens": 7,
                 "total_tokens": 18,
             }
+        finally:
+            await provider.close()
+
+    asyncio.run(execute())
+
+
+def test_openai_provider_sends_configured_qwen_generation_options() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        assert payload["max_tokens"] == 256
+        assert payload["chat_template_kwargs"] == {"enable_thinking": False}
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "strategic_goal": "Hold",
+                                    "steps": [],
+                                    "proposed_actions": [],
+                                }
+                            )
+                        }
+                    }
+                ]
+            },
+        )
+
+    async def execute() -> None:
+        provider = OpenAICompatibleProvider(
+            base_url="http://model.test/v1",
+            model="Qwen/Qwen3-8B",
+            api_key_env="RTSCORTEX_TEST_API_KEY",
+            timeout_seconds=0.1,
+            max_tokens=256,
+            enable_thinking=False,
+            transport=httpx.MockTransport(handler),
+        )
+        try:
+            await provider.generate(PlanningOutput, system_prompt="plan", user_prompt="{}")
         finally:
             await provider.close()
 
@@ -105,5 +147,33 @@ def test_openai_provider_rejects_invalid_structured_output() -> None:
                 await provider.generate(PlanningOutput, system_prompt="plan", user_prompt="{}")
         finally:
             await provider.close()
+
+    asyncio.run(execute())
+
+
+def test_fake_provider_uses_available_live_actor_scope() -> None:
+    async def execute() -> None:
+        provider = FakeProvider()
+        result = await provider.generate(
+            PlanningOutput,
+            system_prompt="plan",
+            user_prompt=json.dumps(
+                {
+                    "observation": {
+                        "available_actions": [
+                            {
+                                "name": "Attack_Unit",
+                                "actor_scopes": [
+                                    "CombatGroupSmac/Stalker-1",
+                                    "CombatGroupSmac/Zealot-1",
+                                ],
+                            }
+                        ],
+                        "state": {"visible_enemies": [{"unit_id": "0xabc"}]},
+                    }
+                }
+            ),
+        )
+        assert result.proposed_actions[0].actor == "CombatGroupSmac/Stalker-1"
 
     asyncio.run(execute())

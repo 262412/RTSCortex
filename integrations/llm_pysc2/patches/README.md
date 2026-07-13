@@ -1,6 +1,7 @@
 # Upstream hook patches
 
-The submodule remains pinned and read-only. Apply patches from inside the pinned checkout:
+The submodule remains pinned and read-only between live sessions. Apply patches from
+inside the pinned checkout before a live run:
 
 ```bash
 git -C third_party/LLM-PySC2 apply --check \
@@ -12,6 +13,23 @@ git -C third_party/LLM-PySC2 apply --check \
 git -C third_party/LLM-PySC2 apply \
   ../../integrations/llm_pysc2/patches/0002-pass-random-seed-to-sc2env.patch
 ```
+
+After the live run, restore the clean pinned checkout by reversing exactly these reviewed
+patches in reverse order:
+
+```bash
+git -C third_party/LLM-PySC2 apply --reverse --check \
+  ../../integrations/llm_pysc2/patches/0002-pass-random-seed-to-sc2env.patch
+git -C third_party/LLM-PySC2 apply --reverse \
+  ../../integrations/llm_pysc2/patches/0002-pass-random-seed-to-sc2env.patch
+git -C third_party/LLM-PySC2 apply --reverse --check \
+  ../../integrations/llm_pysc2/patches/0001-return-noop-while-awaiting-runtime.patch
+git -C third_party/LLM-PySC2 apply --reverse \
+  ../../integrations/llm_pysc2/patches/0001-return-noop-while-awaiting-runtime.patch
+```
+
+Do not configure Git to ignore dirty submodules: that would also hide accidental upstream
+edits or gitlink drift.
 
 `0001-return-noop-while-awaiting-runtime.patch` changes one branch in `MainAgent.step`.
 The upstream implementation currently spins inside its bounded `while` loop while an

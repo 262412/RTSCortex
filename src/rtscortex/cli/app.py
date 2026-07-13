@@ -16,7 +16,12 @@ import yaml
 from rtscortex.api import create_app
 from rtscortex.cli.doctor import run_doctor
 from rtscortex.config import ExperimentConfig, load_config
-from rtscortex.evaluation import run_mock_episode, run_mock_suite
+from rtscortex.evaluation import (
+    ReportError,
+    run_mock_episode,
+    run_mock_suite,
+    write_timeline_report,
+)
 from rtscortex.evaluation.replay import replay_event_log
 from rtscortex.runtime.factory import build_runtime
 from rtscortex.runtime.live import (
@@ -51,10 +56,15 @@ def doctor(
     require_sc2: Annotated[
         bool, typer.Option(help="Treat a missing StarCraft II installation as an error.")
     ] = False,
+    config_path: Annotated[
+        Path | None,
+        typer.Option("--config", exists=True, dir_okay=False, help="Live experiment config."),
+    ] = None,
 ) -> None:
     """Check the core environment, pinned submodule, and optional SC2 installation."""
 
-    checks = run_doctor(PROJECT_ROOT, require_sc2=require_sc2)
+    config = load_config(config_path) if config_path is not None else None
+    checks = run_doctor(PROJECT_ROOT, require_sc2=require_sc2, config=config)
     for check in checks:
         typer.echo(f"{check.status.upper():8} {check.name:16} {check.detail}")
     if any(check.status == "error" for check in checks):
@@ -93,7 +103,12 @@ def run_experiment(
                 seed=config.run.seed,
                 socket_path=runtime_socket,
                 worker_command=live_worker.command,
-                worker_environment={"SC2PATH": str(live_worker.sc2_path)},
+                worker_environment={
+                    "SC2PATH": str(live_worker.sc2_path),
+                    "RTSCORTEX_PENDING_PLAN_STEP_DELAY_SECONDS": str(
+                        config.environment.pending_plan_step_delay_seconds
+                    ),
+                },
                 run_dir=run_dir,
                 server_ready_timeout_seconds=(config.environment.server_ready_timeout_seconds),
                 shutdown_timeout_seconds=config.environment.shutdown_timeout_seconds,
@@ -141,6 +156,19 @@ def evaluate(
         raise typer.BadParameter(str(error), param_hint="--output-dir") from error
     typer.echo(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
     typer.echo(f"Artifacts: {target.expanduser()}")
+
+
+@app.command()
+def report(
+    run_dir: Annotated[Path, typer.Argument(exists=True, file_okay=False)],
+) -> None:
+    """Generate a readable Markdown timeline from one runtime event journal."""
+
+    try:
+        timeline_path = write_timeline_report(run_dir)
+    except ReportError as error:
+        raise typer.BadParameter(str(error), param_hint="RUN_DIR") from error
+    typer.echo(f"Timeline: {timeline_path}")
 
 
 @app.command()

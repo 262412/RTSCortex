@@ -102,4 +102,10 @@ class BridgeCoordinator:
         return report
 
     def end_episode(self, result: dict[str, Any]) -> None:
+        game_result = result.get("outcome")
+        for report in self.tracker.drain_pending(
+            failure_reason="episode ended before command completion",
+            game_result=None if game_result is None else str(game_result),
+        ):
+            self.runtime.execution(report)
         self.runtime.end_episode(result)

@@ -122,6 +122,7 @@ class ActionBatch(ContractModel):
     decision_id: str
     strategic_goal: str = ""
     summary: str = ""
+    planner_pending: bool = False
     commands: list[ActionCommand] = Field(default_factory=list)
     rejected_commands: list[str] = Field(default_factory=list)
 

@@ -39,6 +39,23 @@ class WorkerProcessError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class LiveScenarioSpec:
+    """SC2 installation requirements for one supported live scenario."""
+
+    map_directory: str
+    minimum_sc2_build: int | None = None
+
+
+LIVE_SCENARIOS = {
+    "pvz_task1_level1": LiveScenarioSpec(
+        map_directory="llm_pysc2",
+        minimum_sc2_build=PVZ_TASK1_MINIMUM_SC2_BUILD,
+    ),
+    "2s3z": LiveScenarioSpec(map_directory="llm_smac"),
+}
+
+
+@dataclass(frozen=True)
 class LiveWorkerSpec:
     """Validated inputs needed to start the pinned environment worker."""
 
@@ -66,6 +83,7 @@ def prepare_live_worker(
         raise LiveEnvironmentError("live supervision requires environment.adapter=llm_pysc2")
     if os.name == "nt":
         raise LiveEnvironmentError("the v0.1 live worker requires Unix-domain sockets")
+    scenario = live_scenario_spec(config.environment.scenario)
 
     values = os.environ if environment is None else environment
     worker_python = _worker_python(config, values)
@@ -110,16 +128,18 @@ def prepare_live_worker(
         executable = _find_sc2_executable(sc2_path)
         if executable is None:
             errors.append(f"no SC2_x64 executable found below {sc2_path}")
-        elif config.environment.scenario == "pvz_task1_level1":
+        elif scenario.minimum_sc2_build is not None:
             build = sc2_build(executable)
             if build is None:
                 errors.append(f"cannot determine the SC2 build from {executable}")
-            elif build < PVZ_TASK1_MINIMUM_SC2_BUILD:
+            elif build < scenario.minimum_sc2_build:
                 errors.append(
                     f"SC2 build {build} is older than required build "
-                    f"{PVZ_TASK1_MINIMUM_SC2_BUILD} for pvz_task1_level1"
+                    f"{scenario.minimum_sc2_build} for {config.environment.scenario}"
                 )
-        map_path = sc2_path / "Maps" / "llm_pysc2" / f"{config.environment.scenario}.SC2Map"
+        map_path = (
+            sc2_path / "Maps" / scenario.map_directory / f"{config.environment.scenario}.SC2Map"
+        )
         if not map_path.is_file():
             errors.append(f"scenario map is missing: {map_path}")
 
@@ -157,6 +177,18 @@ def prepare_live_worker(
         str(config.run.seed),
     )
     return LiveWorkerSpec(command=command, sc2_path=sc2_path)
+
+
+def live_scenario_spec(scenario: str) -> LiveScenarioSpec:
+    """Return the declared requirements for a supported live scenario."""
+
+    try:
+        return LIVE_SCENARIOS[scenario]
+    except KeyError as error:
+        supported = ", ".join(sorted(LIVE_SCENARIOS))
+        raise LiveEnvironmentError(
+            f"unsupported live scenario {scenario!r}; supported scenarios: {supported}"
+        ) from error
 
 
 def live_socket_path(runtime_root: Path, run_id: str) -> Path:

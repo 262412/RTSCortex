@@ -13,7 +13,7 @@ class ReflexEngine:
     def evaluate(self, observation: ObservationEnvelope) -> list[ActionCommand]:
         if not self.enabled:
             return []
-        available = {action.name for action in observation.available_actions}
+        available = {action.name: action for action in observation.available_actions}
         commands: list[ActionCommand] = []
 
         if "Retreat" in available:
@@ -31,19 +31,25 @@ class ReflexEngine:
                         )
                     )
 
-        under_attack = any(alert.casefold() == "under_attack" for alert in observation.alerts)
+        under_attack = any(
+            alert.casefold() in {"under_attack", "building_under_attack", "unit_under_attack"}
+            for alert in observation.alerts
+        )
         if under_attack and observation.state.visible_enemies and "Attack_Unit" in available:
-            commands.append(
-                self._command(
-                    observation,
-                    index=len(commands),
-                    actor="army",
-                    name="Attack_Unit",
-                    arguments=[observation.state.visible_enemies[0].unit_id],
-                    priority=90,
-                    ttl_game_loops=8,
+            attack = available["Attack_Unit"]
+            actors = attack.actor_scopes or ["army"]
+            for actor in actors:
+                commands.append(
+                    self._command(
+                        observation,
+                        index=len(commands),
+                        actor=actor,
+                        name="Attack_Unit",
+                        arguments=[observation.state.visible_enemies[0].unit_id],
+                        priority=90,
+                        ttl_game_loops=8,
+                    )
                 )
-            )
         return commands
 
     @staticmethod

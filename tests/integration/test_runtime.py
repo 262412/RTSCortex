@@ -125,6 +125,14 @@ def test_mock_episode_runs_full_module_chain(tmp_path: Path) -> None:
                 ("planning", True),
                 ("action", False),
             ]
+            planning_event = next(
+                event
+                for event in store.recent_events("integration-run", "episode-0", 50)
+                if event.event_type == "module_result" and event.payload["module"] == "planning"
+            )
+            assert planning_event.payload["output"]["plan"]["strategic_goal"] == (
+                "Remove the visible threat"
+            )
         finally:
             await runtime.close()
 
@@ -169,10 +177,74 @@ def test_background_planner_is_timeout_bounded(tmp_path: Path) -> None:
         try:
             first = await runtime.tick(make_observation(step_id=0, game_loop=0))
             assert first.commands[0].name == "No_Operation"
+            assert first.planner_pending is True
             await asyncio.sleep(0.02)
             await runtime.tick(make_observation(step_id=1, game_loop=1))
             timeout = store.last_event("run-1", "episode-1", "planner_timeout")
             assert timeout is not None
+        finally:
+            await runtime.close()
+
+    asyncio.run(execute())
+
+
+def test_background_plan_ttl_starts_when_plan_is_accepted(tmp_path: Path) -> None:
+    config = make_config(
+        tmp_path,
+        variant="planner_only",
+        deterministic=False,
+        planning_interval_game_loops=1000,
+    )
+    store = EventStore(tmp_path / "events.sqlite3", tmp_path / "events.jsonl")
+    runtime = RuntimeEngine(config=config, store=store, provider=FakeProvider())
+
+    async def execute() -> None:
+        try:
+            first = await runtime.tick(make_observation(step_id=0, game_loop=0))
+            assert first.planner_pending is True
+            await asyncio.sleep(0.01)
+
+            second = await runtime.tick(make_observation(step_id=1, game_loop=100))
+
+            assert second.commands[0].source.value == "planner"
+            assert second.commands[0].created_game_loop == 100
+            assert second.planner_pending is False
+            plan = store.last_event("run-1", "episode-1", "plan_accepted")
+            assert plan is not None
+            assert plan.payload["source_step_id"] == 0
+            assert plan.payload["created_game_loop"] == 100
+            assert plan.payload["source_game_loop"] == 0
+            assert plan.payload["accepted_game_loop"] == 100
+            assert plan.payload["plan_age_game_loops"] == 100
+        finally:
+            await runtime.close()
+
+    asyncio.run(execute())
+
+
+def test_background_plan_rejects_a_target_that_disappeared_while_planning(
+    tmp_path: Path,
+) -> None:
+    config = make_config(
+        tmp_path,
+        variant="planner_only",
+        deterministic=False,
+        planning_interval_game_loops=1000,
+    )
+    store = EventStore(tmp_path / "events.sqlite3", tmp_path / "events.jsonl")
+    runtime = RuntimeEngine(config=config, store=store, provider=FakeProvider())
+
+    async def execute() -> None:
+        try:
+            await runtime.tick(make_observation(step_id=0, game_loop=0))
+            await asyncio.sleep(0.01)
+
+            batch = await runtime.tick(
+                make_observation(step_id=1, game_loop=100, include_enemy=False)
+            )
+
+            assert batch.commands[0].source.value == "fallback"
+            assert any("unit_exists" in reason for reason in batch.rejected_commands)
         finally:
             await runtime.close()
 

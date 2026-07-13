@@ -20,5 +20,7 @@ def build_runtime(config: ExperimentConfig, run_dir: Path) -> RuntimeEngine:
             model=config.provider.model,
             api_key_env=config.provider.api_key_env,
             timeout_seconds=config.provider.timeout_seconds,
+            max_tokens=config.provider.max_tokens,
+            enable_thinking=config.provider.enable_thinking,
         )
     return RuntimeEngine(config=config, store=store, provider=provider)

@@ -8,6 +8,7 @@ from typing import Any, Optional
 
 SUPPORTED_ARGUMENTS = frozenset({"minimap", "screen", "tag"})
 ALLIANCES = {1: "self", 2: "ally", 3: "neutral", 4: "enemy"}
+SC2_ALERT_NAMES = {6: "building_under_attack", 19: "unit_under_attack"}
 
 
 class TimeStepExtractor:
@@ -59,7 +60,7 @@ class TimeStepExtractor:
             "text_observation": "\n\n".join(
                 f"[{name}]\n{text_observations[name]}" for name in sorted(text_observations)
             ),
-            "alerts": [f"alert:{int(value)}" for value in _value(observation, "alerts", ())],
+            "alerts": [_alert_name(value) for value in _value(observation, "alerts", ())],
             "image_uri": None,
         }
 
@@ -192,3 +193,8 @@ def _scalar(value: Any) -> Any:
     except (TypeError, IndexError):
         pass
     return value
+
+
+def _alert_name(value: Any) -> str:
+    alert = int(value)
+    return SC2_ALERT_NAMES.get(alert, f"alert:{alert}")

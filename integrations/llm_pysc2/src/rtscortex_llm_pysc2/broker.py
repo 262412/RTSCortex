@@ -54,6 +54,12 @@ class SharedDecisionBroker:
         self._states: dict[int, _DecisionState] = {}
         self._command_queues: dict[tuple[str, str, str], deque[str]] = defaultdict(deque)
         self._active_commands: dict[tuple[str, str], tuple[str, str]] = {}
+        self._planner_pending = False
+
+    @property
+    def planner_pending(self) -> bool:
+        with self._condition:
+            return self._planner_pending
 
     def register(self, agent: Any) -> None:
         with self._condition:
@@ -170,6 +176,7 @@ class SharedDecisionBroker:
 
         with self._condition:
             state.decision = decision
+            self._planner_pending = bool(decision.action_batch.get("planner_pending", False))
             for route in decision.routes.values():
                 for command in route.commands:
                     key = (route.agent_name, command.team_name, command.name)
