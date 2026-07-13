@@ -1,0 +1,4 @@
+agent:
+  variant: planner_reflection_memory_reflex
+provider:
+  kind: fake

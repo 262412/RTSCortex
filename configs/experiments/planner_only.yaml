@@ -1,0 +1,4 @@
+agent:
+  variant: planner_only
+provider:
+  kind: fake
