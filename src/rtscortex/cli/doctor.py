@@ -28,14 +28,7 @@ def run_doctor(project_root: Path, *, require_sc2: bool = False) -> list[Check]:
         ),
         Check("uv", "ok" if shutil.which("uv") else "error", shutil.which("uv") or "missing"),
     ]
-    venv = project_root / ".venv"
-    checks.append(
-        Check(
-            "core_venv",
-            "ok" if venv.is_symlink() else "error",
-            str(venv.resolve()) if venv.exists() else "missing symlink",
-        )
-    )
+    checks.append(_core_venv_check(project_root / ".venv"))
     submodule = project_root / "third_party" / "LLM-PySC2"
     commit = _git_commit(submodule)
     checks.append(
@@ -56,6 +49,21 @@ def run_doctor(project_root: Path, *, require_sc2: bool = False) -> list[Check]:
         )
     )
     return checks
+
+
+def _core_venv_check(venv: Path) -> Check:
+    python = venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    valid = (venv / "pyvenv.cfg").is_file() and python.is_file()
+    if valid:
+        layout = "symlink" if venv.is_symlink() else "directory"
+        detail = f"{venv.resolve()} ({layout})"
+    else:
+        detail = (
+            f"{venv.resolve()} (invalid virtual environment)"
+            if venv.exists()
+            else "missing virtual environment"
+        )
+    return Check("core_venv", "ok" if valid else "error", detail)
 
 
 def _git_commit(path: Path) -> str | None:
