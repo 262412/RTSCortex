@@ -56,6 +56,52 @@ def test_timestep_extractor_produces_json_safe_five_part_snapshot() -> None:
     assert "Unsupported" not in {action.name for action in envelope.available_actions}
 
 
+@pytest.mark.parametrize(
+    ("build_progress", "order_length", "expected_status"),
+    [
+        (0.5, 0, "constructing"),
+        (50, 1, "constructing"),
+        (1.0, 0, "idle"),
+        (100, 1, "active"),
+    ],
+)
+def test_timestep_extractor_marks_incomplete_structures_as_constructing(
+    build_progress: float,
+    order_length: int,
+    expected_status: str,
+) -> None:
+    timestep = _fake_timestep()
+    nexus = timestep.observation.raw_units[1]
+    nexus.build_progress = build_progress
+    nexus.order_length = order_length
+    agent = FakeAgent("CombatGroup7", "Adept-1", timestep, StubBroker())
+
+    snapshot = TimeStepExtractor(
+        "run-worker",
+        "episode-worker",
+        unit_names={59: "Nexus"},
+        building_types=(59,),
+    ).extract(timestep, {"CombatGroup7": agent}, {"CombatGroup7": ""}, step_id=3)
+
+    nexus_snapshot = next(unit for unit in snapshot["units"] if unit["unit_type"] == "Nexus")
+    assert nexus_snapshot["status"] == expected_status
+
+
+def test_timestep_extractor_keeps_missing_build_progress_idle() -> None:
+    timestep = _fake_timestep()
+    agent = FakeAgent("CombatGroup7", "Adept-1", timestep, StubBroker())
+
+    snapshot = TimeStepExtractor(
+        "run-worker",
+        "episode-worker",
+        unit_names={59: "Nexus"},
+        building_types=(59,),
+    ).extract(timestep, {"CombatGroup7": agent}, {"CombatGroup7": ""}, step_id=3)
+
+    nexus_snapshot = next(unit for unit in snapshot["units"] if unit["unit_type"] == "Nexus")
+    assert nexus_snapshot["status"] == "idle"
+
+
 def test_shared_broker_calls_runtime_once_and_distributes_to_all_agents() -> None:
     runtime = FakeRuntime()
     broker = SharedDecisionBroker(
@@ -164,6 +210,7 @@ def test_worker_settings_prefer_canonical_runtime_environment(
     monkeypatch.setenv("RTSCORTEX_SIMULATION_SPEED_MULTIPLIER", "0.25")
     monkeypatch.setenv("RTSCORTEX_PAUSE_UNTIL_FIRST_PLAN", "true")
     monkeypatch.setenv("RTSCORTEX_RUNTIME_REQUEST_TIMEOUT_SECONDS", "50")
+    monkeypatch.setenv("RTSCORTEX_ACTION_EFFECT_TIMEOUT_GAME_LOOPS", "96")
 
     settings = WorkerSettings.from_environment()
 
@@ -174,6 +221,7 @@ def test_worker_settings_prefer_canonical_runtime_environment(
     assert settings.simulation_speed_multiplier == 0.25
     assert settings.pause_until_first_plan is True
     assert settings.runtime_request_timeout_seconds == 50.0
+    assert settings.action_effect_timeout_game_loops == 96
 
 
 def test_shared_broker_exposes_pending_planner_state() -> None:
@@ -266,6 +314,9 @@ def test_timestep_extractor_adds_valid_pylon_screen_candidates() -> None:
         power=UniformGrid(0),
     )
     agent = FakeAgent("Builder", "Builder-Probe-1", timestep, StubBroker())
+    agent.config.AGENTS["Builder"]["action"][311].append(
+        {"name": "Build_Pylon_Screen", "arg": ["screen"], "func": [(12, None, ())]}
+    )
 
     snapshot = TimeStepExtractor("run-worker", "episode-worker").extract(
         timestep,
@@ -277,6 +328,50 @@ def test_timestep_extractor_adds_valid_pylon_screen_candidates() -> None:
     assert "Build_Pylon_Screen candidates:" in snapshot["text_observation"]
     assert "[65, 65]" in snapshot["text_observation"]
     assert "Build_Gateway_Screen candidates:" not in snapshot["text_observation"]
+
+
+def test_timestep_extractor_hides_candidates_for_unavailable_build_actions() -> None:
+    timestep = _fake_timestep()
+    timestep.observation.feature_screen = SimpleNamespace(
+        buildable=UniformGrid(1),
+        pathable=UniformGrid(1),
+        player_relative=UniformGrid(0),
+        power=UniformGrid(1),
+    )
+    agent = FakeAgent("Builder", "Builder-Probe-1", timestep, StubBroker())
+
+    snapshot = TimeStepExtractor("run-worker", "episode-worker").extract(
+        timestep,
+        {"Builder": agent},
+        {"Builder": "builder observation"},
+        step_id=1,
+    )
+
+    assert "[RTSCortex Build Candidates]" not in snapshot["text_observation"]
+
+
+def test_build_candidates_skip_occupied_full_footprints() -> None:
+    player_relative = [[0 for _ in range(128)] for _ in range(128)]
+    player_relative[65][65] = 1
+    observation = SimpleNamespace(
+        feature_units=[
+            SimpleNamespace(x=55, y=65, is_on_screen=True, unit_type=84),
+            SimpleNamespace(x=65, y=55, is_on_screen=True, unit_type=59),
+        ],
+        feature_screen=SimpleNamespace(
+            buildable=UniformGrid(1),
+            pathable=UniformGrid(1),
+            player_relative=Grid(player_relative),
+            power=UniformGrid(0),
+        ),
+    )
+
+    candidates = build_screen_candidates(observation, "Build_Pylon_Screen")
+
+    assert [65, 65] not in candidates  # SELF layer at the preferred center.
+    assert [55, 65] not in candidates  # Explicit Probe position.
+    assert [65, 55] not in candidates  # Explicit structure position.
+    assert candidates[0] == [65, 75]
 
 
 def test_worker_refreshes_volatile_build_position_at_execution_time() -> None:
@@ -300,34 +395,83 @@ def test_worker_refreshes_volatile_build_position_at_execution_time() -> None:
     assert action["func"][0][2] == ("now", [65, 65])
 
 
-def test_build_candidates_require_pysc2_and_upstream_coordinate_orders() -> None:
+def test_build_candidates_use_pysc2_row_major_coordinates() -> None:
     buildable = [[0 for _ in range(128)] for _ in range(128)]
     pathable = [[0 for _ in range(128)] for _ in range(128)]
-    player_relative = [[2 for _ in range(128)] for _ in range(128)]
-    power = [[0 for _ in range(128)] for _ in range(128)]
-    for row in (62, 67):
-        for column in (67, 72):
+    player_relative = [[0 for _ in range(128)] for _ in range(128)]
+    for row in range(64, 76):
+        for column in range(59, 71):
             buildable[row][column] = 1
             pathable[row][column] = 1
-            player_relative[row][column] = 0
     observation = SimpleNamespace(
         feature_screen=SimpleNamespace(
             buildable=Grid(buildable),
             pathable=Grid(pathable),
             player_relative=Grid(player_relative),
-            power=Grid(power),
+            power=UniformGrid(0),
         )
     )
 
-    assert build_screen_candidates(observation, "Build_Pylon_Screen") == []
+    assert [65, 70] in build_screen_candidates(observation, "Build_Pylon_Screen")
 
-    for row in (67, 72):
-        for column in (62, 67):
+    transposed_buildable = [[0 for _ in range(128)] for _ in range(128)]
+    transposed_pathable = [[0 for _ in range(128)] for _ in range(128)]
+    for row in range(59, 71):
+        for column in range(64, 76):
+            transposed_buildable[row][column] = 1
+            transposed_pathable[row][column] = 1
+    transposed_observation = SimpleNamespace(
+        feature_screen=SimpleNamespace(
+            buildable=Grid(transposed_buildable),
+            pathable=Grid(transposed_pathable),
+            player_relative=Grid(player_relative),
+            power=UniformGrid(0),
+        )
+    )
+
+    transposed_candidates = build_screen_candidates(
+        transposed_observation,
+        "Build_Pylon_Screen",
+    )
+    assert [65, 70] not in transposed_candidates
+    assert [70, 65] in transposed_candidates
+
+
+def test_gateway_candidates_use_row_major_power_plane() -> None:
+    buildable = [[0 for _ in range(128)] for _ in range(128)]
+    pathable = [[0 for _ in range(128)] for _ in range(128)]
+    for row in range(82, 99):
+        for column in range(57, 74):
             buildable[row][column] = 1
             pathable[row][column] = 1
-            player_relative[row][column] = 0
+    row_major_power = [[0 for _ in range(128)] for _ in range(128)]
+    row_major_power[90][65] = 1
+    row_major_observation = SimpleNamespace(
+        feature_screen=SimpleNamespace(
+            buildable=Grid(buildable),
+            pathable=Grid(pathable),
+            player_relative=UniformGrid(0),
+            power=Grid(row_major_power),
+        )
+    )
 
-    assert [65, 70] in build_screen_candidates(observation, "Build_Pylon_Screen")
+    assert [65, 90] in build_screen_candidates(
+        row_major_observation,
+        "Build_Gateway_Screen",
+    )
+
+    transposed_power = [[0 for _ in range(128)] for _ in range(128)]
+    transposed_power[65][90] = 1
+    transposed_observation = SimpleNamespace(
+        feature_screen=SimpleNamespace(
+            buildable=Grid(buildable),
+            pathable=Grid(pathable),
+            player_relative=UniformGrid(0),
+            power=Grid(transposed_power),
+        )
+    )
+
+    assert build_screen_candidates(transposed_observation, "Build_Gateway_Screen") == []
 
 
 def test_timestep_extractor_exposes_developer_empty_team_actions() -> None:
@@ -431,6 +575,37 @@ def test_broker_recovers_empty_team_when_upstream_leaves_a_stale_team_name() -> 
 
     assert dispatch is not None
     assert dispatch.command_id == "command-train"
+
+
+def test_broker_forwards_raw_observations_for_deferred_effect_verification() -> None:
+    coordinator = EffectRecordingCoordinator()
+    broker = SharedDecisionBroker(
+        cast(Any, coordinator),
+        TimeStepExtractor("run-worker", "episode-worker"),
+    )
+    broker._command_queues[("Builder", "Builder-Probe-1", "Build_Pylon_Screen")].append(  # noqa: SLF001
+        "command-pylon"
+    )
+    dispatch = broker.claim_primitive(
+        "Builder",
+        "Builder-Probe-1",
+        "Build_Pylon_Screen",
+        "Build_Pylon_screen",
+        final_primitive=True,
+    )
+    assert dispatch is not None
+    observation = SimpleNamespace(game_loop=[225])
+
+    broker.prepare_effect(dispatch, observation, builder_tag=0xABC)
+    broker.settle_primitive(dispatch, success=True, game_loop=225)
+    broker.observe_effects(observation)
+
+    assert coordinator.calls == [
+        ("prepare", "command-pylon", observation, 0xABC),
+        ("primitive", "command-pylon", "Build_Pylon_screen", True),
+        ("complete", "command-pylon", 225),
+        ("observe", observation),
+    ]
 
 
 def test_worker_selects_2s3z_config_and_adds_no_operation(
@@ -704,6 +879,43 @@ class BlockingRuntime(FakeRuntime):
         self.entered.set()
         assert self.release.wait(timeout=1)
         return super().tick(observation)
+
+
+class EffectRecordingCoordinator:
+    def __init__(self) -> None:
+        self.calls: list[tuple[Any, ...]] = []
+
+    def prepare_effect(
+        self,
+        command_id: str,
+        observation: Any,
+        *,
+        builder_tag: int | None,
+    ) -> None:
+        self.calls.append(("prepare", command_id, observation, builder_tag))
+
+    def record_primitive(
+        self,
+        command_id: str,
+        function_name: str,
+        *,
+        success: bool,
+        failure_reason: str | None = None,
+    ) -> None:
+        del failure_reason
+        self.calls.append(("primitive", command_id, function_name, success))
+
+    def complete_command(
+        self,
+        command_id: str,
+        *,
+        game_loop: int | None = None,
+    ) -> None:
+        self.calls.append(("complete", command_id, game_loop))
+
+    def observe_effects(self, observation: Any) -> list[dict[str, Any]]:
+        self.calls.append(("observe", observation))
+        return []
 
 
 class UniformGrid:

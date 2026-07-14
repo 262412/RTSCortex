@@ -59,11 +59,27 @@ class ExecutionTracker:
             )
         )
 
-    def complete(self, command_id: str, *, game_result: Optional[str] = None) -> dict[str, Any]:
+    def complete(
+        self,
+        command_id: str,
+        *,
+        game_result: Optional[str] = None,
+        failure_reason: Optional[str] = None,
+    ) -> dict[str, Any]:
         tracked = self._pending.pop(command_id, None)
         if tracked is None:
             raise KeyError(f"unknown command {command_id!r}")
-        return self._report(tracked, game_result=game_result)
+        return self._report(
+            tracked,
+            game_result=game_result,
+            terminal_failure_reason=failure_reason,
+        )
+
+    def primitives_succeeded(self, command_id: str) -> bool:
+        """Return whether at least one primitive exists and all were accepted."""
+
+        primitives = self._get(command_id).primitives
+        return bool(primitives) and all(item.success for item in primitives)
 
     def drain_pending(
         self,

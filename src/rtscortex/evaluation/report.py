@@ -348,6 +348,7 @@ def _render_module_result(event: StoredEvent) -> list[str]:
         lines.append("  - Structured output not recorded (legacy event).")
     elif output is not None:
         lines.extend(_render_module_output(event, module, output))
+        lines.extend(_render_context_compaction(event, output))
     return lines
 
 
@@ -383,6 +384,40 @@ def _render_module_output(event: StoredEvent, module: str, output: object) -> li
             )
         return lines
     return []
+
+
+def _render_context_compaction(event: StoredEvent, output: object) -> list[str]:
+    if not isinstance(output, dict):
+        return []
+    statistics = output.get("context_compaction")
+    if statistics is None:
+        return []
+    if not isinstance(statistics, dict):
+        raise ReportError(f"Invalid context compaction output at event {event.event_id}")
+
+    budget = statistics.get("budget_chars", "unknown")
+    original = statistics.get("original_chars", "unknown")
+    final = statistics.get("final_chars", "unknown")
+    compacted = "yes" if statistics.get("compacted") is True else "no"
+    lines = [
+        f"  - Context budget: {_code(budget)} chars; {_code(original)} → "
+        f"{_code(final)} chars; compacted: {_code(compacted)}."
+    ]
+    reductions = []
+    for field, label in (
+        ("aggregated_own_units", "own units"),
+        ("aggregated_own_structures", "own structures"),
+        ("aggregated_visible_enemies", "visible enemies"),
+        ("dropped_recent_events", "recent events"),
+        ("dropped_lessons", "lessons"),
+        ("dropped_episode_summaries", "episode summaries"),
+        ("dropped_spatial_lines", "spatial lines"),
+    ):
+        if field in statistics:
+            reductions.append(f"{label} {_code(statistics[field])}")
+    if reductions:
+        lines.append(f"  - Context reductions: {'; '.join(reductions)}.")
+    return lines
 
 
 def _describe_units(units: list[UnitState]) -> str:

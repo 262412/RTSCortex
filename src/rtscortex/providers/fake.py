@@ -32,7 +32,7 @@ class FakeProvider:
                 summary="Previous action succeeded." if success else "Previous action failed.",
                 lessons=[] if success else ["Revalidate action availability before execution."],
             )
-        elif response_type is PlanningOutput:
+        elif issubclass(response_type, PlanningOutput):
             observation = payload["observation"]
             available = {item["name"]: item for item in observation["available_actions"]}
             enemies = observation["state"]["visible_enemies"]

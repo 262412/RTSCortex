@@ -5,7 +5,14 @@ import json
 from pathlib import Path
 
 from rtscortex.agents import ActionProposal, PlanningOutput
-from rtscortex.contracts import AvailableAction, EpisodeOutcome, EpisodeResult, ExecutionReport
+from rtscortex.contracts import (
+    ActionArgumentType,
+    AvailableAction,
+    EconomyState,
+    EpisodeOutcome,
+    EpisodeResult,
+    ExecutionReport,
+)
 from rtscortex.contracts.interfaces import ResponseT
 from rtscortex.evaluation import run_mock_episode
 from rtscortex.memory import EventStore
@@ -96,6 +103,36 @@ class ChangingPlanProvider:
         return response_type.model_validate(output.model_dump())
 
 
+class InvalidAttackBeforeBuildProvider:
+    async def generate(
+        self,
+        response_type: type[ResponseT],
+        *,
+        system_prompt: str,
+        user_prompt: str,
+    ) -> ResponseT:
+        del system_prompt, user_prompt
+        output = PlanningOutput(
+            strategic_goal="Build the first Pylon",
+            steps=["Build a Pylon at a validated candidate"],
+            proposed_actions=[
+                ActionProposal(
+                    actor="Builder/Builder-Probe-1",
+                    name="Attack_Unit",
+                    arguments=["0xdead"],
+                    priority=89,
+                ),
+                ActionProposal(
+                    actor="Builder/Builder-Probe-1",
+                    name="Build_Pylon_Screen",
+                    arguments=[[60, 40]],
+                    priority=50,
+                ),
+            ],
+        )
+        return response_type.model_validate(output.model_dump())
+
+
 def test_mock_episode_runs_full_module_chain(tmp_path: Path) -> None:
     config = make_config(tmp_path)
     store = EventStore(tmp_path / "events.sqlite3", tmp_path / "events.jsonl")
@@ -133,6 +170,9 @@ def test_mock_episode_runs_full_module_chain(tmp_path: Path) -> None:
             assert planning_event.payload["output"]["plan"]["strategic_goal"] == (
                 "Remove the visible threat"
             )
+            context_stats = planning_event.payload["output"]["context_compaction"]
+            assert context_stats["final_chars"] <= context_stats["budget_chars"]
+            assert context_stats["original_chars"] > 0
         finally:
             await runtime.close()
 
@@ -205,6 +245,63 @@ def test_first_plan_barrier_waits_for_initial_background_plan(tmp_path: Path) ->
             assert batch.planner_pending is False
             assert batch.strategic_goal == "Remove the visible threat"
             assert batch.commands[0].source.value == "planner"
+        finally:
+            await runtime.close()
+
+    asyncio.run(execute())
+
+
+def test_invalid_candidate_cannot_block_valid_action_for_same_actor(tmp_path: Path) -> None:
+    config = make_config(tmp_path, variant="planner_only")
+    store = EventStore(tmp_path / "events.sqlite3", tmp_path / "events.jsonl")
+    runtime = RuntimeEngine(
+        config=config,
+        store=store,
+        provider=InvalidAttackBeforeBuildProvider(),
+    )
+    actor = "Builder/Builder-Probe-1"
+    base_observation = make_observation(include_enemy=False)
+    observation = base_observation.model_copy(
+        update={
+            "state": base_observation.state.model_copy(
+                update={
+                    "economy": EconomyState(
+                        minerals=50,
+                        supply_used=11,
+                        supply_cap=15,
+                    )
+                }
+            ),
+            "available_actions": [
+                AvailableAction(
+                    name="Attack_Unit",
+                    argument_names=["tag"],
+                    argument_types=[ActionArgumentType.TAG],
+                    actor_scopes=[actor],
+                ),
+                AvailableAction(
+                    name="Build_Pylon_Screen",
+                    argument_names=["screen"],
+                    argument_types=[ActionArgumentType.POSITION],
+                    actor_scopes=[actor],
+                ),
+                AvailableAction(
+                    name="No_Operation",
+                    actor_scopes=[actor],
+                ),
+            ],
+        }
+    )
+
+    async def execute() -> None:
+        try:
+            batch = await runtime.tick(observation)
+
+            assert [command.name for command in batch.commands] == ["Build_Pylon_Screen"]
+            assert batch.commands[0].arguments == [[60, 40]]
+            assert batch.rejected_commands == [
+                "run-1:episode-1:0:planner:0: precondition 'unit_exists' is not satisfied"
+            ]
         finally:
             await runtime.close()
 

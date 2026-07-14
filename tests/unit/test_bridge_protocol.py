@@ -111,12 +111,70 @@ def test_coordinator_calls_runtime_once_and_reports_execution() -> None:
     report = coordinator.complete_command("command-dark-attack")
 
     assert runtime.tick_calls == 1
+    assert report is not None
     assert decision.observation == load_fixture("observation_envelope.json")
     assert (
         decision.action_text("CombatGroup7") == load_fixture("routed_actions.json")["action_text"]
     )
     assert report["success"] is False
     assert runtime.execution_reports == [report]
+
+
+def test_coordinator_defers_build_report_until_raw_state_confirms_effect() -> None:
+    snapshot = _build_snapshot()
+    runtime = FakeRuntime(_build_batch())
+    coordinator = BridgeCoordinator(runtime)
+
+    coordinator.decide(snapshot, {"Builder": ["Builder-Probe-1"]})
+    coordinator.prepare_effect(
+        "command-pylon",
+        _raw_effect_observation(game_loop=224, minerals=250),
+        builder_tag=0xABC,
+    )
+    coordinator.record_primitive(
+        "command-pylon", "Build_Pylon_screen", success=True, latency_ms=4.0
+    )
+
+    report = coordinator.complete_command("command-pylon", game_loop=225)
+
+    assert report is None
+    assert runtime.execution_reports == []
+
+    reports = coordinator.observe_effects(
+        _raw_effect_observation(
+            game_loop=246,
+            minerals=150,
+            structures=["Nexus", "Pylon"],
+        )
+    )
+
+    assert len(reports) == 1
+    assert reports[0]["success"] is True
+    assert reports[0]["pysc2_function"] == "Build_Pylon_screen"
+    assert runtime.execution_reports == reports
+    assert coordinator.observe_effects(_raw_effect_observation(game_loop=268, minerals=175)) == []
+
+
+def test_coordinator_reports_deferred_build_once_at_episode_end() -> None:
+    runtime = FakeRuntime(_build_batch())
+    coordinator = BridgeCoordinator(runtime)
+    coordinator.decide(_build_snapshot(), {"Builder": ["Builder-Probe-1"]})
+    coordinator.prepare_effect(
+        "command-pylon",
+        _raw_effect_observation(game_loop=224, minerals=250),
+        builder_tag=0xABC,
+    )
+    coordinator.record_primitive("command-pylon", "Build_Pylon_screen", success=True)
+    assert coordinator.complete_command("command-pylon", game_loop=225) is None
+
+    coordinator.end_episode({"outcome": "draw"})
+
+    assert len(runtime.execution_reports) == 1
+    assert runtime.execution_reports[0]["command_id"] == "command-pylon"
+    assert runtime.execution_reports[0]["success"] is False
+    assert runtime.execution_reports[0]["failure_reason"].startswith(
+        "episode ended before gameplay effect was confirmed"
+    )
 
 
 def test_coordinator_does_not_redispatch_a_cached_command_id() -> None:
@@ -156,6 +214,86 @@ def _fixture_route() -> RoutedActionBatch:
         team_order=TEAM_ORDER,
         available_actions=observation["available_actions"],
     )
+
+
+def _build_snapshot() -> dict[str, Any]:
+    snapshot = load_fixture("observation_snapshot.json")
+    snapshot["teams"] = [
+        {
+            "agent_name": "Builder",
+            "team_name": "Builder-Probe-1",
+            "available_actions": [
+                {
+                    "name": "Build_Pylon_Screen",
+                    "argument_names": ["screen"],
+                    "argument_types": ["position"],
+                }
+            ],
+        }
+    ]
+    return snapshot
+
+
+def _build_batch() -> dict[str, Any]:
+    return {
+        "protocol_version": "1.0",
+        "run_id": "run-fixture",
+        "episode_id": "episode-pvz-task1",
+        "step_id": 7,
+        "decision_id": "decision-build",
+        "strategic_goal": "Build supply",
+        "summary": "Build one Pylon",
+        "planner_pending": False,
+        "commands": [
+            {
+                "command_id": "command-pylon",
+                "actor": "Builder/Builder-Probe-1",
+                "name": "Build_Pylon_Screen",
+                "arguments": [[65, 65]],
+                "priority": 50,
+                "ttl_game_loops": 32,
+                "created_game_loop": 224,
+                "source": "planner",
+                "preconditions": {},
+            }
+        ],
+        "rejected_commands": [],
+    }
+
+
+def _raw_effect_observation(
+    *,
+    game_loop: int,
+    minerals: int,
+    structures: list[str] | None = None,
+) -> dict[str, Any]:
+    raw_units = [
+        {
+            "tag": 0xABC,
+            "unit_type": "Probe",
+            "alliance": 1,
+            "order_length": 1,
+            "order_id_0": 295,
+            "is_selected": True,
+            "build_progress": 100,
+        }
+    ]
+    raw_units.extend(
+        {
+            "tag": index + 1,
+            "unit_type": name,
+            "alliance": 1,
+            "order_length": 0,
+            "is_selected": False,
+            "build_progress": 50 if name == "Pylon" else 100,
+        }
+        for index, name in enumerate(structures or ["Nexus"])
+    )
+    return {
+        "game_loop": [game_loop],
+        "player_common": {"minerals": minerals},
+        "raw_units": raw_units,
+    }
 
 
 class FakeRuntime:

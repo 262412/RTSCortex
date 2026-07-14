@@ -15,6 +15,7 @@ import httpx
 from rtscortex.config import ExperimentConfig
 from rtscortex.runtime.live import (
     LiveEnvironmentError,
+    build_feature_plane_patch_is_applied,
     live_scenario_spec,
     random_seed_patch_is_applied,
     sc2_build,
@@ -172,6 +173,8 @@ def _worker_patch_check(project_root: Path, *, required: bool) -> Check:
         missing.append("0001-return-noop-while-awaiting-runtime.patch")
     if not random_seed_patch_is_applied(project_root):
         missing.append("0002-pass-random-seed-to-sc2env.patch")
+    if not build_feature_plane_patch_is_applied(project_root):
+        missing.append("0003-fix-build-feature-plane-coordinate-order.patch")
     status = "ok" if not missing else ("error" if required else "optional")
     detail = "all worker patches applied" if not missing else "apply " + ", ".join(missing)
     return Check("worker_patch", status, detail)

@@ -75,8 +75,7 @@ class SharedDecisionBroker:
         timeout = self.decision_timeout_seconds if timeout_seconds is None else timeout_seconds
         with self._condition:
             ready = self._condition.wait_for(
-                lambda: self._initial_decision_complete
-                or self._initial_decision_error is not None,
+                lambda: self._initial_decision_complete or self._initial_decision_error is not None,
                 timeout=timeout,
             )
             if not ready:
@@ -193,6 +192,7 @@ class SharedDecisionBroker:
         *,
         success: bool,
         failure_reason: Optional[str] = None,
+        game_loop: Optional[int] = None,
     ) -> None:
         self.coordinator.record_primitive(
             dispatch.command_id,
@@ -201,10 +201,26 @@ class SharedDecisionBroker:
             failure_reason=failure_reason,
         )
         if dispatch.final_primitive:
-            self.coordinator.complete_command(dispatch.command_id)
+            self.coordinator.complete_command(dispatch.command_id, game_loop=game_loop)
             for actor, value in list(self._active_commands.items()):
                 if value[1] == dispatch.command_id:
                     del self._active_commands[actor]
+
+    def prepare_effect(
+        self,
+        dispatch: PrimitiveDispatch,
+        observation: Any,
+        *,
+        builder_tag: Optional[int],
+    ) -> None:
+        self.coordinator.prepare_effect(
+            dispatch.command_id,
+            observation,
+            builder_tag=builder_tag,
+        )
+
+    def observe_effects(self, observation: Any) -> None:
+        self.coordinator.observe_effects(observation)
 
     def end_episode(self, result: dict[str, Any]) -> None:
         self.coordinator.end_episode(result)

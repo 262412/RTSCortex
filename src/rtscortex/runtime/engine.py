@@ -10,7 +10,13 @@ import time
 from dataclasses import asdict, dataclass
 from typing import Any
 
-from rtscortex.agents import ActionModule, MemoryModule, PlanningModule, ReflectionModule
+from rtscortex.agents import (
+    ActionModule,
+    ContextBudget,
+    MemoryModule,
+    PlanningModule,
+    ReflectionModule,
+)
 from rtscortex.config import ExperimentConfig
 from rtscortex.contracts import (
     ActionBatch,
@@ -49,9 +55,10 @@ class RuntimeEngine:
         self.config = config
         self.store = store
         self.provider = provider
-        self.memory_module = MemoryModule(store, config.memory.short_term_window)
-        self.reflection_module = ReflectionModule(provider)
-        self.planning_module = PlanningModule(provider)
+        context_budget = ContextBudget(**config.context.model_dump())
+        self.memory_module = MemoryModule(store, config.memory.short_term_window, context_budget)
+        self.reflection_module = ReflectionModule(provider, context_budget)
+        self.planning_module = PlanningModule(provider, context_budget)
         self.action_module = ActionModule(config.runtime.max_actions)
         reflex_enabled = config.reflex.enabled and config.agent.variant in {
             "reflex_only",
@@ -104,10 +111,7 @@ class RuntimeEngine:
             self._last_plan_game_loop = observation.game_loop
             if self.config.runtime.deterministic:
                 await self._run_deterministic_planner(context)
-            elif (
-                self.config.environment.pause_until_first_plan
-                and self._cached_plan is None
-            ):
+            elif self.config.environment.pause_until_first_plan and self._cached_plan is None:
                 await self._run_initial_plan_barrier(context)
             elif self._planner_task is None:
                 self._planner_task = asyncio.create_task(self._deliberate_with_timeout(context))
@@ -117,9 +121,21 @@ class RuntimeEngine:
         reflex_latency_ms = (time.perf_counter() - reflex_started) * 1000
 
         planner_commands = [] if self._cached_plan is None else self._cached_plan.commands
+        candidate_outcome = self.validator.validate_candidates(
+            [*planner_commands, *reflex_commands],
+            observation,
+        )
         arbitration = self.arbiter.arbitrate(
-            planner_commands,
-            reflex_commands,
+            [
+                command
+                for command in candidate_outcome.accepted
+                if command.source is ActionSource.PLANNER
+            ],
+            [
+                command
+                for command in candidate_outcome.accepted
+                if command.source is ActionSource.REFLEX
+            ],
             game_loop=observation.game_loop,
         )
         merged = arbitration.selected
@@ -129,7 +145,7 @@ class RuntimeEngine:
                 merged = [fallback]
         outcome = self.validator.validate(merged, observation)
         accepted_commands = outcome.accepted
-        rejected_commands = outcome.rejected
+        rejected_commands = [*candidate_outcome.rejected, *outcome.rejected]
         if not accepted_commands:
             fallback = self._fallback(observation)
             if fallback is not None:

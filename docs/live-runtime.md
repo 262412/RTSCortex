@@ -19,8 +19,9 @@ Before a live run, provide all of the following:
     92440 (5.0.13) or newer;
   - `2s3z`: `Maps/llm_smac/2s3z.SC2Map`, compatible with the official Linux
     SC2 4.10/Base75689 package, retained as a legacy task map;
-- both reviewed patches from `integrations/llm_pysc2/patches` applied to the pinned
-  LLM-PySC2 checkout (asynchronous waiting and deterministic SC2 seeding).
+- all three reviewed patches from `integrations/llm_pysc2/patches` applied to the pinned
+  LLM-PySC2 checkout (asynchronous waiting, deterministic SC2 seeding, and row-major
+  build-coordinate validation).
 
 The runtime never downloads StarCraft II or applies upstream patches automatically. Keep
 the pinned submodule clean between live runs. To apply the reviewed patches explicitly
@@ -31,6 +32,8 @@ git -C third_party/LLM-PySC2 apply \
   ../../integrations/llm_pysc2/patches/0001-return-noop-while-awaiting-runtime.patch
 git -C third_party/LLM-PySC2 apply \
   ../../integrations/llm_pysc2/patches/0002-pass-random-seed-to-sc2env.patch
+git -C third_party/LLM-PySC2 apply \
+  ../../integrations/llm_pysc2/patches/0003-fix-build-feature-plane-coordinate-order.patch
 ```
 
 After the live session, use the reverse commands documented in
@@ -78,11 +81,11 @@ SC2PATH=~/scratch/StarCraftII \
 
 That configuration targets `http://127.0.0.1:8000/v1`, requires the served model ID
 `Qwen/Qwen3-8B`, disables Qwen thinking, limits each structured completion to 256 tokens,
-and uses a 112-game-loop planning cadence. `doctor --config` checks the endpoint and exact
-model ID before starting SC2. Because the address is loopback-only, the runtime must run
-on the same node as vLLM. Set `RTSCORTEX_LLM_API_KEY` only when the selected
-OpenAI-compatible endpoint requires authentication. This smoke is capped at 1024 game
-loops and 1120 agent steps.
+caps the combined system and user prompt at 9,000 characters, and uses a 112-game-loop
+planning cadence. `doctor --config` checks the endpoint and exact model ID before starting
+SC2. Because the address is loopback-only, the runtime must run on the same node as vLLM.
+Set `RTSCORTEX_LLM_API_KEY` only when the selected OpenAI-compatible endpoint requires
+authentication. This smoke is capped at 1024 game loops and 1120 agent steps.
 
 ### Simulation and planning timing
 
@@ -104,27 +107,56 @@ cap before either player wins, the current worker reports a zero-reward `draw`; 
 bounded result must not be interpreted as a completed match. Live execution always
 passes `--save_replay=false`.
 
+### Model context budget and command economy
+
+Model context is rebuilt from typed state on every reflection or planning call; it is not
+an ever-growing transcript. The structural compactor retains current economy, production,
+alerts, available actions, the active plan, the latest execution, reusable lessons, and
+actionable spatial coordinates. It groups large own-unit, structure, and visible-enemy
+lists by type, coalesces repeated events, and then removes the oldest bounded history until
+the complete system-plus-user prompt fits `context.max_prompt_chars`. If the mandatory
+current state cannot fit, the call fails explicitly instead of sending an oversized or
+truncated JSON prompt.
+
+The Qwen configuration uses a 9,000-character prompt ceiling, at most eight recent events,
+six lessons, and one episode summary. This is a conservative envelope for the current
+structured English/JSON prompts served through the 4,096-token Qwen endpoint, with a
+separate 256-token completion limit. The timeline records the configured budget, original
+and final character counts, and every dropped or aggregated category for each model call.
+
+Planning asks for at most two short plan steps and three typed actions. The model must emit
+only actions needed in the current decision cycle, with one action per actor, and must not
+repeat a successful action or an active-plan command that remains valid. Full observations
+remain in `events.jsonl`, so reducing model input does not reduce experiment traceability.
+
 ### Build position handling
 
 The bridge derives `Build_Pylon_Screen` and `Build_Gateway_Screen` candidates from the
 current feature-screen buildability, pathing, ownership, and power layers. Candidates
-must satisfy both PySC2's row-major feature planes and LLM-PySC2's transposed coordinate
-validator. Compact candidate lines are included in the model's spatial context.
-Immediately before the upstream translator executes a build action, the worker derives
-candidates again from the latest observation and refreshes the screen coordinate. The
-coordinate in an older plan is therefore not replayed blindly after camera or map state
-changes.
+must have a complete build footprint that is buildable, pathable, and empty
+(`player_relative == 0`) in PySC2's row-major feature planes. The reviewed upstream
+coordinate patch makes LLM-PySC2 validate the same planes as `[y][x]`. On-screen
+feature-unit positions are also excluded,
+so a Probe or an existing structure cannot occupy a candidate footprint. Compact candidate
+lines are included in the model's spatial context. Immediately before the upstream
+translator executes a build action, the worker derives candidates again from the latest
+observation and refreshes the screen coordinate. The coordinate in an older plan is
+therefore not replayed blindly after camera, units, or map state changes.
 
-An empty next-step `action_result` currently proves that SC2 accepted the feature action,
-not that the requested structure appeared in game state. The 1024-loop Qwen smoke can
-submit `Build_Pylon_screen` without a Pylon appearing in later observations. State-based
-effect confirmation is therefore still an open bridge requirement; execution success
-must not yet be read as construction success.
+Build execution now uses two-phase confirmation. First, the next SC2 observation must show
+that PySC2 accepted the primitive. The `ActionEffectVerifier` then defers the final
+`ExecutionReport` while it checks raw observations for the target structure count and
+build progress, mineral spending, and the selected Builder's tag, status, and ability
+orders. A newly visible target structure confirms the action; mineral spending together
+with the expected build ability on that Builder also confirms it before the structure is
+visible. If neither condition appears within
+`environment.action_effect_timeout_game_loops` (112 loops in the Qwen configuration), the
+command is reported as failed rather than as a false success.
 
-The model-facing context keeps the typed observation, alerts, available actions, and
-compact decision/execution memory while omitting the verbose raw observation text. The
-complete observation is still retained in `events.jsonl`; this keeps the live Qwen
-request below its 4096-token context limit without reducing run traceability.
+The failure reason includes before/after structure count and progress, minerals, Builder
+selection, status, and order IDs. Those diagnostics make it possible to distinguish a
+missing or lost worker selection, an order changed by worker management, and a
+feature-action placement that was accepted by the API but produced no construction.
 
 Asynchronous plans record their source loop, acceptance loop, and age. Their TTL begins
 at acceptance, while `Attack_Unit` commands carry a `unit_exists` precondition so a target
@@ -189,9 +221,10 @@ newer because Base75689 cannot load the saved map.
 
 The worker receives `RTSCORTEX_RUNTIME_SOCKET`, `RTSCORTEX_RUN_ID`,
 `RTSCORTEX_EPISODE_ID`, `RTSCORTEX_SCENARIO`, `RTSCORTEX_SEED`, and `SC2PATH`. The current
-bridge also receives `RTSCORTEX_SOCKET` as its socket variable. Worker stdout and stderr,
-the config snapshot, SQLite state, and the JSONL event journal are stored in the run's
-artifact directory.
+bridge also receives `RTSCORTEX_SOCKET` as its socket variable and
+`RTSCORTEX_ACTION_EFFECT_TIMEOUT_GAME_LOOPS` from the typed environment configuration.
+Worker stdout and stderr, the config snapshot, SQLite state, and the JSONL event journal
+are stored in the run's artifact directory.
 
 Every live run passes `--save_replay=false` to PySC2 and does not create
 `.SC2Replay` files. Use `rtscortex report <run-dir>` to turn the JSONL journal into a

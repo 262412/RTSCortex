@@ -1,6 +1,13 @@
 from __future__ import annotations
 
-from rtscortex.contracts import ActionArgumentType, ActionCommand, ActionSource, AvailableAction
+from rtscortex.contracts import (
+    ActionArgumentType,
+    ActionCommand,
+    ActionSource,
+    AvailableAction,
+    EconomyState,
+    UnitState,
+)
 from rtscortex.runtime.validation import ActionArbiter, ActionValidator
 from tests.helpers import make_observation
 
@@ -104,4 +111,97 @@ def test_validator_enforces_preconditions_and_creation_loop() -> None:
         "too-expensive: precondition 'min_minerals' is not satisfied",
         "missing-unit: precondition 'unit_exists' is not satisfied",
         "future: command creation loop is in the future",
+    ]
+
+
+def test_validator_enforces_supply_ceiling_and_pending_structure() -> None:
+    base = make_observation()
+    tight_supply = base.model_copy(
+        update={
+            "state": base.state.model_copy(
+                update={
+                    "economy": EconomyState(
+                        minerals=50,
+                        supply_used=11,
+                        supply_cap=15,
+                    )
+                }
+            )
+        }
+    )
+    guarded = command(
+        "guarded",
+        preconditions={
+            "max_supply_free": 4,
+            "no_pending_structure": "Pylon",
+        },
+    )
+
+    assert ActionValidator(max_actions=1).validate([guarded], tight_supply).accepted == [guarded]
+
+    high_supply = tight_supply.model_copy(
+        update={
+            "state": tight_supply.state.model_copy(
+                update={
+                    "economy": EconomyState(
+                        minerals=50,
+                        supply_used=10,
+                        supply_cap=15,
+                    )
+                }
+            )
+        }
+    )
+    assert ActionValidator(max_actions=1).validate([guarded], high_supply).rejected == [
+        "guarded: precondition 'max_supply_free' is not satisfied"
+    ]
+
+    pending_pylon = tight_supply.model_copy(
+        update={
+            "state": tight_supply.state.model_copy(
+                update={
+                    "own_structures": [
+                        UnitState(
+                            unit_id="pylon-1",
+                            unit_type="Pylon",
+                            alliance="self",
+                            status="constructing",
+                        )
+                    ]
+                }
+            )
+        }
+    )
+    assert ActionValidator(max_actions=1).validate([guarded], pending_pylon).rejected == [
+        "guarded: precondition 'no_pending_structure' is not satisfied"
+    ]
+
+
+def test_validator_enforces_structure_absent() -> None:
+    base = make_observation()
+    guarded = command(
+        "gateway",
+        preconditions={"structure_absent": "Gateway"},
+    )
+
+    assert ActionValidator(max_actions=1).validate([guarded], base).accepted == [guarded]
+
+    with_gateway = base.model_copy(
+        update={
+            "state": base.state.model_copy(
+                update={
+                    "own_structures": [
+                        UnitState(
+                            unit_id="gateway-1",
+                            unit_type="Gateway",
+                            alliance="self",
+                            status="constructing",
+                        )
+                    ]
+                }
+            )
+        }
+    )
+    assert ActionValidator(max_actions=1).validate([guarded], with_gateway).rejected == [
+        "gateway: precondition 'structure_absent' is not satisfied"
     ]

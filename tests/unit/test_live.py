@@ -44,6 +44,7 @@ def test_prepare_live_worker_builds_fixed_pysc2_command(tmp_path: Path) -> None:
         'flags.DEFINE_integer("random_seed", None, "Random seed")\nrandom_seed=FLAGS.random_seed\n',
         encoding="utf-8",
     )
+    _write_build_coordinate_patch_source(tmp_path)
 
     config = make_config(tmp_path).model_copy(
         update={
@@ -116,6 +117,7 @@ def test_prepare_live_worker_reports_all_missing_prerequisites(tmp_path: Path) -
     assert "SC2PATH is unset" in message
     assert "waiting-response patch is not applied" in message
     assert "random-seed patch is not applied" in message
+    assert "build-coordinate patch is not applied" in message
 
 
 def test_prepare_live_worker_accepts_2s3z_on_sc2_410(tmp_path: Path) -> None:
@@ -289,5 +291,19 @@ def _write_worker_patch_sources(project_root: Path) -> None:
     runner_source.parent.mkdir(parents=True)
     runner_source.write_text(
         'flags.DEFINE_integer("random_seed", None, "Random seed")\nrandom_seed=FLAGS.random_seed\n',
+        encoding="utf-8",
+    )
+    _write_build_coordinate_patch_source(project_root)
+
+
+def _write_build_coordinate_patch_source(project_root: Path) -> None:
+    source = project_root / "third_party/LLM-PySC2/llm_pysc2/lib/llm_action.py"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text(
+        "feature_screen.power[y0][x0]\n"
+        "feature_screen.creep[y0][x0]\n"
+        "feature_screen.buildable[y][x]\n"
+        "feature_screen.pathable[y][x]\n"
+        "feature_screen.player_relative[y][x]\n",
         encoding="utf-8",
     )

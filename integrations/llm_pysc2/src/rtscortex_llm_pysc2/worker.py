@@ -5,7 +5,7 @@ from __future__ import annotations
 import importlib
 import os
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, Optional
@@ -13,6 +13,10 @@ from typing import Any, Optional
 from rtscortex_llm_pysc2.broker import PrimitiveDispatch, SharedDecisionBroker
 from rtscortex_llm_pysc2.clock import FixedRateGameClock, InitialPlanningBarrier
 from rtscortex_llm_pysc2.coordinator import BridgeCoordinator
+from rtscortex_llm_pysc2.effect_verifier import (
+    DEFAULT_ACTION_EFFECT_TIMEOUT_GAME_LOOPS,
+    ActionEffectVerifier,
+)
 from rtscortex_llm_pysc2.extractor import TimeStepExtractor, build_screen_candidates
 from rtscortex_llm_pysc2.hook import RuntimeQueryMixin
 from rtscortex_llm_pysc2.protocol import RuntimeClient
@@ -41,6 +45,7 @@ class WorkerSettings:
     simulation_speed_multiplier: Optional[float] = None
     pause_until_first_plan: bool = False
     runtime_request_timeout_seconds: float = 60.0
+    action_effect_timeout_game_loops: int = DEFAULT_ACTION_EFFECT_TIMEOUT_GAME_LOOPS
 
     @classmethod
     def from_environment(cls) -> WorkerSettings:
@@ -59,6 +64,14 @@ class WorkerSettings:
         )
         if runtime_request_timeout_seconds <= 0:
             raise RuntimeError("RTSCORTEX_RUNTIME_REQUEST_TIMEOUT_SECONDS must be positive")
+        action_effect_timeout_game_loops = int(
+            os.environ.get(
+                "RTSCORTEX_ACTION_EFFECT_TIMEOUT_GAME_LOOPS",
+                str(DEFAULT_ACTION_EFFECT_TIMEOUT_GAME_LOOPS),
+            )
+        )
+        if action_effect_timeout_game_loops <= 0:
+            raise RuntimeError("RTSCORTEX_ACTION_EFFECT_TIMEOUT_GAME_LOOPS must be positive")
         pause_until_first_plan = _environment_bool("RTSCORTEX_PAUSE_UNTIL_FIRST_PLAN", False)
         return cls(
             run_id=run_id,
@@ -74,6 +87,7 @@ class WorkerSettings:
             ),
             pause_until_first_plan=pause_until_first_plan,
             runtime_request_timeout_seconds=runtime_request_timeout_seconds,
+            action_effect_timeout_game_loops=action_effect_timeout_game_loops,
         )
 
 
@@ -104,8 +118,14 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
             timeout_seconds=self.worker_settings.runtime_request_timeout_seconds,
         )
         self.runtime_client.health()
-        coordinator = BridgeCoordinator(self.runtime_client)
         unit_names, building_types = _unit_metadata()
+        coordinator = BridgeCoordinator(
+            self.runtime_client,
+            effect_verifier=ActionEffectVerifier(
+                timeout_game_loops=self.worker_settings.action_effect_timeout_game_loops,
+                unit_names=unit_names,
+            ),
+        )
         extractor = TimeStepExtractor(
             self.worker_settings.run_id,
             self.worker_settings.episode_id,
@@ -130,6 +150,7 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
 
     def step(self, obs: Any) -> Any:
         self._settle_previous_primitive(obs)
+        self.decision_broker.observe_effects(obs.observation)
         if _is_terminal(obs):
             return _finish_terminal(self, obs, _base_agent_step, _no_op)
         action = super().step(obs)
@@ -144,7 +165,7 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
             self.initial_planning_barrier.release()
             if self.game_clock is not None:
                 self.game_clock.reset()
-        self._capture_primitive(action)
+        self._capture_primitive(action, obs)
         delay = _pending_plan_idle_delay(
             action,
             planner_pending=self.decision_broker.planner_pending,
@@ -170,10 +191,11 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
             dispatch,
             success=not action_results,
             failure_reason=failure_reason,
+            game_loop=_observation_game_loop(obs.observation),
         )
         self._pending_primitive = None
 
-    def _capture_primitive(self, action: Any) -> None:
+    def _capture_primitive(self, action: Any, obs: Any) -> None:
         if self._pending_primitive is not None or not self.AGENT_NAMES:
             return
         agent = self.agents[self.AGENT_NAMES[self.agent_id]]
@@ -202,8 +224,15 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
                 PrimitiveDispatch(dispatch.command_id, function_name, True),
                 success=False,
                 failure_reason="upstream action translation or argument validation failed",
+                game_loop=_observation_game_loop(obs.observation),
             )
             return
+        if dispatch.final_primitive:
+            self.decision_broker.prepare_effect(
+                dispatch,
+                obs.observation,
+                builder_tag=_execution_unit_tag(agent),
+            )
         self._pending_primitive = dispatch
 
     def _report_episode(self, obs: Any) -> None:
@@ -347,6 +376,27 @@ def _execution_team_name(agent: Any) -> Optional[str]:
     if getattr(agent, "flag_enable_empty_unit_group", False):
         return "Empty"
     return None
+
+
+def _execution_unit_tag(agent: Any) -> Optional[int]:
+    value = getattr(agent, "team_unit_tag_curr", None)
+    return None if value is None else int(value)
+
+
+def _observation_game_loop(observation: Any) -> int:
+    value: Any = (
+        observation.get("game_loop", 0)
+        if isinstance(observation, Mapping)
+        else getattr(observation, "game_loop", 0)
+    )
+    if isinstance(value, (str, bytes)):
+        return int(value)
+    try:
+        if len(value) == 1:
+            return int(value[0])
+    except (TypeError, IndexError):
+        pass
+    return int(value)
 
 
 def _environment_bool(name: str, default: bool) -> bool:

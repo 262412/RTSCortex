@@ -2,10 +2,22 @@
 
 from __future__ import annotations
 
-import json
 from typing import Any
 
-from rtscortex.agents.models import PlanningOutput, ReflectionOutput
+from rtscortex.agents.context import (
+    ContextBudget,
+    build_planning_context,
+    build_reflection_context,
+    compact_memory_events,
+    compact_spatial_context,
+    model_observation,
+)
+from rtscortex.agents.models import (
+    PlanningOutput,
+    ReflectionOutput,
+    planning_output_model,
+    project_planning_observation,
+)
 from rtscortex.contracts import ActionCommand, ActionSource, ObservationEnvelope
 from rtscortex.contracts.interfaces import AgentContext, LLMProvider, ModuleResult
 from rtscortex.memory import EventStore, StoredEvent
@@ -14,33 +26,13 @@ from rtscortex.memory import EventStore, StoredEvent
 def _model_observation(observation: ObservationEnvelope) -> dict[str, Any]:
     """Project an observation into the compact, structured context used by an LLM."""
 
-    payload = observation.model_dump(mode="json")
-    payload.pop("observed_at")
-    payload.pop("text_observation")
-    payload.pop("image_uri")
-    spatial_context = _compact_spatial_context(observation.text_observation)
-    if spatial_context:
-        payload["spatial_context"] = spatial_context
-    return payload
+    return model_observation(observation)[0]
 
 
 def _compact_spatial_context(text_observation: str) -> list[str]:
     """Retain actionable screen/minimap coordinates without upstream prompt bulk."""
 
-    lines: list[str] = []
-    for raw_line in text_observation.splitlines():
-        line = raw_line.strip()
-        if (
-            (line.startswith("[") and line.endswith("]"))
-            or (line.startswith("Team ") and line.endswith(" Info:"))
-            or "Team minimap position:" in line
-            or "ScreenPos:" in line
-            or (line.startswith("Build_") and " candidates:" in line)
-        ):
-            lines.append(line)
-            if len(lines) == 48:
-                break
-    return lines
+    return compact_spatial_context(text_observation)
 
 
 def _compact_event(event: StoredEvent) -> dict[str, Any] | None:
@@ -71,24 +63,81 @@ def _compact_event(event: StoredEvent) -> dict[str, Any] | None:
             "failure_reason": event.payload.get("failure_reason"),
             "pysc2_function": event.payload.get("pysc2_function"),
         }
+    if event.event_type in {"planner_error", "planner_timeout", "module_error"}:
+        return {
+            "event_type": event.event_type,
+            "step_id": event.step_id,
+            "module": event.payload.get("module"),
+            "error_type": event.payload.get("error_type"),
+            "message": event.payload.get("message"),
+        }
     return None
+
+
+REFLECTION_SYSTEM_PROMPT = (
+    "Evaluate the previous decision from matching execution and current state. A no_op never "
+    "proves a plan action ran; never infer execution from summaries. Return concise "
+    "evidence-backed lessons."
+)
+
+
+PLANNING_SYSTEM_PROMPT = (
+    "Plan only the actions needed in the current StarCraft II decision cycle. Use only "
+    "the exact, complete action name from observation.available_actions and an actor from "
+    "that action's actor_scopes; never shorten or invent a name. Return "
+    "at most two short steps and three typed actions, with one action per actor and no "
+    "raw PySC2 calls. arguments is a positional JSON array in argument_names order; a "
+    "position uses two integer coordinates in a nested array such as [[80,80]]. Use "
+    "coordinates only from observation.spatial_context for that exact action. A Build_ "
+    "action already moves its worker into range and performs placement. Never pair "
+    "Move_Screen or Move_Minimap with a Build_ action for the same actor; emit only the "
+    "Build_ action. Do not repeat a successfully "
+    "executed action or an active_plan command that remains valid. In a Protoss opening "
+    "without enemies, prioritize legal economy and production: Pylon, then Gateway. Emit "
+    "Build_Pylon_Screen only when supply_free <= 4 and no Pylon in own_structures has "
+    "status='constructing'; otherwise do not propose it. After a completed Gateway exists, "
+    "prioritize Train_Zealot, especially while army_supply is zero, and keep producing "
+    "Zealots when minerals and supply allow. Do not choose Train_Stalker without a completed "
+    "CyberneticsCore and enough vespene."
+)
+
+
+def _planner_preconditions(name: str, arguments: list[Any]) -> dict[str, Any]:
+    if name == "Attack_Unit" and arguments:
+        return {"unit_exists": str(arguments[0])}
+    if name == "Build_Pylon_Screen":
+        return {
+            "max_supply_free": 4,
+            "no_pending_structure": "Pylon",
+        }
+    if name == "Build_Gateway_Screen":
+        return {"structure_absent": "Gateway"}
+    return {}
 
 
 class MemoryModule:
     name = "memory"
 
-    def __init__(self, store: EventStore, short_term_window: int) -> None:
+    def __init__(
+        self,
+        store: EventStore,
+        short_term_window: int,
+        context_budget: ContextBudget | None = None,
+    ) -> None:
         self.store = store
         self.short_term_window = short_term_window
+        self.context_budget = context_budget or ContextBudget()
 
     async def run(self, context: AgentContext) -> ModuleResult:
         observation = context.observation
         recent = self.store.recent_events(
-            observation.run_id, observation.episode_id, self.short_term_window
+            observation.run_id,
+            observation.episode_id,
+            max(self.short_term_window * 8, self.context_budget.max_recent_events * 8),
         )
-        compact_events = [
-            compact for event in recent if (compact := _compact_event(event)) is not None
-        ]
+        compact_events = compact_memory_events(
+            [compact for event in recent if (compact := _compact_event(event)) is not None]
+        )[-self.short_term_window :]
         return ModuleResult(
             module=self.name,
             updates={
@@ -101,11 +150,15 @@ class MemoryModule:
                     for lesson in self.store.lesson_records(
                         observation.run_id,
                         observation.episode_id,
+                        limit=max(10, self.context_budget.max_lessons * 2),
                     )
                 ],
                 "episode_summaries": [
                     summary.model_dump(mode="json")
-                    for summary in self.store.recent_episode_summaries(observation.run_id, limit=3)
+                    for summary in self.store.recent_episode_summaries(
+                        observation.run_id,
+                        limit=max(3, self.context_budget.max_episode_summaries * 2),
+                    )
                 ],
             },
         )
@@ -114,32 +167,32 @@ class MemoryModule:
 class ReflectionModule:
     name = "reflection"
 
-    def __init__(self, provider: LLMProvider) -> None:
+    def __init__(self, provider: LLMProvider, context_budget: ContextBudget | None = None) -> None:
         self.provider = provider
+        self.context_budget = context_budget or ContextBudget()
 
     async def run(self, context: AgentContext) -> ModuleResult:
         if context.last_decision is None:
             return ModuleResult(module=self.name, updates={"reflection": None, "lessons": []})
-        payload = {
-            "observation": _model_observation(context.observation),
-            "last_decision": context.last_decision.model_dump(mode="json"),
-            "last_execution": (
-                None
-                if context.last_execution is None
-                else context.last_execution.model_dump(mode="json")
-            ),
-        }
+        prompt_context = build_reflection_context(
+            observation=context.observation,
+            last_decision=context.last_decision,
+            last_execution=context.last_execution,
+            budget=self.context_budget,
+            system_prompt=REFLECTION_SYSTEM_PROMPT,
+        )
         output = await self.provider.generate(
             ReflectionOutput,
-            system_prompt=(
-                "Evaluate the previous StarCraft II decision. Return a concise summary and "
-                "only reusable, evidence-backed lessons."
-            ),
-            user_prompt=json.dumps(payload, ensure_ascii=False, sort_keys=True),
+            system_prompt=REFLECTION_SYSTEM_PROMPT,
+            user_prompt=prompt_context.user_prompt,
         )
         return ModuleResult(
             module=self.name,
-            updates={"reflection": output.summary, "lessons": output.lessons},
+            updates={
+                "reflection": output.summary,
+                "lessons": output.lessons,
+                "context_compaction": prompt_context.statistics,
+            },
             model_call=True,
         )
 
@@ -147,39 +200,32 @@ class ReflectionModule:
 class PlanningModule:
     name = "planning"
 
-    def __init__(self, provider: LLMProvider) -> None:
+    def __init__(self, provider: LLMProvider, context_budget: ContextBudget | None = None) -> None:
         self.provider = provider
+        self.context_budget = context_budget or ContextBudget()
 
     async def run(self, context: AgentContext) -> ModuleResult:
-        payload = {
-            "observation": _model_observation(context.observation),
-            "memory": context.memory,
-        }
+        planning_observation = project_planning_observation(context.observation)
+        prompt_context = build_planning_context(
+            observation=planning_observation,
+            memory=context.memory,
+            last_decision=context.last_decision,
+            last_execution=context.last_execution,
+            budget=self.context_budget,
+            system_prompt=PLANNING_SYSTEM_PROMPT,
+        )
+        output_type = planning_output_model(planning_observation)
         output = await self.provider.generate(
-            PlanningOutput,
-            system_prompt=(
-                "Create a short-horizon StarCraft II plan using only the available actions. "
-                "Use an actor exactly as listed in the chosen action's actor_scopes. Return "
-                "typed action proposals; never emit raw PySC2 calls. The arguments field is "
-                "a positional JSON array in the exact argument_names order, and every value "
-                "must match the corresponding argument_types entry. For example, an action "
-                'with argument_names=["target"] receives arguments=["0x1001c0001"], '
-                "never a named {name, value} object. A position must be a nested numeric "
-                "array such as arguments=[[80, 80]], never arguments=[\"[80, 80]\"]. Return "
-                "at most three concise plan steps "
-                "and three proposed actions, with no more than one action per actor. When an "
-                "action requires a screen or minimap position, choose it from spatial_context "
-                "and preserve the listed coordinate system. In a Protoss opening with no "
-                "visible enemy, prioritize legal economy and production actions; build a "
-                "Pylon once it is available, then a Gateway. Do not hold position merely "
-                "because no enemy is visible. For Build_*_Screen, use a coordinate listed "
-                "for that exact action in spatial_context."
-            ),
-            user_prompt=json.dumps(payload, ensure_ascii=False, sort_keys=True),
+            output_type,
+            system_prompt=PLANNING_SYSTEM_PROMPT,
+            user_prompt=prompt_context.user_prompt,
         )
         return ModuleResult(
             module=self.name,
-            updates={"plan": output.model_dump(mode="json")},
+            updates={
+                "plan": output.model_dump(mode="json"),
+                "context_compaction": prompt_context.statistics,
+            },
             model_call=True,
         )
 
@@ -193,13 +239,6 @@ class ActionModule:
     async def run(self, context: AgentContext) -> ModuleResult:
         raw_plan: dict[str, Any] = context.memory.get("plan", {})
         plan = PlanningOutput.model_validate(raw_plan)
-        unique_proposals = []
-        seen_actors: set[str] = set()
-        for proposal in plan.proposed_actions:
-            if proposal.actor in seen_actors:
-                continue
-            seen_actors.add(proposal.actor)
-            unique_proposals.append(proposal)
         commands = [
             ActionCommand(
                 command_id=(
@@ -213,13 +252,9 @@ class ActionModule:
                 ttl_game_loops=proposal.ttl_game_loops,
                 created_game_loop=context.observation.game_loop,
                 source=ActionSource.PLANNER,
-                preconditions=(
-                    {"unit_exists": str(proposal.arguments[0])}
-                    if proposal.name == "Attack_Unit" and proposal.arguments
-                    else {}
-                ),
+                preconditions=_planner_preconditions(proposal.name, proposal.arguments),
             )
-            for index, proposal in enumerate(unique_proposals[: self.max_actions])
+            for index, proposal in enumerate(plan.proposed_actions[: self.max_actions])
         ]
         return ModuleResult(
             module=self.name,

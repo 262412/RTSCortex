@@ -51,10 +51,22 @@ class TimeStepExtractor:
             raise ValueError("PySC2 observation has no player data")
 
         raw_units = list(_value(observation, "raw_units", ()))
+        teams = _extract_team_actions(
+            agents,
+            owned_unit_types={
+                int(_value(unit, "unit_type", 0))
+                for unit in raw_units
+                if int(_value(unit, "alliance", 0)) == 1
+            },
+            action_source_types=self.action_source_types,
+        )
         text_observation = "\n\n".join(
             f"[{name}]\n{text_observations[name]}" for name in sorted(text_observations)
         )
-        build_candidates = _build_screen_candidate_lines(observation)
+        available_action_names = {
+            str(action["name"]) for team in teams for action in team["available_actions"]
+        }
+        build_candidates = _build_screen_candidate_lines(observation, available_action_names)
         if build_candidates:
             text_observation = "\n\n".join(
                 [text_observation, "[RTSCortex Build Candidates]", *build_candidates]
@@ -69,15 +81,7 @@ class TimeStepExtractor:
             "production_queue": _extract_production_queue(observation),
             "units": [self._extract_unit(unit) for unit in raw_units],
             "upgrades": [f"upgrade:{int(value)}" for value in _value(observation, "upgrades", ())],
-            "teams": _extract_team_actions(
-                agents,
-                owned_unit_types={
-                    int(_value(unit, "unit_type", 0))
-                    for unit in raw_units
-                    if int(_value(unit, "alliance", 0)) == 1
-                },
-                action_source_types=self.action_source_types,
-            ),
+            "teams": teams,
             "text_observation": text_observation,
             "alerts": [_alert_name(value) for value in _value(observation, "alerts", ())],
             "image_uri": None,
@@ -85,22 +89,31 @@ class TimeStepExtractor:
 
     def _extract_unit(self, unit: Any) -> dict[str, Any]:
         unit_type = int(_value(unit, "unit_type", 0))
+        is_structure = unit_type in self.building_types
         health = float(_value(unit, "health", 0.0))
         health_ratio = float(_value(unit, "health_ratio", 0.0)) / 255.0
         health_max = float(_value(unit, "health_max", 0.0))
         if health_max <= 0:
             health_max = health / health_ratio if health_ratio > 0 else max(health, 1.0)
         order_length = int(_value(unit, "order_length", 0))
+        status = "idle" if order_length == 0 else "active"
+        build_progress = _value(unit, "build_progress", None)
+        if is_structure and build_progress is not None:
+            normalized_progress = float(build_progress)
+            if normalized_progress > 1.0:
+                normalized_progress /= 100.0
+            if normalized_progress < 1.0:
+                status = "constructing"
         return {
             "tag": int(_value(unit, "tag", 0)),
             "unit_type": self.unit_names.get(unit_type, f"unit:{unit_type}"),
             "alliance": ALLIANCES.get(int(_value(unit, "alliance", 0)), "neutral"),
-            "is_structure": unit_type in self.building_types,
+            "is_structure": is_structure,
             "position": [float(_value(unit, "x", 0.0)), float(_value(unit, "y", 0.0))],
             "health": health,
             "health_max": health_max,
             "energy": float(_value(unit, "energy", 0.0)),
-            "status": "idle" if order_length == 0 else "active",
+            "status": status,
         }
 
 
@@ -237,12 +250,23 @@ def _available_function_ids(
     return frozenset(int(value) for value in values)
 
 
-def _build_screen_candidate_lines(observation: Any) -> list[str]:
-    pylon = build_screen_candidates(observation, "Build_Pylon_Screen")
-    gateway = build_screen_candidates(observation, "Build_Gateway_Screen")
+def _build_screen_candidate_lines(
+    observation: Any,
+    available_action_names: set[str],
+) -> list[str]:
     result = []
+    pylon = (
+        build_screen_candidates(observation, "Build_Pylon_Screen")
+        if "Build_Pylon_Screen" in available_action_names
+        else []
+    )
     if pylon:
         result.append(f"Build_Pylon_Screen candidates: {pylon}")
+    gateway = (
+        build_screen_candidates(observation, "Build_Gateway_Screen")
+        if "Build_Gateway_Screen" in available_action_names
+        else []
+    )
     if gateway:
         result.append(f"Build_Gateway_Screen candidates: {gateway}")
     return result
@@ -262,6 +286,7 @@ def build_screen_candidates(observation: Any, action_name: str) -> list[list[int
     pathable = _value(feature_screen, "pathable", None)
     player_relative = _value(feature_screen, "player_relative", None)
     power = _value(feature_screen, "power", None)
+    feature_units = _value(observation, "feature_units", ())
     shape = getattr(buildable, "shape", ())
     if not shape or buildable is None or pathable is None or player_relative is None:
         return []
@@ -272,6 +297,11 @@ def build_screen_candidates(observation: Any, action_name: str) -> list[list[int
         pathable,
         player_relative,
         power,
+        occupied_positions=tuple(
+            (int(unit.x), int(unit.y))
+            for unit in feature_units
+            if getattr(unit, "is_on_screen", True)
+        ),
         screen_size=screen_size,
         building_size=building_size,
         require_power=require_power,
@@ -284,58 +314,134 @@ def _valid_build_positions(
     player_relative: Any,
     power: Any,
     *,
+    occupied_positions: tuple[tuple[int, int], ...],
     screen_size: int,
     building_size: int,
     require_power: bool,
 ) -> list[list[int]]:
     ratio = max(1, int(screen_size / 24))
     stride = max(4, ratio)
+    invalid_cell_prefix = _invalid_build_cell_prefix(
+        buildable,
+        pathable,
+        player_relative,
+        screen_size,
+    )
     candidates: list[tuple[float, int, int]] = []
     for x0 in range(stride, screen_size, stride):
         for y0 in range(stride, screen_size, stride):
-            if require_power and (
-                power is None or power[x0][y0] != 1 or power[y0][x0] != 1
-            ):
+            if require_power and (power is None or power[y0][x0] != 1):
                 continue
-            x1 = int(x0 - ratio * (building_size - 1) / 2)
-            y1 = int(y0 - ratio * (building_size - 1) / 2)
-            valid = True
-            for i in range(building_size):
-                for j in range(building_size):
-                    x = int(x1 + i * ratio)
-                    y = int(y1 + j * ratio)
-                    if not (0 < x < screen_size and 0 < y < screen_size):
-                        valid = False
-                    elif not _build_cell_is_valid_in_both_coordinate_orders(
-                        buildable,
-                        pathable,
-                        player_relative,
-                        x,
-                        y,
-                    ):
-                        valid = False
-            if valid:
+            bounds = _build_footprint_bounds(x0, y0, ratio, building_size)
+            if _build_footprint_is_clear(
+                invalid_cell_prefix,
+                occupied_positions,
+                bounds,
+                screen_size,
+            ):
                 distance = (x0 - screen_size / 2) ** 2 + (y0 - screen_size / 2) ** 2
                 candidates.append((distance, x0, y0))
     candidates.sort()
     return [[x, y] for _, x, y in candidates[:8]]
 
 
-def _build_cell_is_valid_in_both_coordinate_orders(
+def _build_cell_is_valid(
     buildable: Any,
     pathable: Any,
     player_relative: Any,
     x: int,
     y: int,
 ) -> bool:
-    """Satisfy PySC2's row-major plane and LLM-PySC2's transposed validator."""
+    """Check PySC2 feature planes using their row-major ``[y][x]`` layout."""
 
-    for row, column in ((y, x), (x, y)):
-        if buildable[row][column] != 1 or pathable[row][column] != 1:
-            return False
-        if player_relative[row][column] not in (0, 1):
-            return False
+    if buildable[y][x] != 1 or pathable[y][x] != 1:
+        return False
+    if player_relative[y][x] != 0:
+        return False
     return True
+
+
+def _build_footprint_bounds(
+    center_x: int,
+    center_y: int,
+    ratio: int,
+    building_size: int,
+) -> tuple[int, int, int, int]:
+    first_x = int(center_x - ratio * (building_size - 1) / 2)
+    first_y = int(center_y - ratio * (building_size - 1) / 2)
+    last_x = first_x + ratio * (building_size - 1)
+    last_y = first_y + ratio * (building_size - 1)
+    cell_radius = (ratio + 1) // 2
+    return (
+        first_x - cell_radius,
+        last_x + cell_radius,
+        first_y - cell_radius,
+        last_y + cell_radius,
+    )
+
+
+def _build_footprint_is_clear(
+    invalid_cell_prefix: list[list[int]],
+    occupied_positions: tuple[tuple[int, int], ...],
+    bounds: tuple[int, int, int, int],
+    screen_size: int,
+) -> bool:
+    min_x, max_x, min_y, max_y = bounds
+    if min_x <= 0 or min_y <= 0 or max_x >= screen_size or max_y >= screen_size:
+        return False
+    if any(
+        min_x <= unit_x <= max_x and min_y <= unit_y <= max_y
+        for unit_x, unit_y in occupied_positions
+    ):
+        return False
+    return (
+        _rectangle_sum(
+            invalid_cell_prefix,
+            min_x,
+            max_x,
+            min_y,
+            max_y,
+        )
+        == 0
+    )
+
+
+def _invalid_build_cell_prefix(
+    buildable: Any,
+    pathable: Any,
+    player_relative: Any,
+    screen_size: int,
+) -> list[list[int]]:
+    prefix = [[0] * (screen_size + 1) for _ in range(screen_size + 1)]
+    for y in range(screen_size):
+        row_total = 0
+        previous_row = prefix[y]
+        current_row = prefix[y + 1]
+        for x in range(screen_size):
+            row_total += not _build_cell_is_valid(
+                buildable,
+                pathable,
+                player_relative,
+                x,
+                y,
+            )
+            current_row[x + 1] = previous_row[x + 1] + row_total
+    return prefix
+
+
+def _rectangle_sum(
+    prefix: list[list[int]],
+    min_x: int,
+    max_x: int,
+    min_y: int,
+    max_y: int,
+) -> int:
+    return (
+        prefix[max_y + 1][max_x + 1]
+        - prefix[min_y][max_x + 1]
+        - prefix[max_y + 1][min_x]
+        + prefix[min_y][min_x]
+    )
 
 
 def _value(value: Any, name: str, default: Any) -> Any:

@@ -185,6 +185,62 @@ def test_timeline_renders_live_state_reasoning_actions_and_execution(tmp_path: P
     assert report.index("Event 4 · Decision") < report.index("Event 5 · Execution")
 
 
+def test_timeline_renders_module_context_compaction_statistics(tmp_path: Path) -> None:
+    observation = make_observation(
+        run_id="live-run",
+        episode_id="episode-0",
+        step_id=0,
+        game_loop=58,
+    )
+    events = [
+        _event(1, "observation", observation.model_dump(mode="json")),
+        _event(
+            2,
+            "module_result",
+            {
+                "module": "reflection",
+                "latency_ms": 12.5,
+                "command_count": 0,
+                "model_call": True,
+                "provider": "openai_compatible",
+                "model": "qwen3-8b",
+                "usage": {"prompt_tokens": 800, "completion_tokens": 20},
+                "output": {
+                    "reflection": "Keep the current build order.",
+                    "lessons": [],
+                    "context_compaction": {
+                        "budget_chars": 6000,
+                        "original_chars": 14620,
+                        "final_chars": 5732,
+                        "compacted": True,
+                        "aggregated_own_units": 188,
+                        "aggregated_own_structures": 84,
+                        "aggregated_visible_enemies": 134,
+                        "dropped_recent_events": 21,
+                        "dropped_lessons": 3,
+                        "dropped_episode_summaries": 2,
+                        "dropped_spatial_lines": 7,
+                    },
+                },
+            },
+        ),
+    ]
+    run_dir = tmp_path / "compacted"
+    _write_journal(run_dir, events)
+
+    report = write_timeline_report(run_dir).read_text(encoding="utf-8")
+
+    assert "Context budget: `6000` chars; `14620` → `5732` chars" in report
+    assert "compacted: `yes`" in report
+    assert "own units `188`" in report
+    assert "own structures `84`" in report
+    assert "visible enemies `134`" in report
+    assert "recent events `21`" in report
+    assert "lessons `3`" in report
+    assert "episode summaries `2`" in report
+    assert "spatial lines `7`" in report
+
+
 def test_legacy_incomplete_mock_journal_still_writes_report_and_cli_succeeds(
     tmp_path: Path,
 ) -> None:

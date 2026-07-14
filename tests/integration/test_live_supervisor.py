@@ -60,12 +60,16 @@ with httpx.Client(transport=transport, base_url="http://rtscortex") as client:
     response.raise_for_status()
 """
 
-PACED_SUCCESS_WORKER = """
+PACED_SUCCESS_WORKER = (
+    """
 import os
 
 assert os.environ["RTSCORTEX_SIMULATION_SPEED_MULTIPLIER"] == "0.25"
 assert os.environ["RTSCORTEX_PAUSE_UNTIL_FIRST_PLAN"] == "true"
-""" + SUCCESS_WORKER
+assert os.environ["RTSCORTEX_ACTION_EFFECT_TIMEOUT_GAME_LOOPS"] == "96"
+"""
+    + SUCCESS_WORKER
+)
 
 
 def _supervisor(tmp_path: Path, worker_code: str) -> LiveProcessSupervisor:
@@ -226,6 +230,7 @@ environment:
   max_steps: 4
   simulation_speed_multiplier: 0.25
   pause_until_first_plan: true
+  action_effect_timeout_game_loops: 96
 provider:
   kind: fake
 """,

@@ -1,0 +1,28 @@
+diff --git a/llm_pysc2/lib/llm_action.py b/llm_pysc2/lib/llm_action.py
+--- a/llm_pysc2/lib/llm_action.py
++++ b/llm_pysc2/lib/llm_action.py
+@@ -404,8 +404,8 @@ def get_arg_screen_build(obs, screen: list, size_screen, action_name) -> (tuple,
+     x0 = int(min(max(0, screen[0]), size_screen))
+     y0 = int(min(max(0, screen[1]), size_screen))
+     x1 = int(min(max(0, screen[0]), size_screen) - ratio * (building_size - 1) / 2)
+     y1 = int(min(max(0, screen[1]), size_screen) - ratio * (building_size - 1) / 2)
+-    if building_name in POWER_BUILDING_NAMES and obs.observation.feature_screen.power[x0][y0] == 0:
++    if building_name in POWER_BUILDING_NAMES and obs.observation.feature_screen.power[y0][x0] == 0:
+       return f'({x0}, {y0}) need power', False
+-    if building_name in CREEP_BUILDING_NAMES and obs.observation.feature_screen.creep[x0][y0] == 0:
++    if building_name in CREEP_BUILDING_NAMES and obs.observation.feature_screen.creep[y0][x0] == 0:
+       return f'({x0}, {y0}) need creep', False
+@@ -415,10 +415,10 @@ def get_arg_screen_build(obs, screen: list, size_screen, action_name) -> (tuple,
+         y = int(y1 + j * ratio)
+         if not (0 < x < size_screen and 0 < y < size_screen):
+           return f'({x0}, {y0}) too close to screen edge', False
+-        if obs.observation.feature_screen.buildable[x][y] != 1:
++        if obs.observation.feature_screen.buildable[y][x] != 1:
+           return f'area near ({x0}, {y0}) not buildable', False
+-        if obs.observation.feature_screen.pathable[x][y] != 1:
++        if obs.observation.feature_screen.pathable[y][x] != 1:
+           return f'area near ({x0}, {y0}) not pathable', False
+-        if obs.observation.feature_screen.player_relative[x][y] not in [0, 1]:
++        if obs.observation.feature_screen.player_relative[y][x] not in [0, 1]:
+           return f'area near ({x0}, {y0}) not blocked', False
+     return (x0, y0), True

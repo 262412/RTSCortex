@@ -98,6 +98,22 @@ class ActionValidator:
     def validate(
         self, commands: list[ActionCommand], observation: ObservationEnvelope
     ) -> ValidationOutcome:
+        return self._validate(commands, observation, max_actions=self.max_actions)
+
+    def validate_candidates(
+        self, commands: list[ActionCommand], observation: ObservationEnvelope
+    ) -> ValidationOutcome:
+        """Reject invalid candidates without applying the final action budget."""
+
+        return self._validate(commands, observation, max_actions=None)
+
+    def _validate(
+        self,
+        commands: list[ActionCommand],
+        observation: ObservationEnvelope,
+        *,
+        max_actions: int | None,
+    ) -> ValidationOutcome:
         available = {action.name: action for action in observation.available_actions}
         accepted: list[ActionCommand] = []
         rejected: list[str] = []
@@ -146,7 +162,7 @@ class ActionValidator:
             if reason is not None:
                 rejected.append(f"{command.command_id}: {reason}")
                 continue
-            if len(accepted) >= self.max_actions:
+            if max_actions is not None and len(accepted) >= max_actions:
                 rejected.append(f"{command.command_id}: action budget exceeded")
                 continue
             seen_ids.add(command.command_id)
@@ -190,13 +206,14 @@ def _precondition_failure(
     observation: ObservationEnvelope,
 ) -> str | None:
     state = observation.state
+    supply_free = state.economy.supply_cap - state.economy.supply_used
     unit_ids = {
         unit.unit_id for unit in [*state.own_units, *state.own_structures, *state.visible_enemies]
     }
     checks = {
         "min_minerals": state.economy.minerals,
         "min_vespene": state.economy.vespene,
-        "min_supply_free": state.economy.supply_cap - state.economy.supply_used,
+        "min_supply_free": supply_free,
     }
     for name, expected in command.preconditions.items():
         if name in checks:
@@ -204,6 +221,24 @@ def _precondition_failure(
                 return f"precondition {name!r} must be numeric"
             if checks[name] < expected:
                 return f"precondition {name!r} is not satisfied"
+        elif name == "max_supply_free":
+            if not isinstance(expected, (int, float)) or isinstance(expected, bool):
+                return "precondition 'max_supply_free' must be numeric"
+            if supply_free > expected:
+                return "precondition 'max_supply_free' is not satisfied"
+        elif name == "no_pending_structure":
+            if not isinstance(expected, str):
+                return "precondition 'no_pending_structure' must be a structure type"
+            if any(
+                structure.unit_type == expected and structure.status == "constructing"
+                for structure in state.own_structures
+            ):
+                return "precondition 'no_pending_structure' is not satisfied"
+        elif name == "structure_absent":
+            if not isinstance(expected, str):
+                return "precondition 'structure_absent' must be a structure type"
+            if any(structure.unit_type == expected for structure in state.own_structures):
+                return "precondition 'structure_absent' is not satisfied"
         elif name == "unit_exists":
             if not isinstance(expected, str):
                 return "precondition 'unit_exists' must be a unit ID"

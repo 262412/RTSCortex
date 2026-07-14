@@ -160,6 +160,11 @@ def prepare_live_worker(
             "the PySC2 random-seed patch is not applied; see "
             "integrations/llm_pysc2/patches/README.md"
         )
+    if not build_feature_plane_patch_is_applied(project_root):
+        errors.append(
+            "the LLM-PySC2 build-coordinate patch is not applied; see "
+            "integrations/llm_pysc2/patches/README.md"
+        )
 
     if errors:
         raise LiveEnvironmentError("Live environment validation failed:\n- " + "\n- ".join(errors))
@@ -194,14 +199,14 @@ def prepare_live_worker(
         )
     command.extend(
         [
-        "--parallel",
-        "1",
-        "--render=false",
-        "--save_replay=false",
-        "--max_agent_steps",
-        str(config.environment.max_steps),
-        "--random_seed",
-        str(config.run.seed),
+            "--parallel",
+            "1",
+            "--render=false",
+            "--save_replay=false",
+            "--max_agent_steps",
+            str(config.environment.max_steps),
+            "--random_seed",
+            str(config.run.seed),
         ]
     )
     return LiveWorkerSpec(command=tuple(command), sc2_path=sc2_path)
@@ -526,6 +531,25 @@ def random_seed_patch_is_applied(project_root: Path) -> bool:
     return (
         'flags.DEFINE_integer("random_seed", None' in text
         and "random_seed=FLAGS.random_seed" in text
+    )
+
+
+def build_feature_plane_patch_is_applied(project_root: Path) -> bool:
+    """Return whether build validation reads PySC2 planes as ``[y][x]``."""
+
+    source = project_root / "third_party/LLM-PySC2/llm_pysc2/lib/llm_action.py"
+    if not source.is_file():
+        return False
+    text = source.read_text(encoding="utf-8")
+    return all(
+        marker in text
+        for marker in (
+            "feature_screen.power[y0][x0]",
+            "feature_screen.creep[y0][x0]",
+            "feature_screen.buildable[y][x]",
+            "feature_screen.pathable[y][x]",
+            "feature_screen.player_relative[y][x]",
+        )
     )
 
 

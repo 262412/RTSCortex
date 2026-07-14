@@ -49,6 +49,7 @@ class EnvironmentSettings(SettingsModel):
     sc2_path: Path | None = None
     worker_python: Path = Path("~/fastscratch/envs/rtscortex-llm-pysc2/bin/python")
     pending_plan_step_delay_seconds: float = Field(default=0.0, ge=0.0)
+    action_effect_timeout_game_loops: int = Field(default=112, ge=1)
     server_ready_timeout_seconds: float = Field(default=15.0, gt=0.0)
     shutdown_timeout_seconds: float = Field(default=10.0, gt=0.0)
 
@@ -82,6 +83,13 @@ class MemorySettings(SettingsModel):
     short_term_window: int = Field(default=20, ge=1)
 
 
+class ContextSettings(SettingsModel):
+    max_prompt_chars: int = Field(default=9_000, ge=2_000)
+    max_recent_events: int = Field(default=8, ge=1)
+    max_lessons: int = Field(default=6, ge=1)
+    max_episode_summaries: int = Field(default=1, ge=0)
+
+
 class ProviderSettings(SettingsModel):
     kind: Literal["fake", "openai_compatible"] = "fake"
     model: str = "fake-planner-v1"
@@ -105,6 +113,7 @@ class ExperimentConfig(SettingsModel):
     agent: AgentSettings = Field(default_factory=AgentSettings)
     reflex: ReflexSettings = Field(default_factory=ReflexSettings)
     memory: MemorySettings = Field(default_factory=MemorySettings)
+    context: ContextSettings = Field(default_factory=ContextSettings)
     provider: ProviderSettings = Field(default_factory=ProviderSettings)
     evaluation: EvaluationSettings = Field(default_factory=EvaluationSettings)
 

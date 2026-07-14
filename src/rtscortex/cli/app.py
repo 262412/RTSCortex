@@ -106,6 +106,9 @@ def run_experiment(
                 "RTSCORTEX_RUNTIME_REQUEST_TIMEOUT_SECONDS": str(
                     config.runtime.planner_timeout_seconds + 5.0
                 ),
+                "RTSCORTEX_ACTION_EFFECT_TIMEOUT_GAME_LOOPS": str(
+                    config.environment.action_effect_timeout_game_loops
+                ),
             }
             if config.environment.simulation_speed_multiplier is not None:
                 worker_environment["RTSCORTEX_SIMULATION_SPEED_MULTIPLIER"] = str(

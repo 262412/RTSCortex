@@ -117,6 +117,17 @@ def test_worker_patch_is_required_only_for_live_runs(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
+    action_source = tmp_path / "third_party/LLM-PySC2/llm_pysc2/lib/llm_action.py"
+    action_source.parent.mkdir(parents=True)
+    action_source.write_text(
+        "feature_screen.power[y0][x0]\n"
+        "feature_screen.creep[y0][x0]\n"
+        "feature_screen.buildable[y][x]\n"
+        "feature_screen.pathable[y][x]\n"
+        "feature_screen.player_relative[y][x]\n",
+        encoding="utf-8",
+    )
+
     assert _worker_patch_check(tmp_path, required=True).status == "ok"
 
 
