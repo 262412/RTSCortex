@@ -56,10 +56,18 @@ class BridgeCoordinator:
     ) -> BridgeDecision:
         observation = self.mapper.map(snapshot)
         batch = self.runtime.tick(observation)
+        dispatch_batch = {
+            **batch,
+            "commands": [
+                command
+                for command in batch["commands"]
+                if not self.tracker.has_seen(str(command["command_id"]))
+            ],
+        }
         available_actions = observation["available_actions"]
         routes = {
             agent_name: self.router.route(
-                batch,
+                dispatch_batch,
                 agent_name=agent_name,
                 team_order=team_order,
                 available_actions=available_actions,
@@ -67,7 +75,7 @@ class BridgeCoordinator:
             for agent_name, team_order in agent_team_order.items()
         }
 
-        expected = {str(command["command_id"]) for command in batch["commands"]}
+        expected = {str(command["command_id"]) for command in dispatch_batch["commands"]}
         routed = {command.command_id for route in routes.values() for command in route.commands}
         if routed != expected:
             missing = sorted(expected - routed)

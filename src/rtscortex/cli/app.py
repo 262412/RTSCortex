@@ -95,6 +95,22 @@ def run_experiment(
         runtime = build_runtime(config, run_dir)
         if live_worker is not None:
             assert runtime_socket is not None
+            worker_environment = {
+                "SC2PATH": str(live_worker.sc2_path),
+                "RTSCORTEX_PENDING_PLAN_STEP_DELAY_SECONDS": str(
+                    config.environment.pending_plan_step_delay_seconds
+                ),
+                "RTSCORTEX_PAUSE_UNTIL_FIRST_PLAN": str(
+                    config.environment.pause_until_first_plan
+                ).lower(),
+                "RTSCORTEX_RUNTIME_REQUEST_TIMEOUT_SECONDS": str(
+                    config.runtime.planner_timeout_seconds + 5.0
+                ),
+            }
+            if config.environment.simulation_speed_multiplier is not None:
+                worker_environment["RTSCORTEX_SIMULATION_SPEED_MULTIPLIER"] = str(
+                    config.environment.simulation_speed_multiplier
+                )
             supervisor = LiveProcessSupervisor(
                 runtime=runtime,
                 run_id=run_id,
@@ -103,12 +119,7 @@ def run_experiment(
                 seed=config.run.seed,
                 socket_path=runtime_socket,
                 worker_command=live_worker.command,
-                worker_environment={
-                    "SC2PATH": str(live_worker.sc2_path),
-                    "RTSCORTEX_PENDING_PLAN_STEP_DELAY_SECONDS": str(
-                        config.environment.pending_plan_step_delay_seconds
-                    ),
-                },
+                worker_environment=worker_environment,
                 run_dir=run_dir,
                 server_ready_timeout_seconds=(config.environment.server_ready_timeout_seconds),
                 shutdown_timeout_seconds=config.environment.shutdown_timeout_seconds,

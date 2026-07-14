@@ -60,6 +60,13 @@ with httpx.Client(transport=transport, base_url="http://rtscortex") as client:
     response.raise_for_status()
 """
 
+PACED_SUCCESS_WORKER = """
+import os
+
+assert os.environ["RTSCORTEX_SIMULATION_SPEED_MULTIPLIER"] == "0.25"
+assert os.environ["RTSCORTEX_PAUSE_UNTIL_FIRST_PLAN"] == "true"
+""" + SUCCESS_WORKER
+
 
 def _supervisor(tmp_path: Path, worker_code: str) -> LiveProcessSupervisor:
     config = make_config(tmp_path)
@@ -217,6 +224,8 @@ environment:
   adapter: llm_pysc2
   scenario: pvz_task1_level1
   max_steps: 4
+  simulation_speed_multiplier: 0.25
+  pause_until_first_plan: true
 provider:
   kind: fake
 """,
@@ -226,7 +235,7 @@ provider:
         cli_module,
         "prepare_live_worker",
         lambda config, project_root: LiveWorkerSpec(
-            command=(sys.executable, "-c", SUCCESS_WORKER),
+            command=(sys.executable, "-c", PACED_SUCCESS_WORKER),
             sc2_path=tmp_path / "StarCraftII",
         ),
     )

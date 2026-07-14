@@ -17,12 +17,27 @@ def main() -> None:
         "--map",
         os.environ.get("RTSCORTEX_SCENARIO", "pvz_task1_level1"),
         "--agent_race",
-        "protoss",
+        os.environ.get("RTSCORTEX_AGENT_RACE", "protoss"),
+        "--agent2",
+        "Bot",
+        "--agent2_race",
+        os.environ.get("RTSCORTEX_OPPONENT_RACE", "random"),
+        "--difficulty",
+        os.environ.get("RTSCORTEX_OPPONENT_DIFFICULTY", "very_hard"),
+        "--bot_build",
+        os.environ.get("RTSCORTEX_OPPONENT_BUILD", "random"),
+        "--step_mul",
+        os.environ.get("RTSCORTEX_STEP_MUL", "1"),
         "--parallel",
         "1",
+        "--render=false",
+        "--save_replay=false",
         "--agent",
         "rtscortex_llm_pysc2.worker.RTSCortexMainAgent",
         "--random_seed",
         os.environ.get("RTSCORTEX_SEED", "0"),
     ]
+    game_steps_per_episode = os.environ.get("RTSCORTEX_GAME_STEPS_PER_EPISODE")
+    if game_steps_per_episode is not None:
+        command.extend(["--game_steps_per_episode", game_steps_per_episode])
     subprocess.run(command, check=True)

@@ -8,7 +8,7 @@ from threading import Condition
 from typing import Any, Optional
 
 from rtscortex_llm_pysc2.coordinator import BridgeCoordinator, BridgeDecision
-from rtscortex_llm_pysc2.extractor import TimeStepExtractor
+from rtscortex_llm_pysc2.extractor import TimeStepExtractor, current_team_order
 
 
 @dataclass
@@ -55,11 +55,36 @@ class SharedDecisionBroker:
         self._command_queues: dict[tuple[str, str, str], deque[str]] = defaultdict(deque)
         self._active_commands: dict[tuple[str, str], tuple[str, str]] = {}
         self._planner_pending = False
+        self._initial_decision_started = False
+        self._initial_decision_complete = False
+        self._initial_decision_error: Optional[Exception] = None
 
     @property
     def planner_pending(self) -> bool:
         with self._condition:
             return self._planner_pending
+
+    @property
+    def initial_decision_started(self) -> bool:
+        with self._condition:
+            return self._initial_decision_started
+
+    def wait_for_initial_decision(self, timeout_seconds: Optional[float] = None) -> None:
+        """Block the environment thread until the first Runtime decision exists."""
+
+        timeout = self.decision_timeout_seconds if timeout_seconds is None else timeout_seconds
+        with self._condition:
+            ready = self._condition.wait_for(
+                lambda: self._initial_decision_complete
+                or self._initial_decision_error is not None,
+                timeout=timeout,
+            )
+            if not ready:
+                raise TimeoutError("initial runtime decision did not complete before timeout")
+            if self._initial_decision_error is not None:
+                raise RuntimeError("initial runtime decision failed") from (
+                    self._initial_decision_error
+                )
 
     def register(self, agent: Any) -> None:
         with self._condition:
@@ -83,6 +108,9 @@ class SharedDecisionBroker:
             if set(state.submissions) == expected and not state.in_flight:
                 state.in_flight = True
                 leader = True
+                if not self._initial_decision_started:
+                    self._initial_decision_started = True
+                    self._condition.notify_all()
 
         if leader:
             self._decide(step_id)
@@ -96,6 +124,8 @@ class SharedDecisionBroker:
                 state.error = TimeoutError(
                     f"not all enabled agents submitted runtime step {step_id}"
                 )
+                if not self._initial_decision_complete:
+                    self._initial_decision_error = state.error
                 self._states.pop(step_id, None)
                 self._condition.notify_all()
             if state.error is not None:
@@ -112,21 +142,50 @@ class SharedDecisionBroker:
     def claim_primitive(
         self,
         agent_name: str,
-        team_name: str,
+        team_name: Optional[str],
         action_name: str,
         function_name: str,
         *,
         final_primitive: bool,
     ) -> Optional[PrimitiveDispatch]:
-        actor = (agent_name, team_name)
+        actor = self._resolve_dispatch_actor(agent_name, team_name, action_name)
+        if actor is None:
+            return None
         active = self._active_commands.get(actor)
         if active is None or active[0] != action_name:
-            queue = self._command_queues[(agent_name, team_name, action_name)]
+            queue = self._command_queues[(actor[0], actor[1], action_name)]
             if not queue:
                 return None
             active = (action_name, queue.popleft())
             self._active_commands[actor] = active
         return PrimitiveDispatch(active[1], function_name, final_primitive)
+
+    def _resolve_dispatch_actor(
+        self,
+        agent_name: str,
+        team_name: Optional[str],
+        action_name: str,
+    ) -> Optional[tuple[str, str]]:
+        if team_name is not None:
+            preferred = (agent_name, team_name)
+            active = self._active_commands.get(preferred)
+            queued = self._command_queues.get((agent_name, team_name, action_name))
+            if (active is not None and active[0] == action_name) or queued:
+                return preferred
+
+        candidates = {
+            (queued_agent, queued_team)
+            for (queued_agent, queued_team, queued_action), queue in self._command_queues.items()
+            if queued_agent == agent_name and queued_action == action_name and queue
+        }
+        candidates.update(
+            actor
+            for actor, active in self._active_commands.items()
+            if actor[0] == agent_name and active[0] == action_name
+        )
+        if len(candidates) == 1:
+            return candidates.pop()
+        return None
 
     def settle_primitive(
         self,
@@ -164,18 +223,21 @@ class SharedDecisionBroker:
                 step_id=step_id,
             )
             team_order = {
-                name: tuple(item.agent.team_unit_team_list) for name, item in submissions.items()
+                name: current_team_order(item.agent) for name, item in submissions.items()
             }
             decision = self.coordinator.decide(snapshot, team_order)
         except Exception as error:
             with self._condition:
                 state.error = error
+                if not self._initial_decision_complete:
+                    self._initial_decision_error = error
                 self._states.pop(step_id, None)
                 self._condition.notify_all()
             return
 
         with self._condition:
             state.decision = decision
+            self._initial_decision_complete = True
             self._planner_pending = bool(decision.action_batch.get("planner_pending", False))
             for route in decision.routes.values():
                 for command in route.commands:

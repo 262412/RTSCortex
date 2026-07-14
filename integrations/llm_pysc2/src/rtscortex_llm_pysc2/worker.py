@@ -11,8 +11,9 @@ from functools import partial
 from typing import Any, Optional
 
 from rtscortex_llm_pysc2.broker import PrimitiveDispatch, SharedDecisionBroker
+from rtscortex_llm_pysc2.clock import FixedRateGameClock, InitialPlanningBarrier
 from rtscortex_llm_pysc2.coordinator import BridgeCoordinator
-from rtscortex_llm_pysc2.extractor import TimeStepExtractor
+from rtscortex_llm_pysc2.extractor import TimeStepExtractor, build_screen_candidates
 from rtscortex_llm_pysc2.hook import RuntimeQueryMixin
 from rtscortex_llm_pysc2.protocol import RuntimeClient
 
@@ -37,6 +38,9 @@ class WorkerSettings:
     seed: int
     scenario: str = "pvz_task1_level1"
     pending_plan_step_delay_seconds: float = 0.0
+    simulation_speed_multiplier: Optional[float] = None
+    pause_until_first_plan: bool = False
+    runtime_request_timeout_seconds: float = 60.0
 
     @classmethod
     def from_environment(cls) -> WorkerSettings:
@@ -49,6 +53,13 @@ class WorkerSettings:
         )
         if pending_plan_step_delay_seconds < 0:
             raise RuntimeError("RTSCORTEX_PENDING_PLAN_STEP_DELAY_SECONDS cannot be negative")
+        simulation_speed = os.environ.get("RTSCORTEX_SIMULATION_SPEED_MULTIPLIER")
+        runtime_request_timeout_seconds = float(
+            os.environ.get("RTSCORTEX_RUNTIME_REQUEST_TIMEOUT_SECONDS", "60")
+        )
+        if runtime_request_timeout_seconds <= 0:
+            raise RuntimeError("RTSCORTEX_RUNTIME_REQUEST_TIMEOUT_SECONDS must be positive")
+        pause_until_first_plan = _environment_bool("RTSCORTEX_PAUSE_UNTIL_FIRST_PLAN", False)
         return cls(
             run_id=run_id,
             episode_id=episode_id,
@@ -58,6 +69,11 @@ class WorkerSettings:
             seed=int(os.environ.get("RTSCORTEX_SEED", "0")),
             scenario=os.environ.get("RTSCORTEX_SCENARIO", "pvz_task1_level1"),
             pending_plan_step_delay_seconds=pending_plan_step_delay_seconds,
+            simulation_speed_multiplier=(
+                float(simulation_speed) if simulation_speed is not None else None
+            ),
+            pause_until_first_plan=pause_until_first_plan,
+            runtime_request_timeout_seconds=runtime_request_timeout_seconds,
         )
 
 
@@ -70,6 +86,11 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
         self.broker = broker
         broker.register(self)
 
+    def get_func(self, obs: Any) -> Any:
+        if not self.func_list and self.action_list:
+            _refresh_build_action_position(self.action_list[0], obs.observation)
+        return super().get_func(obs)
+
 
 class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
     """Keep the upstream environment loop and attach RTSCortex at its query seam."""
@@ -80,6 +101,7 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
         self.runtime_client = RuntimeClient(
             base_url=self.worker_settings.runtime_url,
             unix_socket=self.worker_settings.socket_path,
+            timeout_seconds=self.worker_settings.runtime_request_timeout_seconds,
         )
         self.runtime_client.health()
         coordinator = BridgeCoordinator(self.runtime_client)
@@ -89,10 +111,17 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
             self.worker_settings.episode_id,
             unit_names=unit_names,
             building_types=building_types,
+            action_source_types=_production_action_source_types(),
         )
         self.decision_broker = SharedDecisionBroker(coordinator, extractor)
         self._pending_primitive: Optional[PrimitiveDispatch] = None
         self._episode_reported = False
+        self.initial_planning_barrier = InitialPlanningBarrier()
+        self.game_clock = (
+            FixedRateGameClock(self.worker_settings.simulation_speed_multiplier)
+            if self.worker_settings.simulation_speed_multiplier is not None
+            else None
+        )
 
         config = _scenario_config(self.worker_settings.scenario)
         subagent = partial(RTSCortexLLMAgent, broker=self.decision_broker)
@@ -104,13 +133,26 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
         if _is_terminal(obs):
             return _finish_terminal(self, obs, _base_agent_step, _no_op)
         action = super().step(obs)
+        if (
+            self.worker_settings.pause_until_first_plan
+            and self.initial_planning_barrier.blocks_steps
+            and self.decision_broker.initial_decision_started
+        ):
+            self.decision_broker.wait_for_initial_decision(
+                self.worker_settings.runtime_request_timeout_seconds + 5.0
+            )
+            self.initial_planning_barrier.release()
+            if self.game_clock is not None:
+                self.game_clock.reset()
         self._capture_primitive(action)
         delay = _pending_plan_idle_delay(
             action,
             planner_pending=self.decision_broker.planner_pending,
             configured_delay_seconds=self.worker_settings.pending_plan_step_delay_seconds,
         )
-        if delay:
+        if self.game_clock is not None:
+            self.game_clock.wait_for_step()
+        elif delay:
             time.sleep(delay)
         return action
 
@@ -135,10 +177,10 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
         if self._pending_primitive is not None or not self.AGENT_NAMES:
             return
         agent = self.agents[self.AGENT_NAMES[self.agent_id]]
-        team_name = getattr(agent, "team_unit_team_curr", None)
+        team_name = _execution_team_name(agent)
         action_name = getattr(agent, "curr_action_name", "")
         function_id = getattr(action, "function", None)
-        if not team_name or not action_name or function_id is None:
+        if not action_name or function_id is None:
             return
         action_specification = getattr(agent.translator_a, "ACTION_SPACE_DICT", {}).get(action_name)
         if action_specification is None:
@@ -148,7 +190,7 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
         final_primitive = int(function_id) in expected_ids and len(agent.func_list) == 0
         dispatch = self.decision_broker.claim_primitive(
             agent.name,
-            str(team_name),
+            team_name,
             str(action_name),
             function_name,
             final_primitive=final_primitive,
@@ -198,6 +240,7 @@ def _scenario_config(scenario: str) -> Any:
             "ConfigPysc2_Harass",
         ),
         "2s3z": ("llm_pysc2.agents.configs.llm_smac", "ConfigSmac_2s3z"),
+        "Simple64": ("rtscortex_llm_pysc2.melee", "RTSCortexMeleeConfig"),
     }
     try:
         module_name, class_name = definitions[scenario]
@@ -267,6 +310,17 @@ def _unit_metadata() -> tuple[dict[int, str], tuple[int, ...]]:
     return names, tuple(int(value) for value in utils.BUILDING_TYPE)
 
 
+def _production_action_source_types() -> dict[int, int]:
+    actions = importlib.import_module("pysc2.lib.actions")
+    llm_action = importlib.import_module("llm_pysc2.lib.llm_action")
+    result: dict[int, int] = {}
+    for function_id in range(len(actions.FUNCTIONS)):
+        source_type = llm_action.find_unit_type_the_func_belongs_to(function_id, "protoss")
+        if source_type is not None:
+            result[function_id] = int(source_type)
+    return result
+
+
 def _function_name(function_id: int) -> str:
     actions = importlib.import_module("pysc2.lib.actions")
     return str(actions.FUNCTIONS[function_id].name)
@@ -282,6 +336,49 @@ def _pending_plan_idle_delay(
     if planner_pending and function_id == 0:
         return configured_delay_seconds
     return 0.0
+
+
+def _execution_team_name(agent: Any) -> Optional[str]:
+    """Recover the implicit Empty actor omitted by the upstream execution loop."""
+
+    team_name = getattr(agent, "team_unit_team_curr", None)
+    if team_name is not None:
+        return str(team_name)
+    if getattr(agent, "flag_enable_empty_unit_group", False):
+        return "Empty"
+    return None
+
+
+def _environment_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized == "true":
+        return True
+    if normalized == "false":
+        return False
+    raise RuntimeError(f"{name} must be 'true' or 'false'")
+
+
+def _refresh_build_action_position(action: dict[str, Any], observation: Any) -> bool:
+    candidates = build_screen_candidates(observation, str(action.get("name", "")))
+    if not candidates:
+        return False
+    position = candidates[0]
+    refreshed_functions = []
+    for function_id, function, arguments in action.get("func", ()):
+        refreshed_arguments = tuple(
+            position
+            if isinstance(argument, list)
+            and len(argument) == 2
+            and all(isinstance(value, (int, float)) for value in argument)
+            else argument
+            for argument in arguments
+        )
+        refreshed_functions.append((function_id, function, refreshed_arguments))
+    action["func"] = refreshed_functions
+    return True
 
 
 def _finish_terminal(

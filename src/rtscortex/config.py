@@ -8,6 +8,21 @@ from typing import Literal, TypeAlias
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
+RaceName: TypeAlias = Literal["random", "protoss", "terran", "zerg"]
+BotDifficulty: TypeAlias = Literal[
+    "very_easy",
+    "easy",
+    "medium",
+    "medium_hard",
+    "hard",
+    "harder",
+    "very_hard",
+    "cheat_vision",
+    "cheat_money",
+    "cheat_insane",
+]
+BotBuild: TypeAlias = Literal["random", "rush", "timing", "power", "macro", "air"]
+
 
 class SettingsModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -23,6 +38,14 @@ class EnvironmentSettings(SettingsModel):
     adapter: Literal["mock", "llm_pysc2"] = "mock"
     scenario: str = "pvz_task1_level1"
     max_steps: int = Field(default=6, ge=1)
+    agent_race: RaceName = "protoss"
+    opponent_race: RaceName = "random"
+    opponent_difficulty: BotDifficulty = "very_hard"
+    opponent_build: BotBuild = "random"
+    step_mul: int = Field(default=1, ge=1)
+    game_steps_per_episode: int | None = Field(default=None, ge=1)
+    simulation_speed_multiplier: float | None = Field(default=None, gt=0.0, le=1.0)
+    pause_until_first_plan: bool = False
     sc2_path: Path | None = None
     worker_python: Path = Path("~/fastscratch/envs/rtscortex-llm-pysc2/bin/python")
     pending_plan_step_delay_seconds: float = Field(default=0.0, ge=0.0)

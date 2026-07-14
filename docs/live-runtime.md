@@ -13,10 +13,12 @@ Before a live run, provide all of the following:
   `RTSCORTEX_LLM_PYSC2_PYTHON`;
 - an executable `SC2_x64` below `SC2PATH`;
 - a supported scenario and its matching map/build combination:
+  - `Simple64`: `Maps/Melee/Simple64.SC2Map`, compatible with the official Linux
+    SC2 4.10/Base75689 package and recommended for Ladder/Melee live smoke runs;
   - `pvz_task1_level1`: `Maps/llm_pysc2/pvz_task1_level1.SC2Map`, SC2 build
     92440 (5.0.13) or newer;
   - `2s3z`: `Maps/llm_smac/2s3z.SC2Map`, compatible with the official Linux
-    SC2 4.10/Base75689 package;
+    SC2 4.10/Base75689 package, retained as a legacy task map;
 - both reviewed patches from `integrations/llm_pysc2/patches` applied to the pinned
   LLM-PySC2 checkout (asynchronous waiting and deterministic SC2 seeding).
 
@@ -40,48 +42,84 @@ The Blizzard download page currently exposes Linux packages only through SC2 4.1
 92440; a real create-game test shows Base75689 crashes while loading them. `doctor` and
 the live preflight therefore reject older builds instead of relying on path checks alone.
 
-Validate and launch the Linux-compatible `2s3z` bridge with:
+## Recommended Simple64 Ladder/Melee smoke
+
+`Simple64` is the recommended compute-center live path. It uses the RTSCortex-owned
+minimal Protoss melee configuration for building, production, Zealot, and Stalker
+control while leaving SC2 lifecycle and PySC2 execution in LLM-PySC2. The opponent is a
+built-in VeryEasy Zerg bot using the Macro build.
+
+Validate and launch the deterministic Fake-provider smoke with:
 
 ```bash
 SC2PATH=~/scratch/StarCraftII \
   uv run rtscortex doctor \
-  --config configs/experiments/live_2s3z.yaml \
+  --config configs/experiments/live_simple64.yaml \
   --require-sc2
 SC2PATH=~/scratch/StarCraftII \
-  uv run rtscortex run --config configs/experiments/live_2s3z.yaml
+  uv run rtscortex run --config configs/experiments/live_simple64.yaml
 ```
 
-The default `live_2s3z.yaml` uses the deterministic Fake Provider, so it tests the real
+`live_simple64.yaml` uses the deterministic Fake Provider, so it tests the real
 SC2 process, observation mapping, Unix-socket API, typed planning, actor routing, upstream
 translator, PySC2 execution feedback, and cleanup without requiring a model endpoint. A
-run that reaches `max_agent_steps` is recorded as `truncated`; that is expected for a
-bounded smoke and is distinct from a worker error.
+run is capped at 224 game loops and 256 agent steps.
 
-To use the Qwen3-8B vLLM service already running on the current compute node, use the
-separate real-model configuration:
+Use the separate real-model configuration for the Qwen3-8B vLLM service:
 
 ```bash
 SC2PATH=~/scratch/StarCraftII \
   uv run rtscortex doctor \
-  --config configs/experiments/live_2s3z_qwen3_8b.yaml \
+  --config configs/experiments/live_simple64_qwen3_8b.yaml \
   --require-sc2
 SC2PATH=~/scratch/StarCraftII \
-  uv run rtscortex run --config configs/experiments/live_2s3z_qwen3_8b.yaml
+  uv run rtscortex run --config configs/experiments/live_simple64_qwen3_8b.yaml
 ```
 
 That configuration targets `http://127.0.0.1:8000/v1`, requires the served model ID
-`Qwen/Qwen3-8B`, disables Qwen thinking, limits each structured completion to 512 tokens,
-and uses a 128-game-loop planning cadence. `doctor --config` checks the endpoint and exact
+`Qwen/Qwen3-8B`, disables Qwen thinking, limits each structured completion to 256 tokens,
+and uses a 112-game-loop planning cadence. `doctor --config` checks the endpoint and exact
 model ID before starting SC2. Because the address is loopback-only, the runtime must run
 on the same node as vLLM. Set `RTSCORTEX_LLM_API_KEY` only when the selected
-OpenAI-compatible endpoint requires authentication.
+OpenAI-compatible endpoint requires authentication. This smoke is capped at 1024 game
+loops and 1120 agent steps.
 
-The 2s3z simulation can otherwise finish in a few wall-clock seconds while a local model
-is still planning. While `ActionBatch.planner_pending` is true, the Qwen configuration
-therefore delays idle/no-op SC2 steps by 0.75 seconds. Attack, camera, selection, and other
-real primitives are never delayed, so cached plans and reflex actions retain the fast
-path. This fixed delay is tuned to the current node's observed Qwen latency; slower model
-deployments should measure and adjust it. Fake-provider configs leave the delay at zero.
+### Simulation and planning timing
+
+Both recommended configurations use `step_mul=1`: each environment step advances exactly
+one SC2 game loop. `simulation_speed_multiplier=0.25` applies a fixed monotonic clock to
+every step, producing 5.6 game loops per wall-clock second from SC2's 22.4-loop baseline.
+If work misses a wall-clock deadline, the clock skips obsolete deadlines rather than
+bursting through catch-up steps; it never skips SC2 game loops.
+
+`pause_until_first_plan=true` prevents the game from advancing until the first valid plan
+has completed. The pacing clock starts fresh when that one-time barrier releases. Later
+planner cycles are asynchronous: the SC2 loop continues at the fixed rate while the
+runtime validates cached actions and evaluates reflexes. A first-plan timeout or error is
+a startup failure rather than permission to begin with an empty plan.
+
+These limits make both configurations live integration smokes, not complete ladder
+matches or win-rate measurements. When the SC2 episode reaches its configured game-loop
+cap before either player wins, the current worker reports a zero-reward `draw`; that
+bounded result must not be interpreted as a completed match. Live execution always
+passes `--save_replay=false`.
+
+### Build position handling
+
+The bridge derives `Build_Pylon_Screen` and `Build_Gateway_Screen` candidates from the
+current feature-screen buildability, pathing, ownership, and power layers. Candidates
+must satisfy both PySC2's row-major feature planes and LLM-PySC2's transposed coordinate
+validator. Compact candidate lines are included in the model's spatial context.
+Immediately before the upstream translator executes a build action, the worker derives
+candidates again from the latest observation and refreshes the screen coordinate. The
+coordinate in an older plan is therefore not replayed blindly after camera or map state
+changes.
+
+An empty next-step `action_result` currently proves that SC2 accepted the feature action,
+not that the requested structure appeared in game state. The 1024-loop Qwen smoke can
+submit `Build_Pylon_screen` without a Pylon appearing in later observations. State-based
+effect confirmation is therefore still an open bridge requirement; execution success
+must not yet be read as construction success.
 
 The model-facing context keeps the typed observation, alerts, available actions, and
 compact decision/execution memory while omitting the verbose raw observation text. The
@@ -92,11 +130,47 @@ Asynchronous plans record their source loop, acceptance loop, and age. Their TTL
 at acceptance, while `Attack_Unit` commands carry a `unit_exists` precondition so a target
 that disappeared during model inference is rejected before reaching the bridge.
 
+## Legacy task-map scenarios
+
+### 2s3z micro task
+
+`2s3z` remains available for regression coverage of the original task-map bridge. It is a
+small fixed micro-combat task, not a Ladder/Melee game, and is no longer the recommended
+compute-center live scenario.
+
+```bash
+SC2PATH=~/scratch/StarCraftII \
+  uv run rtscortex doctor \
+  --config configs/experiments/live_2s3z.yaml \
+  --require-sc2
+SC2PATH=~/scratch/StarCraftII \
+  uv run rtscortex run --config configs/experiments/live_2s3z.yaml
+```
+
+The default `live_2s3z.yaml` uses the Fake Provider. The legacy Qwen configuration uses
+the same loopback `Qwen/Qwen3-8B` endpoint:
+
+```bash
+SC2PATH=~/scratch/StarCraftII \
+  uv run rtscortex doctor \
+  --config configs/experiments/live_2s3z_qwen3_8b.yaml \
+  --require-sc2
+SC2PATH=~/scratch/StarCraftII \
+  uv run rtscortex run --config configs/experiments/live_2s3z_qwen3_8b.yaml
+```
+
+Because this task can otherwise finish in a few wall-clock seconds, that older
+configuration delays idle/no-op steps by 0.75 seconds while
+`ActionBatch.planner_pending` is true. This content-dependent delay is retained for
+legacy regression behavior; the recommended Simple64 configurations use the fixed game
+clock instead.
+
 The `2s3z` arena is only 32 by 32 world units. Its camera is clamped at the map edge, so
-an initial unit cannot satisfy LLM-PySC2's large-map centering threshold. The bridge
-therefore marks strict centering complete for this scenario; upstream still infers the
-coordinate range from the first observation before entering its grouping and decision
-loop. The PvZ scenario continues to use the complete upstream camera calibration.
+an initial unit cannot satisfy LLM-PySC2's large-map centering threshold. The bridge marks
+strict centering complete for this scenario while still inferring its coordinate range
+before grouping and decision execution.
+
+### Original PvZ task
 
 Validate and launch the original Protoss PvZ scenario only with a compatible SC2 build:
 
@@ -109,13 +183,17 @@ SC2PATH=/path/to/StarCraftII \
   uv run rtscortex run --config configs/experiments/live_pvz.yaml
 ```
 
+This remains a task-map integration path rather than the recommended melee smoke. It
+continues to use complete upstream camera calibration and requires SC2 build 92440 or
+newer because Base75689 cannot load the saved map.
+
 The worker receives `RTSCORTEX_RUNTIME_SOCKET`, `RTSCORTEX_RUN_ID`,
 `RTSCORTEX_EPISODE_ID`, `RTSCORTEX_SCENARIO`, `RTSCORTEX_SEED`, and `SC2PATH`. The current
 bridge also receives `RTSCORTEX_SOCKET` as its socket variable. Worker stdout and stderr,
 the config snapshot, SQLite state, and the JSONL event journal are stored in the run's
 artifact directory.
 
-Live runs currently pass `--save_replay=false` to PySC2 and do not create
+Every live run passes `--save_replay=false` to PySC2 and does not create
 `.SC2Replay` files. Use `rtscortex report <run-dir>` to turn the JSONL journal into a
 readable `timeline.md` until replay capture is deliberately enabled in a later version.
 

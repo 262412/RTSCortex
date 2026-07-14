@@ -104,6 +104,11 @@ class RuntimeEngine:
             self._last_plan_game_loop = observation.game_loop
             if self.config.runtime.deterministic:
                 await self._run_deterministic_planner(context)
+            elif (
+                self.config.environment.pause_until_first_plan
+                and self._cached_plan is None
+            ):
+                await self._run_initial_plan_barrier(context)
             elif self._planner_task is None:
                 self._planner_task = asyncio.create_task(self._deliberate_with_timeout(context))
 
@@ -186,6 +191,23 @@ class RuntimeEngine:
                 "planner_error",
                 {"error_type": type(error).__name__, "message": str(error)},
             )
+
+    async def _run_initial_plan_barrier(self, context: AgentContext) -> None:
+        """Require one valid plan before allowing the live game to advance."""
+
+        try:
+            plan = await self._deliberate_with_timeout(context)
+            self._accept_plan(plan, context.observation)
+        except TimeoutError as error:
+            self._record_planner_event(context.observation, "planner_timeout", {})
+            raise RuntimeError("initial planner timed out before the game could start") from error
+        except Exception as error:
+            self._record_planner_event(
+                context.observation,
+                "planner_error",
+                {"error_type": type(error).__name__, "message": str(error)},
+            )
+            raise RuntimeError("initial planner failed before the game could start") from error
 
     async def _collect_finished_planner(self, observation: ObservationEnvelope) -> None:
         if self._planner_task is None or not self._planner_task.done():

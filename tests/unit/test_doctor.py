@@ -190,6 +190,29 @@ def test_sc2_checks_accepts_2s3z_on_base75689(
     }
 
 
+def test_sc2_checks_accept_official_melee_map_without_submodule_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sc2_path = tmp_path / "StarCraftII"
+    executable = sc2_path / "Versions/Base75689/SC2_x64"
+    executable.parent.mkdir(parents=True)
+    executable.touch()
+    installed_map = sc2_path / "Maps/Melee/Simple64.SC2Map"
+    installed_map.parent.mkdir(parents=True)
+    installed_map.touch()
+    monkeypatch.setenv("SC2PATH", str(sc2_path))
+
+    checks = _sc2_checks(tmp_path, required=True, scenario="Simple64")
+
+    assert {check.name: check.status for check in checks} == {
+        "scenario_map_source": "optional",
+        "starcraft_ii": "ok",
+        "scenario_map_installed": "ok",
+    }
+    source_check = next(check for check in checks if check.name == "scenario_map_source")
+    assert "official map pack" in source_check.detail
+
+
 def test_sc2_checks_rejects_incomplete_configured_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

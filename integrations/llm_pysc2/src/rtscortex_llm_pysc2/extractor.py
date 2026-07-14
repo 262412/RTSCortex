@@ -26,11 +26,16 @@ class TimeStepExtractor:
         *,
         unit_names: Optional[Mapping[int, str]] = None,
         building_types: Sequence[int] = (),
+        action_source_types: Optional[Mapping[int, int]] = None,
     ) -> None:
         self.run_id = run_id
         self.episode_id = episode_id
         self.unit_names = dict(unit_names or {})
         self.building_types = frozenset(int(value) for value in building_types)
+        self.action_source_types = {
+            int(function_id): int(unit_type)
+            for function_id, unit_type in (action_source_types or {}).items()
+        }
 
     def extract(
         self,
@@ -46,6 +51,14 @@ class TimeStepExtractor:
             raise ValueError("PySC2 observation has no player data")
 
         raw_units = list(_value(observation, "raw_units", ()))
+        text_observation = "\n\n".join(
+            f"[{name}]\n{text_observations[name]}" for name in sorted(text_observations)
+        )
+        build_candidates = _build_screen_candidate_lines(observation)
+        if build_candidates:
+            text_observation = "\n\n".join(
+                [text_observation, "[RTSCortex Build Candidates]", *build_candidates]
+            )
         return {
             "run_id": self.run_id,
             "episode_id": self.episode_id,
@@ -56,10 +69,16 @@ class TimeStepExtractor:
             "production_queue": _extract_production_queue(observation),
             "units": [self._extract_unit(unit) for unit in raw_units],
             "upgrades": [f"upgrade:{int(value)}" for value in _value(observation, "upgrades", ())],
-            "teams": _extract_team_actions(agents),
-            "text_observation": "\n\n".join(
-                f"[{name}]\n{text_observations[name]}" for name in sorted(text_observations)
+            "teams": _extract_team_actions(
+                agents,
+                owned_unit_types={
+                    int(_value(unit, "unit_type", 0))
+                    for unit in raw_units
+                    if int(_value(unit, "alliance", 0)) == 1
+                },
+                action_source_types=self.action_source_types,
             ),
+            "text_observation": text_observation,
             "alerts": [_alert_name(value) for value in _value(observation, "alerts", ())],
             "image_uri": None,
         }
@@ -113,7 +132,12 @@ def _extract_production_queue(observation: Any) -> list[dict[str, Any]]:
     return result
 
 
-def _extract_team_actions(agents: Mapping[str, Any]) -> list[dict[str, Any]]:
+def _extract_team_actions(
+    agents: Mapping[str, Any],
+    *,
+    owned_unit_types: set[int],
+    action_source_types: Mapping[int, int],
+) -> list[dict[str, Any]]:
     teams = []
     for agent_name in sorted(agents):
         agent = agents[agent_name]
@@ -121,10 +145,20 @@ def _extract_team_actions(agents: Mapping[str, Any]) -> list[dict[str, Any]]:
             str(team["name"]): team for team in agent.config.AGENTS[agent_name]["team"]
         }
         team_observations = list(agent.team_unit_obs_list)
-        for index, team_name in enumerate(agent.team_unit_team_list):
+        for index, team_name in enumerate(current_team_order(agent)):
             team = team_definitions[str(team_name)]
-            available_ids = _available_function_ids(team_observations, index)
-            actions = _available_team_actions(agent, team, available_ids)
+            available_ids = (
+                None
+                if str(team_name) == "Empty"
+                else _available_function_ids(team_observations, index)
+            )
+            actions = _available_team_actions(
+                agent,
+                team,
+                available_ids,
+                owned_unit_types=owned_unit_types,
+                action_source_types=action_source_types,
+            )
             teams.append(
                 {
                     "agent_name": agent_name,
@@ -135,8 +169,26 @@ def _extract_team_actions(agents: Mapping[str, Any]) -> list[dict[str, Any]]:
     return teams
 
 
+def current_team_order(agent: Any) -> tuple[str, ...]:
+    """Return the positional team order, including upstream's implicit Empty team."""
+
+    team_names = [str(value) for value in agent.team_unit_team_list]
+    if getattr(agent, "flag_enable_empty_unit_group", False):
+        configured_teams = agent.config.AGENTS[agent.name]["team"]
+        for team in configured_teams:
+            name = str(team["name"])
+            if name == "Empty" and name not in team_names:
+                team_names.append(name)
+    return tuple(team_names)
+
+
 def _available_team_actions(
-    agent: Any, team: Mapping[str, Any], available_ids: Optional[frozenset[int]]
+    agent: Any,
+    team: Mapping[str, Any],
+    available_ids: Optional[frozenset[int]],
+    *,
+    owned_unit_types: set[int],
+    action_source_types: Mapping[int, int],
 ) -> list[dict[str, Any]]:
     action_space = agent.config.AGENTS[agent.name]["action"]
     unit_types = list(team.get("unit_type", ())) or ["EmptyGroup"]
@@ -149,6 +201,13 @@ def _available_team_actions(
             continue
         function_ids = [int(triple[0]) for triple in action.get("func", ())]
         if available_ids is not None and any(value not in available_ids for value in function_ids):
+            continue
+        required_sources = {
+            action_source_types[function_id]
+            for function_id in function_ids
+            if function_id in action_source_types
+        }
+        if required_sources and not required_sources.issubset(owned_unit_types):
             continue
         key = (str(action["name"]), argument_names)
         if key in seen:
@@ -176,6 +235,107 @@ def _available_function_ids(
         return None
     values = _value(team_observations[index].observation, "available_actions", ())
     return frozenset(int(value) for value in values)
+
+
+def _build_screen_candidate_lines(observation: Any) -> list[str]:
+    pylon = build_screen_candidates(observation, "Build_Pylon_Screen")
+    gateway = build_screen_candidates(observation, "Build_Gateway_Screen")
+    result = []
+    if pylon:
+        result.append(f"Build_Pylon_Screen candidates: {pylon}")
+    if gateway:
+        result.append(f"Build_Gateway_Screen candidates: {gateway}")
+    return result
+
+
+def build_screen_candidates(observation: Any, action_name: str) -> list[list[int]]:
+    specifications = {
+        "Build_Pylon_Screen": (2, False),
+        "Build_Gateway_Screen": (3, True),
+    }
+    if action_name not in specifications:
+        return []
+    feature_screen = _value(observation, "feature_screen", None)
+    if feature_screen is None:
+        return []
+    buildable = _value(feature_screen, "buildable", None)
+    pathable = _value(feature_screen, "pathable", None)
+    player_relative = _value(feature_screen, "player_relative", None)
+    power = _value(feature_screen, "power", None)
+    shape = getattr(buildable, "shape", ())
+    if not shape or buildable is None or pathable is None or player_relative is None:
+        return []
+    screen_size = int(shape[0])
+    building_size, require_power = specifications[action_name]
+    return _valid_build_positions(
+        buildable,
+        pathable,
+        player_relative,
+        power,
+        screen_size=screen_size,
+        building_size=building_size,
+        require_power=require_power,
+    )
+
+
+def _valid_build_positions(
+    buildable: Any,
+    pathable: Any,
+    player_relative: Any,
+    power: Any,
+    *,
+    screen_size: int,
+    building_size: int,
+    require_power: bool,
+) -> list[list[int]]:
+    ratio = max(1, int(screen_size / 24))
+    stride = max(4, ratio)
+    candidates: list[tuple[float, int, int]] = []
+    for x0 in range(stride, screen_size, stride):
+        for y0 in range(stride, screen_size, stride):
+            if require_power and (
+                power is None or power[x0][y0] != 1 or power[y0][x0] != 1
+            ):
+                continue
+            x1 = int(x0 - ratio * (building_size - 1) / 2)
+            y1 = int(y0 - ratio * (building_size - 1) / 2)
+            valid = True
+            for i in range(building_size):
+                for j in range(building_size):
+                    x = int(x1 + i * ratio)
+                    y = int(y1 + j * ratio)
+                    if not (0 < x < screen_size and 0 < y < screen_size):
+                        valid = False
+                    elif not _build_cell_is_valid_in_both_coordinate_orders(
+                        buildable,
+                        pathable,
+                        player_relative,
+                        x,
+                        y,
+                    ):
+                        valid = False
+            if valid:
+                distance = (x0 - screen_size / 2) ** 2 + (y0 - screen_size / 2) ** 2
+                candidates.append((distance, x0, y0))
+    candidates.sort()
+    return [[x, y] for _, x, y in candidates[:8]]
+
+
+def _build_cell_is_valid_in_both_coordinate_orders(
+    buildable: Any,
+    pathable: Any,
+    player_relative: Any,
+    x: int,
+    y: int,
+) -> bool:
+    """Satisfy PySC2's row-major plane and LLM-PySC2's transposed validator."""
+
+    for row, column in ((y, x), (x, y)):
+        if buildable[row][column] != 1 or pathable[row][column] != 1:
+            return False
+        if player_relative[row][column] not in (0, 1):
+            return False
+    return True
 
 
 def _value(value: Any, name: str, default: Any) -> Any:

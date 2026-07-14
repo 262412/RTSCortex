@@ -119,6 +119,19 @@ def test_coordinator_calls_runtime_once_and_reports_execution() -> None:
     assert runtime.execution_reports == [report]
 
 
+def test_coordinator_does_not_redispatch_a_cached_command_id() -> None:
+    runtime = FakeRuntime(load_fixture("action_batch.json"))
+    coordinator = BridgeCoordinator(runtime)
+    snapshot = load_fixture("observation_snapshot.json")
+
+    first = coordinator.decide(snapshot, {"CombatGroup7": TEAM_ORDER})
+    second = coordinator.decide(snapshot, {"CombatGroup7": TEAM_ORDER})
+
+    assert len(first.routes["CombatGroup7"].commands) == 3
+    assert second.routes["CombatGroup7"].commands == ()
+    assert "<Attack_Unit" not in second.routes["CombatGroup7"].action_text
+
+
 def test_coordinator_reports_pending_commands_before_episode_end() -> None:
     runtime = FakeRuntime(load_fixture("action_batch.json"))
     coordinator = BridgeCoordinator(runtime)

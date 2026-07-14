@@ -4,6 +4,7 @@ import stat
 from pathlib import Path
 
 import pytest
+from rtscortex_llm_pysc2 import entrypoint as worker_entrypoint
 
 from rtscortex.config import EnvironmentSettings
 from rtscortex.runtime.live import LiveEnvironmentError, prepare_live_worker
@@ -68,6 +69,16 @@ def test_prepare_live_worker_builds_fixed_pysc2_command(tmp_path: Path) -> None:
         "rtscortex_llm_pysc2.worker.RTSCortexMainAgent",
         "--agent_race",
         "protoss",
+        "--agent2",
+        "Bot",
+        "--agent2_race",
+        "random",
+        "--difficulty",
+        "very_hard",
+        "--bot_build",
+        "random",
+        "--step_mul",
+        "1",
         "--parallel",
         "1",
         "--render=false",
@@ -142,6 +153,108 @@ def test_prepare_live_worker_accepts_2s3z_on_sc2_410(tmp_path: Path) -> None:
     assert spec.sc2_path == sc2_path
     assert spec.command[spec.command.index("--map") + 1] == "2s3z"
     assert spec.command[spec.command.index("--max_agent_steps") + 1] == "128"
+
+
+def test_prepare_live_worker_builds_official_melee_bot_command(tmp_path: Path) -> None:
+    base_python = tmp_path / "python3.9"
+    base_python.write_text("#!/bin/sh\necho 'Python 3.9.99'\n", encoding="utf-8")
+    base_python.chmod(base_python.stat().st_mode | stat.S_IXUSR)
+    worker_python = tmp_path / "worker-venv/bin/python"
+    worker_python.parent.mkdir(parents=True)
+    worker_python.symlink_to(base_python)
+
+    sc2_path = tmp_path / "StarCraftII"
+    executable = sc2_path / "Versions/Base75689/SC2_x64"
+    executable.parent.mkdir(parents=True)
+    executable.touch()
+    executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
+    scenario_map = sc2_path / "Maps/Melee/Simple64.SC2Map"
+    scenario_map.parent.mkdir(parents=True)
+    scenario_map.touch()
+    _write_worker_patch_sources(tmp_path)
+
+    config = make_config(tmp_path).model_copy(
+        update={
+            "environment": EnvironmentSettings(
+                adapter="llm_pysc2",
+                scenario="Simple64",
+                sc2_path=sc2_path,
+                worker_python=worker_python,
+                max_steps=40_000,
+                agent_race="protoss",
+                opponent_race="zerg",
+                opponent_difficulty="easy",
+                opponent_build="macro",
+                step_mul=1,
+                game_steps_per_episode=28_800,
+            )
+        }
+    )
+
+    spec = prepare_live_worker(config, tmp_path, environment={})
+
+    assert spec.command == (
+        str(worker_python),
+        "-m",
+        "pysc2.bin.agent",
+        "--map",
+        "Simple64",
+        "--agent",
+        "rtscortex_llm_pysc2.worker.RTSCortexMainAgent",
+        "--agent_race",
+        "protoss",
+        "--agent2",
+        "Bot",
+        "--agent2_race",
+        "zerg",
+        "--difficulty",
+        "easy",
+        "--bot_build",
+        "macro",
+        "--step_mul",
+        "1",
+        "--game_steps_per_episode",
+        "28800",
+        "--parallel",
+        "1",
+        "--render=false",
+        "--save_replay=false",
+        "--max_agent_steps",
+        "40000",
+        "--random_seed",
+        "0",
+    )
+
+
+def test_worker_entrypoint_forwards_melee_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[list[str]] = []
+
+    def run(command: list[str], *, check: bool) -> None:
+        assert check is True
+        captured.append(command)
+
+    monkeypatch.setenv("RTSCORTEX_SCENARIO", "Simple64")
+    monkeypatch.setenv("RTSCORTEX_AGENT_RACE", "protoss")
+    monkeypatch.setenv("RTSCORTEX_OPPONENT_RACE", "zerg")
+    monkeypatch.setenv("RTSCORTEX_OPPONENT_DIFFICULTY", "easy")
+    monkeypatch.setenv("RTSCORTEX_OPPONENT_BUILD", "macro")
+    monkeypatch.setenv("RTSCORTEX_STEP_MUL", "1")
+    monkeypatch.setenv("RTSCORTEX_GAME_STEPS_PER_EPISODE", "28800")
+    monkeypatch.setattr("rtscortex_llm_pysc2.entrypoint.subprocess.run", run)
+
+    worker_entrypoint.main()
+
+    command = captured[0]
+    assert command[command.index("--map") + 1] == "Simple64"
+    assert command[command.index("--agent2") + 1] == "Bot"
+    assert command[command.index("--agent2_race") + 1] == "zerg"
+    assert command[command.index("--difficulty") + 1] == "easy"
+    assert command[command.index("--bot_build") + 1] == "macro"
+    assert command[command.index("--step_mul") + 1] == "1"
+    assert command[command.index("--game_steps_per_episode") + 1] == "28800"
+    assert "--save_replay=false" in command
 
 
 def test_prepare_live_worker_rejects_unsupported_scenario(tmp_path: Path) -> None:

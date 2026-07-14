@@ -210,10 +210,19 @@ def _sc2_checks(
         specification = live_scenario_spec(scenario)
     except LiveEnvironmentError as error:
         return [Check("live_scenario", "error", str(error))]
-    map_relative = Path(specification.map_directory) / f"{scenario}.SC2Map"
+    map_relative = specification.map_relative_path(scenario)
     source_map = project_root / "third_party/LLM-PySC2/llm_pysc2/maps" / map_relative
-    source_map_status = "ok" if source_map.is_file() else "error"
-    checks = [Check("scenario_map_source", source_map_status, str(source_map))]
+    if specification.source_map_required:
+        source_map_status = "ok" if source_map.is_file() else "error"
+        checks = [Check("scenario_map_source", source_map_status, str(source_map))]
+    else:
+        checks = [
+            Check(
+                "scenario_map_source",
+                "optional",
+                f"official map pack; no submodule source required ({map_relative})",
+            )
+        ]
 
     sc2_path_value = os.environ.get("SC2PATH")
     if sc2_path_value:

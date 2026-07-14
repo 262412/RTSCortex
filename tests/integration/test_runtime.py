@@ -188,6 +188,29 @@ def test_background_planner_is_timeout_bounded(tmp_path: Path) -> None:
     asyncio.run(execute())
 
 
+def test_first_plan_barrier_waits_for_initial_background_plan(tmp_path: Path) -> None:
+    config = make_config(
+        tmp_path,
+        variant="planner_only",
+        deterministic=False,
+    )
+    config.environment.pause_until_first_plan = True
+    store = EventStore(tmp_path / "events.sqlite3", tmp_path / "events.jsonl")
+    runtime = RuntimeEngine(config=config, store=store, provider=FakeProvider())
+
+    async def execute() -> None:
+        try:
+            batch = await runtime.tick(make_observation(step_id=0, game_loop=0))
+
+            assert batch.planner_pending is False
+            assert batch.strategic_goal == "Remove the visible threat"
+            assert batch.commands[0].source.value == "planner"
+        finally:
+            await runtime.close()
+
+    asyncio.run(execute())
+
+
 def test_background_plan_ttl_starts_when_plan_is_accepted(tmp_path: Path) -> None:
     config = make_config(
         tmp_path,

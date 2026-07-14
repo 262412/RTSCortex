@@ -9,14 +9,20 @@ from typing import Any, cast
 import pytest
 from rtscortex_llm_pysc2.broker import SharedDecisionBroker
 from rtscortex_llm_pysc2.coordinator import BridgeCoordinator
-from rtscortex_llm_pysc2.extractor import TimeStepExtractor
+from rtscortex_llm_pysc2.extractor import (
+    TimeStepExtractor,
+    build_screen_candidates,
+    current_team_order,
+)
 from rtscortex_llm_pysc2.hook import RuntimeDecisionBroker, RuntimeQueryMixin
 from rtscortex_llm_pysc2.observation import ObservationMapper
 from rtscortex_llm_pysc2.worker import (
     WorkerSettings,
     _apply_scenario_bootstrap,
+    _execution_team_name,
     _finish_terminal,
     _pending_plan_idle_delay,
+    _refresh_build_action_position,
     _scenario_config,
 )
 
@@ -155,6 +161,9 @@ def test_worker_settings_prefer_canonical_runtime_environment(
     monkeypatch.setenv("RTSCORTEX_SCENARIO", "pvz_task1_level1")
     monkeypatch.setenv("RTSCORTEX_SEED", "17")
     monkeypatch.setenv("RTSCORTEX_PENDING_PLAN_STEP_DELAY_SECONDS", "0.75")
+    monkeypatch.setenv("RTSCORTEX_SIMULATION_SPEED_MULTIPLIER", "0.25")
+    monkeypatch.setenv("RTSCORTEX_PAUSE_UNTIL_FIRST_PLAN", "true")
+    monkeypatch.setenv("RTSCORTEX_RUNTIME_REQUEST_TIMEOUT_SECONDS", "50")
 
     settings = WorkerSettings.from_environment()
 
@@ -162,6 +171,9 @@ def test_worker_settings_prefer_canonical_runtime_environment(
     assert settings.scenario == "pvz_task1_level1"
     assert settings.seed == 17
     assert settings.pending_plan_step_delay_seconds == 0.75
+    assert settings.simulation_speed_multiplier == 0.25
+    assert settings.pause_until_first_plan is True
+    assert settings.runtime_request_timeout_seconds == 50.0
 
 
 def test_shared_broker_exposes_pending_planner_state() -> None:
@@ -182,6 +194,28 @@ def test_shared_broker_exposes_pending_planner_state() -> None:
     agent.query(timestep)
 
     assert broker.planner_pending is True
+
+
+def test_shared_broker_initial_barrier_waits_for_first_runtime_decision() -> None:
+    runtime = BlockingRuntime()
+    broker = SharedDecisionBroker(
+        BridgeCoordinator(runtime),
+        TimeStepExtractor("run-worker", "episode-worker"),
+    )
+    timestep = _fake_timestep()
+    agent = FakeAgent("AgentA", "A", timestep, broker)
+    broker.register(agent)
+    thread = threading.Thread(target=agent.query, args=(timestep,))
+
+    thread.start()
+    assert runtime.entered.wait(timeout=1)
+    assert broker.initial_decision_started is True
+
+    runtime.release.set()
+    broker.wait_for_initial_decision()
+    thread.join(timeout=1)
+
+    assert not thread.is_alive()
 
 
 def test_pending_plan_pacing_only_delays_no_op() -> None:
@@ -221,6 +255,182 @@ def test_timestep_extractor_maps_sc2_attack_alerts() -> None:
     )
 
     assert snapshot["alerts"] == ["building_under_attack", "unit_under_attack", "alert:3"]
+
+
+def test_timestep_extractor_adds_valid_pylon_screen_candidates() -> None:
+    timestep = _fake_timestep()
+    timestep.observation.feature_screen = SimpleNamespace(
+        buildable=UniformGrid(1),
+        pathable=UniformGrid(1),
+        player_relative=UniformGrid(0),
+        power=UniformGrid(0),
+    )
+    agent = FakeAgent("Builder", "Builder-Probe-1", timestep, StubBroker())
+
+    snapshot = TimeStepExtractor("run-worker", "episode-worker").extract(
+        timestep,
+        {"Builder": agent},
+        {"Builder": "builder observation"},
+        step_id=1,
+    )
+
+    assert "Build_Pylon_Screen candidates:" in snapshot["text_observation"]
+    assert "[65, 65]" in snapshot["text_observation"]
+    assert "Build_Gateway_Screen candidates:" not in snapshot["text_observation"]
+
+
+def test_worker_refreshes_volatile_build_position_at_execution_time() -> None:
+    observation = SimpleNamespace(
+        feature_screen=SimpleNamespace(
+            buildable=UniformGrid(1),
+            pathable=UniformGrid(1),
+            player_relative=UniformGrid(0),
+            power=UniformGrid(0),
+        )
+    )
+    action = {
+        "name": "Build_Pylon_Screen",
+        "arg": ["screen"],
+        "func": [(70, object(), ("now", [54.0, 68.0]))],
+    }
+
+    refreshed = _refresh_build_action_position(action, observation)
+
+    assert refreshed is True
+    assert action["func"][0][2] == ("now", [65, 65])
+
+
+def test_build_candidates_require_pysc2_and_upstream_coordinate_orders() -> None:
+    buildable = [[0 for _ in range(128)] for _ in range(128)]
+    pathable = [[0 for _ in range(128)] for _ in range(128)]
+    player_relative = [[2 for _ in range(128)] for _ in range(128)]
+    power = [[0 for _ in range(128)] for _ in range(128)]
+    for row in (62, 67):
+        for column in (67, 72):
+            buildable[row][column] = 1
+            pathable[row][column] = 1
+            player_relative[row][column] = 0
+    observation = SimpleNamespace(
+        feature_screen=SimpleNamespace(
+            buildable=Grid(buildable),
+            pathable=Grid(pathable),
+            player_relative=Grid(player_relative),
+            power=Grid(power),
+        )
+    )
+
+    assert build_screen_candidates(observation, "Build_Pylon_Screen") == []
+
+    for row in (67, 72):
+        for column in (62, 67):
+            buildable[row][column] = 1
+            pathable[row][column] = 1
+            player_relative[row][column] = 0
+
+    assert [65, 70] in build_screen_candidates(observation, "Build_Pylon_Screen")
+
+
+def test_timestep_extractor_exposes_developer_empty_team_actions() -> None:
+    timestep = _fake_timestep()
+    train = {"name": "Train_Zealot", "arg": [], "func": [(100, None, ())]}
+    agent = SimpleNamespace(
+        name="Developer",
+        flag_enable_empty_unit_group=True,
+        team_unit_team_list=[],
+        team_unit_obs_list=[timestep],
+        config=SimpleNamespace(
+            AGENTS={
+                "Developer": {
+                    "team": [{"name": "Empty", "unit_type": []}],
+                    "action": {"EmptyGroup": [train]},
+                }
+            }
+        ),
+    )
+
+    snapshot = TimeStepExtractor("run-worker", "episode-worker").extract(
+        timestep,
+        {"Developer": agent},
+        {"Developer": "production overview"},
+        step_id=1,
+    )
+
+    assert current_team_order(agent) == ("Empty",)
+    assert snapshot["teams"] == [
+        {
+            "agent_name": "Developer",
+            "team_name": "Empty",
+            "available_actions": [
+                {"name": "No_Operation", "argument_names": [], "argument_types": []},
+                {"name": "Train_Zealot", "argument_names": [], "argument_types": []},
+            ],
+        }
+    ]
+
+
+def test_timestep_extractor_hides_production_action_without_source_structure() -> None:
+    timestep = _fake_timestep()
+    train = {"name": "Train_Zealot", "arg": [], "func": [(100, None, ())]}
+    agent = SimpleNamespace(
+        name="Developer",
+        flag_enable_empty_unit_group=True,
+        team_unit_team_list=[],
+        team_unit_obs_list=[timestep],
+        config=SimpleNamespace(
+            AGENTS={
+                "Developer": {
+                    "team": [{"name": "Empty", "unit_type": []}],
+                    "action": {"EmptyGroup": [train]},
+                }
+            }
+        ),
+    )
+
+    snapshot = TimeStepExtractor(
+        "run-worker",
+        "episode-worker",
+        action_source_types={100: 999},
+    ).extract(
+        timestep,
+        {"Developer": agent},
+        {"Developer": "production overview"},
+        step_id=1,
+    )
+
+    assert snapshot["teams"][0]["available_actions"] == [
+        {"name": "No_Operation", "argument_names": [], "argument_types": []}
+    ]
+
+
+def test_empty_team_is_used_for_developer_primitive_tracking() -> None:
+    agent = SimpleNamespace(
+        flag_enable_empty_unit_group=True,
+        team_unit_tag_list=[],
+        team_unit_team_curr=None,
+    )
+
+    assert _execution_team_name(agent) == "Empty"
+
+
+def test_broker_recovers_empty_team_when_upstream_leaves_a_stale_team_name() -> None:
+    broker = SharedDecisionBroker(
+        BridgeCoordinator(FakeRuntime()),
+        TimeStepExtractor("run-worker", "episode-worker"),
+    )
+    broker._command_queues[("Developer", "Empty", "Train_Zealot")].append(  # noqa: SLF001
+        "command-train"
+    )
+
+    dispatch = broker.claim_primitive(
+        "Developer",
+        "WarpGate-1",
+        "Train_Zealot",
+        "Train_Zealot_quick",
+        final_primitive=True,
+    )
+
+    assert dispatch is not None
+    assert dispatch.command_id == "command-train"
 
 
 def test_worker_selects_2s3z_config_and_adds_no_operation(
@@ -276,6 +486,37 @@ def test_worker_selects_2s3z_config_and_adds_no_operation(
 def test_worker_rejects_unknown_scenario() -> None:
     with pytest.raises(ValueError, match="unsupported worker scenario"):
         _scenario_config("unknown")
+
+
+def test_worker_selects_rtscortex_melee_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeMeleeConfig:
+        def __init__(self) -> None:
+            self.AGENTS: dict[str, Any] = {}
+            self.reset_args: dict[str, Any] | None = None
+
+        def reset_llm(self, **kwargs: Any) -> None:
+            self.reset_args = kwargs
+
+    config = FakeMeleeConfig()
+    no_op_function = object()
+
+    def fake_import(name: str) -> Any:
+        if name == "rtscortex_llm_pysc2.melee":
+            return SimpleNamespace(RTSCortexMeleeConfig=lambda: config)
+        if name == "pysc2.lib.actions":
+            return SimpleNamespace(FUNCTIONS=SimpleNamespace(no_op=no_op_function))
+        raise AssertionError(f"unexpected import: {name}")
+
+    monkeypatch.setattr(importlib, "import_module", fake_import)
+
+    selected = _scenario_config("Simple64")
+
+    assert selected is config
+    assert config.reset_args == {
+        "model_name": "gpt-3.5-turbo",
+        "api_base": "http://127.0.0.1",
+        "api_key": "rtscortex-unused",
+    }
 
 
 def test_2s3z_bootstrap_skips_unreachable_camera_calibration() -> None:
@@ -451,6 +692,41 @@ class FakeRuntime:
 
     def end_episode(self, result: dict[str, Any]) -> None:
         self.episode_results.append(result)
+
+
+class BlockingRuntime(FakeRuntime):
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def tick(self, observation: dict[str, Any]) -> dict[str, Any]:
+        self.entered.set()
+        assert self.release.wait(timeout=1)
+        return super().tick(observation)
+
+
+class UniformGrid:
+    shape = (128, 128)
+
+    def __init__(self, value: int) -> None:
+        self.value = value
+
+    def __getitem__(self, _index: int) -> UniformGrid:
+        return self
+
+    def __eq__(self, other: object) -> bool:
+        return self.value == other
+
+
+class Grid:
+    shape = (128, 128)
+
+    def __init__(self, values: list[list[int]]) -> None:
+        self.values = values
+
+    def __getitem__(self, index: int) -> list[int]:
+        return self.values[index]
 
 
 def _fake_timestep(*, alerts: list[int] | None = None) -> Any:

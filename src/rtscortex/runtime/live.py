@@ -43,7 +43,15 @@ class LiveScenarioSpec:
     """SC2 installation requirements for one supported live scenario."""
 
     map_directory: str
+    map_filename: str | None = None
+    source_map_required: bool = True
     minimum_sc2_build: int | None = None
+
+    def map_relative_path(self, scenario: str) -> Path:
+        """Return the map path below the SC2 ``Maps`` directory."""
+
+        filename = self.map_filename or scenario
+        return Path(self.map_directory) / f"{filename}.SC2Map"
 
 
 LIVE_SCENARIOS = {
@@ -52,6 +60,7 @@ LIVE_SCENARIOS = {
         minimum_sc2_build=PVZ_TASK1_MINIMUM_SC2_BUILD,
     ),
     "2s3z": LiveScenarioSpec(map_directory="llm_smac"),
+    "Simple64": LiveScenarioSpec(map_directory="Melee", source_map_required=False),
 }
 
 
@@ -137,9 +146,7 @@ def prepare_live_worker(
                     f"SC2 build {build} is older than required build "
                     f"{scenario.minimum_sc2_build} for {config.environment.scenario}"
                 )
-        map_path = (
-            sc2_path / "Maps" / scenario.map_directory / f"{config.environment.scenario}.SC2Map"
-        )
+        map_path = sc2_path / "Maps" / scenario.map_relative_path(config.environment.scenario)
         if not map_path.is_file():
             errors.append(f"scenario map is missing: {map_path}")
 
@@ -157,7 +164,7 @@ def prepare_live_worker(
     if errors:
         raise LiveEnvironmentError("Live environment validation failed:\n- " + "\n- ".join(errors))
     assert sc2_path is not None
-    command = (
+    command = [
         str(worker_python),
         "-m",
         "pysc2.bin.agent",
@@ -166,7 +173,27 @@ def prepare_live_worker(
         "--agent",
         WORKER_AGENT,
         "--agent_race",
-        "protoss",
+        config.environment.agent_race,
+        "--agent2",
+        "Bot",
+        "--agent2_race",
+        config.environment.opponent_race,
+        "--difficulty",
+        config.environment.opponent_difficulty,
+        "--bot_build",
+        config.environment.opponent_build,
+        "--step_mul",
+        str(config.environment.step_mul),
+    ]
+    if config.environment.game_steps_per_episode is not None:
+        command.extend(
+            [
+                "--game_steps_per_episode",
+                str(config.environment.game_steps_per_episode),
+            ]
+        )
+    command.extend(
+        [
         "--parallel",
         "1",
         "--render=false",
@@ -175,8 +202,9 @@ def prepare_live_worker(
         str(config.environment.max_steps),
         "--random_seed",
         str(config.run.seed),
+        ]
     )
-    return LiveWorkerSpec(command=command, sc2_path=sc2_path)
+    return LiveWorkerSpec(command=tuple(command), sc2_path=sc2_path)
 
 
 def live_scenario_spec(scenario: str) -> LiveScenarioSpec:

@@ -18,7 +18,29 @@ def _model_observation(observation: ObservationEnvelope) -> dict[str, Any]:
     payload.pop("observed_at")
     payload.pop("text_observation")
     payload.pop("image_uri")
+    spatial_context = _compact_spatial_context(observation.text_observation)
+    if spatial_context:
+        payload["spatial_context"] = spatial_context
     return payload
+
+
+def _compact_spatial_context(text_observation: str) -> list[str]:
+    """Retain actionable screen/minimap coordinates without upstream prompt bulk."""
+
+    lines: list[str] = []
+    for raw_line in text_observation.splitlines():
+        line = raw_line.strip()
+        if (
+            (line.startswith("[") and line.endswith("]"))
+            or (line.startswith("Team ") and line.endswith(" Info:"))
+            or "Team minimap position:" in line
+            or "ScreenPos:" in line
+            or (line.startswith("Build_") and " candidates:" in line)
+        ):
+            lines.append(line)
+            if len(lines) == 48:
+                break
+    return lines
 
 
 def _compact_event(event: StoredEvent) -> dict[str, Any] | None:
@@ -142,8 +164,16 @@ class PlanningModule:
                 "a positional JSON array in the exact argument_names order, and every value "
                 "must match the corresponding argument_types entry. For example, an action "
                 'with argument_names=["target"] receives arguments=["0x1001c0001"], '
-                "never a named {name, value} object. Return at most three concise plan steps "
-                "and three proposed actions, with no more than one action per actor."
+                "never a named {name, value} object. A position must be a nested numeric "
+                "array such as arguments=[[80, 80]], never arguments=[\"[80, 80]\"]. Return "
+                "at most three concise plan steps "
+                "and three proposed actions, with no more than one action per actor. When an "
+                "action requires a screen or minimap position, choose it from spatial_context "
+                "and preserve the listed coordinate system. In a Protoss opening with no "
+                "visible enemy, prioritize legal economy and production actions; build a "
+                "Pylon once it is available, then a Gateway. Do not hold position merely "
+                "because no enemy is visible. For Build_*_Screen, use a coordinate listed "
+                "for that exact action in spatial_context."
             ),
             user_prompt=json.dumps(payload, ensure_ascii=False, sort_keys=True),
         )
@@ -163,6 +193,13 @@ class ActionModule:
     async def run(self, context: AgentContext) -> ModuleResult:
         raw_plan: dict[str, Any] = context.memory.get("plan", {})
         plan = PlanningOutput.model_validate(raw_plan)
+        unique_proposals = []
+        seen_actors: set[str] = set()
+        for proposal in plan.proposed_actions:
+            if proposal.actor in seen_actors:
+                continue
+            seen_actors.add(proposal.actor)
+            unique_proposals.append(proposal)
         commands = [
             ActionCommand(
                 command_id=(
@@ -182,7 +219,7 @@ class ActionModule:
                     else {}
                 ),
             )
-            for index, proposal in enumerate(plan.proposed_actions[: self.max_actions])
+            for index, proposal in enumerate(unique_proposals[: self.max_actions])
         ]
         return ModuleResult(
             module=self.name,

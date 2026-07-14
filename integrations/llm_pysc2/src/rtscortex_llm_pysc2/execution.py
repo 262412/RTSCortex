@@ -28,12 +28,17 @@ class ExecutionTracker:
 
     def __init__(self) -> None:
         self._pending: dict[str, _TrackedCommand] = {}
+        self._seen: set[str] = set()
+
+    def has_seen(self, command_id: str) -> bool:
+        return command_id in self._seen
 
     def register(self, route: RoutedActionBatch) -> None:
         for command in route.commands:
             if command.command_id in self._pending:
                 raise ValueError(f"command {command.command_id!r} is already registered")
             self._pending[command.command_id] = _TrackedCommand(route=route, command=command)
+            self._seen.add(command.command_id)
 
     def record_primitive(
         self,
