@@ -98,4 +98,13 @@ describe("event projection", () => {
     expect(eventMatches(observation, "all", false)).toBe(false);
     expect(eventMatches(observation, "all", true)).toBe(true);
   });
+
+  it("keeps goal progress in the planning timeline even for structure goals", () => {
+    const progress = storedEvent(4, "goal_progress", {
+      status: "actionable",
+      missing: [{ kind: "structure", target: "Gateway" }],
+    });
+
+    expect(eventCategory(progress)).toBe("planner");
+  });
 });

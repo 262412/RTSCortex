@@ -152,6 +152,40 @@ only actions needed in the current decision cycle, with one action per actor, an
 repeat a successful action or an active-plan command that remains valid. Full observations
 remain in `events.jsonl`, so reducing model input does not reduce experiment traceability.
 
+### Deterministic goal progress and policy shadowing
+
+For accepted plans that contain supported Protoss state-changing actions, Runtime creates a
+typed `GoalSpec` and evaluates it on every observation with `GoalProgressVerifier`. The
+result records completed and missing requirements, deterministic blockers, every action
+that can advance the goal now, and `unique_next_action` only when exactly one such action
+exists. Resource totals, production queues, completed/in-progress structures, units,
+upgrades, prerequisites, action availability, and defensive alerts are state evidence;
+the LLM does not decide whether its own goal advanced.
+
+The same `GoalProgressReport` is supplied to Reflection and Planning and emitted as a
+durable `goal_progress` event for the Live Console. `ProgressGuard` removes `Stop`,
+`Hold_Position`, and semantic no-op commands while a goal can advance or its effect is
+already in progress, unless the observation explicitly requires a defensive hold. An
+empty follow-up plan retains the last measurable goal, so waiting for a build effect does
+not erase its progress state.
+
+Policy candidates can be evaluated without giving them dispatch access:
+
+```bash
+uv run rtscortex policy-shadow \
+  ~/scratch/outputs/RTSCortex/<run-directory> \
+  --limit 11 --stride 6
+```
+
+Every candidate receives the same historical observations, fixed Protoss opening goal,
+and deterministic progress reports. The current OpenAI-compatible Qwen configuration is
+loaded from the run snapshot. HIMA Protoss-a/b/c and HierNet-SC2 remain explicit
+`unavailable` entries until local weights and RTSCortex action adapters are configured;
+this command never downloads them. Use `--no-current-qwen` to validate the fixture and
+report path entirely offline. The resulting `policy-shadow-comparison.json` separates
+schema legality, goal-advancing choices on actionable fixtures, control-action violations,
+latency, model failures, and unavailable candidates.
+
 ### Build position handling
 
 The bridge derives one structured candidate domain for every exposed target or position

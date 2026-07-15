@@ -117,10 +117,65 @@ describe("Chinese event presentation", () => {
     });
   });
 
+  it("presents deterministic goal progress as a readable review checkpoint", () => {
+    const progress = event("goal_progress", {
+      run_id: "run-1",
+      episode_id: "episode-1",
+      step_id: 12,
+      game_loop: 448,
+      goal_id: "protoss-opening",
+      strategic_goal: "建立基础科技并开始生产追猎者",
+      status: "actionable",
+      achieved: [
+        {
+          requirement_id: "pylon",
+          kind: "structure",
+          target: "Pylon",
+          required_count: 1,
+          current_count: 1,
+          in_progress_count: 0,
+        },
+      ],
+      missing: [
+        {
+          requirement_id: "gateway",
+          kind: "structure",
+          target: "Gateway",
+          required_count: 1,
+          current_count: 0,
+          in_progress_count: 0,
+        },
+      ],
+      blockers: [],
+      advancing_actions: ["Build_Gateway_Screen"],
+      unique_next_action: "Build_Gateway_Screen",
+      defensive_hold_required: false,
+    });
+
+    expect(eventTitle(progress)).toBe("目标进度检查");
+    expect(eventSummary(progress)).toBe(
+      "可以立即推进（actionable） · 已完成 1 项 · 待完成 1 项 · 下一步：建造传送门",
+    );
+    expect(eventSemanticPayload(progress)).toEqual({
+      strategic_goal: "建立基础科技并开始生产追猎者",
+      status: "actionable",
+      achieved: progress.payload.achieved,
+      missing: progress.payload.missing,
+      blockers: [],
+      advancing_actions: ["Build_Gateway_Screen"],
+      unique_next_action: "Build_Gateway_Screen",
+      defensive_hold_required: false,
+      game_loop: 448,
+    });
+    expect(semanticScalar("Build_Gateway_Screen", "unique_next_action")).toBe(
+      "建造传送门（Build_Gateway_Screen）",
+    );
+    expect(semanticScalar("missing_prerequisite", "kind")).toBe("缺少科技前置条件");
+  });
+
   it("falls back safely for future event types", () => {
     const unknown = event("world_model_projection", { horizon: 32 });
     expect(eventTitle(unknown)).toBe("world model projection");
     expect(eventSummary(unknown)).toBe("已记录运行事件");
   });
 });
-

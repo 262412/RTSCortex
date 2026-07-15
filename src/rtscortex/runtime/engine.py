@@ -41,7 +41,14 @@ from rtscortex.contracts.interfaces import (
     ModuleResult,
 )
 from rtscortex.memory import EventStore
+from rtscortex.progress import (
+    PROTOSS_SIMPLE64_ACTION_SPECS,
+    GoalProgressReport,
+    GoalProgressVerifier,
+    GoalSpec,
+)
 from rtscortex.reflex import ReflexEngine
+from rtscortex.runtime.progress_guard import ProgressGuard
 from rtscortex.runtime.validation import (
     ActionArbiter,
     ActionValidator,
@@ -57,6 +64,7 @@ class PlanState:
     commands: list[ActionCommand]
     source_step_id: int
     created_game_loop: int
+    goal_spec: GoalSpec | None = None
 
 
 class CommandStatus(StrEnum):
@@ -119,7 +127,9 @@ _ALLOWED_COMMAND_TRANSITIONS = {
     },
 }
 
-
+_PROGRESS_ACTION_NAMES = frozenset(
+    action.name for action in PROTOSS_SIMPLE64_ACTION_SPECS
+)
 class RuntimeEngine:
     """Run a non-blocking strategic planner alongside a synchronous reflex path."""
 
@@ -151,6 +161,8 @@ class RuntimeEngine:
         )
         self.arbiter = ActionArbiter()
         self.validator = ActionValidator(config.runtime.max_actions)
+        self.goal_progress_verifier = GoalProgressVerifier()
+        self.progress_guard = ProgressGuard()
         self._planner_enabled = config.agent.variant in {
             "planner_only",
             "planner_reflection_memory_reflex",
@@ -172,6 +184,7 @@ class RuntimeEngine:
         self._decision_by_command_id: dict[str, ActionBatch] = {}
         self._last_execution: ExecutionReport | None = None
         self._episode_key: tuple[str, str] | None = None
+        self._last_goal_progress_fingerprint: str | None = None
 
     async def tick(self, observation: ObservationEnvelope) -> ActionBatch:
         tick_started = time.perf_counter()
@@ -188,12 +201,21 @@ class RuntimeEngine:
         planner_due = self._planner_enabled and self._should_plan(observation)
         self._expire_planner_commands(observation)
 
-        context = self._agent_context(observation)
+        goal_progress = self._goal_progress_for(observation)
+        self._record_goal_progress_if_changed(observation, goal_progress)
+        context = self._agent_context(observation, goal_progress=goal_progress)
         memory_result = await self._run_module(self.memory_module, context)
-        context = self._agent_context(observation, memory=memory_result.updates)
+        context = self._agent_context(
+            observation,
+            memory=memory_result.updates,
+            goal_progress=goal_progress,
+        )
 
         if planner_due:
             await self._begin_planner_cycle(context)
+
+        dispatch_goal_progress = self._goal_progress_for(observation)
+        self._record_goal_progress_if_changed(observation, dispatch_goal_progress)
 
         reflex_started = time.perf_counter()
         reflex_candidates = [
@@ -204,16 +226,29 @@ class RuntimeEngine:
         reflex_latency_ms = (time.perf_counter() - reflex_started) * 1000
 
         planner_candidates = self._active_planner_commands(observation)
+        guarded_planner = self.progress_guard.filter_commands(
+            planner_candidates,
+            dispatch_goal_progress,
+        )
+        guarded_reflex = self.progress_guard.filter_commands(
+            reflex_candidates,
+            dispatch_goal_progress,
+        )
+        rejected_commands = self._apply_validation_failures(
+            [*guarded_planner.failures, *guarded_reflex.failures],
+            observation,
+        )
         (
             planner_commands,
             reflex_commands,
-            rejected_commands,
+            busy_actor_rejections,
             busy_actor_candidates,
         ) = self._defer_busy_actor_commands(
-            planner_candidates,
-            reflex_candidates,
+            guarded_planner.accepted,
+            guarded_reflex.accepted,
             observation,
         )
+        rejected_commands.extend(busy_actor_rejections)
         candidate_outcome = self.validator.validate_candidates(
             [*planner_commands, *reflex_commands],
             observation,
@@ -291,6 +326,20 @@ class RuntimeEngine:
                 "validated_candidates": [
                     command.model_dump(mode="json") for command in candidate_outcome.accepted
                 ],
+                "goal_progress": (
+                    None
+                    if dispatch_goal_progress is None
+                    else dispatch_goal_progress.model_dump(mode="json")
+                ),
+                "progress_guard_rejections": [
+                    {
+                        "command_id": failure.command.command_id,
+                        "action_name": failure.command.name,
+                        "actor": failure.command.actor,
+                        "reason": failure.reason,
+                    }
+                    for failure in [*guarded_planner.failures, *guarded_reflex.failures]
+                ],
             },
         )
         self._last_decision = batch
@@ -304,6 +353,7 @@ class RuntimeEngine:
         observation: ObservationEnvelope,
         *,
         memory: dict[str, Any] | None = None,
+        goal_progress: GoalProgressReport | None = None,
     ) -> AgentContext:
         execution = self._last_execution
         matching_decision = (
@@ -315,6 +365,46 @@ class RuntimeEngine:
             last_execution=execution,
             last_decision=matching_decision,
             active_plan=self._active_plan_snapshot(),
+            goal_progress=goal_progress,
+        )
+
+    def _goal_progress_for(
+        self,
+        observation: ObservationEnvelope,
+    ) -> GoalProgressReport | None:
+        if self._cached_plan is None or self._cached_plan.goal_spec is None:
+            return None
+        return self.goal_progress_verifier.verify(
+            observation,
+            self._cached_plan.goal_spec,
+        )
+
+    def _record_goal_progress_if_changed(
+        self,
+        observation: ObservationEnvelope,
+        report: GoalProgressReport | None,
+    ) -> None:
+        if report is None:
+            return
+        semantic_payload = report.model_dump(mode="json")
+        for transient_key in ("run_id", "episode_id", "step_id", "game_loop"):
+            semantic_payload.pop(transient_key)
+        fingerprint = hashlib.sha256(
+            json.dumps(
+                semantic_payload,
+                ensure_ascii=False,
+                sort_keys=True,
+            ).encode()
+        ).hexdigest()
+        if fingerprint == self._last_goal_progress_fingerprint:
+            return
+        self._last_goal_progress_fingerprint = fingerprint
+        self.store.append_event(
+            run_id=observation.run_id,
+            episode_id=observation.episode_id,
+            step_id=observation.step_id,
+            event_type="goal_progress",
+            payload=report,
         )
 
     def _active_plan_snapshot(self) -> ActivePlanSnapshot | None:
@@ -483,12 +573,17 @@ class RuntimeEngine:
                     source_step_id=context.observation.step_id,
                     content=str(lesson),
                 )
+        planning_observation = self.progress_guard.project_observation(
+            context.observation,
+            context.goal_progress,
+        )
         planning_context = AgentContext(
-            observation=context.observation,
+            observation=planning_observation,
             memory=working_memory,
             last_execution=context.last_execution,
             last_decision=context.last_decision,
             active_plan=context.active_plan,
+            goal_progress=context.goal_progress,
         )
         planning = await self._run_module(self.planning_module, planning_context)
         working_memory.update(planning.updates)
@@ -498,14 +593,30 @@ class RuntimeEngine:
             last_execution=context.last_execution,
             last_decision=context.last_decision,
             active_plan=context.active_plan,
+            goal_progress=context.goal_progress,
         )
         action = await self._run_module(self.action_module, action_context)
+        measurable_actions = [
+            command.name
+            for command in action.commands
+            if command.name in _PROGRESS_ACTION_NAMES
+        ]
+        goal_spec = (
+            self.goal_progress_verifier.goal_from_action_names(
+                strategic_goal=str(action.updates["strategic_goal"]),
+                action_names=measurable_actions,
+                observation=context.observation,
+            )
+            if measurable_actions
+            else None
+        )
         return PlanState(
             strategic_goal=str(action.updates["strategic_goal"]),
             summary=str(action.updates["plan_summary"]),
             commands=action.commands,
             source_step_id=context.observation.step_id,
             created_game_loop=context.observation.game_loop,
+            goal_spec=goal_spec,
         )
 
     async def _activate_episode(self, observation: ObservationEnvelope) -> None:
@@ -528,6 +639,7 @@ class RuntimeEngine:
         self._last_decision = None
         self._decision_by_command_id = {}
         self._last_execution = None
+        self._last_goal_progress_fingerprint = None
 
         decision_events = self.store.events_of_type(
             observation.run_id,
@@ -584,6 +696,11 @@ class RuntimeEngine:
                 ],
                 source_step_id=int(plan_event.payload["source_step_id"]),
                 created_game_loop=int(plan_event.payload["created_game_loop"]),
+                goal_spec=(
+                    None
+                    if plan_event.payload.get("goal_spec") is None
+                    else GoalSpec.model_validate(plan_event.payload["goal_spec"])
+                ),
             )
         if self._cached_plan is not None:
             self._last_plan_accepted_game_loop = self._cached_plan.created_game_loop
@@ -749,6 +866,15 @@ class RuntimeEngine:
             commands=accepted_commands,
             source_step_id=plan.source_step_id,
             created_game_loop=observation.game_loop,
+            goal_spec=(
+                plan.goal_spec
+                if plan.goal_spec is not None
+                else (
+                    None
+                    if self._cached_plan is None
+                    else self._cached_plan.goal_spec
+                )
+            ),
         )
         fingerprint = self._plan_fingerprint(accepted_plan)
         previous_fingerprint = (
@@ -778,6 +904,11 @@ class RuntimeEngine:
                 ),
                 "lifecycle_protocol": CURRENT_PROTOCOL_VERSION,
                 "retained_command_ids": sorted(retained_command_ids),
+                "goal_spec": (
+                    None
+                    if accepted_plan.goal_spec is None
+                    else accepted_plan.goal_spec.model_dump(mode="json")
+                ),
             },
         )
         for command in accepted_plan.commands:
@@ -802,6 +933,11 @@ class RuntimeEngine:
                 "strategic_goal": plan.strategic_goal,
                 "summary": plan.summary,
                 "commands": semantic_commands,
+                "goal_spec": (
+                    None
+                    if plan.goal_spec is None
+                    else plan.goal_spec.model_dump(mode="json")
+                ),
             },
             ensure_ascii=False,
             sort_keys=True,

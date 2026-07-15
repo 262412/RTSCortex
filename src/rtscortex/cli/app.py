@@ -26,6 +26,16 @@ from rtscortex.evaluation import (
 )
 from rtscortex.evaluation.replay import replay_event_log
 from rtscortex.memory import EventStore, read_event_log
+from rtscortex.policy import (
+    LLMPlanningPolicySubagent,
+    PolicyShadowComparison,
+    PolicyShadowRunner,
+    attach_goal_progress,
+    build_protoss_opening_goal,
+    default_shadow_registrations,
+    load_historical_observations,
+)
+from rtscortex.providers import OpenAICompatibleProvider
 from rtscortex.runtime.factory import build_runtime
 from rtscortex.runtime.live import (
     LiveEnvironmentError,
@@ -359,6 +369,115 @@ def replay(
     typer.echo(json.dumps(result.__dict__, indent=2, sort_keys=True))
     if result.mismatched_steps:
         raise typer.Exit(code=1)
+
+
+async def _run_policy_shadow(
+    *,
+    config: ExperimentConfig | None,
+    journal_path: Path,
+    limit: int,
+    stride: int,
+    use_current_qwen: bool,
+) -> PolicyShadowComparison:
+    fixtures = load_historical_observations(
+        journal_path,
+        limit=limit,
+        stride=stride,
+    )
+    if not fixtures:
+        raise ValueError("events.jsonl contains no observation events")
+    fixtures = attach_goal_progress(fixtures, build_protoss_opening_goal())
+
+    provider: OpenAICompatibleProvider | None = None
+    current_qwen = None
+    if use_current_qwen:
+        if config is None or config.provider.kind != "openai_compatible":
+            raise ValueError(
+                "current Qwen comparison requires provider.kind=openai_compatible "
+                "in RUN_DIR/config.yaml"
+            )
+        provider = OpenAICompatibleProvider(
+            base_url=config.provider.base_url,
+            model=config.provider.model,
+            api_key_env=config.provider.api_key_env,
+            timeout_seconds=config.provider.timeout_seconds,
+            max_tokens=config.provider.max_tokens,
+            enable_thinking=config.provider.enable_thinking,
+        )
+        current_qwen = LLMPlanningPolicySubagent(provider)
+
+    try:
+        return await PolicyShadowRunner().compare(
+            fixtures,
+            default_shadow_registrations(current_qwen=current_qwen),
+        )
+    finally:
+        if provider is not None:
+            await provider.close()
+
+
+@app.command("policy-shadow")
+def policy_shadow(
+    run_dir: Annotated[Path, typer.Argument(exists=True, file_okay=False)],
+    limit: Annotated[int, typer.Option(min=1, help="Maximum historical observations.")] = 10,
+    stride: Annotated[
+        int,
+        typer.Option(min=1, help="Select every Nth observation in journal order."),
+    ] = 1,
+    output: Annotated[
+        Path | None,
+        typer.Option("--output", dir_okay=False, help="Comparison JSON artifact path."),
+    ] = None,
+    current_qwen: Annotated[
+        bool,
+        typer.Option(
+            "--current-qwen/--no-current-qwen",
+            help="Evaluate the OpenAI-compatible Qwen provider from the run config.",
+        ),
+    ] = True,
+) -> None:
+    """Compare shadow policies on the same historical Protoss observations."""
+
+    journal_path = run_dir / "events.jsonl"
+    if not journal_path.is_file():
+        raise typer.BadParameter(
+            "run directory is missing events.jsonl",
+            param_hint="RUN_DIR",
+        )
+    config: ExperimentConfig | None = None
+    if current_qwen:
+        config_path = run_dir / "config.yaml"
+        if not config_path.is_file():
+            raise typer.BadParameter(
+                "run directory is missing config.yaml",
+                param_hint="RUN_DIR",
+            )
+        config = load_config(config_path)
+
+    try:
+        comparison = asyncio.run(
+            _run_policy_shadow(
+                config=config,
+                journal_path=journal_path,
+                limit=limit,
+                stride=stride,
+                use_current_qwen=current_qwen,
+            )
+        )
+    except ValueError as error:
+        raise typer.BadParameter(str(error), param_hint="RUN_DIR") from error
+
+    target = (output or run_dir / "policy-shadow-comparison.json").expanduser()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(comparison.model_dump_json(indent=2) + "\n", encoding="utf-8")
+    typer.echo(
+        json.dumps(
+            [summary.model_dump(mode="json") for summary in comparison.summaries],
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+    typer.echo(f"Artifact: {target}")
 
 
 @app.command()

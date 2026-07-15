@@ -77,6 +77,7 @@ export function App() {
     const action = latestModule(cycleEvents, "action");
     return {
       reflection: latestModule(cycleEvents, "reflection"),
+      goalProgress: findLatest(events, (event) => event.event_type === "goal_progress"),
       plan: findLatest(events, (event) => event.event_type === "plan_accepted") ?? planning,
       candidateActions: proposedActions(planning, action),
       context: findLatest(cycleEvents, (event) => event.event_type === "context_prepared"),
@@ -147,6 +148,7 @@ export function App() {
         />
         <DecisionRail
           reflection={projection.reflection}
+          goalProgress={projection.goalProgress}
           plan={projection.plan}
           candidateActions={projection.candidateActions}
           context={projection.context}

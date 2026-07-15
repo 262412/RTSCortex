@@ -9,6 +9,7 @@ from typing import Any
 
 from rtscortex.contracts import ActionBatch, ExecutionReport, ObservationEnvelope
 from rtscortex.contracts.interfaces import ActivePlanSnapshot
+from rtscortex.progress import GoalProgressReport
 
 
 class ContextBudgetExceeded(ValueError):
@@ -192,6 +193,7 @@ def build_planning_context(
     memory: dict[str, Any],
     active_plan: ActivePlanSnapshot | None,
     last_execution: ExecutionReport | None,
+    goal_progress: GoalProgressReport | None,
     budget: ContextBudget,
     system_prompt: str,
 ) -> PromptContext:
@@ -203,6 +205,8 @@ def build_planning_context(
         raw_payload["active_plan"] = _compact_active_plan(active_plan)
     if last_execution is not None:
         raw_payload["last_execution"] = last_execution.model_dump(mode="json")
+    if goal_progress is not None:
+        raw_payload["goal_progress"] = goal_progress.model_dump(mode="json")
 
     projected_observation, unit_stats = model_observation(observation)
     raw_events = list(memory.get("recent_events", []))
@@ -235,6 +239,8 @@ def build_planning_context(
         payload["active_plan"] = _compact_active_plan(active_plan)
     if last_execution is not None:
         payload["last_execution"] = _compact_execution(last_execution)
+    if goal_progress is not None:
+        payload["goal_progress"] = goal_progress.model_dump(mode="json")
     statistics: dict[str, int | bool] = {
         "budget_chars": budget.max_prompt_chars,
         "original_chars": _prompt_chars(system_prompt, raw_payload),
@@ -258,6 +264,7 @@ def build_reflection_context(
     observation: ObservationEnvelope,
     last_decision: ActionBatch,
     last_execution: ExecutionReport | None,
+    goal_progress: GoalProgressReport | None,
     budget: ContextBudget,
     system_prompt: str,
 ) -> PromptContext:
@@ -268,12 +275,16 @@ def build_reflection_context(
             None if last_execution is None else last_execution.model_dump(mode="json")
         ),
     }
+    if goal_progress is not None:
+        raw_payload["goal_progress"] = goal_progress.model_dump(mode="json")
     projected_observation, unit_stats = model_observation(observation)
     payload = {
         "observation": projected_observation,
         "last_decision": _compact_decision(last_decision, include_rejections=True),
         "last_execution": (None if last_execution is None else _compact_execution(last_execution)),
     }
+    if goal_progress is not None:
+        payload["goal_progress"] = goal_progress.model_dump(mode="json")
     statistics: dict[str, int | bool] = {
         "budget_chars": budget.max_prompt_chars,
         "original_chars": _prompt_chars(system_prompt, raw_payload),

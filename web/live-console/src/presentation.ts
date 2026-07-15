@@ -23,6 +23,7 @@ const EVENT_TITLES: Record<string, string> = {
   command_lifecycle: "动作状态变化",
   execution: "动作执行结果",
   validation_failed: "动作验证失败",
+  goal_progress: "目标进度检查",
   episode_summary: "对局总结",
   episode_result: "对局结果",
 };
@@ -72,6 +73,21 @@ const FIELD_LABELS: Record<string, string> = {
   plan_summary: "计划摘要",
   strategic_goal: "战略目标",
   goal: "目标",
+  goal_id: "目标 ID",
+  requirement_id: "检查项 ID",
+  kind: "检查类型",
+  target: "目标对象",
+  required_count: "目标数量",
+  current_count: "已完成数量",
+  in_progress_count: "进行中数量",
+  description: "检查说明",
+  achieved: "已完成",
+  missing: "尚缺少",
+  blockers: "推进阻塞",
+  detail: "阻塞说明",
+  advancing_actions: "可推进动作",
+  unique_next_action: "唯一下一动作",
+  defensive_hold_required: "当前必须防守",
   steps: "计划步骤",
   proposed_actions: "模型建议动作",
   planner_candidates: "规划器候选动作",
@@ -224,6 +240,21 @@ const VALUE_LABELS: Record<string, string> = {
   rejected: "已拒绝",
   obsolete: "已经失效",
   superseded: "已被新计划替代",
+  actionable: "可以立即推进",
+  in_progress: "正在推进",
+  achieved: "目标已达成",
+  structure: "建筑",
+  unit: "单位",
+  upgrade: "科技升级",
+  goal_dependency: "前序目标尚未完成",
+  missing_prerequisite: "缺少科技前置条件",
+  prerequisite_in_progress: "科技前置条件正在建设",
+  effect_in_progress: "目标动作正在生效",
+  insufficient_minerals: "晶体矿不足",
+  insufficient_vespene: "高能瓦斯不足",
+  insufficient_supply: "人口不足",
+  action_unavailable: "推进动作当前不可用",
+  no_progress_action: "没有可推进目标的动作",
   starting: "正在启动",
   running: "运行中",
   completed: "已完成",
@@ -276,6 +307,13 @@ const CATEGORY_LABELS: Record<Exclude<EventCategory, "all"> | "system", string> 
   combat: "战斗",
   failure: "失败",
   system: "系统",
+};
+
+const GOAL_PROGRESS_STATUS_LABELS: Record<string, string> = {
+  actionable: "可以立即推进",
+  in_progress: "正在推进",
+  blocked: "暂时受阻",
+  achieved: "目标已达成",
 };
 
 function asObject(value: JsonValue | undefined): JsonObject | undefined {
@@ -354,8 +392,17 @@ export function semanticScalar(value: string | number | boolean | null, key?: st
     if (key?.endsWith("game_loops") || key?.endsWith("_loop") || key === "game_loop") return `${value} loops`;
     return value.toLocaleString();
   }
-  if (key === "action_name" || key === "action" || key === "name") return actionLabel(value);
+  if (
+    key === "action_name" ||
+    key === "action" ||
+    key === "name" ||
+    key === "unique_next_action" ||
+    key === "advancing_actions"
+  ) return actionLabel(value);
   if (key === "actor") return actorLabel(value);
+  if (key === "status" && GOAL_PROGRESS_STATUS_LABELS[value.toLowerCase()]) {
+    return `${GOAL_PROGRESS_STATUS_LABELS[value.toLowerCase()]}（${value}）`;
+  }
   const translated = VALUE_LABELS[value.toLowerCase()];
   const protocolEnum = [
     "status",
@@ -431,6 +478,19 @@ export function eventSummary(event: StoredEvent): string {
     const plan = asObject(payload.plan);
     const goal = readString(plan ?? payload, "strategic_goal", "goal");
     return goal ? `采用目标：${truncate(goal)}` : "新的战略计划已进入执行队列";
+  }
+  if (event.event_type === "goal_progress") {
+    const achieved = asArray(payload.achieved).length;
+    const missing = asArray(payload.missing).length;
+    const blockers = asArray(payload.blockers).length;
+    const nextAction = readString(payload, "unique_next_action");
+    return [
+      status ? semanticScalar(status, "status") : "目标进度已更新",
+      `已完成 ${achieved} 项`,
+      `待完成 ${missing} 项`,
+      nextAction ? `下一步：${actionLabel(nextAction, false)}` : undefined,
+      blockers > 0 ? `阻塞 ${blockers} 项` : undefined,
+    ].filter(Boolean).join(" · ");
   }
   if (event.event_type === "decision") {
     const batch = asObject(payload.batch);
@@ -508,6 +568,19 @@ export function eventSemanticPayload(event: StoredEvent): JsonValue {
       ["command_count", payload.command_count],
       ["output", payload.output],
       ["usage", payload.usage],
+    ]);
+  }
+  if (event.event_type === "goal_progress") {
+    return compactObject([
+      ["strategic_goal", payload.strategic_goal],
+      ["status", payload.status],
+      ["achieved", payload.achieved],
+      ["missing", payload.missing],
+      ["blockers", payload.blockers],
+      ["advancing_actions", payload.advancing_actions],
+      ["unique_next_action", payload.unique_next_action],
+      ["defensive_hold_required", payload.defensive_hold_required],
+      ["game_loop", payload.game_loop],
     ]);
   }
   if (event.event_type === "decision") {

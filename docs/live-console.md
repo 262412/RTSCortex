@@ -52,6 +52,9 @@ start a frame publisher, or bind a browser server.
   a full HUD stream.
 - **Planner activity:** module start time, elapsed time, provider/model, explicit
   Reflection and Planning results, context-compaction statistics, and token usage.
+- **Goal progress:** deterministic completed/missing requirements, blockers, currently
+  advancing actions, and the unique next action when one exists. This card is the state
+  evidence supplied to both Reflection and Planning, not an LLM self-assessment.
 - **Action trace:** proposals, validation and arbitration, dispatch, translator
   primitives, PySC2 acceptance, and ActionEffectVerifier evidence joined by command ID.
 - **Timeline:** durable SQLite/JSONL events with filtering, pause/autofollow, reconnect

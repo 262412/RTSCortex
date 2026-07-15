@@ -42,6 +42,12 @@ from rtscortex.contracts import (
 )
 from rtscortex.contracts.interfaces import AgentContext, ResponseT
 from rtscortex.memory import EventStore
+from rtscortex.progress import (
+    GoalProgressItem,
+    GoalProgressReport,
+    GoalProgressStatus,
+    GoalRequirementKind,
+)
 from tests.helpers import make_observation
 
 
@@ -60,7 +66,11 @@ class FailingProvider:
 def test_reflection_skips_first_decision() -> None:
     module = ReflectionModule(FailingProvider())
     result = asyncio.run(module.run(AgentContext(observation=make_observation())))
-    assert result.updates == {"reflection": None, "lessons": []}
+    assert result.updates == {
+        "reflection": None,
+        "lessons": [],
+        "goal_progress": None,
+    }
 
 
 class CapturingProvider:
@@ -209,6 +219,63 @@ def test_reflection_prompt_requires_execution_evidence() -> None:
 
     assert "matching execution" in provider.system_prompt
     assert "no_op never proves a plan action ran" in provider.system_prompt
+
+
+def test_goal_progress_reaches_reflection_and_planning_prompts() -> None:
+    observation = make_observation(include_enemy=False)
+    report = GoalProgressReport(
+        run_id=observation.run_id,
+        episode_id=observation.episode_id,
+        step_id=observation.step_id,
+        game_loop=observation.game_loop,
+        goal_id="opening",
+        strategic_goal="Build a Gateway",
+        status=GoalProgressStatus.ACTIONABLE,
+        missing=[
+            GoalProgressItem(
+                requirement_id="gateway",
+                kind=GoalRequirementKind.STRUCTURE,
+                target="Gateway",
+                required_count=1,
+                current_count=0,
+            )
+        ],
+        advancing_actions=["Build_Gateway_Screen"],
+        unique_next_action="Build_Gateway_Screen",
+    )
+    decision = ActionBatch(
+        run_id=observation.run_id,
+        episode_id=observation.episode_id,
+        step_id=0,
+        decision_id="decision-0",
+        idle_reason=IdleReason.NO_LEGAL_ACTION,
+    )
+
+    reflection_provider = CapturingProvider()
+    reflection = asyncio.run(
+        ReflectionModule(reflection_provider).run(
+            AgentContext(
+                observation=observation,
+                last_decision=decision,
+                goal_progress=report,
+            )
+        )
+    )
+    assert json.loads(reflection_provider.user_prompt)["goal_progress"] == (
+        report.model_dump(mode="json")
+    )
+    assert reflection.updates["goal_progress"] == report.model_dump(mode="json")
+
+    planning_provider = CapturingProvider()
+    planning = asyncio.run(
+        PlanningModule(planning_provider).run(
+            AgentContext(observation=observation, goal_progress=report)
+        )
+    )
+    assert json.loads(planning_provider.user_prompt)["goal_progress"] == (
+        report.model_dump(mode="json")
+    )
+    assert planning.updates["goal_progress"] == report.model_dump(mode="json")
 
 
 def test_failed_execution_provenance_reaches_reflection_and_planning_prompts() -> None:
