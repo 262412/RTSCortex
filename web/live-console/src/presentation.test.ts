@@ -1,0 +1,126 @@
+import { describe, expect, it } from "vitest";
+
+import { actionName } from "./data";
+import {
+  actionLabel,
+  eventSemanticPayload,
+  eventSummary,
+  eventTitle,
+  moduleSemanticOutput,
+  semanticScalar,
+} from "./presentation";
+import type { JsonObject, StoredEvent } from "./types";
+
+function event(eventType: string, payload: JsonObject, eventId = 1): StoredEvent {
+  return { event_id: eventId, event_type: eventType, payload };
+}
+
+describe("Chinese event presentation", () => {
+  it("summarizes the planner lifecycle without exposing JSON syntax", () => {
+    const started = event("planner_started", { started_game_loop: 24 });
+    const context = event("context_prepared", {
+      module: "planning",
+      original_chars: 8_200,
+      final_chars: 3_900,
+      statistics: { retained_observations: 4 },
+    });
+    const result = event("module_result", {
+      module: "planning",
+      latency_ms: 1_260,
+      model_call: true,
+      output: { plan: { strategic_goal: "Establish Protoss production" } },
+      usage: { total_tokens: 1_110 },
+    });
+
+    expect(eventTitle(started)).toBe("规划器开始思考");
+    expect(eventSummary(started)).toBe("开始生成下一轮战略计划 · loop 24");
+    expect(eventSummary(context)).toBe("战略规划上下文：8,200 → 3,900 字符 · 保留 4 条观察");
+    expect(eventTitle(result)).toBe("战略规划完成");
+    expect(eventSummary(result)).toContain("1.26 秒 · 1,110 tokens · Establish Protoss production");
+  });
+
+  it("explains decision, lifecycle, execution, and failure stages", () => {
+    const decision = event("decision", {
+      planner_candidates: [{ name: "Build_Pylon_Screen" }],
+      batch: {
+        commands: [
+          {
+            command_id: "cmd-pylon-1",
+            name: "Build_Pylon_Screen",
+            actor: "Builder/Builder-Probe-1",
+          },
+        ],
+        rejected_commands: [],
+      },
+    });
+    const lifecycle = event("command_lifecycle", {
+      command: { command_id: "cmd-pylon-1", name: "Build_Pylon_Screen" },
+      status: "dispatched",
+    });
+    const failed = event("execution", {
+      command_id: "cmd-pylon-1",
+      action_name: "Build_Pylon_Screen",
+      status: "failed",
+      execution_stage: "effect_verification",
+      failure_code: "target_not_created",
+    });
+
+    expect(actionName(decision)).toBe("Build_Pylon_Screen");
+    expect(actionName(lifecycle)).toBe("Build_Pylon_Screen");
+    expect(eventSummary(decision)).toBe("派发 1 个动作：建造水晶塔");
+    expect(eventSummary(lifecycle)).toBe("建造水晶塔：已派发");
+    expect(eventSummary(failed)).toBe("建造水晶塔 · 失败 · 效果验证 · 目标建筑未出现");
+    expect(semanticScalar("target_not_created", "failure_code")).toBe(
+      "目标建筑未出现（target_not_created）",
+    );
+  });
+
+  it("reduces observations to useful state and retains canonical protocol names", () => {
+    const observation = event("observation", {
+      game_loop: 120,
+      state: {
+        economy: { minerals: 400, vespene: 50, workers: 18 },
+        own_units: [{ unit_type: "Probe" }],
+        own_structures: [{ unit_type: "Nexus" }],
+        visible_enemies: [],
+        production_queue: [],
+        upgrades: [],
+      },
+      available_actions: [{ name: "Build_Pylon_Screen" }],
+      alerts: [],
+      text_observation: "large upstream prompt that should not be in the semantic view",
+    });
+    const view = eventSemanticPayload(observation);
+
+    expect(eventSummary(observation)).toBe("晶体矿 400 · 瓦斯 50 · 工人 18 · 可见敌军 0");
+    expect(JSON.stringify(view)).not.toContain("large upstream prompt");
+    expect(JSON.stringify(view)).toContain("Build_Pylon_Screen");
+    expect(actionLabel("Build_Pylon_Screen")).toBe("建造水晶塔（Build_Pylon_Screen）");
+  });
+
+  it("handles first-step reflection and PySC2 terminal actions explicitly", () => {
+    const reflection = event("module_result", {
+      module: "reflection",
+      model_call: false,
+      output: { reflection: null, lessons: [] },
+    });
+    const execution = event("execution", {
+      action_name: "Stop",
+      status: "succeeded",
+      execution_stage: "pysc2_acceptance",
+      effect_evidence: null,
+    });
+
+    expect(moduleSemanticOutput(reflection)).toMatchObject({ reflection: "首轮没有上一条决策，已跳过复盘。" });
+    expect(eventSemanticPayload(execution)).toMatchObject({
+      effect_evidence: "该动作以 PySC2 接受为终态，不需要独立游戏效果校验。",
+    });
+  });
+
+  it("falls back safely for future event types", () => {
+    const unknown = event("world_model_projection", { horizon: 32 });
+    expect(eventTitle(unknown)).toBe("world model projection");
+    expect(eventSummary(unknown)).toBe("已记录运行事件");
+  });
+});
+

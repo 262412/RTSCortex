@@ -21,6 +21,10 @@ test("historical console renders, reconnects without duplicates, and stays read-
   await expect(page.locator(".status-header")).toContainText("Qwen/Qwen3-8B");
   await expect(page.getByText("Historical RGB unavailable: frames were not persisted.", { exact: true })).toHaveCount(2);
   await expect(page.locator(".console-footer")).toContainText("9 / 5,000 events retained");
+  await expect(page.getByRole("heading", { name: "当前采用的计划" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "模型建议动作" })).toBeVisible();
+  await expect(page.locator(".decision-rail")).toContainText("Establish Protoss production");
+  await expect(page.locator(".decision-rail")).toContainText("建造水晶塔（Build_Pylon_Screen）");
 
   const desktopFrame = await page.locator(".frame-stage").boundingBox();
   const desktopRail = await page.locator(".decision-rail").boundingBox();
@@ -43,21 +47,29 @@ test("historical console renders, reconnects without duplicates, and stays read-
   expect(sessionSnapshot.latest_event_id).toBe(12);
 
   const executionRow = page.locator(".event-row").filter({
-    has: page.locator(".event-type", { hasText: /^execution$/ }),
+    has: page.locator(".event-type", { hasText: /^动作执行结果$/ }),
   });
   await executionRow.click();
-  const drawer = page.getByRole("dialog", { name: "execution" });
+  const drawer = page.getByRole("dialog", { name: "动作执行结果" });
   await expect(drawer).toBeVisible();
-  await expect(drawer.getByText("Command lifecycle")).toBeVisible();
-  await expect(drawer.getByText("3 events", { exact: true })).toBeVisible();
+  await expect(drawer.getByText("动作完整生命周期")).toBeVisible();
+  await expect(drawer.getByText("3 条事件", { exact: true })).toBeVisible();
   await expect(drawer).toContainText("cmd-build-pylon-001");
+  await expect(drawer.locator(".json-detail")).toBeHidden();
   await page.keyboard.press("Escape");
   await expect(drawer).toBeHidden();
 
-  await page.getByRole("button", { name: "Failures" }).click();
-  await expect(page.locator(".event-count")).toHaveText("1 events");
-  await expect(page.locator(".event-row")).toContainText("friendly_target");
-  await page.getByRole("button", { name: "All" }).click();
+  await page.getByRole("button", { name: "失败", exact: true }).click();
+  await expect(page.locator(".event-count")).toHaveText("1 条事件");
+  await expect(page.locator(".event-row")).toContainText("目标属于己方");
+  await page.locator(".event-row").click();
+  const failedDrawer = page.getByRole("dialog", { name: "动作验证失败" });
+  await expect(failedDrawer.locator(".json-detail")).toBeHidden();
+  await failedDrawer.getByText("技术详情：查看原始 JSON").click();
+  await expect(failedDrawer.locator(".json-detail")).toBeVisible();
+  await expect(failedDrawer.locator(".json-detail")).toContainText("friendly_target");
+  await page.keyboard.press("Escape");
+  await page.getByRole("button", { name: "全部", exact: true }).click();
 
   await page.setViewportSize({ width: 1_024, height: 900 });
   const tabletFrame = await page.locator(".frame-stage").boundingBox();

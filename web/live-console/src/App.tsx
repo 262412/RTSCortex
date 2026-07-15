@@ -6,8 +6,8 @@ import { EventDetailDrawer } from "./components/EventDetailDrawer";
 import { EventTimeline } from "./components/EventTimeline";
 import { FramePanel } from "./components/FramePanel";
 import { StatusHeader } from "./components/StatusHeader";
-import { findLatest, moduleName, readNumber } from "./data";
-import type { StoredEvent } from "./types";
+import { findLatest, moduleName, moduleOutput, readNumber } from "./data";
+import type { JsonObject, JsonValue, StoredEvent } from "./types";
 import { useConsole } from "./useConsole";
 
 const plannerTerminalEvents = new Set([
@@ -23,6 +23,18 @@ function latestModule(events: StoredEvent[], name: string): StoredEvent | undefi
     events,
     (event) => event.event_type === "module_result" && moduleName(event)?.toLowerCase() === name,
   );
+}
+
+function asObject(value: JsonValue | undefined): JsonObject | undefined {
+  return typeof value === "object" && value !== null && !Array.isArray(value) ? value : undefined;
+}
+
+function proposedActions(planning: StoredEvent | undefined, action: StoredEvent | undefined): JsonValue | undefined {
+  const planningOutput = asObject(moduleOutput(planning));
+  const plan = asObject(planningOutput?.plan);
+  if (plan?.proposed_actions !== undefined) return plan.proposed_actions;
+  const legacyActionOutput = asObject(moduleOutput(action));
+  return legacyActionOutput?.commands;
 }
 
 function useElapsed(started: StoredEvent | undefined, running: boolean): number | undefined {
@@ -56,18 +68,23 @@ export function App() {
   const moduleRunning = Boolean(moduleStarted && (!moduleTerminal || moduleStarted.event_id > moduleTerminal.event_id));
   const moduleElapsedSeconds = useElapsed(moduleStarted, moduleRunning);
 
-  const projection = useMemo(
-    () => ({
-      reflection: latestModule(events, "reflection"),
-      plan: latestModule(events, "planning"),
-      action: latestModule(events, "action"),
-      context: findLatest(events, (event) => event.event_type === "context_prepared"),
-      decision: findLatest(events, (event) => event.event_type === "decision"),
+  const projection = useMemo(() => {
+    const currentPlanner = findLatest(events, (event) => event.event_type === "planner_started");
+    const cycleEvents = currentPlanner
+      ? events.filter((event) => event.event_id >= currentPlanner.event_id)
+      : events;
+    const planning = latestModule(cycleEvents, "planning");
+    const action = latestModule(cycleEvents, "action");
+    return {
+      reflection: latestModule(cycleEvents, "reflection"),
+      plan: findLatest(events, (event) => event.event_type === "plan_accepted") ?? planning,
+      candidateActions: proposedActions(planning, action),
+      context: findLatest(cycleEvents, (event) => event.event_type === "context_prepared"),
+      decision: findLatest(cycleEvents, (event) => event.event_type === "decision"),
       execution: findLatest(events, (event) => event.event_type === "execution"),
       observation: findLatest(events, (event) => event.event_type === "observation"),
-    }),
-    [events],
-  );
+    };
+  }, [events]);
 
   const modelTelemetry = useMemo(() => {
     const calls = events.filter(
@@ -131,7 +148,7 @@ export function App() {
         <DecisionRail
           reflection={projection.reflection}
           plan={projection.plan}
-          action={projection.action}
+          candidateActions={projection.candidateActions}
           context={projection.context}
           decision={projection.decision}
           execution={projection.execution}

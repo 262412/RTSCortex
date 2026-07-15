@@ -486,15 +486,13 @@ pre {
   place-items: center;
 }
 
-.insight-card pre {
+.insight-card > .semantic-object,
+.insight-card > .semantic-list,
+.insight-card > .semantic-prose {
   max-height: 122px;
   margin: 0;
   overflow: auto;
-  color: #dbeafe;
-  font-size: 0.65rem;
-  line-height: 1.5;
-  white-space: pre-wrap;
-  word-break: break-word;
+  scrollbar-color: var(--surface-soft) transparent;
 }
 
 .empty-copy {
@@ -644,7 +642,7 @@ pre {
   grid-template-columns: 3px 74px 62px minmax(180px, 1fr) auto 20px;
   align-items: center;
   gap: 8px;
-  min-height: 42px;
+  min-height: 48px;
   padding: 5px 9px 5px 0;
   border: 0;
   border-bottom: 1px solid rgba(148, 163, 184, 0.09);
@@ -859,6 +857,200 @@ pre {
   gap: 6px;
 }
 
+.semantic-event {
+  margin-top: 14px;
+  padding: 0 11px 11px;
+  border: 1px solid rgba(129, 140, 248, 0.25);
+  border-radius: var(--radius);
+  background: rgba(129, 140, 248, 0.07);
+}
+
+.semantic-event .json-heading {
+  margin-top: 11px;
+}
+
+.semantic-event-summary {
+  margin: 0 0 11px;
+  color: var(--foreground);
+  font-size: 0.83rem;
+  font-weight: 650;
+  line-height: 1.55;
+}
+
+.semantic-object {
+  min-width: 0;
+  color: var(--muted-bright);
+  font-size: 0.72rem;
+}
+
+.semantic-fields {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+}
+
+.semantic-field {
+  display: grid;
+  grid-template-columns: minmax(105px, 0.34fr) minmax(0, 1fr);
+  gap: 9px;
+  align-items: start;
+  padding-bottom: 6px;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.1);
+}
+
+.semantic-field:last-child {
+  padding-bottom: 0;
+  border-bottom: 0;
+}
+
+.semantic-field dt {
+  color: var(--muted);
+  font-size: 0.65rem;
+  font-weight: 650;
+  line-height: 1.45;
+}
+
+.semantic-field dd {
+  min-width: 0;
+  margin: 0;
+  color: var(--muted-bright);
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.semantic-fields.compact {
+  gap: 4px;
+}
+
+.semantic-fields.compact > .semantic-field {
+  grid-template-columns: minmax(88px, 0.45fr) minmax(0, 1fr);
+  gap: 6px;
+  padding-bottom: 4px;
+}
+
+.semantic-fields.compact .semantic-field dt,
+.semantic-fields.compact .semantic-field dd {
+  font-size: 0.63rem;
+}
+
+.semantic-list {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding-left: 19px;
+}
+
+.semantic-list > li {
+  padding-left: 2px;
+  color: var(--muted-bright);
+  line-height: 1.48;
+}
+
+.semantic-list.nested {
+  gap: 4px;
+  padding-left: 16px;
+}
+
+.semantic-command {
+  padding: 7px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: rgba(8, 13, 23, 0.42);
+}
+
+.semantic-command-heading {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 4px 8px;
+  margin-bottom: 6px;
+}
+
+.semantic-command-heading strong {
+  color: #dbeafe;
+  font-size: 0.7rem;
+}
+
+.semantic-command-heading span {
+  color: var(--muted);
+  font-size: 0.62rem;
+}
+
+.semantic-prose {
+  margin: 0;
+  color: var(--muted-bright);
+  font-size: 0.71rem;
+  line-height: 1.58;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.semantic-empty {
+  color: var(--muted);
+  font-size: 0.68rem;
+}
+
+.semantic-technical {
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  font-size: 0.66rem;
+  word-break: break-all;
+}
+
+.raw-json-disclosure {
+  margin-top: 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: rgba(5, 8, 15, 0.5);
+}
+
+.raw-json-disclosure > summary {
+  display: flex;
+  min-height: 44px;
+  align-items: center;
+  gap: 7px;
+  padding: 9px 11px;
+  color: var(--muted-bright);
+  font-size: 0.72rem;
+  font-weight: 700;
+  cursor: pointer;
+  list-style-position: inside;
+}
+
+.raw-json-disclosure > summary:hover {
+  color: var(--foreground);
+}
+
+.raw-json-disclosure > summary:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+}
+
+.raw-json-disclosure[open] {
+  padding: 0 11px 11px;
+}
+
+.raw-json-disclosure[open] > summary {
+  margin: 0 -11px;
+  border-bottom: 1px solid var(--border);
+}
+
+.raw-json-disclosure .json-heading {
+  margin-top: 11px;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
 .json-detail {
   min-height: 360px;
   margin: 0;
@@ -1003,6 +1195,12 @@ pre {
   .lifecycle-row {
     grid-template-columns: 1fr;
     gap: 3px;
+  }
+
+  .semantic-field,
+  .semantic-fields.compact > .semantic-field {
+    grid-template-columns: 1fr;
+    gap: 2px;
   }
 
   .console-footer {

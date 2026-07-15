@@ -153,8 +153,17 @@ export function actionName(event: StoredEvent): string | undefined {
   if (direct) return direct;
   for (const key of ["command", "execution", "report"]) {
     const nested = asObject(payload[key]);
-    const name = nested ? readString(nested, "action_name", "action") : undefined;
+    const name = nested ? readString(nested, "action_name", "action", "name") : undefined;
     if (name) return name;
+  }
+  const batch = asObject(payload.batch);
+  for (const value of [payload.commands, batch?.commands, payload.planner_candidates, payload.reflex_candidates]) {
+    if (!Array.isArray(value)) continue;
+    for (const command of value) {
+      const nested = asObject(command);
+      const name = nested ? readString(nested, "action_name", "action", "name") : undefined;
+      if (name) return name;
+    }
   }
   return undefined;
 }
@@ -165,7 +174,7 @@ export function isFailure(event: StoredEvent): boolean {
   return (
     event.event_type.includes("failed") ||
     event.event_type.includes("error") ||
-    status === "failed" ||
+    ["failed", "rejected", "expired", "unconfirmed"].includes(status ?? "") ||
     typeof payload.failure_code === "string" ||
     typeof payload.failure_reason === "string"
   );

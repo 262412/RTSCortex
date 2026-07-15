@@ -55,7 +55,16 @@ start a frame publisher, or bind a browser server.
 - **Action trace:** proposals, validation and arbitration, dispatch, translator
   primitives, PySC2 acceptance, and ActionEffectVerifier evidence joined by command ID.
 - **Timeline:** durable SQLite/JSONL events with filtering, pause/autofollow, reconnect
-  backfill, and raw JSON inspection.
+  backfill, and human-readable Chinese summaries for actions, states, stages, and failure
+  codes.
+
+The decision rail and event drawer use a presentation-only semantic layer. Protocol field
+labels, SC2 actions, lifecycle states, execution stages, and known failure codes are shown
+in Chinese while canonical action names, command IDs, actor scopes, model output prose,
+coordinates, tags, and PySC2 function names remain unchanged for auditability. The original
+event JSON is available under **技术详情：查看原始 JSON**, but stays collapsed by default.
+This display transformation never rewrites the SQLite/JSONL journal or changes the Worker
+control protocol.
 
 The provider remains schema-based and non-streaming. The page therefore shows a live
 elapsed timer while a module is running and displays its structured result when the
