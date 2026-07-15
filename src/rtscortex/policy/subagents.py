@@ -106,6 +106,8 @@ class LLMPlanningPolicySubagent:
     async def propose(self, fixture: PolicyObservationFixture) -> PolicyProposal:
         observation = project_planning_observation(fixture.observation)
         compact_observation, _ = model_observation(observation)
+        # Exact action candidates already carry every dispatchable screen/minimap value.
+        compact_observation.pop("spatial_context", None)
         response_type = planning_output_model(observation)
         output = await self.provider.generate(
             response_type,

@@ -89,6 +89,24 @@ hiernet:
         )
 
 
+def test_comparison_config_preserves_hima_venv_python_symlink(tmp_path: Path) -> None:
+    venv_python = tmp_path / "hima-venv/bin/python"
+    venv_python.parent.mkdir(parents=True)
+    venv_python.symlink_to(Path(sys.executable).resolve())
+    config = PolicyComparisonConfig.model_validate(
+        {
+            "corpus_manifest": "manifest.yaml",
+            "qwen": {"enabled": False},
+            "hima": {"python_executable": "hima-venv/bin/python"},
+        }
+    )
+
+    resolved = config.resolved(base_dir=tmp_path)
+
+    assert resolved.hima.python_executable == venv_python.absolute()
+    assert resolved.hima.python_executable != venv_python.resolve()
+
+
 def test_hima_checkpoint_provenance_rejects_swapped_model_and_revision(
     tmp_path: Path,
 ) -> None:

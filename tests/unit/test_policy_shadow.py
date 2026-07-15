@@ -7,13 +7,19 @@ from typing import NoReturn
 
 import pytest
 
-from rtscortex.agents.models import ActionProposal, PlanningOutput
+from rtscortex.agents.context import model_observation
+from rtscortex.agents.models import (
+    ActionProposal,
+    PlanningOutput,
+    project_planning_observation,
+)
 from rtscortex.contracts import ActionArgumentType, AvailableAction, UnitState
 from rtscortex.contracts.interfaces import ResponseT
 from rtscortex.policy import (
     HIERNET_SC2_SPEC,
     HIMA_PROTOSS_SPECS,
     QWEN3_8B_SPEC,
+    HIMAObservationAdapter,
     LLMPlanningPolicySubagent,
     PolicyAvailability,
     PolicyAvailabilityStatus,
@@ -28,6 +34,7 @@ from rtscortex.policy import (
     built_in_policy_specs,
     default_shadow_registrations,
     load_historical_observations,
+    load_policy_corpus,
 )
 from rtscortex.progress import (
     GoalProgressItem,
@@ -206,6 +213,7 @@ class FixedPlanningProvider:
 
 class CapturingPlanningProvider:
     def __init__(self) -> None:
+        self.system_prompt = ""
         self.user_prompt = ""
 
     async def generate(
@@ -215,7 +223,7 @@ class CapturingPlanningProvider:
         system_prompt: str,
         user_prompt: str,
     ) -> ResponseT:
-        del system_prompt
+        self.system_prompt = system_prompt
         self.user_prompt = user_prompt
         return response_type.model_validate(
             PlanningOutput(strategic_goal="Observe compact state").model_dump()
@@ -265,6 +273,42 @@ def test_llm_adapter_compacts_historical_observation_before_model_call() -> None
     assert "text_observation" not in payload["observation"]
     assert "UNBOUNDED_HISTORY" not in provider.user_prompt
     assert len(payload["observation"]["state"]["own_units"]) < len(units)
+
+
+def test_llm_adapter_drops_redundant_spatial_context_from_largest_corpus_fixture(
+) -> None:
+    fixture_id = "protoss-v0.2:combat:seed-1-full:event-1019"
+    manifest_path = (
+        Path(__file__).resolve().parents[2]
+        / "benchmarks/policy/protoss_v0_2/manifest.yaml"
+    )
+    fixture = next(
+        item
+        for item in load_policy_corpus(manifest_path)
+        if item.fixture_id == fixture_id
+    )
+    assert fixture.goal_spec is not None
+    assert fixture.goal_progress is not None
+    original_observation = fixture.observation.model_dump(mode="json")
+    expected_projection, _ = model_observation(
+        project_planning_observation(fixture.observation)
+    )
+    assert len(expected_projection["spatial_context"]) == 30
+    hima_before = HIMAObservationAdapter().prepare(fixture)
+    provider = CapturingPlanningProvider()
+
+    asyncio.run(LLMPlanningPolicySubagent(provider).propose(fixture))
+
+    payload = json.loads(provider.user_prompt)
+    projected = payload["observation"]
+    assert "spatial_context" not in projected
+    assert projected["state"] == expected_projection["state"]
+    assert projected["available_actions"] == expected_projection["available_actions"]
+    assert payload["goal_spec"] == fixture.goal_spec.model_dump(mode="json")
+    assert payload["goal_progress"] == fixture.goal_progress.model_dump(mode="json")
+    assert len(provider.system_prompt) + len(provider.user_prompt) <= 9_000
+    assert fixture.observation.model_dump(mode="json") == original_observation
+    assert HIMAObservationAdapter().prepare(fixture) == hima_before
 
 
 def test_historical_loader_reuses_observations_in_event_order(tmp_path: Path) -> None:

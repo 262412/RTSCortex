@@ -122,7 +122,7 @@ class PolicyComparisonConfig(ComparisonConfigModel):
                 ),
                 "hima": self.hima.model_copy(
                     update={
-                        "python_executable": _resolve_path(
+                        "python_executable": _absolute_path_preserving_symlinks(
                             self.hima.python_executable,
                             base_dir=base_dir,
                         ),
@@ -711,6 +711,12 @@ def _project_root() -> Path:
 def _resolve_path(path: Path, *, base_dir: Path) -> Path:
     expanded = path.expanduser()
     return expanded.resolve() if expanded.is_absolute() else (base_dir / expanded).resolve()
+
+
+def _absolute_path_preserving_symlinks(path: Path, *, base_dir: Path) -> Path:
+    expanded = path.expanduser()
+    candidate = expanded if expanded.is_absolute() else base_dir / expanded
+    return candidate.absolute()
 
 
 __all__ = [
