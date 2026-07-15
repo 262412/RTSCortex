@@ -17,13 +17,23 @@ semantic boundary needed by a future action-conditioned world model.
 ## Timing model
 
 - Reflex policies run synchronously on every observation.
-- Planning runs in the background in live mode and on a fixed game-loop cadence.
+- Planning runs single-flight in the background on a fixed Planner-start game-loop cadence.
 - The last valid plan remains active while a new plan is pending.
 - `ActionBatch.planner_pending` lets a simulation worker pace game steps for a slower
   local model without blocking the runtime's reflex and fallback path.
 - Reflex commands can preempt only commands for the same actor scope.
-- Every command has a priority, source, acceptance loop, and TTL; asynchronous plan TTLs
-  begin when the runtime accepts the finished plan rather than at the older source tick.
+- Every command has a priority, source, acceptance loop, Runtime-owned TTL, and persistent
+  lifecycle. A dispatched command ID is never returned a second time, including after a
+  Runtime restart.
+- Planner context contains a compact snapshot of every active `pending`, `deferred`, and
+  `dispatched` command. Accepting an equivalent plan retains the existing command ID instead
+  of refreshing its TTL or creating another dispatch.
+- Each actor has at most one in-flight dispatched command. Planner work for a busy actor is
+  deferred, and Reflex work is suppressed until that command reaches one terminal report.
+- Multiple Planner commands for one actor remain ordered in lifecycle state; the Runtime
+  dispatches only the first and defers the rest until the actor is released.
+- A decision with no legal command uses `commands=[]` plus a typed `idle_reason`; semantic
+  `No_Operation` commands never enter command lifecycle or execution metrics.
 
 ## Live process lifecycle
 
@@ -39,11 +49,18 @@ for a non-zero status, so incomplete live runs remain visible in evaluation arti
 
 ## Safety boundary
 
-Model responses are parsed into typed proposals. Only `ActionCommand` objects accepted by
-the action validator can cross the environment boundary. Unknown actions, invalid argument
-counts, invalid actor scopes, expired commands, and commands exceeding the action budget are
-recorded and rejected. Planner-generated `Attack_Unit` commands also require their target
-unit to remain present when the finished asynchronous plan is applied.
+Model responses are parsed into typed proposals. Every target or position action must select
+a complete argument tuple from the current structured candidate domain. Only validated
+`ActionCommand` objects can cross the environment boundary. Unknown actions,
+candidate-external arguments, invalid actor scopes, expired commands, and commands exceeding
+the action budget are recorded and rejected. `Attack_Unit` is additionally enemy-only at
+extraction, schema, Runtime, and upstream alliance-validation layers.
+
+The live Bridge records every translator primitive with command provenance and distinguishes
+orchestration actions (camera and selection) from the final translated primitive. A command
+can have exactly one terminal execution report. Build commands are confirmed only when a new
+structure tag of the expected type appears near that command's resolved target; resource
+changes and worker orders are diagnostic evidence, not success criteria.
 
 ## Research provenance
 

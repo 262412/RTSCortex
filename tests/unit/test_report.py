@@ -16,9 +16,16 @@ from rtscortex.contracts import (
     EpisodeResult,
     EpisodeSummary,
     ExecutionReport,
+    ExecutionStage,
+    ExecutionStatus,
 )
-from rtscortex.evaluation.report import ReportError, write_timeline_report
-from rtscortex.memory import StoredEvent
+from rtscortex.evaluation.report import (
+    ReportError,
+    render_timeline,
+    write_run_reports,
+    write_timeline_report,
+)
+from rtscortex.memory import StoredEvent, read_event_log
 from tests.helpers import make_observation
 
 
@@ -150,6 +157,14 @@ def test_timeline_renders_live_state_reasoning_actions_and_execution(tmp_path: P
         ),
         _event(
             5,
+            "command_lifecycle",
+            {
+                "command": command.model_dump(mode="json"),
+                "status": "dispatched",
+            },
+        ),
+        _event(
+            6,
             "execution",
             ExecutionReport(
                 run_id="live-run",
@@ -157,20 +172,53 @@ def test_timeline_renders_live_state_reasoning_actions_and_execution(tmp_path: P
                 step_id=0,
                 command_id=command.command_id,
                 success=True,
+                action_name=command.name,
+                actor=command.actor,
+                source=command.source,
+                requested_arguments=command.arguments,
+                resolved_arguments=command.arguments,
+                status=ExecutionStatus.SUCCEEDED,
+                execution_stage=ExecutionStage.PYSC2_ACCEPTANCE,
                 pysc2_function="select_control_group -> Attack_screen",
                 latency_ms=2.5,
             ).model_dump(mode="json"),
         ),
-        _event(6, "episode_result", result.model_dump(mode="json"), step_id=481),
-        _event(7, "episode_summary", summary.model_dump(mode="json"), step_id=481),
+        _event(7, "episode_result", result.model_dump(mode="json"), step_id=481),
+        _event(8, "episode_summary", summary.model_dump(mode="json"), step_id=481),
     ]
     run_dir = tmp_path / "live"
     _write_journal(run_dir, events)
 
-    output_path = write_timeline_report(run_dir)
-    report = output_path.read_text(encoding="utf-8")
+    artifacts = write_run_reports(run_dir)
+    report = artifacts.timeline_path.read_text(encoding="utf-8")
+    summary_report = artifacts.summary_path.read_text(encoding="utf-8")
+    summary_payload = json.loads(summary_report)
+    episode = summary_payload["runs"]["live-run"]["episodes"]["episode-0"]
 
-    assert output_path == run_dir / "timeline.md"
+    assert artifacts.timeline_path == run_dir / "timeline.md"
+    assert artifacts.summary_path == run_dir / "summary.json"
+    assert episode["complete"] is True
+    assert episode["result"]["outcome"] == "victory"
+    assert episode["result"]["scenario"] == "2s3z"
+    assert episode["result"]["seed"] == 7
+    assert episode["result"]["steps"] == 481
+    assert episode["metrics"]["model_requests"] == 1
+    assert episode["metrics"]["prompt_tokens"] == 80
+    assert episode["metrics"]["completion_tokens"] == 20
+    assert episode["metrics"]["total_tokens"] == 100
+    assert episode["metrics"]["execution"]["status_counts"] == {"succeeded": 1}
+    assert episode["metrics"]["execution"]["terminal_backlog_rate"] == 0.0
+    assert episode["classification_conservation"] == {
+        "reported": 1,
+        "succeeded": 1,
+        "failed": 0,
+        "cancelled": 0,
+        "unconfirmed": 0,
+        "classified": 1,
+        "conserved": True,
+    }
+    assert episode["terminal_reports"]["exactly_once"] is True
+    assert episode["hard_acceptance"]["gates"]["meaningful_command_success_rate"]["passed"] is True
     assert "`openai_compatible`/`qwen3-8b`" in report
     assert "`2s3z` | `victory` | 7 | 1.00 | 481" in report
     assert "`Adept` x1 (HP 42%)" in report
@@ -180,9 +228,23 @@ def test_timeline_renders_live_state_reasoning_actions_and_execution(tmp_path: P
     assert "actor is outside the action scope" in report
     assert "Reflex preemption" in report
     assert "source loop `50`, accepted loop `58`, age `8` loops" in report
+    assert "### Decision activity" in report
+    assert "### Meaningful outcomes" in report
+    assert "Meaningful success: `1/1` (100.0%)" in report
+    assert "### Build funnel" in report
+    assert "### Safety and attribution invariants" in report
+    assert "Terminal backlog rate: `0.0%` (`0/1`)" in report
+    assert "### Hard acceptance gates" in report
+    assert "insufficient samples (requires at least two accepted plans)" in report
+    assert "### Failure taxonomy" in report
+    assert "Legacy execution-report rate: `1/1` (100.0%) (deprecated)" in report
     assert "RAW OBSERVATION SHOULD STAY IN JSONL" not in report
     assert report.index("Event 2 · Plan revision") < report.index("Event 4 · Decision")
-    assert report.index("Event 4 · Decision") < report.index("Event 5 · Execution")
+    assert report.index("Event 4 · Decision") < report.index("Event 6 · Execution")
+
+    second = write_run_reports(run_dir)
+    assert second.timeline_path.read_text(encoding="utf-8") == report
+    assert second.summary_path.read_text(encoding="utf-8") == summary_report
 
 
 def test_timeline_renders_module_context_compaction_statistics(tmp_path: Path) -> None:
@@ -241,6 +303,171 @@ def test_timeline_renders_module_context_compaction_statistics(tmp_path: Path) -
     assert "spatial lines `7`" in report
 
 
+def test_report_gates_raw_planner_attack_proposals_and_dispatched_safety(
+    tmp_path: Path,
+) -> None:
+    observation = make_observation(
+        run_id="live-run",
+        episode_id="episode-0",
+        step_id=0,
+        game_loop=58,
+    )
+    friendly_attack = ActionCommand(
+        command_id="live-run:episode-0:0:planner:1",
+        actor="CombatGroup/Zealot-1",
+        name="Attack_Unit",
+        arguments=["unit-1"],
+        priority=50,
+        ttl_game_loops=112,
+        created_game_loop=58,
+        source=ActionSource.PLANNER,
+    )
+    result = EpisodeResult(
+        run_id="live-run",
+        episode_id="episode-0",
+        scenario="Simple64",
+        seed=0,
+        outcome=EpisodeOutcome.TRUNCATED,
+        steps=1,
+    )
+    events = [
+        _event(1, "observation", observation.model_dump(mode="json")),
+        _event(
+            2,
+            "module_result",
+            {
+                "module": "planning",
+                "model_call": True,
+                "output": {
+                    "plan": {
+                        "strategic_goal": "Reject unsafe attacks",
+                        "proposed_actions": [
+                            {
+                                "actor": "Builder/Probe-1",
+                                "name": "Attack_Unit",
+                                "arguments": ["0x1"],
+                            },
+                            {
+                                "actor": "CombatGroup/Zealot-1",
+                                "name": "Attack_Unit",
+                                "arguments": ["unit-1"],
+                            },
+                        ],
+                    }
+                },
+            },
+        ),
+        _event(
+            3,
+            "command_lifecycle",
+            {
+                "command": friendly_attack.model_dump(mode="json"),
+                "status": "dispatched",
+            },
+        ),
+        _event(4, "episode_result", result.model_dump(mode="json")),
+    ]
+    run_dir = tmp_path / "unsafe-proposals"
+    _write_journal(run_dir, events)
+
+    artifacts = write_run_reports(run_dir)
+    report = artifacts.timeline_path.read_text(encoding="utf-8")
+    summary = json.loads(artifacts.summary_path.read_text(encoding="utf-8"))
+    episode = summary["runs"]["live-run"]["episodes"]["episode-0"]
+    execution = episode["metrics"]["execution"]
+    gates = episode["hard_acceptance"]["gates"]
+
+    assert execution["planner_unsafe_attack_proposals"] == 2
+    assert execution["planner_unsafe_attack_rejected_before_dispatch"] == 1
+    assert execution["planner_unsafe_attack_dispatched"] == 1
+    assert gates["planner_builder_attack_proposals"]["passed"] is False
+    assert gates["planner_friendly_target_attack_proposals"]["passed"] is False
+    assert gates["friendly_target_attacks"]["passed"] is False
+    assert "Planner unsafe Attack proposals: `2`" in report
+    assert "rejected before dispatch `1`; dispatched `1`" in report
+
+
+def test_report_exactly_once_gate_rejects_unexpected_terminal_report(
+    tmp_path: Path,
+) -> None:
+    observation = make_observation(
+        run_id="live-run",
+        episode_id="episode-0",
+        step_id=0,
+        game_loop=58,
+    )
+    command = ActionCommand(
+        command_id="known",
+        actor="CombatGroup/Zealot-1",
+        name="Attack_Unit",
+        arguments=["0x1"],
+        priority=50,
+        ttl_game_loops=112,
+        created_game_loop=58,
+        source=ActionSource.PLANNER,
+    )
+
+    def report(command_id: str) -> ExecutionReport:
+        return ExecutionReport(
+            run_id="live-run",
+            episode_id="episode-0",
+            step_id=0,
+            command_id=command_id,
+            success=False,
+            action_name=command.name,
+            actor=command.actor,
+            source=command.source,
+            requested_arguments=command.arguments,
+            status=ExecutionStatus.FAILED,
+            execution_stage=ExecutionStage.PYSC2_ACCEPTANCE,
+            failure_code="pysc2_rejected",
+        )
+
+    result = EpisodeResult(
+        run_id="live-run",
+        episode_id="episode-0",
+        scenario="Simple64",
+        seed=0,
+        outcome=EpisodeOutcome.TRUNCATED,
+        steps=1,
+    )
+    events = [
+        _event(1, "observation", observation.model_dump(mode="json")),
+        _event(
+            2,
+            "command_lifecycle",
+            {"command": command.model_dump(mode="json"), "status": "dispatched"},
+        ),
+        _event(3, "execution", report("known").model_dump(mode="json")),
+        _event(4, "execution", report("rogue").model_dump(mode="json")),
+        _event(5, "episode_result", result.model_dump(mode="json")),
+    ]
+    run_dir = tmp_path / "unexpected-terminal"
+    _write_journal(run_dir, events)
+
+    artifacts = write_run_reports(run_dir)
+    summary = json.loads(artifacts.summary_path.read_text(encoding="utf-8"))
+    episode = summary["runs"]["live-run"]["episodes"]["episode-0"]
+
+    assert episode["terminal_reports"]["unexpected_reports"] == 1
+    assert episode["terminal_reports"]["exactly_once"] is False
+    assert episode["hard_acceptance"]["gates"]["unexpected_terminal_reports"]["passed"] is False
+
+
+def test_real_legacy_full_match_report_freezes_baseline_lines() -> None:
+    fixture = Path(__file__).parents[1] / "fixtures" / "legacy_full_match_characterization.jsonl"
+
+    report = render_timeline(list(read_event_log(fixture)))
+
+    assert "| 946 | 754 | 462 | 39 |" in report
+    assert "Tracked control NoOps: `782` (`729` succeeded)" in report
+    assert "Meaningful commands: `121` — `30` succeeded, `73` failed" in report
+    assert "Meaningful success: `30/121` (24.8%)" in report
+    assert "Completed execution success: `30/103` (29.1%)" in report
+    assert "Terminal cancelled: `71`" in report
+    assert "Legacy execution-report rate: `759/903` (84.1%) (deprecated)" in report
+
+
 def test_legacy_incomplete_mock_journal_still_writes_report_and_cli_succeeds(
     tmp_path: Path,
 ) -> None:
@@ -259,6 +486,7 @@ def test_legacy_incomplete_mock_journal_still_writes_report_and_cli_succeeds(
         source=ActionSource.FALLBACK,
     )
     batch = ActionBatch(
+        protocol_version="1.0",
         run_id="live-run",
         episode_id="episode-0",
         step_id=0,
@@ -294,6 +522,7 @@ def test_legacy_incomplete_mock_journal_still_writes_report_and_cli_succeeds(
             4,
             "execution",
             ExecutionReport(
+                protocol_version="1.0",
                 run_id="live-run",
                 episode_id="episode-0",
                 step_id=0,
@@ -308,13 +537,71 @@ def test_legacy_incomplete_mock_journal_still_writes_report_and_cli_succeeds(
 
     result = CliRunner().invoke(cli_module.app, ["report", str(run_dir)])
     report = (run_dir / "timeline.md").read_text(encoding="utf-8")
+    summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
+    episode = summary["runs"]["live-run"]["episodes"]["episode-0"]
 
     assert result.exit_code == 0, result.output
     assert f"Timeline: {run_dir / 'timeline.md'}" in result.output
+    assert f"Summary: {run_dir / 'summary.json'}" in result.output
+    assert episode["complete"] is False
+    assert episode["result"] is None
+    assert episode["metrics"]["execution"]["control_noops"] == 1
+    assert episode["metrics"]["execution"]["meaningful_commands"] == 0
+    assert episode["hard_acceptance"]["passed"] is False
     assert "`incomplete`" in report
     assert "No terminal episode result was recorded" in report
     assert "Structured output not recorded (legacy event)." in report
     assert "mock.No_Operation" in report
+    assert "`No_Operation` by `global` from `fallback`" in report
+    assert "Tracked control NoOps: `1` (`1` succeeded)" in report
+    assert "Meaningful commands: `0`" in report
+
+
+def test_report_reads_legacy_planning_ttl(tmp_path: Path) -> None:
+    observation = make_observation(
+        run_id="live-run",
+        episode_id="episode-0",
+        step_id=0,
+        game_loop=0,
+    )
+    events = [
+        _event(1, "observation", observation.model_dump(mode="json")),
+        _event(
+            2,
+            "module_result",
+            {
+                "module": "planning",
+                "latency_ms": 3.0,
+                "model_call": True,
+                "provider": "fake",
+                "model": "fake-planner-v1",
+                "usage": None,
+                "output": {
+                    "plan": {
+                        "strategic_goal": "Hold the ramp",
+                        "steps": ["Target the visible enemy"],
+                        "proposed_actions": [
+                            {
+                                "actor": "CombatGroup/Zealot-1",
+                                "name": "Attack_Unit",
+                                "arguments": ["0xabc"],
+                                "priority": 60,
+                                "ttl_game_loops": 32,
+                            }
+                        ],
+                    }
+                },
+            },
+        ),
+    ]
+    run_dir = tmp_path / "legacy-planning"
+    _write_journal(run_dir, events)
+
+    report = write_timeline_report(run_dir).read_text(encoding="utf-8")
+
+    assert "Proposed goal: **Hold the ramp**" in report
+    assert "`Attack_Unit`" in report
+    assert "TTL" not in report
 
 
 def test_report_rejects_missing_empty_and_malformed_journals(tmp_path: Path) -> None:
@@ -322,20 +609,51 @@ def test_report_rejects_missing_empty_and_malformed_journals(tmp_path: Path) -> 
     missing.mkdir()
     with pytest.raises(ReportError, match="does not contain events.jsonl"):
         write_timeline_report(missing)
+    with pytest.raises(ReportError, match="does not contain events.jsonl"):
+        write_run_reports(missing)
 
     empty = tmp_path / "empty"
     empty.mkdir()
     (empty / "events.jsonl").touch()
     with pytest.raises(ReportError, match="Event journal is empty"):
         write_timeline_report(empty)
+    with pytest.raises(ReportError, match="Event journal is empty"):
+        write_run_reports(empty)
 
     malformed = tmp_path / "malformed"
     malformed.mkdir()
     (malformed / "events.jsonl").write_text("{broken\n", encoding="utf-8")
     with pytest.raises(ReportError, match="Invalid event journal"):
         write_timeline_report(malformed)
+    with pytest.raises(ReportError, match="Invalid event journal"):
+        write_run_reports(malformed)
 
     result = CliRunner().invoke(cli_module.app, ["report", str(missing)])
     assert result.exit_code == 2
     assert "does not contain events.jsonl" in result.output
     assert not (missing / "timeline.md").exists()
+    assert not (missing / "summary.json").exists()
+    assert not (empty / "summary.json").exists()
+    assert not (malformed / "summary.json").exists()
+
+
+def test_best_effort_report_failure_does_not_escape(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    run_dir = tmp_path / "run"
+    observation = make_observation(run_id="live-run", episode_id="episode-0")
+    _write_journal(run_dir, [_event(1, "observation", observation.model_dump(mode="json"))])
+
+    def fail_report(_: Path) -> None:
+        raise RuntimeError("derived artifact write failed")
+
+    monkeypatch.setattr(cli_module, "write_run_reports", fail_report)
+
+    cli_module._write_run_reports_best_effort(run_dir)
+
+    assert (
+        "Warning: could not generate run reports: derived artifact write failed"
+        in capsys.readouterr().err
+    )

@@ -1,0 +1,91 @@
+diff --git a/llm_pysc2/agents/llm_pysc2_agent.py b/llm_pysc2/agents/llm_pysc2_agent.py
+--- a/llm_pysc2/agents/llm_pysc2_agent.py
++++ b/llm_pysc2/agents/llm_pysc2_agent.py
+@@ -220,14 +220,16 @@ class LLMAgent:
+ 
+     # store all the raw unit by tags
+     self.unit_raw_list = []
++    raw_unit_tags = set()
+     for unit in obs.observation.raw_units:
++      raw_unit_tags.add(unit.tag)
+       if unit.tag in self.unit_tag_list:
+         self.unit_raw_list.append(unit)
+ 
+     # delete dead units and change head unit to the closest one (if former head unit dead)
+     for team in self.teams:
+       for unit_tag in team['unit_tags']:
+-        if unit_tag not in self.unit_tag_list and unit_tag == team['unit_tags'][0]:
++        if unit_tag not in raw_unit_tags and unit_tag == team['unit_tags'][0]:
+           unit_r = None
+           unit_h = None
+           dist_min = 99999
+@@ -249,7 +251,7 @@ class LLMAgent:
+             team['unit_tags'].remove(unit_h.tag)
+             team['unit_tags'] = [unit_h.tag] + team['unit_tags']
+ 
+-        if unit_tag not in self.unit_tag_list:
++        if unit_tag not in raw_unit_tags:
+           team['unit_tags'].remove(unit_tag)
+         team['unit_tags'] = list(set(team['unit_tags']))
+ 
+diff --git a/llm_pysc2/agents/llm_pysc2_agent_main.py b/llm_pysc2/agents/llm_pysc2_agent_main.py
+--- a/llm_pysc2/agents/llm_pysc2_agent_main.py
++++ b/llm_pysc2/agents/llm_pysc2_agent_main.py
+@@ -369,13 +369,19 @@ class MainAgent(base_agent.BaseAgent):
+             if unit_f is None:
+               logger.error(f"[ID {self.log_id}] Agent {agent_name}: unit of tag {tag} not found")
+               logger.error(f"[ID {self.log_id}]                     relative team = {team}")
+               logger.error(f"[ID {self.log_id}] unit_f is None")
++              if any(unit.tag == tag for unit in obs.observation.raw_units):
++                logger.warning(
++                  f"[ID {self.log_id}] Agent {agent_name}: raw unit {tag} still exists; "
++                  "wait one observation for feature visibility")
++                func_id, func_call = (0, actions.FUNCTIONS.no_op())
++                self.func_id_history.append(func_id)
++                return func_call
+               if tag in team['unit_tags']:
+                 team['unit_tags'].remove(tag)
+               if tag in agent.unit_tag_list:
+                 agent.unit_tag_list.remove(tag)
+               agent.update(obs)
+-              time.sleep(1)
+               continue
+ 
+             # Select unit
+@@ -506,6 +506,14 @@ class MainAgent(base_agent.BaseAgent):
+             logger.debug(f"[ID {self.log_id}] Agent {agent_name} status: 7.3.2")
+             team, tag = agent._get_unacted_team_and_unit_tag()
+             if tag == None:  # single select team, unit dead / multi select team, all unit dead, relese actions
++              if len(agent.action_list) != 0:
++                agent.last_execution_abort = {
++                  'team_name': agent.team_unit_team_curr,
++                  'action_name': agent.curr_action_name,
++                  'actor_tag': agent.team_unit_tag_curr,
++                  'failure_code': 'actor_not_available',
++                  'failure_reason': 'team head unit is unavailable before action translation',
++                }
+               agent.func_list = []
+               agent.action_list = []
+               continue
+@@ -531,10 +539,18 @@ class MainAgent(base_agent.BaseAgent):
+               if unit_f is None:
+                 logger.error(f"[ID {self.log_id}] 7.3.2.1 Agent {agent_name}: unit of tag {tag} not found")
+                 logger.error(f"[ID {self.log_id}]         relative team = {team['name']} {team['unit_tags']}")
+-                func_id, func_call = agent.get_func(obs)  # 销掉这个动作
+-                logger.error(f"[ID {self.log_id}] 7.3.4 Agent {agent_name}: Func Call: {func_call}")
++                agent.last_execution_abort = {
++                  'team_name': team['name'],
++                  'action_name': agent.curr_action_name,
++                  'actor_tag': tag,
++                  'failure_code': 'actor_not_visible',
++                  'failure_reason': 'team head unit is not visible before action translation',
++                }
++                agent.func_list = []
++                agent.action_list = []
++                func_id, func_call = (0, actions.FUNCTIONS.no_op())
+                 self.func_id_history.append(func_id)
+-                time.sleep(1)
++                return func_call
+ 
+               # Unit select
+               if (unit_f is not None and not unit_f.is_selected):

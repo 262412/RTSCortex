@@ -1,0 +1,244 @@
+diff --git a/llm_pysc2/lib/llm_action.py b/llm_pysc2/lib/llm_action.py
+index f3f82f1..b51289d 100644
+--- a/llm_pysc2/lib/llm_action.py
++++ b/llm_pysc2/lib/llm_action.py
+@@ -178,7 +178,8 @@ PROTOSS_ACTION_UPGRADE = [
+ PROTOSS_ACTION_BUILD = [
+   # tag for Vespene Geyser
+   {'name': 'Build_Nexus_Near', 'arg': ['tag'],
+-   'func': [(573, F.llm_pysc2_move_camera, ('world_tag')), (65, F.Build_Nexus_screen, ('queued', 'screen_tag'))]},
++   'func': [(573, F.llm_pysc2_move_camera, ('world_tag')), (0, F.no_op, ()),
++            (65, F.Build_Nexus_screen, ('queued', 'screen_tag'))]},
+   # tag for Vespene Geyser
+   {'name': 'Build_Assimilator_Near', 'arg': ['tag'],
+    'func': [(40, F.Build_Assimilator_screen, ('queued', 'screen_tag'))]},
+@@ -556,56 +556,36 @@ def get_arg_screen_tag_gas_building(obs, tag: int, size_screen, action_name) ->
+ def get_arg_world_tag_base_building(obs, tag: int, x_offset, y_offset, world_range) -> (tuple, bool):
+ 
+   def find_nearby_raw_mg(unit_g):
+-    nearby_resource_unit_dict = {}
++    nearby_resources = []
+     for unit in obs.observation.raw_units:
+-      if unit.unit_type in MINERAL_TYPE:
+-        dist = math.sqrt((unit.x - unit_g.x) ** 2 + (unit.y - unit_g.y) ** 2)
+-        if dist < 16:
+-          nearby_resource_unit_dict[dist] = unit
+-      if unit.unit_type in GAS_TYPE:
+-        dist = math.sqrt((unit.x - unit_g.x) ** 2 + (unit.y - unit_g.y) ** 2)
+-        if dist < 16:
+-          nearby_resource_unit_dict[dist] = unit
+-    return nearby_resource_unit_dict.values()
+-
+-  def artificial_force_field_iteration_world(unit_list, x, y):
+-    k, r, m = 0.5, 7, 1
+-    vespene_r, vespene_m = 8, 1
+-    mineral_r, mineral_m = 7, 1
+-    n, bad_n, fx, fy = 0, 0, 0, 0
+-    for unit in unit_list:
+-      bad = False
+-      if unit.unit_type in GAS_TYPE:
+-        r, m = vespene_r, vespene_m
+-      if unit.unit_type in MINERAL_TYPE:
+-        r, m = mineral_r, mineral_m
+-      d = math.sqrt((unit.x - x) ** 2 + (unit.y - y) ** 2)
+-      f = k * (r - d) * m
+-      fx += f * (x - unit.x) / d
+-      fy += f * (y - unit.y) / d
+-      n += 1
+-      if unit.unit_type in GAS_TYPE and not (7 < d < 10):
+-        bad = True
+-      if unit.unit_type in MINERAL_TYPE and not (6 < d < 9):
+-        bad = True
+-      if bad:
+-        bad_n += 1
+-    return (x + fx / n), (y + fy / n), bad_n
++      if unit.alliance != features.PlayerRelative.NEUTRAL:
++        continue
++      if unit.unit_type not in GAS_TYPE + MINERAL_TYPE:
++        continue
++      dist = math.sqrt((unit.x - unit_g.x) ** 2 + (unit.y - unit_g.y) ** 2)
++      if dist < 16:
++        nearby_resources.append((dist, unit))
++    return [unit for _, unit in sorted(nearby_resources, key=lambda item: (item[0], item[1].tag))]
+ 
+   for unit in obs.observation.raw_units:
+     if unit.tag == tag:
+-      if unit.unit_type not in GAS_TYPE + MINERAL_TYPE:
+-        return f'tag {unit.tag}({unit.unit_type}) is not VespeneGaser', False
+-      mineral_list = find_nearby_raw_mg(unit)
++      if unit.alliance != features.PlayerRelative.NEUTRAL or unit.unit_type not in GAS_TYPE + MINERAL_TYPE:
++        return f'tag {unit.tag}({unit.unit_type}) is not a neutral resource anchor', False
++      resource_list = find_nearby_raw_mg(unit)
++      mineral_count = sum(resource.unit_type in MINERAL_TYPE for resource in resource_list)
++      if mineral_count < 5:
++        return f'resource cluster for tag {hex(tag)} has fewer than 5 minerals', False
+       n, x0, y0 = 0, 0, 0
+-      for mineral in mineral_list:
++      for resource in resource_list:
+         n += 1
+-        x0 += mineral.x
+-        y0 += mineral.y
++        x0 += resource.x
++        y0 += resource.y
+       x0 = x0 / n
+       y0 = y0 / n
+-      for i in range(16):
+-        x0, y0, bad_n = artificial_force_field_iteration_world(mineral_list, x0, y0)
++      for townhall in obs.observation.raw_units:
++        if townhall.alliance in [features.PlayerRelative.SELF, features.PlayerRelative.ALLY, features.PlayerRelative.ENEMY] and townhall.unit_type in BASE_BUILDING_TYPE and \
++            math.sqrt((townhall.x - x0) ** 2 + (townhall.y - y0) ** 2) < 12:
++          return f'resource cluster for tag {hex(tag)} already has a townhall', False
+       x = int(x0 + x_offset)
+       y = int(max(0, world_range - y0 + y_offset))
+       return (x, y), True
+@@ -617,73 +597,76 @@ def get_arg_world_tag_base_building(obs, tag: int, x_offset, y_offset, world_ran
+ def get_arg_screen_tag_base_building(obs, tag: int, size_screen, action_name) -> (tuple, bool):
+   def find_nearby_screen_mg(unit_g):
+     ratio = size_screen / SCREEN_WORLD_GRID
+-    nearby_resource_unit_dict = {}
++    nearby_resources = []
+     for unit in obs.observation.feature_units:
+-      if unit.unit_type in MINERAL_TYPE:
+-        dist = math.sqrt((unit.x - unit_g.x) ** 2 + (unit.y - unit_g.y) ** 2)
+-        if dist < 16 * ratio:
+-          nearby_resource_unit_dict[dist] = unit
+-      if unit.unit_type in GAS_TYPE:
+-        dist = math.sqrt((unit.x - unit_g.x) ** 2 + (unit.y - unit_g.y) ** 2)
+-        if dist < 16 * ratio:
+-          nearby_resource_unit_dict[dist] = unit
+-    return nearby_resource_unit_dict.values()
+-
+-  def artificial_force_field_iteration_screen(unit_list, x, y):
+-    ratio = size_screen / SCREEN_WORLD_GRID
+-    k, r, m = 0.5, 7 * ratio, 1
+-    vespene_r, vespene_m = 8 * ratio, 1
+-    mineral_r, mineral_m = 7 * ratio, 1
+-    n, bad_n, fx, fy = 0, 0, 0, 0
+-    for unit in unit_list:
+-      bad = False
+-      if unit.unit_type in GAS_TYPE:
+-        r, m = vespene_r, vespene_m
+-      if unit.unit_type in MINERAL_TYPE:
+-        r, m = mineral_r, mineral_m
+-      d = math.sqrt((unit.x - x) ** 2 + (unit.y - y) ** 2)
+-      f = k * (r - d) * m
+-      fx += f * (x - unit.x) / d
+-      fy += f * (y - unit.y) / d
+-      n += 1
+-      if unit.unit_type in GAS_TYPE and not (7 * ratio < d < 10 * ratio):
+-        bad = True
+-      if unit.unit_type in MINERAL_TYPE and not (6 * ratio < d < 9 * ratio):
+-        bad = True
+-      if bad:
+-        bad_n += 1
+-    return (x + fx / n), (y + fy / n), bad_n
++      if unit.alliance != features.PlayerRelative.NEUTRAL or not unit.is_on_screen or not (0 < unit.x < size_screen and 0 < unit.y < size_screen):
++        continue
++      if unit.unit_type not in GAS_TYPE + MINERAL_TYPE:
++        continue
++      dist = math.sqrt((unit.x - unit_g.x) ** 2 + (unit.y - unit_g.y) ** 2)
++      if dist < 16 * ratio:
++        nearby_resources.append((dist, unit))
++    return [unit for _, unit in sorted(nearby_resources, key=lambda item: (item[0], item[1].tag))]
+ 
+   building_name = action_name.split('_Screen')[0].split('_')[1]  # Build/Lock
+   building_size = find_building_size(building_name)
++  ratio = max(1, int(size_screen / SCREEN_WORLD_GRID))
++
++  def full_footprint_valid(center_x, center_y):
++    first_x = int(center_x - ratio * (building_size - 1) / 2)
++    first_y = int(center_y - ratio * (building_size - 1) / 2)
++    last_x = first_x + ratio * (building_size - 1)
++    last_y = first_y + ratio * (building_size - 1)
++    cell_radius = (ratio + 1) // 2
++    min_x, max_x = first_x - cell_radius, last_x + cell_radius
++    min_y, max_y = first_y - cell_radius, last_y + cell_radius
++    if min_x <= 0 or min_y <= 0 or max_x >= size_screen or max_y >= size_screen:
++      return False
++    for y in range(min_y, max_y + 1):
++      for x in range(min_x, max_x + 1):
++        if obs.observation.feature_screen.buildable[y][x] != 1:
++          return False
++        if obs.observation.feature_screen.pathable[y][x] != 1:
++          return False
++        if obs.observation.feature_screen.player_relative[y][x] != 0:
++          return False
++    return True
++
+   for unit in obs.observation.feature_units:
+-    if unit.tag == tag or (unit.unit_type in GAS_TYPE + MINERAL_TYPE and unit.is_on_screen):
+-      if unit.unit_type not in GAS_TYPE + MINERAL_TYPE:
+-        return f'tag {unit.tag}({unit.unit_type}) is not VespeneGaser', False
++    if unit.tag == tag:
++      if not unit.is_on_screen or not (0 < unit.x < size_screen and 0 < unit.y < size_screen):
++        return f'cannot find unit {hex(tag)} on screen', False
++      if unit.alliance != features.PlayerRelative.NEUTRAL or unit.unit_type not in GAS_TYPE + MINERAL_TYPE:
++        return f'tag {unit.tag}({unit.unit_type}) is not a neutral resource anchor', False
+       mineral_gas_list = find_nearby_screen_mg(unit)
++      mineral_count = sum(resource.unit_type in MINERAL_TYPE for resource in mineral_gas_list)
++      if mineral_count < 5:
++        return f'resource cluster for tag {hex(tag)} has fewer than 5 minerals', False
+       n, x0, y0 = 0, 0, 0
+-      for mineral in mineral_gas_list:
++      for resource in mineral_gas_list:
+         n += 1
+-        x0 += mineral.x
+-        y0 += mineral.y
++        x0 += resource.x
++        y0 += resource.y
+       x = x0 / n
+       y = y0 / n
+-      bad_n = len(mineral_gas_list)
+-      for i in range(16):
+-        x, y, bad_n = artificial_force_field_iteration_screen(mineral_gas_list, x, y)
+-      x, y = int(x), int(y)
+-      if bad_n > 3:
+-        return f'({x}, {y}) may be a bad position for base building', False
+-      if not (0 < x < size_screen and 0 < y < size_screen):
+-        return f'({x}, {y}) too close to screen edge', False
+-      if obs.observation.feature_screen.buildable[x][y] != 1:
+-        return f'area near ({x}, {y}) not buildable', False
+-      if obs.observation.feature_screen.pathable[x][y] != 1:
+-        return f'area near ({x}, {y}) not pathable', False
+-      if obs.observation.feature_screen.player_relative[x][y] not in [0, 1]:
+-        return f'area near ({x}, {y}) not blocked', False
+-      if unit.is_on_screen and (0 < x < size_screen and 0 < y < size_screen):
+-        return (x, y), True
++      for townhall in obs.observation.feature_units:
++        if townhall.alliance in [features.PlayerRelative.SELF, features.PlayerRelative.ALLY, features.PlayerRelative.ENEMY] and townhall.unit_type in BASE_BUILDING_TYPE and \
++            math.sqrt((townhall.x - x) ** 2 + (townhall.y - y) ** 2) < 12 * ratio:
++          return f'resource cluster for tag {hex(tag)} already has a townhall', False
++      search_radius = 12 * ratio
++      candidates = sorted(
++        (
++          ((candidate_x - x) ** 2 + (candidate_y - y) ** 2, candidate_x, candidate_y)
++          for candidate_y in range(ratio, size_screen, ratio)
++          for candidate_x in range(ratio, size_screen, ratio)
++          if (candidate_x - x) ** 2 + (candidate_y - y) ** 2 <= search_radius ** 2
++        ),
++        key=lambda item: (item[0], item[1], item[2]),
++      )
++      for _, candidate_x, candidate_y in candidates:
++        if full_footprint_valid(candidate_x, candidate_y):
++          return (candidate_x, candidate_y), True
++      return f'area near ({int(x)}, {int(y)}) not buildable for a complete footprint', False
+   tag = hex(tag) if isinstance(tag, int) else tag
+   return f'cannot find unit {tag} on screen', False
+ 
+diff --git a/llm_pysc2/agents/llm_pysc2_agent_main.py b/llm_pysc2/agents/llm_pysc2_agent_main.py
+--- a/llm_pysc2/agents/llm_pysc2_agent_main.py
++++ b/llm_pysc2/agents/llm_pysc2_agent_main.py
+@@ -611,5 +611,13 @@ class MainAgent(base_agent.BaseAgent):
+         self.func_id_history.append(func_id)
+         return func_call
+ 
++      translation_result = getattr(agent, 'last_translation_result', None)
++      if func_id == 0 and translation_result is not None and \
++          translation_result.get('accepted') and \
++          translation_result.get('requested_function_id') == 0 and \
++          translation_result.get('ordinal', -1) < translation_result.get('total', 0) - 1:
++        logger.success(f"[ID {self.log_id}] 7.3.6 Agent {agent_name}: return translator settlement no_op")
++        return func_call
++
+       # execute function of current agent's current action
+       if func_id != 0:

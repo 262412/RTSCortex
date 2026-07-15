@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from enum import StrEnum
+from typing import Any
 
 from rtscortex.contracts import (
     ActionArgumentType,
     ActionCommand,
     ActionSource,
+    AvailableAction,
     ObservationEnvelope,
 )
 
@@ -36,7 +39,7 @@ class ActionArbiter:
                 continue
             winner, loser = (
                 (command, current)
-                if self._rank(command) > self._rank(current)
+                if self._precedence(command) > self._precedence(current)
                 else (current, command)
             )
             by_actor[command.actor] = winner
@@ -67,6 +70,11 @@ class ActionArbiter:
         ).selected
 
     @staticmethod
+    def _precedence(command: ActionCommand) -> tuple[int, int]:
+        source_rank = 1 if command.source is ActionSource.REFLEX else 0
+        return command.priority, source_rank
+
+    @staticmethod
     def _rank(command: ActionCommand) -> tuple[int, int, str]:
         source_rank = 1 if command.source is ActionSource.REFLEX else 0
         return command.priority, source_rank, command.command_id
@@ -76,6 +84,20 @@ class ActionArbiter:
 class ValidationOutcome:
     accepted: list[ActionCommand]
     rejected: list[str]
+    failures: list[ValidationFailure] = field(default_factory=list)
+
+
+class ValidationDisposition(StrEnum):
+    DEFERRED = "deferred"
+    REJECTED = "rejected"
+    OBSOLETE = "obsolete"
+
+
+@dataclass(frozen=True)
+class ValidationFailure:
+    command: ActionCommand
+    reason: str
+    disposition: ValidationDisposition
 
 
 @dataclass(frozen=True)
@@ -114,60 +136,173 @@ class ActionValidator:
         *,
         max_actions: int | None,
     ) -> ValidationOutcome:
-        available = {action.name: action for action in observation.available_actions}
+        available_by_name: dict[str, list[AvailableAction]] = {}
+        for action in observation.available_actions:
+            available_by_name.setdefault(action.name, []).append(action)
         accepted: list[ActionCommand] = []
         rejected: list[str] = []
+        failures: list[ValidationFailure] = []
         seen_ids: set[str] = set()
 
         for command in commands:
-            action = available.get(command.name)
             reason: str | None = None
+            disposition = ValidationDisposition.REJECTED
             if command.command_id in seen_ids:
                 reason = "duplicate command_id"
-            elif action is None:
-                reason = "action is not available"
             elif command.created_game_loop > observation.game_loop:
                 reason = "command creation loop is in the future"
-            elif len(command.arguments) != len(action.argument_names):
-                reason = (
-                    f"expected {len(action.argument_names)} arguments, "
-                    f"received {len(command.arguments)}"
-                )
-            elif action.argument_types:
-                invalid_index = next(
-                    (
-                        index
-                        for index, (value, argument_type) in enumerate(
-                            zip(command.arguments, action.argument_types, strict=True)
-                        )
-                        if not _argument_matches(value, argument_type)
-                    ),
+            named_actions = available_by_name.get(command.name, [])
+            if reason is None and command.name == "Attack_Unit":
+                attack_failure = _attack_invariant_failure(command, observation)
+                if attack_failure is not None:
+                    reason = attack_failure.reason
+                    disposition = attack_failure.disposition
+                elif not named_actions:
+                    reason = "target_not_visible"
+            scoped_actions = [
+                candidate
+                for candidate in named_actions
+                if not candidate.actor_scopes or command.actor in candidate.actor_scopes
+            ]
+            if reason is None and not named_actions:
+                reason = "action is not available"
+                disposition = ValidationDisposition.DEFERRED
+            elif reason is None and not scoped_actions:
+                reason = f"actor {command.actor!r} is outside the action scope"
+            elif reason is None:
+                candidate_failures = [
+                    _action_failure(command, candidate, observation) for candidate in scoped_actions
+                ]
+                accepted_index = next(
+                    (index for index, failure in enumerate(candidate_failures) if failure is None),
                     None,
                 )
-                if invalid_index is not None:
-                    reason = (
-                        f"argument {action.argument_names[invalid_index]!r} must be "
-                        f"{action.argument_types[invalid_index].value}"
-                    )
-            if (
-                reason is None
-                and action is not None
-                and action.actor_scopes
-                and command.actor not in action.actor_scopes
-            ):
-                reason = f"actor {command.actor!r} is outside the action scope"
+                if accepted_index is None:
+                    failure = candidate_failures[0]
+                    assert failure is not None
+                    reason = failure.reason
+                    disposition = failure.disposition
             if reason is None:
-                reason = _precondition_failure(command, observation)
+                failure = _precondition_failure(command, observation)
+                if failure is not None:
+                    reason = failure.reason
+                    disposition = failure.disposition
 
             if reason is not None:
                 rejected.append(f"{command.command_id}: {reason}")
+                failures.append(
+                    ValidationFailure(
+                        command=command,
+                        reason=reason,
+                        disposition=disposition,
+                    )
+                )
                 continue
             if max_actions is not None and len(accepted) >= max_actions:
-                rejected.append(f"{command.command_id}: action budget exceeded")
+                reason = "action budget exceeded"
+                rejected.append(f"{command.command_id}: {reason}")
+                failures.append(
+                    ValidationFailure(
+                        command=command,
+                        reason=reason,
+                        disposition=ValidationDisposition.DEFERRED,
+                    )
+                )
                 continue
             seen_ids.add(command.command_id)
             accepted.append(command)
-        return ValidationOutcome(accepted=accepted, rejected=rejected)
+        return ValidationOutcome(accepted=accepted, rejected=rejected, failures=failures)
+
+
+@dataclass(frozen=True)
+class _ActionFailure:
+    reason: str
+    disposition: ValidationDisposition = ValidationDisposition.REJECTED
+
+
+def _action_failure(
+    command: ActionCommand,
+    action: AvailableAction,
+    observation: ObservationEnvelope,
+) -> _ActionFailure | None:
+    if len(command.arguments) != len(action.argument_names):
+        return _ActionFailure(
+            f"expected {len(action.argument_names)} arguments, received {len(command.arguments)}"
+        )
+    if action.argument_types:
+        invalid_index = next(
+            (
+                index
+                for index, (value, argument_type) in enumerate(
+                    zip(command.arguments, action.argument_types, strict=True)
+                )
+                if not _argument_matches(value, argument_type)
+            ),
+            None,
+        )
+        if invalid_index is not None:
+            return _ActionFailure(
+                f"argument {action.argument_names[invalid_index]!r} must be "
+                f"{action.argument_types[invalid_index].value}"
+            )
+    if command.name == "Attack_Unit":
+        failure = _attack_invariant_failure(command, observation)
+        if failure is not None:
+            return failure
+    if action.argument_candidates is not None and not any(
+        _arguments_match_candidate(command.arguments, candidate, action.argument_types)
+        for candidate in action.argument_candidates
+    ):
+        return _ActionFailure("arguments are outside the available candidate set")
+    return None
+
+
+def _attack_invariant_failure(
+    command: ActionCommand,
+    observation: ObservationEnvelope,
+) -> _ActionFailure | None:
+    if command.actor != "army" and not command.actor.startswith("CombatGroup"):
+        return _ActionFailure("Attack_Unit requires a combat actor")
+    if not command.arguments:
+        return _ActionFailure("Attack_Unit requires an enemy target")
+    target = _normalize_tag(command.arguments[0])
+    enemy_ids = {_normalize_tag(enemy.unit_id) for enemy in observation.state.visible_enemies}
+    if target in enemy_ids:
+        return None
+    own_ids = {
+        _normalize_tag(unit.unit_id)
+        for unit in [*observation.state.own_units, *observation.state.own_structures]
+    }
+    reason = "friendly_target" if target in own_ids else "target_not_visible"
+    return _ActionFailure(reason)
+
+
+def _arguments_match_candidate(
+    arguments: list[Any],
+    candidate: list[Any],
+    argument_types: list[ActionArgumentType],
+) -> bool:
+    if len(arguments) != len(candidate):
+        return False
+    return all(
+        _normalize_argument(argument, argument_types[index] if argument_types else None)
+        == _normalize_argument(candidate_value, argument_types[index] if argument_types else None)
+        for index, (argument, candidate_value) in enumerate(zip(arguments, candidate, strict=True))
+    )
+
+
+def _normalize_argument(value: Any, argument_type: ActionArgumentType | None) -> Any:
+    if argument_type is ActionArgumentType.TAG:
+        return _normalize_tag(value)
+    if argument_type is ActionArgumentType.POSITION and isinstance(value, (list, tuple)):
+        return tuple(value)
+    return value
+
+
+def _normalize_tag(value: object) -> str:
+    if isinstance(value, int) and not isinstance(value, bool):
+        return hex(value)
+    return str(value).casefold()
 
 
 def _argument_matches(value: object, argument_type: ActionArgumentType) -> bool:
@@ -204,7 +339,7 @@ def _argument_matches(value: object, argument_type: ActionArgumentType) -> bool:
 def _precondition_failure(
     command: ActionCommand,
     observation: ObservationEnvelope,
-) -> str | None:
+) -> _ActionFailure | None:
     state = observation.state
     supply_free = state.economy.supply_cap - state.economy.supply_used
     unit_ids = {
@@ -218,37 +353,57 @@ def _precondition_failure(
     for name, expected in command.preconditions.items():
         if name in checks:
             if not isinstance(expected, (int, float)) or isinstance(expected, bool):
-                return f"precondition {name!r} must be numeric"
+                return _ActionFailure(f"precondition {name!r} must be numeric")
             if checks[name] < expected:
-                return f"precondition {name!r} is not satisfied"
+                return _ActionFailure(
+                    f"precondition {name!r} is not satisfied",
+                    ValidationDisposition.DEFERRED,
+                )
         elif name == "max_supply_free":
             if not isinstance(expected, (int, float)) or isinstance(expected, bool):
-                return "precondition 'max_supply_free' must be numeric"
+                return _ActionFailure("precondition 'max_supply_free' must be numeric")
             if supply_free > expected:
-                return "precondition 'max_supply_free' is not satisfied"
+                return _ActionFailure(
+                    "precondition 'max_supply_free' is not satisfied",
+                    ValidationDisposition.OBSOLETE,
+                )
         elif name == "no_pending_structure":
             if not isinstance(expected, str):
-                return "precondition 'no_pending_structure' must be a structure type"
+                return _ActionFailure(
+                    "precondition 'no_pending_structure' must be a structure type"
+                )
             if any(
                 structure.unit_type == expected and structure.status == "constructing"
                 for structure in state.own_structures
             ):
-                return "precondition 'no_pending_structure' is not satisfied"
+                return _ActionFailure(
+                    "precondition 'no_pending_structure' is not satisfied",
+                    ValidationDisposition.OBSOLETE,
+                )
         elif name == "structure_absent":
             if not isinstance(expected, str):
-                return "precondition 'structure_absent' must be a structure type"
+                return _ActionFailure("precondition 'structure_absent' must be a structure type")
             if any(structure.unit_type == expected for structure in state.own_structures):
-                return "precondition 'structure_absent' is not satisfied"
+                return _ActionFailure(
+                    "precondition 'structure_absent' is not satisfied",
+                    ValidationDisposition.OBSOLETE,
+                )
         elif name == "unit_exists":
             if not isinstance(expected, str):
-                return "precondition 'unit_exists' must be a unit ID"
+                return _ActionFailure("precondition 'unit_exists' must be a unit ID")
             if expected not in unit_ids:
-                return "precondition 'unit_exists' is not satisfied"
+                return _ActionFailure("precondition 'unit_exists' is not satisfied")
+        elif name == "enemy_target_exists":
+            if not isinstance(expected, str):
+                return _ActionFailure("precondition 'enemy_target_exists' must be a unit ID")
+            enemy_ids = {_normalize_tag(enemy.unit_id) for enemy in state.visible_enemies}
+            if _normalize_tag(expected) not in enemy_ids:
+                return _ActionFailure("precondition 'enemy_target_exists' is not satisfied")
         elif name == "enemy_visible":
             if not isinstance(expected, bool):
-                return "precondition 'enemy_visible' must be boolean"
+                return _ActionFailure("precondition 'enemy_visible' must be boolean")
             if bool(state.visible_enemies) is not expected:
-                return "precondition 'enemy_visible' is not satisfied"
+                return _ActionFailure("precondition 'enemy_visible' is not satisfied")
         else:
-            return f"unsupported precondition {name!r}"
+            return _ActionFailure(f"unsupported precondition {name!r}")
     return None

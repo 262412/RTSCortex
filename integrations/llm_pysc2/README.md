@@ -32,10 +32,15 @@ The bridge has seven independently testable pieces:
    validation behavior while reporting observable primitive results and episode end.
 
 The fixtures in `tests/fixtures/llm_pysc2` freeze both sides of the boundary without
-requiring PySC2. Every available action carries explicit argument names and semantic types
-(`tag`, `position`, and so on), and every team exposes `No_Operation`; this gives the core
-validator enough information to reject malformed arguments and keeps its fallback action
-routable to a canonical actor.
+requiring PySC2. Every available action carries explicit argument names, semantic types,
+and, where required, complete argument candidates. The Runtime emits an empty `ActionBatch`
+with an `idle_reason` when no semantic action is ready. The router may still supply an
+untracked transport-level no-op for an empty upstream team slot because SC2 requires one
+action per step; that no-op never becomes an `ExecutionReport`.
+Builder minimap movement exposes unseen remote neutral resource clusters ordered by base
+distance, falling back to deterministic map-spanning pathable points only when every resource
+cluster is already scouted. Nexus anchors remain hidden until the exact anchor and enough cluster minerals are
+currently visible, and the final translated footprint receives a second visibility check.
 
 The worker command is intentionally inert on import. To launch a supported live scenario,
 set `RTSCORTEX_RUN_ID` and `RTSCORTEX_EPISODE_ID`, then set either
@@ -48,12 +53,10 @@ worker supports `pvz_task1_level1` and the Linux-compatible `2s3z` smoke scenari
 Installing SC2 and accepting its license remain separate operator steps.
 
 For `2s3z`, the worker uses upstream `ConfigSmac_2s3z` and preserves its positional team
-order (`Zealot-1`, `Zealot-2`, `Stalker-1`). The bridge adds `No_Operation` to copied
-per-config action lists when upstream omits it; it does not mutate the shared upstream
-SMAC action constant. This keeps runtime fallback commands translatable and traceable to
-an `ExecutionReport`. It also skips the unreachable large-map centering condition caused
-by the small arena's camera boundary while leaving coordinate-range inference, grouping,
-observation collection, and action execution in the upstream main loop.
+order (`Zealot-1`, `Zealot-2`, `Stalker-1`). It skips the unreachable large-map centering
+condition caused by the small arena's camera boundary while leaving coordinate-range
+inference, grouping, observation collection, and action execution in the upstream main
+loop.
 
 ## Upstream ownership
 
@@ -63,7 +66,9 @@ only be applied for live sessions, then reversed to restore the clean gitlink. E
 semantics, camera control, team management, automatic economy, text-action translation,
 and PySC2 action validation remain upstream-owned.
 
-One upstream source patch changes the waiting-response branch to return one PySC2 no-op
-per environment tick. This prevents its original busy-spin while the shared broker waits
-for the runtime response. The second exposes the existing `SC2Env.random_seed` input on
-the PySC2 runner so fixed-seed experiments control real game initialization.
+Nine reviewed patches cover the waiting-response transport no-op, real SC2 random seed,
+row-major feature planes, structured translator provenance, exact Near placement,
+pre-translation abort attribution, transient-unit disappearance grace, and Nexus resource
+clearance with exact screen-to-world scaling and visibility checks. Their exact scope and
+reproducible apply/reverse order are documented in
+[`patches/README.md`](patches/README.md).

@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from rtscortex.config import EnvironmentSettings
+from rtscortex.config import EnvironmentSettings, RuntimeSettings
 
 
 def test_environment_settings_accept_melee_runtime_controls() -> None:
@@ -40,3 +40,18 @@ def test_environment_settings_reject_invalid_simulation_speed(multiplier: float)
 def test_environment_settings_reject_invalid_action_effect_timeout() -> None:
     with pytest.raises(ValidationError):
         EnvironmentSettings(action_effect_timeout_game_loops=0)
+
+
+def test_runtime_command_ttl_defaults_to_planning_interval() -> None:
+    settings = RuntimeSettings(planning_interval_game_loops=112)
+
+    assert settings.planner_command_ttl_game_loops == 112
+
+
+def test_runtime_command_ttl_can_be_configured_independently() -> None:
+    settings = RuntimeSettings(
+        planning_interval_game_loops=112,
+        planner_command_ttl_game_loops=64,
+    )
+
+    assert settings.planner_command_ttl_game_loops == 64

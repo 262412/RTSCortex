@@ -106,7 +106,15 @@ def test_worker_patch_is_required_only_for_live_runs(tmp_path: Path) -> None:
         "    func_id, func_call = (0, actions.FUNCTIONS.no_op())\n"
         "    return func_call\n"
         "elif not self._all_agent_executing_finished():\n"
-        "    pass\n",
+        "    pass\n"
+        "return translator settlement no_op\n"
+        "if tag not in self.unit_uid_disappear:\n"
+        "agent.curr_action_name != 'No_Operation'\n"
+        "wait for confirmed disappearance\n"
+        "keep the action pending\n"
+        "agent.last_execution_abort = {\n"
+        "'failure_code': 'actor_not_available'\n"
+        "team head unit is unavailable before action translation\n",
         encoding="utf-8",
     )
 
@@ -124,11 +132,88 @@ def test_worker_patch_is_required_only_for_live_runs(tmp_path: Path) -> None:
         "feature_screen.creep[y0][x0]\n"
         "feature_screen.buildable[y][x]\n"
         "feature_screen.pathable[y][x]\n"
-        "feature_screen.player_relative[y][x]\n",
+        "feature_screen.player_relative[y][x]\n"
+        "if unit.tag == tag:\n"
+        "(0, F.no_op, ())\n"
+        "if not unit.is_on_screen or not (0 < unit.x < size_screen:\n"
+        "is not a neutral resource anchor\n"
+        "def full_footprint_valid(center_x, center_y):\n"
+        "feature_screen.player_relative[y][x] != 0\n"
+        "not buildable for a complete footprint\n"
+        "def resource_clearance_score(center_x, center_y, resources):\n"
+        "has no complete footprint with valid resource clearance\n"
+        "candidates.append((clearance_score, centroid_distance, candidate_x, candidate_y))\n"
+        "pixel_scale = size_screen / SCREEN_WORLD_GRID\n"
+        "sample_stride = max(1, int(pixel_scale))\n"
+        "minimum, ideal, maximum = 7 * pixel_scale, 8.5 * pixel_scale, 10 * pixel_scale\n"
+        "minimum, ideal, maximum = 6 * pixel_scale, 7.5 * pixel_scale, 9 * pixel_scale\n"
+        "feature_screen.visibility_map[y][x] != features.Visibility.VISIBLE\n"
+        "unit.display_type != 1 or not unit.is_on_screen\n",
+        encoding="utf-8",
+    )
+    translation_source = tmp_path / "third_party/LLM-PySC2/llm_pysc2/agents/llm_pysc2_agent.py"
+    translation_source.write_text(
+        "self.last_translation_result\n"
+        "'requested_function_id': requested_function_id\n"
+        "'emitted_function_id': func_id\n"
+        "'ordinal': translation_ordinal\n"
+        "'total': self._rtscortex_translation_total\n"
+        "all_args_valid = all_args_valid and func_valid\n"
+        "MainAgent confirms unit death across observations\n"
+        "team['unit_tags'] = list(dict.fromkeys(team['unit_tags']))\n",
+        encoding="utf-8",
+    )
+
+    funcs_source = tmp_path / "third_party/LLM-PySC2/llm_pysc2/agents/main_agent_funcs.py"
+    funcs_source.write_text(
+        "Advance confirmed-death state on every observation\n"
+        "tag for tag, steps in self.unit_disappear_steps.items() if steps >= 40\n"
+        "tag for tag in agent.unit_tag_list if tag not in self.unit_uid_disappear\n"
+        "tag for tag in team['unit_tags'] if tag not in self.unit_uid_disappear\n",
         encoding="utf-8",
     )
 
     assert _worker_patch_check(tmp_path, required=True).status == "ok"
+
+    complete_action_source = action_source.read_text(encoding="utf-8")
+    action_source.write_text(
+        complete_action_source.replace("sample_stride = max(1, int(pixel_scale))\n", ""),
+        encoding="utf-8",
+    )
+    exact_scale_check = _worker_patch_check(tmp_path, required=True)
+    assert exact_scale_check.status == "error"
+    assert "0009-use-exact-nexus-screen-scale.patch" in exact_scale_check.detail
+    action_source.write_text(complete_action_source, encoding="utf-8")
+
+    complete_funcs_source = funcs_source.read_text(encoding="utf-8")
+    funcs_source.write_text(
+        complete_funcs_source.replace("Advance confirmed-death state on every observation\n", ""),
+        encoding="utf-8",
+    )
+    locked_death_check = _worker_patch_check(tmp_path, required=True)
+    assert locked_death_check.status == "error"
+    assert "0007-preserve-transient-team-units.patch" in locked_death_check.detail
+    funcs_source.write_text(complete_funcs_source, encoding="utf-8")
+
+    complete_main_source = source.read_text(encoding="utf-8")
+    source.write_text(
+        complete_main_source.replace("agent.curr_action_name != 'No_Operation'\n", ""),
+        encoding="utf-8",
+    )
+    control_noop_check = _worker_patch_check(tmp_path, required=True)
+    assert control_noop_check.status == "error"
+    assert "0007-preserve-transient-team-units.patch" in control_noop_check.detail
+    source.write_text(complete_main_source, encoding="utf-8")
+
+    translation_source.write_text(
+        translation_source.read_text(encoding="utf-8").replace(
+            "team['unit_tags'] = list(dict.fromkeys(team['unit_tags']))\n", ""
+        ),
+        encoding="utf-8",
+    )
+    check = _worker_patch_check(tmp_path, required=True)
+    assert check.status == "error"
+    assert "0007-preserve-transient-team-units.patch" in check.detail
 
 
 def test_sc2_checks_executable_and_installed_scenario_map(

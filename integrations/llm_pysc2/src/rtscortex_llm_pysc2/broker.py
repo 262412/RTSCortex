@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
+import json
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
+from pathlib import Path
 from threading import Condition
-from typing import Any, Optional
+from typing import Any, NoReturn, Optional
 
 from rtscortex_llm_pysc2.coordinator import BridgeCoordinator, BridgeDecision
 from rtscortex_llm_pysc2.extractor import TimeStepExtractor, current_team_order
+
+
+class BridgeIntegrityError(RuntimeError):
+    """Raised after a Bridge invariant violation has been accounted for."""
 
 
 @dataclass
@@ -32,6 +38,26 @@ class PrimitiveDispatch:
     command_id: str
     function_name: str
     final_primitive: bool
+    origin: str = "translator"
+    ordinal: Optional[int] = None
+    total: Optional[int] = None
+    failure_code: Optional[str] = None
+    requested_function_id: Optional[int] = None
+    emitted_function_id: Optional[int] = None
+
+
+@dataclass
+class _ActiveCommand:
+    action_name: str
+    command_id: str
+    total: int
+    next_ordinal: int = 0
+
+
+@dataclass(frozen=True)
+class ScreenRouteProvenance:
+    world_target: tuple[float, float]
+    anchor_tag: int
 
 
 class SharedDecisionBroker:
@@ -43,6 +69,7 @@ class SharedDecisionBroker:
         extractor: TimeStepExtractor,
         *,
         decision_timeout_seconds: float = 60.0,
+        metrics_path: Optional[str] = None,
     ) -> None:
         if decision_timeout_seconds <= 0:
             raise ValueError("decision_timeout_seconds must be positive")
@@ -53,11 +80,105 @@ class SharedDecisionBroker:
         self._agents: dict[str, Any] = {}
         self._states: dict[int, _DecisionState] = {}
         self._command_queues: dict[tuple[str, str, str], deque[str]] = defaultdict(deque)
-        self._active_commands: dict[tuple[str, str], tuple[str, str]] = {}
+        self._active_commands: dict[tuple[str, str], _ActiveCommand] = {}
+        self._screen_route_provenance: dict[str, ScreenRouteProvenance] = {}
         self._planner_pending = False
         self._initial_decision_started = False
         self._initial_decision_complete = False
         self._initial_decision_error: Optional[Exception] = None
+        self.unattributed_primitives = 0
+        self.candidate_outside_pysc2_dispatches = 0
+        self._metrics_path = None if metrics_path is None else Path(metrics_path)
+        with self._condition:
+            self._persist_metrics_locked()
+
+    def metrics(self) -> dict[str, int]:
+        """Return the live Worker counters included in every episode result."""
+
+        with self._condition:
+            return {
+                "unattributed_primitives": self.unattributed_primitives,
+                "candidate_outside_pysc2_dispatches": (self.candidate_outside_pysc2_dispatches),
+            }
+
+    def record_unattributed_primitive(self) -> None:
+        with self._condition:
+            self.unattributed_primitives += 1
+            self._persist_metrics_locked()
+
+    def reject_candidate_outside_dispatch(
+        self,
+        dispatch: PrimitiveDispatch,
+        reason: str,
+        *,
+        game_loop: Optional[int],
+    ) -> NoReturn:
+        """Account for and abort a primitive that escaped its candidate domain."""
+
+        with self._condition:
+            self.candidate_outside_pysc2_dispatches += 1
+            self._persist_metrics_locked()
+        self._raise_integrity(
+            reason,
+            command_id=dispatch.command_id,
+            function_name=dispatch.function_name,
+            origin=dispatch.origin,
+            ordinal=dispatch.ordinal,
+            total=dispatch.total,
+            game_loop=game_loop,
+            requested_function_id=dispatch.requested_function_id,
+            emitted_function_id=dispatch.emitted_function_id,
+        )
+
+    def raise_unattributed_integrity(self, reason: str) -> NoReturn:
+        self._raise_integrity(reason, command_id=None)
+
+    def fail_dispatch_integrity(
+        self,
+        dispatch: PrimitiveDispatch,
+        reason: str,
+        *,
+        game_loop: Optional[int],
+    ) -> NoReturn:
+        """Fail one known command when MainAgent changes its translator output."""
+
+        self._raise_integrity(
+            reason,
+            command_id=dispatch.command_id,
+            function_name=dispatch.function_name,
+            origin=dispatch.origin,
+            ordinal=dispatch.ordinal,
+            total=dispatch.total,
+            game_loop=game_loop,
+            requested_function_id=dispatch.requested_function_id,
+            emitted_function_id=dispatch.emitted_function_id,
+        )
+
+    def fail_command_integrity(
+        self,
+        agent_name: str,
+        team_name: Optional[str],
+        action_name: str,
+        reason: str,
+        *,
+        function_name: str = "bridge_integrity",
+        game_loop: Optional[int] = None,
+    ) -> NoReturn:
+        """Fail the uniquely owned command when no dispatch object could be formed."""
+
+        actor = self._resolve_dispatch_actor(
+            agent_name,
+            team_name,
+            action_name,
+            active_only=False,
+        )
+        command_id = None if actor is None else self._command_id_for_actor(actor, action_name)
+        self._raise_integrity(
+            reason,
+            command_id=command_id,
+            function_name=function_name,
+            game_loop=game_loop,
+        )
 
     @property
     def planner_pending(self) -> bool:
@@ -146,32 +267,260 @@ class SharedDecisionBroker:
         function_name: str,
         *,
         final_primitive: bool,
+        origin: str = "translator",
+        ordinal: Optional[int] = None,
+        total: Optional[int] = None,
+        failure_code: Optional[str] = None,
+        requested_function_id: Optional[int] = None,
+        emitted_function_id: Optional[int] = None,
     ) -> Optional[PrimitiveDispatch]:
-        actor = self._resolve_dispatch_actor(agent_name, team_name, action_name)
+        if origin == "translator" and team_name is not None:
+            explicit_active = self._active_commands.get((agent_name, team_name))
+            if explicit_active is not None and explicit_active.action_name != action_name:
+                self._raise_integrity(
+                    "action changed before active command completed: "
+                    f"{explicit_active.action_name!r} -> {action_name!r}",
+                    command_id=explicit_active.command_id,
+                    function_name=function_name,
+                    ordinal=ordinal,
+                    total=total,
+                    requested_function_id=requested_function_id,
+                    emitted_function_id=emitted_function_id,
+                )
+        actor = (
+            self._resolve_orchestration_actor(agent_name, team_name, action_name)
+            if origin == "orchestration"
+            else self._resolve_dispatch_actor(
+                agent_name,
+                team_name,
+                action_name,
+                active_only=False,
+            )
+        )
         if actor is None:
             return None
         active = self._active_commands.get(actor)
-        if active is None or active[0] != action_name:
+        command_id = self._command_id_for_actor(actor, action_name)
+        if origin == "orchestration":
+            command_id = (
+                active.command_id
+                if active is not None and active.action_name == action_name
+                else self._command_queues[(actor[0], actor[1], action_name)][0]
+            )
+            return PrimitiveDispatch(
+                command_id,
+                function_name,
+                False,
+                origin,
+                requested_function_id=requested_function_id,
+                emitted_function_id=emitted_function_id,
+            )
+        if origin != "translator":
+            self._raise_integrity(
+                f"unsupported primitive origin {origin!r}",
+                command_id=command_id,
+                function_name=function_name,
+                origin=origin,
+                requested_function_id=requested_function_id,
+                emitted_function_id=emitted_function_id,
+            )
+        if ordinal is None or total is None or total <= 0:
+            self._raise_integrity(
+                "translator primitive lacks sequence data",
+                command_id=command_id,
+                function_name=function_name,
+                ordinal=ordinal,
+                total=total,
+                requested_function_id=requested_function_id,
+                emitted_function_id=emitted_function_id,
+            )
+        if active is not None and active.action_name != action_name:
+            self._raise_integrity(
+                "action changed before active command completed: "
+                f"{active.action_name!r} -> {action_name!r}",
+                command_id=active.command_id,
+                function_name=function_name,
+                ordinal=ordinal,
+                total=total,
+                requested_function_id=requested_function_id,
+                emitted_function_id=emitted_function_id,
+            )
+        if active is None:
+            if ordinal != 0:
+                self._raise_integrity(
+                    "translator sequence must begin at ordinal 0",
+                    command_id=command_id,
+                    function_name=function_name,
+                    ordinal=ordinal,
+                    total=total,
+                    requested_function_id=requested_function_id,
+                    emitted_function_id=emitted_function_id,
+                )
             queue = self._command_queues[(actor[0], actor[1], action_name)]
             if not queue:
                 return None
-            active = (action_name, queue.popleft())
+            active = _ActiveCommand(action_name, queue.popleft(), total)
             self._active_commands[actor] = active
-        return PrimitiveDispatch(active[1], function_name, final_primitive)
+        if total != active.total or ordinal != active.next_ordinal:
+            self._raise_integrity(
+                "invalid translator sequence for command "
+                f"{active.command_id!r}; expected {active.next_ordinal}/{active.total}, "
+                f"received {ordinal}/{total}",
+                command_id=active.command_id,
+                function_name=function_name,
+                ordinal=ordinal,
+                total=total,
+                requested_function_id=requested_function_id,
+                emitted_function_id=emitted_function_id,
+            )
+        expected_final = ordinal == total - 1
+        if final_primitive != expected_final and not (final_primitive and failure_code is not None):
+            self._raise_integrity(
+                "translator final flag disagrees with sequence",
+                command_id=active.command_id,
+                function_name=function_name,
+                ordinal=ordinal,
+                total=total,
+                requested_function_id=requested_function_id,
+                emitted_function_id=emitted_function_id,
+            )
+        active.next_ordinal += 1
+        return PrimitiveDispatch(
+            active.command_id,
+            function_name,
+            final_primitive,
+            origin,
+            ordinal,
+            total,
+            failure_code,
+            requested_function_id,
+            emitted_function_id,
+        )
+
+    def command_id_for(
+        self,
+        agent_name: str,
+        team_name: Optional[str],
+        action_name: str,
+    ) -> Optional[str]:
+        actor = self._resolve_dispatch_actor(
+            agent_name,
+            team_name,
+            action_name,
+            active_only=False,
+        )
+        if actor is None:
+            return None
+        active = self._active_commands.get(actor)
+        if active is not None and active.action_name == action_name:
+            return active.command_id
+        queue = self._command_queues[(actor[0], actor[1], action_name)]
+        return queue[0] if queue else None
+
+    def reject_command(
+        self,
+        agent_name: str,
+        team_name: Optional[str],
+        action_name: str,
+        *,
+        failure_code: str,
+    ) -> Optional[PrimitiveDispatch]:
+        """Claim a terminal pre-translation failure for one uniquely owned command."""
+
+        actor = self._resolve_dispatch_actor(
+            agent_name,
+            team_name,
+            action_name,
+            active_only=False,
+        )
+        if actor is None:
+            return None
+        active = self._active_commands.get(actor)
+        if active is None:
+            ordinal, total = 0, 1
+        else:
+            if active.next_ordinal >= active.total:
+                self._raise_integrity(
+                    "cannot abort a completed translator sequence",
+                    command_id=active.command_id,
+                    function_name="pre_dispatch",
+                    ordinal=active.next_ordinal,
+                    total=active.total,
+                )
+            ordinal, total = active.next_ordinal, active.total
+        return self.claim_primitive(
+            agent_name,
+            team_name,
+            action_name,
+            "pre_dispatch",
+            final_primitive=True,
+            origin="translator",
+            ordinal=ordinal,
+            total=total,
+            failure_code=failure_code,
+        )
+
+    def resolve_arguments(self, command_id: str, arguments: list[Any]) -> None:
+        self.coordinator.resolve_arguments(command_id, arguments)
+
+    def screen_route_provenance(
+        self,
+        command_id: str,
+    ) -> Optional[ScreenRouteProvenance]:
+        return self._screen_route_provenance.get(command_id)
 
     def _resolve_dispatch_actor(
         self,
         agent_name: str,
         team_name: Optional[str],
         action_name: str,
+        *,
+        active_only: bool,
     ) -> Optional[tuple[str, str]]:
         if team_name is not None:
             preferred = (agent_name, team_name)
             active = self._active_commands.get(preferred)
             queued = self._command_queues.get((agent_name, team_name, action_name))
-            if (active is not None and active[0] == action_name) or queued:
+            if active is not None and active.action_name == action_name:
                 return preferred
+            if not active_only and queued:
+                return preferred
+            return None
 
+        candidates = (
+            set()
+            if active_only
+            else {
+                (queued_agent, queued_team)
+                for (
+                    queued_agent,
+                    queued_team,
+                    queued_action,
+                ), queue in self._command_queues.items()
+                if queued_agent == agent_name and queued_action == action_name and queue
+            }
+        )
+        candidates.update(
+            actor
+            for actor, active in self._active_commands.items()
+            if actor[0] == agent_name and active.action_name == action_name
+        )
+        if len(candidates) > 1:
+            rendered = ", ".join(f"{agent}/{team}" for agent, team in sorted(candidates))
+            self._raise_integrity(
+                f"primitive ownership is ambiguous for {agent_name}/{action_name}: {rendered}",
+                command_id=None,
+            )
+        if len(candidates) == 1:
+            return candidates.pop()
+        return None
+
+    def _resolve_orchestration_actor(
+        self,
+        agent_name: str,
+        team_name: Optional[str],
+        action_name: str,
+    ) -> Optional[tuple[str, str]]:
         candidates = {
             (queued_agent, queued_team)
             for (queued_agent, queued_team, queued_action), queue in self._command_queues.items()
@@ -180,8 +529,19 @@ class SharedDecisionBroker:
         candidates.update(
             actor
             for actor, active in self._active_commands.items()
-            if actor[0] == agent_name and active[0] == action_name
+            if actor[0] == agent_name and active.action_name == action_name
         )
+        preferred = None if team_name is None else (agent_name, team_name)
+        if preferred is not None and preferred in candidates:
+            return preferred
+        if len(candidates) > 1:
+            rendered = ", ".join(f"{agent}/{team}" for agent, team in sorted(candidates))
+            self._raise_integrity(
+                "orchestration primitive ownership is ambiguous for "
+                f"{agent_name}/{action_name}: {rendered}",
+                command_id=None,
+                origin="orchestration",
+            )
         if len(candidates) == 1:
             return candidates.pop()
         return None
@@ -199,11 +559,19 @@ class SharedDecisionBroker:
             dispatch.function_name,
             success=success,
             failure_reason=failure_reason,
+            origin=dispatch.origin,
+            ordinal=dispatch.ordinal,
+            total=dispatch.total,
+            game_loop=game_loop,
+            failure_code=dispatch.failure_code,
+            requested_function_id=dispatch.requested_function_id,
+            emitted_function_id=dispatch.emitted_function_id,
         )
         if dispatch.final_primitive:
             self.coordinator.complete_command(dispatch.command_id, game_loop=game_loop)
+            self._screen_route_provenance.pop(dispatch.command_id, None)
             for actor, value in list(self._active_commands.items()):
-                if value[1] == dispatch.command_id:
+                if value.command_id == dispatch.command_id:
                     del self._active_commands[actor]
 
     def prepare_effect(
@@ -224,6 +592,79 @@ class SharedDecisionBroker:
 
     def end_episode(self, result: dict[str, Any]) -> None:
         self.coordinator.end_episode(result)
+        self._screen_route_provenance.clear()
+
+    def _command_id_for_actor(
+        self,
+        actor: tuple[str, str],
+        action_name: str,
+    ) -> Optional[str]:
+        active = self._active_commands.get(actor)
+        if active is not None:
+            return active.command_id
+        queue = self._command_queues.get((actor[0], actor[1], action_name))
+        return queue[0] if queue else None
+
+    def _raise_integrity(
+        self,
+        reason: str,
+        *,
+        command_id: Optional[str],
+        function_name: str = "bridge_integrity",
+        execution_stage: str = "translation",
+        origin: str = "translator",
+        ordinal: Optional[int] = None,
+        total: Optional[int] = None,
+        game_loop: Optional[int] = None,
+        requested_function_id: Optional[int] = None,
+        emitted_function_id: Optional[int] = None,
+    ) -> NoReturn:
+        rendered = reason.removeprefix("bridge_integrity_error: ")
+        if command_id is None:
+            self.record_unattributed_primitive()
+        else:
+            self.coordinator.fail_bridge_integrity(
+                command_id,
+                rendered,
+                function_name=function_name,
+                execution_stage=execution_stage,
+                origin=origin,
+                ordinal=ordinal,
+                total=total,
+                game_loop=game_loop,
+                requested_function_id=requested_function_id,
+                emitted_function_id=emitted_function_id,
+            )
+            self._forget_command(command_id)
+        raise BridgeIntegrityError(f"bridge_integrity_error: {rendered}")
+
+    def _forget_command(self, command_id: str) -> None:
+        self._screen_route_provenance.pop(command_id, None)
+        for actor, active in list(self._active_commands.items()):
+            if active.command_id == command_id:
+                del self._active_commands[actor]
+        for key, queue in list(self._command_queues.items()):
+            retained = deque(value for value in queue if value != command_id)
+            if retained:
+                self._command_queues[key] = retained
+            else:
+                self._command_queues.pop(key, None)
+
+    def _persist_metrics_locked(self) -> None:
+        if self._metrics_path is None:
+            return
+        self._metrics_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self._metrics_path.with_name(f"{self._metrics_path.name}.tmp")
+        temporary.write_text(
+            json.dumps(
+                {
+                    "unattributed_primitives": self.unattributed_primitives,
+                    "candidate_outside_pysc2_dispatches": (self.candidate_outside_pysc2_dispatches),
+                }
+            ),
+            encoding="utf-8",
+        )
+        temporary.replace(self._metrics_path)
 
     def _decide(self, step_id: int) -> None:
         with self._condition:
@@ -259,4 +700,12 @@ class SharedDecisionBroker:
                 for command in route.commands:
                     key = (route.agent_name, command.team_name, command.name)
                     self._command_queues[key].append(command.command_id)
+                    if (
+                        command.screen_world_target is not None
+                        and command.screen_anchor_tag is not None
+                    ):
+                        self._screen_route_provenance[command.command_id] = ScreenRouteProvenance(
+                            world_target=command.screen_world_target,
+                            anchor_tag=command.screen_anchor_tag,
+                        )
             self._condition.notify_all()

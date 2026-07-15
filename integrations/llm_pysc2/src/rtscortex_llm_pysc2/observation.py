@@ -2,8 +2,43 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping, MutableMapping
+from dataclasses import dataclass
 from typing import Any, cast
+
+
+@dataclass(frozen=True)
+class ScreenCandidateMetadata:
+    """Bridge-only world target associated with one wire-level screen candidate."""
+
+    world_target: tuple[float, float]
+    anchor_tag: int
+
+
+class BridgeAvailableAction(dict[str, Any]):
+    """A JSON-compatible action carrying metadata that never enters the wire payload."""
+
+    def __init__(self, value: Mapping[str, Any]) -> None:
+        super().__init__(value)
+        self.screen_metadata_by_actor: dict[
+            str, dict[tuple[int, int], ScreenCandidateMetadata]
+        ] = {}
+
+    def add_screen_metadata(
+        self,
+        actor: str,
+        metadata: Mapping[tuple[int, int], ScreenCandidateMetadata],
+    ) -> None:
+        if metadata:
+            self.screen_metadata_by_actor[actor] = dict(metadata)
+
+    def screen_metadata(
+        self,
+        actor: str,
+        screen_target: tuple[int, int],
+    ) -> ScreenCandidateMetadata | None:
+        return self.screen_metadata_by_actor.get(actor, {}).get(screen_target)
 
 
 class ObservationMapper:
@@ -31,7 +66,7 @@ class ObservationMapper:
                 own_units.append(mapped)
 
         return {
-            "protocol_version": "1.0",
+            "protocol_version": "1.1",
             "run_id": str(snapshot["run_id"]),
             "episode_id": str(snapshot["episode_id"]),
             "step_id": int(snapshot["step_id"]),
@@ -108,7 +143,7 @@ def _map_production_item(item: Mapping[str, Any]) -> dict[str, Any]:
 
 def _map_available_actions(value: Any) -> list[dict[str, Any]]:
     teams = [_mapping(item, "teams item") for item in _list(value, "teams")]
-    actions: MutableMapping[tuple[str, tuple[str, ...], tuple[str, ...]], dict[str, Any]] = {}
+    actions: MutableMapping[tuple[str, tuple[str, ...], tuple[str, ...], str], dict[str, Any]] = {}
     for team in teams:
         actor = canonical_actor(str(team["agent_name"]), str(team["team_name"]))
         for item in _list(team["available_actions"], "available_actions"):
@@ -121,16 +156,91 @@ def _map_available_actions(value: Any) -> list[dict[str, Any]]:
             )
             if len(argument_names) != len(argument_types):
                 raise ValueError("argument_types must match argument_names")
-            key = (str(action["name"]), argument_names, argument_types)
+            argument_candidates = _map_argument_candidates(
+                action.get("argument_candidates"),
+                argument_types,
+            )
+            candidates_key = json.dumps(argument_candidates, separators=(",", ":"))
+            key = (str(action["name"]), argument_names, argument_types, candidates_key)
             if key not in actions:
-                actions[key] = {
-                    "name": key[0],
-                    "argument_names": list(argument_names),
-                    "argument_types": list(argument_types),
-                    "actor_scopes": [],
-                }
-            cast(list[str], actions[key]["actor_scopes"]).append(actor)
+                actions[key] = BridgeAvailableAction(
+                    {
+                        "name": key[0],
+                        "argument_names": list(argument_names),
+                        "argument_types": list(argument_types),
+                        "argument_candidates": argument_candidates,
+                        "actor_scopes": [],
+                    }
+                )
+            mapped_action = actions[key]
+            cast(list[str], mapped_action["actor_scopes"]).append(actor)
+            if isinstance(mapped_action, BridgeAvailableAction):
+                mapped_action.add_screen_metadata(
+                    actor,
+                    _map_screen_provenance(action.get("bridge_screen_provenance")),
+                )
     return list(actions.values())
+
+
+def _map_screen_provenance(
+    value: Any,
+) -> dict[tuple[int, int], ScreenCandidateMetadata]:
+    if value is None:
+        return {}
+    result: dict[tuple[int, int], ScreenCandidateMetadata] = {}
+    for item_value in _list(value, "bridge_screen_provenance"):
+        item = _mapping(item_value, "bridge_screen_provenance item")
+        screen = _list(item["screen_target"], "screen_target")
+        world = _list(item["world_target"], "world_target")
+        if (
+            len(screen) != 2
+            or not all(isinstance(coordinate, int) for coordinate in screen)
+            or len(world) != 2
+        ):
+            raise ValueError("screen provenance must contain two screen and world coordinates")
+        target = (int(screen[0]), int(screen[1]))
+        if target in result:
+            raise ValueError("screen provenance cannot contain duplicate candidates")
+        result[target] = ScreenCandidateMetadata(
+            world_target=(float(world[0]), float(world[1])),
+            anchor_tag=int(item["anchor_tag"]),
+        )
+    return result
+
+
+def _map_argument_candidates(
+    value: Any,
+    argument_types: tuple[str, ...],
+) -> list[list[Any]] | None:
+    if value is None:
+        return None
+    candidates = _list(value, "argument_candidates")
+    mapped = []
+    for candidate_value in candidates:
+        candidate = _list(candidate_value, "argument candidate")
+        if len(candidate) != len(argument_types):
+            raise ValueError("argument candidate length must match argument_types")
+        mapped.append(
+            [
+                _map_candidate_argument(argument_types[index], argument)
+                for index, argument in enumerate(candidate)
+            ]
+        )
+    return mapped
+
+
+def _map_candidate_argument(argument_type: str, value: Any) -> Any:
+    if argument_type == "tag":
+        return _format_tag(value)
+    if argument_type == "position":
+        position = _list(value, "position candidate")
+        if len(position) != 2 or not all(
+            isinstance(coordinate, int) and not isinstance(coordinate, bool)
+            for coordinate in position
+        ):
+            raise ValueError("position candidate must contain exactly two integers")
+        return position
+    return value
 
 
 def _format_tag(value: Any) -> str:

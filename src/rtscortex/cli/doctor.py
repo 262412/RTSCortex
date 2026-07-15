@@ -17,8 +17,14 @@ from rtscortex.runtime.live import (
     LiveEnvironmentError,
     build_feature_plane_patch_is_applied,
     live_scenario_spec,
+    near_placement_patch_is_applied,
+    nexus_exact_screen_scale_patch_is_applied,
+    nexus_resource_clearance_patch_is_applied,
+    pretranslation_abort_patch_is_applied,
     random_seed_patch_is_applied,
     sc2_build,
+    transient_unit_grace_patch_is_applied,
+    translation_result_patch_is_applied,
     waiting_response_patch_is_applied,
 )
 
@@ -175,6 +181,18 @@ def _worker_patch_check(project_root: Path, *, required: bool) -> Check:
         missing.append("0002-pass-random-seed-to-sc2env.patch")
     if not build_feature_plane_patch_is_applied(project_root):
         missing.append("0003-fix-build-feature-plane-coordinate-order.patch")
+    if not translation_result_patch_is_applied(project_root):
+        missing.append("0004-expose-structured-translation-results.patch")
+    if not near_placement_patch_is_applied(project_root):
+        missing.append("0005-fix-near-base-placement.patch")
+    if not pretranslation_abort_patch_is_applied(project_root):
+        missing.append("0006-report-pretranslation-action-aborts.patch")
+    if not transient_unit_grace_patch_is_applied(project_root):
+        missing.append("0007-preserve-transient-team-units.patch")
+    if not nexus_resource_clearance_patch_is_applied(project_root):
+        missing.append("0008-enforce-nexus-resource-clearance.patch")
+    if not nexus_exact_screen_scale_patch_is_applied(project_root):
+        missing.append("0009-use-exact-nexus-screen-scale.patch")
     status = "ok" if not missing else ("error" if required else "optional")
     detail = "all worker patches applied" if not missing else "apply " + ", ".join(missing)
     return Check("worker_patch", status, detail)

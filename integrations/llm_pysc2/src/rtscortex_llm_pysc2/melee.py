@@ -18,14 +18,11 @@ _ACTION_NAMES = {
         "Hold_Position",
         "Move_Minimap",
         "Move_Screen",
-        "Attack_Unit",
         "Build_Pylon_Screen",
         "Build_Gateway_Screen",
         "Build_Assimilator_Near",
-        "Build_Assimilator_Screen",
         "Build_CyberneticsCore_Screen",
         "Build_Nexus_Near",
-        "Build_Nexus_Screen",
     },
     "Developer": {
         "No_Operation",
@@ -83,7 +80,9 @@ class RTSCortexMeleeConfig(ProtossAgentConfig):  # type: ignore[misc]
 
         self.AGENTS_ALWAYS_DISABLE = []
         self.ENABLE_INIT_STEPS = True
-        self.ENABLE_AUTO_WORKER_MANAGE = True
+        # ``select_idle_worker`` cannot exclude the dedicated Builder probe. Keep
+        # automatic training, but reserve that actor from economy reassignment.
+        self.ENABLE_AUTO_WORKER_MANAGE = False
         self.ENABLE_AUTO_WORKER_TRAINING = True
         _ensure_no_operation(self.AGENTS)
 

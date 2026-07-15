@@ -28,7 +28,12 @@ def melee_config_type(monkeypatch: pytest.MonkeyPatch) -> Iterator[tuple[type[An
                     "action": {
                         "Probe": [
                             {"name": "No_Operation", "arg": [], "func": [(0, None, ())]},
+                            {"name": "Attack_Unit", "arg": ["tag"], "func": []},
                             {"name": "Build_Pylon_Screen", "arg": ["screen"], "func": []},
+                            {"name": "Build_Assimilator_Near", "arg": ["tag"], "func": []},
+                            {"name": "Build_Assimilator_Screen", "arg": ["screen"], "func": []},
+                            {"name": "Build_Nexus_Near", "arg": ["tag"], "func": []},
+                            {"name": "Build_Nexus_Screen", "arg": ["screen"], "func": []},
                             {"name": "Build_Stargate_Screen", "arg": ["screen"], "func": []},
                         ]
                     },
@@ -101,22 +106,16 @@ def test_melee_config_keeps_only_the_minimum_protoss_chain(
     config = config_type()
 
     assert list(config.AGENTS) == ["Builder", "Developer", "CombatGroup0", "CombatGroup1"]
-    assert [team["name"] for team in config.AGENTS["Builder"]["team"]] == [
-        "Builder-Probe-1"
-    ]
+    assert [team["name"] for team in config.AGENTS["Builder"]["team"]] == ["Builder-Probe-1"]
     assert [team["name"] for team in config.AGENTS["Developer"]["team"]] == [
         "WarpGate-1",
         "Empty",
     ]
-    assert [team["name"] for team in config.AGENTS["CombatGroup0"]["team"]] == [
-        "Zealot-1"
-    ]
-    assert [team["name"] for team in config.AGENTS["CombatGroup1"]["team"]] == [
-        "Stalker-1"
-    ]
+    assert [team["name"] for team in config.AGENTS["CombatGroup0"]["team"]] == ["Zealot-1"]
+    assert [team["name"] for team in config.AGENTS["CombatGroup1"]["team"]] == ["Stalker-1"]
 
 
-def test_melee_config_enables_opening_and_worker_automation(
+def test_melee_config_reserves_builder_from_worker_management(
     melee_config_type: tuple[type[Any], list[Any]],
 ) -> None:
     config_type, _ = melee_config_type
@@ -124,7 +123,7 @@ def test_melee_config_enables_opening_and_worker_automation(
     config = config_type()
 
     assert config.ENABLE_INIT_STEPS is True
-    assert config.ENABLE_AUTO_WORKER_MANAGE is True
+    assert config.ENABLE_AUTO_WORKER_MANAGE is False
     assert config.ENABLE_AUTO_WORKER_TRAINING is True
     assert config.AGENTS_ALWAYS_DISABLE == []
 
@@ -152,20 +151,19 @@ def test_melee_config_preserves_build_train_research_and_combat_actions(
     config = config_type()
 
     action_names = {
-        agent_name: {
-            action["name"]
-            for actions in agent["action"].values()
-            for action in actions
-        }
+        agent_name: {action["name"] for actions in agent["action"].values() for action in actions}
         for agent_name, agent in config.AGENTS.items()
     }
 
     assert "Build_Pylon_Screen" in action_names["Builder"]
-    assert {"Train_Zealot", "Train_Stalker", "Research_WarpGate"} <= action_names[
-        "Developer"
-    ]
+    assert {"Train_Zealot", "Train_Stalker", "Research_WarpGate"} <= action_names["Developer"]
     assert "Attack_Unit" in action_names["CombatGroup0"]
     assert "Attack_Unit" in action_names["CombatGroup1"]
+    assert "Attack_Unit" not in action_names["Builder"]
+    assert "Build_Assimilator_Near" in action_names["Builder"]
+    assert "Build_Nexus_Near" in action_names["Builder"]
+    assert "Build_Assimilator_Screen" not in action_names["Builder"]
+    assert "Build_Nexus_Screen" not in action_names["Builder"]
     assert "Build_Stargate_Screen" not in action_names["Builder"]
     assert "Train_Carrier" not in action_names["Developer"]
     assert "Research_ProtossGroundWeapons" not in action_names["Developer"]

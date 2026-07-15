@@ -11,6 +11,7 @@ from rtscortex.config import (
     RuntimeSettings,
 )
 from rtscortex.contracts import (
+    ActionArgumentType,
     AvailableAction,
     EconomyState,
     ObservationEnvelope,
@@ -52,7 +53,7 @@ def make_observation(
     enemies = (
         [
             UnitState(
-                unit_id="enemy-1",
+                unit_id="0x1",
                 unit_type="Zergling",
                 alliance="enemy",
                 health_fraction=1.0,
@@ -61,6 +62,21 @@ def make_observation(
         if include_enemy
         else []
     )
+    available_actions = [
+        AvailableAction(name="Retreat"),
+        AvailableAction(name="No_Operation", actor_scopes=["global"]),
+    ]
+    if enemies:
+        available_actions.insert(
+            0,
+            AvailableAction(
+                name="Attack_Unit",
+                argument_names=["tag"],
+                argument_types=[ActionArgumentType.TAG],
+                actor_scopes=["army"],
+                argument_candidates=[[enemies[0].unit_id]],
+            ),
+        )
     return ObservationEnvelope(
         run_id=run_id,
         episode_id=episode_id,
@@ -79,10 +95,6 @@ def make_observation(
             visible_enemies=enemies,
         ),
         text_observation="A compact test observation.",
-        available_actions=[
-            AvailableAction(name="Attack_Unit", argument_names=["target"], actor_scopes=["army"]),
-            AvailableAction(name="Retreat"),
-            AvailableAction(name="No_Operation", actor_scopes=["global"]),
-        ],
+        available_actions=available_actions,
         alerts=alerts or [],
     )

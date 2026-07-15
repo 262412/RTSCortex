@@ -157,6 +157,22 @@ class EventStore:
         ).fetchone()
         return None if row is None else self._row_to_event(row)
 
+    def events_of_type(
+        self,
+        run_id: str,
+        episode_id: str,
+        event_type: str,
+    ) -> list[StoredEvent]:
+        rows = self._connection.execute(
+            """
+            SELECT * FROM events
+            WHERE run_id = ? AND episode_id = ? AND event_type = ?
+            ORDER BY event_id
+            """,
+            (run_id, episode_id, event_type),
+        ).fetchall()
+        return [self._row_to_event(row) for row in rows]
+
     @staticmethod
     def _row_to_event(row: sqlite3.Row) -> StoredEvent:
         return StoredEvent(

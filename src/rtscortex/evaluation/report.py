@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import json
 from collections.abc import Sequence
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, Literal, TypeVar
 
 from pydantic import BaseModel, ValidationError
 
@@ -19,11 +20,47 @@ from rtscortex.contracts import (
     ObservationEnvelope,
     UnitState,
 )
-from rtscortex.evaluation.metrics import compute_episode_metrics
+from rtscortex.evaluation.metrics import (
+    EpisodeMetrics,
+    ExecutionMetrics,
+    compute_episode_metrics,
+    compute_execution_metrics,
+)
 from rtscortex.memory import StoredEvent, read_event_log
 
 REPORT_FILENAME = "timeline.md"
+SUMMARY_FILENAME = "summary.json"
 ModelT = TypeVar("ModelT", bound=BaseModel)
+GateScalar = bool | int | float
+
+
+@dataclass(frozen=True)
+class RunReportArtifacts:
+    """Paths produced from one immutable runtime journal."""
+
+    timeline_path: Path
+    summary_path: Path
+
+
+@dataclass(frozen=True)
+class AcceptanceGate:
+    """One machine-readable live acceptance check."""
+
+    name: str
+    value: GateScalar
+    comparison: Literal["==", ">=", "<="]
+    threshold: GateScalar
+    unit: Literal["boolean", "count", "game_loops", "ratio"]
+    passed: bool | None
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "value": self.value,
+            "comparison": self.comparison,
+            "threshold": self.threshold,
+            "unit": self.unit,
+            "passed": self.passed,
+        }
 
 
 class ReportError(ValueError):
@@ -33,6 +70,38 @@ class ReportError(ValueError):
 def write_timeline_report(run_dir: Path) -> Path:
     """Render ``events.jsonl`` in a run directory to ``timeline.md``."""
 
+    resolved_run_dir, events = _read_run_events(run_dir)
+    report = render_timeline(events)
+    output_path = resolved_run_dir / REPORT_FILENAME
+    try:
+        output_path.write_text(report, encoding="utf-8")
+    except OSError as error:
+        raise ReportError(f"Could not write timeline {output_path}: {error}") from error
+    return output_path
+
+
+def write_run_reports(run_dir: Path) -> RunReportArtifacts:
+    """Idempotently derive the Markdown timeline and JSON summary from a journal."""
+
+    resolved_run_dir, events = _read_run_events(run_dir)
+    timeline_path = resolved_run_dir / REPORT_FILENAME
+    summary_path = resolved_run_dir / SUMMARY_FILENAME
+    timeline = render_timeline(events)
+    summary = _build_run_summary(events)
+    try:
+        timeline_path.write_text(timeline, encoding="utf-8")
+        summary_path.write_text(
+            json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    except OSError as error:
+        raise ReportError(
+            f"Could not write run reports below {resolved_run_dir}: {error}"
+        ) from error
+    return RunReportArtifacts(timeline_path=timeline_path, summary_path=summary_path)
+
+
+def _read_run_events(run_dir: Path) -> tuple[Path, list[StoredEvent]]:
     resolved_run_dir = run_dir.expanduser().resolve()
     if not resolved_run_dir.is_dir():
         raise ReportError(f"Run directory does not exist or is not a directory: {resolved_run_dir}")
@@ -48,14 +117,301 @@ def write_timeline_report(run_dir: Path) -> Path:
         raise ReportError(f"Could not read event journal {journal_path}: {error}") from error
     if not events:
         raise ReportError(f"Event journal is empty: {journal_path}")
+    return resolved_run_dir, events
 
-    report = render_timeline(events)
-    output_path = resolved_run_dir / REPORT_FILENAME
-    try:
-        output_path.write_text(report, encoding="utf-8")
-    except OSError as error:
-        raise ReportError(f"Could not write timeline {output_path}: {error}") from error
-    return output_path
+
+def _build_run_summary(events: Sequence[StoredEvent]) -> dict[str, object]:
+    episodes = _group_episodes(events)
+    runs: dict[str, dict[str, object]] = {}
+    for (run_id, episode_id), episode_events in episodes.items():
+        result = _last_model(episode_events, "episode_result", EpisodeResult)
+        execution = compute_execution_metrics(episode_events)
+        episode_metrics = (
+            compute_episode_metrics(episode_events, result) if result is not None else None
+        )
+        gates = _acceptance_gates(execution, episode_metrics)
+        run = runs.setdefault(run_id, {"episodes": {}})
+        run_episodes = run["episodes"]
+        assert isinstance(run_episodes, dict)
+        run_episodes[episode_id] = {
+            "run_id": run_id,
+            "episode_id": episode_id,
+            "complete": result is not None,
+            "result": result.model_dump(mode="json") if result is not None else None,
+            "metrics": (
+                episode_metrics.as_dict()
+                if episode_metrics is not None
+                else {"execution": asdict(execution)}
+            ),
+            "classification_conservation": _classification_conservation(execution),
+            "terminal_reports": _terminal_report_summary(execution),
+            "hard_acceptance": _hard_acceptance_summary(
+                gates,
+                complete=result is not None,
+            ),
+        }
+    return {
+        "format_version": "1.0",
+        "source_journal": "events.jsonl",
+        "runs": runs,
+    }
+
+
+def _group_episodes(events: Sequence[StoredEvent]) -> dict[tuple[str, str], list[StoredEvent]]:
+    ordered = sorted(events, key=lambda event: event.event_id)
+    episodes: dict[tuple[str, str], list[StoredEvent]] = {}
+    for event in ordered:
+        episodes.setdefault((event.run_id, event.episode_id), []).append(event)
+    return episodes
+
+
+def _classification_conservation(metrics: ExecutionMetrics) -> dict[str, int | bool]:
+    succeeded = metrics.status_counts.get("succeeded", 0)
+    failed = metrics.status_counts.get("failed", 0)
+    cancelled = metrics.status_counts.get("cancelled", 0)
+    unconfirmed = metrics.status_counts.get("unconfirmed", 0)
+    classified = succeeded + failed + cancelled + unconfirmed
+    return {
+        "reported": metrics.execution_reports,
+        "succeeded": succeeded,
+        "failed": failed,
+        "cancelled": cancelled,
+        "unconfirmed": unconfirmed,
+        "classified": classified,
+        "conserved": classified == metrics.execution_reports,
+    }
+
+
+def _terminal_report_summary(metrics: ExecutionMetrics) -> dict[str, int | float | bool]:
+    exactly_once = (
+        metrics.missing_terminal_reports == 0
+        and metrics.duplicate_terminal_reports == 0
+        and metrics.unexpected_terminal_reports == 0
+    )
+    return {
+        "dispatched_commands": metrics.dispatched_commands,
+        "known_lifecycle_commands": metrics.known_lifecycle_commands,
+        "reported_commands": metrics.terminal_commands_reported,
+        "missing_reports": metrics.missing_terminal_reports,
+        "duplicate_reports": metrics.duplicate_terminal_reports,
+        "unexpected_reports": metrics.unexpected_terminal_reports,
+        "duplicate_dispatches": metrics.duplicate_dispatches,
+        "coverage": metrics.terminal_report_coverage,
+        "exactly_once": exactly_once,
+    }
+
+
+def _acceptance_gates(
+    execution: ExecutionMetrics,
+    episode: EpisodeMetrics | None,
+) -> tuple[AcceptanceGate, ...]:
+    classified = sum(
+        execution.status_counts.get(status, 0)
+        for status in ("succeeded", "failed", "cancelled", "unconfirmed")
+    )
+    terminal_exactly_once = (
+        execution.missing_terminal_reports == 0
+        and execution.duplicate_terminal_reports == 0
+        and execution.unexpected_terminal_reports == 0
+    )
+    plan_samples = episode.plan_accept_gap_samples if episode is not None else 0
+    accepted_builds = execution.build_funnel.get("pysc2_accepted", 0)
+    proposed_builds = execution.build_funnel.get("proposed", 0)
+    return (
+        _gate("semantic_control_noops", execution.control_noops, "==", 0, "count"),
+        _gate("planner_noop_proposals", execution.planner_noop_proposals, "==", 0, "count"),
+        _gate("duplicate_command_dispatches", execution.duplicate_dispatches, "==", 0, "count"),
+        _gate(
+            "unexpected_terminal_reports",
+            execution.unexpected_terminal_reports,
+            "==",
+            0,
+            "count",
+        ),
+        _gate(
+            "planner_proposal_audit_complete",
+            execution.planner_proposal_audit_complete,
+            "==",
+            True,
+            "boolean",
+            applicable=execution.planner_module_results > 0,
+        ),
+        _gate(
+            "planner_builder_attack_proposals",
+            execution.planner_builder_attack_proposals,
+            "==",
+            0,
+            "count",
+        ),
+        _gate(
+            "planner_friendly_target_attack_proposals",
+            execution.planner_friendly_target_attack_proposals,
+            "==",
+            0,
+            "count",
+        ),
+        _gate(
+            "planner_unsafe_attack_dispatched",
+            execution.planner_unsafe_attack_dispatched,
+            "==",
+            0,
+            "count",
+        ),
+        _gate("friendly_target_attacks", execution.friendly_target_attacks, "==", 0, "count"),
+        _gate("builder_attack_commands", execution.builder_attack_commands, "==", 0, "count"),
+        _gate(
+            "generic_translation_failures",
+            execution.generic_translation_failures,
+            "==",
+            0,
+            "count",
+        ),
+        _gate("unattributed_primitives", execution.unattributed_primitives, "==", 0, "count"),
+        _gate(
+            "upstream_placement_rejections",
+            execution.upstream_placement_rejections,
+            "==",
+            0,
+            "count",
+        ),
+        _gate(
+            "candidate_outside_pysc2_dispatches",
+            execution.candidate_outside_pysc2_dispatches,
+            "==",
+            0,
+            "count",
+        ),
+        _gate(
+            "orchestration_573_terminal_reports",
+            execution.orchestration_573_terminal_reports,
+            "==",
+            0,
+            "count",
+        ),
+        _gate(
+            "classification_conservation",
+            classified,
+            "==",
+            execution.execution_reports,
+            "count",
+        ),
+        _gate("terminal_report_exactly_once", terminal_exactly_once, "==", True, "boolean"),
+        _gate(
+            "failure_classification_coverage",
+            execution.failure_classification_coverage,
+            ">=",
+            1.0,
+            "ratio",
+        ),
+        _gate(
+            "plan_accept_gap_p50_game_loops",
+            episode.plan_accept_gap_game_loops_p50 if episode is not None else 0.0,
+            "<=",
+            140,
+            "game_loops",
+            applicable=plan_samples > 0,
+        ),
+        _gate(
+            "plan_accept_gap_p95_game_loops",
+            episode.plan_accept_gap_game_loops_p95 if episode is not None else 0.0,
+            "<=",
+            170,
+            "game_loops",
+            applicable=plan_samples > 0,
+        ),
+        _gate(
+            "meaningful_command_success_rate",
+            execution.meaningful_action_success_rate,
+            ">=",
+            0.70,
+            "ratio",
+            applicable=execution.meaningful_commands > 0,
+        ),
+        _gate(
+            "completed_execution_success_rate",
+            execution.completed_execution_success_rate,
+            ">=",
+            0.75,
+            "ratio",
+            applicable=execution.completed_meaningful_commands > 0,
+        ),
+        _gate(
+            "terminal_backlog_rate",
+            execution.terminal_backlog_rate,
+            "<=",
+            0.05,
+            "ratio",
+            applicable=execution.meaningful_commands > 0,
+        ),
+        _gate(
+            "build_effect_confirmed_rate",
+            execution.build_effect_confirmed_rate,
+            ">=",
+            0.90,
+            "ratio",
+            applicable=accepted_builds > 0,
+        ),
+        _gate(
+            "build_effect_timeout_rate",
+            execution.build_effect_timeout_rate,
+            "<=",
+            0.10,
+            "ratio",
+            applicable=accepted_builds > 0,
+        ),
+        _gate(
+            "build_pre_dispatch_rejection_rate",
+            execution.build_pre_dispatch_rejection_rate,
+            "<=",
+            0.05,
+            "ratio",
+            applicable=proposed_builds > 0,
+        ),
+    )
+
+
+def _gate(
+    name: str,
+    value: GateScalar,
+    comparison: Literal["==", ">=", "<="],
+    threshold: GateScalar,
+    unit: Literal["boolean", "count", "game_loops", "ratio"],
+    *,
+    applicable: bool = True,
+) -> AcceptanceGate:
+    passed: bool | None = None
+    if applicable:
+        if comparison == "==":
+            passed = value == threshold
+        elif comparison == ">=":
+            passed = value >= threshold
+        else:
+            passed = value <= threshold
+    return AcceptanceGate(
+        name=name,
+        value=value,
+        comparison=comparison,
+        threshold=threshold,
+        unit=unit,
+        passed=passed,
+    )
+
+
+def _hard_acceptance_summary(
+    gates: Sequence[AcceptanceGate],
+    *,
+    complete: bool,
+) -> dict[str, object]:
+    passed_gates = sum(gate.passed is True for gate in gates)
+    failed_gates = sum(gate.passed is False for gate in gates)
+    not_applicable_gates = sum(gate.passed is None for gate in gates)
+    return {
+        "passed": complete and failed_gates == 0 and not_applicable_gates == 0,
+        "passed_gates": passed_gates,
+        "failed_gates": failed_gates,
+        "not_applicable_gates": not_applicable_gates,
+        "gates": {gate.name: gate.as_dict() for gate in gates},
+    }
 
 
 def render_timeline(events: Sequence[StoredEvent]) -> str:
@@ -63,10 +419,7 @@ def render_timeline(events: Sequence[StoredEvent]) -> str:
 
     if not events:
         raise ReportError("Event journal is empty")
-    ordered = sorted(events, key=lambda event: event.event_id)
-    episodes: dict[tuple[str, str], list[StoredEvent]] = {}
-    for event in ordered:
-        episodes.setdefault((event.run_id, event.episode_id), []).append(event)
+    episodes = _group_episodes(events)
 
     lines = [
         "# RTSCortex Run Timeline",
@@ -97,6 +450,9 @@ def _render_episode(
     ]
     rejected = sum(len(_payload_list(event, "batch", "rejected_commands")) for event in decisions)
     successful_executions = sum(event.payload.get("success") is True for event in executions)
+    execution_metrics = compute_execution_metrics(events)
+    episode_metrics = compute_episode_metrics(events, result) if result is not None else None
+    command_index = _decision_command_index(decisions)
     total_tokens = sum(_total_tokens(event.payload.get("usage")) for event in model_events)
 
     scenario = result.scenario if result is not None else summary.scenario if summary else "unknown"
@@ -126,36 +482,62 @@ def _render_episode(
             f"{seed if seed is not None else 'n/a'} | {score} | {steps} |"
         ),
         "",
-        "| Agent ticks | Decisions | Plans | Executions | Rejected | Model calls | Tokens |",
+        (
+            "| Agent ticks | Decisions | Plans | Legacy executions (deprecated) | "
+            "Rejected | Model calls | Tokens |"
+        ),
         "|---:|---:|---:|---:|---:|---:|---:|",
         (
             f"| {len(observations)} | {len(decisions)} | {len(plans)} | {execution_rate} | "
             f"{rejected} | {len(model_events)} | {total_tokens} |"
         ),
     ]
-    if result is not None:
-        metrics = compute_episode_metrics(events, result)
+    if episode_metrics is not None:
+        accept_gap_summary = (
+            f"`{episode_metrics.plan_accept_gap_game_loops_p50:.0f}/"
+            f"{episode_metrics.plan_accept_gap_game_loops_p95:.0f}` loops "
+            f"({episode_metrics.plan_accept_gap_samples} samples)"
+            if episode_metrics.plan_accept_gap_samples
+            else "insufficient samples (requires at least two accepted plans)"
+        )
         lines.extend(
             [
                 "",
                 (
                     "- Latency p50/p95: planner "
-                    f"`{metrics.planner_latency_ms_p50:.2f}/{metrics.planner_latency_ms_p95:.2f} "
+                    f"`{episode_metrics.planner_latency_ms_p50:.2f}/"
+                    f"{episode_metrics.planner_latency_ms_p95:.2f} "
                     "ms`, reflex "
-                    f"`{metrics.reflex_latency_ms_p50:.2f}/{metrics.reflex_latency_ms_p95:.2f} "
+                    f"`{episode_metrics.reflex_latency_ms_p50:.2f}/"
+                    f"{episode_metrics.reflex_latency_ms_p95:.2f} "
                     "ms`, tick "
-                    f"`{metrics.tick_latency_ms_p50:.2f}/{metrics.tick_latency_ms_p95:.2f} ms`."
+                    f"`{episode_metrics.tick_latency_ms_p50:.2f}/"
+                    f"{episode_metrics.tick_latency_ms_p95:.2f} ms`."
                 ),
                 (
-                    f"- Plan revisions: `{metrics.plan_revisions}`; reflex preemptions: "
-                    f"`{metrics.reflex_preemptions}`; duration: "
-                    f"`{metrics.episode_duration_seconds:.2f} s`."
+                    f"- Plan revisions: `{episode_metrics.plan_revisions}`; "
+                    f"reflex preemptions: `{episode_metrics.reflex_preemptions}`; duration: "
+                    f"`{episode_metrics.episode_duration_seconds:.2f} s`."
+                ),
+                (
+                    "- Plan age p50/p95: "
+                    f"`{episode_metrics.plan_age_game_loops_p50:.0f}/"
+                    f"{episode_metrics.plan_age_game_loops_p95:.0f}` loops; "
+                    "accept gap p50/p95: "
+                    f"{accept_gap_summary}."
                 ),
             ]
         )
     else:
         lines.extend(["", "- No terminal episode result was recorded; this run is incomplete."])
 
+    lines.extend(_render_execution_metrics(execution_metrics))
+    lines.extend(
+        _render_hard_acceptance(
+            _acceptance_gates(execution_metrics, episode_metrics),
+            complete=result is not None,
+        )
+    )
     lines.extend(["", "### Timeline", ""])
     timeline_started = False
     for event in events:
@@ -184,7 +566,7 @@ def _render_episode(
         if not timeline_started:
             lines.extend(["#### Before first observation", ""])
             timeline_started = True
-        lines.extend(_render_event(event))
+        lines.extend(_render_event(event, command_index))
     lines.append("")
     return lines
 
@@ -220,13 +602,16 @@ def _render_observation(event: StoredEvent, observation: ObservationEnvelope) ->
     return lines
 
 
-def _render_event(event: StoredEvent) -> list[str]:
+def _render_event(
+    event: StoredEvent,
+    command_index: dict[str, ActionCommand],
+) -> list[str]:
     if event.event_type == "plan_accepted":
         return _render_plan(event)
     if event.event_type == "decision":
         return _render_decision(event)
     if event.event_type == "execution":
-        return _render_execution(event)
+        return _render_execution(event, command_index)
     if event.event_type == "module_result":
         return _render_module_result(event)
     if event.event_type == "planner_cycle":
@@ -309,9 +694,23 @@ def _render_decision(event: StoredEvent) -> list[str]:
     return lines
 
 
-def _render_execution(event: StoredEvent) -> list[str]:
+def _render_execution(
+    event: StoredEvent,
+    command_index: dict[str, ActionCommand],
+) -> list[str]:
     report = _validate(event, ExecutionReport)
-    status = "SUCCESS" if report.success else "FAILED"
+    command = command_index.get(report.command_id)
+    if report.protocol_version == "1.0" and command is not None:
+        report = report.model_copy(
+            update={
+                "action_name": report.action_name or command.name,
+                "actor": report.actor or command.actor,
+                "source": report.source or command.source,
+                "requested_arguments": report.requested_arguments or command.arguments,
+                "resolved_arguments": report.resolved_arguments or command.arguments,
+            }
+        )
+    status = report.status.value.upper()
     function = report.pysc2_function or "not reported"
     lines = [
         (
@@ -322,9 +721,253 @@ def _render_execution(event: StoredEvent) -> list[str]:
     ]
     if report.failure_reason:
         lines.append(f"  - Failure reason: {_inline(report.failure_reason)}")
+    if report.action_name or report.actor or report.source:
+        lines.append(
+            "  - Command: "
+            f"{_code(report.action_name or 'unknown')} by "
+            f"{_code(report.actor or 'unknown')} from "
+            f"{_code(report.source.value if report.source else 'unknown')}."
+        )
+    if report.execution_stage or report.failure_code:
+        lines.append(
+            "  - Classification: stage "
+            f"{_code(report.execution_stage.value if report.execution_stage else 'unknown')}; "
+            f"code {_code(report.failure_code or 'none')}."
+        )
+    if report.primitive_trace:
+        accepted = sum(primitive.accepted for primitive in report.primitive_trace)
+        lines.append(f"  - Primitive trace: `{accepted}/{len(report.primitive_trace)}` accepted.")
+    if report.effect_evidence and report.effect_evidence.new_structure_tag:
+        lines.append(
+            "  - Effect confirmed by new structure "
+            f"{_code(report.effect_evidence.new_structure_tag)}."
+        )
     if report.game_result:
         lines.append(f"  - Game result: {_code(report.game_result)}")
     return lines
+
+
+def _decision_command_index(decisions: Sequence[StoredEvent]) -> dict[str, ActionCommand]:
+    commands: dict[str, ActionCommand] = {}
+    for event in decisions:
+        batch = _validate_nested(event, "batch", ActionBatch)
+        for command in batch.commands:
+            commands.setdefault(command.command_id, command)
+    return commands
+
+
+def _render_execution_metrics(metrics: ExecutionMetrics) -> list[str]:
+    terminal_cancelled = metrics.status_counts.get("cancelled", 0)
+    terminal_unconfirmed = metrics.status_counts.get("unconfirmed", 0)
+    meaningful_rate = _rate(
+        metrics.meaningful_successes,
+        metrics.meaningful_commands,
+    )
+    completed_rate = _rate(
+        metrics.meaningful_successes,
+        metrics.completed_meaningful_commands,
+    )
+    legacy_rate = _rate(metrics.legacy_successes, metrics.execution_reports)
+    classified = sum(
+        metrics.status_counts.get(status, 0)
+        for status in ("succeeded", "failed", "cancelled", "unconfirmed")
+    )
+    lines = [
+        "",
+        "### Decision activity",
+        "",
+        "| Decisions | Fallback | Planner pending | Unique validation rejections |",
+        "|---:|---:|---:|---:|",
+        (
+            f"| {metrics.decision_count} | {metrics.fallback_decisions} | "
+            f"{metrics.planner_pending_decisions} | "
+            f"{metrics.unique_validation_rejected_command_ids} |"
+        ),
+    ]
+    if metrics.idle_reason_counts:
+        lines.extend(_render_count_table("Idle reasons", metrics.idle_reason_counts))
+    lines.extend(
+        [
+            "",
+            "### Meaningful outcomes",
+            "",
+            (
+                f"- Tracked control NoOps: `{metrics.control_noops}` "
+                f"(`{metrics.control_noop_successes}` succeeded)."
+            ),
+            (f"- Untracked transport NoOp primitives: `{metrics.transport_noop_primitives}`."),
+            (
+                f"- Meaningful commands: `{metrics.meaningful_commands}` — "
+                f"`{metrics.meaningful_successes}` succeeded, "
+                f"`{metrics.meaningful_failures}` failed, "
+                f"`{metrics.meaningful_cancelled}` cancelled, "
+                f"`{metrics.meaningful_unconfirmed}` unconfirmed."
+            ),
+            f"- Meaningful success: {meaningful_rate}.",
+            f"- Completed execution success: {completed_rate}.",
+            (
+                f"- Terminal cancelled: `{terminal_cancelled}`; "
+                f"unconfirmed: `{terminal_unconfirmed}`."
+            ),
+            (
+                "- Terminal backlog rate: "
+                f"`{metrics.terminal_backlog_rate:.1%}` "
+                f"(`{metrics.meaningful_cancelled + metrics.meaningful_unconfirmed}/"
+                f"{metrics.meaningful_commands}`)."
+            ),
+            f"- Classification conservation: `{classified}/{metrics.execution_reports}`.",
+            (
+                "- Terminal report coverage: "
+                f"`{metrics.terminal_commands_reported}/{metrics.dispatched_commands}` "
+                f"({metrics.terminal_report_coverage:.1%}); "
+                f"known lifecycle commands `{metrics.known_lifecycle_commands}`, "
+                f"missing `{metrics.missing_terminal_reports}`, unexpected reports "
+                f"`{metrics.unexpected_terminal_reports}`, duplicate reports "
+                f"`{metrics.duplicate_terminal_reports}`, duplicate dispatches "
+                f"`{metrics.duplicate_dispatches}`."
+            ),
+            (
+                "- Explicit failure stage/code coverage: "
+                f"`{metrics.explicitly_classified_failures}/{metrics.failure_reports}` "
+                f"({metrics.failure_classification_coverage:.1%})."
+            ),
+            f"- Legacy execution-report rate: {legacy_rate} (deprecated).",
+            "",
+            "### Build funnel",
+            "",
+            "| Raw Planner proposed | Candidate validated | Translator accepted | PySC2 accepted | "
+            "Effect confirmed |",
+            "|---:|---:|---:|---:|---:|",
+            (
+                f"| {metrics.build_funnel.get('proposed', 0)} | "
+                f"{metrics.build_funnel.get('candidate_validated', 0)} | "
+                f"{metrics.build_funnel.get('translator_accepted', 0)} | "
+                f"{metrics.build_funnel.get('pysc2_accepted', 0)} | "
+                f"{metrics.build_funnel.get('effect_confirmed', 0)} |"
+            ),
+            (
+                "- Build effect confirmed rate: "
+                f"`{metrics.build_effect_confirmed_rate:.1%}`; effect timeout rate: "
+                f"`{metrics.build_effect_timeout_rate:.1%}` "
+                f"(`{metrics.build_effect_timeouts}` commands)."
+            ),
+            (
+                "- Build pre-dispatch race rejection rate: "
+                f"`{metrics.build_pre_dispatch_rejection_rate:.1%}` "
+                f"(`{metrics.build_pre_dispatch_rejections}` commands)."
+            ),
+            "",
+            "### Safety and attribution invariants",
+            "",
+            (
+                "- Planner proposal audit: "
+                f"`{metrics.planner_proposal_audited_results}/"
+                f"{metrics.planner_module_results}` module results complete."
+            ),
+            (
+                f"- Planner unsafe Attack proposals: `{metrics.planner_unsafe_attack_proposals}` "
+                f"(Builder actor `{metrics.planner_builder_attack_proposals}`, friendly target "
+                f"`{metrics.planner_friendly_target_attack_proposals}`); rejected before dispatch "
+                f"`{metrics.planner_unsafe_attack_rejected_before_dispatch}`; dispatched "
+                f"`{metrics.planner_unsafe_attack_dispatched}`."
+            ),
+            (
+                f"- Dispatched unsafe Attack commands: Builder actor "
+                f"`{metrics.builder_attack_commands}`; friendly target "
+                f"`{metrics.friendly_target_attacks}`."
+            ),
+            "",
+            "| Planner NoOp proposals | Generic translation failures | "
+            "Upstream placement rejections | Unattributed primitives | "
+            "Candidate-external PySC2 dispatches | Orchestration 573 terminal reports |",
+            "|---:|---:|---:|---:|---:|---:|",
+            (
+                f"| {metrics.planner_noop_proposals} | "
+                f"{metrics.generic_translation_failures} | "
+                f"{metrics.upstream_placement_rejections} | "
+                f"{metrics.unattributed_primitives} | "
+                f"{metrics.candidate_outside_pysc2_dispatches} | "
+                f"{metrics.orchestration_573_terminal_reports} |"
+            ),
+            "",
+            "### Failure taxonomy",
+        ]
+    )
+    lines.extend(_render_count_table("By stage", metrics.failure_by_stage))
+    lines.extend(_render_count_table("By code", metrics.failure_by_code))
+    lines.extend(_render_count_table("By action", metrics.failure_by_action))
+    lines.extend(_render_count_table("By actor", metrics.failure_by_actor))
+    lines.extend(
+        _render_count_table("Commands by action and actor", metrics.command_by_action_actor)
+    )
+    lines.extend(
+        _render_count_table(
+            "Failures by action, stage, and code",
+            metrics.failure_by_action_stage_code,
+        )
+    )
+    return lines
+
+
+def _render_hard_acceptance(
+    gates: Sequence[AcceptanceGate],
+    *,
+    complete: bool,
+) -> list[str]:
+    summary = _hard_acceptance_summary(gates, complete=complete)
+    overall = "PASS" if summary["passed"] is True else "FAIL"
+    lines = [
+        "",
+        "### Hard acceptance gates",
+        "",
+        (
+            f"- Overall: **{overall}** — `{summary['passed_gates']}` passed, "
+            f"`{summary['failed_gates']}` failed, "
+            f"`{summary['not_applicable_gates']}` not applicable."
+        ),
+        "",
+        "| Gate | Value | Requirement | Result |",
+        "|---|---:|---:|---|",
+    ]
+    for gate in gates:
+        result = "PASS" if gate.passed is True else "FAIL" if gate.passed is False else "N/A"
+        lines.append(
+            f"| `{gate.name}` | {_format_gate_scalar(gate.value, gate.unit)} | "
+            f"`{gate.comparison}` {_format_gate_scalar(gate.threshold, gate.unit)} | "
+            f"**{result}** |"
+        )
+    return lines
+
+
+def _format_gate_scalar(
+    value: GateScalar,
+    unit: Literal["boolean", "count", "game_loops", "ratio"],
+) -> str:
+    if unit == "ratio":
+        return f"`{float(value):.1%}`"
+    if unit == "boolean":
+        return _code(str(bool(value)).lower())
+    if unit == "game_loops":
+        return f"`{float(value):.0f}` loops"
+    return _code(value)
+
+
+def _render_count_table(title: str, counts: dict[str, int]) -> list[str]:
+    lines = ["", f"#### {title}", ""]
+    if not counts:
+        return [*lines, "None."]
+    lines.extend(["| Value | Count |", "|---|---:|"])
+    lines.extend(
+        f"| {_code(key)} | {value} |"
+        for key, value in sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    )
+    return lines
+
+
+def _rate(numerator: int, denominator: int) -> str:
+    if not denominator:
+        return "`0/0`"
+    return f"`{numerator}/{denominator}` ({numerator / denominator:.1%})"
 
 
 def _render_module_result(event: StoredEvent) -> list[str]:
@@ -356,7 +999,7 @@ def _render_module_output(event: StoredEvent, module: str, output: object) -> li
     if not isinstance(output, dict):
         raise ReportError(f"Invalid module output at event {event.event_id}")
     if module == "reflection":
-        reflection = output.get("reflection")
+        reflection = output.get("summary") or output.get("reflection")
         lines = [f"  - Reflection: {_inline(reflection) if reflection else 'none'}"]
         lessons = output.get("lessons", [])
         if not isinstance(lessons, list):
@@ -368,7 +1011,7 @@ def _render_module_output(event: StoredEvent, module: str, output: object) -> li
         if raw_plan is None:
             return ["  - Plan output: none"]
         try:
-            plan = PlanningOutput.model_validate(raw_plan)
+            plan = PlanningOutput.model_validate(_without_legacy_planner_ttl(raw_plan))
         except ValidationError as error:
             raise ReportError(
                 f"Invalid planning output at event {event.event_id}: {error}"
@@ -379,11 +1022,26 @@ def _render_module_output(event: StoredEvent, module: str, output: object) -> li
             arguments = json.dumps(proposal.arguments, ensure_ascii=False)
             lines.append(
                 f"  - Proposed: [{_code(proposal.actor)}] {_code(proposal.name)}"
-                f"({arguments}) · priority `{proposal.priority}`, TTL "
-                f"`{proposal.ttl_game_loops}` loops."
+                f"({arguments}) · priority `{proposal.priority}`."
             )
         return lines
     return []
+
+
+def _without_legacy_planner_ttl(raw_plan: object) -> object:
+    if not isinstance(raw_plan, dict):
+        return raw_plan
+    proposed_actions = raw_plan.get("proposed_actions")
+    if not isinstance(proposed_actions, list):
+        return raw_plan
+    normalized = dict(raw_plan)
+    normalized["proposed_actions"] = [
+        {key: value for key, value in proposal.items() if key != "ttl_game_loops"}
+        if isinstance(proposal, dict)
+        else proposal
+        for proposal in proposed_actions
+    ]
+    return normalized
 
 
 def _render_context_compaction(event: StoredEvent, output: object) -> list[str]:

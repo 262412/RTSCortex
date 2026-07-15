@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Literal, TypeAlias
+from typing import Any, Literal, TypeAlias
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 RaceName: TypeAlias = Literal["random", "protoss", "terran", "zerg"]
 BotDifficulty: TypeAlias = Literal[
@@ -57,8 +57,20 @@ class EnvironmentSettings(SettingsModel):
 class RuntimeSettings(SettingsModel):
     deterministic: bool = True
     planning_interval_game_loops: int = Field(default=16, ge=1)
+    planner_command_ttl_game_loops: int = Field(default=16, ge=1)
     planner_timeout_seconds: float = Field(default=15.0, gt=0.0)
     max_actions: int = Field(default=5, ge=1)
+
+    @model_validator(mode="before")
+    @classmethod
+    def default_command_ttl_to_planning_interval(cls, value: Any) -> Any:
+        if not isinstance(value, dict) or "planner_command_ttl_game_loops" in value:
+            return value
+        normalized = dict(value)
+        normalized["planner_command_ttl_game_loops"] = normalized.get(
+            "planning_interval_game_loops", 16
+        )
+        return normalized
 
 
 AgentVariant: TypeAlias = Literal[

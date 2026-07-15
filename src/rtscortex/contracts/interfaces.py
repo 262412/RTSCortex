@@ -18,11 +18,40 @@ from rtscortex.contracts.models import (
 
 
 @dataclass(frozen=True)
+class CommandLifecycleSnapshot:
+    """Compact non-terminal command state exposed to deliberative modules."""
+
+    command_id: str
+    actor: str
+    name: str
+    arguments: tuple[Any, ...]
+    source: str
+    status: str
+    reason: str | None
+    created_game_loop: int
+    ttl_game_loops: int
+
+    @property
+    def expires_at_game_loop(self) -> int:
+        return self.created_game_loop + self.ttl_game_loops
+
+
+@dataclass(frozen=True)
+class ActivePlanSnapshot:
+    """Current strategy plus every command that can still affect the game."""
+
+    strategic_goal: str
+    summary: str
+    commands: tuple[CommandLifecycleSnapshot, ...]
+
+
+@dataclass(frozen=True)
 class AgentContext:
     observation: ObservationEnvelope
     memory: dict[str, Any] = field(default_factory=dict)
     last_execution: ExecutionReport | None = None
     last_decision: ActionBatch | None = None
+    active_plan: ActivePlanSnapshot | None = None
 
 
 @dataclass(frozen=True)

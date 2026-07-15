@@ -7,7 +7,11 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from rtscortex_llm_pysc2.observation import split_actor
+from rtscortex_llm_pysc2.observation import (
+    BridgeAvailableAction,
+    ScreenCandidateMetadata,
+    split_actor,
+)
 
 
 @dataclass(frozen=True)
@@ -17,13 +21,21 @@ class RoutedCommand:
     team_name: str
     name: str
     rendered_action: str
+    source: str = "planner"
+    requested_arguments: tuple[Any, ...] = ()
+    resolved_arguments: tuple[Any, ...] = ()
+    screen_world_target: tuple[float, float] | None = None
+    screen_anchor_tag: int | None = None
 
-    def to_dict(self) -> dict[str, str]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "command_id": self.command_id,
             "actor": self.actor,
             "team_name": self.team_name,
             "name": self.name,
+            "source": self.source,
+            "requested_arguments": list(self.requested_arguments),
+            "resolved_arguments": list(self.resolved_arguments),
             "rendered_action": self.rendered_action,
         }
 
@@ -84,7 +96,9 @@ class ActionRouter:
             specification_key = (name, actor)
             if specification_key not in specifications:
                 raise ValueError(f"action {name!r} is unavailable for actor {actor!r}")
-            argument_names, argument_types = specifications[specification_key]
+            specification = specifications[specification_key]
+            argument_names = specification.argument_names
+            argument_types = specification.argument_types
             arguments = _list(command["arguments"], "command arguments")
             if len(arguments) != len(argument_names):
                 raise ValueError(
@@ -94,13 +108,23 @@ class ActionRouter:
                 _format_argument(argument_types[index], arguments[index])
                 for index in range(len(argument_names))
             )
+            screen_metadata = specification.screen_metadata(actor, arguments)
             commands_by_team[team_name].append(
                 RoutedCommand(
                     command_id=str(command["command_id"]),
                     actor=actor,
                     team_name=team_name,
                     name=name,
+                    source=str(command["source"]),
+                    requested_arguments=tuple(arguments),
+                    resolved_arguments=tuple(arguments),
                     rendered_action=f"<{name}({rendered_arguments})>",
+                    screen_world_target=(
+                        None if screen_metadata is None else screen_metadata.world_target
+                    ),
+                    screen_anchor_tag=(
+                        None if screen_metadata is None else screen_metadata.anchor_tag
+                    ),
                 )
             )
 
@@ -129,10 +153,43 @@ class ActionRouter:
         )
 
 
+@dataclass(frozen=True)
+class _ActionSpecification:
+    argument_names: tuple[str, ...]
+    argument_types: tuple[str, ...]
+    available_action: Mapping[str, Any]
+
+    def screen_metadata(
+        self,
+        actor: str,
+        arguments: list[Any],
+    ) -> ScreenCandidateMetadata | None:
+        if not isinstance(self.available_action, BridgeAvailableAction):
+            return None
+        position = next(
+            (
+                value
+                for index, value in enumerate(arguments)
+                if self.argument_types[index] == "position"
+            ),
+            None,
+        )
+        if (
+            not isinstance(position, (list, tuple))
+            or len(position) != 2
+            or not all(isinstance(coordinate, int) for coordinate in position)
+        ):
+            return None
+        return self.available_action.screen_metadata(
+            actor,
+            (int(position[0]), int(position[1])),
+        )
+
+
 def _action_specifications(
     available_actions: Sequence[Mapping[str, Any]],
-) -> dict[tuple[str, str], tuple[tuple[str, ...], tuple[str, ...]]]:
-    specifications: dict[tuple[str, str], tuple[tuple[str, ...], tuple[str, ...]]] = {}
+) -> dict[tuple[str, str], _ActionSpecification]:
+    specifications: dict[tuple[str, str], _ActionSpecification] = {}
     for action in available_actions:
         name = str(action["name"])
         arguments = tuple(str(item) for item in _list(action["argument_names"], "argument_names"))
@@ -144,7 +201,11 @@ def _action_specifications(
         for actor_value in _list(action["actor_scopes"], "actor_scopes"):
             actor = str(actor_value)
             split_actor(actor)
-            specifications[(name, actor)] = (arguments, argument_types)
+            specifications[(name, actor)] = _ActionSpecification(
+                arguments,
+                argument_types,
+                action,
+            )
     return specifications
 
 

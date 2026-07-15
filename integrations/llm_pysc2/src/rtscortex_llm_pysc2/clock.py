@@ -90,9 +90,7 @@ class FixedRateGameClock:
         next_deadline = deadline + self.seconds_per_step
         skipped_deadlines = 0
         if next_deadline <= after_wait:
-            skipped_deadlines = (
-                math.floor((after_wait - next_deadline) / self.seconds_per_step) + 1
-            )
+            skipped_deadlines = math.floor((after_wait - next_deadline) / self.seconds_per_step) + 1
             next_deadline += skipped_deadlines * self.seconds_per_step
         self._next_deadline = next_deadline
 

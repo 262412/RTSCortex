@@ -19,9 +19,11 @@ Before a live run, provide all of the following:
     92440 (5.0.13) or newer;
   - `2s3z`: `Maps/llm_smac/2s3z.SC2Map`, compatible with the official Linux
     SC2 4.10/Base75689 package, retained as a legacy task map;
-- all three reviewed patches from `integrations/llm_pysc2/patches` applied to the pinned
-  LLM-PySC2 checkout (asynchronous waiting, deterministic SC2 seeding, and row-major
-  build-coordinate validation).
+- all nine reviewed patches from `integrations/llm_pysc2/patches` applied to the pinned
+  LLM-PySC2 checkout (asynchronous waiting, deterministic SC2 seeding, row-major
+  build-coordinate validation, structured primitive provenance, safe Near placement, and
+  explicit pre-translation abort reporting, transient gas/transport unit grace, and Nexus
+  resource-clearance validation with exact screen-to-world scaling and visibility checks).
 
 The runtime never downloads StarCraft II or applies upstream patches automatically. Keep
 the pinned submodule clean between live runs. To apply the reviewed patches explicitly
@@ -34,6 +36,18 @@ git -C third_party/LLM-PySC2 apply \
   ../../integrations/llm_pysc2/patches/0002-pass-random-seed-to-sc2env.patch
 git -C third_party/LLM-PySC2 apply \
   ../../integrations/llm_pysc2/patches/0003-fix-build-feature-plane-coordinate-order.patch
+git -C third_party/LLM-PySC2 apply \
+  ../../integrations/llm_pysc2/patches/0004-expose-structured-translation-results.patch
+git -C third_party/LLM-PySC2 apply \
+  ../../integrations/llm_pysc2/patches/0005-fix-near-base-placement.patch
+git -C third_party/LLM-PySC2 apply \
+  ../../integrations/llm_pysc2/patches/0006-report-pretranslation-action-aborts.patch
+git -C third_party/LLM-PySC2 apply \
+  ../../integrations/llm_pysc2/patches/0007-preserve-transient-team-units.patch
+git -C third_party/LLM-PySC2 apply \
+  ../../integrations/llm_pysc2/patches/0008-enforce-nexus-resource-clearance.patch
+git -C third_party/LLM-PySC2 apply \
+  ../../integrations/llm_pysc2/patches/0009-use-exact-nexus-screen-scale.patch
 ```
 
 After the live session, use the reverse commands documented in
@@ -51,6 +65,9 @@ the live preflight therefore reject older builds instead of relying on path chec
 minimal Protoss melee configuration for building, production, Zealot, and Stalker
 control while leaving SC2 lifecycle and PySC2 execution in LLM-PySC2. The opponent is a
 built-in VeryEasy Zerg bot using the Macro build.
+Production and research actions are exposed only when their completed idle source, mineral,
+vespene, supply, and prerequisite requirements are all currently satisfied; this includes the
+50-mineral/50-vespene Warp Gate research cost.
 
 Validate and launch the deterministic Fake-provider smoke with:
 
@@ -79,13 +96,19 @@ SC2PATH=~/scratch/StarCraftII \
   uv run rtscortex run --config configs/experiments/live_simple64_qwen3_8b.yaml
 ```
 
+For deterministic multi-seed regression, `run` accepts a non-negative override without editing
+the checked-in configuration, for example `--seed 0`, `--seed 1`, and `--seed 2`. The override is
+written into the run's config snapshot and forwarded to SC2Env.
+
 That configuration targets `http://127.0.0.1:8000/v1`, requires the served model ID
 `Qwen/Qwen3-8B`, disables Qwen thinking, limits each structured completion to 256 tokens,
 caps the combined system and user prompt at 9,000 characters, and uses a 112-game-loop
 planning cadence. `doctor --config` checks the endpoint and exact model ID before starting
 SC2. Because the address is loopback-only, the runtime must run on the same node as vLLM.
 Set `RTSCORTEX_LLM_API_KEY` only when the selected OpenAI-compatible endpoint requires
-authentication. This smoke is capped at 1024 game loops and 1120 agent steps.
+authentication. The short configuration is capped at 1024 game loops and 1120 agent
+steps. `live_simple64_smoke_qwen3_8b.yaml` runs 3,000 game loops before the complete-match
+configuration is used.
 
 ### Simulation and planning timing
 
@@ -131,36 +154,107 @@ remain in `events.jsonl`, so reducing model input does not reduce experiment tra
 
 ### Build position handling
 
-The bridge derives `Build_Pylon_Screen` and `Build_Gateway_Screen` candidates from the
-current feature-screen buildability, pathing, ownership, and power layers. Candidates
-must have a complete build footprint that is buildable, pathable, and empty
-(`player_relative == 0`) in PySC2's row-major feature planes. The reviewed upstream
-coordinate patch makes LLM-PySC2 validate the same planes as `[y][x]`. On-screen
-feature-unit positions are also excluded,
-so a Probe or an existing structure cannot occupy a candidate footprint. Compact candidate
-lines are included in the model's spatial context. Immediately before the upstream
-translator executes a build action, the worker derives candidates again from the latest
-observation and refreshes the screen coordinate. The coordinate in an older plan is
-therefore not replayed blindly after camera, units, or map state changes.
+The bridge derives one structured candidate domain for every exposed target or position
+action. Screen-build candidates use the current buildability, pathing, ownership, and
+power layers. Their complete footprint must be buildable, pathable, powered when required,
+and empty (`player_relative == 0`) in PySC2's row-major feature planes. Feature-unit radii
+are dilated around the footprint, so a Probe or existing structure cannot overlap its edge.
+The model schema and Runtime membership validator consume exactly this same candidate set;
+the candidates are not duplicated into free-form observation text.
+
+Pylon, Gateway, and Cybernetics Core use screen candidates with their appropriate footprint,
+power, resource, and prerequisite rules. Assimilator accepts only an unoccupied, visible
+neutral geyser near a completed Nexus. Builder `Move_Minimap` candidates expose unseen remote
+neutral minimap clusters ordered by distance from the current base. Deterministic map-spanning
+pathable points are used only when no unseen resource cluster is available. This gives the Planner
+an explicit scouting path before a remote expansion is eligible for construction; the Worker
+revalidates the selected minimap point immediately before dispatch.
+Nexus accepts a unique anchor only after at least five
+mineral patches in its resource cluster have been scouted and are currently visible; this avoids
+issuing a 400-mineral order into an unverified fogged expansion. The cluster must have no existing
+Protoss, Terran, or Zerg townhall belonging to either player. Arbitrary Nexus and Assimilator
+screen placement is not exposed. Immediately
+before translation, the Worker reprojects the candidate's Bridge-private world target into
+the current camera and recomputes the same semantics. A stale screen coordinate may move only
+to the nearest equivalent candidate within two sampling strides of that reprojection; tag
+targets are never substituted. Camera provenance never enters the public v1.1 payload.
+`Move_Screen` and `Ability_Blink_Screen` use the same world-target provenance, then re-enter
+the current pathable candidate domain before dispatch. The Builder's pre-Gateway movement also
+rechecks the current power mask. Reports retain the Planner's requested pixel coordinate and
+record the reprojected coordinate separately in `resolved_arguments`.
+
+Nexus translation moves the camera to the exact resource cluster, emits one translator-owned
+transport no-op, and resolves the final 5x5 placement on the following observation. This
+settlement tick is required because SC2 can update the camera transform one observation before
+its raw `is_on_screen` flags; projected coordinates outside the feature screen are never used.
+The final candidate must also keep every mineral 6–9 world units and every geyser 7–10 world
+units from the Nexus center. Candidates are scored by their distance from the ideal resource
+ring before centroid proximity, preventing a nominally buildable 5x5 footprint from landing
+inside the mineral line. These distances use the exact floating-point `screen_size / 24`
+conversion; the final anchor, candidate center, and complete footprint must be visible.
+RTSCortex repeats the complete-footprint visibility check against the translator's resolved
+screen position before allowing the final Nexus primitive to enter PySC2.
 
 Build execution now uses two-phase confirmation. First, the next SC2 observation must show
 that PySC2 accepted the primitive. The `ActionEffectVerifier` then defers the final
-`ExecutionReport` while it checks raw observations for the target structure count and
-build progress, mineral spending, and the selected Builder's tag, status, and ability
-orders. A newly visible target structure confirms the action; mineral spending together
-with the expected build ability on that Builder also confirms it before the structure is
-visible. If neither condition appears within
+`ExecutionReport` while it checks raw observations for a new structure tag of the expected
+type at the resolved command target. Assimilator keeps the exact requested geyser as that
+target; Nexus uses the translator's actual final screen placement rather than the resource
+anchor. This target-matched new tag is the only success criterion. Mineral spending and the
+selected Builder's status and ability orders remain diagnostic evidence; unrelated spending,
+another build elsewhere, or a concurrent worker order cannot produce a false success.
+Concurrent structures are matched one-to-one. If the target structure does not appear within
 `environment.action_effect_timeout_game_loops` (112 loops in the Qwen configuration), the
-command is reported as failed rather than as a false success.
+command is normally reported as failed rather than as a false success. PySC2 exposes unit
+orders as RAW function IDs; when the expected build order is still active at that deadline,
+the verifier keeps the command pending for a bounded maximum. Ordinary structures use four
+times the base timeout; Nexus uses twelve times because a Probe can traverse most of a melee
+map before warp-in starts. The order still is not proof of success, and every wait remains
+bounded. When an observed build order disappears, the verifier gives the target structure a
+final 32-loop visibility grace period before classifying the command as failed; the hard timeout
+still takes precedence.
 
 The failure reason includes before/after structure count and progress, minerals, Builder
-selection, status, and order IDs. Those diagnostics make it possible to distinguish a
-missing or lost worker selection, an order changed by worker management, and a
-feature-action placement that was accepted by the API but produced no construction.
+selection, status, RAW function order IDs, elapsed loops, and the effective deadline. An
+order is classified as replaced only if the expected build order was observed first and a
+different non-empty order appeared later; the report does not attribute that change to a
+specific subsystem without matching evidence.
 
-Asynchronous plans record their source loop, acceptance loop, and age. Their TTL begins
-at acceptance, while `Attack_Unit` commands carry a `unit_exists` precondition so a target
-that disappeared during model inference is rejected before reaching the bridge.
+`Move_Minimap` uses a separate bounded confirmation rule because its argument is a feature-
+minimap pixel, not a world coordinate or camera target. After PySC2 accepts the primitive, the
+verifier confirms that the addressed unit either receives RAW `Move_pt` order 13 or moves at
+least one world unit from its dispatch position. The global camera mask is diagnostic only and
+cannot confirm a team-owned movement command. No order and no displacement within one base
+effect window produces `effect_timeout`.
+
+Asynchronous plans record independent Planner start and acceptance loops. Planner starts use
+a fixed single-flight cadence; accepting a plan does not reset that cadence. Runtime-owned
+command TTL begins at acceptance. Each command then moves once through pending, deferred,
+dispatched, and one terminal state. At most one command per actor can remain dispatched;
+later Planner commands are deferred and Reflex commands suppressed until the execution report
+closes that actor. The dedicated Builder is excluded from upstream idle-worker reassignment,
+and from the moment a build is tracked until it terminates the Worker disables both automatic
+worker-management paths so they cannot replace the Probe's build order. An `Attack_Unit` target
+must remain in the current enemy-only candidate domain; a
+stale or friendly tag is rejected before reaching the Bridge.
+
+Upstream team membership is not changed by a single camera-dependent observation. Gas and
+transport occupants can temporarily disappear from both raw and feature views; the Worker
+preserves their membership and waits for the upstream 40-step confirmed-death threshold. Only
+confirmed disappearance removes the unit and emits a command-owned
+`pre_dispatch/actor_not_available` report, so a transient observation gap cannot silently drop
+or duplicate a command. Death confirmation advances on every SC2 observation even while the
+upstream action loop is locked, preventing a permanently missing team head from stalling the
+environment worker.
+An actor disappearing while its upstream team is executing transport `No_Operation` clears that
+control action without producing an execution report; unattributed semantic actions remain a
+fatal Bridge integrity violation.
+
+Live payloads use protocol 1.1. Empty decisions carry an `idle_reason` and no semantic
+NoOp command. SC2 transport NoOps are counted separately and never enter gameplay success
+rates. Execution reports include the action, actor, source, requested and resolved arguments,
+stage, stable failure code, primitive sequence, and effect evidence. Historical protocol 1.0
+journals remain readable by `report` and `replay`.
 
 ## Legacy task-map scenarios
 
@@ -224,11 +318,16 @@ The worker receives `RTSCORTEX_RUNTIME_SOCKET`, `RTSCORTEX_RUN_ID`,
 bridge also receives `RTSCORTEX_SOCKET` as its socket variable and
 `RTSCORTEX_ACTION_EFFECT_TIMEOUT_GAME_LOOPS` from the typed environment configuration.
 Worker stdout and stderr, the config snapshot, SQLite state, and the JSONL event journal
-are stored in the run's artifact directory.
+are stored in the run's artifact directory. At run shutdown, RTSCortex also derives
+`timeline.md` and `summary.json` whenever the journal contains events. The JSON summary
+contains per-episode metrics, classification conservation, dispatched-command terminal
+coverage, and hard acceptance gate results. A report-generation warning never replaces the
+worker's original success or failure status.
 
 Every live run passes `--save_replay=false` to PySC2 and does not create
-`.SC2Replay` files. Use `rtscortex report <run-dir>` to turn the JSONL journal into a
-readable `timeline.md` until replay capture is deliberately enabled in a later version.
+`.SC2Replay` files. Use `rtscortex report <run-dir>` to regenerate the readable
+`timeline.md` and machine-readable `summary.json` until replay capture is deliberately
+enabled in a later version.
 
 ## Failure behavior
 

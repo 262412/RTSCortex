@@ -1,5 +1,5 @@
 {
-  "protocol_version": "1.0",
+  "protocol_version": "1.1",
   "run_id": "run-fixture",
   "episode_id": "episode-pvz-task1",
   "step_id": 7,
@@ -33,7 +33,7 @@
       "command_id": "command-adept-attack",
       "actor": "CombatGroup7/Adept-1",
       "name": "Attack_Unit",
-      "arguments": [4300734465],
+      "arguments": [4316463105],
       "priority": 70,
       "ttl_game_loops": 8,
       "created_game_loop": 224,

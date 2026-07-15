@@ -8,6 +8,7 @@ from rtscortex.agents.context import (
     ContextBudget,
     build_planning_context,
     build_reflection_context,
+    compact_execution_payload,
     compact_memory_events,
     compact_spatial_context,
     model_observation,
@@ -57,11 +58,8 @@ def _compact_event(event: StoredEvent) -> dict[str, Any] | None:
     if event.event_type == "execution":
         return {
             "event_type": event.event_type,
+            **compact_execution_payload(event.payload),
             "step_id": event.step_id,
-            "command_id": event.payload.get("command_id"),
-            "success": event.payload.get("success"),
-            "failure_reason": event.payload.get("failure_reason"),
-            "pysc2_function": event.payload.get("pysc2_function"),
         }
     if event.event_type in {"planner_error", "planner_timeout", "module_error"}:
         return {
@@ -88,11 +86,18 @@ PLANNING_SYSTEM_PROMPT = (
     "at most two short steps and three typed actions, with one action per actor and no "
     "raw PySC2 calls. arguments is a positional JSON array in argument_names order; a "
     "position uses two integer coordinates in a nested array such as [[80,80]]. Use "
-    "coordinates only from observation.spatial_context for that exact action. A Build_ "
+    "only a complete argument list from that action and actor's argument_candidates. "
+    "Never emit No_Operation; return an empty proposed_actions list when no legal action "
+    "exists. An Attack_Unit target must be an enemy tag from argument_candidates. A Build_ "
     "action already moves its worker into range and performs placement. Never pair "
     "Move_Screen or Move_Minimap with a Build_ action for the same actor; emit only the "
-    "Build_ action. Do not repeat a successfully "
-    "executed action or an active_plan command that remains valid. In a Protoss opening "
+    "Build_ action. Do not move the Builder merely to wait for minerals: keep it near the "
+    "current base and return no Builder action until the next opening build is legal. Use "
+    "Move_Minimap for the Builder only when the opening Pylon and Gateway are complete and "
+    "an expansion must be scouted; prefer an unseen resource-cluster candidate and keep that "
+    "move as the actor's only proposal. Do not repeat a successfully "
+    "executed action or any active_plan command whose status is pending, deferred, or "
+    "dispatched. In a Protoss opening "
     "without enemies, prioritize legal economy and production: Pylon, then Gateway. Emit "
     "Build_Pylon_Screen only when supply_free <= 4 and no Pylon in own_structures has "
     "status='constructing'; otherwise do not propose it. After a completed Gateway exists, "
@@ -104,7 +109,7 @@ PLANNING_SYSTEM_PROMPT = (
 
 def _planner_preconditions(name: str, arguments: list[Any]) -> dict[str, Any]:
     if name == "Attack_Unit" and arguments:
-        return {"unit_exists": str(arguments[0])}
+        return {"enemy_target_exists": str(arguments[0])}
     if name == "Build_Pylon_Screen":
         return {
             "max_supply_free": 4,
@@ -113,6 +118,15 @@ def _planner_preconditions(name: str, arguments: list[Any]) -> dict[str, Any]:
     if name == "Build_Gateway_Screen":
         return {"structure_absent": "Gateway"}
     return {}
+
+
+def _has_observation_bound_position(arguments: list[Any]) -> bool:
+    return any(
+        isinstance(argument, list)
+        and len(argument) == 2
+        and all(isinstance(value, int) and not isinstance(value, bool) for value in argument)
+        for argument in arguments
+    )
 
 
 class MemoryModule:
@@ -209,7 +223,7 @@ class PlanningModule:
         prompt_context = build_planning_context(
             observation=planning_observation,
             memory=context.memory,
-            last_decision=context.last_decision,
+            active_plan=context.active_plan,
             last_execution=context.last_execution,
             budget=self.context_budget,
             system_prompt=PLANNING_SYSTEM_PROMPT,
@@ -233,29 +247,50 @@ class PlanningModule:
 class ActionModule:
     name = "action"
 
-    def __init__(self, max_actions: int) -> None:
+    def __init__(self, max_actions: int, planner_command_ttl_game_loops: int = 16) -> None:
         self.max_actions = max_actions
+        self.planner_command_ttl_game_loops = planner_command_ttl_game_loops
 
     async def run(self, context: AgentContext) -> ModuleResult:
         raw_plan: dict[str, Any] = context.memory.get("plan", {})
         plan = PlanningOutput.model_validate(raw_plan)
-        commands = [
-            ActionCommand(
-                command_id=(
-                    f"{context.observation.run_id}:{context.observation.episode_id}:"
-                    f"{context.observation.step_id}:planner:{index}"
-                ),
-                actor=proposal.actor,
-                name=proposal.name,
-                arguments=proposal.arguments,
-                priority=proposal.priority,
-                ttl_game_loops=proposal.ttl_game_loops,
-                created_game_loop=context.observation.game_loop,
-                source=ActionSource.PLANNER,
-                preconditions=_planner_preconditions(proposal.name, proposal.arguments),
+        commands: list[ActionCommand] = []
+        position_actors = {
+            proposal.actor
+            for proposal in plan.proposed_actions
+            if _has_observation_bound_position(proposal.arguments)
+        }
+        selected_position_actors: set[str] = set()
+        selected_proposals = []
+        for index, proposal in enumerate(plan.proposed_actions):
+            if proposal.actor in position_actors:
+                if (
+                    proposal.actor in selected_position_actors
+                    or not _has_observation_bound_position(proposal.arguments)
+                ):
+                    continue
+                selected_position_actors.add(proposal.actor)
+            selected_proposals.append((index, proposal))
+            if len(selected_proposals) >= self.max_actions:
+                break
+
+        for index, proposal in selected_proposals:
+            commands.append(
+                ActionCommand(
+                    command_id=(
+                        f"{context.observation.run_id}:{context.observation.episode_id}:"
+                        f"{context.observation.step_id}:planner:{index}"
+                    ),
+                    actor=proposal.actor,
+                    name=proposal.name,
+                    arguments=proposal.arguments,
+                    priority=proposal.priority,
+                    ttl_game_loops=self.planner_command_ttl_game_loops,
+                    created_game_loop=context.observation.game_loop,
+                    source=ActionSource.PLANNER,
+                    preconditions=_planner_preconditions(proposal.name, proposal.arguments),
+                )
             )
-            for index, proposal in enumerate(plan.proposed_actions[: self.max_actions])
-        ]
         return ModuleResult(
             module=self.name,
             updates={

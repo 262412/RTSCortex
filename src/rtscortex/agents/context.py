@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from rtscortex.contracts import ActionBatch, ExecutionReport, ObservationEnvelope
+from rtscortex.contracts.interfaces import ActivePlanSnapshot
 
 
 class ContextBudgetExceeded(ValueError):
@@ -123,11 +124,73 @@ def compact_memory_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return result
 
 
+def compact_execution_payload(
+    execution: ExecutionReport | dict[str, Any],
+) -> dict[str, Any]:
+    """Retain actionable execution provenance without primitive-level prompt bulk."""
+
+    raw = execution.model_dump(mode="json") if isinstance(execution, ExecutionReport) else execution
+    payload: dict[str, Any] = {}
+    for key in (
+        "protocol_version",
+        "step_id",
+        "command_id",
+        "success",
+        "action_name",
+        "actor",
+        "source",
+        "status",
+        "execution_stage",
+        "failure_code",
+        "pysc2_function",
+    ):
+        if key in raw:
+            payload[key] = _bounded_json_value(raw[key])
+
+    if "failure_reason" in raw:
+        reason = raw["failure_reason"]
+        payload["failure_reason"] = None if reason is None else _bounded_text(str(reason), 240)
+    for key in ("requested_arguments", "resolved_arguments"):
+        if key in raw:
+            payload[key] = _bounded_json_value(raw[key])
+
+    raw_evidence = raw.get("effect_evidence")
+    if raw_evidence is not None:
+        if hasattr(raw_evidence, "model_dump"):
+            raw_evidence = raw_evidence.model_dump(mode="json")
+        if isinstance(raw_evidence, dict):
+            evidence: dict[str, Any] = {}
+            for key in (
+                "target_type",
+                "target_position",
+                "target_tag",
+                "builder_tag",
+                "new_structure_tag",
+                "dispatch_game_loop",
+                "accepted_game_loop",
+                "confirmed_game_loop",
+                "worker_orders",
+                "order_seen",
+                "order_last_seen_game_loop",
+                "post_order_grace_game_loops",
+                "mineral_delta",
+                "resource_delta",
+                "elapsed_game_loops",
+                "base_timeout_game_loops",
+                "effective_timeout_game_loops",
+                "active_order_extension",
+            ):
+                if key in raw_evidence:
+                    evidence[key] = _bounded_json_value(raw_evidence[key])
+            payload["effect_evidence"] = evidence
+    return payload
+
+
 def build_planning_context(
     *,
     observation: ObservationEnvelope,
     memory: dict[str, Any],
-    last_decision: ActionBatch | None,
+    active_plan: ActivePlanSnapshot | None,
     last_execution: ExecutionReport | None,
     budget: ContextBudget,
     system_prompt: str,
@@ -136,8 +199,8 @@ def build_planning_context(
         "observation": _raw_model_observation(observation),
         "memory": memory,
     }
-    if last_decision is not None:
-        raw_payload["active_plan"] = last_decision.model_dump(mode="json")
+    if active_plan is not None:
+        raw_payload["active_plan"] = _compact_active_plan(active_plan)
     if last_execution is not None:
         raw_payload["last_execution"] = last_execution.model_dump(mode="json")
 
@@ -168,8 +231,8 @@ def build_planning_context(
         "observation": projected_observation,
         "memory": compact_memory,
     }
-    if last_decision is not None:
-        payload["active_plan"] = _compact_decision(last_decision, include_rejections=False)
+    if active_plan is not None:
+        payload["active_plan"] = _compact_active_plan(active_plan)
     if last_execution is not None:
         payload["last_execution"] = _compact_execution(last_execution)
     statistics: dict[str, int | bool] = {
@@ -398,6 +461,7 @@ def _compact_decision(decision: ActionBatch, *, include_rejections: bool) -> dic
         "summary": _bounded_text(decision.summary, 500),
         "commands": [
             {
+                "command_id": command.command_id,
                 "actor": command.actor,
                 "name": command.name,
                 "arguments": command.arguments,
@@ -416,21 +480,36 @@ def _compact_decision(decision: ActionBatch, *, include_rejections: bool) -> dic
     return payload
 
 
-def _compact_execution(execution: ExecutionReport) -> dict[str, Any]:
+def _compact_active_plan(active_plan: ActivePlanSnapshot) -> dict[str, Any]:
     return {
-        "step_id": execution.step_id,
-        "command_id": execution.command_id,
-        "success": execution.success,
-        "failure_reason": (
-            None
-            if execution.failure_reason is None
-            else _bounded_text(execution.failure_reason, 240)
-        ),
-        "pysc2_function": execution.pysc2_function,
+        "strategic_goal": _bounded_text(active_plan.strategic_goal, 240),
+        "summary": _bounded_text(active_plan.summary, 500),
+        "commands": [
+            {
+                "command_id": command.command_id,
+                "actor": command.actor,
+                "name": command.name,
+                "arguments": list(command.arguments),
+                "source": command.source,
+                "status": command.status,
+                "reason": (None if command.reason is None else _bounded_text(command.reason, 180)),
+                "created_game_loop": command.created_game_loop,
+                "ttl_game_loops": command.ttl_game_loops,
+                "expires_at_game_loop": command.expires_at_game_loop,
+            }
+            for command in active_plan.commands
+        ],
     }
 
 
+def _compact_execution(execution: ExecutionReport) -> dict[str, Any]:
+    return compact_execution_payload(execution)
+
+
 def _bounded_event(event: dict[str, Any]) -> dict[str, Any]:
+    if event.get("event_type") == "execution":
+        return {"event_type": "execution", **compact_execution_payload(event)}
+
     bounded: dict[str, Any] = {}
     for key in (
         "event_type",
@@ -452,6 +531,21 @@ def _bounded_event(event: dict[str, Any]) -> dict[str, Any]:
         value = event[key]
         bounded[key] = _bounded_text(value, 300) if isinstance(value, str) else value
     return bounded
+
+
+def _bounded_json_value(value: Any, *, depth: int = 0) -> Any:
+    if isinstance(value, str):
+        return _bounded_text(value, 160)
+    if depth >= 3:
+        return _bounded_text(str(value), 160)
+    if isinstance(value, (list, tuple)):
+        return [_bounded_json_value(item, depth=depth + 1) for item in value[:8]]
+    if isinstance(value, dict):
+        return {
+            _bounded_text(str(key), 80): _bounded_json_value(item, depth=depth + 1)
+            for key, item in list(value.items())[:8]
+        }
+    return value
 
 
 def _bounded_text(value: str, limit: int) -> str:

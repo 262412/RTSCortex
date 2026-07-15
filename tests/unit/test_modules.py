@@ -17,17 +17,26 @@ from rtscortex.agents import (
     PlanningOutput,
     ReflectionModule,
 )
+from rtscortex.agents.context import compact_execution_payload
 from rtscortex.agents.models import (
     ActionProposal,
     ReflectionOutput,
     planning_output_model,
+    project_planning_observation,
 )
 from rtscortex.contracts import (
     ActionArgumentType,
     ActionBatch,
+    ActionSource,
+    ActivePlanSnapshot,
     AvailableAction,
+    CommandLifecycleSnapshot,
     EconomyState,
+    EffectEvidence,
     ExecutionReport,
+    ExecutionStage,
+    ExecutionStatus,
+    IdleReason,
     ProductionItem,
     UnitState,
 )
@@ -78,6 +87,60 @@ class CapturingProvider:
         return response_type.model_validate(output.model_dump())
 
 
+def _failed_build_execution() -> ExecutionReport:
+    return ExecutionReport(
+        run_id="run-1",
+        episode_id="episode-1",
+        step_id=8,
+        command_id="command-build-gateway",
+        success=False,
+        action_name="Build_Gateway_Screen",
+        actor="Builder/Builder-Probe-1",
+        source=ActionSource.PLANNER,
+        requested_arguments=[[60, 40]],
+        resolved_arguments=[[62, 40]],
+        status=ExecutionStatus.FAILED,
+        execution_stage=ExecutionStage.EFFECT_VERIFICATION,
+        failure_code="worker_order_replaced",
+        failure_reason="the expected build order was replaced before completion",
+        pysc2_function="Build_Gateway_screen",
+        effect_evidence=EffectEvidence(
+            target_type="Gateway",
+            target_position=(62.0, 40.0),
+            builder_tag="0x101",
+            baseline_structure_tags=[f"gateway-{index}" for index in range(20)],
+            dispatch_game_loop=900,
+            accepted_game_loop=904,
+            worker_orders=["37", "Move_screen"],
+            order_seen=True,
+            elapsed_game_loops=112,
+            base_timeout_game_loops=112,
+            effective_timeout_game_loops=448,
+            active_order_extension=True,
+        ),
+    )
+
+
+def test_compact_execution_payload_preserves_legacy_v1_fields() -> None:
+    assert compact_execution_payload(
+        {
+            "protocol_version": "1.0",
+            "step_id": 3,
+            "command_id": "legacy-command",
+            "success": False,
+            "failure_reason": "legacy translator failure",
+            "pysc2_function": "Build_Gateway_screen",
+        }
+    ) == {
+        "protocol_version": "1.0",
+        "step_id": 3,
+        "command_id": "legacy-command",
+        "success": False,
+        "pysc2_function": "Build_Gateway_screen",
+        "failure_reason": "legacy translator failure",
+    }
+
+
 def test_model_modules_omit_verbose_text_observation() -> None:
     observation = make_observation().model_copy(
         update={"text_observation": "raw-observation-marker " * 1000}
@@ -96,6 +159,7 @@ def test_model_modules_omit_verbose_text_observation() -> None:
         episode_id=observation.episode_id,
         step_id=0,
         decision_id="decision-0",
+        idle_reason=IdleReason.NO_LEGAL_ACTION,
     )
     asyncio.run(
         ReflectionModule(provider).run(
@@ -114,6 +178,8 @@ def test_planning_prompt_requires_exact_direct_actions() -> None:
     assert "exact, complete action name" in provider.system_prompt
     assert "integer coordinates" in provider.system_prompt
     assert "Never pair Move_Screen or Move_Minimap with a Build_ action" in (provider.system_prompt)
+    assert "Do not move the Builder merely to wait for minerals" in provider.system_prompt
+    assert "opening Pylon and Gateway are complete" in provider.system_prompt
     assert "supply_free <= 4" in provider.system_prompt
     assert "status='constructing'" in provider.system_prompt
     assert "After a completed Gateway exists" in provider.system_prompt
@@ -132,6 +198,7 @@ def test_reflection_prompt_requires_execution_evidence() -> None:
         episode_id=observation.episode_id,
         step_id=0,
         decision_id="decision-0",
+        idle_reason=IdleReason.NO_LEGAL_ACTION,
     )
 
     asyncio.run(
@@ -142,6 +209,77 @@ def test_reflection_prompt_requires_execution_evidence() -> None:
 
     assert "matching execution" in provider.system_prompt
     assert "no_op never proves a plan action ran" in provider.system_prompt
+
+
+def test_failed_execution_provenance_reaches_reflection_and_planning_prompts() -> None:
+    observation = make_observation()
+    execution = _failed_build_execution()
+    decision = ActionBatch(
+        run_id=observation.run_id,
+        episode_id=observation.episode_id,
+        step_id=8,
+        decision_id="decision-8",
+        idle_reason=IdleReason.PLAN_EXHAUSTED,
+    )
+    expected = {
+        "action_name": "Build_Gateway_Screen",
+        "actor": "Builder/Builder-Probe-1",
+        "status": "failed",
+        "execution_stage": "effect_verification",
+        "failure_code": "worker_order_replaced",
+        "requested_arguments": [[60, 40]],
+        "resolved_arguments": [[62, 40]],
+    }
+
+    reflection_provider = CapturingProvider()
+    asyncio.run(
+        ReflectionModule(reflection_provider).run(
+            AgentContext(
+                observation=observation,
+                last_decision=decision,
+                last_execution=execution,
+            )
+        )
+    )
+    planning_provider = CapturingProvider()
+    asyncio.run(
+        PlanningModule(planning_provider).run(
+            AgentContext(
+                observation=observation,
+                last_decision=decision,
+                last_execution=execution,
+            )
+        )
+    )
+
+    for provider in (reflection_provider, planning_provider):
+        projected = json.loads(provider.user_prompt)["last_execution"]
+        assert {key: projected[key] for key in expected} == expected
+        assert projected["success"] is False
+        assert projected["failure_reason"].startswith("the expected build order")
+        assert projected["pysc2_function"] == "Build_Gateway_screen"
+        assert projected["effect_evidence"] == {
+            "target_type": "Gateway",
+            "target_position": [62.0, 40.0],
+            "target_tag": None,
+            "builder_tag": "0x101",
+            "new_structure_tag": None,
+            "dispatch_game_loop": 900,
+            "accepted_game_loop": 904,
+            "confirmed_game_loop": None,
+            "worker_orders": ["37", "Move_screen"],
+            "order_seen": True,
+            "order_last_seen_game_loop": None,
+            "post_order_grace_game_loops": None,
+            "mineral_delta": None,
+            "resource_delta": {},
+            "elapsed_game_loops": 112,
+            "base_timeout_game_loops": 112,
+            "effective_timeout_game_loops": 448,
+            "active_order_extension": True,
+        }
+        assert "primitive_trace" not in projected
+        assert "baseline_structure_tags" not in projected["effect_evidence"]
 
 
 def test_planner_keeps_only_compact_spatial_lines_from_upstream_text() -> None:
@@ -162,6 +300,7 @@ def test_planner_keeps_only_compact_spatial_lines_from_upstream_text() -> None:
                     argument_names=["screen"],
                     argument_types=[ActionArgumentType.POSITION],
                     actor_scopes=["Builder/Builder-Probe-1"],
+                    argument_candidates=[[[48, 56]], [[80, 72]]],
                 ),
             ],
             "text_observation": "\n".join(
@@ -250,7 +389,6 @@ def test_planner_projects_completed_gateway_opening_to_first_zealot() -> None:
     prompt = json.loads(provider.user_prompt)
     assert [action["name"] for action in prompt["observation"]["available_actions"]] == [
         "Train_Zealot",
-        "No_Operation",
     ]
     assert "spatial_context" not in prompt["observation"]
     assert provider.response_type is not None
@@ -290,6 +428,7 @@ def test_planner_exposes_pylon_only_at_tight_supply_without_pending_pylon() -> N
         argument_names=["screen"],
         argument_types=[ActionArgumentType.POSITION],
         actor_scopes=["Builder/Builder-Probe-1"],
+        argument_candidates=[[[60, 40]]],
     )
     observation = observation.model_copy(
         update={"available_actions": [pylon, AvailableAction(name="No_Operation")]}
@@ -300,7 +439,7 @@ def test_planner_exposes_pylon_only_at_tight_supply_without_pending_pylon() -> N
     high_supply_prompt = json.loads(high_supply_provider.user_prompt)
     assert [
         action["name"] for action in high_supply_prompt["observation"]["available_actions"]
-    ] == ["No_Operation"]
+    ] == []
 
     tight_state = observation.state.model_copy(
         update={
@@ -320,7 +459,7 @@ def test_planner_exposes_pylon_only_at_tight_supply_without_pending_pylon() -> N
     tight_supply_prompt = json.loads(tight_supply_provider.user_prompt)
     assert [
         action["name"] for action in tight_supply_prompt["observation"]["available_actions"]
-    ] == ["Build_Pylon_Screen", "No_Operation"]
+    ] == ["Build_Pylon_Screen"]
 
     pending_state = tight_state.model_copy(
         update={
@@ -341,9 +480,7 @@ def test_planner_exposes_pylon_only_at_tight_supply_without_pending_pylon() -> N
         )
     )
     pending_prompt = json.loads(pending_provider.user_prompt)
-    assert [action["name"] for action in pending_prompt["observation"]["available_actions"]] == [
-        "No_Operation"
-    ]
+    assert [action["name"] for action in pending_prompt["observation"]["available_actions"]] == []
 
 
 def test_planner_exposes_stalker_only_with_completed_core_and_gas() -> None:
@@ -371,7 +508,7 @@ def test_planner_exposes_stalker_only_with_completed_core_and_gas() -> None:
     missing_core_prompt = json.loads(missing_core_provider.user_prompt)
     assert [
         action["name"] for action in missing_core_prompt["observation"]["available_actions"]
-    ] == ["No_Operation"]
+    ] == []
 
     completed_core = UnitState(
         unit_id="core-1",
@@ -387,7 +524,6 @@ def test_planner_exposes_stalker_only_with_completed_core_and_gas() -> None:
     ready_prompt = json.loads(ready_provider.user_prompt)
     assert [action["name"] for action in ready_prompt["observation"]["available_actions"]] == [
         "Train_Stalker",
-        "No_Operation",
     ]
 
     low_gas_state = ready_observation.state.model_copy(
@@ -400,9 +536,7 @@ def test_planner_exposes_stalker_only_with_completed_core_and_gas() -> None:
         )
     )
     low_gas_prompt = json.loads(low_gas_provider.user_prompt)
-    assert [action["name"] for action in low_gas_prompt["observation"]["available_actions"]] == [
-        "No_Operation"
-    ]
+    assert [action["name"] for action in low_gas_prompt["observation"]["available_actions"]] == []
 
 
 def test_memory_module_keeps_only_compact_decision_and_execution_events(
@@ -417,6 +551,7 @@ def test_memory_module_keeps_only_compact_decision_and_execution_events(
         decision_id="decision-0",
         strategic_goal="Hold",
         summary="Wait",
+        idle_reason=IdleReason.PLAN_EXHAUSTED,
     )
     store.append_event(
         run_id=observation.run_id,
@@ -444,14 +579,7 @@ def test_memory_module_keeps_only_compact_decision_and_execution_events(
         episode_id=observation.episode_id,
         step_id=0,
         event_type="execution",
-        payload=ExecutionReport(
-            run_id=observation.run_id,
-            episode_id=observation.episode_id,
-            step_id=0,
-            command_id="command-0",
-            success=True,
-            pysc2_function="no_op",
-        ),
+        payload=_failed_build_execution().model_copy(update={"step_id": 0}),
     )
     module = MemoryModule(store, short_term_window=20)
 
@@ -462,6 +590,17 @@ def test_memory_module_keeps_only_compact_decision_and_execution_events(
         "decision",
         "execution",
     ]
+    execution_event = result.updates["recent_events"][1]
+    assert execution_event["action_name"] == "Build_Gateway_Screen"
+    assert execution_event["actor"] == "Builder/Builder-Probe-1"
+    assert execution_event["status"] == "failed"
+    assert execution_event["execution_stage"] == "effect_verification"
+    assert execution_event["failure_code"] == "worker_order_replaced"
+    assert execution_event["requested_arguments"] == [[60, 40]]
+    assert execution_event["resolved_arguments"] == [[62, 40]]
+    assert execution_event["effect_evidence"]["target_type"] == "Gateway"
+    assert execution_event["effect_evidence"]["accepted_game_loop"] == 904
+    assert execution_event["effect_evidence"]["worker_orders"] == ["37", "Move_screen"]
     assert "large" not in json.dumps(result.updates)
 
 
@@ -494,13 +633,22 @@ def test_memory_module_preserves_recent_planner_errors(tmp_path: Path) -> None:
 
 def test_planning_context_is_structurally_compacted_to_budget() -> None:
     observation = make_observation(include_enemy=False)
-    decision = ActionBatch(
-        run_id=observation.run_id,
-        episode_id=observation.episode_id,
-        step_id=19,
-        decision_id="decision-19",
+    active_plan = ActivePlanSnapshot(
         strategic_goal="Build production",
         summary="Pylon then Gateway",
+        commands=(
+            CommandLifecycleSnapshot(
+                command_id="command-pylon",
+                actor="Builder/Builder-Probe-1",
+                name="Build_Pylon_Screen",
+                arguments=([48, 56],),
+                source="planner",
+                status="dispatched",
+                reason=None,
+                created_game_loop=80,
+                ttl_game_loops=112,
+            ),
+        ),
     )
     repeated_events = [
         {
@@ -528,7 +676,7 @@ def test_planning_context_is_structurally_compacted_to_budget() -> None:
         module.run(
             AgentContext(
                 observation=observation,
-                last_decision=decision,
+                active_plan=active_plan,
                 memory={
                     "recent_events": repeated_events,
                     "reflection": "The opening remains legal.",
@@ -551,11 +699,22 @@ def test_planning_context_is_structurally_compacted_to_budget() -> None:
     assert prompt["context_compaction"]["final_chars"] == (
         len(provider.system_prompt) + len(provider.user_prompt)
     )
-    assert (
-        prompt["observation"]["available_actions"]
-        == observation.model_dump(mode="json")["available_actions"]
-    )
+    assert [action["name"] for action in prompt["observation"]["available_actions"]] == ["Retreat"]
     assert prompt["active_plan"]["strategic_goal"] == "Build production"
+    assert prompt["active_plan"]["commands"] == [
+        {
+            "command_id": "command-pylon",
+            "actor": "Builder/Builder-Probe-1",
+            "name": "Build_Pylon_Screen",
+            "arguments": [[48, 56]],
+            "source": "planner",
+            "status": "dispatched",
+            "reason": None,
+            "created_game_loop": 80,
+            "ttl_game_loops": 112,
+            "expires_at_game_loop": 192,
+        }
+    ]
     assert prompt["memory"]["reflection"] == "The opening remains legal."
     assert [lesson["content"] for lesson in prompt["memory"]["lessons"]] == [
         "Build supply before cap.",
@@ -582,15 +741,16 @@ def test_reflection_context_obeys_budget_without_truncating_json() -> None:
         decision_id="decision-1",
         strategic_goal="Hold",
         summary="long-summary " * 500,
+        idle_reason=IdleReason.PLAN_EXHAUSTED,
         rejected_commands=[f"rejected-{index}-" + "x" * 200 for index in range(20)],
     )
     provider = CapturingProvider()
-    module = ReflectionModule(provider, ContextBudget(max_prompt_chars=2_500))
+    module = ReflectionModule(provider, ContextBudget(max_prompt_chars=2_700))
 
     asyncio.run(module.run(AgentContext(observation=observation, last_decision=decision)))
 
     prompt = json.loads(provider.user_prompt)
-    assert len(provider.system_prompt) + len(provider.user_prompt) <= 2_500
+    assert len(provider.system_prompt) + len(provider.user_prompt) <= 2_700
     assert prompt["context_compaction"]["final_chars"] == (
         len(provider.system_prompt) + len(provider.user_prompt)
     )
@@ -734,6 +894,7 @@ def test_planning_output_model_restricts_names_and_multiple_available_actors() -
                         "Builder/Builder-Probe-1",
                         "Builder/Builder-Probe-2",
                     ],
+                    argument_candidates=[[[60, 40]]],
                 )
             ],
         }
@@ -783,6 +944,7 @@ def test_planning_output_model_binds_each_action_to_its_actor_and_arguments() ->
                     argument_names=["screen"],
                     argument_types=[ActionArgumentType.POSITION],
                     actor_scopes=["Builder/Builder-Probe-1"],
+                    argument_candidates=[[[60, 40]]],
                 ),
                 AvailableAction(
                     name="Train_Zealot",
@@ -794,7 +956,7 @@ def test_planning_output_model_binds_each_action_to_its_actor_and_arguments() ->
     output_type = planning_output_model(observation)
     base_payload = {"strategic_goal": "Continue the opening", "steps": []}
 
-    for proposal in (
+    valid_proposals: list[dict[str, Any]] = [
         {
             "actor": "Builder/Builder-Probe-1",
             "name": "Build_Pylon_Screen",
@@ -805,10 +967,11 @@ def test_planning_output_model_binds_each_action_to_its_actor_and_arguments() ->
             "name": "Train_Zealot",
             "arguments": [],
         },
-    ):
-        output_type.model_validate({**base_payload, "proposed_actions": [proposal]})
+    ]
+    for valid_proposal in valid_proposals:
+        output_type.model_validate({**base_payload, "proposed_actions": [valid_proposal]})
 
-    for proposal in (
+    invalid_proposals: list[dict[str, Any]] = [
         {
             "actor": "Builder/Builder-Probe-1",
             "name": "Train_Zealot",
@@ -838,9 +1001,10 @@ def test_planning_output_model_binds_each_action_to_its_actor_and_arguments() ->
             "actor": "Developer/Empty",
             "name": "Train_Zealot",
         },
-    ):
+    ]
+    for invalid_proposal in invalid_proposals:
         with pytest.raises(ValidationError):
-            output_type.model_validate({**base_payload, "proposed_actions": [proposal]})
+            output_type.model_validate({**base_payload, "proposed_actions": [invalid_proposal]})
 
 
 def test_planning_output_model_uses_strict_declared_argument_types() -> None:
@@ -865,11 +1029,12 @@ def test_planning_output_model_uses_strict_declared_argument_types() -> None:
             ActionArgumentType.ANY,
         ],
         actor_scopes=["Typed/Actor"],
+        argument_candidates=[["value", 2, 0.5, True, [60, 40], "0x10", "free"]],
     )
     observation = make_observation().model_copy(update={"available_actions": [action]})
     output_type = planning_output_model(observation)
     valid_arguments: list[Any] = ["value", 2, 0.5, True, [60, 40], "0x10", "free"]
-    payload = {
+    payload: dict[str, Any] = {
         "strategic_goal": "Exercise the action schema",
         "steps": [],
         "proposed_actions": [
@@ -882,15 +1047,6 @@ def test_planning_output_model_uses_strict_declared_argument_types() -> None:
     }
 
     output_type.model_validate(payload)
-    output_type.model_validate(
-        {
-            **payload,
-            "proposed_actions": [
-                {**payload["proposed_actions"][0], "arguments": [*valid_arguments[:5], 16, "free"]}
-            ],
-        }
-    )
-
     for index, invalid_value in enumerate((1, "2", "0.5", 1, ["60", 40], 0.5)):
         invalid_arguments = valid_arguments.copy()
         invalid_arguments[index] = invalid_value
@@ -948,6 +1104,86 @@ def test_planning_output_model_disallows_proposals_without_available_actions() -
         )
 
 
+def test_planning_projection_removes_noop_and_attack_without_visible_enemies() -> None:
+    observation = make_observation(include_enemy=False)
+
+    projected = project_planning_observation(observation)
+
+    assert [action.name for action in projected.available_actions] == ["Retreat"]
+
+
+def test_planning_output_model_binds_candidates_to_their_actor_scope() -> None:
+    base = make_observation()
+    observation = base.model_copy(
+        update={
+            "state": base.state.model_copy(
+                update={
+                    "visible_enemies": [
+                        UnitState(unit_id="0x1", unit_type="Zergling", alliance="enemy"),
+                        UnitState(unit_id="0x2", unit_type="Roach", alliance="enemy"),
+                    ]
+                }
+            ),
+            "available_actions": [
+                AvailableAction(
+                    name="Attack_Unit",
+                    argument_names=["target"],
+                    argument_types=[ActionArgumentType.TAG],
+                    actor_scopes=["CombatGroup0/Zealot-1"],
+                    argument_candidates=[["0x1"]],
+                ),
+                AvailableAction(
+                    name="Attack_Unit",
+                    argument_names=["target"],
+                    argument_types=[ActionArgumentType.TAG],
+                    actor_scopes=["CombatGroup1/Stalker-1"],
+                    argument_candidates=[["0x2"]],
+                ),
+            ],
+        }
+    )
+    output_type = planning_output_model(observation)
+    payload = {"strategic_goal": "Defend", "steps": []}
+
+    output_type.model_validate(
+        {
+            **payload,
+            "proposed_actions": [
+                {
+                    "actor": "CombatGroup1/Stalker-1",
+                    "name": "Attack_Unit",
+                    "arguments": ["0x2"],
+                }
+            ],
+        }
+    )
+    with pytest.raises(ValidationError):
+        output_type.model_validate(
+            {
+                **payload,
+                "proposed_actions": [
+                    {
+                        "actor": "CombatGroup0/Zealot-1",
+                        "name": "Attack_Unit",
+                        "arguments": ["0x2"],
+                    }
+                ],
+            }
+        )
+
+
+def test_action_proposal_does_not_accept_planner_controlled_ttl() -> None:
+    with pytest.raises(ValidationError):
+        ActionProposal.model_validate(
+            {
+                "actor": "army",
+                "name": "Attack_Unit",
+                "arguments": ["0x1"],
+                "ttl_game_loops": 1,
+            }
+        )
+
+
 def test_action_module_requires_attack_target_to_still_exist() -> None:
     plan = PlanningOutput(
         strategic_goal="Attack",
@@ -955,7 +1191,7 @@ def test_action_module_requires_attack_target_to_still_exist() -> None:
             ActionProposal(
                 actor="army",
                 name="Attack_Unit",
-                arguments=["enemy-1"],
+                arguments=["0x1"],
             )
         ],
     )
@@ -969,7 +1205,7 @@ def test_action_module_requires_attack_target_to_still_exist() -> None:
         )
     )
 
-    assert result.commands[0].preconditions == {"unit_exists": "enemy-1"}
+    assert result.commands[0].preconditions == {"enemy_target_exists": "0x1"}
 
 
 def test_action_module_guards_planner_pylon_by_supply_and_pending_construction() -> None:
@@ -1045,3 +1281,29 @@ def test_action_module_preserves_candidates_when_actor_is_duplicated() -> None:
         "Train_Zealot",
         "Research_WarpGate",
     ]
+
+
+def test_action_module_keeps_one_observation_bound_position_per_actor() -> None:
+    actor = "Builder/Builder-Probe-1"
+    plan = PlanningOutput(
+        strategic_goal="Establish the opening",
+        proposed_actions=[
+            ActionProposal(actor=actor, name="Hold_Position"),
+            ActionProposal(actor=actor, name="Build_Pylon_Screen", arguments=[[60, 35]]),
+            ActionProposal(actor=actor, name="Build_Pylon_Screen", arguments=[[95, 75]]),
+        ],
+    )
+
+    result = asyncio.run(
+        ActionModule(max_actions=3).run(
+            AgentContext(
+                observation=make_observation(),
+                memory={"plan": plan.model_dump(mode="json")},
+            )
+        )
+    )
+
+    assert len(result.commands) == 1
+    assert result.commands[0].name == "Build_Pylon_Screen"
+    assert result.commands[0].arguments == [[60, 35]]
+    assert result.commands[0].command_id.endswith(":planner:1")

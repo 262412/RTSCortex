@@ -9,6 +9,7 @@ environment:
 runtime:
   deterministic: true
   planning_interval_game_loops: 16
+  planner_command_ttl_game_loops: 16
   planner_timeout_seconds: 15.0
   max_actions: 5
 agent:

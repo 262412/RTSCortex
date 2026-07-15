@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import json
 import os
 import signal
 import subprocess
@@ -165,6 +166,36 @@ def prepare_live_worker(
             "the LLM-PySC2 build-coordinate patch is not applied; see "
             "integrations/llm_pysc2/patches/README.md"
         )
+    if not translation_result_patch_is_applied(project_root):
+        errors.append(
+            "the LLM-PySC2 translation-result patch is not applied; see "
+            "integrations/llm_pysc2/patches/README.md"
+        )
+    if not near_placement_patch_is_applied(project_root):
+        errors.append(
+            "the LLM-PySC2 near-placement patch is not applied; see "
+            "integrations/llm_pysc2/patches/README.md"
+        )
+    if not pretranslation_abort_patch_is_applied(project_root):
+        errors.append(
+            "the LLM-PySC2 pre-translation abort patch is not applied; see "
+            "integrations/llm_pysc2/patches/README.md"
+        )
+    if not transient_unit_grace_patch_is_applied(project_root):
+        errors.append(
+            "the LLM-PySC2 transient-unit grace patch is not applied; see "
+            "integrations/llm_pysc2/patches/README.md"
+        )
+    if not nexus_resource_clearance_patch_is_applied(project_root):
+        errors.append(
+            "the LLM-PySC2 Nexus resource-clearance patch is not applied; see "
+            "integrations/llm_pysc2/patches/README.md"
+        )
+    if not nexus_exact_screen_scale_patch_is_applied(project_root):
+        errors.append(
+            "the LLM-PySC2 Nexus exact-screen-scale patch is not applied; see "
+            "integrations/llm_pysc2/patches/README.md"
+        )
 
     if errors:
         raise LiveEnvironmentError("Live environment validation failed:\n- " + "\n- ".join(errors))
@@ -270,6 +301,7 @@ class LiveProcessSupervisor:
         self._worker: asyncio.subprocess.Process | None = None
         self._stdout: BinaryIO | None = None
         self._stderr: BinaryIO | None = None
+        self._worker_metrics_path = self.run_dir / "worker.metrics.json"
 
     async def run(self) -> EpisodeResult:
         """Run until the worker exits, always closing every owned resource."""
@@ -350,6 +382,8 @@ class LiveProcessSupervisor:
         )
 
     async def _start_worker(self) -> None:
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        self._worker_metrics_path.unlink(missing_ok=True)
         environment = dict(os.environ)
         environment.update(self.worker_environment)
         environment.update(
@@ -361,10 +395,10 @@ class LiveProcessSupervisor:
                 "RTSCORTEX_EPISODE_ID": self.episode_id,
                 "RTSCORTEX_SCENARIO": self.scenario,
                 "RTSCORTEX_SEED": str(self.seed),
+                "RTSCORTEX_WORKER_METRICS_PATH": str(self._worker_metrics_path),
                 "PYGAME_HIDE_SUPPORT_PROMPT": "1",
             }
         )
-        self.run_dir.mkdir(parents=True, exist_ok=True)
         self._stdout = (self.run_dir / "worker.stdout.log").open("wb")
         self._stderr = (self.run_dir / "worker.stderr.log").open("wb")
         try:
@@ -460,10 +494,25 @@ class LiveProcessSupervisor:
             seed=self.seed,
             outcome=outcome,
             steps=steps,
+            metrics=self._worker_metrics(),
             failure_reason=failure_reason,
         )
         self.runtime.end_episode(result)
         return result
+
+    def _worker_metrics(self) -> dict[str, float]:
+        if not self._worker_metrics_path.is_file():
+            return {}
+        payload = json.loads(self._worker_metrics_path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise LiveEnvironmentError("worker metrics sidecar must contain a JSON object")
+        metrics: dict[str, float] = {}
+        for key in ("unattributed_primitives", "candidate_outside_pysc2_dispatches"):
+            value = payload.get(key)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise LiveEnvironmentError(f"worker metrics sidecar has invalid {key!r}")
+            metrics[key] = float(value)
+        return metrics
 
 
 def _worker_python(config: ExperimentConfig, environment: Mapping[str, str]) -> Path:
@@ -549,6 +598,144 @@ def build_feature_plane_patch_is_applied(project_root: Path) -> bool:
             "feature_screen.buildable[y][x]",
             "feature_screen.pathable[y][x]",
             "feature_screen.player_relative[y][x]",
+        )
+    )
+
+
+def translation_result_patch_is_applied(project_root: Path) -> bool:
+    """Return whether translator attempts expose structured primitive provenance."""
+
+    source = project_root / "third_party/LLM-PySC2/llm_pysc2/agents/llm_pysc2_agent.py"
+    if not source.is_file():
+        return False
+    text = source.read_text(encoding="utf-8")
+    return all(
+        marker in text
+        for marker in (
+            "self.last_translation_result",
+            "'requested_function_id': requested_function_id",
+            "'emitted_function_id': func_id",
+            "'ordinal': translation_ordinal",
+            "'total': self._rtscortex_translation_total",
+            "all_args_valid = all_args_valid and func_valid",
+        )
+    )
+
+
+def near_placement_patch_is_applied(project_root: Path) -> bool:
+    """Return whether Near building helpers use exact anchors and full footprints."""
+
+    source = project_root / "third_party/LLM-PySC2/llm_pysc2/lib/llm_action.py"
+    main_source = project_root / "third_party/LLM-PySC2/llm_pysc2/agents/llm_pysc2_agent_main.py"
+    if not source.is_file() or not main_source.is_file():
+        return False
+    text = source.read_text(encoding="utf-8") + main_source.read_text(encoding="utf-8")
+    return all(
+        marker in text
+        for marker in (
+            "(0, F.no_op, ())",
+            "if unit.tag == tag:",
+            "not unit.is_on_screen or not (0 < unit.x < size_screen",
+            "is not a neutral resource anchor",
+            "def full_footprint_valid(center_x, center_y):",
+            "feature_screen.player_relative[y][x] != 0",
+            "complete footprint",
+            "return translator settlement no_op",
+        )
+    )
+
+
+def pretranslation_abort_patch_is_applied(project_root: Path) -> bool:
+    """Return whether upstream reports command-owned pre-translation aborts."""
+
+    agent_source = project_root / "third_party/LLM-PySC2/llm_pysc2/agents/llm_pysc2_agent.py"
+    main_source = project_root / "third_party/LLM-PySC2/llm_pysc2/agents/llm_pysc2_agent_main.py"
+    if not agent_source.is_file() or not main_source.is_file():
+        return False
+    text = agent_source.read_text(encoding="utf-8") + main_source.read_text(encoding="utf-8")
+    return all(
+        marker in text
+        for marker in (
+            "agent.last_execution_abort = {",
+            "'failure_code': 'actor_not_available'",
+            "team head unit is unavailable before action translation",
+        )
+    )
+
+
+def transient_unit_grace_patch_is_applied(project_root: Path) -> bool:
+    """Return whether transient gas/transport absence uses confirmed death state."""
+
+    agent_source = project_root / "third_party/LLM-PySC2/llm_pysc2/agents/llm_pysc2_agent.py"
+    main_source = project_root / "third_party/LLM-PySC2/llm_pysc2/agents/llm_pysc2_agent_main.py"
+    funcs_source = project_root / "third_party/LLM-PySC2/llm_pysc2/agents/main_agent_funcs.py"
+    if not agent_source.is_file() or not main_source.is_file() or not funcs_source.is_file():
+        return False
+    agent_text = agent_source.read_text(encoding="utf-8")
+    main_text = main_source.read_text(encoding="utf-8")
+    funcs_text = funcs_source.read_text(encoding="utf-8")
+    return (
+        all(
+            marker in agent_text
+            for marker in (
+                "MainAgent confirms unit death across observations",
+                "team['unit_tags'] = list(dict.fromkeys(team['unit_tags']))",
+            )
+        )
+        and all(
+            marker in main_text
+            for marker in (
+                "if tag not in self.unit_uid_disappear:",
+                "agent.curr_action_name != 'No_Operation'",
+                "wait for confirmed disappearance",
+                "keep the action pending",
+            )
+        )
+        and all(
+            marker in funcs_text
+            for marker in (
+                "Advance confirmed-death state on every observation",
+                "tag for tag, steps in self.unit_disappear_steps.items() if steps >= 40",
+                "tag for tag in agent.unit_tag_list if tag not in self.unit_uid_disappear",
+                "tag for tag in team['unit_tags'] if tag not in self.unit_uid_disappear",
+            )
+        )
+    )
+
+
+def nexus_resource_clearance_patch_is_applied(project_root: Path) -> bool:
+    """Return whether Nexus placement enforces resource-ring geometry."""
+
+    source = project_root / "third_party/LLM-PySC2/llm_pysc2/lib/llm_action.py"
+    if not source.is_file():
+        return False
+    text = source.read_text(encoding="utf-8")
+    return all(
+        marker in text
+        for marker in (
+            "def resource_clearance_score(center_x, center_y, resources):",
+            "has no complete footprint with valid resource clearance",
+            "candidates.append((clearance_score, centroid_distance, candidate_x, candidate_y))",
+        )
+    )
+
+
+def nexus_exact_screen_scale_patch_is_applied(project_root: Path) -> bool:
+    """Return whether Nexus screen geometry uses exact scale and current visibility."""
+
+    source = project_root / "third_party/LLM-PySC2/llm_pysc2/lib/llm_action.py"
+    if not source.is_file():
+        return False
+    text = source.read_text(encoding="utf-8")
+    return all(
+        marker in text
+        for marker in (
+            "pixel_scale = size_screen / SCREEN_WORLD_GRID",
+            "sample_stride = max(1, int(pixel_scale))",
+            "minimum, ideal, maximum = 7 * pixel_scale, 8.5 * pixel_scale, 10 * pixel_scale",
+            "minimum, ideal, maximum = 6 * pixel_scale, 7.5 * pixel_scale, 9 * pixel_scale",
+            "feature_screen.visibility_map[y][x] != features.Visibility.VISIBLE",
+            "unit.display_type != 1 or not unit.is_on_screen",
         )
     )
 

@@ -18,9 +18,10 @@ from rtscortex.cli.doctor import run_doctor
 from rtscortex.config import ExperimentConfig, load_config
 from rtscortex.evaluation import (
     ReportError,
+    RunReportArtifacts,
     run_mock_episode,
     run_mock_suite,
-    write_timeline_report,
+    write_run_reports,
 )
 from rtscortex.evaluation.replay import replay_event_log
 from rtscortex.runtime.factory import build_runtime
@@ -51,6 +52,23 @@ def _snapshot_config(config: ExperimentConfig, run_dir: Path) -> None:
     )
 
 
+def _echo_report_artifacts(artifacts: RunReportArtifacts) -> None:
+    typer.echo(f"Timeline: {artifacts.timeline_path}")
+    typer.echo(f"Summary: {artifacts.summary_path}")
+
+
+def _write_run_reports_best_effort(run_dir: Path) -> None:
+    journal_path = run_dir / "events.jsonl"
+    try:
+        if not journal_path.is_file() or journal_path.stat().st_size == 0:
+            return
+        artifacts = write_run_reports(run_dir)
+    except Exception as error:
+        typer.echo(f"Warning: could not generate run reports: {error}", err=True)
+        return
+    _echo_report_artifacts(artifacts)
+
+
 @app.command()
 def doctor(
     require_sc2: Annotated[
@@ -74,10 +92,13 @@ def doctor(
 @app.command("run")
 def run_experiment(
     config_path: Annotated[Path, typer.Option("--config", exists=True, dir_okay=False)],
+    seed: Annotated[int | None, typer.Option("--seed", min=0)] = None,
 ) -> None:
     """Run one configured episode."""
 
     config = load_config(config_path)
+    if seed is not None:
+        config = config.model_copy(update={"run": config.run.model_copy(update={"seed": seed})})
     run_id = _run_id(config.agent.variant)
     episode_id = "episode-0"
     run_dir = config.run.output_root / run_id
@@ -144,13 +165,19 @@ def run_experiment(
     try:
         output = asyncio.run(execute())
     except WorkerProcessError as error:
+        _write_run_reports_best_effort(run_dir)
         typer.echo(error.result.model_dump_json(indent=2), err=True)
         typer.echo(f"Artifacts: {run_dir}", err=True)
         raise typer.Exit(code=1) from error
     except LiveEnvironmentError as error:
+        _write_run_reports_best_effort(run_dir)
         typer.echo(f"Live run failed: {error}", err=True)
         typer.echo(f"Artifacts: {run_dir}", err=True)
         raise typer.Exit(code=1) from error
+    except BaseException:
+        _write_run_reports_best_effort(run_dir)
+        raise
+    _write_run_reports_best_effort(run_dir)
     typer.echo(output)
     typer.echo(f"Artifacts: {run_dir}")
 
@@ -176,13 +203,13 @@ def evaluate(
 def report(
     run_dir: Annotated[Path, typer.Argument(exists=True, file_okay=False)],
 ) -> None:
-    """Generate a readable Markdown timeline from one runtime event journal."""
+    """Generate readable Markdown and machine-readable JSON run reports."""
 
     try:
-        timeline_path = write_timeline_report(run_dir)
+        artifacts = write_run_reports(run_dir)
     except ReportError as error:
         raise typer.BadParameter(str(error), param_hint="RUN_DIR") from error
-    typer.echo(f"Timeline: {timeline_path}")
+    _echo_report_artifacts(artifacts)
 
 
 @app.command()

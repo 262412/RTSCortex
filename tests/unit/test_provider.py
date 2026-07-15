@@ -121,6 +121,7 @@ def test_openai_provider_sends_action_bound_planning_schema() -> None:
                     argument_names=["screen"],
                     argument_types=[ActionArgumentType.POSITION],
                     actor_scopes=["Builder/Builder-Probe-1"],
+                    argument_candidates=[[[60, 40]]],
                 ),
                 AvailableAction(
                     name="Train_Zealot",
@@ -147,7 +148,7 @@ def test_openai_provider_sends_action_bound_planning_schema() -> None:
         assert build_arguments["minItems"] == build_arguments["maxItems"] == 1
         position_schema = build_arguments["prefixItems"][0]
         assert position_schema["minItems"] == position_schema["maxItems"] == 2
-        assert position_schema["items"]["type"] == "integer"
+        assert [item["const"] for item in position_schema["prefixItems"]] == [60, 40]
         train_schema = proposals_by_name["Train_Zealot"]
         assert train_schema["properties"]["actor"]["const"] == "Developer/Empty"
         train_arguments = train_schema["properties"]["arguments"]

@@ -8,7 +8,11 @@ from rtscortex.contracts import (
     EconomyState,
     UnitState,
 )
-from rtscortex.runtime.validation import ActionArbiter, ActionValidator
+from rtscortex.runtime.validation import (
+    ActionArbiter,
+    ActionValidator,
+    ValidationDisposition,
+)
 from tests.helpers import make_observation
 
 
@@ -28,7 +32,7 @@ def command(
         command_id=command_id,
         actor=actor,
         name=name,
-        arguments=["enemy-1"] if arguments is None else arguments,
+        arguments=["0x1"] if arguments is None else arguments,
         priority=priority,
         source=source,
         created_game_loop=created_game_loop,
@@ -45,6 +49,15 @@ def test_reflex_preempts_only_same_actor() -> None:
     assert len(outcome.preemptions) == 1
     assert outcome.preemptions[0].winner_command_id == "reflex"
     assert outcome.preemptions[0].loser_command_id == "planner"
+
+
+def test_equal_priority_commands_for_same_actor_keep_plan_order() -> None:
+    first = command("plan:0")
+    second = command("plan:1")
+
+    outcome = ActionArbiter().arbitrate([first, second], [], game_loop=1)
+
+    assert outcome.selected == [first]
 
 
 def test_expired_command_is_removed() -> None:
@@ -77,22 +90,23 @@ def test_validator_rejects_invalid_typed_argument() -> None:
         update={
             "available_actions": [
                 AvailableAction(
-                    name="Attack_Unit",
-                    argument_names=["target"],
-                    argument_types=[ActionArgumentType.TAG],
+                    name="Move_Screen",
+                    argument_names=["screen"],
+                    argument_types=[ActionArgumentType.POSITION],
                     actor_scopes=["army"],
+                    argument_candidates=[[[40, 40]]],
                 )
             ]
         }
     )
 
     outcome = ActionValidator(max_actions=1).validate(
-        [command("bad-tag", arguments=["enemy-1"])],
+        [command("bad-position", name="Move_Screen", arguments=["bad"])],
         observation,
     )
 
     assert outcome.accepted == []
-    assert outcome.rejected == ["bad-tag: argument 'target' must be tag"]
+    assert outcome.rejected == ["bad-position: argument 'screen' must be position"]
 
 
 def test_validator_enforces_preconditions_and_creation_loop() -> None:
@@ -205,3 +219,136 @@ def test_validator_enforces_structure_absent() -> None:
     assert ActionValidator(max_actions=1).validate([guarded], with_gateway).rejected == [
         "gateway: precondition 'structure_absent' is not satisfied"
     ]
+
+
+def test_validator_rejects_friendly_and_non_visible_attack_targets() -> None:
+    observation = make_observation()
+    outcome = ActionValidator(max_actions=2).validate(
+        [
+            command("friendly", arguments=["unit-1"]),
+            command("missing", arguments=["enemy-missing"]),
+        ],
+        observation,
+    )
+
+    assert outcome.accepted == []
+    assert outcome.rejected == [
+        "friendly: friendly_target",
+        "missing: target_not_visible",
+    ]
+    assert all(
+        failure.disposition is ValidationDisposition.REJECTED for failure in outcome.failures
+    )
+
+
+def test_validator_uses_actor_specific_argument_candidates_for_same_action() -> None:
+    base = make_observation()
+    observation = base.model_copy(
+        update={
+            "state": base.state.model_copy(
+                update={
+                    "visible_enemies": [
+                        UnitState(
+                            unit_id="0x1",
+                            unit_type="Zergling",
+                            alliance="enemy",
+                        ),
+                        UnitState(
+                            unit_id="0x2",
+                            unit_type="Roach",
+                            alliance="enemy",
+                        ),
+                    ]
+                }
+            ),
+            "available_actions": [
+                AvailableAction(
+                    name="Attack_Unit",
+                    argument_names=["target"],
+                    argument_types=[ActionArgumentType.TAG],
+                    actor_scopes=["CombatGroup0/Zealot-1"],
+                    argument_candidates=[["0x1"]],
+                ),
+                AvailableAction(
+                    name="Attack_Unit",
+                    argument_names=["target"],
+                    argument_types=[ActionArgumentType.TAG],
+                    actor_scopes=["CombatGroup1/Stalker-1"],
+                    argument_candidates=[["0x2"]],
+                ),
+            ],
+        }
+    )
+    valid = command(
+        "valid",
+        actor="CombatGroup1/Stalker-1",
+        arguments=["0x2"],
+    )
+    wrong_domain = command(
+        "wrong-domain",
+        actor="CombatGroup0/Zealot-1",
+        arguments=["0x2"],
+    )
+
+    outcome = ActionValidator(max_actions=2).validate([valid, wrong_domain], observation)
+
+    assert outcome.accepted == [valid]
+    assert outcome.rejected == ["wrong-domain: arguments are outside the available candidate set"]
+
+
+def test_validator_rejects_candidate_external_screen_coordinate_within_relocation_radius() -> None:
+    base = make_observation()
+    actor = "Builder/Probe-1"
+    observation = base.model_copy(
+        update={
+            "available_actions": [
+                AvailableAction(
+                    name="Build_Pylon_Screen",
+                    argument_names=["screen"],
+                    argument_types=[ActionArgumentType.POSITION],
+                    actor_scopes=[actor],
+                    argument_candidates=[[[50, 50]], [[55, 50]]],
+                )
+            ]
+        }
+    )
+    relocated = command(
+        "relocated",
+        actor=actor,
+        name="Build_Pylon_Screen",
+        arguments=[[64, 50]],
+    )
+
+    outcome = ActionValidator(max_actions=1).validate([relocated], observation)
+
+    assert outcome.accepted == []
+    assert outcome.rejected == ["relocated: arguments are outside the available candidate set"]
+
+
+def test_validator_rejects_screen_relocation_outside_two_sample_strides() -> None:
+    base = make_observation()
+    actor = "Builder/Probe-1"
+    observation = base.model_copy(
+        update={
+            "available_actions": [
+                AvailableAction(
+                    name="Build_Pylon_Screen",
+                    argument_names=["screen"],
+                    argument_types=[ActionArgumentType.POSITION],
+                    actor_scopes=[actor],
+                    argument_candidates=[[[50, 50]], [[55, 50]]],
+                )
+            ]
+        }
+    )
+    stale = command(
+        "stale",
+        actor=actor,
+        name="Build_Pylon_Screen",
+        arguments=[[66, 50]],
+    )
+
+    outcome = ActionValidator(max_actions=1).validate([stale], observation)
+
+    assert outcome.accepted == []
+    assert outcome.rejected == ["stale: arguments are outside the available candidate set"]

@@ -35,7 +35,15 @@ def test_prepare_live_worker_builds_fixed_pysc2_command(tmp_path: Path) -> None:
         "    func_id, func_call = (0, actions.FUNCTIONS.no_op())\n"
         "    return func_call\n"
         "elif not self._all_agent_executing_finished():\n"
-        "    pass\n",
+        "    pass\n"
+        "return translator settlement no_op\n"
+        "if tag not in self.unit_uid_disappear:\n"
+        "agent.curr_action_name != 'No_Operation'\n"
+        "wait for confirmed disappearance\n"
+        "keep the action pending\n"
+        "agent.last_execution_abort = {\n"
+        "'failure_code': 'actor_not_available'\n"
+        "team head unit is unavailable before action translation\n",
         encoding="utf-8",
     )
     runner_source = tmp_path / "third_party/LLM-PySC2/pysc2/bin/agent.py"
@@ -45,6 +53,15 @@ def test_prepare_live_worker_builds_fixed_pysc2_command(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     _write_build_coordinate_patch_source(tmp_path)
+    _write_translation_result_patch_source(tmp_path)
+    funcs_source = tmp_path / "third_party/LLM-PySC2/llm_pysc2/agents/main_agent_funcs.py"
+    funcs_source.write_text(
+        "Advance confirmed-death state on every observation\n"
+        "tag for tag, steps in self.unit_disappear_steps.items() if steps >= 40\n"
+        "tag for tag in agent.unit_tag_list if tag not in self.unit_uid_disappear\n"
+        "tag for tag in team['unit_tags'] if tag not in self.unit_uid_disappear\n",
+        encoding="utf-8",
+    )
 
     config = make_config(tmp_path).model_copy(
         update={
@@ -118,6 +135,12 @@ def test_prepare_live_worker_reports_all_missing_prerequisites(tmp_path: Path) -
     assert "waiting-response patch is not applied" in message
     assert "random-seed patch is not applied" in message
     assert "build-coordinate patch is not applied" in message
+    assert "translation-result patch is not applied" in message
+    assert "near-placement patch is not applied" in message
+    assert "pre-translation abort patch is not applied" in message
+    assert "transient-unit grace patch is not applied" in message
+    assert "Nexus resource-clearance patch is not applied" in message
+    assert "Nexus exact-screen-scale patch is not applied" in message
 
 
 def test_prepare_live_worker_accepts_2s3z_on_sc2_410(tmp_path: Path) -> None:
@@ -284,7 +307,15 @@ def _write_worker_patch_sources(project_root: Path) -> None:
         "    func_id, func_call = (0, actions.FUNCTIONS.no_op())\n"
         "    return func_call\n"
         "elif not self._all_agent_executing_finished():\n"
-        "    pass\n",
+        "    pass\n"
+        "return translator settlement no_op\n"
+        "if tag not in self.unit_uid_disappear:\n"
+        "agent.curr_action_name != 'No_Operation'\n"
+        "wait for confirmed disappearance\n"
+        "keep the action pending\n"
+        "agent.last_execution_abort = {\n"
+        "'failure_code': 'actor_not_available'\n"
+        "team head unit is unavailable before action translation\n",
         encoding="utf-8",
     )
     runner_source = project_root / "third_party/LLM-PySC2/pysc2/bin/agent.py"
@@ -294,6 +325,15 @@ def _write_worker_patch_sources(project_root: Path) -> None:
         encoding="utf-8",
     )
     _write_build_coordinate_patch_source(project_root)
+    _write_translation_result_patch_source(project_root)
+    funcs_source = project_root / "third_party/LLM-PySC2/llm_pysc2/agents/main_agent_funcs.py"
+    funcs_source.write_text(
+        "Advance confirmed-death state on every observation\n"
+        "tag for tag, steps in self.unit_disappear_steps.items() if steps >= 40\n"
+        "tag for tag in agent.unit_tag_list if tag not in self.unit_uid_disappear\n"
+        "tag for tag in team['unit_tags'] if tag not in self.unit_uid_disappear\n",
+        encoding="utf-8",
+    )
 
 
 def _write_build_coordinate_patch_source(project_root: Path) -> None:
@@ -304,6 +344,38 @@ def _write_build_coordinate_patch_source(project_root: Path) -> None:
         "feature_screen.creep[y0][x0]\n"
         "feature_screen.buildable[y][x]\n"
         "feature_screen.pathable[y][x]\n"
-        "feature_screen.player_relative[y][x]\n",
+        "feature_screen.player_relative[y][x]\n"
+        "(0, F.no_op, ())\n"
+        "if unit.tag == tag:\n"
+        "if not unit.is_on_screen or not (0 < unit.x < size_screen:\n"
+        "is not a neutral resource anchor\n"
+        "def full_footprint_valid(center_x, center_y):\n"
+        "feature_screen.player_relative[y][x] != 0\n"
+        "not buildable for a complete footprint\n"
+        "def resource_clearance_score(center_x, center_y, resources):\n"
+        "has no complete footprint with valid resource clearance\n"
+        "candidates.append((clearance_score, centroid_distance, candidate_x, candidate_y))\n"
+        "pixel_scale = size_screen / SCREEN_WORLD_GRID\n"
+        "sample_stride = max(1, int(pixel_scale))\n"
+        "minimum, ideal, maximum = 7 * pixel_scale, 8.5 * pixel_scale, 10 * pixel_scale\n"
+        "minimum, ideal, maximum = 6 * pixel_scale, 7.5 * pixel_scale, 9 * pixel_scale\n"
+        "feature_screen.visibility_map[y][x] != features.Visibility.VISIBLE\n"
+        "unit.display_type != 1 or not unit.is_on_screen\n",
+        encoding="utf-8",
+    )
+
+
+def _write_translation_result_patch_source(project_root: Path) -> None:
+    source = project_root / "third_party/LLM-PySC2/llm_pysc2/agents/llm_pysc2_agent.py"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text(
+        "self.last_translation_result\n"
+        "'requested_function_id': requested_function_id\n"
+        "'emitted_function_id': func_id\n"
+        "'ordinal': translation_ordinal\n"
+        "'total': self._rtscortex_translation_total\n"
+        "all_args_valid = all_args_valid and func_valid\n"
+        "MainAgent confirms unit death across observations\n"
+        "team['unit_tags'] = list(dict.fromkeys(team['unit_tags']))\n",
         encoding="utf-8",
     )

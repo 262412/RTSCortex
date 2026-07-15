@@ -171,23 +171,147 @@ def _write_markdown_report(
         f"Scenario: `{config.environment.scenario}`",
         f"Seeds: `{', '.join(str(seed) for seed in config.evaluation.seeds)}`",
         "",
-        (
-            "| Variant | Episodes | Success | Mean score | Mean steps | Action success | Illegal | "
-            "Planner p95 ms | Reflex p95 ms | Tick p95 ms | Requests | Tokens | Cost USD |"
-        ),
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "## Task results",
+        "",
+        "| Variant | Episodes | Success | Mean score | Mean steps | Requests | Tokens | Cost USD |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for display_variant, metrics in variants.items():
         lines.append(
             f"| `{display_variant}` | {int(metrics['episodes'])} | "
             f"{metrics['success_rate']:.3f} | {metrics['mean_score']:.2f} | "
-            f"{metrics['mean_steps']:.2f} | {metrics['action_success_rate']:.3f} | "
-            f"{metrics['illegal_action_rate']:.3f} | "
-            f"{metrics['planner_latency_ms_p95']:.3f} | "
-            f"{metrics['reflex_latency_ms_p95']:.3f} | "
-            f"{metrics['tick_latency_ms_p95']:.3f} | "
-            f"{metrics['model_requests']} | {metrics['total_tokens']} | "
+            f"{metrics['mean_steps']:.2f} | {metrics['model_requests']} | "
+            f"{metrics['total_tokens']} | "
             f"{metrics['model_cost_usd']:.6f} |"
+        )
+    lines.extend(
+        [
+            "",
+            "## Decision activity",
+            "",
+            (
+                "| Variant | Decisions | Planner pending | Fallback | Idle reasons | "
+                "Unique rejected IDs | Duplicate dispatch |"
+            ),
+            "|---|---:|---:|---:|---|---:|---:|",
+        ]
+    )
+    for display_variant, metrics in variants.items():
+        execution = metrics["execution"]
+        lines.append(
+            f"| `{display_variant}` | {execution['decision_count']} | "
+            f"{execution['planner_pending_decisions']} | "
+            f"{execution['fallback_decisions']} | "
+            f"{_count_summary(execution['idle_reason_counts'])} | "
+            f"{execution['unique_validation_rejected_command_ids']} | "
+            f"{execution['duplicate_dispatches']} |"
+        )
+    lines.extend(
+        [
+            "",
+            "## Meaningful outcomes",
+            "",
+            (
+                "| Variant | Commands | Succeeded | Failed | Cancelled | Unconfirmed | "
+                "Meaningful success | Completed success | Backlog | Terminal coverage | "
+                "Unexpected terminal | Failure classification | Transport NoOps |"
+            ),
+            "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        ]
+    )
+    for display_variant, metrics in variants.items():
+        execution = metrics["execution"]
+        lines.append(
+            f"| `{display_variant}` | {execution['meaningful_commands']} | "
+            f"{execution['meaningful_successes']} | "
+            f"{execution['meaningful_failures']} | "
+            f"{execution['meaningful_cancelled']} | "
+            f"{execution['meaningful_unconfirmed']} | "
+            f"{execution['meaningful_action_success_rate']:.3f} | "
+            f"{execution['completed_execution_success_rate']:.3f} | "
+            f"{execution['terminal_backlog_rate']:.3f} | "
+            f"{execution['terminal_report_coverage']:.3f} | "
+            f"{execution['unexpected_terminal_reports']} | "
+            f"{execution['failure_classification_coverage']:.3f} | "
+            f"{execution['transport_noop_primitives']} |"
+        )
+    lines.extend(
+        [
+            "",
+            "## Build funnel",
+            "",
+            (
+                "| Variant | Raw Planner proposed | Candidate validated | Translator accepted | "
+                "PySC2 accepted | Effect confirmed | Effect confirmed rate | "
+                "Effect timeout rate | Pre-dispatch rejection rate |"
+            ),
+            "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+        ]
+    )
+    for display_variant, metrics in variants.items():
+        funnel = metrics["execution"]["build_funnel"]
+        lines.append(
+            f"| `{display_variant}` | {funnel['proposed']} | "
+            f"{funnel['candidate_validated']} | {funnel['translator_accepted']} | "
+            f"{funnel['pysc2_accepted']} | {funnel['effect_confirmed']} | "
+            f"{metrics['execution']['build_effect_confirmed_rate']:.3f} | "
+            f"{metrics['execution']['build_effect_timeout_rate']:.3f} | "
+            f"{metrics['execution']['build_pre_dispatch_rejection_rate']:.3f} |"
+        )
+    lines.extend(
+        [
+            "",
+            "## Failure taxonomy",
+            "",
+            (
+                "| Variant | Stage | Code | Action | Actor | Action/actor commands | "
+                "Action/stage/code failures | Dispatched Builder Attack | "
+                "Dispatched friendly target Attack |"
+            ),
+            "|---|---|---|---|---|---|---|---:|---:|",
+        ]
+    )
+    for display_variant, metrics in variants.items():
+        execution = metrics["execution"]
+        lines.append(
+            f"| `{display_variant}` | {_count_summary(execution['failure_by_stage'])} | "
+            f"{_count_summary(execution['failure_by_code'])} | "
+            f"{_count_summary(execution['failure_by_action'])} | "
+            f"{_count_summary(execution['failure_by_actor'])} | "
+            f"{_count_summary(execution['command_by_action_actor'])} | "
+            f"{_count_summary(execution['failure_by_action_stage_code'])} | "
+            f"{execution['builder_attack_commands']} | "
+            f"{execution['friendly_target_attacks']} |"
+        )
+    lines.extend(
+        [
+            "",
+            "## Safety and attribution invariants",
+            "",
+            (
+                "| Variant | Planner audit | Planner Builder Attack | Planner friendly Attack | "
+                "Unsafe rejected | Unsafe dispatched | Planner NoOps | Generic translation | "
+                "Placement rejection | Unattributed primitive | Candidate-external PySC2 | "
+                "573 terminal |"
+            ),
+            "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        ]
+    )
+    for display_variant, metrics in variants.items():
+        execution = metrics["execution"]
+        lines.append(
+            f"| `{display_variant}` | {execution['planner_proposal_audited_results']}/"
+            f"{execution['planner_module_results']} | "
+            f"{execution['planner_builder_attack_proposals']} | "
+            f"{execution['planner_friendly_target_attack_proposals']} | "
+            f"{execution['planner_unsafe_attack_rejected_before_dispatch']} | "
+            f"{execution['planner_unsafe_attack_dispatched']} | "
+            f"{execution['planner_noop_proposals']} | "
+            f"{execution['generic_translation_failures']} | "
+            f"{execution['upstream_placement_rejections']} | "
+            f"{execution['unattributed_primitives']} | "
+            f"{execution['candidate_outside_pysc2_dispatches']} | "
+            f"{execution['orchestration_573_terminal_reports']} |"
         )
     lines.extend(
         [
@@ -230,3 +354,9 @@ def _write_markdown_report(
         ]
     )
     (output_dir / "report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _count_summary(counts: dict[str, int]) -> str:
+    if not counts:
+        return "none"
+    return ", ".join(f"`{name}`: {count}" for name, count in sorted(counts.items()))

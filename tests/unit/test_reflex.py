@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from rtscortex.contracts import AvailableAction
+from rtscortex.contracts import ActionArgumentType, AvailableAction
 from rtscortex.reflex import ReflexEngine
 from rtscortex.runtime.validation import ActionValidator
 from tests.helpers import make_observation
@@ -22,12 +22,14 @@ def test_reflex_targets_all_live_actor_scopes_for_sc2_alert() -> None:
             "available_actions": [
                 AvailableAction(
                     name="Attack_Unit",
-                    argument_names=["target"],
+                    argument_names=["tag"],
+                    argument_types=[ActionArgumentType.TAG],
                     actor_scopes=[
                         "CombatGroupSmac/Zealot-1",
                         "CombatGroupSmac/Zealot-2",
                         "CombatGroupSmac/Stalker-1",
                     ],
+                    argument_candidates=[["0x1"]],
                 ),
                 AvailableAction(name="No_Operation", actor_scopes=["global"]),
             ]
@@ -41,3 +43,32 @@ def test_reflex_targets_all_live_actor_scopes_for_sc2_alert() -> None:
         "CombatGroupSmac/Stalker-1",
     ]
     assert ActionValidator(max_actions=5).validate(commands, observation).rejected == []
+
+
+def test_reflex_ignores_builder_and_respects_actor_specific_enemy_candidates() -> None:
+    observation = make_observation(alerts=["under_attack"]).model_copy(
+        update={
+            "available_actions": [
+                AvailableAction(
+                    name="Attack_Unit",
+                    argument_names=["tag"],
+                    argument_types=[ActionArgumentType.TAG],
+                    actor_scopes=["Builder/Builder-Probe-1"],
+                    argument_candidates=[["0x1"]],
+                ),
+                AvailableAction(
+                    name="Attack_Unit",
+                    argument_names=["tag"],
+                    argument_types=[ActionArgumentType.TAG],
+                    actor_scopes=["CombatGroup0/Zealot-1"],
+                    argument_candidates=[["0x1"]],
+                ),
+            ]
+        }
+    )
+
+    commands = ReflexEngine(enabled=True, low_health_threshold=0.25).evaluate(observation)
+
+    assert [(command.actor, command.arguments) for command in commands] == [
+        ("CombatGroup0/Zealot-1", ["0x1"])
+    ]

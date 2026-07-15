@@ -20,6 +20,7 @@ environment:
 runtime:
   deterministic: false
   planning_interval_game_loops: 112
+  planner_command_ttl_game_loops: 112
   planner_timeout_seconds: 45.0
   max_actions: 5
 agent:
@@ -46,4 +47,4 @@ provider:
   prompt_cost_per_million_tokens: 0.0
   completion_cost_per_million_tokens: 0.0
 evaluation:
-  seeds: [0]
+  seeds: [0, 1, 2]

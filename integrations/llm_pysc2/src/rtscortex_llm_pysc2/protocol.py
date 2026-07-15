@@ -22,7 +22,14 @@ class RuntimeClient:
     def health(self) -> dict[str, Any]:
         response = self.client.get("/healthz")
         response.raise_for_status()
-        return cast(dict[str, Any], response.json())
+        payload = cast(dict[str, Any], response.json())
+        protocol_version = payload.get("protocol_version")
+        if protocol_version != "1.1":
+            raise RuntimeError(
+                "RTSCortex live protocol mismatch: "
+                f"worker requires 1.1, runtime reported {protocol_version!r}"
+            )
+        return payload
 
     def tick(self, observation: dict[str, Any]) -> dict[str, Any]:
         response = self.client.post("/v1/tick", json=observation)
