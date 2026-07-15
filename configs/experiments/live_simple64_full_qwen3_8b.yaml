@@ -1,0 +1,50 @@
+run:
+  output_root: ~/scratch/outputs/RTSCortex
+  runtime_root: ~/fastscratch/rtscortex_runtime
+  seed: 0
+environment:
+  adapter: llm_pysc2
+  scenario: Simple64
+  max_steps: 40000
+  agent_race: protoss
+  opponent_race: zerg
+  opponent_difficulty: very_easy
+  opponent_build: macro
+  step_mul: 1
+  simulation_speed_multiplier: 0.25
+  pause_until_first_plan: true
+  action_effect_timeout_game_loops: 112
+  worker_python: ~/fastscratch/envs/rtscortex-llm-pysc2/bin/python
+  server_ready_timeout_seconds: 15.0
+  shutdown_timeout_seconds: 10.0
+runtime:
+  deterministic: false
+  planning_interval_game_loops: 112
+  planner_command_ttl_game_loops: 112
+  planner_timeout_seconds: 45.0
+  max_actions: 5
+agent:
+  variant: planner_reflection_memory_reflex
+reflex:
+  enabled: true
+  low_health_threshold: 0.25
+  target_latency_ms: 50.0
+memory:
+  short_term_window: 20
+context:
+  max_prompt_chars: 9000
+  max_recent_events: 8
+  max_lessons: 6
+  max_episode_summaries: 1
+provider:
+  kind: openai_compatible
+  model: Qwen/Qwen3-8B
+  base_url: http://127.0.0.1:8000/v1
+  api_key_env: RTSCORTEX_LLM_API_KEY
+  timeout_seconds: 45.0
+  max_tokens: 256
+  enable_thinking: false
+  prompt_cost_per_million_tokens: 0.0
+  completion_cost_per_million_tokens: 0.0
+evaluation:
+  seeds: [0, 1, 2]

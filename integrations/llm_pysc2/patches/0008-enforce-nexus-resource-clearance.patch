@@ -1,0 +1,77 @@
+diff --git a/llm_pysc2/lib/llm_action.py b/llm_pysc2/lib/llm_action.py
+--- a/llm_pysc2/lib/llm_action.py
++++ b/llm_pysc2/lib/llm_action.py
+@@ -633,6 +633,26 @@
+           return False
+     return True
+ 
++  def resource_clearance_score(center_x, center_y, resources):
++    score = 0
++    for resource in resources:
++      distance = math.sqrt((resource.x - center_x) ** 2 + (resource.y - center_y) ** 2)
++      if resource.unit_type in GAS_TYPE:
++        minimum, ideal, maximum = 7 * ratio, 8.5 * ratio, 10 * ratio
++      else:
++        minimum, ideal, maximum = 6 * ratio, 7.5 * ratio, 9 * ratio
++      if not (minimum < distance < maximum):
++        return None
++      score += (distance - ideal) ** 2
++    return score
++
++  def townhall_clear(center_x, center_y):
++    for townhall in obs.observation.feature_units:
++      if townhall.alliance in [features.PlayerRelative.SELF, features.PlayerRelative.ALLY, features.PlayerRelative.ENEMY] and townhall.unit_type in BASE_BUILDING_TYPE and \
++          math.sqrt((townhall.x - center_x) ** 2 + (townhall.y - center_y) ** 2) < 12 * ratio:
++        return False
++    return True
++
+   for unit in obs.observation.feature_units:
+     if unit.tag == tag:
+       if not unit.is_on_screen or not (0 < unit.x < size_screen and 0 < unit.y < size_screen):
+@@ -650,24 +670,29 @@
+         y0 += resource.y
+       x = x0 / n
+       y = y0 / n
+-      for townhall in obs.observation.feature_units:
+-        if townhall.alliance in [features.PlayerRelative.SELF, features.PlayerRelative.ALLY, features.PlayerRelative.ENEMY] and townhall.unit_type in BASE_BUILDING_TYPE and \
+-            math.sqrt((townhall.x - x) ** 2 + (townhall.y - y) ** 2) < 12 * ratio:
+-          return f'resource cluster for tag {hex(tag)} already has a townhall', False
+       search_radius = 12 * ratio
+-      candidates = sorted(
+-        (
+-          ((candidate_x - x) ** 2 + (candidate_y - y) ** 2, candidate_x, candidate_y)
+-          for candidate_y in range(ratio, size_screen, ratio)
+-          for candidate_x in range(ratio, size_screen, ratio)
+-          if (candidate_x - x) ** 2 + (candidate_y - y) ** 2 <= search_radius ** 2
+-        ),
+-        key=lambda item: (item[0], item[1], item[2]),
+-      )
+-      for _, candidate_x, candidate_y in candidates:
+-        if full_footprint_valid(candidate_x, candidate_y):
+-          return (candidate_x, candidate_y), True
+-      return f'area near ({int(x)}, {int(y)}) not buildable for a complete footprint', False
++      candidates = []
++      occupied = False
++      for candidate_y in range(ratio, size_screen, ratio):
++        for candidate_x in range(ratio, size_screen, ratio):
++          centroid_distance = (candidate_x - x) ** 2 + (candidate_y - y) ** 2
++          if centroid_distance > search_radius ** 2:
++            continue
++          if not full_footprint_valid(candidate_x, candidate_y):
++            continue
++          clearance_score = resource_clearance_score(candidate_x, candidate_y, mineral_gas_list)
++          if clearance_score is None:
++            continue
++          if not townhall_clear(candidate_x, candidate_y):
++            occupied = True
++            continue
++          candidates.append((clearance_score, centroid_distance, candidate_x, candidate_y))
++      if candidates:
++        _, _, candidate_x, candidate_y = min(candidates)
++        return (candidate_x, candidate_y), True
++      if occupied:
++        return f'resource cluster for tag {hex(tag)} already has a townhall', False
++      return f'area near ({int(x)}, {int(y)}) has no complete footprint with valid resource clearance', False
+   tag = hex(tag) if isinstance(tag, int) else tag
+   return f'cannot find unit {tag} on screen', False
+

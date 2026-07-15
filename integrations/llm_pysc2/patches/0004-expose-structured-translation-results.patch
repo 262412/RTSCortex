@@ -1,0 +1,93 @@
+diff --git a/llm_pysc2/agents/llm_pysc2_agent.py b/llm_pysc2/agents/llm_pysc2_agent.py
+index 5b2c72d..96a8b40 100644
+--- a/llm_pysc2/agents/llm_pysc2_agent.py
++++ b/llm_pysc2/agents/llm_pysc2_agent.py
+@@ -119,6 +119,9 @@ class LLMAgent:
+     self.curr_action_name = ''
+     self.curr_action_args = []
+     self.last_text_a_raw = ''
++    self.last_translation_result = None
++    self._rtscortex_translation_ordinal = 0
++    self._rtscortex_translation_total = 0
+     self.last_text_a_pro = ''
+     self.first_action = True
+ 
+@@ -446,6 +449,8 @@ class LLMAgent:
+       action = llm_action.add_func_for_select_workers(self, obs, action)
+       action = llm_action.add_func_for_train_and_research(self, obs, action)
+       self.func_list = action['func']
++      self._rtscortex_translation_ordinal = 0
++      self._rtscortex_translation_total = len(self.func_list)
+       # self.func_list_standard = llm_a.get_text_action(self.name, action['name'])
+       self.curr_action_name = action['name']
+       self.curr_action_args = action['arg']
+@@ -453,10 +458,16 @@ class LLMAgent:
+     # for i in range(len(self.func_list)):
+     # logger.debug(f"[ID {self.log_id}] LLMAgent {self.name}, get_func(): self.func_list[{i}] = {self.func_list[i]}")
+     func_id, func, llm_pysc2_args = self.func_list.pop(0)
++    requested_function_id = func_id
++    requested_function_name = func.name
++    translation_ordinal = self._rtscortex_translation_ordinal
++    self._rtscortex_translation_ordinal += 1
+     func_call = None
++    validation_reason = None
+     # func_id, func, llm_pysc2_arg_types = llm_a.get_action(self.name, )
+ 
+     pysc2_args = []
++    all_args_valid = True
+     if func_id in obs.observation.available_actions:  # 函数合法性检验，非法动作直接跳出
+       func_valid = True
+       pysc2_args = []
+@@ -518,9 +529,12 @@ class LLMAgent:
+             func_valid = False
+             pysc2_arg = 'WrongType-Arg'
+ 
++          if not func_valid:
++            validation_reason = str(pysc2_arg)
++          all_args_valid = all_args_valid and func_valid
+           pysc2_args.append(pysc2_arg)
+ 
+-        if func_valid is True and 'error' not in pysc2_args:
++        if all_args_valid is True and 'error' not in pysc2_args:
+           logger.info(
+             f"[ID {self.log_id}] LLMAgent {self.name}, get_func(): func avaliable, func {func} pysc2_args {pysc2_args}")
+           if len(pysc2_args) == 3:
+@@ -533,16 +547,19 @@ class LLMAgent:
+             with open(self.history_func_path, "a") as f:  # 打开文件
+               print(f"{self.name};   loop{self.main_loop_step};   step{self.num_step};   [Invalid Args]  {func.name} {pysc2_args}", file=f)
+             logger.warning(f"[ID {self.log_id}] LLMAgent {self.name} get_func() Error type 1: Arg quantity invalid: ({pysc2_args})! Replace with no_op().")
++            validation_reason = f"argument quantity invalid: {pysc2_args}"
+             func_id, func_call = (0, actions.FUNCTIONS.no_op())
+         else:
+           with open(self.history_func_path, "a") as f:  # 打开文件
+             print(f"{self.name};   loop{self.main_loop_step};   step{self.num_step};   [Invalid Args]  {func.name} {pysc2_args} ", file=f)
+           logger.warning(f"[ID {self.log_id}] LLMAgent {self.name} get_func() Error type 2: Func {func} Arg invalid: {pysc2_args}! Replace with no_op()")
++          validation_reason = validation_reason or f"arguments invalid: {pysc2_args}"
+           func_id, func_call = (0, actions.FUNCTIONS.no_op())
+     else:
+       with open(self.history_func_path, "a") as f:  # 打开文件
+         print(f"{self.name};   loop{self.main_loop_step};   step{self.num_step};   [Invalid Func]  {func.name} ", file=f)
+       logger.warning(f"[ID {self.log_id}] LLMAgent {self.name} get_func() Error type 3: Func invalid: {func}! Replace with no_op()")
++      validation_reason = f"function {requested_function_name} is not available"
+       func_id, func_call = (0, actions.FUNCTIONS.no_op())
+ 
+     # 保存动作信息
+@@ -554,6 +571,18 @@ class LLMAgent:
+     if len(self.action_list) == 0:
+       self.first_action = True  # 本小队最后一个动作已经执行完毕
+     logger.info(f"[ID {self.log_id}] LLMAgent {self.name} get_func(): Get Func {func_id}, {func_call}")
++    self.last_translation_result = {
++      'action_name': self.curr_action_name,
++      'requested_function_id': requested_function_id,
++      'requested_function_name': requested_function_name,
++      'emitted_function_id': func_id,
++      'emitted_function_name': actions.FUNCTIONS[func_id].name,
++      'ordinal': translation_ordinal,
++      'total': self._rtscortex_translation_total,
++      'accepted': func_id == requested_function_id,
++      'resolved_arguments': pysc2_args if func_id == requested_function_id else [],
++      'reason': validation_reason,
++    }
+     return func_id, func_call
+ 
+ 

@@ -12,5 +12,6 @@ htmlcov/
 .env
 logs/
 outputs/
+output/playwright/
 .rtscortex/
 *.sock

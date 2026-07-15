@@ -1,0 +1,45 @@
+{
+  "protocol_version": "1.1",
+  "run_id": "run-fixture",
+  "episode_id": "episode-pvz-task1",
+  "step_id": 7,
+  "decision_id": "decision-fixture",
+  "strategic_goal": "Harass the Zerg mineral line",
+  "summary": "Move the Adept into range and focus a Drone.",
+  "commands": [
+    {
+      "command_id": "command-dark-attack",
+      "actor": "CombatGroup7/DarkTemplar-1",
+      "name": "Attack_Unit",
+      "arguments": ["0x101480001"],
+      "priority": 70,
+      "ttl_game_loops": 8,
+      "created_game_loop": 224,
+      "source": "planner",
+      "preconditions": {}
+    },
+    {
+      "command_id": "command-adept-move",
+      "actor": "CombatGroup7/Adept-1",
+      "name": "Move_Screen",
+      "arguments": [[48, 30]],
+      "priority": 65,
+      "ttl_game_loops": 8,
+      "created_game_loop": 224,
+      "source": "planner",
+      "preconditions": {}
+    },
+    {
+      "command_id": "command-adept-attack",
+      "actor": "CombatGroup7/Adept-1",
+      "name": "Attack_Unit",
+      "arguments": [4316463105],
+      "priority": 70,
+      "ttl_game_loops": 8,
+      "created_game_loop": 224,
+      "source": "planner",
+      "preconditions": {}
+    }
+  ],
+  "rejected_commands": []
+}

@@ -1,0 +1,42 @@
+{
+  "protocol_version": "1.1",
+  "run_id": "run-fixture",
+  "episode_id": "episode-pvz-task1",
+  "step_id": 7,
+  "decision_id": "decision-fixture",
+  "agent_name": "CombatGroup7",
+  "team_order": ["Adept-1", "AdeptPhase-1", "DarkTemplar-1"],
+  "commands": [
+    {
+      "command_id": "command-adept-move",
+      "actor": "CombatGroup7/Adept-1",
+      "team_name": "Adept-1",
+      "name": "Move_Screen",
+      "source": "planner",
+      "requested_arguments": [[48, 30]],
+      "resolved_arguments": [[48, 30]],
+      "rendered_action": "<Move_Screen([48,30])>"
+    },
+    {
+      "command_id": "command-adept-attack",
+      "actor": "CombatGroup7/Adept-1",
+      "team_name": "Adept-1",
+      "name": "Attack_Unit",
+      "source": "planner",
+      "requested_arguments": [4316463105],
+      "resolved_arguments": [4316463105],
+      "rendered_action": "<Attack_Unit(0x101480001)>"
+    },
+    {
+      "command_id": "command-dark-attack",
+      "actor": "CombatGroup7/DarkTemplar-1",
+      "team_name": "DarkTemplar-1",
+      "name": "Attack_Unit",
+      "source": "planner",
+      "requested_arguments": ["0x101480001"],
+      "resolved_arguments": ["0x101480001"],
+      "rendered_action": "<Attack_Unit(0x101480001)>"
+    }
+  ],
+  "action_text": "Actions:\n    Team Adept-1:\n        <Move_Screen([48,30])>\n        <Attack_Unit(0x101480001)>\n    Team AdeptPhase-1:\n        <No_Operation()>\n    Team DarkTemplar-1:\n        <Attack_Unit(0x101480001)>"
+}

@@ -1,0 +1,206 @@
+diff --git a/llm_pysc2/agents/llm_pysc2_agent.py b/llm_pysc2/agents/llm_pysc2_agent.py
+index 4fe7462..37d0799 100644
+--- a/llm_pysc2/agents/llm_pysc2_agent.py
++++ b/llm_pysc2/agents/llm_pysc2_agent.py
+@@ -22,7 +22,6 @@ from loguru import logger
+ import threading
+ import time
+ import json
+-import math
+ import os
+ 
+ 
+@@ -220,40 +219,14 @@ class LLMAgent:
+ 
+     # store all the raw unit by tags
+     self.unit_raw_list = []
+-    raw_unit_tags = set()
+     for unit in obs.observation.raw_units:
+-      raw_unit_tags.add(unit.tag)
+       if unit.tag in self.unit_tag_list:
+         self.unit_raw_list.append(unit)
+ 
+-    # delete dead units and change head unit to the closest one (if former head unit dead)
++    # MainAgent confirms unit death across observations before removing team members.
++    # A unit may temporarily disappear from raw_units while it is in gas or transport.
+     for team in self.teams:
+-      for unit_tag in team['unit_tags']:
+-        if unit_tag not in raw_unit_tags and unit_tag == team['unit_tags'][0]:
+-          unit_r = None
+-          unit_h = None
+-          dist_min = 99999
+-          for unit in self.unit_raw_list:
+-            if unit.tag == unit_tag:
+-              unit_r = unit
+-          if unit_r is None:
+-            logger.warning(
+-              f"[ID {self.log_id}] Agent {self.name} team {team['name']} head unit {unit_tag} do not exist")
+-            team['unit_tags'].remove(unit_tag)
+-            continue
+-          for unit in self.unit_raw_list:
+-            if unit.tag in self.unit_tag_list and unit.tag in team['unit_tags']:
+-              dist = math.sqrt((unit.x - unit_r.x) ** 2 + (unit.y - unit_r.y) ** 2)
+-              if dist < dist_min:
+-                dist_min = dist
+-                unit_h = unit
+-          if unit_h is not None:
+-            team['unit_tags'].remove(unit_h.tag)
+-            team['unit_tags'] = [unit_h.tag] + team['unit_tags']
+-
+-        if unit_tag not in raw_unit_tags:
+-          team['unit_tags'].remove(unit_tag)
+-        team['unit_tags'] = list(set(team['unit_tags']))
++      team['unit_tags'] = list(dict.fromkeys(team['unit_tags']))
+ 
+     # clear communication info for disabled agent
+     if not self.enable:
+diff --git a/llm_pysc2/agents/llm_pysc2_agent_main.py b/llm_pysc2/agents/llm_pysc2_agent_main.py
+index 8a52b53..d65e8d1 100644
+--- a/llm_pysc2/agents/llm_pysc2_agent_main.py
++++ b/llm_pysc2/agents/llm_pysc2_agent_main.py
+@@ -370,18 +370,13 @@ class MainAgent(base_agent.BaseAgent):
+               logger.error(f"[ID {self.log_id}] Agent {agent_name}: unit of tag {tag} not found")
+               logger.error(f"[ID {self.log_id}]                     relative team = {team}")
+               logger.error(f"[ID {self.log_id}] unit_f is None")
+-              if any(unit.tag == tag for unit in obs.observation.raw_units):
++              if tag not in self.unit_uid_disappear:
+                 logger.warning(
+-                  f"[ID {self.log_id}] Agent {agent_name}: raw unit {tag} still exists; "
+-                  "wait one observation for feature visibility")
++                  f"[ID {self.log_id}] Agent {agent_name}: unit {tag} is temporarily unavailable; "
++                  "wait for confirmed disappearance")
+                 func_id, func_call = (0, actions.FUNCTIONS.no_op())
+                 self.func_id_history.append(func_id)
+                 return func_call
+-              if tag in team['unit_tags']:
+-                team['unit_tags'].remove(tag)
+-              if tag in agent.unit_tag_list:
+-                agent.unit_tag_list.remove(tag)
+-              agent.update(obs)
+               continue
+ 
+             # Select unit
+@@ -506,7 +501,7 @@ class MainAgent(base_agent.BaseAgent):
+             logger.debug(f"[ID {self.log_id}] Agent {agent_name} status: 7.3.2")
+             team, tag = agent._get_unacted_team_and_unit_tag()
+             if tag == None:  # single select team, unit dead / multi select team, all unit dead, relese actions
+-              if len(agent.action_list) != 0:
++              if len(agent.action_list) != 0 and agent.curr_action_name != 'No_Operation':
+                 agent.last_execution_abort = {
+                   'team_name': agent.team_unit_team_curr,
+                   'action_name': agent.curr_action_name,
+@@ -545,15 +540,21 @@ class MainAgent(base_agent.BaseAgent):
+               if unit_f is None:
+                 logger.error(f"[ID {self.log_id}] 7.3.2.1 Agent {agent_name}: unit of tag {tag} not found")
+                 logger.error(f"[ID {self.log_id}]         relative team = {team['name']} {team['unit_tags']}")
+-                agent.last_execution_abort = {
+-                  'team_name': team['name'],
+-                  'action_name': agent.curr_action_name,
+-                  'actor_tag': tag,
+-                  'failure_code': 'actor_not_visible',
+-                  'failure_reason': 'team head unit is not visible before action translation',
+-                }
+-                agent.func_list = []
+-                agent.action_list = []
++                if tag in self.unit_uid_disappear:
++                  if agent.curr_action_name != 'No_Operation':
++                    agent.last_execution_abort = {
++                      'team_name': team['name'],
++                      'action_name': agent.curr_action_name,
++                      'actor_tag': tag,
++                      'failure_code': 'actor_not_available',
++                      'failure_reason': 'team head unit disappearance was confirmed before action translation',
++                    }
++                  agent.func_list = []
++                  agent.action_list = []
++                else:
++                  logger.warning(
++                    f"[ID {self.log_id}] Agent {agent_name}: unit {tag} is temporarily unavailable; "
++                    "keep the action pending")
+                 func_id, func_call = (0, actions.FUNCTIONS.no_op())
+                 self.func_id_history.append(func_id)
+                 return func_call
+diff --git a/llm_pysc2/agents/main_agent_funcs.py b/llm_pysc2/agents/main_agent_funcs.py
+index 5a68a87..9a7eb8e 100644
+--- a/llm_pysc2/agents/main_agent_funcs.py
++++ b/llm_pysc2/agents/main_agent_funcs.py
+@@ -334,8 +334,6 @@ def main_agent_func1(self, obs):
+   for unit in obs.observation.raw_units:
+     if unit.alliance == features.PlayerRelative.SELF and unit.build_progress == 100:
+       unit_uid_.append(unit.tag)
+-    if unit.tag in self.unit_uid and unit.tag not in unit_uid_:
+-      self.unit_uid_disappear.append(unit.tag)
+     if unit.tag not in self.unit_uid and unit.tag in unit_uid_:
+       self.unit_uid_appear.append(unit.tag)
+   # for tag in self.unit_uid:
+@@ -357,6 +355,12 @@ def main_agent_func1(self, obs):
+       if tag in self.unit_disappear_steps.keys():
+         self.unit_disappear_steps.pop(tag)
+ 
++  # Advance confirmed-death state on every observation. Waiting for a missing
++  # team head holds main_loop_lock, so gating this update on the lock deadlocks.
++  self.unit_uid_disappear = [
++    tag for tag, steps in self.unit_disappear_steps.items() if steps >= 40
++  ]
++
+   # 验证可能消失的单位是否真的消失了，只保留真正消失了的
+   # possible_disappear_unit_list_ = []
+   # possible_disappear_unit_tag_list_ = []
+@@ -400,12 +404,8 @@ def main_agent_func1(self, obs):
+       # 临时消失的单位：gas_building里面出来的单位/载具里面出来的单位
+       if (curr_unit.tag in self.unit_uid_appear) and (curr_unit.tag in self.unit_uid_total):
+         logger.info(f"[ID {self.log_id}] 3.1 {str(units.get_unit_type(curr_unit.unit_type))} {curr_unit.tag} re-appear")
+-        # print('--' * 25)
+-        # for agent_name in self.AGENT_NAMES:
+-        #     if curr_unit.tag in self.agents[agent_name].unit_tag_list_history:
+-        #         self.agents[agent_name].unit_tag_list.append(curr_unit.tag)
+-        # self.unit_uid_appear.remove(curr_unit.tag)
+-        # continue
++        self.unit_uid_appear.remove(curr_unit.tag)
++        continue
+ 
+       # 获取所属小组，若没有所属小组，直接处理掉
+       agent_name = get_new_unit_agent(self, obs, curr_unit)  # 编队逻辑在此函数中设置
+@@ -546,15 +546,9 @@ def main_agent_func1(self, obs):
+       else:
+         pass
+ 
+-  # 死亡单位的处理
++  # 死亡单位的经济管理状态只在外层自动管理阶段清理
+   if not self.main_loop_lock:
+-    for tag in self.unit_disappear_steps.keys():
+-      if self.unit_disappear_steps[tag] < 40:
+-        if tag in self.unit_uid_disappear:
+-          self.unit_uid_disappear.remove(tag)
+-      else:
+-        if tag not in self.unit_uid_disappear:
+-          self.unit_uid_disappear.append(tag)
++    for tag in self.unit_uid_disappear:
+       for key in self.nexus_info_dict.keys():
+         if tag in self.nexus_info_dict[key]['worker_m_tag_list']:
+           self.nexus_info_dict[key]['worker_m_tag_list'].remove(tag)
+@@ -565,15 +559,17 @@ def main_agent_func1(self, obs):
+         if tag in self.nexus_info_dict[key]['worker_g2_tag_list']:
+           self.nexus_info_dict[key]['worker_g2_tag_list'].remove(tag)
+ 
+-  # 死亡单位剔除出agent的unit_list
+-  if len(self.unit_disappear_steps.keys()) != 0:
++  # 只有连续消失40步后，才从agent和team中移除单位
++  if len(self.unit_uid_disappear) != 0:
+     for agent_name in self.AGENT_NAMES:
+       agent = self.agents[agent_name]
+-      unit_tag_list = []
+-      for tag in agent.unit_tag_list:
+-        if tag not in self.unit_disappear_steps.keys():
+-          unit_tag_list.append(tag)
+-      agent.unit_tag_list = unit_tag_list
++      agent.unit_tag_list = [
++        tag for tag in agent.unit_tag_list if tag not in self.unit_uid_disappear
++      ]
++      for team in agent.teams:
++        team['unit_tags'] = [
++          tag for tag in team['unit_tags'] if tag not in self.unit_uid_disappear
++        ]
+   # print(f"temp debug {self.unit_disappear_steps.keys()}")
+ 
+   self.unit_uid_total = set(list(self.unit_uid) + list(self.unit_uid_total))

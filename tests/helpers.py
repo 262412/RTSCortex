@@ -11,6 +11,7 @@ from rtscortex.config import (
     RuntimeSettings,
 )
 from rtscortex.contracts import (
+    ActionArgumentType,
     AvailableAction,
     EconomyState,
     ObservationEnvelope,
@@ -25,12 +26,14 @@ def make_config(
     variant: AgentVariant = "planner_reflection_memory_reflex",
     deterministic: bool = True,
     planner_timeout_seconds: float = 1.0,
+    planning_interval_game_loops: int = 16,
 ) -> ExperimentConfig:
     return ExperimentConfig(
         run=RunSettings(output_root=tmp_path, runtime_root=tmp_path / "runtime"),
         runtime=RuntimeSettings(
             deterministic=deterministic,
             planner_timeout_seconds=planner_timeout_seconds,
+            planning_interval_game_loops=planning_interval_game_loops,
         ),
         agent=AgentSettings(variant=variant),
         provider=ProviderSettings(kind="fake"),
@@ -39,6 +42,8 @@ def make_config(
 
 def make_observation(
     *,
+    run_id: str = "run-1",
+    episode_id: str = "episode-1",
     step_id: int = 0,
     game_loop: int = 0,
     alerts: list[str] | None = None,
@@ -48,7 +53,7 @@ def make_observation(
     enemies = (
         [
             UnitState(
-                unit_id="enemy-1",
+                unit_id="0x1",
                 unit_type="Zergling",
                 alliance="enemy",
                 health_fraction=1.0,
@@ -57,9 +62,24 @@ def make_observation(
         if include_enemy
         else []
     )
+    available_actions = [
+        AvailableAction(name="Retreat"),
+        AvailableAction(name="No_Operation", actor_scopes=["global"]),
+    ]
+    if enemies:
+        available_actions.insert(
+            0,
+            AvailableAction(
+                name="Attack_Unit",
+                argument_names=["tag"],
+                argument_types=[ActionArgumentType.TAG],
+                actor_scopes=["army"],
+                argument_candidates=[[enemies[0].unit_id]],
+            ),
+        )
     return ObservationEnvelope(
-        run_id="run-1",
-        episode_id="episode-1",
+        run_id=run_id,
+        episode_id=episode_id,
         step_id=step_id,
         game_loop=game_loop,
         state=SC2State(
@@ -75,10 +95,6 @@ def make_observation(
             visible_enemies=enemies,
         ),
         text_observation="A compact test observation.",
-        available_actions=[
-            AvailableAction(name="Attack_Unit", argument_names=["target"], actor_scopes=["army"]),
-            AvailableAction(name="Retreat"),
-            AvailableAction(name="No_Operation", actor_scopes=["global"]),
-        ],
+        available_actions=available_actions,
         alerts=alerts or [],
     )

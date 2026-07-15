@@ -1,6 +1,5 @@
-"""JSON transport and LLM-PySC2 text-action rendering."""
+"""HTTP transport for the versioned RTSCortex worker API."""
 
-import json
 from typing import Any, Optional, cast
 
 import httpx
@@ -23,7 +22,14 @@ class RuntimeClient:
     def health(self) -> dict[str, Any]:
         response = self.client.get("/healthz")
         response.raise_for_status()
-        return cast(dict[str, Any], response.json())
+        payload = cast(dict[str, Any], response.json())
+        protocol_version = payload.get("protocol_version")
+        if protocol_version != "1.1":
+            raise RuntimeError(
+                "RTSCortex live protocol mismatch: "
+                f"worker requires 1.1, runtime reported {protocol_version!r}"
+            )
+        return payload
 
     def tick(self, observation: dict[str, Any]) -> dict[str, Any]:
         response = self.client.post("/v1/tick", json=observation)
@@ -40,24 +46,3 @@ class RuntimeClient:
 
     def close(self) -> None:
         self.client.close()
-
-
-def render_action_batch(batch: dict[str, Any]) -> str:
-    """Render a validated ActionBatch in LLM-PySC2's Team/action text format."""
-
-    grouped: dict[str, list[dict[str, Any]]] = {}
-    for command in batch.get("commands", []):
-        grouped.setdefault(command["actor"], []).append(command)
-    lines = ["Actions:"]
-    for actor, commands in grouped.items():
-        lines.append(f"    Team {actor}:")
-        for command in commands:
-            arguments = ", ".join(_format_argument(value) for value in command["arguments"])
-            lines.append(f"        <{command['name']}({arguments})>")
-    return "\n".join(lines)
-
-
-def _format_argument(value: Any) -> str:
-    if isinstance(value, (list, dict)):
-        return json.dumps(value, separators=(",", ":"))
-    return str(value)

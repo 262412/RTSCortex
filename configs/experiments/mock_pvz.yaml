@@ -9,6 +9,7 @@ environment:
 runtime:
   deterministic: true
   planning_interval_game_loops: 16
+  planner_command_ttl_game_loops: 16
   planner_timeout_seconds: 15.0
   max_actions: 5
 agent:
@@ -25,5 +26,7 @@ provider:
   base_url: http://127.0.0.1:8000/v1
   api_key_env: RTSCORTEX_LLM_API_KEY
   timeout_seconds: 30.0
+  prompt_cost_per_million_tokens: 0.0
+  completion_cost_per_million_tokens: 0.0
 evaluation:
   seeds: [0, 1, 2]

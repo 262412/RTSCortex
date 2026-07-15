@@ -3,10 +3,25 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Literal, TypeAlias
+from typing import Any, Literal, TypeAlias
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+RaceName: TypeAlias = Literal["random", "protoss", "terran", "zerg"]
+BotDifficulty: TypeAlias = Literal[
+    "very_easy",
+    "easy",
+    "medium",
+    "medium_hard",
+    "hard",
+    "harder",
+    "very_hard",
+    "cheat_vision",
+    "cheat_money",
+    "cheat_insane",
+]
+BotBuild: TypeAlias = Literal["random", "rush", "timing", "power", "macro", "air"]
 
 
 class SettingsModel(BaseModel):
@@ -23,14 +38,39 @@ class EnvironmentSettings(SettingsModel):
     adapter: Literal["mock", "llm_pysc2"] = "mock"
     scenario: str = "pvz_task1_level1"
     max_steps: int = Field(default=6, ge=1)
+    agent_race: RaceName = "protoss"
+    opponent_race: RaceName = "random"
+    opponent_difficulty: BotDifficulty = "very_hard"
+    opponent_build: BotBuild = "random"
+    step_mul: int = Field(default=1, ge=1)
+    game_steps_per_episode: int | None = Field(default=None, ge=1)
+    simulation_speed_multiplier: float | None = Field(default=None, gt=0.0, le=1.0)
+    pause_until_first_plan: bool = False
     sc2_path: Path | None = None
+    worker_python: Path = Path("~/fastscratch/envs/rtscortex-llm-pysc2/bin/python")
+    pending_plan_step_delay_seconds: float = Field(default=0.0, ge=0.0)
+    action_effect_timeout_game_loops: int = Field(default=112, ge=1)
+    server_ready_timeout_seconds: float = Field(default=15.0, gt=0.0)
+    shutdown_timeout_seconds: float = Field(default=10.0, gt=0.0)
 
 
 class RuntimeSettings(SettingsModel):
     deterministic: bool = True
     planning_interval_game_loops: int = Field(default=16, ge=1)
+    planner_command_ttl_game_loops: int = Field(default=16, ge=1)
     planner_timeout_seconds: float = Field(default=15.0, gt=0.0)
     max_actions: int = Field(default=5, ge=1)
+
+    @model_validator(mode="before")
+    @classmethod
+    def default_command_ttl_to_planning_interval(cls, value: Any) -> Any:
+        if not isinstance(value, dict) or "planner_command_ttl_game_loops" in value:
+            return value
+        normalized = dict(value)
+        normalized["planner_command_ttl_game_loops"] = normalized.get(
+            "planning_interval_game_loops", 16
+        )
+        return normalized
 
 
 AgentVariant: TypeAlias = Literal[
@@ -55,16 +95,38 @@ class MemorySettings(SettingsModel):
     short_term_window: int = Field(default=20, ge=1)
 
 
+class ContextSettings(SettingsModel):
+    max_prompt_chars: int = Field(default=9_000, ge=2_000)
+    max_recent_events: int = Field(default=8, ge=1)
+    max_lessons: int = Field(default=6, ge=1)
+    max_episode_summaries: int = Field(default=1, ge=0)
+
+
 class ProviderSettings(SettingsModel):
     kind: Literal["fake", "openai_compatible"] = "fake"
     model: str = "fake-planner-v1"
     base_url: str = "http://127.0.0.1:8000/v1"
     api_key_env: str = "RTSCORTEX_LLM_API_KEY"
     timeout_seconds: float = Field(default=30.0, gt=0.0)
+    max_tokens: int | None = Field(default=None, ge=1)
+    enable_thinking: bool | None = None
+    prompt_cost_per_million_tokens: float = Field(default=0.0, ge=0.0)
+    completion_cost_per_million_tokens: float = Field(default=0.0, ge=0.0)
 
 
 class EvaluationSettings(SettingsModel):
-    seeds: list[int] = Field(default_factory=lambda: [0, 1, 2])
+    seeds: list[int] = Field(default_factory=lambda: [0, 1, 2], min_length=1)
+
+
+class ConsoleSettings(SettingsModel):
+    enabled: bool = False
+    port: int = Field(default=8765, ge=1, le=65_535)
+    frame_fps: float = Field(default=2.0, gt=0.0, le=30.0)
+    rgb_screen_size: int = Field(default=256, ge=64, le=2_048)
+    rgb_minimap_size: int = Field(default=128, ge=32, le=1_024)
+    jpeg_quality: int = Field(default=75, ge=1, le=95)
+    stale_after_seconds: float = Field(default=2.0, gt=0.0)
+    frontend_event_limit: int = Field(default=5_000, ge=100, le=100_000)
 
 
 class ExperimentConfig(SettingsModel):
@@ -74,8 +136,10 @@ class ExperimentConfig(SettingsModel):
     agent: AgentSettings = Field(default_factory=AgentSettings)
     reflex: ReflexSettings = Field(default_factory=ReflexSettings)
     memory: MemorySettings = Field(default_factory=MemorySettings)
+    context: ContextSettings = Field(default_factory=ContextSettings)
     provider: ProviderSettings = Field(default_factory=ProviderSettings)
     evaluation: EvaluationSettings = Field(default_factory=EvaluationSettings)
+    console: ConsoleSettings = Field(default_factory=ConsoleSettings)
 
     def expanded(self) -> ExperimentConfig:
         data = self.model_dump()
@@ -83,6 +147,7 @@ class ExperimentConfig(SettingsModel):
         data["run"]["runtime_root"] = self.run.runtime_root.expanduser()
         if self.environment.sc2_path is not None:
             data["environment"]["sc2_path"] = self.environment.sc2_path.expanduser()
+        data["environment"]["worker_python"] = self.environment.worker_python.expanduser()
         return ExperimentConfig.model_validate(data)
 
 

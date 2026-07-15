@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 from rtscortex.contracts import (
+    ActionArgumentType,
     ActionBatch,
     AvailableAction,
     EconomyState,
     EpisodeOutcome,
     ExecutionReport,
+    ExecutionStage,
+    ExecutionStatus,
     ObservationEnvelope,
     SC2State,
     UnitState,
@@ -60,6 +63,14 @@ class MockSC2Adapter:
                     step_id=actions.step_id,
                     command_id=command.command_id,
                     success=success,
+                    action_name=command.name,
+                    actor=command.actor,
+                    source=command.source,
+                    requested_arguments=command.arguments,
+                    resolved_arguments=command.arguments,
+                    status=(ExecutionStatus.SUCCEEDED if success else ExecutionStatus.FAILED),
+                    execution_stage=ExecutionStage.PYSC2_ACCEPTANCE,
+                    failure_code=None if success else "unsupported_action",
                     failure_reason=None if success else "unsupported mock action",
                     pysc2_function=f"mock.{command.name}",
                     latency_ms=0.1,
@@ -82,12 +93,27 @@ class MockSC2Adapter:
         if self.enemy_health > 0:
             enemies.append(
                 UnitState(
-                    unit_id="zergling-1",
+                    unit_id="0x1001",
                     unit_type="Zergling",
                     alliance="enemy",
                     position=(20.0, 20.0),
                     health_fraction=self.enemy_health,
                 )
+            )
+        available_actions = [
+            AvailableAction(name="Retreat", argument_names=[]),
+            AvailableAction(name="No_Operation", argument_names=[], actor_scopes=["global"]),
+        ]
+        if enemies:
+            available_actions.insert(
+                0,
+                AvailableAction(
+                    name="Attack_Unit",
+                    argument_names=["tag"],
+                    argument_types=[ActionArgumentType.TAG],
+                    actor_scopes=["army"],
+                    argument_candidates=[[enemies[0].unit_id]],
+                ),
             )
         return ObservationEnvelope(
             run_id=self.run_id,
@@ -104,7 +130,7 @@ class MockSC2Adapter:
                 ),
                 own_units=[
                     UnitState(
-                        unit_id="adept-1",
+                        unit_id="0x2001",
                         unit_type="Adept",
                         alliance="self",
                         position=(10.0, 10.0),
@@ -116,13 +142,7 @@ class MockSC2Adapter:
             text_observation=(
                 f"Mock {self.scenario}: one Adept sees {len(enemies)} hostile unit(s)."
             ),
-            available_actions=[
-                AvailableAction(
-                    name="Attack_Unit", argument_names=["target_id"], actor_scopes=["army"]
-                ),
-                AvailableAction(name="Retreat", argument_names=[]),
-                AvailableAction(name="No_Operation", argument_names=[], actor_scopes=["global"]),
-            ],
+            available_actions=available_actions,
             alerts=["under_attack"] if enemies else [],
         )
 

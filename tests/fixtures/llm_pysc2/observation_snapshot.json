@@ -1,0 +1,88 @@
+{
+  "run_id": "run-fixture",
+  "episode_id": "episode-pvz-task1",
+  "step_id": 7,
+  "game_loop": 224,
+  "observed_at": "2026-07-13T12:00:00Z",
+  "player_common": {
+    "minerals": 375,
+    "vespene": 100,
+    "food_used": 34,
+    "food_cap": 46,
+    "food_workers": 20,
+    "food_army": 14
+  },
+  "production_queue": [
+    {
+      "name": "Adept",
+      "producer_tag": 4294967297,
+      "progress": 0.5
+    }
+  ],
+  "units": [
+    {
+      "tag": 4300734465,
+      "unit_type": "Adept",
+      "alliance": "self",
+      "is_structure": false,
+      "position": [42.0, 38.5],
+      "health": 112.0,
+      "health_max": 140.0,
+      "energy": null,
+      "status": "idle"
+    },
+    {
+      "tag": 4294967297,
+      "unit_type": "Nexus",
+      "alliance": "self",
+      "is_structure": true,
+      "position": [30.0, 30.0],
+      "health": 1000.0,
+      "health_max": 1000.0,
+      "energy": 40.0,
+      "status": "training"
+    },
+    {
+      "tag": 4316463105,
+      "unit_type": "Drone",
+      "alliance": "enemy",
+      "is_structure": false,
+      "position": [52.0, 32.0],
+      "health": 30.0,
+      "health_max": 40.0,
+      "energy": null,
+      "status": "visible"
+    }
+  ],
+  "upgrades": ["WarpGateResearch"],
+  "teams": [
+    {
+      "agent_name": "CombatGroup7",
+      "team_name": "Adept-1",
+      "available_actions": [
+        {"name": "No_Operation", "argument_names": [], "argument_types": [], "argument_candidates": null},
+        {"name": "Attack_Unit", "argument_names": ["tag"], "argument_types": ["tag"], "argument_candidates": [[4316463105]]},
+        {"name": "Move_Screen", "argument_names": ["screen"], "argument_types": ["position"], "argument_candidates": [[[48, 30]]]}
+      ]
+    },
+    {
+      "agent_name": "CombatGroup7",
+      "team_name": "AdeptPhase-1",
+      "available_actions": [
+        {"name": "No_Operation", "argument_names": [], "argument_types": [], "argument_candidates": null},
+        {"name": "Move_Screen", "argument_names": ["screen"], "argument_types": ["position"], "argument_candidates": [[[48, 30]]]}
+      ]
+    },
+    {
+      "agent_name": "CombatGroup7",
+      "team_name": "DarkTemplar-1",
+      "available_actions": [
+        {"name": "No_Operation", "argument_names": [], "argument_types": [], "argument_candidates": null},
+        {"name": "Attack_Unit", "argument_names": ["tag"], "argument_types": ["tag"], "argument_candidates": [[4316463105]]}
+      ]
+    }
+  ],
+  "text_observation": "Adept-1 sees an enemy Drone near the mineral line.",
+  "alerts": ["enemy_worker_visible"],
+  "image_uri": null
+}

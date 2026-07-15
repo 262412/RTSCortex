@@ -16,12 +16,30 @@ import yaml
 from rtscortex.api import create_app
 from rtscortex.cli.doctor import run_doctor
 from rtscortex.config import ExperimentConfig, load_config
-from rtscortex.evaluation import run_mock_episode, run_mock_suite
+from rtscortex.console import ConsoleSession, LiveConsoleHub, create_console_app
+from rtscortex.evaluation import (
+    ReportError,
+    RunReportArtifacts,
+    run_mock_episode,
+    run_mock_suite,
+    write_run_reports,
+)
 from rtscortex.evaluation.replay import replay_event_log
+from rtscortex.memory import EventStore, read_event_log
 from rtscortex.runtime.factory import build_runtime
+from rtscortex.runtime.live import (
+    LiveEnvironmentError,
+    LiveProcessSupervisor,
+    LiveWorkerSpec,
+    WorkerProcessError,
+    ensure_console_port_available,
+    live_socket_path,
+    prepare_live_worker,
+)
 
 app = typer.Typer(no_args_is_help=True, help="RTSCortex agent runtime")
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
+CONSOLE_STATIC_DIR = Path(__file__).resolve().parents[1] / "console" / "static"
 
 
 def _run_id(prefix: str) -> str:
@@ -38,15 +56,48 @@ def _snapshot_config(config: ExperimentConfig, run_dir: Path) -> None:
     )
 
 
+def _echo_report_artifacts(artifacts: RunReportArtifacts) -> None:
+    typer.echo(f"Timeline: {artifacts.timeline_path}")
+    typer.echo(f"Summary: {artifacts.summary_path}")
+
+
+def _write_run_reports_best_effort(run_dir: Path) -> None:
+    journal_path = run_dir / "events.jsonl"
+    try:
+        if not journal_path.is_file() or journal_path.stat().st_size == 0:
+            return
+        artifacts = write_run_reports(run_dir)
+    except Exception as error:
+        typer.echo(f"Warning: could not generate run reports: {error}", err=True)
+        return
+    _echo_report_artifacts(artifacts)
+
+
+def _require_console_static_dir() -> Path:
+    index = CONSOLE_STATIC_DIR / "index.html"
+    if not index.is_file():
+        raise typer.BadParameter(
+            "Live Console frontend assets are missing; run `npm ci && npm run build` "
+            "from web/live-console",
+            param_hint="--console",
+        )
+    return CONSOLE_STATIC_DIR
+
+
 @app.command()
 def doctor(
     require_sc2: Annotated[
         bool, typer.Option(help="Treat a missing StarCraft II installation as an error.")
     ] = False,
+    config_path: Annotated[
+        Path | None,
+        typer.Option("--config", exists=True, dir_okay=False, help="Live experiment config."),
+    ] = None,
 ) -> None:
     """Check the core environment, pinned submodule, and optional SC2 installation."""
 
-    checks = run_doctor(PROJECT_ROOT, require_sc2=require_sc2)
+    config = load_config(config_path) if config_path is not None else None
+    checks = run_doctor(PROJECT_ROOT, require_sc2=require_sc2, config=config)
     for check in checks:
         typer.echo(f"{check.status.upper():8} {check.name:16} {check.detail}")
     if any(check.status == "error" for check in checks):
@@ -56,32 +107,212 @@ def doctor(
 @app.command("run")
 def run_experiment(
     config_path: Annotated[Path, typer.Option("--config", exists=True, dir_okay=False)],
+    seed: Annotated[int | None, typer.Option("--seed", min=0)] = None,
+    console: Annotated[
+        bool,
+        typer.Option("--console", help="Serve the read-only Live Console for this run."),
+    ] = False,
+    console_port: Annotated[
+        int | None,
+        typer.Option("--console-port", min=1, max=65_535),
+    ] = None,
 ) -> None:
     """Run one configured episode."""
 
     config = load_config(config_path)
-    if config.environment.adapter != "mock":
-        raise typer.BadParameter("The v0.1 core currently executes only the mock adapter.")
+    if seed is not None:
+        config = config.model_copy(update={"run": config.run.model_copy(update={"seed": seed})})
+    console_enabled = config.console.enabled or console or console_port is not None
+    effective_console_port = console_port or config.console.port
+    config = config.model_copy(
+        update={
+            "console": config.console.model_copy(
+                update={"enabled": console_enabled, "port": effective_console_port}
+            )
+        }
+    )
+    console_static_dir: Path | None = None
+    if console_enabled:
+        if config.environment.adapter != "llm_pysc2":
+            raise typer.BadParameter(
+                "Live Console streaming requires environment.adapter=llm_pysc2; "
+                "use `rtscortex console RUN_DIR` for completed mock runs",
+                param_hint="--console",
+            )
+        try:
+            ensure_console_port_available(effective_console_port)
+        except LiveEnvironmentError as error:
+            raise typer.BadParameter(str(error), param_hint="--console-port") from error
+        console_static_dir = _require_console_static_dir()
     run_id = _run_id(config.agent.variant)
+    episode_id = "episode-0"
     run_dir = config.run.output_root / run_id
+    live_worker: LiveWorkerSpec | None = None
+    runtime_socket: Path | None = None
+    if config.environment.adapter == "llm_pysc2":
+        try:
+            live_worker = prepare_live_worker(config, PROJECT_ROOT)
+            runtime_socket = live_socket_path(config.run.runtime_root, run_id)
+        except LiveEnvironmentError as error:
+            raise typer.BadParameter(str(error), param_hint="--config") from error
     _snapshot_config(config, run_dir)
 
     async def execute() -> str:
         runtime = build_runtime(config, run_dir)
+        if live_worker is not None:
+            assert runtime_socket is not None
+            worker_environment = {
+                "SC2PATH": str(live_worker.sc2_path),
+                "RTSCORTEX_PENDING_PLAN_STEP_DELAY_SECONDS": str(
+                    config.environment.pending_plan_step_delay_seconds
+                ),
+                "RTSCORTEX_PAUSE_UNTIL_FIRST_PLAN": str(
+                    config.environment.pause_until_first_plan
+                ).lower(),
+                "RTSCORTEX_RUNTIME_REQUEST_TIMEOUT_SECONDS": str(
+                    config.runtime.planner_timeout_seconds + 5.0
+                ),
+                "RTSCORTEX_ACTION_EFFECT_TIMEOUT_GAME_LOOPS": str(
+                    config.environment.action_effect_timeout_game_loops
+                ),
+                "RTSCORTEX_CONSOLE_ENABLED": str(config.console.enabled).lower(),
+                "RTSCORTEX_CONSOLE_FRAME_FPS": str(config.console.frame_fps),
+                "RTSCORTEX_CONSOLE_JPEG_QUALITY": str(config.console.jpeg_quality),
+                "RTSCORTEX_CONSOLE_RGB_SCREEN_SIZE": str(config.console.rgb_screen_size),
+                "RTSCORTEX_CONSOLE_RGB_MINIMAP_SIZE": str(config.console.rgb_minimap_size),
+            }
+            if config.environment.simulation_speed_multiplier is not None:
+                worker_environment["RTSCORTEX_SIMULATION_SPEED_MULTIPLIER"] = str(
+                    config.environment.simulation_speed_multiplier
+                )
+            console_hub: LiveConsoleHub | None = None
+            console_api = None
+            if config.console.enabled:
+                session = ConsoleSession(
+                    run_id=run_id,
+                    episode_id=episode_id,
+                    status="starting",
+                    scenario=config.environment.scenario,
+                    seed=config.run.seed,
+                    model=config.provider.model,
+                    stale_after_seconds=config.console.stale_after_seconds,
+                    frontend_event_limit=config.console.frontend_event_limit,
+                )
+                console_hub = LiveConsoleHub(session)
+                assert console_static_dir is not None
+                console_api = create_console_app(
+                    runtime.store,
+                    session,
+                    console_hub,
+                    console_static_dir,
+                    frontend_event_limit=config.console.frontend_event_limit,
+                )
+            supervisor = LiveProcessSupervisor(
+                runtime=runtime,
+                run_id=run_id,
+                episode_id=episode_id,
+                scenario=config.environment.scenario,
+                seed=config.run.seed,
+                socket_path=runtime_socket,
+                worker_command=live_worker.command,
+                worker_environment=worker_environment,
+                console_hub=console_hub,
+                console_app=console_api,
+                console_port=(config.console.port if config.console.enabled else None),
+                run_dir=run_dir,
+                server_ready_timeout_seconds=(config.environment.server_ready_timeout_seconds),
+                shutdown_timeout_seconds=config.environment.shutdown_timeout_seconds,
+            )
+            result = await supervisor.run()
+            return result.model_dump_json(indent=2)
         try:
             result = await run_mock_episode(
                 config=config,
                 runtime=runtime,
                 run_id=run_id,
-                episode_id="episode-0",
+                episode_id=episode_id,
                 seed=config.run.seed,
             )
             return result.model_dump_json(indent=2)
         finally:
             await runtime.close()
 
-    typer.echo(asyncio.run(execute()))
+    try:
+        if config.console.enabled:
+            typer.echo(f"Live Console: http://127.0.0.1:{config.console.port}")
+            typer.echo(f"Run directory: {run_dir}")
+        output = asyncio.run(execute())
+    except WorkerProcessError as error:
+        _write_run_reports_best_effort(run_dir)
+        typer.echo(error.result.model_dump_json(indent=2), err=True)
+        typer.echo(f"Artifacts: {run_dir}", err=True)
+        raise typer.Exit(code=1) from error
+    except LiveEnvironmentError as error:
+        _write_run_reports_best_effort(run_dir)
+        typer.echo(f"Live run failed: {error}", err=True)
+        typer.echo(f"Artifacts: {run_dir}", err=True)
+        raise typer.Exit(code=1) from error
+    except BaseException:
+        _write_run_reports_best_effort(run_dir)
+        raise
+    _write_run_reports_best_effort(run_dir)
+    typer.echo(output)
     typer.echo(f"Artifacts: {run_dir}")
+
+
+@app.command("console")
+def serve_console(
+    run_dir: Annotated[Path, typer.Argument(exists=True, file_okay=False)],
+    port: Annotated[int, typer.Option(min=1, max=65_535)] = 8765,
+) -> None:
+    """Serve the read-only event history for a completed run."""
+
+    journal_path = run_dir / "events.jsonl"
+    database_path = run_dir / "events.sqlite3"
+    config_path = run_dir / "config.yaml"
+    missing = [
+        path.name for path in (journal_path, database_path, config_path) if not path.is_file()
+    ]
+    if missing:
+        raise typer.BadParameter(
+            f"run directory is missing: {', '.join(missing)}",
+            param_hint="RUN_DIR",
+        )
+    try:
+        first_event = next(iter(read_event_log(journal_path)))
+    except StopIteration as error:
+        raise typer.BadParameter("events.jsonl is empty", param_hint="RUN_DIR") from error
+    config = load_config(config_path)
+    try:
+        ensure_console_port_available(port)
+    except LiveEnvironmentError as error:
+        raise typer.BadParameter(str(error), param_hint="--port") from error
+    static_dir = _require_console_static_dir()
+    store = EventStore(database_path, journal_path)
+    session = ConsoleSession(
+        run_id=first_event.run_id,
+        episode_id=first_event.episode_id,
+        status="historical",
+        scenario=config.environment.scenario,
+        seed=config.run.seed,
+        model=config.provider.model,
+        stale_after_seconds=config.console.stale_after_seconds,
+        frontend_event_limit=config.console.frontend_event_limit,
+    )
+    hub = LiveConsoleHub(session)
+    console_api = create_console_app(
+        store,
+        session,
+        hub,
+        static_dir,
+        frontend_event_limit=config.console.frontend_event_limit,
+    )
+    typer.echo(f"Historical Console: http://127.0.0.1:{port}")
+    typer.echo("RGB history is unavailable because frames are not persisted.")
+    try:
+        uvicorn.run(console_api, host="127.0.0.1", port=port, log_level="info")
+    finally:
+        store.close()
 
 
 @app.command("eval")
@@ -93,9 +324,25 @@ def evaluate(
 
     config = load_config(config_path)
     target = output_dir or config.run.output_root / _run_id("evaluation")
-    summary = asyncio.run(run_mock_suite(config, target.expanduser()))
+    try:
+        summary = asyncio.run(run_mock_suite(config, target.expanduser()))
+    except FileExistsError as error:
+        raise typer.BadParameter(str(error), param_hint="--output-dir") from error
     typer.echo(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
     typer.echo(f"Artifacts: {target.expanduser()}")
+
+
+@app.command()
+def report(
+    run_dir: Annotated[Path, typer.Argument(exists=True, file_okay=False)],
+) -> None:
+    """Generate readable Markdown and machine-readable JSON run reports."""
+
+    try:
+        artifacts = write_run_reports(run_dir)
+    except ReportError as error:
+        raise typer.BadParameter(str(error), param_hint="RUN_DIR") from error
+    _echo_report_artifacts(artifacts)
 
 
 @app.command()

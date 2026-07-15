@@ -6,6 +6,35 @@ on:
   pull_request:
 
 jobs:
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web/live-console
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.11"
+      - name: Install Python console runtime
+        working-directory: .
+        run: uv sync --group dev
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/live-console/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm test
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+      - run: npm run test:e2e
+      - name: Verify packaged frontend is current
+        working-directory: .
+        run: git diff --exit-code -- src/rtscortex/console/static
+
   core:
     runs-on: ubuntu-latest
     steps:
@@ -20,4 +49,85 @@ jobs:
       - run: uv run ruff format --check .
       - run: uv run mypy
       - run: uv run pytest
+      - name: Verify wheel contains the Live Console
+        run: |
+          uv build --wheel --out-dir dist
+          uv run python - <<'PY'
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          wheel = next(Path("dist").glob("*.whl"))
+          with ZipFile(wheel) as archive:
+              names = archive.namelist()
+          assert "rtscortex/console/static/index.html" in names
+          assert any(
+              name.startswith("rtscortex/console/static/assets/") and name.endswith(".js")
+              for name in names
+          )
+          assert any(
+              name.startswith("rtscortex/console/static/assets/") and name.endswith(".css")
+              for name in names
+          )
+          PY
       - run: uv run rtscortex doctor
+
+  worker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.9"
+      - run: uv venv --python 3.9 .worker-venv
+      - run: >-
+          uv pip install --python .worker-venv/bin/python
+          -e integrations/llm_pysc2
+          -e third_party/LLM-PySC2
+      - name: Validate reviewed patch chain on Python 3.9
+        shell: bash
+        run: |
+          set -euo pipefail
+          patches=(
+            ../../integrations/llm_pysc2/patches/0001-return-noop-while-awaiting-runtime.patch
+            ../../integrations/llm_pysc2/patches/0002-pass-random-seed-to-sc2env.patch
+            ../../integrations/llm_pysc2/patches/0003-fix-build-feature-plane-coordinate-order.patch
+            ../../integrations/llm_pysc2/patches/0004-expose-structured-translation-results.patch
+            ../../integrations/llm_pysc2/patches/0005-fix-near-base-placement.patch
+            ../../integrations/llm_pysc2/patches/0006-report-pretranslation-action-aborts.patch
+            ../../integrations/llm_pysc2/patches/0007-preserve-transient-team-units.patch
+            ../../integrations/llm_pysc2/patches/0008-enforce-nexus-resource-clearance.patch
+            ../../integrations/llm_pysc2/patches/0009-use-exact-nexus-screen-scale.patch
+          )
+          applied=()
+          cleanup() {
+            for ((index=${#applied[@]} - 1; index >= 0; index--)); do
+              git -C third_party/LLM-PySC2 apply --reverse "${applied[index]}"
+            done
+          }
+          trap cleanup EXIT
+
+          for patch in "${patches[@]}"; do
+            git -C third_party/LLM-PySC2 apply --check "$patch"
+            git -C third_party/LLM-PySC2 apply "$patch"
+            applied+=("$patch")
+          done
+
+          .worker-venv/bin/python -m compileall -q \
+            integrations/llm_pysc2/src \
+            third_party/LLM-PySC2/llm_pysc2
+          PYGAME_HIDE_SUPPORT_PROMPT=1 .worker-venv/bin/python -c \
+            "import llm_pysc2.agents, pysc2, rtscortex_llm_pysc2.worker"
+          PYGAME_HIDE_SUPPORT_PROMPT=1 .worker-venv/bin/python \
+            integrations/llm_pysc2/tests/python39_contract_smoke.py
+          PYGAME_HIDE_SUPPORT_PROMPT=1 .worker-venv/bin/python -m unittest discover \
+            -s integrations/llm_pysc2/tests -p 'test_frame_stream.py' -v
+
+          # The legacy editable install writes build metadata into the submodule.
+          rm -rf -- third_party/LLM-PySC2/llm_pysc2.egg-info
+          cleanup
+          applied=()
+          trap - EXIT
+          git -C third_party/LLM-PySC2 diff --exit-code
+          test -z "$(git -C third_party/LLM-PySC2 status --short)"
