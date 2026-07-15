@@ -47,6 +47,34 @@ The worker must report `EpisodeResult` through `/v1/episode/end`. If it exits fi
 supervisor records a synthetic `truncated` result for exit status zero or an `error` result
 for a non-zero status, so incomplete live runs remain visible in evaluation artifacts.
 
+## Live Console observability path
+
+The optional Live Console is a read-only branch from the live process, not part of the
+control loop:
+
+```text
+LLM-PySC2 worker -- control JSON over UDS --> Runtime API
+        |                                      |
+        | latest RGB JPEG over UDS             | durable events
+        v                                      v
+   bounded frame queue -----------------> LiveConsoleHub
+                                               |
+                                  loopback HTTP/WebSocket
+                                               v
+                                      React Live Console
+```
+
+When enabled, the Worker encodes agent-visible RGB observations on a background thread.
+Its queue holds at most one pending frame, and the Hub retains only the latest screen and
+minimap in memory. Durable decision events remain in SQLite and JSONL, allowing a browser
+to backfill after reconnect; RGB frames are intentionally neither backfilled nor written to
+disk. The browser server binds to `127.0.0.1` and exposes only `/console/api/v1` read APIs.
+Tick, execution, episode, and frame-ingest requests remain private to the Unix socket.
+
+When disabled, RTSCortex does not request RGB planes, start the encoder or Hub, or bind a
+browser port. Console failure and slow or disconnected browsers cannot block the Worker or
+terminate the SC2 episode.
+
 ## Safety boundary
 
 Model responses are parsed into typed proposals. Every target or position action must select

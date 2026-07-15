@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import signal
+import socket
 import subprocess
 from collections.abc import Generator, Mapping, Sequence
 from dataclasses import dataclass
@@ -16,9 +17,11 @@ from typing import BinaryIO
 
 import httpx
 import uvicorn
+from fastapi import FastAPI
 
 from rtscortex.api import create_app
 from rtscortex.config import ExperimentConfig
+from rtscortex.console import LiveConsoleHub
 from rtscortex.contracts import EpisodeOutcome, EpisodeResult
 from rtscortex.runtime.engine import RuntimeEngine
 
@@ -228,6 +231,17 @@ def prepare_live_worker(
                 str(config.environment.game_steps_per_episode),
             ]
         )
+    if config.console.enabled:
+        command.extend(
+            [
+                "--rgb_screen_size",
+                str(config.console.rgb_screen_size),
+                "--rgb_minimap_size",
+                str(config.console.rgb_minimap_size),
+                "--action_space",
+                "FEATURES",
+            ]
+        )
     command.extend(
         [
             "--parallel",
@@ -265,6 +279,20 @@ def live_socket_path(runtime_root: Path, run_id: str) -> Path:
     return path
 
 
+def ensure_console_port_available(port: int) -> None:
+    """Fail before SC2 starts when the loopback console port is occupied."""
+
+    if not 1 <= port <= 65_535:
+        raise LiveEnvironmentError(f"invalid console port: {port}")
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind(("127.0.0.1", port))
+    except OSError as error:
+        raise LiveEnvironmentError(
+            f"Live Console port 127.0.0.1:{port} is unavailable: {error}"
+        ) from error
+
+
 class LiveProcessSupervisor:
     """Own the API server, worker process, and runtime for one live episode."""
 
@@ -280,11 +308,19 @@ class LiveProcessSupervisor:
         worker_command: Sequence[str],
         run_dir: Path,
         worker_environment: Mapping[str, str] | None = None,
+        console_hub: LiveConsoleHub | None = None,
+        console_app: FastAPI | None = None,
+        console_port: int | None = None,
         server_ready_timeout_seconds: float = 15.0,
         shutdown_timeout_seconds: float = 10.0,
     ) -> None:
         if not worker_command:
             raise ValueError("worker_command cannot be empty")
+        console_values = (console_hub, console_app, console_port)
+        if any(value is not None for value in console_values) and not all(
+            value is not None for value in console_values
+        ):
+            raise ValueError("console_hub, console_app, and console_port must be provided together")
         self.runtime = runtime
         self.run_id = run_id
         self.episode_id = episode_id
@@ -294,10 +330,15 @@ class LiveProcessSupervisor:
         self.worker_command = tuple(worker_command)
         self.run_dir = run_dir
         self.worker_environment = dict(worker_environment or {})
+        self.console_hub = console_hub
+        self.console_app = console_app
+        self.console_port = console_port
         self.server_ready_timeout_seconds = server_ready_timeout_seconds
         self.shutdown_timeout_seconds = shutdown_timeout_seconds
         self._server: uvicorn.Server | None = None
         self._server_task: asyncio.Task[None] | None = None
+        self._console_server: uvicorn.Server | None = None
+        self._console_server_task: asyncio.Task[None] | None = None
         self._worker: asyncio.subprocess.Process | None = None
         self._stdout: BinaryIO | None = None
         self._stderr: BinaryIO | None = None
@@ -308,6 +349,9 @@ class LiveProcessSupervisor:
 
         try:
             await self._start_server()
+            await self._start_console_server()
+            if self.console_hub is not None:
+                self.console_hub.set_status("running", episode_id=self.episode_id)
             await self._start_worker()
             return_code = await self._wait_for_worker()
             result = self._terminal_result()
@@ -317,10 +361,17 @@ class LiveProcessSupervisor:
                     outcome,
                     f"worker exited with status {return_code} before reporting an episode result",
                 )
+            if self.console_hub is not None:
+                if result.outcome is EpisodeOutcome.ERROR:
+                    self.console_hub.set_status("failed", episode_id=self.episode_id)
+                else:
+                    self.console_hub.set_status("completed", episode_id=self.episode_id)
             if return_code != 0:
                 raise WorkerProcessError(return_code, result)
             return result
         except asyncio.CancelledError:
+            if self.console_hub is not None:
+                self.console_hub.set_status("failed", episode_id=self.episode_id)
             await self._stop_worker()
             if self._terminal_result() is None:
                 self._record_synthetic_result(
@@ -329,6 +380,8 @@ class LiveProcessSupervisor:
                 )
             raise
         except BaseException as error:
+            if self.console_hub is not None:
+                self.console_hub.set_status("failed", episode_id=self.episode_id)
             await self._stop_worker()
             if self._terminal_result() is None:
                 self._record_synthetic_result(
@@ -338,6 +391,7 @@ class LiveProcessSupervisor:
             raise
         finally:
             await self._stop_worker()
+            await self._stop_console_server()
             await self._stop_server()
             await self.runtime.close()
 
@@ -346,7 +400,7 @@ class LiveProcessSupervisor:
         if self.socket_path.exists():
             raise LiveEnvironmentError(f"runtime socket already exists: {self.socket_path}")
         config = uvicorn.Config(
-            create_app(self.runtime),
+            create_app(self.runtime, console_hub=self.console_hub),
             uds=str(self.socket_path),
             log_level="warning",
             lifespan="off",
@@ -356,6 +410,23 @@ class LiveProcessSupervisor:
         self._server = _EmbeddedUvicornServer(config)
         self._server_task = asyncio.create_task(self._server.serve())
         await self._wait_until_ready()
+
+    async def _start_console_server(self) -> None:
+        if self.console_app is None or self.console_port is None:
+            return
+        ensure_console_port_available(self.console_port)
+        config = uvicorn.Config(
+            self.console_app,
+            host="127.0.0.1",
+            port=self.console_port,
+            log_level="warning",
+            lifespan="on",
+            access_log=False,
+            timeout_graceful_shutdown=max(1, round(self.shutdown_timeout_seconds)),
+        )
+        self._console_server = _EmbeddedUvicornServer(config)
+        self._console_server_task = asyncio.create_task(self._console_server.serve())
+        await self._wait_until_console_ready()
 
     async def _wait_until_ready(self) -> None:
         assert self._server_task is not None
@@ -379,6 +450,28 @@ class LiveProcessSupervisor:
                 await asyncio.sleep(0.05)
         raise LiveEnvironmentError(
             f"runtime API did not become ready within {self.server_ready_timeout_seconds}s"
+        )
+
+    async def _wait_until_console_ready(self) -> None:
+        assert self._console_server_task is not None
+        assert self.console_port is not None
+        deadline = asyncio.get_running_loop().time() + self.server_ready_timeout_seconds
+        async with httpx.AsyncClient(timeout=0.5) as client:
+            while asyncio.get_running_loop().time() < deadline:
+                if self._console_server_task.done():
+                    await self._console_server_task
+                    raise LiveEnvironmentError("Live Console stopped before becoming ready")
+                try:
+                    response = await client.get(
+                        f"http://127.0.0.1:{self.console_port}/console/api/v1/health"
+                    )
+                    if response.status_code == 200:
+                        return
+                except httpx.HTTPError:
+                    pass
+                await asyncio.sleep(0.05)
+        raise LiveEnvironmentError(
+            f"Live Console did not become ready within {self.server_ready_timeout_seconds}s"
         )
 
     async def _start_worker(self) -> None:
@@ -461,6 +554,22 @@ class LiveProcessSupervisor:
             except (Exception, asyncio.CancelledError):
                 pass
         self.socket_path.unlink(missing_ok=True)
+
+    async def _stop_console_server(self) -> None:
+        if self._console_server is not None:
+            self._console_server.should_exit = True
+        if self._console_server_task is not None:
+            try:
+                await asyncio.wait_for(
+                    self._console_server_task,
+                    timeout=self.shutdown_timeout_seconds,
+                )
+            except TimeoutError:
+                self._console_server_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self._console_server_task
+            except (Exception, asyncio.CancelledError):
+                pass
 
     def _close_worker_logs(self) -> None:
         if self._stdout is not None:

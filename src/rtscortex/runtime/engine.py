@@ -1032,12 +1032,21 @@ class RuntimeEngine:
         context: AgentContext,
     ) -> ModuleResult:
         started = time.perf_counter()
+        self._record_planner_event(
+            context.observation,
+            "module_started",
+            {
+                "module": module.name,
+                "provider": self.config.provider.kind,
+                "model": self.config.provider.model,
+            },
+        )
         try:
             result = await module.run(context)
         except Exception as error:
             self._record_planner_event(
                 context.observation,
-                "module_error",
+                "module_failed",
                 {
                     "module": module.name,
                     "latency_ms": (time.perf_counter() - started) * 1000,
@@ -1046,6 +1055,28 @@ class RuntimeEngine:
                 },
             )
             raise
+        context_statistics = result.updates.get("context_compaction")
+        if isinstance(context_statistics, dict):
+            original_chars = int(context_statistics.get("original_chars", 0))
+            final_chars = int(context_statistics.get("final_chars", 0))
+            compression_ratio = (
+                round(min(1.0, final_chars / original_chars), 4) if original_chars > 0 else 1.0
+            )
+            self._record_planner_event(
+                context.observation,
+                "context_prepared",
+                {
+                    "module": module.name,
+                    "provider": self.config.provider.kind,
+                    "model": self.config.provider.model,
+                    "prompt_version": "v0.1",
+                    "original_chars": original_chars,
+                    "final_chars": final_chars,
+                    "estimated_tokens": (final_chars + 3) // 4,
+                    "compression_ratio": compression_ratio,
+                    "statistics": context_statistics,
+                },
+            )
         payload: dict[str, Any] = {
             "module": module.name,
             "latency_ms": (time.perf_counter() - started) * 1000,

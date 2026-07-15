@@ -118,6 +118,17 @@ class EvaluationSettings(SettingsModel):
     seeds: list[int] = Field(default_factory=lambda: [0, 1, 2], min_length=1)
 
 
+class ConsoleSettings(SettingsModel):
+    enabled: bool = False
+    port: int = Field(default=8765, ge=1, le=65_535)
+    frame_fps: float = Field(default=2.0, gt=0.0, le=30.0)
+    rgb_screen_size: int = Field(default=256, ge=64, le=2_048)
+    rgb_minimap_size: int = Field(default=128, ge=32, le=1_024)
+    jpeg_quality: int = Field(default=75, ge=1, le=95)
+    stale_after_seconds: float = Field(default=2.0, gt=0.0)
+    frontend_event_limit: int = Field(default=5_000, ge=100, le=100_000)
+
+
 class ExperimentConfig(SettingsModel):
     run: RunSettings = Field(default_factory=RunSettings)
     environment: EnvironmentSettings = Field(default_factory=EnvironmentSettings)
@@ -128,6 +139,7 @@ class ExperimentConfig(SettingsModel):
     context: ContextSettings = Field(default_factory=ContextSettings)
     provider: ProviderSettings = Field(default_factory=ProviderSettings)
     evaluation: EvaluationSettings = Field(default_factory=EvaluationSettings)
+    console: ConsoleSettings = Field(default_factory=ConsoleSettings)
 
     def expanded(self) -> ExperimentConfig:
         data = self.model_dump()

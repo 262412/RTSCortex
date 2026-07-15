@@ -40,4 +40,15 @@ def main() -> None:
     game_steps_per_episode = os.environ.get("RTSCORTEX_GAME_STEPS_PER_EPISODE")
     if game_steps_per_episode is not None:
         command.extend(["--game_steps_per_episode", game_steps_per_episode])
+    if os.environ.get("RTSCORTEX_CONSOLE_ENABLED", "false").strip().lower() == "true":
+        command.extend(
+            [
+                "--rgb_screen_size",
+                os.environ.get("RTSCORTEX_CONSOLE_RGB_SCREEN_SIZE", "256"),
+                "--rgb_minimap_size",
+                os.environ.get("RTSCORTEX_CONSOLE_RGB_MINIMAP_SIZE", "128"),
+                "--action_space",
+                "FEATURES",
+            ]
+        )
     subprocess.run(command, check=True)

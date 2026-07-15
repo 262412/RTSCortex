@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -52,9 +52,15 @@ class EventStore:
         self.database_path = database_path
         self.journal_path = journal_path
         self._lock = threading.Lock()
+        self._reader_lock = threading.Lock()
+        self._subscriber_lock = threading.Lock()
+        self._subscribers: dict[int, Callable[[StoredEvent], None]] = {}
+        self._next_subscriber_id = 0
         self._connection = sqlite3.connect(database_path, check_same_thread=False)
         self._connection.row_factory = sqlite3.Row
         self._initialize()
+        self._reader_connection = sqlite3.connect(database_path, check_same_thread=False)
+        self._reader_connection.row_factory = sqlite3.Row
 
     def _initialize(self) -> None:
         self._connection.executescript(
@@ -133,7 +139,83 @@ class EventStore:
                 journal.write(
                     json.dumps(record.__dict__, ensure_ascii=False, sort_keys=True) + "\n"
                 )
+            # Sinks enqueue only; publishing under the write lock preserves event-id order.
+            self._publish(record)
         return record
+
+    def subscribe(self, subscriber: Callable[[StoredEvent], None]) -> Callable[[], None]:
+        """Subscribe a non-blocking event sink and return its unsubscribe function.
+
+        Subscribers run after the event is durable. Their failures never affect the
+        runtime write path. Subscribers should only enqueue work and return immediately.
+        """
+
+        with self._subscriber_lock:
+            subscriber_id = self._next_subscriber_id
+            self._next_subscriber_id += 1
+            self._subscribers[subscriber_id] = subscriber
+
+        def unsubscribe() -> None:
+            with self._subscriber_lock:
+                self._subscribers.pop(subscriber_id, None)
+
+        return unsubscribe
+
+    def _publish(self, event: StoredEvent) -> None:
+        with self._subscriber_lock:
+            subscribers = tuple(self._subscribers.values())
+        for subscriber in subscribers:
+            try:
+                subscriber(event)
+            except Exception:
+                # Console and other observers are best-effort and must never stop a run.
+                continue
+
+    def events_after(
+        self,
+        run_id: str,
+        after_event_id: int,
+        limit: int,
+        *,
+        episode_id: str | None = None,
+    ) -> list[StoredEvent]:
+        """Return persisted events after an event id in ascending order."""
+
+        if after_event_id < 0:
+            raise ValueError("after_event_id must be non-negative")
+        if limit < 1:
+            raise ValueError("limit must be positive")
+        if episode_id is None:
+            query = """
+                SELECT * FROM events
+                WHERE run_id = ? AND event_id > ?
+                ORDER BY event_id LIMIT ?
+            """
+            parameters: tuple[object, ...] = (run_id, after_event_id, limit)
+        else:
+            query = """
+                SELECT * FROM events
+                WHERE run_id = ? AND episode_id = ? AND event_id > ?
+                ORDER BY event_id LIMIT ?
+            """
+            parameters = (run_id, episode_id, after_event_id, limit)
+        with self._reader_lock:
+            rows = self._reader_connection.execute(query, parameters).fetchall()
+        return [self._row_to_event(row) for row in rows]
+
+    def latest_event_id(self, run_id: str, *, episode_id: str | None = None) -> int:
+        if episode_id is None:
+            query = "SELECT MAX(event_id) AS event_id FROM events WHERE run_id = ?"
+            parameters: tuple[object, ...] = (run_id,)
+        else:
+            query = """
+                SELECT MAX(event_id) AS event_id FROM events
+                WHERE run_id = ? AND episode_id = ?
+            """
+            parameters = (run_id, episode_id)
+        with self._reader_lock:
+            row = self._reader_connection.execute(query, parameters).fetchone()
+        return 0 if row is None or row["event_id"] is None else int(row["event_id"])
 
     def recent_events(self, run_id: str, episode_id: str, limit: int) -> list[StoredEvent]:
         rows = self._connection.execute(
@@ -305,6 +387,9 @@ class EventStore:
         ]
 
     def close(self) -> None:
+        with self._subscriber_lock:
+            self._subscribers.clear()
+        self._reader_connection.close()
         self._connection.close()
 
 

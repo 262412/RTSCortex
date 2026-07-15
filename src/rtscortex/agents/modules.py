@@ -61,7 +61,12 @@ def _compact_event(event: StoredEvent) -> dict[str, Any] | None:
             **compact_execution_payload(event.payload),
             "step_id": event.step_id,
         }
-    if event.event_type in {"planner_error", "planner_timeout", "module_error"}:
+    if event.event_type in {
+        "planner_error",
+        "planner_timeout",
+        "module_error",
+        "module_failed",
+    }:
         return {
             "event_type": event.event_type,
             "step_id": event.step_id,

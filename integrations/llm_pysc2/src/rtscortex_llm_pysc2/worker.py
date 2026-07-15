@@ -35,6 +35,7 @@ from rtscortex_llm_pysc2.extractor import (
     screen_build_position_is_legal,
     semantic_argument_candidates,
 )
+from rtscortex_llm_pysc2.frame_stream import RGBFramePublisher, RuntimeFrameUploader
 from rtscortex_llm_pysc2.hook import RuntimeQueryMixin
 from rtscortex_llm_pysc2.protocol import RuntimeClient
 
@@ -63,6 +64,9 @@ class WorkerSettings:
     pause_until_first_plan: bool = False
     runtime_request_timeout_seconds: float = 60.0
     action_effect_timeout_game_loops: int = DEFAULT_ACTION_EFFECT_TIMEOUT_GAME_LOOPS
+    console_enabled: bool = False
+    console_frame_fps: float = 2.0
+    console_jpeg_quality: int = 75
 
     @classmethod
     def from_environment(cls) -> WorkerSettings:
@@ -90,6 +94,13 @@ class WorkerSettings:
         if action_effect_timeout_game_loops <= 0:
             raise RuntimeError("RTSCORTEX_ACTION_EFFECT_TIMEOUT_GAME_LOOPS must be positive")
         pause_until_first_plan = _environment_bool("RTSCORTEX_PAUSE_UNTIL_FIRST_PLAN", False)
+        console_enabled = _environment_bool("RTSCORTEX_CONSOLE_ENABLED", False)
+        console_frame_fps = float(os.environ.get("RTSCORTEX_CONSOLE_FRAME_FPS", "2"))
+        if console_frame_fps <= 0:
+            raise RuntimeError("RTSCORTEX_CONSOLE_FRAME_FPS must be positive")
+        console_jpeg_quality = int(os.environ.get("RTSCORTEX_CONSOLE_JPEG_QUALITY", "75"))
+        if not 1 <= console_jpeg_quality <= 95:
+            raise RuntimeError("RTSCORTEX_CONSOLE_JPEG_QUALITY must be between 1 and 95")
         return cls(
             run_id=run_id,
             episode_id=episode_id,
@@ -105,6 +116,9 @@ class WorkerSettings:
             pause_until_first_plan=pause_until_first_plan,
             runtime_request_timeout_seconds=runtime_request_timeout_seconds,
             action_effect_timeout_game_loops=action_effect_timeout_game_loops,
+            console_enabled=console_enabled,
+            console_frame_fps=console_frame_fps,
+            console_jpeg_quality=console_jpeg_quality,
         )
 
 
@@ -437,6 +451,7 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
     def __init__(self) -> None:
         _require_upstream()
         self.worker_settings = WorkerSettings.from_environment()
+        self._frame_publisher: Optional[RGBFramePublisher] = None
         self.runtime_client = RuntimeClient(
             base_url=self.worker_settings.runtime_url,
             unix_socket=self.worker_settings.socket_path,
@@ -482,15 +497,30 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
         )
         super().__init__(config, subagent)
         _apply_scenario_bootstrap(self, self.worker_settings.scenario)
+        if self.worker_settings.console_enabled:
+            self._frame_publisher = RGBFramePublisher(
+                uploader=RuntimeFrameUploader(
+                    run_id=self.worker_settings.run_id,
+                    episode_id=self.worker_settings.episode_id,
+                    base_url=self.worker_settings.runtime_url,
+                    unix_socket=self.worker_settings.socket_path,
+                ),
+                frame_fps=self.worker_settings.console_frame_fps,
+                jpeg_quality=self.worker_settings.console_jpeg_quality,
+            )
 
     def step(self, obs: Any) -> Any:
         try:
             return self._step(obs)
         except Exception as error:
-            self._report_error_episode(error)
+            try:
+                self._report_error_episode(error)
+            finally:
+                self._close_frame_publisher()
             raise
 
     def _step(self, obs: Any) -> Any:
+        self._submit_console_frame(obs)
         self._settle_previous_primitive(obs)
         self.decision_broker.observe_effects(obs.observation)
         if _is_terminal(obs):
@@ -528,6 +558,27 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
         elif delay:
             time.sleep(delay)
         return action
+
+    def _submit_console_frame(self, obs: Any) -> None:
+        publisher = self._frame_publisher
+        if publisher is None:
+            return
+        try:
+            publisher.submit(
+                obs.observation,
+                step_id=int(self.steps),
+                game_loop=_observation_game_loop(obs.observation),
+            )
+        except Exception:
+            # Console telemetry is best-effort and cannot fail an environment step.
+            return
+
+    def _close_frame_publisher(self) -> None:
+        publisher = self._frame_publisher
+        if publisher is None:
+            return
+        self._frame_publisher = None
+        publisher.close()
 
     def _consume_execution_aborts(self, obs: Any) -> None:
         for agent in self.agents.values():
@@ -1277,7 +1328,12 @@ def _finish_terminal(
         try:
             agent._report_episode(obs)
         finally:
-            agent.runtime_client.close()
+            try:
+                close_frames = getattr(agent, "_close_frame_publisher", None)
+                if callable(close_frames):
+                    close_frames()
+            finally:
+                agent.runtime_client.close()
     return no_op()
 
 

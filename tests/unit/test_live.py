@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 from rtscortex_llm_pysc2 import entrypoint as worker_entrypoint
 
-from rtscortex.config import EnvironmentSettings
+from rtscortex.config import ConsoleSettings, EnvironmentSettings
 from rtscortex.runtime.live import LiveEnvironmentError, prepare_live_worker
 from tests.helpers import make_config
 
@@ -249,6 +249,20 @@ def test_prepare_live_worker_builds_official_melee_bot_command(tmp_path: Path) -
         "--random_seed",
         "0",
     )
+
+    console_config = config.model_copy(
+        update={
+            "console": ConsoleSettings(
+                enabled=True,
+                rgb_screen_size=320,
+                rgb_minimap_size=160,
+            )
+        }
+    )
+    console_spec = prepare_live_worker(console_config, tmp_path, environment={})
+    assert console_spec.command[console_spec.command.index("--rgb_screen_size") + 1] == "320"
+    assert console_spec.command[console_spec.command.index("--rgb_minimap_size") + 1] == "160"
+    assert console_spec.command[console_spec.command.index("--action_space") + 1] == "FEATURES"
 
 
 def test_worker_entrypoint_forwards_melee_environment(

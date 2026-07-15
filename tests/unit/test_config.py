@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from rtscortex.config import EnvironmentSettings, RuntimeSettings
+from rtscortex.config import ConsoleSettings, EnvironmentSettings, ExperimentConfig, RuntimeSettings
 
 
 def test_environment_settings_accept_melee_runtime_controls() -> None:
@@ -55,3 +55,28 @@ def test_runtime_command_ttl_can_be_configured_independently() -> None:
     )
 
     assert settings.planner_command_ttl_game_loops == 64
+
+
+def test_console_settings_are_disabled_and_bounded_by_default() -> None:
+    settings = ExperimentConfig().console
+
+    assert settings == ConsoleSettings()
+    assert settings.enabled is False
+    assert settings.port == 8765
+    assert settings.frame_fps == 2.0
+    assert settings.frontend_event_limit == 5_000
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("port", 0),
+        ("frame_fps", 0),
+        ("jpeg_quality", 96),
+        ("stale_after_seconds", 0),
+        ("frontend_event_limit", 99),
+    ],
+)
+def test_console_settings_reject_invalid_values(field: str, value: int) -> None:
+    with pytest.raises(ValidationError):
+        ConsoleSettings.model_validate({field: value})

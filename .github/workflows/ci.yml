@@ -6,6 +6,35 @@ on:
   pull_request:
 
 jobs:
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web/live-console
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.11"
+      - name: Install Python console runtime
+        working-directory: .
+        run: uv sync --group dev
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/live-console/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm test
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+      - run: npm run test:e2e
+      - name: Verify packaged frontend is current
+        working-directory: .
+        run: git diff --exit-code -- src/rtscortex/console/static
+
   core:
     runs-on: ubuntu-latest
     steps:
@@ -20,6 +49,26 @@ jobs:
       - run: uv run ruff format --check .
       - run: uv run mypy
       - run: uv run pytest
+      - name: Verify wheel contains the Live Console
+        run: |
+          uv build --wheel --out-dir dist
+          uv run python - <<'PY'
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          wheel = next(Path("dist").glob("*.whl"))
+          with ZipFile(wheel) as archive:
+              names = archive.namelist()
+          assert "rtscortex/console/static/index.html" in names
+          assert any(
+              name.startswith("rtscortex/console/static/assets/") and name.endswith(".js")
+              for name in names
+          )
+          assert any(
+              name.startswith("rtscortex/console/static/assets/") and name.endswith(".css")
+              for name in names
+          )
+          PY
       - run: uv run rtscortex doctor
 
   worker:
@@ -72,6 +121,8 @@ jobs:
             "import llm_pysc2.agents, pysc2, rtscortex_llm_pysc2.worker"
           PYGAME_HIDE_SUPPORT_PROMPT=1 .worker-venv/bin/python \
             integrations/llm_pysc2/tests/python39_contract_smoke.py
+          PYGAME_HIDE_SUPPORT_PROMPT=1 .worker-venv/bin/python -m unittest discover \
+            -s integrations/llm_pysc2/tests -p 'test_frame_stream.py' -v
 
           cleanup
           applied=()

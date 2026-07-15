@@ -27,7 +27,12 @@ root. Pass `--tcp` to use loopback TCP instead.
 
 The recommended compute-center live configurations are
 `configs/experiments/live_simple64.yaml` and
-`configs/experiments/live_simple64_qwen3_8b.yaml`. They run a Protoss agent against a
+`configs/experiments/live_simple64_qwen3_8b.yaml`. The companion
+`configs/experiments/live_simple64_qwen3_8b_console.yaml` supplies the RGB and browser
+settings for the read-only Live Console. Enable it explicitly with
+`rtscortex run --console`; see
+[the Live Console guide](docs/live-console.md) for SSH port forwarding, RGB-frame
+semantics, and the non-persistence boundary. These configurations run a Protoss agent against a
 VeryEasy Zerg built-in bot using the Macro build on the SC2 4.10-compatible `Simple64`
 Ladder/Melee map. Both use `step_mul=1`, a fixed 0.25x simulation rate (5.6 game loops
 per wall-clock second), and pause SC2 until the first plan is ready; later planning is

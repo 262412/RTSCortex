@@ -31,6 +31,32 @@ from rtscortex.runtime.validation import ValidationDisposition, ValidationFailur
 from tests.helpers import make_config, make_observation
 
 
+def test_console_setting_does_not_change_deterministic_action_batch(tmp_path: Path) -> None:
+    async def decide(*, console_enabled: bool, suffix: str) -> dict[str, Any]:
+        config = make_config(tmp_path / suffix)
+        config = config.model_copy(
+            update={"console": config.console.model_copy(update={"enabled": console_enabled})}
+        )
+        runtime = RuntimeEngine(
+            config=config,
+            store=EventStore(
+                tmp_path / suffix / "events.sqlite3",
+                tmp_path / suffix / "events.jsonl",
+            ),
+            provider=FakeProvider(),
+        )
+        try:
+            batch = await runtime.tick(make_observation())
+            return batch.model_dump(mode="json")
+        finally:
+            await runtime.close()
+
+    disabled = asyncio.run(decide(console_enabled=False, suffix="disabled"))
+    enabled = asyncio.run(decide(console_enabled=True, suffix="enabled"))
+
+    assert enabled == disabled
+
+
 class SlowSecondPlanProvider:
     calls = 0
 
@@ -370,6 +396,22 @@ def test_mock_episode_runs_full_module_chain(tmp_path: Path) -> None:
                 ("planning", True),
                 ("action", False),
             ]
+            module_started = [
+                event.payload["module"]
+                for event in store.recent_events("integration-run", "episode-0", 80)
+                if event.event_type == "module_started" and event.step_id == 0
+            ]
+            assert module_started == ["memory", "reflection", "planning", "action"]
+            context_events = [
+                event
+                for event in store.recent_events("integration-run", "episode-0", 80)
+                if event.event_type == "context_prepared" and event.step_id == 0
+            ]
+            assert len(context_events) == 1
+            assert context_events[0].payload["module"] == "planning"
+            assert context_events[0].payload["final_chars"] > 0
+            assert context_events[0].payload["estimated_tokens"] > 0
+            assert 0 < context_events[0].payload["compression_ratio"] <= 1
             planning_event = next(
                 event
                 for event in store.recent_events("integration-run", "episode-0", 50)

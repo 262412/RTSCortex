@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
 
 from rtscortex.api import create_app
+from rtscortex.console import ConsoleSession, LiveConsoleHub
 from rtscortex.contracts import (
     ActionSource,
     EpisodeOutcome,
@@ -99,6 +101,62 @@ def test_live_api_rejects_legacy_protocol(tmp_path: Path) -> None:
                 response = await client.post("/v1/tick", json=payload)
                 assert response.status_code == 409
                 assert "expected 1.1" in response.json()["detail"]
+        finally:
+            await runtime.close()
+
+    asyncio.run(execute())
+
+
+def test_runtime_api_accepts_console_frames_only_when_hub_is_enabled(tmp_path: Path) -> None:
+    runtime = RuntimeEngine(
+        config=make_config(tmp_path),
+        store=EventStore(tmp_path / "events.sqlite3", tmp_path / "events.jsonl"),
+        provider=FakeProvider(),
+    )
+    hub = LiveConsoleHub(ConsoleSession(run_id="run-1", episode_id="episode-1", status="running"))
+
+    async def execute() -> None:
+        headers = {
+            "content-type": "image/jpeg",
+            "x-rtscortex-protocol-version": "1.1",
+            "x-rtscortex-run-id": "run-1",
+            "x-rtscortex-episode-id": "episode-1",
+            "x-rtscortex-step-id": "3",
+            "x-rtscortex-game-loop": "24",
+            "x-rtscortex-frame-sequence": "7",
+            "x-rtscortex-captured-at": datetime.now(UTC).isoformat(),
+            "x-rtscortex-width": "256",
+            "x-rtscortex-height": "256",
+        }
+        jpeg = b"\xff\xd8screen\xff\xd9"
+        try:
+            enabled = httpx.ASGITransport(app=create_app(runtime, console_hub=hub))
+            async with httpx.AsyncClient(
+                transport=enabled,
+                base_url="http://runtime.test",
+            ) as client:
+                response = await client.post(
+                    "/internal/console/v1/frame/screen",
+                    headers=headers,
+                    content=jpeg,
+                )
+                assert response.status_code == 204
+                frame = hub.latest_frame("screen")
+                assert frame is not None
+                assert frame.metadata.game_loop == 24
+                assert frame.content == jpeg
+
+            disabled = httpx.ASGITransport(app=create_app(runtime))
+            async with httpx.AsyncClient(
+                transport=disabled,
+                base_url="http://runtime.test",
+            ) as client:
+                response = await client.post(
+                    "/internal/console/v1/frame/screen",
+                    headers=headers,
+                    content=jpeg,
+                )
+                assert response.status_code == 404
         finally:
             await runtime.close()
 

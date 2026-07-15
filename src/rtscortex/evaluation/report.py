@@ -623,7 +623,12 @@ def _render_event(
         lines = [f"- Event {event.event_id} · Episode summary: {_inline(summary.summary)}"]
         lines.extend(f"  - Lesson: {_inline(lesson)}" for lesson in summary.lessons)
         return lines
-    if event.event_type in {"planner_timeout", "planner_error", "module_error"}:
+    if event.event_type in {
+        "planner_timeout",
+        "planner_error",
+        "module_error",
+        "module_failed",
+    }:
         details = _error_details(event.payload)
         return [
             f"- Event {event.event_id} · {_inline(event.event_type)}"
