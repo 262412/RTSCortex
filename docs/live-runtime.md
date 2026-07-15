@@ -169,7 +169,7 @@ already in progress, unless the observation explicitly requires a defensive hold
 empty follow-up plan retains the last measurable goal, so waiting for a build effect does
 not erase its progress state.
 
-Policy candidates can be evaluated without giving them dispatch access:
+The legacy single-run shadow command remains available for small historical checks:
 
 ```bash
 uv run rtscortex policy-shadow \
@@ -177,14 +177,24 @@ uv run rtscortex policy-shadow \
   --limit 11 --stride 6
 ```
 
-Every candidate receives the same historical observations, fixed Protoss opening goal,
-and deterministic progress reports. The current OpenAI-compatible Qwen configuration is
-loaded from the run snapshot. HIMA Protoss-a/b/c and HierNet-SC2 remain explicit
-`unavailable` entries until local weights and RTSCortex action adapters are configured;
-this command never downloads them. Use `--no-current-qwen` to validate the fixture and
-report path entirely offline. The resulting `policy-shadow-comparison.json` separates
-schema legality, goal-advancing choices on actionable fixtures, control-action violations,
-latency, model failures, and unavailable candidates.
+It loads the current OpenAI-compatible Qwen configuration from the run snapshot. Use
+`--no-current-qwen` to keep that compatibility path completely offline.
+
+Formal Policy Comparison v0.2 uses the checked-in, provenance-rich 48-state corpus and
+generates both machine and Markdown reports:
+
+```bash
+uv run rtscortex policy-corpus verify \
+  benchmarks/policy/protoss_v0_2/manifest.yaml
+uv run rtscortex policy-compare \
+  --config configs/policy/comparison_v0_2.offline.yaml
+```
+
+The offline configuration does not call Qwen or load/download HIMA. Local HIMA specialists
+remain unavailable until absolute pinned snapshot paths and the explicit unlicensed-weight
+acknowledgement are configured. They are then evaluated one model subprocess at a time and
+still have no dispatch capability. See [Policy Comparison v0.2](policy-comparison.md) for
+the strict HIMA input contract, corpus strata, classification rules, and artifacts.
 
 ### Build position handling
 

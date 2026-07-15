@@ -1,0 +1,40 @@
+format_version: "0.2"
+corpus_id: protoss-v0.2
+protocol_version: "1.1"
+fixtures_per_stratum: 8
+minimum_game_loop_gap: 224
+max_per_episode_per_stratum: 4
+minimum_episodes_per_stratum: 2
+minimum_seeds: 3
+minimum_condition_fixtures_per_phase: 2
+sources:
+  - source_id: seed-0-opening-variant
+    journal_path: >-
+      ~/scratch/outputs/RTSCortex/planner_reflection_memory_reflex-20260714T145312Z/events.jsonl
+    seed: 0
+    map_name: Simple64
+  - source_id: seed-0-tech
+    journal_path: >-
+      ~/scratch/outputs/RTSCortex/planner_reflection_memory_reflex-20260714T185049Z/events.jsonl
+    seed: 0
+    map_name: Simple64
+  - source_id: seed-0-full
+    journal_path: >-
+      ~/scratch/outputs/RTSCortex/planner_reflection_memory_reflex-20260714T211615Z/events.jsonl
+    seed: 0
+    map_name: Simple64
+  - source_id: seed-1-tech
+    journal_path: >-
+      ~/scratch/outputs/RTSCortex/planner_reflection_memory_reflex-20260714T220301Z/events.jsonl
+    seed: 1
+    map_name: Simple64
+  - source_id: seed-1-full
+    journal_path: >-
+      ~/scratch/outputs/RTSCortex/planner_reflection_memory_reflex-20260714T221839Z/events.jsonl
+    seed: 1
+    map_name: Simple64
+  - source_id: seed-2-full
+    journal_path: >-
+      ~/scratch/outputs/RTSCortex/planner_reflection_memory_reflex-20260714T230625Z/events.jsonl
+    seed: 2
+    map_name: Simple64

@@ -1,0 +1,151 @@
+format_version: '0.2'
+corpus_id: protoss-v0.2
+protocol_version: '1.1'
+fixtures_file: fixtures.jsonl
+fixture_count: 48
+fixtures_sha256: 601404bfe04b88d56834ef35a2a68e5bb857af8bf4e93cab5c957e14841a9991
+fixtures_per_stratum: 8
+minimum_game_loop_gap: 224
+max_per_episode_per_stratum: 4
+minimum_episodes_per_stratum: 2
+minimum_seeds: 3
+minimum_condition_fixtures_per_phase: 2
+stratum_counts:
+  early: 8
+  technology: 8
+  production: 8
+  combat: 8
+  blocked: 8
+  in_progress: 8
+condition_phase_counts:
+  blocked:
+    early: 2
+    technology: 2
+    production: 2
+    combat: 2
+  in_progress:
+    early: 2
+    technology: 2
+    production: 2
+    combat: 2
+seeds:
+- 0
+- 1
+- 2
+episode_keys:
+- planner_reflection_memory_reflex-20260714T145312Z:episode-0
+- planner_reflection_memory_reflex-20260714T185049Z:episode-0
+- planner_reflection_memory_reflex-20260714T211615Z:episode-0
+- planner_reflection_memory_reflex-20260714T220301Z:episode-0
+- planner_reflection_memory_reflex-20260714T221839Z:episode-0
+- planner_reflection_memory_reflex-20260714T230625Z:episode-0
+fixture_ids:
+- protoss-v0.2:early:seed-0-full:event-1
+- protoss-v0.2:early:seed-0-opening-variant:event-1
+- protoss-v0.2:early:seed-0-tech:event-61
+- protoss-v0.2:early:seed-1-full:event-126
+- protoss-v0.2:early:seed-1-tech:event-115
+- protoss-v0.2:early:seed-2-full:event-121
+- protoss-v0.2:early:seed-0-full:event-182
+- protoss-v0.2:early:seed-0-opening-variant:event-57
+- protoss-v0.2:technology:seed-0-tech:event-631
+- protoss-v0.2:technology:seed-1-full:event-767
+- protoss-v0.2:technology:seed-1-tech:event-610
+- protoss-v0.2:technology:seed-0-tech:event-684
+- protoss-v0.2:technology:seed-1-tech:event-671
+- protoss-v0.2:technology:seed-0-tech:event-729
+- protoss-v0.2:technology:seed-1-tech:event-723
+- protoss-v0.2:technology:seed-0-tech:event-776
+- protoss-v0.2:production:seed-0-full:event-387
+- protoss-v0.2:production:seed-0-tech:event-386
+- protoss-v0.2:production:seed-1-full:event-393
+- protoss-v0.2:production:seed-1-tech:event-320
+- protoss-v0.2:production:seed-2-full:event-444
+- protoss-v0.2:production:seed-0-full:event-443
+- protoss-v0.2:production:seed-0-tech:event-441
+- protoss-v0.2:production:seed-1-full:event-442
+- protoss-v0.2:combat:seed-0-full:event-903
+- protoss-v0.2:combat:seed-0-tech:event-951
+- protoss-v0.2:combat:seed-1-full:event-967
+- protoss-v0.2:combat:seed-1-tech:event-1042
+- protoss-v0.2:combat:seed-2-full:event-894
+- protoss-v0.2:combat:seed-0-full:event-974
+- protoss-v0.2:combat:seed-0-tech:event-998
+- protoss-v0.2:combat:seed-1-full:event-1019
+- protoss-v0.2:blocked:seed-0-full:event-320
+- protoss-v0.2:blocked:seed-0-opening-variant:event-269
+- protoss-v0.2:blocked:seed-1-tech:event-894
+- protoss-v0.2:blocked:seed-1-tech:event-952
+- protoss-v0.2:blocked:seed-0-full:event-667
+- protoss-v0.2:blocked:seed-1-full:event-673
+- protoss-v0.2:blocked:seed-0-full:event-920
+- protoss-v0.2:blocked:seed-0-tech:event-1044
+- protoss-v0.2:in_progress:seed-0-full:event-245
+- protoss-v0.2:in_progress:seed-0-opening-variant:event-91
+- protoss-v0.2:in_progress:seed-1-tech:event-691
+- protoss-v0.2:in_progress:seed-1-tech:event-742
+- protoss-v0.2:in_progress:seed-0-full:event-393
+- protoss-v0.2:in_progress:seed-0-tech:event-491
+- protoss-v0.2:in_progress:seed-0-full:event-1196
+- protoss-v0.2:in_progress:seed-1-full:event-1200
+sources:
+- source_id: seed-0-opening-variant
+  journal_path: ~/scratch/outputs/RTSCortex/planner_reflection_memory_reflex-20260714T145312Z/events.jsonl
+  journal_sha256: 2334e058578cb5a4d97a766d083577b861ad5093a3fe56837bf54499f07e0f2f
+  seed: 0
+  map_name: Simple64
+  observation_count: 130
+  run_ids:
+  - planner_reflection_memory_reflex-20260714T145312Z
+  episode_keys:
+  - planner_reflection_memory_reflex-20260714T145312Z:episode-0
+- source_id: seed-0-tech
+  journal_path: ~/scratch/outputs/RTSCortex/planner_reflection_memory_reflex-20260714T185049Z/events.jsonl
+  journal_sha256: 433b34f4358795a06841a7ed721b06e9df393ba75e21494efd2aee9bbeaf50a0
+  seed: 0
+  map_name: Simple64
+  observation_count: 219
+  run_ids:
+  - planner_reflection_memory_reflex-20260714T185049Z
+  episode_keys:
+  - planner_reflection_memory_reflex-20260714T185049Z:episode-0
+- source_id: seed-0-full
+  journal_path: ~/scratch/outputs/RTSCortex/planner_reflection_memory_reflex-20260714T211615Z/events.jsonl
+  journal_sha256: a8b677d89140a889e508e206bfc0d70bb734b313765d5e4a16b22a2477909dcc
+  seed: 0
+  map_name: Simple64
+  observation_count: 649
+  run_ids:
+  - planner_reflection_memory_reflex-20260714T211615Z
+  episode_keys:
+  - planner_reflection_memory_reflex-20260714T211615Z:episode-0
+- source_id: seed-1-tech
+  journal_path: ~/scratch/outputs/RTSCortex/planner_reflection_memory_reflex-20260714T220301Z/events.jsonl
+  journal_sha256: 902efa78c6c46fe465c9da025fc7aa6f9da60b13e78da7d6b8476c1586ecb8f7
+  seed: 1
+  map_name: Simple64
+  observation_count: 195
+  run_ids:
+  - planner_reflection_memory_reflex-20260714T220301Z
+  episode_keys:
+  - planner_reflection_memory_reflex-20260714T220301Z:episode-0
+- source_id: seed-1-full
+  journal_path: ~/scratch/outputs/RTSCortex/planner_reflection_memory_reflex-20260714T221839Z/events.jsonl
+  journal_sha256: db363398855ad33e5e8e7179d7161afd652be2b6053baa267ee8badada45a213
+  seed: 1
+  map_name: Simple64
+  observation_count: 667
+  run_ids:
+  - planner_reflection_memory_reflex-20260714T221839Z
+  episode_keys:
+  - planner_reflection_memory_reflex-20260714T221839Z:episode-0
+- source_id: seed-2-full
+  journal_path: ~/scratch/outputs/RTSCortex/planner_reflection_memory_reflex-20260714T230625Z/events.jsonl
+  journal_sha256: 69deb202458b292c115594882d3f1a9548b0f73367177a01321b0db51d836169
+  seed: 2
+  map_name: Simple64
+  observation_count: 695
+  run_ids:
+  - planner_reflection_memory_reflex-20260714T230625Z
+  episode_keys:
+  - planner_reflection_memory_reflex-20260714T230625Z:episode-0

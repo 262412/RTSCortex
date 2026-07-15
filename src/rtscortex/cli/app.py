@@ -35,6 +35,11 @@ from rtscortex.policy import (
     default_shadow_registrations,
     load_historical_observations,
 )
+from rtscortex.policy.comparison import (
+    load_policy_comparison_config,
+    run_policy_comparison,
+)
+from rtscortex.policy.corpus import build_policy_corpus_from_file, verify_policy_corpus
 from rtscortex.providers import OpenAICompatibleProvider
 from rtscortex.runtime.factory import build_runtime
 from rtscortex.runtime.live import (
@@ -48,6 +53,11 @@ from rtscortex.runtime.live import (
 )
 
 app = typer.Typer(no_args_is_help=True, help="RTSCortex agent runtime")
+policy_corpus_app = typer.Typer(
+    no_args_is_help=True,
+    help="Build and verify immutable policy-comparison corpora.",
+)
+app.add_typer(policy_corpus_app, name="policy-corpus")
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 CONSOLE_STATIC_DIR = Path(__file__).resolve().parents[1] / "console" / "static"
 
@@ -369,6 +379,103 @@ def replay(
     typer.echo(json.dumps(result.__dict__, indent=2, sort_keys=True))
     if result.mismatched_steps:
         raise typer.Exit(code=1)
+
+
+@policy_corpus_app.command("build")
+def policy_corpus_build(
+    config_path: Annotated[
+        Path,
+        typer.Option("--config", exists=True, dir_okay=False),
+    ],
+    output_dir: Annotated[Path, typer.Option("--output-dir", file_okay=False)],
+) -> None:
+    """Build a deterministic, provenance-rich policy fixture corpus."""
+
+    try:
+        result = build_policy_corpus_from_file(
+            config_path.expanduser().resolve(),
+            output_dir.expanduser().resolve(),
+        )
+    except (OSError, ValueError) as error:
+        raise typer.BadParameter(str(error), param_hint="--config") from error
+    typer.echo(
+        json.dumps(
+            {
+                "fixture_count": result.manifest.fixture_count,
+                "stratum_counts": {
+                    key.value: value
+                    for key, value in result.manifest.stratum_counts.items()
+                },
+                "seeds": result.manifest.seeds,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+    typer.echo(f"Manifest: {result.manifest_path}")
+    typer.echo(f"Fixtures: {result.fixtures_path}")
+
+
+@policy_corpus_app.command("verify")
+def policy_corpus_verify(
+    manifest: Annotated[Path, typer.Argument(exists=True, dir_okay=False)],
+    verify_sources: Annotated[
+        bool,
+        typer.Option(
+            "--verify-sources",
+            help="Also hash and cross-check every original journal.",
+        ),
+    ] = False,
+) -> None:
+    """Verify corpus hashes, balance, ordering, and optional source journals."""
+
+    try:
+        verification = verify_policy_corpus(
+            manifest.expanduser().resolve(),
+            verify_sources=verify_sources,
+        )
+    except (OSError, ValueError) as error:
+        raise typer.BadParameter(str(error), param_hint="MANIFEST") from error
+    typer.echo(verification.model_dump_json(indent=2))
+    if not verification.valid:
+        raise typer.Exit(code=1)
+
+
+@app.command("policy-compare")
+def policy_compare(
+    config_path: Annotated[
+        Path,
+        typer.Option("--config", exists=True, dir_okay=False),
+    ],
+    output_dir: Annotated[
+        Path | None,
+        typer.Option(
+            "--output-dir",
+            file_okay=False,
+            help="Override the timestamped output directory from the config.",
+        ),
+    ] = None,
+) -> None:
+    """Compare Qwen, HIMA, and HierNet candidates on one immutable corpus."""
+
+    try:
+        config = load_policy_comparison_config(
+            config_path.expanduser().resolve(),
+            base_dir=PROJECT_ROOT,
+        )
+        artifacts = run_policy_comparison(config, output_dir=output_dir)
+    except (OSError, ValueError) as error:
+        raise typer.BadParameter(str(error), param_hint="--config") from error
+    typer.echo(
+        json.dumps(
+            [summary.model_dump(mode="json") for summary in artifacts.comparison.summaries],
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+    typer.echo(f"Comparison: {artifacts.reports.comparison_path}")
+    typer.echo(f"Report: {artifacts.reports.report_path}")
+    typer.echo(f"Artifacts: {artifacts.output_dir}")
 
 
 async def _run_policy_shadow(

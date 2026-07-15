@@ -49,3 +49,15 @@ and launch commands.
 
 See [the architecture overview](docs/architecture/overview.md) for the data flow and
 extension contracts.
+
+Policy Comparison v0.2 provides a 48-state, six-stratum shadow benchmark for the current
+Qwen planner and optional local HIMA Protoss specialists. It never dispatches candidate
+actions and never downloads model weights. Start with the fully offline workflow:
+
+```bash
+uv run rtscortex policy-corpus verify benchmarks/policy/protoss_v0_2/manifest.yaml
+uv run rtscortex policy-compare --config configs/policy/comparison_v0_2.offline.yaml
+```
+
+See [the Policy Comparison guide](docs/policy-comparison.md) for corpus provenance, HIMA
+model gates, classification semantics, and output artifacts.

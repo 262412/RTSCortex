@@ -14,6 +14,7 @@ from rtscortex.agents.models import (
 )
 from rtscortex.contracts.interfaces import LLMProvider
 from rtscortex.policy.models import (
+    MacroPolicyProposal,
     PolicyAvailability,
     PolicyAvailabilityStatus,
     PolicyObservationFixture,
@@ -28,7 +29,10 @@ class PolicySubagent(Protocol):
 
     spec: PolicySubagentSpec
 
-    async def propose(self, fixture: PolicyObservationFixture) -> PolicyProposal: ...
+    async def propose(
+        self,
+        fixture: PolicyObservationFixture,
+    ) -> PolicyProposal | MacroPolicyProposal: ...
 
 
 @dataclass(frozen=True)
@@ -65,9 +69,9 @@ HIMA_PROTOSS_SPECS = tuple(
         display_name=f"HIMA Protoss-{specialist}",
         provider_kind=PolicyProviderKind.HUGGING_FACE_TRANSFORMERS,
         model_id=f"SNUMPR/Protoss-{specialist}",
-        role=f"Protoss imitation specialist {specialist.upper()}",
+        role=f"upstream Protoss specialist cluster {specialist.upper()}",
         race="Protoss",
-        action_interface="HIMA action proposal adapter required",
+        action_interface="HIMA GitHub JSON state to ordered Protoss macro actions",
         requires_external_weights=True,
         license_id=None,
     )
@@ -167,17 +171,21 @@ def default_shadow_registrations(
             subagent=current_qwen,
         )
 
-    external = tuple(
+    hima = tuple(
         PolicySubagentRegistration(
             spec=spec,
             availability=PolicyAvailability(
                 status=PolicyAvailabilityStatus.UNAVAILABLE,
-                reason=(
-                    "local weights and an RTSCortex adapter are not configured; "
-                    "no download attempted"
-                ),
+                reason="local weights are not configured; no download attempted",
             ),
         )
-        for spec in (*HIMA_PROTOSS_SPECS, HIERNET_SC2_SPEC)
+        for spec in HIMA_PROTOSS_SPECS
     )
-    return (qwen_registration, *external)
+    hiernet = PolicySubagentRegistration(
+        spec=HIERNET_SC2_SPEC,
+        availability=PolicyAvailability(
+            status=PolicyAvailabilityStatus.UNAVAILABLE,
+            reason="adapter_not_implemented; no download attempted",
+        ),
+    )
+    return (qwen_registration, *hima, hiernet)

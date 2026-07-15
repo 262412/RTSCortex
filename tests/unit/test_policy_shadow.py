@@ -17,6 +17,8 @@ from rtscortex.policy import (
     LLMPlanningPolicySubagent,
     PolicyAvailability,
     PolicyAvailabilityStatus,
+    PolicyFixtureSource,
+    PolicyFixtureStratum,
     PolicyObservationFixture,
     PolicyProposal,
     PolicyShadowRunner,
@@ -455,7 +457,29 @@ def test_shadow_metrics_forbid_control_while_goal_effect_is_in_progress() -> Non
 
 
 def test_attach_goal_progress_is_deterministic_and_preserves_observation() -> None:
-    fixture = PolicyObservationFixture(fixture_id="opening", observation=make_observation())
+    observation = make_observation()
+    source = PolicyFixtureSource(
+        run_id=observation.run_id,
+        episode_id=observation.episode_id,
+        event_id=7,
+        seed=1,
+        map_name="Simple64",
+        game_loop=observation.game_loop,
+        protocol_version=observation.protocol_version,
+        journal_sha256="b" * 64,
+        observation_sha256="c" * 64,
+    )
+    fixture = PolicyObservationFixture(
+        fixture_id="opening",
+        observation=observation,
+        primary_stratum=PolicyFixtureStratum.TECHNOLOGY,
+        phase_tags=["technology"],
+        condition_tags=["blocked"],
+        blocker_tags=["prerequisite"],
+        selection_evidence=["CyberneticsCore is missing"],
+        source=source,
+        state_fingerprint="a" * 64,
+    )
     verifier = GoalProgressVerifier()
     goal = verifier.goal_from_action_names(
         strategic_goal="Build one Pylon",
@@ -467,6 +491,13 @@ def test_attach_goal_progress_is_deterministic_and_preserves_observation() -> No
     enriched = attach_goal_progress([fixture], goal, verifier=verifier)
 
     assert enriched[0].observation == fixture.observation
+    assert enriched[0].primary_stratum == fixture.primary_stratum
+    assert enriched[0].phase_tags == fixture.phase_tags
+    assert enriched[0].condition_tags == fixture.condition_tags
+    assert enriched[0].blocker_tags == fixture.blocker_tags
+    assert enriched[0].selection_evidence == fixture.selection_evidence
+    assert enriched[0].source == fixture.source
+    assert enriched[0].state_fingerprint == fixture.state_fingerprint
     assert enriched[0].goal_spec == goal
     assert enriched[0].goal_progress == verifier.verify(fixture.observation, goal)
 
