@@ -124,6 +124,8 @@ jobs:
           PYGAME_HIDE_SUPPORT_PROMPT=1 .worker-venv/bin/python -m unittest discover \
             -s integrations/llm_pysc2/tests -p 'test_frame_stream.py' -v
 
+          # The legacy editable install writes build metadata into the submodule.
+          rm -rf -- third_party/LLM-PySC2/llm_pysc2.egg-info
           cleanup
           applied=()
           trap - EXIT
