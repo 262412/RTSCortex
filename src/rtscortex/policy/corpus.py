@@ -71,9 +71,12 @@ _RUNTIME_TO_HIMA_SHORT_ACTION = {
     "Build_Nexus_Near": "Nexus",
     "Build_Gateway_Screen": "Gateway",
     "Build_CyberneticsCore_Screen": "CyberneticsCore",
+    "Build_Stargate_Screen": "Stargate",
     "Train_Probe": "Probe",
     "Train_Zealot": "Zealot",
     "Train_Stalker": "Stalker",
+    "Train_Adept": "Adept",
+    "Train_VoidRay": "VoidRay",
     "Research_WarpGate": "WarpGateResearch",
 }
 _IN_PROGRESS_ACTIONS: tuple[tuple[GoalRequirementKind, str, str], ...] = (
@@ -86,8 +89,11 @@ _IN_PROGRESS_ACTIONS: tuple[tuple[GoalRequirementKind, str, str], ...] = (
     ),
     (GoalRequirementKind.STRUCTURE, "Assimilator", "Build_Assimilator_Near"),
     (GoalRequirementKind.STRUCTURE, "Nexus", "Build_Nexus_Near"),
+    (GoalRequirementKind.STRUCTURE, "Stargate", "Build_Stargate_Screen"),
     (GoalRequirementKind.UNIT, "Zealot", "Train_Zealot"),
     (GoalRequirementKind.UNIT, "Stalker", "Train_Stalker"),
+    (GoalRequirementKind.UNIT, "Adept", "Train_Adept"),
+    (GoalRequirementKind.UNIT, "VoidRay", "Train_VoidRay"),
 )
 
 

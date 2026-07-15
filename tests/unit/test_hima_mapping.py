@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from rtscortex.contracts import ActionArgumentType, AvailableAction
+from rtscortex.contracts import ActionArgumentType, AvailableAction, EconomyState, UnitState
 from rtscortex.policy.hima.mapping import HIMA_RUNTIME_MAPPINGS, HIMAMacroActionMapper
 from rtscortex.policy.hima.models import HIMA_PARSER_VERSION, HIMA_VOCABULARY_VERSION
 from rtscortex.policy.models import (
@@ -43,23 +43,51 @@ def _step(
     )
 
 
-def test_mapping_registry_exposes_exactly_eight_hima_semantics() -> None:
-    assert len(HIMA_RUNTIME_MAPPINGS) == 8
+def _macro_ready_state(
+    *,
+    structures: list[UnitState] | None = None,
+) -> dict[str, object]:
+    observation = make_observation(include_enemy=False)
+    return {
+        "economy": EconomyState(
+            minerals=500,
+            vespene=500,
+            supply_used=2,
+            supply_cap=30,
+        ),
+        "own_structures": structures or observation.state.own_structures,
+    }
+
+
+def test_mapping_registry_exposes_first_expanded_protoss_semantics() -> None:
+    assert len(HIMA_RUNTIME_MAPPINGS) == 11
     assert {item.macro_action for item in HIMA_RUNTIME_MAPPINGS} == {
         "TRAIN ZEALOT",
         "TRAIN STALKER",
+        "TRAIN ADEPT",
+        "TRAIN VOIDRAY",
         "BUILD PYLON",
         "BUILD GATEWAY",
         "BUILD CYBERNETICSCORE",
         "BUILD ASSIMILATOR",
         "BUILD NEXUS",
+        "BUILD STARGATE",
         "RESEARCH WARPGATERESEARCH",
     }
+    mappings = {
+        item.macro_action: item.runtime_actions for item in HIMA_RUNTIME_MAPPINGS
+    }
+    assert mappings["TRAIN ADEPT"] == ("Train_Adept",)
+    assert mappings["BUILD STARGATE"] == ("Build_Stargate_Screen",)
+    assert mappings["TRAIN VOIDRAY"] == ("Train_VoidRay",)
 
 
 def test_mapper_binds_frontier_actor_and_candidate_from_observation() -> None:
     observation = make_observation(include_enemy=False).model_copy(
         update={
+            "state": make_observation(include_enemy=False).state.model_copy(
+                update=_macro_ready_state()
+            ),
             "available_actions": [
                 AvailableAction(
                     name="Build_Pylon_Screen",
@@ -88,7 +116,12 @@ def test_supported_action_missing_now_is_deferred_not_unsupported_or_illegal() -
     fixture = PolicyObservationFixture(
         fixture_id="no-pylon-candidate",
         observation=make_observation(include_enemy=False).model_copy(
-            update={"available_actions": []}
+            update={
+                "state": make_observation(include_enemy=False).state.model_copy(
+                    update=_macro_ready_state()
+                ),
+                "available_actions": [],
+            }
         ),
     )
 
@@ -139,6 +172,9 @@ def test_auto_managed_probe_is_unsupported_without_becoming_noop() -> None:
 def test_only_first_runtime_frontier_is_validated_against_current_state() -> None:
     observation = make_observation(include_enemy=False).model_copy(
         update={
+            "state": make_observation(include_enemy=False).state.model_copy(
+                update=_macro_ready_state()
+            ),
             "available_actions": [
                 AvailableAction(
                     name="Build_Pylon_Screen",
@@ -168,6 +204,178 @@ def test_only_first_runtime_frontier_is_validated_against_current_state() -> Non
     assert assessments[0].is_logical_frontier is True
     assert assessments[0].is_runtime_frontier is True
     assert assessments[1].is_runtime_frontier is False
+
+
+def test_mapper_skips_deferred_step_to_earliest_legal_runtime_frontier() -> None:
+    observation = make_observation(include_enemy=False).model_copy(
+        update={
+            "state": make_observation(include_enemy=False).state.model_copy(
+                update=_macro_ready_state()
+            ),
+            "available_actions": [
+                AvailableAction(
+                    name="Build_Gateway_Screen",
+                    argument_names=["screen"],
+                    argument_types=[ActionArgumentType.POSITION],
+                    actor_scopes=["Builder/Probe-1"],
+                    argument_candidates=[[[65, 90]]],
+                )
+            ]
+        }
+    )
+    fixture = PolicyObservationFixture(
+        fixture_id="deferred-before-legal",
+        observation=observation,
+    )
+
+    assessments = HIMAMacroActionMapper().assess(
+        _proposal(
+            _step(0, "BUILD PYLON", "build"),
+            _step(1, "BUILD GATEWAY", "build"),
+            _step(2, "BUILD NEXUS", "build"),
+        ),
+        fixture,
+    )
+
+    assert [item.classification for item in assessments] == [
+        PolicyActionClassification.MAPPED_DEFERRED,
+        PolicyActionClassification.MAPPED_LEGAL_NOW,
+        PolicyActionClassification.MAPPED_FUTURE,
+    ]
+    assert assessments[0].reason_code == "action_unavailable_now"
+    assert [item.is_runtime_frontier for item in assessments] == [False, True, False]
+
+
+def test_mapper_uses_earliest_deferred_frontier_when_no_step_is_legal() -> None:
+    fixture = PolicyObservationFixture(
+        fixture_id="all-deferred",
+        observation=make_observation(include_enemy=False).model_copy(
+            update={
+                "state": make_observation(include_enemy=False).state.model_copy(
+                    update=_macro_ready_state(
+                        structures=[
+                            UnitState(
+                                unit_id="pylon-1",
+                                unit_type="Pylon",
+                                alliance="self",
+                            )
+                        ]
+                    )
+                ),
+                "available_actions": [],
+            }
+        ),
+    )
+
+    assessments = HIMAMacroActionMapper().assess(
+        _proposal(
+            _step(0, "BUILD PYLON", "build"),
+            _step(1, "BUILD GATEWAY", "build"),
+        ),
+        fixture,
+    )
+
+    assert [item.classification for item in assessments] == [
+        PolicyActionClassification.MAPPED_DEFERRED,
+        PolicyActionClassification.MAPPED_DEFERRED,
+    ]
+    assert [item.reason_code for item in assessments] == [
+        "action_unavailable_now",
+        "action_unavailable_now",
+    ]
+    assert [item.is_runtime_frontier for item in assessments] == [True, False]
+
+
+def test_hard_resource_blocker_preserves_hima_sequence_order() -> None:
+    base = make_observation(include_enemy=False)
+    observation = base.model_copy(
+        update={
+            "state": base.state.model_copy(
+                update={
+                    "economy": EconomyState(
+                        minerals=100,
+                        vespene=500,
+                        supply_used=2,
+                        supply_cap=30,
+                    ),
+                    "own_structures": [
+                        UnitState(
+                            unit_id="pylon-1",
+                            unit_type="Pylon",
+                            alliance="self",
+                        ),
+                        UnitState(
+                            unit_id="gateway-1",
+                            unit_type="Gateway",
+                            alliance="self",
+                        ),
+                    ],
+                }
+            ),
+            "available_actions": [
+                AvailableAction(
+                    name="Train_Zealot",
+                    actor_scopes=["Developer/Empty"],
+                )
+            ],
+        }
+    )
+
+    assessments = HIMAMacroActionMapper().assess(
+        _proposal(
+            _step(0, "BUILD CYBERNETICSCORE", "build"),
+            _step(1, "TRAIN ZEALOT", "train"),
+        ),
+        PolicyObservationFixture(fixture_id="hard-blocker", observation=observation),
+    )
+
+    assert assessments[0].classification is PolicyActionClassification.MAPPED_DEFERRED
+    assert assessments[0].reason_code == "insufficient_minerals"
+    assert assessments[0].is_runtime_frontier is True
+    assert assessments[1].classification is PolicyActionClassification.MAPPED_FUTURE
+
+
+def test_mapper_selects_available_runtime_alternative() -> None:
+    base = make_observation(include_enemy=False)
+    observation = base.model_copy(
+        update={
+            "state": base.state.model_copy(
+                update={
+                    "economy": EconomyState(
+                        minerals=500,
+                        vespene=500,
+                        supply_used=2,
+                        supply_cap=30,
+                    ),
+                    "own_structures": [
+                        UnitState(
+                            unit_id="gateway-1",
+                            unit_type="Gateway",
+                            alliance="self",
+                        )
+                    ],
+                }
+            ),
+            "available_actions": [
+                AvailableAction(
+                    name="Warp_Zealot_Near",
+                    argument_names=["tag"],
+                    argument_types=[ActionArgumentType.TAG],
+                    actor_scopes=["Developer/WarpGate-1"],
+                    argument_candidates=[["0x100"]],
+                )
+            ],
+        }
+    )
+
+    assessment = HIMAMacroActionMapper().assess(
+        _proposal(_step(0, "TRAIN ZEALOT", "train")),
+        PolicyObservationFixture(fixture_id="warp-alternative", observation=observation),
+    )[0]
+
+    assert assessment.classification is PolicyActionClassification.MAPPED_LEGAL_NOW
+    assert assessment.runtime_action == "Warp_Zealot_Near"
+    assert assessment.is_runtime_frontier is True
 
 
 def test_parse_error_is_logical_frontier_but_next_mapped_step_is_runtime_frontier() -> None:

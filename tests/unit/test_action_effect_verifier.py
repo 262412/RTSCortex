@@ -592,6 +592,58 @@ def test_immediate_action_is_not_tracked_for_effect_confirmation() -> None:
     assert verifier.is_tracked(command.command_id) is False
 
 
+def test_stargate_build_effect_is_confirmed_at_resolved_structure_position() -> None:
+    verifier = ActionEffectVerifier(timeout_game_loops=112)
+    command = _stargate_command()
+    verifier.track(command)
+    verifier.prepare(
+        command.command_id,
+        _observation(game_loop=100, minerals=500, builder_orders=[]),
+        0xABC,
+    )
+    verifier.accept_primitive(command.command_id, game_loop=104)
+    current = _observation(
+        game_loop=126,
+        minerals=350,
+        structures=["Nexus", "Stargate"],
+        builder_orders=[],
+    )
+    stargate = next(unit for unit in current["raw_units"] if unit["unit_type"] == "Stargate")
+    stargate["x"] = 31.875
+    stargate["y"] = 30
+
+    verdicts = verifier.observe(current)
+
+    assert len(verdicts) == 1
+    assert verdicts[0].success is True
+    assert verdicts[0].evidence is not None
+    assert verdicts[0].evidence["target_type"] == "Stargate"
+    assert verdicts[0].evidence["target_position"] == (31.875, 30.0)
+    assert verdicts[0].evidence["observed_structure_tag"] == "0x2"
+
+
+def test_stargate_raw_build_order_marks_order_seen_for_diagnostics() -> None:
+    verifier = ActionEffectVerifier(timeout_game_loops=10)
+    command = _stargate_command()
+    verifier.track(command)
+    verifier.prepare(
+        command.command_id,
+        _observation(game_loop=100, minerals=500, builder_orders=[]),
+        0xABC,
+    )
+    verifier.accept_primitive(command.command_id, game_loop=101)
+
+    assert verifier.observe(_observation(game_loop=105, minerals=350, builder_orders=[42])) == []
+    assert verifier.observe(_observation(game_loop=111, minerals=500, builder_orders=[154])) == []
+    verdict = verifier.observe(_observation(game_loop=141, minerals=500, builder_orders=[154]))[0]
+
+    assert verdict.success is False
+    assert verdict.failure_code == "worker_order_replaced"
+    assert verdict.evidence is not None
+    assert verdict.evidence["order_seen"] is True
+    assert verdict.evidence["order_last_seen_game_loop"] == 105
+
+
 def _build_command(
     *,
     command_id: str = "command-pylon",
@@ -606,6 +658,19 @@ def _build_command(
         requested_arguments=(list(position),),
         resolved_arguments=(list(position),),
         rendered_action=f"<Build_Pylon_Screen([{position[0]},{position[1]}])>",
+    )
+
+
+def _stargate_command() -> RoutedCommand:
+    return RoutedCommand(
+        command_id="command-stargate",
+        actor="Builder/Builder-Probe-1",
+        team_name="Builder-Probe-1",
+        name="Build_Stargate_Screen",
+        source="planner",
+        requested_arguments=([65, 65],),
+        resolved_arguments=([65, 65],),
+        rendered_action="<Build_Stargate_Screen([65,65])>",
     )
 
 

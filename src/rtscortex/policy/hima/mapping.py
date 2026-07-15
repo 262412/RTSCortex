@@ -5,7 +5,13 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-from rtscortex.contracts import ActionCommand, ActionSource, AvailableAction
+from rtscortex.contracts import (
+    ActionCommand,
+    ActionSource,
+    AvailableAction,
+    SC2State,
+    UnitState,
+)
 from rtscortex.policy.models import (
     MacroActionStep,
     MacroPolicyProposal,
@@ -13,6 +19,8 @@ from rtscortex.policy.models import (
     PolicyActionClassification,
     PolicyObservationFixture,
 )
+from rtscortex.progress.models import GoalRequirementKind
+from rtscortex.progress.verifier import PROTOSS_SIMPLE64_ACTION_SPECS
 from rtscortex.runtime.validation import ActionValidator, ValidationDisposition
 
 
@@ -27,6 +35,8 @@ class HIMAMacroMapping:
 HIMA_RUNTIME_MAPPINGS: tuple[HIMAMacroMapping, ...] = (
     HIMAMacroMapping("TRAIN ZEALOT", ("Train_Zealot", "Warp_Zealot_Near")),
     HIMAMacroMapping("TRAIN STALKER", ("Train_Stalker", "Warp_Stalker_Near")),
+    HIMAMacroMapping("TRAIN ADEPT", ("Train_Adept",)),
+    HIMAMacroMapping("TRAIN VOIDRAY", ("Train_VoidRay",)),
     HIMAMacroMapping("BUILD PYLON", ("Build_Pylon_Screen",)),
     HIMAMacroMapping("BUILD GATEWAY", ("Build_Gateway_Screen",)),
     HIMAMacroMapping(
@@ -35,10 +45,14 @@ HIMA_RUNTIME_MAPPINGS: tuple[HIMAMacroMapping, ...] = (
     ),
     HIMAMacroMapping("BUILD ASSIMILATOR", ("Build_Assimilator_Near",)),
     HIMAMacroMapping("BUILD NEXUS", ("Build_Nexus_Near",)),
+    HIMAMacroMapping("BUILD STARGATE", ("Build_Stargate_Screen",)),
     HIMAMacroMapping("RESEARCH WARPGATERESEARCH", ("Research_WarpGate",)),
 )
 
 _MAPPINGS_BY_MACRO = {mapping.macro_action: mapping for mapping in HIMA_RUNTIME_MAPPINGS}
+_PROGRESS_SPECS_BY_ACTION = {
+    spec.name: spec for spec in PROTOSS_SIMPLE64_ACTION_SPECS
+}
 _STEP_PARSE_ERROR_CODES = frozenset(
     {
         "action_limit_exceeded",
@@ -54,6 +68,14 @@ _STEP_PARSE_ERROR_CODES = frozenset(
         "unknown_action_token",
     }
 )
+
+
+@dataclass(frozen=True, slots=True)
+class _FrontierProbe:
+    runtime_action: str
+    classification: PolicyActionClassification
+    reason_code: str
+    hard_blocker: bool = False
 
 
 class HIMAMacroActionMapper:
@@ -76,14 +98,28 @@ class HIMAMacroActionMapper:
             if diagnostic.ordinal is not None
         )
         logical_frontier_ordinal = min(logical_ordinals, default=None)
-        runtime_frontier_ordinal = min(
-            (
-                step.ordinal
-                for step in proposal.steps
-                if step.canonical_action in _MAPPINGS_BY_MACRO
-            ),
-            default=None,
-        )
+        probes: dict[int, _FrontierProbe] = {}
+        runtime_frontier_ordinal: int | None = None
+        first_soft_deferred_ordinal: int | None = None
+        for step in sorted(proposal.steps, key=lambda item: item.ordinal):
+            mapping = _MAPPINGS_BY_MACRO.get(step.canonical_action)
+            if mapping is None:
+                continue
+            probe = self._probe_step(step, mapping, fixture)
+            probes[step.ordinal] = probe
+            if probe.classification is PolicyActionClassification.MAPPED_DEFERRED:
+                if first_soft_deferred_ordinal is None:
+                    first_soft_deferred_ordinal = step.ordinal
+                if probe.hard_blocker:
+                    runtime_frontier_ordinal = step.ordinal
+                    break
+                continue
+            if probe.classification is PolicyActionClassification.OBSOLETE:
+                continue
+            runtime_frontier_ordinal = step.ordinal
+            break
+        if runtime_frontier_ordinal is None:
+            runtime_frontier_ordinal = first_soft_deferred_ordinal
         assessments = [
             PolicyActionAssessment(
                 ordinal=diagnostic.ordinal if diagnostic.ordinal is not None else 0,
@@ -103,6 +139,7 @@ class HIMAMacroActionMapper:
             self._assess_step(
                 step,
                 fixture,
+                probe=probes.get(step.ordinal),
                 is_logical_frontier=step.ordinal == logical_frontier_ordinal,
                 is_runtime_frontier=step.ordinal == runtime_frontier_ordinal,
             )
@@ -115,6 +152,7 @@ class HIMAMacroActionMapper:
         step: MacroActionStep,
         fixture: PolicyObservationFixture,
         *,
+        probe: _FrontierProbe | None,
         is_logical_frontier: bool,
         is_runtime_frontier: bool,
     ) -> PolicyActionAssessment:
@@ -134,7 +172,7 @@ class HIMAMacroActionMapper:
                 is_logical_frontier=is_logical_frontier,
             )
 
-        if not is_runtime_frontier:
+        if probe is None:
             return PolicyActionAssessment(
                 ordinal=step.ordinal,
                 repeat=step.repeat,
@@ -145,21 +183,21 @@ class HIMAMacroActionMapper:
                 is_logical_frontier=is_logical_frontier,
             )
 
-        return self._assess_frontier(
+        return _assessment(
             step,
-            mapping,
-            fixture,
+            probe.runtime_action,
+            probe.classification,
+            probe.reason_code,
             is_logical_frontier=is_logical_frontier,
+            is_runtime_frontier=is_runtime_frontier,
         )
 
-    def _assess_frontier(
+    def _probe_step(
         self,
         step: MacroActionStep,
         mapping: HIMAMacroMapping,
         fixture: PolicyObservationFixture,
-        *,
-        is_logical_frontier: bool,
-    ) -> PolicyActionAssessment:
+    ) -> _FrontierProbe:
         observation = fixture.observation
         available_by_name: dict[str, list[AvailableAction]] = {}
         for action in observation.available_actions:
@@ -186,12 +224,10 @@ class HIMAMacroActionMapper:
                     observation,
                 )
                 if outcome.accepted:
-                    return _assessment(
-                        step,
+                    return _FrontierProbe(
                         runtime_action,
                         PolicyActionClassification.MAPPED_LEGAL_NOW,
                         "validated",
-                        is_logical_frontier=is_logical_frontier,
                     )
                 for failure in outcome.failures:
                     if failure.disposition is ValidationDisposition.DEFERRED:
@@ -203,36 +239,103 @@ class HIMAMacroActionMapper:
 
         runtime_action = mapping.runtime_actions[0]
         if not saw_available_action:
-            return _assessment(
-                step,
+            hard_blocker = _hard_state_blocker(mapping, fixture)
+            return _FrontierProbe(
                 runtime_action,
                 PolicyActionClassification.MAPPED_DEFERRED,
-                "action_unavailable_now",
-                is_logical_frontier=is_logical_frontier,
+                hard_blocker or "action_unavailable_now",
+                hard_blocker=hard_blocker is not None,
             )
         if saw_deferred:
-            return _assessment(
-                step,
+            return _FrontierProbe(
                 runtime_action,
                 PolicyActionClassification.MAPPED_DEFERRED,
                 "actor_or_candidate_unavailable",
-                is_logical_frontier=is_logical_frontier,
             )
         if saw_obsolete:
-            return _assessment(
-                step,
+            return _FrontierProbe(
                 runtime_action,
                 PolicyActionClassification.OBSOLETE,
                 "goal_already_satisfied",
-                is_logical_frontier=is_logical_frontier,
             )
-        return _assessment(
-            step,
+        return _FrontierProbe(
             runtime_action,
             PolicyActionClassification.ILLEGAL_ACTION,
             rejected_reasons[0] if rejected_reasons else "validator_rejected",
-            is_logical_frontier=is_logical_frontier,
         )
+
+
+def _hard_state_blocker(
+    mapping: HIMAMacroMapping,
+    fixture: PolicyObservationFixture,
+) -> str | None:
+    spec = next(
+        (
+            _PROGRESS_SPECS_BY_ACTION[action_name]
+            for action_name in mapping.runtime_actions
+            if action_name in _PROGRESS_SPECS_BY_ACTION
+        ),
+        None,
+    )
+    if spec is None:
+        return None
+    state = fixture.observation.state
+    for prerequisite in spec.prerequisites:
+        if (
+            _completed_count(state, prerequisite.kind, prerequisite.target)
+            >= prerequisite.count
+        ):
+            continue
+        suffix = _reason_code(prerequisite.target)
+        if _in_progress_count(state, prerequisite.kind, prerequisite.target) > 0:
+            return f"prerequisite_in_progress_{suffix}"
+        return f"missing_prerequisite_{suffix}"
+    economy = state.economy
+    if economy.minerals < spec.minerals:
+        return "insufficient_minerals"
+    if economy.vespene < spec.vespene:
+        return "insufficient_vespene"
+    if economy.supply_cap - economy.supply_used < spec.supply:
+        return "insufficient_supply"
+    return None
+
+
+def _completed_count(state: SC2State, kind: GoalRequirementKind, target: str) -> int:
+    units = _state_units(state, kind)
+    canonical_target = _reason_code(target).replace("_", "")
+    return sum(
+        _reason_code(unit.unit_type).replace("_", "") == canonical_target
+        and _status_is_complete(unit.status)
+        for unit in units
+    )
+
+
+def _in_progress_count(state: SC2State, kind: GoalRequirementKind, target: str) -> int:
+    units = _state_units(state, kind)
+    canonical_target = _reason_code(target).replace("_", "")
+    return sum(
+        _reason_code(unit.unit_type).replace("_", "") == canonical_target
+        and not _status_is_complete(unit.status)
+        for unit in units
+    )
+
+
+def _state_units(state: SC2State, kind: GoalRequirementKind) -> list[UnitState]:
+    if kind is GoalRequirementKind.STRUCTURE:
+        return state.own_structures
+    if kind is GoalRequirementKind.UNIT:
+        return state.own_units
+    return []
+
+
+def _status_is_complete(status: str | None) -> bool:
+    return status is None or status.casefold() not in {
+        "constructing",
+        "in_progress",
+        "pending",
+        "queued",
+        "warping_in",
+    }
 
 
 def _candidate_commands(
@@ -276,6 +379,7 @@ def _assessment(
     reason_code: str,
     *,
     is_logical_frontier: bool,
+    is_runtime_frontier: bool,
 ) -> PolicyActionAssessment:
     return PolicyActionAssessment(
         ordinal=step.ordinal,
@@ -285,8 +389,8 @@ def _assessment(
         classification=classification,
         reason_code=reason_code,
         is_logical_frontier=is_logical_frontier,
-        is_runtime_frontier=True,
-        is_frontier=True,
+        is_runtime_frontier=is_runtime_frontier,
+        is_frontier=is_runtime_frontier,
     )
 
 

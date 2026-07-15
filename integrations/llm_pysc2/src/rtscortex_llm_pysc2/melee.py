@@ -9,8 +9,20 @@ from llm_pysc2.agents.configs.config import (  # type: ignore[import-not-found]
     ProtossAgentConfig,
 )
 
-_MELEE_AGENTS = ("Builder", "Developer", "CombatGroup0", "CombatGroup1")
-_SINGLE_TEAM_AGENTS = ("CombatGroup0", "CombatGroup1")
+_MELEE_AGENTS = (
+    "Builder",
+    "Developer",
+    "CombatGroup0",
+    "CombatGroup1",
+    "CombatGroup3",
+    "CombatGroup7",
+)
+_SINGLE_TEAM_AGENTS = (
+    "CombatGroup0",
+    "CombatGroup1",
+    "CombatGroup3",
+    "CombatGroup7",
+)
 _ACTION_NAMES = {
     "Builder": {
         "No_Operation",
@@ -23,11 +35,14 @@ _ACTION_NAMES = {
         "Build_Assimilator_Near",
         "Build_CyberneticsCore_Screen",
         "Build_Nexus_Near",
+        "Build_Stargate_Screen",
     },
     "Developer": {
         "No_Operation",
         "Train_Zealot",
         "Train_Stalker",
+        "Train_Adept",
+        "Train_VoidRay",
         "Research_WarpGate",
         "Warp_Zealot_Near",
         "Warp_Stalker_Near",
@@ -50,11 +65,27 @@ _ACTION_NAMES = {
         "Ability_Blink_Screen",
         "Select_Unit_Blink_Screen",
     },
+    "CombatGroup3": {
+        "No_Operation",
+        "Stop",
+        "Hold_Position",
+        "Move_Minimap",
+        "Move_Screen",
+        "Attack_Unit",
+    },
+    "CombatGroup7": {
+        "No_Operation",
+        "Stop",
+        "Hold_Position",
+        "Move_Minimap",
+        "Move_Screen",
+        "Attack_Unit",
+    },
 }
 
 
 class RTSCortexMeleeConfig(ProtossAgentConfig):  # type: ignore[misc]
-    """Retain only the economy, production, Zealot, and Stalker control chain."""
+    """Retain the supported Protoss macro chain and its combat groups."""
 
     AGENTS: dict[str, dict[str, Any]]
     AGENTS_ALWAYS_DISABLE: list[str]

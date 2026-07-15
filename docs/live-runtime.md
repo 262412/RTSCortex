@@ -62,12 +62,13 @@ the live preflight therefore reject older builds instead of relying on path chec
 ## Recommended Simple64 Ladder/Melee smoke
 
 `Simple64` is the recommended compute-center live path. It uses the RTSCortex-owned
-minimal Protoss melee configuration for building, production, Zealot, and Stalker
-control while leaving SC2 lifecycle and PySC2 execution in LLM-PySC2. The opponent is a
-built-in VeryEasy Zerg bot using the Macro build.
+Protoss melee configuration for the Gateway-to-Stargate macro chain and Zealot, Stalker,
+Adept, and Void Ray control while leaving SC2 lifecycle and PySC2 execution in
+LLM-PySC2. The opponent is a built-in VeryEasy Zerg bot using the Macro build.
 Production and research actions are exposed only when their completed idle source, mineral,
 vespene, supply, and prerequisite requirements are all currently satisfied; this includes the
-50-mineral/50-vespene Warp Gate research cost.
+50-mineral/50-vespene Warp Gate research cost, the 150-mineral/150-vespene Stargate,
+and the full Adept and Void Ray production costs.
 
 Validate and launch the deterministic Fake-provider smoke with:
 

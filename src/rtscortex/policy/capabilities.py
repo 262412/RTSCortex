@@ -13,6 +13,7 @@ RTSCORTEX_MELEE_NATIVE_ACTIONS = frozenset(
         "Build_Gateway_Screen",
         "Build_Nexus_Near",
         "Build_Pylon_Screen",
+        "Build_Stargate_Screen",
         "Hold_Position",
         "Move_Minimap",
         "Move_Screen",
@@ -22,6 +23,8 @@ RTSCORTEX_MELEE_NATIVE_ACTIONS = frozenset(
         "Stop",
         "Train_Stalker",
         "Train_Zealot",
+        "Train_Adept",
+        "Train_VoidRay",
         "Warp_Stalker_Near",
         "Warp_Zealot_Near",
     }

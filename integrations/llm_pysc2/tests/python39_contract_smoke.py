@@ -37,6 +37,7 @@ def _assert_build_order_ids_use_raw_function_domain() -> None:
         "Gateway": 883,
         "Nexus": 880,
         "Pylon": 881,
+        "Stargate": 889,
     }
     assert _BUILD_RAW_FUNCTION_IDS == {
         structure: int(actions.RAW_ABILITY_ID_TO_FUNC_ID[ability_id])

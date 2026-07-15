@@ -32,6 +32,7 @@ class BuildSpec:
     footprint: int
     requires_power: bool
     mineral_cost: int
+    vespene_cost: int = 0
     prerequisites: tuple[str, ...] = ()
 
 
@@ -60,10 +61,19 @@ BUILD_SPECS = {
         3,
         True,
         150,
-        ("Gateway",),
+        prerequisites=("Gateway",),
     ),
     "Build_Assimilator_Near": BuildSpec("Assimilator", "geyser", 3, False, 75),
     "Build_Nexus_Near": BuildSpec("Nexus", "expansion", 5, False, 400),
+    "Build_Stargate_Screen": BuildSpec(
+        "Stargate",
+        "screen",
+        3,
+        True,
+        150,
+        vespene_cost=150,
+        prerequisites=("CyberneticsCore",),
+    ),
 }
 
 SCREEN_POINT_ACTIONS = frozenset({"Move_Screen", "Ability_Blink_Screen"})
@@ -71,12 +81,16 @@ MINIMAP_POINT_ACTIONS = frozenset({"Move_Minimap"})
 SELECT_BLINK_ACTION = "Select_Unit_Blink_Screen"
 PRODUCTION_ACTION_PREFIXES = ("Train_", "Research_")
 PRODUCTION_PREREQUISITES = {
+    "Train_Adept": ("CyberneticsCore",),
     "Train_Stalker": ("CyberneticsCore",),
+    "Train_VoidRay": ("Stargate",),
 }
 PRODUCTION_COSTS = {
     "Research_WarpGate": ProductionCost(minerals=50, vespene=50, supply=0),
     "Train_Zealot": ProductionCost(minerals=100, vespene=0, supply=2),
     "Train_Stalker": ProductionCost(minerals=125, vespene=50, supply=2),
+    "Train_Adept": ProductionCost(minerals=100, vespene=25, supply=2),
+    "Train_VoidRay": ProductionCost(minerals=250, vespene=150, supply=4),
 }
 
 
@@ -791,8 +805,11 @@ def _build_prerequisites_satisfied(
     unit_names: Mapping[int, str],
 ) -> bool:
     player = _value(observation, "player_common", _value(observation, "player", None))
-    if player is not None and int(_value(player, "minerals", 0)) < spec.mineral_cost:
-        return False
+    if player is not None:
+        if int(_value(player, "minerals", 0)) < spec.mineral_cost:
+            return False
+        if int(_value(player, "vespene", 0)) < spec.vespene_cost:
+            return False
     completed = {
         _unit_name(unit, unit_names)
         for unit in _value(observation, "raw_units", ())

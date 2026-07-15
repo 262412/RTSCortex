@@ -403,3 +403,157 @@ def test_goal_graph_rejects_cycles_and_unknown_actions() -> None:
             strategic_goal="Do nothing",
             action_names=["Stop"],
         )
+
+
+@pytest.mark.parametrize(
+    ("action_name", "structures", "mineral_cost", "vespene_cost", "supply_cost"),
+    [
+        (
+            "Build_Stargate_Screen",
+            ["Nexus", "Pylon", "Gateway", "CyberneticsCore"],
+            150,
+            150,
+            0,
+        ),
+        (
+            "Train_Adept",
+            ["Nexus", "Pylon", "Gateway", "CyberneticsCore"],
+            100,
+            25,
+            2,
+        ),
+        (
+            "Train_VoidRay",
+            ["Nexus", "Pylon", "Gateway", "CyberneticsCore", "Stargate"],
+            250,
+            150,
+            4,
+        ),
+    ],
+)
+def test_goal_progress_registers_extended_protoss_action_costs(
+    action_name: str,
+    structures: list[str],
+    mineral_cost: int,
+    vespene_cost: int,
+    supply_cost: int,
+) -> None:
+    verifier = GoalProgressVerifier()
+    goal = verifier.goal_from_action_names(
+        strategic_goal=f"Complete {action_name}",
+        action_names=[action_name],
+    )
+    unit_states = [_structure(name, index=index + 1) for index, name in enumerate(structures)]
+
+    exact = verifier.verify(
+        _observation(
+            minerals=mineral_cost,
+            vespene=vespene_cost,
+            supply_used=20,
+            supply_cap=20 + supply_cost,
+            structures=unit_states,
+            actions=[action_name],
+        ),
+        goal,
+    )
+    assert exact.status is GoalProgressStatus.ACTIONABLE
+    assert exact.unique_next_action == action_name
+
+    mineral_blocked = verifier.verify(
+        _observation(
+            minerals=mineral_cost - 1,
+            vespene=vespene_cost,
+            supply_used=20,
+            supply_cap=20 + supply_cost,
+            structures=unit_states,
+            actions=[action_name],
+        ),
+        goal,
+    )
+    assert mineral_blocked.status is GoalProgressStatus.BLOCKED
+    assert GoalBlockerKind.INSUFFICIENT_MINERALS in {
+        blocker.kind for blocker in mineral_blocked.blockers
+    }
+
+    vespene_blocked = verifier.verify(
+        _observation(
+            minerals=mineral_cost,
+            vespene=vespene_cost - 1,
+            supply_used=20,
+            supply_cap=20 + supply_cost,
+            structures=unit_states,
+            actions=[action_name],
+        ),
+        goal,
+    )
+    assert vespene_blocked.status is GoalProgressStatus.BLOCKED
+    assert GoalBlockerKind.INSUFFICIENT_VESPENE in {
+        blocker.kind for blocker in vespene_blocked.blockers
+    }
+
+    if supply_cost:
+        supply_blocked = verifier.verify(
+            _observation(
+                minerals=mineral_cost,
+                vespene=vespene_cost,
+                supply_used=20,
+                supply_cap=20 + supply_cost - 1,
+                structures=unit_states,
+                actions=[action_name],
+            ),
+            goal,
+        )
+        assert supply_blocked.status is GoalProgressStatus.BLOCKED
+        assert GoalBlockerKind.INSUFFICIENT_SUPPLY in {
+            blocker.kind for blocker in supply_blocked.blockers
+        }
+
+
+@pytest.mark.parametrize(
+    ("goal_action", "structures", "available_actions", "expected_next_action"),
+    [
+        (
+            "Build_Stargate_Screen",
+            ["Nexus"],
+            ["Build_Pylon_Screen"],
+            "Build_Pylon_Screen",
+        ),
+        (
+            "Train_Adept",
+            ["Nexus", "Pylon", "Gateway"],
+            ["Build_CyberneticsCore_Screen"],
+            "Build_CyberneticsCore_Screen",
+        ),
+        (
+            "Train_VoidRay",
+            ["Nexus", "Pylon", "Gateway", "CyberneticsCore"],
+            ["Build_Stargate_Screen"],
+            "Build_Stargate_Screen",
+        ),
+    ],
+)
+def test_goal_progress_resolves_extended_protoss_prerequisite_chain(
+    goal_action: str,
+    structures: list[str],
+    available_actions: list[str],
+    expected_next_action: str,
+) -> None:
+    verifier = GoalProgressVerifier()
+    goal = verifier.goal_from_action_names(
+        strategic_goal=f"Complete {goal_action}",
+        action_names=[goal_action],
+    )
+    report = verifier.verify(
+        _observation(
+            minerals=1000,
+            vespene=1000,
+            supply_used=10,
+            supply_cap=30,
+            structures=[_structure(name, index=index + 1) for index, name in enumerate(structures)],
+            actions=available_actions,
+        ),
+        goal,
+    )
+
+    assert report.status is GoalProgressStatus.ACTIONABLE
+    assert report.unique_next_action == expected_next_action

@@ -24,6 +24,7 @@ _BUILD_RAW_FUNCTION_IDS = {
     "Gateway": 37,
     "Nexus": 34,
     "Pylon": 35,
+    "Stargate": 42,
 }
 
 

@@ -279,7 +279,9 @@ def render_policy_comparison_report(comparison: PolicyShadowComparison) -> str:
             "",
             "The sequence frontier is the first logical model action. The Runtime frontier "
             "skips actions that RTSCortex does not own, such as automatically managed Probe "
-            "production, and evaluates the first mapped action.",
+            "production. Soft availability gaps may be skipped to the earliest action that "
+            "validates now; resource, supply, and prerequisite blockers preserve sequence "
+            "order.",
             "",
             "| Candidate | Frontier | Count unit | Parse error | Unsupported | Future | "
             "Legal now | Deferred | Illegal | Obsolete | Total | Runtime conserved | "

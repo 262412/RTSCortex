@@ -8,6 +8,7 @@ from rtscortex.policy.capabilities import (
     RTSCORTEX_MELEE_NATIVE_ACTIONS,
     RuntimeCapabilityRegistry,
 )
+from rtscortex.policy.hima.mapping import HIMA_RUNTIME_MAPPINGS
 
 
 def test_default_registry_matches_the_melee_integration_action_surface() -> None:
@@ -47,3 +48,13 @@ def test_registry_distinguishes_global_support_from_current_availability() -> No
     assert registry.is_globally_supported("Build_Pylon_Screen")
     assert not registry.is_globally_supported("Build_FleetBeacon_Screen")
     assert not registry.is_globally_supported("")
+
+
+def test_every_hima_mapping_targets_a_live_runtime_capability() -> None:
+    mapped_actions = {
+        action_name
+        for mapping in HIMA_RUNTIME_MAPPINGS
+        for action_name in mapping.runtime_actions
+    }
+
+    assert mapped_actions <= RTSCORTEX_MELEE_NATIVE_ACTIONS

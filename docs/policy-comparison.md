@@ -93,10 +93,25 @@ Every discovered logical action has exactly one outcome:
 - `obsolete`: its effect is already satisfied.
 
 The sequence frontier is the first model action. The runtime frontier skips actions such as
-`Probe`, which RTSCortex currently manages automatically, and evaluates the first mapped
-action it is responsible for. Unsupported, deferred, future, obsolete, and parse-error
-actions never inflate the illegal-action rate. Reports retain both logical-step counts and
-repeat-weighted effective-action counts.
+`Probe`, which RTSCortex currently manages automatically. It also distinguishes two kinds of
+mapped blocker:
+
+- a soft blocker, such as a missing camera candidate or temporarily unavailable actor, does
+  not hide the next mapped action that Runtime can validate now;
+- a hard blocker, such as insufficient resources, insufficient supply, or an incomplete tech
+  prerequisite, preserves the HIMA sequence and becomes the runtime frontier.
+
+The first legal, illegal, or hard-deferred action is the unique runtime frontier. If every
+mapped action is soft-deferred, the earliest one is the frontier. Unsupported, deferred,
+future, obsolete, and parse-error actions never inflate the illegal-action rate. Reports
+retain both logical-step counts and repeat-weighted effective-action counts.
+
+The current live Protoss macro slice maps Zealot, Stalker, Adept, Void Ray, Pylon, Gateway,
+Cybernetics Core, Assimilator, Nexus, Stargate, and Warp Gate research. Stargate placement
+requires a completed Cybernetics Core, power, 150 minerals, and 150 vespene. Adept and Void
+Ray production use their real resource, supply, prerequisite, and idle-production-source
+checks. The melee profile also retains one Adept and one Void Ray combat team so newly
+produced units remain controllable.
 
 ## Artifacts
 

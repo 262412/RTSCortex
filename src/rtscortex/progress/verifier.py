@@ -79,6 +79,16 @@ PROTOSS_SIMPLE64_ACTION_SPECS: tuple[ProgressActionSpec, ...] = (
         minerals=400,
     ),
     ProgressActionSpec(
+        "Build_Stargate_Screen",
+        GoalRequirementKind.STRUCTURE,
+        "Stargate",
+        minerals=150,
+        vespene=150,
+        prerequisites=(
+            StatePrerequisite(GoalRequirementKind.STRUCTURE, "CyberneticsCore"),
+        ),
+    ),
+    ProgressActionSpec(
         "Train_Probe",
         GoalRequirementKind.UNIT,
         "Probe",
@@ -108,6 +118,29 @@ PROTOSS_SIMPLE64_ACTION_SPECS: tuple[ProgressActionSpec, ...] = (
         prerequisites=(
             StatePrerequisite(GoalRequirementKind.STRUCTURE, "Gateway"),
             StatePrerequisite(GoalRequirementKind.STRUCTURE, "CyberneticsCore"),
+        ),
+    ),
+    ProgressActionSpec(
+        "Train_Adept",
+        GoalRequirementKind.UNIT,
+        "Adept",
+        minerals=100,
+        vespene=25,
+        supply=2,
+        prerequisites=(
+            StatePrerequisite(GoalRequirementKind.STRUCTURE, "Gateway"),
+            StatePrerequisite(GoalRequirementKind.STRUCTURE, "CyberneticsCore"),
+        ),
+    ),
+    ProgressActionSpec(
+        "Train_VoidRay",
+        GoalRequirementKind.UNIT,
+        "VoidRay",
+        minerals=250,
+        vespene=150,
+        supply=4,
+        prerequisites=(
+            StatePrerequisite(GoalRequirementKind.STRUCTURE, "Stargate"),
         ),
     ),
     ProgressActionSpec(

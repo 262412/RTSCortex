@@ -907,6 +907,73 @@ def test_cybernetics_core_candidates_require_completed_gateway_and_power() -> No
     assert all(len(candidate) == 1 and len(candidate[0]) == 2 for candidate in candidates)
 
 
+def test_stargate_candidates_require_completed_core_and_full_resource_cost() -> None:
+    observation = SimpleNamespace(
+        player_common=SimpleNamespace(minerals=150, vespene=150),
+        raw_units=[],
+        feature_units=[],
+        feature_screen=SimpleNamespace(
+            buildable=UniformGrid(1),
+            pathable=UniformGrid(1),
+            player_relative=UniformGrid(0),
+            power=UniformGrid(1),
+        ),
+    )
+    unit_names = {72: "CyberneticsCore"}
+
+    assert (
+        semantic_argument_candidates(
+            observation,
+            "Build_Stargate_Screen",
+            unit_names=unit_names,
+        )
+        == []
+    )
+
+    core = _unit(0xDEF, 72, 1, 36, 35, 500, 255)
+    core.build_progress = 50
+    observation.raw_units.append(core)
+    assert (
+        semantic_argument_candidates(
+            observation,
+            "Build_Stargate_Screen",
+            unit_names=unit_names,
+        )
+        == []
+    )
+
+    core.build_progress = 100
+    observation.player_common.minerals = 149
+    assert (
+        semantic_argument_candidates(
+            observation,
+            "Build_Stargate_Screen",
+            unit_names=unit_names,
+        )
+        == []
+    )
+
+    observation.player_common.minerals = 150
+    observation.player_common.vespene = 149
+    assert (
+        semantic_argument_candidates(
+            observation,
+            "Build_Stargate_Screen",
+            unit_names=unit_names,
+        )
+        == []
+    )
+
+    observation.player_common.vespene = 150
+    candidates = semantic_argument_candidates(
+        observation,
+        "Build_Stargate_Screen",
+        unit_names=unit_names,
+    )
+    assert candidates
+    assert all(len(candidate) == 1 and len(candidate[0]) == 2 for candidate in candidates)
+
+
 def test_assimilator_candidates_require_nearby_unoccupied_visible_geyser() -> None:
     nexus = SimpleNamespace(
         tag=1,
@@ -1790,6 +1857,90 @@ def test_known_simple64_production_cost_boundaries(
     )
 
     assert (resolved == 0xABC) is expected
+
+
+@pytest.mark.parametrize(
+    ("minerals", "vespene", "food_used", "food_cap", "core_complete", "expected"),
+    [
+        (100, 25, 13, 15, True, True),
+        (99, 25, 13, 15, True, False),
+        (100, 24, 13, 15, True, False),
+        (100, 25, 14, 15, True, False),
+        (100, 25, 13, 15, False, False),
+    ],
+)
+def test_train_adept_requires_full_cost_supply_core_and_gateway_source(
+    minerals: int,
+    vespene: int,
+    food_used: int,
+    food_cap: int,
+    core_complete: bool,
+    expected: bool,
+) -> None:
+    timestep = _fake_timestep()
+    timestep.observation.player.minerals = minerals
+    timestep.observation.player.vespene = vespene
+    timestep.observation.player.food_used = food_used
+    timestep.observation.player.food_cap = food_cap
+    gateway = _unit(0xADE, 62, 1, 35, 35, 500, 255)
+    gateway.build_progress = 100
+    gateway.active = 0
+    stargate = _unit(0x57A, 67, 1, 36, 35, 500, 255)
+    stargate.build_progress = 100
+    stargate.active = 0
+    timestep.observation.raw_units.extend([gateway, stargate])
+    if core_complete:
+        core = _unit(0xC0E, 72, 1, 37, 35, 500, 255)
+        core.build_progress = 100
+        timestep.observation.raw_units.append(core)
+
+    resolved = production_source_tag(
+        timestep.observation,
+        {"name": "Train_Adept", "func": [(457, None, ())]},
+        unit_names={62: "Gateway", 67: "Stargate", 72: "CyberneticsCore"},
+        action_source_types={457: 62},
+    )
+
+    assert (resolved == 0xADE) is expected
+
+
+@pytest.mark.parametrize(
+    ("minerals", "vespene", "food_used", "food_cap", "expected"),
+    [
+        (250, 150, 11, 15, True),
+        (249, 150, 11, 15, False),
+        (250, 149, 11, 15, False),
+        (250, 150, 12, 15, False),
+    ],
+)
+def test_train_voidray_requires_full_cost_supply_and_stargate_source(
+    minerals: int,
+    vespene: int,
+    food_used: int,
+    food_cap: int,
+    expected: bool,
+) -> None:
+    timestep = _fake_timestep()
+    timestep.observation.player.minerals = minerals
+    timestep.observation.player.vespene = vespene
+    timestep.observation.player.food_used = food_used
+    timestep.observation.player.food_cap = food_cap
+    gateway = _unit(0x6A7, 62, 1, 35, 35, 500, 255)
+    gateway.build_progress = 100
+    gateway.active = 0
+    stargate = _unit(0x57A, 67, 1, 36, 35, 500, 255)
+    stargate.build_progress = 100
+    stargate.active = 0
+    timestep.observation.raw_units.extend([gateway, stargate])
+
+    resolved = production_source_tag(
+        timestep.observation,
+        {"name": "Train_VoidRay", "func": [(500, None, ())]},
+        unit_names={62: "Gateway", 67: "Stargate"},
+        action_source_types={500: 67},
+    )
+
+    assert (resolved == 0x57A) is expected
 
 
 def test_full_supply_hides_zealot_despite_completed_idle_gateway() -> None:
