@@ -190,6 +190,7 @@ class ExecutionTracker:
                 "invalid_expansion_anchor",
                 "invalid_geyser_tag",
                 "no_legal_placement",
+                "production_source_invalidated",
                 "production_source_unavailable",
                 "target_not_visible",
             }

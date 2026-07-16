@@ -14,6 +14,7 @@ from llm_pysc2.lib import llm_action
 from pysc2.lib import actions, features
 from rtscortex_llm_pysc2.effect_verifier import _BUILD_RAW_FUNCTION_IDS
 from rtscortex_llm_pysc2.observation import _map_argument_candidates
+from rtscortex_llm_pysc2.production import PRODUCTION_SPECS
 
 
 def _assert_candidate_mapping() -> None:
@@ -37,12 +38,55 @@ def _assert_build_order_ids_use_raw_function_domain() -> None:
         "Gateway": 883,
         "Nexus": 880,
         "Pylon": 881,
+        "ShieldBattery": 895,
         "Stargate": 889,
     }
     assert _BUILD_RAW_FUNCTION_IDS == {
         structure: int(actions.RAW_ABILITY_ID_TO_FUNC_ID[ability_id])
         for structure, ability_id in ability_ids.items()
     }
+
+
+def _assert_direct_production_contract() -> None:
+    expected = {
+        "Train_Zealot": (503, 49, "Gateway", "Zealot", 100, 0, 2, ("Gateway",)),
+        "Train_Stalker": (
+            493,
+            50,
+            "Gateway",
+            "Stalker",
+            125,
+            50,
+            2,
+            ("Gateway", "CyberneticsCore"),
+        ),
+        "Train_Adept": (
+            457,
+            54,
+            "Gateway",
+            "Adept",
+            100,
+            25,
+            2,
+            ("Gateway", "CyberneticsCore"),
+        ),
+        "Train_Phoenix": (484, 55, "Stargate", "Phoenix", 150, 100, 2, ("Stargate",)),
+        "Train_VoidRay": (500, 57, "Stargate", "VoidRay", 250, 150, 4, ("Stargate",)),
+        "Train_Oracle": (482, 58, "Stargate", "Oracle", 150, 150, 3, ("Stargate",)),
+    }
+    assert {
+        action_name: (
+            spec.feature_function_id,
+            spec.raw_order_id,
+            spec.producer_type,
+            spec.unit_type,
+            spec.minerals,
+            spec.vespene,
+            spec.supply,
+            spec.prerequisites,
+        )
+        for action_name, spec in PRODUCTION_SPECS.items()
+    } == expected
 
 
 def _agent_with_tracked_team() -> LLMAgent:
@@ -522,6 +566,7 @@ def _assert_exact_anchor_and_footprint() -> None:
 def main() -> None:
     _assert_candidate_mapping()
     _assert_build_order_ids_use_raw_function_domain()
+    _assert_direct_production_contract()
     _assert_raw_unit_presence_controls_team_lifecycle()
     _assert_transient_disappearance_grace()
     _assert_confirmed_disappearance_removes_actor()

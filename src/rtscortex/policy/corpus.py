@@ -72,10 +72,13 @@ _RUNTIME_TO_HIMA_SHORT_ACTION = {
     "Build_Gateway_Screen": "Gateway",
     "Build_CyberneticsCore_Screen": "CyberneticsCore",
     "Build_Stargate_Screen": "Stargate",
+    "Build_ShieldBattery_Screen": "ShieldBattery",
     "Train_Probe": "Probe",
     "Train_Zealot": "Zealot",
     "Train_Stalker": "Stalker",
     "Train_Adept": "Adept",
+    "Train_Oracle": "Oracle",
+    "Train_Phoenix": "Phoenix",
     "Train_VoidRay": "VoidRay",
     "Research_WarpGate": "WarpGateResearch",
 }
@@ -90,9 +93,16 @@ _IN_PROGRESS_ACTIONS: tuple[tuple[GoalRequirementKind, str, str], ...] = (
     (GoalRequirementKind.STRUCTURE, "Assimilator", "Build_Assimilator_Near"),
     (GoalRequirementKind.STRUCTURE, "Nexus", "Build_Nexus_Near"),
     (GoalRequirementKind.STRUCTURE, "Stargate", "Build_Stargate_Screen"),
+    (
+        GoalRequirementKind.STRUCTURE,
+        "ShieldBattery",
+        "Build_ShieldBattery_Screen",
+    ),
     (GoalRequirementKind.UNIT, "Zealot", "Train_Zealot"),
     (GoalRequirementKind.UNIT, "Stalker", "Train_Stalker"),
     (GoalRequirementKind.UNIT, "Adept", "Train_Adept"),
+    (GoalRequirementKind.UNIT, "Oracle", "Train_Oracle"),
+    (GoalRequirementKind.UNIT, "Phoenix", "Train_Phoenix"),
     (GoalRequirementKind.UNIT, "VoidRay", "Train_VoidRay"),
 )
 

@@ -36,7 +36,9 @@ HIMA_RUNTIME_MAPPINGS: tuple[HIMAMacroMapping, ...] = (
     HIMAMacroMapping("TRAIN ZEALOT", ("Train_Zealot", "Warp_Zealot_Near")),
     HIMAMacroMapping("TRAIN STALKER", ("Train_Stalker", "Warp_Stalker_Near")),
     HIMAMacroMapping("TRAIN ADEPT", ("Train_Adept",)),
+    HIMAMacroMapping("TRAIN PHOENIX", ("Train_Phoenix",)),
     HIMAMacroMapping("TRAIN VOIDRAY", ("Train_VoidRay",)),
+    HIMAMacroMapping("TRAIN ORACLE", ("Train_Oracle",)),
     HIMAMacroMapping("BUILD PYLON", ("Build_Pylon_Screen",)),
     HIMAMacroMapping("BUILD GATEWAY", ("Build_Gateway_Screen",)),
     HIMAMacroMapping(
@@ -46,6 +48,7 @@ HIMA_RUNTIME_MAPPINGS: tuple[HIMAMacroMapping, ...] = (
     HIMAMacroMapping("BUILD ASSIMILATOR", ("Build_Assimilator_Near",)),
     HIMAMacroMapping("BUILD NEXUS", ("Build_Nexus_Near",)),
     HIMAMacroMapping("BUILD STARGATE", ("Build_Stargate_Screen",)),
+    HIMAMacroMapping("BUILD SHIELDBATTERY", ("Build_ShieldBattery_Screen",)),
     HIMAMacroMapping("RESEARCH WARPGATERESEARCH", ("Research_WarpGate",)),
 )
 

@@ -6,6 +6,8 @@ import pytest
 
 from rtscortex.contracts import AvailableAction, EconomyState, UnitState
 from rtscortex.policy.corpus import (
+    _IN_PROGRESS_ACTIONS,
+    _RUNTIME_TO_HIMA_SHORT_ACTION,
     PolicyCorpusBuildConfig,
     PolicyCorpusSourceConfig,
     _observation_phase,
@@ -13,6 +15,7 @@ from rtscortex.policy.corpus import (
     state_fingerprint,
 )
 from rtscortex.policy.models import PolicyFixtureStratum
+from rtscortex.progress import GoalRequirementKind
 from tests.helpers import make_observation
 
 
@@ -156,3 +159,36 @@ sources:
 
     assert config.corpus_id == "test"
     assert config.sources[0].seed == 7
+
+
+def test_future_corpora_recognize_oracle_phoenix_and_shield_battery_events() -> None:
+    assert {
+        action: _RUNTIME_TO_HIMA_SHORT_ACTION[action]
+        for action in (
+            "Train_Oracle",
+            "Train_Phoenix",
+            "Build_ShieldBattery_Screen",
+        )
+    } == {
+        "Train_Oracle": "Oracle",
+        "Train_Phoenix": "Phoenix",
+        "Build_ShieldBattery_Screen": "ShieldBattery",
+    }
+    assert {
+        (kind, target, action)
+        for kind, target, action in _IN_PROGRESS_ACTIONS
+        if action
+        in {
+            "Train_Oracle",
+            "Train_Phoenix",
+            "Build_ShieldBattery_Screen",
+        }
+    } == {
+        (GoalRequirementKind.UNIT, "Oracle", "Train_Oracle"),
+        (GoalRequirementKind.UNIT, "Phoenix", "Train_Phoenix"),
+        (
+            GoalRequirementKind.STRUCTURE,
+            "ShieldBattery",
+            "Build_ShieldBattery_Screen",
+        ),
+    }

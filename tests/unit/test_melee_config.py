@@ -35,6 +35,11 @@ def melee_config_type(monkeypatch: pytest.MonkeyPatch) -> Iterator[tuple[type[An
                             {"name": "Build_Nexus_Near", "arg": ["tag"], "func": []},
                             {"name": "Build_Nexus_Screen", "arg": ["screen"], "func": []},
                             {"name": "Build_Stargate_Screen", "arg": ["screen"], "func": []},
+                            {
+                                "name": "Build_ShieldBattery_Screen",
+                                "arg": ["screen"],
+                                "func": [],
+                            },
                         ]
                     },
                 },
@@ -48,6 +53,8 @@ def melee_config_type(monkeypatch: pytest.MonkeyPatch) -> Iterator[tuple[type[An
                             {"name": "Train_Zealot", "arg": [], "func": []},
                             {"name": "Train_Stalker", "arg": [], "func": []},
                             {"name": "Train_VoidRay", "arg": [], "func": []},
+                            {"name": "Train_Oracle", "arg": [], "func": []},
+                            {"name": "Train_Phoenix", "arg": [], "func": []},
                             {"name": "Research_WarpGate", "arg": [], "func": []},
                             {"name": "Train_Carrier", "arg": [], "func": []},
                             {
@@ -108,6 +115,33 @@ def melee_config_type(monkeypatch: pytest.MonkeyPatch) -> Iterator[tuple[type[An
                         ]
                     },
                 },
+                "CombatGroup8": {
+                    "team": [{"name": "Oracle-1"}, {"name": "Phoenix-1"}],
+                    "action": {
+                        "Oracle": [
+                            {"name": "No_Operation", "arg": [], "func": [(0, None, ())]},
+                            {"name": "Stop", "arg": [], "func": []},
+                            {"name": "Hold_Position", "arg": [], "func": []},
+                            {"name": "Move_Minimap", "arg": ["minimap"], "func": []},
+                            {"name": "Move_Screen", "arg": ["screen"], "func": []},
+                            {"name": "Attack_Unit", "arg": ["tag"], "func": []},
+                            {"name": "Ability_PulsarBeamOn", "arg": [], "func": []},
+                        ],
+                        "Phoenix": [
+                            {"name": "No_Operation", "arg": [], "func": [(0, None, ())]},
+                            {"name": "Stop", "arg": [], "func": []},
+                            {"name": "Hold_Position", "arg": [], "func": []},
+                            {"name": "Move_Minimap", "arg": ["minimap"], "func": []},
+                            {"name": "Move_Screen", "arg": ["screen"], "func": []},
+                            {"name": "Attack_Unit", "arg": ["tag"], "func": []},
+                            {
+                                "name": "Ability_GravitonBeam_Unit",
+                                "arg": ["tag"],
+                                "func": [],
+                            },
+                        ],
+                    },
+                },
                 "Defender": {"team": [], "action": {}},
             }
 
@@ -146,6 +180,7 @@ def test_melee_config_keeps_only_the_minimum_protoss_chain(
         "CombatGroup1",
         "CombatGroup3",
         "CombatGroup7",
+        "CombatGroup8",
     ]
     assert [team["name"] for team in config.AGENTS["Builder"]["team"]] == ["Builder-Probe-1"]
     assert [team["name"] for team in config.AGENTS["Developer"]["team"]] == [
@@ -156,6 +191,10 @@ def test_melee_config_keeps_only_the_minimum_protoss_chain(
     assert [team["name"] for team in config.AGENTS["CombatGroup1"]["team"]] == ["Stalker-1"]
     assert [team["name"] for team in config.AGENTS["CombatGroup3"]["team"]] == ["VoidRay-1"]
     assert [team["name"] for team in config.AGENTS["CombatGroup7"]["team"]] == ["Adept-1"]
+    assert [team["name"] for team in config.AGENTS["CombatGroup8"]["team"]] == [
+        "Oracle-1",
+        "Phoenix-1",
+    ]
 
 
 def test_melee_config_reserves_builder_from_worker_management(
@@ -200,11 +239,14 @@ def test_melee_config_preserves_build_train_research_and_combat_actions(
 
     assert "Build_Pylon_Screen" in action_names["Builder"]
     assert "Build_Stargate_Screen" in action_names["Builder"]
+    assert "Build_ShieldBattery_Screen" in action_names["Builder"]
     assert {
         "Train_Adept",
         "Train_Zealot",
         "Train_Stalker",
         "Train_VoidRay",
+        "Train_Oracle",
+        "Train_Phoenix",
         "Research_WarpGate",
     } <= action_names["Developer"]
     assert "Attack_Unit" in action_names["CombatGroup0"]
@@ -219,6 +261,18 @@ def test_melee_config_preserves_build_train_research_and_combat_actions(
     }
     assert action_names["CombatGroup3"] == basic_combat_actions
     assert action_names["CombatGroup7"] == basic_combat_actions
+    assert action_names["CombatGroup8"] == {
+        "No_Operation",
+        "Move_Minimap",
+        "Move_Screen",
+    }
+    assert {
+        "Stop",
+        "Hold_Position",
+        "Attack_Unit",
+        "Ability_PulsarBeamOn",
+        "Ability_GravitonBeam_Unit",
+    }.isdisjoint(action_names["CombatGroup8"])
     assert "Attack_Unit" not in action_names["Builder"]
     assert "Build_Assimilator_Near" in action_names["Builder"]
     assert "Build_Nexus_Near" in action_names["Builder"]

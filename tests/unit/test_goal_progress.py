@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 from pydantic import ValidationError
+from rtscortex_llm_pysc2.production import PRODUCTION_SPECS
 
 from rtscortex.contracts import (
     ActionArgumentType,
@@ -22,6 +23,7 @@ from rtscortex.progress import (
     GoalRequirementKind,
     GoalSpec,
 )
+from rtscortex.progress.verifier import PROTOSS_SIMPLE64_ACTION_SPECS
 
 
 def _structure(name: str, *, status: str = "idle", index: int = 1) -> UnitState:
@@ -429,6 +431,27 @@ def test_goal_graph_rejects_cycles_and_unknown_actions() -> None:
             150,
             4,
         ),
+        (
+            "Build_ShieldBattery_Screen",
+            ["Nexus", "Pylon", "Gateway", "CyberneticsCore"],
+            100,
+            0,
+            0,
+        ),
+        (
+            "Train_Oracle",
+            ["Nexus", "Pylon", "Gateway", "CyberneticsCore", "Stargate"],
+            150,
+            150,
+            3,
+        ),
+        (
+            "Train_Phoenix",
+            ["Nexus", "Pylon", "Gateway", "CyberneticsCore", "Stargate"],
+            150,
+            100,
+            2,
+        ),
     ],
 )
 def test_goal_progress_registers_extended_protoss_action_costs(
@@ -475,21 +498,22 @@ def test_goal_progress_registers_extended_protoss_action_costs(
         blocker.kind for blocker in mineral_blocked.blockers
     }
 
-    vespene_blocked = verifier.verify(
-        _observation(
-            minerals=mineral_cost,
-            vespene=vespene_cost - 1,
-            supply_used=20,
-            supply_cap=20 + supply_cost,
-            structures=unit_states,
-            actions=[action_name],
-        ),
-        goal,
-    )
-    assert vespene_blocked.status is GoalProgressStatus.BLOCKED
-    assert GoalBlockerKind.INSUFFICIENT_VESPENE in {
-        blocker.kind for blocker in vespene_blocked.blockers
-    }
+    if vespene_cost:
+        vespene_blocked = verifier.verify(
+            _observation(
+                minerals=mineral_cost,
+                vespene=vespene_cost - 1,
+                supply_used=20,
+                supply_cap=20 + supply_cost,
+                structures=unit_states,
+                actions=[action_name],
+            ),
+            goal,
+        )
+        assert vespene_blocked.status is GoalProgressStatus.BLOCKED
+        assert GoalBlockerKind.INSUFFICIENT_VESPENE in {
+            blocker.kind for blocker in vespene_blocked.blockers
+        }
 
     if supply_cost:
         supply_blocked = verifier.verify(
@@ -530,6 +554,24 @@ def test_goal_progress_registers_extended_protoss_action_costs(
             ["Build_Stargate_Screen"],
             "Build_Stargate_Screen",
         ),
+        (
+            "Build_ShieldBattery_Screen",
+            ["Nexus", "Pylon", "Gateway"],
+            ["Build_CyberneticsCore_Screen"],
+            "Build_CyberneticsCore_Screen",
+        ),
+        (
+            "Train_Oracle",
+            ["Nexus", "Pylon", "Gateway", "CyberneticsCore"],
+            ["Build_Stargate_Screen"],
+            "Build_Stargate_Screen",
+        ),
+        (
+            "Train_Phoenix",
+            ["Nexus", "Pylon", "Gateway", "CyberneticsCore"],
+            ["Build_Stargate_Screen"],
+            "Build_Stargate_Screen",
+        ),
     ],
 )
 def test_goal_progress_resolves_extended_protoss_prerequisite_chain(
@@ -557,3 +599,26 @@ def test_goal_progress_resolves_extended_protoss_prerequisite_chain(
 
     assert report.status is GoalProgressStatus.ACTIONABLE
     assert report.unique_next_action == expected_next_action
+
+
+def test_worker_and_runtime_production_specs_remain_contract_equivalent() -> None:
+    """Keep the Python 3.9 Worker registry aligned with the Python 3.11 Runtime."""
+
+    runtime_specs = {
+        spec.name: spec
+        for spec in PROTOSS_SIMPLE64_ACTION_SPECS
+        if spec.name in PRODUCTION_SPECS
+    }
+
+    assert set(runtime_specs) == set(PRODUCTION_SPECS)
+    for action_name, worker_spec in PRODUCTION_SPECS.items():
+        runtime_spec = runtime_specs[action_name]
+        assert runtime_spec.effect_target == worker_spec.unit_type
+        assert (runtime_spec.minerals, runtime_spec.vespene, runtime_spec.supply) == (
+            worker_spec.minerals,
+            worker_spec.vespene,
+            worker_spec.supply,
+        )
+        assert {item.target for item in runtime_spec.prerequisites} == set(
+            worker_spec.prerequisites
+        )

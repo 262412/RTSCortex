@@ -63,12 +63,17 @@ the live preflight therefore reject older builds instead of relying on path chec
 
 `Simple64` is the recommended compute-center live path. It uses the RTSCortex-owned
 Protoss melee configuration for the Gateway-to-Stargate macro chain and Zealot, Stalker,
-Adept, and Void Ray control while leaving SC2 lifecycle and PySC2 execution in
-LLM-PySC2. The opponent is a built-in VeryEasy Zerg bot using the Macro build.
+Adept, Void Ray, Oracle, and Phoenix control while leaving SC2 lifecycle and PySC2
+execution in LLM-PySC2. Oracle and Phoenix retain their two distinct upstream teams, but
+the initial profile exposes only no-op and movement for them. Generic Attack, Stop, Hold,
+Pulsar Beam, Revelation, Stasis Trap, and Graviton Beam remain disabled until their
+unit-specific target and effect semantics are implemented. The opponent is a built-in
+VeryEasy Zerg bot using the Macro build.
 Production and research actions are exposed only when their completed idle source, mineral,
 vespene, supply, and prerequisite requirements are all currently satisfied; this includes the
 50-mineral/50-vespene Warp Gate research cost, the 150-mineral/150-vespene Stargate,
-and the full Adept and Void Ray production costs.
+the 100-mineral powered Shield Battery after Cybernetics Core, and the full Adept, Void Ray,
+Oracle, and Phoenix production costs.
 
 Validate and launch the deterministic Fake-provider smoke with:
 

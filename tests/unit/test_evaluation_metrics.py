@@ -649,6 +649,348 @@ def test_build_effect_timeout_and_predispatch_rates_use_build_command_denominato
     assert metrics.build_pre_dispatch_rejection_rate == 0.5
 
 
+def test_production_funnel_separates_effect_confirmation_from_acceptance_only() -> None:
+    commands = [
+        {
+            "command_id": command_id,
+            "name": action_name,
+            "actor": actor,
+            "source": "planner",
+        }
+        for command_id, action_name, actor in (
+            ("order-confirmed", "Train_Adept", "Gateway/0x1"),
+            ("unit-confirmed", "Train_VoidRay", "Stargate/0x2"),
+            ("acceptance-only", "Train_Zealot", "Gateway/0x3"),
+            ("effect-timeout", "Train_Stalker", "Gateway/0x4"),
+        )
+    ]
+    candidate_only_warp = {
+        "command_id": "warp-not-direct-training",
+        "name": "Warp_Zealot_Near",
+        "actor": "WarpGate/0x5",
+        "source": "planner",
+    }
+
+    def primitive(function_name: str) -> list[dict[str, object]]:
+        return [
+            {
+                "function_name": function_name,
+                "origin": "translator",
+                "ordinal": 0,
+                "total": 1,
+                "accepted": True,
+            }
+        ]
+
+    def evidence(
+        *,
+        producer_tag: str,
+        producer_type: str,
+        unit_type: str,
+        order_id: int,
+        accepted_loop: int,
+        confirmed_loop: int | None = None,
+        confirmation_kind: str | None = None,
+    ) -> dict[str, object]:
+        return {
+            "effect_kind": "production",
+            "producer_tag": producer_tag,
+            "producer_type": producer_type,
+            "expected_unit_type": unit_type,
+            "expected_order_id": order_id,
+            "baseline_unit_tags": [],
+            "baseline_producer_orders": [],
+            "producer_orders": [order_id],
+            "accepted_loop": accepted_loop,
+            "confirmed_loop": confirmed_loop,
+            "confirmation_kind": confirmation_kind,
+        }
+
+    events = [
+        _event(
+            1,
+            "decision",
+            {
+                "planner_candidates": [*commands, candidate_only_warp],
+                "validated_candidates": commands,
+                "batch": {"commands": commands, "rejected_commands": []},
+            },
+        ),
+        _event(
+            2,
+            "execution",
+            {
+                **commands[0],
+                "protocol_version": "1.1",
+                "action_name": "Train_Adept",
+                "success": True,
+                "status": "succeeded",
+                "execution_stage": "effect_verification",
+                "primitive_trace": primitive("Train_Adept_quick"),
+                "effect_evidence": evidence(
+                    producer_tag="0x1",
+                    producer_type="Gateway",
+                    unit_type="Adept",
+                    order_id=54,
+                    accepted_loop=100,
+                    confirmed_loop=108,
+                    confirmation_kind="producer_order",
+                ),
+            },
+        ),
+        _event(
+            3,
+            "execution",
+            {
+                **commands[1],
+                "protocol_version": "1.1",
+                "action_name": "Train_VoidRay",
+                "success": True,
+                "status": "succeeded",
+                "execution_stage": "effect_verification",
+                "primitive_trace": primitive("Train_VoidRay_quick"),
+                "effect_evidence": {
+                    **evidence(
+                        producer_tag="0x2",
+                        producer_type="Stargate",
+                        unit_type="VoidRay",
+                        order_id=57,
+                        accepted_loop=110,
+                        confirmed_loop=130,
+                        confirmation_kind="new_unit",
+                    ),
+                    "new_unit_tag": "0x20",
+                },
+            },
+        ),
+        _event(
+            4,
+            "execution",
+            {
+                **commands[2],
+                "protocol_version": "1.1",
+                "action_name": "Train_Zealot",
+                "success": True,
+                "status": "succeeded",
+                "execution_stage": "pysc2_acceptance",
+                "primitive_trace": primitive("Train_Zealot_quick"),
+                "effect_evidence": None,
+            },
+        ),
+        _event(
+            5,
+            "execution",
+            {
+                **commands[3],
+                "protocol_version": "1.1",
+                "action_name": "Train_Stalker",
+                "success": False,
+                "status": "failed",
+                "execution_stage": "effect_verification",
+                "failure_code": "no_production_order_observed",
+                "primitive_trace": primitive("Train_Stalker_quick"),
+                "effect_evidence": evidence(
+                    producer_tag="0x4",
+                    producer_type="Gateway",
+                    unit_type="Stalker",
+                    order_id=50,
+                    accepted_loop=140,
+                ),
+            },
+        ),
+    ]
+
+    metrics = compute_execution_metrics(events)
+
+    assert metrics.production_funnel == {
+        "proposed": 4,
+        "candidate_validated": 4,
+        "translator_accepted": 4,
+        "pysc2_accepted": 4,
+        "order_confirmed": 1,
+        "unit_fallback_confirmed": 1,
+        "effect_confirmed": 2,
+        "acceptance_only": 1,
+    }
+    assert metrics.production_effect_confirmed_rate == 0.5
+    assert metrics.production_provenance_coverage == 0.75
+    assert metrics.production_effect_timeouts == 1
+    assert metrics.production_timeout_rate == 0.25
+    assert metrics.production_metrics_applicable is True
+    assert metrics.production_by_action == {
+        "Train_Adept": 1,
+        "Train_Stalker": 1,
+        "Train_VoidRay": 1,
+        "Train_Zealot": 1,
+    }
+    assert metrics.production_by_producer == {
+        "Gateway / 0x1": 1,
+        "Gateway / 0x4": 1,
+        "Gateway/0x3": 1,
+        "Stargate / 0x2": 1,
+    }
+    assert sum(metrics.production_by_producer.values()) == sum(
+        metrics.production_by_action.values()
+    )
+    assert metrics.confirmation_latency_game_loops_p50 == 14.0
+    assert metrics.confirmation_latency_game_loops_p95 == pytest.approx(19.4)
+    assert metrics.confirmation_latency_game_loops_samples == 2
+
+    episode = compute_episode_metrics(
+        events,
+        EpisodeResult(
+            run_id="run-1",
+            episode_id="episode-1",
+            scenario="Simple64",
+            seed=0,
+            outcome=EpisodeOutcome.TRUNCATED,
+        ),
+    )
+    aggregate = aggregate_episode_metrics([episode, episode])
+    assert aggregate["execution"]["production_provenance_coverage"] == 0.75
+    assert aggregate["execution"]["production_by_action"]["Train_Adept"] == 2
+    assert aggregate["execution"]["production_by_producer"]["Gateway / 0x1"] == 2
+    assert aggregate["execution"]["confirmation_latency_game_loops_samples"] == 4
+    assert aggregate["execution"]["confirmation_latency_game_loops_p50"] == 14.0
+
+
+def test_legacy_train_acceptance_only_is_deprecated_not_gate_applicable() -> None:
+    command = {
+        "command_id": "legacy-train",
+        "name": "Train_Zealot",
+        "actor": "Developer/Empty",
+        "source": "planner",
+    }
+    events = [
+        _event(
+            1,
+            "decision",
+            {"batch": {"commands": [command], "rejected_commands": []}},
+        ),
+        _event(
+            2,
+            "execution",
+            {
+                "protocol_version": "1.0",
+                "command_id": "legacy-train",
+                "success": True,
+                "pysc2_function": "Train_Zealot_quick",
+            },
+        ),
+    ]
+
+    metrics = compute_execution_metrics(events)
+
+    assert metrics.production_funnel["pysc2_accepted"] == 1
+    assert metrics.production_funnel["acceptance_only"] == 1
+    assert metrics.production_effect_confirmed_rate == 0.0
+    assert metrics.production_metrics_applicable is False
+    assert metrics.production_by_producer == {"unknown": 1}
+
+
+def test_production_pysc2_rejection_is_not_counted_as_accepted_effect() -> None:
+    command = {
+        "command_id": "rejected-train",
+        "name": "Train_Stalker",
+        "actor": "Gateway/0x1",
+        "source": "planner",
+    }
+    events = [
+        _event(
+            1,
+            "decision",
+            {"batch": {"commands": [command], "rejected_commands": []}},
+        ),
+        _event(
+            2,
+            "execution",
+            {
+                **command,
+                "protocol_version": "1.1",
+                "action_name": "Train_Stalker",
+                "success": False,
+                "status": "failed",
+                "execution_stage": "pysc2_acceptance",
+                "failure_code": "pysc2_rejected",
+                "primitive_trace": [
+                    {
+                        "function_name": "Train_Stalker_quick",
+                        "origin": "translator",
+                        "ordinal": 0,
+                        "total": 1,
+                        "accepted": True,
+                    }
+                ],
+            },
+        ),
+    ]
+
+    metrics = compute_execution_metrics(events)
+
+    assert metrics.production_funnel["translator_accepted"] == 1
+    assert metrics.production_funnel["pysc2_accepted"] == 0
+    assert metrics.production_funnel["effect_confirmed"] == 0
+
+
+def test_failed_production_report_does_not_contribute_confirmation_latency() -> None:
+    command = {
+        "command_id": "failed-confirmation",
+        "name": "Train_Adept",
+        "actor": "Gateway/0x1",
+        "source": "planner",
+    }
+    events = [
+        _event(
+            1,
+            "decision",
+            {"batch": {"commands": [command], "rejected_commands": []}},
+        ),
+        _event(
+            2,
+            "execution",
+            {
+                **command,
+                "protocol_version": "1.1",
+                "action_name": "Train_Adept",
+                "success": False,
+                "status": "failed",
+                "execution_stage": "effect_verification",
+                "failure_code": "production_order_replaced",
+                "effect_evidence": {
+                    "effect_kind": "production",
+                    "producer_tag": "0x1",
+                    "producer_type": "Gateway",
+                    "expected_unit_type": "Adept",
+                    "expected_order_id": 54,
+                    "accepted_game_loop": 100,
+                    "confirmed_game_loop": 108,
+                    "confirmation_kind": "producer_order",
+                },
+            },
+        ),
+    ]
+
+    metrics = compute_execution_metrics(events)
+
+    assert metrics.production_funnel["pysc2_accepted"] == 1
+    assert metrics.production_funnel["order_confirmed"] == 0
+    assert metrics.confirmation_latency_game_loops_samples == 0
+    assert metrics.confirmation_latency_game_loops_p50 == 0.0
+
+    episode = compute_episode_metrics(
+        events,
+        EpisodeResult(
+            run_id="run-1",
+            episode_id="episode-1",
+            scenario="Simple64",
+            seed=0,
+            outcome=EpisodeOutcome.TRUNCATED,
+        ),
+    )
+    aggregate = aggregate_episode_metrics([episode])
+    assert aggregate["execution"]["confirmation_latency_game_loops_samples"] == 0
+
+
 def test_terminal_coverage_uses_dispatched_lifecycle_not_execution_count() -> None:
     command_a = {"command_id": "a", "name": "Attack_Unit"}
     command_b = {"command_id": "b", "name": "Attack_Unit"}

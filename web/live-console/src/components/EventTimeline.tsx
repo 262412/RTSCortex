@@ -1,4 +1,4 @@
-import { Activity, ChevronRight, Crosshair, Eye, EyeOff, Filter, Hammer, Pause, Play, RotateCcw, TriangleAlert, Zap } from "lucide-react";
+import { Activity, ChevronRight, Crosshair, Eye, EyeOff, Factory, Filter, Hammer, Pause, Play, RotateCcw, TriangleAlert, Zap } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { actionName, commandId, eventCategory, eventMatches, isFailure } from "../data";
@@ -15,6 +15,7 @@ const categories: { id: EventCategory; label: string; icon: React.ReactNode }[] 
   { id: "planner", label: "规划", icon: <Filter size={13} /> },
   { id: "reflex", label: "快速反应", icon: <Zap size={13} /> },
   { id: "build", label: "建造", icon: <Hammer size={13} /> },
+  { id: "production", label: "生产", icon: <Factory size={13} /> },
   { id: "combat", label: "战斗", icon: <Crosshair size={13} /> },
   { id: "failure", label: "失败", icon: <TriangleAlert size={13} /> },
 ];

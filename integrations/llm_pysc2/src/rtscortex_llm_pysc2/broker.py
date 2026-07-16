@@ -580,11 +580,13 @@ class SharedDecisionBroker:
         observation: Any,
         *,
         builder_tag: Optional[int],
+        producer_tag: Optional[int] = None,
     ) -> None:
         self.coordinator.prepare_effect(
             dispatch.command_id,
             observation,
             builder_tag=builder_tag,
+            producer_tag=producer_tag,
         )
 
     def observe_effects(self, observation: Any) -> None:

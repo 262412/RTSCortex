@@ -16,6 +16,7 @@ _MELEE_AGENTS = (
     "CombatGroup1",
     "CombatGroup3",
     "CombatGroup7",
+    "CombatGroup8",
 )
 _SINGLE_TEAM_AGENTS = (
     "CombatGroup0",
@@ -36,6 +37,7 @@ _ACTION_NAMES = {
         "Build_CyberneticsCore_Screen",
         "Build_Nexus_Near",
         "Build_Stargate_Screen",
+        "Build_ShieldBattery_Screen",
     },
     "Developer": {
         "No_Operation",
@@ -43,6 +45,8 @@ _ACTION_NAMES = {
         "Train_Stalker",
         "Train_Adept",
         "Train_VoidRay",
+        "Train_Oracle",
+        "Train_Phoenix",
         "Research_WarpGate",
         "Warp_Zealot_Near",
         "Warp_Stalker_Near",
@@ -80,6 +84,14 @@ _ACTION_NAMES = {
         "Move_Minimap",
         "Move_Screen",
         "Attack_Unit",
+    },
+    # Oracle and Phoenix have different target and ability semantics. The first
+    # live slice keeps both upstream teams but exposes movement only, so neither
+    # unit can receive an unsafe generic Attack or an unverified special ability.
+    "CombatGroup8": {
+        "No_Operation",
+        "Move_Minimap",
+        "Move_Screen",
     },
 }
 

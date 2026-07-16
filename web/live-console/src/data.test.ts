@@ -107,4 +107,27 @@ describe("event projection", () => {
 
     expect(eventCategory(progress)).toBe("planner");
   });
+
+  it("classifies direct training and production evidence under the production filter", () => {
+    const train = storedEvent(5, "execution", {
+      action_name: "Train_Adept",
+      status: "succeeded",
+      execution_stage: "effect_verification",
+      effect_evidence: { effect_kind: "production", confirmation_kind: "producer_order" },
+    });
+    const failedTrain = storedEvent(6, "execution", {
+      action_name: "Train_VoidRay",
+      status: "failed",
+      failure_code: "no_production_order_observed",
+    });
+    const warp = storedEvent(7, "execution", {
+      action_name: "Warp_Zealot_Near",
+      status: "succeeded",
+    });
+
+    expect(eventCategory(train)).toBe("production");
+    expect(eventMatches(train, "production", false)).toBe(true);
+    expect(eventCategory(failedTrain)).toBe("failure");
+    expect(eventCategory(warp)).toBe("system");
+  });
 });

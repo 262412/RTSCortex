@@ -37,6 +37,7 @@ from rtscortex_llm_pysc2.extractor import (
 )
 from rtscortex_llm_pysc2.frame_stream import RGBFramePublisher, RuntimeFrameUploader
 from rtscortex_llm_pysc2.hook import RuntimeQueryMixin
+from rtscortex_llm_pysc2.production import ProductionSpec, production_spec
 from rtscortex_llm_pysc2.protocol import RuntimeClient
 
 try:
@@ -146,11 +147,14 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
         self.unit_names = dict(unit_names)
         self._rtscortex_translation_attempt: Optional[dict[str, Any]] = None
         self._rtscortex_semantic_action: Optional[dict[str, Any]] = None
+        self._rtscortex_production_source_tag: Optional[int] = None
         broker.register(self)
 
     def get_func(self, obs: Any) -> Any:
         if not self.func_list and self.action_list:
             self._rtscortex_semantic_action = self.action_list[0]
+            if production_spec(str(self.action_list[0].get("name", ""))) is None:
+                self._rtscortex_production_source_tag = None
         action: dict[str, Any] = (
             self._rtscortex_semantic_action
             if self._rtscortex_semantic_action is not None
@@ -295,6 +299,36 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
         ordinal = int(attempt.get("ordinal", 0))
         total = int(attempt.get("total", 1))
         final_primitive = not accepted or ordinal + 1 >= total
+        train_spec = production_spec(action_name)
+        producer_tag, provenance_failure = self._validated_production_source_tag(
+            action_name,
+            attempt,
+            obs,
+        )
+        if provenance_failure is not None:
+            failure_code, reason = provenance_failure
+            self._settle_production_command_failure(
+                action_name,
+                obs,
+                failure_code=failure_code,
+                reason=reason,
+            )
+            return 0, _no_op()
+        if train_spec is not None and final_primitive:
+            invalid_reason = _production_source_invalid_reason(
+                obs.observation,
+                producer_tag,
+                train_spec,
+                self.unit_names,
+            )
+            if invalid_reason is not None:
+                self._settle_production_command_failure(
+                    action_name,
+                    obs,
+                    failure_code="production_source_invalidated",
+                    reason=invalid_reason,
+                )
+                return 0, _no_op()
         translated_position = _translated_build_position(
             action_name,
             attempt.get("resolved_arguments"),
@@ -389,10 +423,42 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
             "emitted_function_id": int(attempt.get("emitted_function_id", requested_id)),
             "expected_arguments": attempt.get("resolved_arguments", []),
             "candidate_constrained": _is_candidate_constrained_action(action_name),
+            "producer_tag": producer_tag,
         }
         if dispatch.final_primitive:
             self._rtscortex_semantic_action = None
+            self._rtscortex_production_source_tag = None
         return result
+
+    def _validated_production_source_tag(
+        self,
+        action_name: str,
+        attempt: Mapping[str, Any],
+        obs: Any,
+    ) -> tuple[Optional[int], Optional[tuple[str, str]]]:
+        """Bind primitive 573 to the exact raw producer chosen by upstream."""
+
+        if production_spec(action_name) is None:
+            return None, None
+        source_tag = self._rtscortex_production_source_tag
+        ordinal = int(attempt.get("ordinal", 0))
+        requested_id = int(attempt.get("requested_function_id", 0))
+        if source_tag is None:
+            return None, (
+                "production_provenance_missing",
+                "production provenance missing before translator dispatch",
+            )
+        if ordinal == 0:
+            expected_world = _production_source_world_position(self, obs.observation, source_tag)
+            translated_world = _single_position(attempt.get("resolved_arguments"))
+            if requested_id != 573 or expected_world is None or translated_world != expected_world:
+                return None, (
+                    "production_provenance_missing",
+                    "production primitive 573 does not match the cached producer tag "
+                    f"{hex(source_tag)}: expected {expected_world!r}, received "
+                    f"function {requested_id} arguments {translated_world!r}",
+                )
+        return source_tag, None
 
     def _reject_unavailable_production_action(
         self,
@@ -409,6 +475,8 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
             action_source_types=self.broker.extractor.action_source_types,
         )
         if source_tag is not None:
+            if production_spec(action_name) is not None:
+                self._rtscortex_production_source_tag = source_tag
             return False
         self._settle_production_source_failure(
             action_name,
@@ -425,11 +493,26 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
         obs: Any,
         reason: str,
     ) -> None:
+        self._settle_production_command_failure(
+            action_name,
+            obs,
+            failure_code="production_source_unavailable",
+            reason=reason,
+        )
+
+    def _settle_production_command_failure(
+        self,
+        action_name: str,
+        obs: Any,
+        *,
+        failure_code: str,
+        reason: str,
+    ) -> None:
         dispatch = self.broker.reject_command(
             self.name,
             _execution_team_name(self),
             action_name,
-            failure_code="production_source_unavailable",
+            failure_code=failure_code,
         )
         if dispatch is None:
             self.broker.raise_unattributed_integrity(
@@ -443,6 +526,7 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
         )
         self.func_list.clear()
         self._rtscortex_semantic_action = None
+        self._rtscortex_production_source_tag = None
 
 
 class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
@@ -686,6 +770,7 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
                     dispatch,
                     obs.observation,
                     builder_tag=_execution_unit_tag(agent),
+                    producer_tag=attempt.get("producer_tag"),
                 )
             self._pending_primitive = dispatch
             self._pending_primitive_agent = agent
@@ -930,6 +1015,116 @@ def _execution_team_name(agent: Any) -> Optional[str]:
 def _execution_unit_tag(agent: Any) -> Optional[int]:
     value = getattr(agent, "team_unit_tag_curr", None)
     return None if value is None else int(value)
+
+
+def _production_source_world_position(
+    agent: Any,
+    observation: Any,
+    source_tag: int,
+) -> Optional[tuple[float, float]]:
+    source = next(
+        (
+            unit
+            for unit in getattr(observation, "raw_units", ())
+            if int(getattr(unit, "tag", -1)) == source_tag
+        ),
+        None,
+    )
+    if source is None and isinstance(observation, Mapping):
+        source = next(
+            (
+                unit
+                for unit in observation.get("raw_units", ())
+                if int(
+                    unit.get("tag", -1) if isinstance(unit, Mapping) else getattr(unit, "tag", -1)
+                )
+                == source_tag
+            ),
+            None,
+        )
+    if source is None:
+        return None
+    x = source.get("x", 0.0) if isinstance(source, Mapping) else getattr(source, "x", 0.0)
+    y = source.get("y", 0.0) if isinstance(source, Mapping) else getattr(source, "y", 0.0)
+    return (
+        float(x) + float(getattr(agent, "world_x_offset", 0.0)),
+        max(
+            0.0,
+            float(getattr(agent, "world_range", 0.0))
+            - float(y)
+            + float(getattr(agent, "world_y_offset", 0.0)),
+        ),
+    )
+
+
+def _production_source_invalid_reason(
+    observation: Any,
+    source_tag: Optional[int],
+    spec: ProductionSpec,
+    unit_names: Mapping[int, str],
+) -> Optional[str]:
+    if source_tag is None:
+        return f"{spec.action_name} producer provenance is unavailable at final dispatch"
+    raw_units = (
+        observation.get("raw_units", ())
+        if isinstance(observation, Mapping)
+        else getattr(observation, "raw_units", ())
+    )
+    source = next(
+        (
+            unit
+            for unit in raw_units
+            if int(
+                unit.get("tag", -1) if isinstance(unit, Mapping) else getattr(unit, "tag", -1)
+            )
+            == source_tag
+        ),
+        None,
+    )
+    if source is None:
+        return f"{spec.action_name} producer {hex(source_tag)} disappeared before final dispatch"
+
+    def value(name: str, default: Any) -> Any:
+        return (
+            source.get(name, default)
+            if isinstance(source, Mapping)
+            else getattr(source, name, default)
+        )
+
+    unit_type = value("unit_type", "")
+    source_name = (
+        str(unit_type)
+        if isinstance(unit_type, str)
+        else unit_names.get(int(unit_type), f"unit:{int(unit_type)}")
+    )
+    if int(value("alliance", 0)) != 1 or source_name != spec.producer_type:
+        return (
+            f"{spec.action_name} producer {hex(source_tag)} changed identity to "
+            f"{source_name!r} alliance {int(value('alliance', 0))}"
+        )
+    progress = float(value("build_progress", 0.0))
+    normalized_progress = progress / 100.0 if progress > 1.0 else progress
+    if normalized_progress < 1.0:
+        return f"{spec.action_name} producer {hex(source_tag)} is no longer complete"
+    if int(value("active", 0)) != 0 or int(value("order_length", 0)) != 0:
+        return f"{spec.action_name} producer {hex(source_tag)} became busy before final dispatch"
+    return None
+
+
+def _single_position(arguments: Any) -> Optional[tuple[float, float]]:
+    if not isinstance(arguments, (list, tuple)):
+        return None
+    for value in arguments:
+        if (
+            isinstance(value, (list, tuple))
+            and len(value) == 2
+            and all(
+                isinstance(coordinate, (int, float)) and not isinstance(coordinate, bool)
+                for coordinate in value
+            )
+        ):
+            return float(value[0]), float(value[1])
+    return None
 
 
 def _observation_game_loop(observation: Any) -> int:

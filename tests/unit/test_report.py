@@ -12,6 +12,7 @@ from rtscortex.contracts import (
     ActionBatch,
     ActionCommand,
     ActionSource,
+    EffectEvidence,
     EpisodeOutcome,
     EpisodeResult,
     EpisodeSummary,
@@ -454,6 +455,136 @@ def test_report_exactly_once_gate_rejects_unexpected_terminal_report(
     assert episode["hard_acceptance"]["gates"]["unexpected_terminal_reports"]["passed"] is False
 
 
+def test_report_exposes_production_funnel_provenance_and_acceptance_only_gate(
+    tmp_path: Path,
+) -> None:
+    confirmed = ActionCommand(
+        command_id="train-confirmed",
+        actor="Gateway/0x1",
+        name="Train_Adept",
+        source=ActionSource.PLANNER,
+        created_game_loop=100,
+    )
+    acceptance_only = ActionCommand(
+        command_id="train-acceptance-only",
+        actor="Gateway/0x2",
+        name="Train_Zealot",
+        source=ActionSource.PLANNER,
+        created_game_loop=100,
+    )
+    batch = ActionBatch(
+        run_id="live-run",
+        episode_id="episode-0",
+        step_id=0,
+        decision_id="decision-production",
+        commands=[confirmed, acceptance_only],
+    )
+    result = EpisodeResult(
+        run_id="live-run",
+        episode_id="episode-0",
+        scenario="Simple64",
+        seed=0,
+        outcome=EpisodeOutcome.TRUNCATED,
+        steps=1,
+    )
+    confirmed_report = ExecutionReport(
+        run_id="live-run",
+        episode_id="episode-0",
+        step_id=0,
+        command_id=confirmed.command_id,
+        success=True,
+        action_name=confirmed.name,
+        actor=confirmed.actor,
+        source=confirmed.source,
+        status=ExecutionStatus.SUCCEEDED,
+        execution_stage=ExecutionStage.EFFECT_VERIFICATION,
+        effect_evidence=EffectEvidence(
+            effect_kind="production",
+            producer_tag="0x1",
+            producer_type="Gateway",
+            expected_unit_type="Adept",
+            expected_order_id=54,
+            baseline_producer_orders=[],
+            producer_orders=[54],
+            production_order_seen=True,
+            confirmation_kind="producer_order",
+            accepted_game_loop=100,
+            confirmed_game_loop=108,
+        ),
+    )
+    acceptance_report = ExecutionReport(
+        run_id="live-run",
+        episode_id="episode-0",
+        step_id=0,
+        command_id=acceptance_only.command_id,
+        success=True,
+        action_name=acceptance_only.name,
+        actor=acceptance_only.actor,
+        source=acceptance_only.source,
+        status=ExecutionStatus.SUCCEEDED,
+        execution_stage=ExecutionStage.PYSC2_ACCEPTANCE,
+    )
+    events = [
+        _event(
+            1,
+            "decision",
+            {
+                "planner_candidates": [
+                    confirmed.model_dump(mode="json"),
+                    acceptance_only.model_dump(mode="json"),
+                ],
+                "validated_candidates": [
+                    confirmed.model_dump(mode="json"),
+                    acceptance_only.model_dump(mode="json"),
+                ],
+                "batch": batch.model_dump(mode="json"),
+            },
+        ),
+        _event(
+            2,
+            "command_lifecycle",
+            {"command": confirmed.model_dump(mode="json"), "status": "dispatched"},
+        ),
+        _event(
+            3,
+            "command_lifecycle",
+            {"command": acceptance_only.model_dump(mode="json"), "status": "dispatched"},
+        ),
+        _event(4, "execution", confirmed_report.model_dump(mode="json")),
+        _event(5, "execution", acceptance_report.model_dump(mode="json")),
+        _event(6, "episode_result", result.model_dump(mode="json")),
+    ]
+    run_dir = tmp_path / "production-funnel"
+    _write_journal(run_dir, events)
+
+    artifacts = write_run_reports(run_dir)
+    report = artifacts.timeline_path.read_text(encoding="utf-8")
+    summary = json.loads(artifacts.summary_path.read_text(encoding="utf-8"))
+    episode = summary["runs"]["live-run"]["episodes"]["episode-0"]
+    execution = episode["metrics"]["execution"]
+    gates = episode["hard_acceptance"]["gates"]
+
+    assert execution["production_funnel"]["pysc2_accepted"] == 2
+    assert execution["production_funnel"]["effect_confirmed"] == 1
+    assert execution["production_funnel"]["acceptance_only"] == 1
+    assert execution["production_provenance_coverage"] == 0.5
+    assert execution["production_by_action"] == {"Train_Adept": 1, "Train_Zealot": 1}
+    assert execution["production_by_producer"] == {
+        "Gateway / 0x1": 1,
+        "Gateway/0x2": 1,
+    }
+    assert execution["confirmation_latency_game_loops_p50"] == 8.0
+    assert gates["production_acceptance_only"]["passed"] is False
+    assert gates["production_provenance_coverage"]["passed"] is False
+    assert gates["production_effect_confirmed_rate"]["passed"] is False
+    assert gates["production_timeout_rate"]["passed"] is True
+    assert "### Production funnel" in report
+    assert "Production confirmed by order on `Gateway` `0x1` for `Adept`" in report
+    assert "Production acceptance only (deprecated)" in report
+    assert "#### Production by action" in report
+    assert "#### Production by producer" in report
+
+
 def test_real_legacy_full_match_report_freezes_baseline_lines() -> None:
     fixture = Path(__file__).parents[1] / "fixtures" / "legacy_full_match_characterization.jsonl"
 
@@ -548,6 +679,10 @@ def test_legacy_incomplete_mock_journal_still_writes_report_and_cli_succeeds(
     assert episode["metrics"]["execution"]["control_noops"] == 1
     assert episode["metrics"]["execution"]["meaningful_commands"] == 0
     assert episode["hard_acceptance"]["passed"] is False
+    assert (
+        episode["hard_acceptance"]["gates"]["production_acceptance_only"]["passed"]
+        is None
+    )
     assert "`incomplete`" in report
     assert "No terminal episode result was recorded" in report
     assert "Structured output not recorded (legacy event)." in report

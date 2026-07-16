@@ -106,12 +106,21 @@ mapped action is soft-deferred, the earliest one is the frontier. Unsupported, d
 future, obsolete, and parse-error actions never inflate the illegal-action rate. Reports
 retain both logical-step counts and repeat-weighted effective-action counts.
 
-The current live Protoss macro slice maps Zealot, Stalker, Adept, Void Ray, Pylon, Gateway,
-Cybernetics Core, Assimilator, Nexus, Stargate, and Warp Gate research. Stargate placement
-requires a completed Cybernetics Core, power, 150 minerals, and 150 vespene. Adept and Void
-Ray production use their real resource, supply, prerequisite, and idle-production-source
-checks. The melee profile also retains one Adept and one Void Ray combat team so newly
-produced units remain controllable.
+The current live Protoss macro slice maps Zealot, Stalker, Adept, Void Ray, Oracle, Phoenix,
+Pylon, Gateway, Cybernetics Core, Assimilator, Nexus, Stargate, Shield Battery, and Warp Gate
+research. Stargate placement requires a completed Cybernetics Core, power, 150 minerals, and
+150 vespene. Shield Battery requires the completed Core, a powered 2-by-2 placement, and 100
+minerals. Adept, Void Ray, Oracle, and Phoenix production use their real resource, supply,
+prerequisite, and idle-production-source checks. The melee profile retains the Adept and Void
+Ray teams plus both distinct upstream Oracle and Phoenix teams. The new air-specialist teams
+are movement-only in this first slice; generic attacks and special abilities remain disabled
+until actor-specific target and effect semantics are available.
+
+The checked-in Protoss-a output regression keeps the existing 48-state v0.2 corpus and its
+manifest unchanged. Re-scoring those 1,650 effective macro actions with the expanded mapping
+must produce 687 mapped actions: 582 future, 91 deferred, and 14 legal now. The remaining
+actions are 961 unsupported and 2 parse errors, with no illegal or obsolete actions. This is a
+mapping characterization baseline, not a new model inference or gameplay score.
 
 ## Artifacts
 

@@ -105,9 +105,15 @@ class BridgeCoordinator:
         observation: Any,
         *,
         builder_tag: Optional[int],
+        producer_tag: Optional[int] = None,
     ) -> None:
         if self.effect_verifier.is_tracked(command_id):
-            self.effect_verifier.prepare(command_id, observation, builder_tag)
+            self.effect_verifier.prepare(
+                command_id,
+                observation,
+                builder_tag,
+                producer_tag=producer_tag,
+            )
 
     def record_primitive(
         self,
@@ -155,7 +161,7 @@ class BridgeCoordinator:
         if self.effect_verifier.is_tracked(command_id):
             if self.tracker.primitives_succeeded(command_id):
                 if game_loop is None:
-                    raise ValueError("game_loop is required to verify a build effect")
+                    raise ValueError("game_loop is required to verify a gameplay effect")
                 self.effect_verifier.accept_primitive(command_id, game_loop=game_loop)
                 return None
             self.effect_verifier.cancel(command_id)

@@ -261,6 +261,52 @@ def _write_markdown_report(
     lines.extend(
         [
             "",
+            "## Production funnel",
+            "",
+            (
+                "| Variant | Raw Planner proposed | Candidate validated | "
+                "Translator accepted | PySC2 accepted | Order confirmed | "
+                "Unit fallback confirmed | Effect confirmed | Acceptance only (deprecated) | "
+                "Effect confirmed rate | Provenance coverage | Timeout rate | "
+                "Confirmation latency p50/p95 loops |"
+            ),
+            "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        ]
+    )
+    for display_variant, metrics in variants.items():
+        execution = metrics["execution"]
+        funnel = execution["production_funnel"]
+        lines.append(
+            f"| `{display_variant}` | {funnel['proposed']} | "
+            f"{funnel['candidate_validated']} | {funnel['translator_accepted']} | "
+            f"{funnel['pysc2_accepted']} | {funnel['order_confirmed']} | "
+            f"{funnel['unit_fallback_confirmed']} | {funnel['effect_confirmed']} | "
+            f"{funnel['acceptance_only']} | "
+            f"{execution['production_effect_confirmed_rate']:.3f} | "
+            f"{execution['production_provenance_coverage']:.3f} | "
+            f"{execution['production_timeout_rate']:.3f} | "
+            f"{execution['confirmation_latency_game_loops_p50']:.1f} / "
+            f"{execution['confirmation_latency_game_loops_p95']:.1f} |"
+        )
+    lines.extend(
+        [
+            "",
+            "### Production breakdown",
+            "",
+            "| Variant | Actions | Producers |",
+            "|---|---|---|",
+        ]
+    )
+    for display_variant, metrics in variants.items():
+        execution = metrics["execution"]
+        lines.append(
+            f"| `{display_variant}` | "
+            f"{_count_summary(execution['production_by_action'])} | "
+            f"{_count_summary(execution['production_by_producer'])} |"
+        )
+    lines.extend(
+        [
+            "",
             "## Failure taxonomy",
             "",
             (

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
@@ -31,6 +32,7 @@ class MetricSamples:
     tick_latency_ms: tuple[float, ...] = ()
     plan_age_game_loops: tuple[float, ...] = ()
     plan_accept_gap_game_loops: tuple[float, ...] = ()
+    confirmation_latency_game_loops: tuple[float, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -39,6 +41,7 @@ class _PlannerProposalAudit:
     parsed_results: int = 0
     audited_results: int = 0
     build_proposals: int = 0
+    production_proposals: int = 0
     unsafe_attacks: int = 0
     builder_attacks: int = 0
     friendly_target_attacks: int = 0
@@ -89,6 +92,17 @@ class ExecutionMetrics:
     build_effect_timeout_rate: float
     build_pre_dispatch_rejections: int
     build_pre_dispatch_rejection_rate: float
+    production_funnel: dict[str, int]
+    production_effect_confirmed_rate: float
+    production_provenance_coverage: float
+    production_effect_timeouts: int
+    production_timeout_rate: float
+    production_metrics_applicable: bool
+    production_by_action: dict[str, int]
+    production_by_producer: dict[str, int]
+    confirmation_latency_game_loops_p50: float
+    confirmation_latency_game_loops_p95: float
+    confirmation_latency_game_loops_samples: int
     planner_module_results: int
     planner_proposal_audited_results: int
     planner_proposal_audit_complete: bool
@@ -198,6 +212,29 @@ class EpisodeMetrics:
                 "build_pre_dispatch_rejections": (self.execution.build_pre_dispatch_rejections),
                 "build_pre_dispatch_rejection_rate": (
                     self.execution.build_pre_dispatch_rejection_rate
+                ),
+                "production_funnel": self.execution.production_funnel,
+                "production_effect_confirmed_rate": (
+                    self.execution.production_effect_confirmed_rate
+                ),
+                "production_provenance_coverage": (
+                    self.execution.production_provenance_coverage
+                ),
+                "production_effect_timeouts": self.execution.production_effect_timeouts,
+                "production_timeout_rate": self.execution.production_timeout_rate,
+                "production_metrics_applicable": (
+                    self.execution.production_metrics_applicable
+                ),
+                "production_by_action": self.execution.production_by_action,
+                "production_by_producer": self.execution.production_by_producer,
+                "confirmation_latency_game_loops_p50": (
+                    self.execution.confirmation_latency_game_loops_p50
+                ),
+                "confirmation_latency_game_loops_p95": (
+                    self.execution.confirmation_latency_game_loops_p95
+                ),
+                "confirmation_latency_game_loops_samples": (
+                    self.execution.confirmation_latency_game_loops_samples
                 ),
                 "planner_module_results": self.execution.planner_module_results,
                 "planner_proposal_audited_results": (
@@ -372,6 +409,9 @@ def compute_episode_metrics(
             tick_latency_ms=tuple(tick_latencies),
             plan_age_game_loops=tuple(plan_ages),
             plan_accept_gap_game_loops=tuple(plan_accept_gaps),
+            confirmation_latency_game_loops=tuple(
+                _production_confirmation_latencies(events)
+            ),
         ),
     )
 
@@ -390,6 +430,11 @@ def aggregate_episode_metrics(metrics: list[EpisodeMetrics]) -> dict[str, Any]:
     plan_ages = [value for item in metrics for value in item.samples.plan_age_game_loops]
     plan_accept_gaps = [
         value for item in metrics for value in item.samples.plan_accept_gap_game_loops
+    ]
+    confirmation_latencies = [
+        value
+        for item in metrics
+        for value in item.samples.confirmation_latency_game_loops
     ]
     failure_reasons: dict[str, int] = {}
     for item in metrics:
@@ -426,12 +471,31 @@ def aggregate_episode_metrics(metrics: list[EpisodeMetrics]) -> dict[str, Any]:
     build_pre_dispatch_rejections = sum(
         item.execution.build_pre_dispatch_rejections for item in metrics
     )
+    production_funnel = _merge_counts(
+        [item.execution.production_funnel for item in metrics]
+    )
+    production_effect_timeouts = sum(
+        item.execution.production_effect_timeouts for item in metrics
+    )
+    production_by_action = _merge_counts(
+        [item.execution.production_by_action for item in metrics]
+    )
+    production_by_producer = _merge_counts(
+        [item.execution.production_by_producer for item in metrics]
+    )
     planner_module_results = sum(item.execution.planner_module_results for item in metrics)
     planner_proposal_audited_results = sum(
         item.execution.planner_proposal_audited_results for item in metrics
     )
     pysc2_accepted_builds = build_funnel.get("pysc2_accepted", 0)
     proposed_builds = build_funnel.get("proposed", 0)
+    pysc2_accepted_production = production_funnel.get("pysc2_accepted", 0)
+    production_metrics = [
+        item.execution
+        for item in metrics
+        if item.execution.production_funnel.get("proposed", 0) > 0
+        or item.execution.production_funnel.get("pysc2_accepted", 0) > 0
+    ]
     execution = {
         "execution_reports": execution_reports,
         "dispatched_commands": dispatched_commands,
@@ -496,6 +560,41 @@ def aggregate_episode_metrics(metrics: list[EpisodeMetrics]) -> dict[str, Any]:
         "build_pre_dispatch_rejection_rate": (
             build_pre_dispatch_rejections / proposed_builds if proposed_builds else 0.0
         ),
+        "production_funnel": production_funnel,
+        "production_effect_confirmed_rate": (
+            production_funnel.get("effect_confirmed", 0) / pysc2_accepted_production
+            if pysc2_accepted_production
+            else 0.0
+        ),
+        "production_provenance_coverage": (
+            sum(
+                item.execution.production_provenance_coverage
+                * item.execution.production_funnel.get("pysc2_accepted", 0)
+                for item in metrics
+            )
+            / pysc2_accepted_production
+            if pysc2_accepted_production
+            else 0.0
+        ),
+        "production_effect_timeouts": production_effect_timeouts,
+        "production_timeout_rate": (
+            production_effect_timeouts / pysc2_accepted_production
+            if pysc2_accepted_production
+            else 0.0
+        ),
+        "production_metrics_applicable": (
+            bool(production_metrics)
+            and all(item.production_metrics_applicable for item in production_metrics)
+        ),
+        "production_by_action": production_by_action,
+        "production_by_producer": production_by_producer,
+        "confirmation_latency_game_loops_p50": _percentile(
+            confirmation_latencies, 0.50
+        ),
+        "confirmation_latency_game_loops_p95": _percentile(
+            confirmation_latencies, 0.95
+        ),
+        "confirmation_latency_game_loops_samples": len(confirmation_latencies),
         "planner_module_results": planner_module_results,
         "planner_proposal_audited_results": planner_proposal_audited_results,
         "planner_proposal_audit_complete": (
@@ -633,11 +732,22 @@ def compute_execution_metrics(events: list[StoredEvent]) -> ExecutionMetrics:
     meaningful_failures = 0
     meaningful_cancelled = 0
     meaningful_unconfirmed = 0
-    translator_accepted_ids: set[str] = set()
-    pysc2_accepted_ids: set[str] = set()
-    effect_confirmed_ids: set[str] = set()
+    build_translator_accepted_ids: set[str] = set()
+    build_pysc2_accepted_ids: set[str] = set()
+    build_effect_confirmed_ids: set[str] = set()
     build_effect_timeout_ids: set[str] = set()
     build_pre_dispatch_rejection_ids: set[str] = set()
+    production_translator_accepted_ids: set[str] = set()
+    production_pysc2_accepted_ids: set[str] = set()
+    production_order_confirmed_ids: set[str] = set()
+    production_unit_confirmed_ids: set[str] = set()
+    production_acceptance_only_ids: set[str] = set()
+    production_provenance_complete_ids: set[str] = set()
+    production_effect_timeout_ids: set[str] = set()
+    production_confirmation_latencies: dict[str, float] = {}
+    production_report_protocols: set[str] = set()
+    production_action_by_command: dict[str, str] = {}
+    production_producer_by_command: dict[str, str] = {}
     failure_reports = 0
     explicitly_classified_failures = 0
     generic_translation_failures = 0
@@ -716,11 +826,11 @@ def compute_execution_metrics(events: list[StoredEvent]) -> ExecutionMetrics:
             if stage in {"pysc2_acceptance", "effect_verification"} or (
                 stage == "episode_end" and final_translator is not None
             ):
-                translator_accepted_ids.add(command_id)
+                build_translator_accepted_ids.add(command_id)
             if (final_translator is not None and final_translator.get("accepted") is True) or (
                 final_translator is None and stage == "effect_verification"
             ):
-                pysc2_accepted_ids.add(command_id)
+                build_pysc2_accepted_ids.add(command_id)
             evidence = payload.get("effect_evidence")
             confirmed_tag = (
                 (evidence.get("new_structure_tag") or evidence.get("observed_structure_tag"))
@@ -728,7 +838,90 @@ def compute_execution_metrics(events: list[StoredEvent]) -> ExecutionMetrics:
                 else None
             )
             if status == "succeeded" and (stage == "effect_verification" or confirmed_tag):
-                effect_confirmed_ids.add(command_id)
+                build_effect_confirmed_ids.add(command_id)
+
+        if _is_production_action(action_name):
+            production_action_by_command[command_id] = action_name
+            production_report_protocols.add(str(payload.get("protocol_version") or "legacy"))
+            final_translator = _final_translator_primitive(payload)
+            if stage in {"pysc2_acceptance", "effect_verification"} or (
+                stage == "episode_end" and final_translator is not None
+            ):
+                production_translator_accepted_ids.add(command_id)
+            final_translator_accepted = (
+                final_translator is not None
+                and final_translator.get("accepted") is True
+            )
+            if (
+                stage == "effect_verification"
+                and (final_translator is None or final_translator_accepted)
+            ) or (
+                stage == "episode_end" and final_translator_accepted
+            ) or (
+                stage == "pysc2_acceptance"
+                and status == "succeeded"
+                and (final_translator is None or final_translator_accepted)
+            ):
+                production_pysc2_accepted_ids.add(command_id)
+
+            evidence = payload.get("effect_evidence")
+            production_evidence = (
+                evidence
+                if isinstance(evidence, dict) and evidence.get("effect_kind") == "production"
+                else None
+            )
+            producer = _production_producer_label(production_evidence, actor)
+            if producer is not None:
+                production_producer_by_command[command_id] = producer
+            if production_evidence is not None and _production_provenance_complete(
+                production_evidence
+            ):
+                production_provenance_complete_ids.add(command_id)
+            confirmation_kind = (
+                production_evidence.get("confirmation_kind")
+                if production_evidence is not None
+                else None
+            )
+            if (
+                command_id in production_pysc2_accepted_ids
+                and status == "succeeded"
+                and confirmation_kind == "producer_order"
+            ):
+                production_order_confirmed_ids.add(command_id)
+            elif (
+                command_id in production_pysc2_accepted_ids
+                and status == "succeeded"
+                and confirmation_kind == "new_unit"
+            ):
+                production_unit_confirmed_ids.add(command_id)
+
+            if (
+                _is_train_action(action_name)
+                and status == "succeeded"
+                and stage == "pysc2_acceptance"
+                and production_evidence is None
+            ):
+                production_acceptance_only_ids.add(command_id)
+
+            if code in {
+                "producer_not_observable",
+                "no_production_order_observed",
+                "production_order_replaced",
+            } or (
+                _is_train_action(action_name)
+                and code in {"effect_timeout", "target_not_created"}
+            ):
+                production_effect_timeout_ids.add(command_id)
+
+            if (
+                production_evidence is not None
+                and confirmation_kind in {"producer_order", "new_unit"}
+                and command_id in production_pysc2_accepted_ids
+                and status == "succeeded"
+            ):
+                latency = _confirmation_latency(production_evidence)
+                if latency is not None:
+                    production_confirmation_latencies[command_id] = latency
 
     meaningful_commands = (
         meaningful_successes + meaningful_failures + meaningful_cancelled + meaningful_unconfirmed
@@ -742,6 +935,17 @@ def compute_execution_metrics(events: list[StoredEvent]) -> ExecutionMetrics:
         else len(build_proposed_ids)
     )
     build_validated_ids = _build_validated_ids(decisions, fallback=build_selected_ids)
+    production_selected_ids = _production_selected_ids(commands)
+    production_proposed_ids = production_selected_ids | _production_candidate_ids(decisions)
+    production_proposed_count = (
+        proposal_audit.production_proposals
+        if proposal_audit.parsed_results > 0
+        else len(production_proposed_ids)
+    )
+    production_validated_ids = _production_validated_ids(
+        decisions,
+        fallback=production_selected_ids,
+    )
     rejected_ids = _unique_rejected_command_ids(decisions)
     idle_reasons: dict[str, int] = {}
     fallback_decisions = 0
@@ -827,22 +1031,75 @@ def compute_execution_metrics(events: list[StoredEvent]) -> ExecutionMetrics:
         build_funnel={
             "proposed": build_proposed_count,
             "candidate_validated": len(build_validated_ids),
-            "translator_accepted": len(translator_accepted_ids),
-            "pysc2_accepted": len(pysc2_accepted_ids),
-            "effect_confirmed": len(effect_confirmed_ids),
+            "translator_accepted": len(build_translator_accepted_ids),
+            "pysc2_accepted": len(build_pysc2_accepted_ids),
+            "effect_confirmed": len(build_effect_confirmed_ids),
         },
         build_effect_confirmed_rate=(
-            len(effect_confirmed_ids) / len(pysc2_accepted_ids) if pysc2_accepted_ids else 0.0
+            len(build_effect_confirmed_ids) / len(build_pysc2_accepted_ids)
+            if build_pysc2_accepted_ids
+            else 0.0
         ),
         build_effect_timeouts=len(build_effect_timeout_ids),
         build_effect_timeout_rate=(
-            len(build_effect_timeout_ids) / len(pysc2_accepted_ids) if pysc2_accepted_ids else 0.0
+            len(build_effect_timeout_ids) / len(build_pysc2_accepted_ids)
+            if build_pysc2_accepted_ids
+            else 0.0
         ),
         build_pre_dispatch_rejections=len(build_pre_dispatch_rejection_ids),
         build_pre_dispatch_rejection_rate=(
             len(build_pre_dispatch_rejection_ids) / build_proposed_count
             if build_proposed_count
             else 0.0
+        ),
+        production_funnel={
+            "proposed": production_proposed_count,
+            "candidate_validated": len(production_validated_ids),
+            "translator_accepted": len(production_translator_accepted_ids),
+            "pysc2_accepted": len(production_pysc2_accepted_ids),
+            "order_confirmed": len(production_order_confirmed_ids),
+            "unit_fallback_confirmed": len(production_unit_confirmed_ids),
+            "effect_confirmed": len(
+                production_order_confirmed_ids | production_unit_confirmed_ids
+            ),
+            "acceptance_only": len(production_acceptance_only_ids),
+        },
+        production_effect_confirmed_rate=(
+            len(production_order_confirmed_ids | production_unit_confirmed_ids)
+            / len(production_pysc2_accepted_ids)
+            if production_pysc2_accepted_ids
+            else 0.0
+        ),
+        production_provenance_coverage=(
+            len(production_provenance_complete_ids & production_pysc2_accepted_ids)
+            / len(production_pysc2_accepted_ids)
+            if production_pysc2_accepted_ids
+            else 0.0
+        ),
+        production_effect_timeouts=len(
+            production_effect_timeout_ids & production_pysc2_accepted_ids
+        ),
+        production_timeout_rate=(
+            len(production_effect_timeout_ids & production_pysc2_accepted_ids)
+            / len(production_pysc2_accepted_ids)
+            if production_pysc2_accepted_ids
+            else 0.0
+        ),
+        production_metrics_applicable=(production_report_protocols == {"1.1"}),
+        production_by_action=_counts_from_values(production_action_by_command.values()),
+        production_by_producer=_counts_from_values(
+            production_producer_by_command.values()
+        ),
+        confirmation_latency_game_loops_p50=_percentile(
+            list(production_confirmation_latencies.values()),
+            0.50,
+        ),
+        confirmation_latency_game_loops_p95=_percentile(
+            list(production_confirmation_latencies.values()),
+            0.95,
+        ),
+        confirmation_latency_game_loops_samples=len(
+            production_confirmation_latencies
         ),
         planner_module_results=proposal_audit.module_results,
         planner_proposal_audited_results=proposal_audit.audited_results,
@@ -1002,6 +1259,7 @@ def _audit_planner_proposals(
     parsed_results = 0
     audited_results = 0
     build_proposals = 0
+    production_proposals = 0
     unsafe_attacks = 0
     builder_attacks = 0
     friendly_target_attacks = 0
@@ -1023,6 +1281,8 @@ def _audit_planner_proposals(
             action_name = str(proposal.get("name", ""))
             if action_name.casefold().startswith("build_"):
                 build_proposals += 1
+            if _is_production_action(action_name):
+                production_proposals += 1
             if action_name != "Attack_Unit":
                 continue
             is_builder_attack = _is_builder_actor(str(proposal.get("actor", "")))
@@ -1051,6 +1311,7 @@ def _audit_planner_proposals(
         parsed_results=parsed_results,
         audited_results=audited_results,
         build_proposals=build_proposals,
+        production_proposals=production_proposals,
         unsafe_attacks=unsafe_attacks,
         builder_attacks=builder_attacks,
         friendly_target_attacks=friendly_target_attacks,
@@ -1119,6 +1380,141 @@ def _build_validated_ids(
             if isinstance(command_id, str) and str(action_name).lower().startswith("build_"):
                 command_ids.add(command_id)
     return command_ids if has_explicit_validation else fallback
+
+
+def _production_candidate_ids(decisions: list[StoredEvent]) -> set[str]:
+    command_ids: set[str] = set()
+    for decision in decisions:
+        for candidate_field in ("planner_candidates", "reflex_candidates"):
+            candidates = decision.payload.get(candidate_field)
+            if not isinstance(candidates, list):
+                continue
+            for command in candidates:
+                if not isinstance(command, dict):
+                    continue
+                command_id = command.get("command_id")
+                action_name = str(command.get("name", ""))
+                if isinstance(command_id, str) and _is_production_action(action_name):
+                    command_ids.add(command_id)
+    return command_ids
+
+
+def _production_selected_ids(commands: dict[str, dict[str, Any]]) -> set[str]:
+    return {
+        command_id
+        for command_id, command in commands.items()
+        if _is_production_action(str(command.get("name", "")))
+    }
+
+
+def _production_validated_ids(
+    decisions: list[StoredEvent],
+    *,
+    fallback: set[str],
+) -> set[str]:
+    command_ids: set[str] = set()
+    has_explicit_validation = False
+    for decision in decisions:
+        candidates = decision.payload.get("validated_candidates")
+        if not isinstance(candidates, list):
+            continue
+        has_explicit_validation = True
+        for command in candidates:
+            if not isinstance(command, dict):
+                continue
+            command_id = command.get("command_id")
+            action_name = str(command.get("name", ""))
+            if isinstance(command_id, str) and _is_production_action(action_name):
+                command_ids.add(command_id)
+    return command_ids if has_explicit_validation else fallback
+
+
+def _is_production_action(action_name: str) -> bool:
+    return action_name.casefold().startswith("train_")
+
+
+def _is_train_action(action_name: str) -> bool:
+    return action_name.casefold().startswith("train_")
+
+
+def _production_provenance_complete(evidence: dict[str, Any]) -> bool:
+    return (
+        evidence.get("effect_kind") == "production"
+        and isinstance(evidence.get("producer_tag"), str)
+        and bool(str(evidence["producer_tag"]).strip())
+        and isinstance(evidence.get("producer_type"), str)
+        and bool(str(evidence["producer_type"]).strip())
+        and isinstance(evidence.get("expected_unit_type"), str)
+        and bool(str(evidence["expected_unit_type"]).strip())
+        and isinstance(evidence.get("expected_order_id"), int)
+        and not isinstance(evidence.get("expected_order_id"), bool)
+    )
+
+
+def _production_producer_label(
+    evidence: dict[str, Any] | None,
+    actor: str,
+) -> str | None:
+    producer_type = evidence.get("producer_type") if evidence is not None else None
+    producer_tag = evidence.get("producer_tag") if evidence is not None else None
+    if (
+        isinstance(producer_type, str)
+        and producer_type
+        and isinstance(producer_tag, str)
+        and producer_tag
+    ):
+        return f"{producer_type} / {producer_tag}"
+    if isinstance(producer_type, str) and producer_type:
+        return producer_type
+    if isinstance(producer_tag, str) and producer_tag:
+        return producer_tag
+    if actor and actor.casefold() not in {"unknown", "developer/empty"}:
+        return actor
+    return "unknown"
+
+
+def _counts_from_values(values: Iterable[str]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for value in values:
+        _increment(counts, value)
+    return counts
+
+
+def _confirmation_latency(evidence: dict[str, Any]) -> float | None:
+    accepted = evidence.get("accepted_game_loop", evidence.get("accepted_loop"))
+    confirmed = evidence.get("confirmed_game_loop", evidence.get("confirmed_loop"))
+    if (
+        not isinstance(accepted, int | float)
+        or isinstance(accepted, bool)
+        or not isinstance(confirmed, int | float)
+        or isinstance(confirmed, bool)
+        or confirmed < accepted
+    ):
+        return None
+    return float(confirmed - accepted)
+
+
+def _production_confirmation_latencies(events: list[StoredEvent]) -> list[float]:
+    latencies: dict[str, float] = {}
+    for event in events:
+        if event.event_type != "execution":
+            continue
+        payload = event.payload
+        action_name = str(payload.get("action_name") or "")
+        evidence = payload.get("effect_evidence")
+        if (
+            not _is_production_action(action_name)
+            or _execution_status(payload) != "succeeded"
+            or not isinstance(evidence, dict)
+            or evidence.get("effect_kind") != "production"
+            or evidence.get("confirmation_kind") not in {"producer_order", "new_unit"}
+        ):
+            continue
+        latency = _confirmation_latency(evidence)
+        command_id = payload.get("command_id")
+        if latency is not None and isinstance(command_id, str):
+            latencies[command_id] = latency
+    return list(latencies.values())
 
 
 def _execution_status(payload: dict[str, Any]) -> str:

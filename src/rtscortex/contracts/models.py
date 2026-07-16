@@ -239,15 +239,22 @@ class PrimitiveTraceEntry(ContractModel):
 
 
 class EffectEvidence(ContractModel):
+    effect_kind: Literal["build", "move", "production"] | None = None
     target_type: str | None = None
     target_position: tuple[float, float] | None = None
     target_tag: str | None = None
     builder_tag: str | None = None
+    producer_tag: str | None = None
+    producer_type: str | None = None
+    expected_unit_type: str | None = None
+    expected_order_id: int | None = Field(default=None, ge=0)
     baseline_structure_tags: list[str] = Field(default_factory=list)
+    baseline_unit_tags: list[str] = Field(default_factory=list)
     new_structure_tag: str | None = Field(
         default=None,
         validation_alias=AliasChoices("new_structure_tag", "observed_structure_tag"),
     )
+    new_unit_tag: str | None = None
     dispatch_game_loop: int | None = Field(
         default=None,
         ge=0,
@@ -264,8 +271,12 @@ class EffectEvidence(ContractModel):
         validation_alias=AliasChoices("confirmed_game_loop", "confirmed_loop"),
     )
     worker_orders: list[str] = Field(default_factory=list)
+    baseline_producer_orders: list[int] = Field(default_factory=list)
+    producer_orders: list[int] = Field(default_factory=list)
     resource_delta: dict[str, int] = Field(default_factory=dict)
     order_seen: bool = False
+    production_order_seen: bool = False
+    confirmation_kind: Literal["producer_order", "new_unit"] | None = None
     order_last_seen_game_loop: int | None = Field(default=None, ge=0)
     post_order_grace_game_loops: int | None = Field(default=None, ge=1)
     mineral_delta: int | None = None

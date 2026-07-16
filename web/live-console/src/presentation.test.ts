@@ -6,6 +6,7 @@ import {
   eventSemanticPayload,
   eventSummary,
   eventTitle,
+  fieldLabel,
   moduleSemanticOutput,
   semanticScalar,
 } from "./presentation";
@@ -114,6 +115,64 @@ describe("Chinese event presentation", () => {
     expect(moduleSemanticOutput(reflection)).toMatchObject({ reflection: "首轮没有上一条决策，已跳过复盘。" });
     expect(eventSemanticPayload(execution)).toMatchObject({
       effect_evidence: "该动作以 PySC2 接受为终态，不需要独立游戏效果校验。",
+    });
+  });
+
+  it("distinguishes direct production confirmation from acceptance-only training", () => {
+    const confirmed = event("execution", {
+      action_name: "Train_Adept",
+      actor: "Gateway/0x1",
+      status: "succeeded",
+      execution_stage: "effect_verification",
+      effect_evidence: {
+        effect_kind: "production",
+        producer_tag: "0x1",
+        producer_type: "Gateway",
+        expected_unit_type: "Adept",
+        expected_order_id: 54,
+        production_order_seen: true,
+        confirmation_kind: "producer_order",
+      },
+    });
+    const acceptanceOnly = event("execution", {
+      action_name: "Train_VoidRay",
+      actor: "Stargate/0x2",
+      status: "succeeded",
+      execution_stage: "pysc2_acceptance",
+      effect_evidence: null,
+    });
+
+    expect(actionLabel("Build_Stargate_Screen")).toBe("建造星门（Build_Stargate_Screen）");
+    expect(actionLabel("Build_ShieldBattery_Screen")).toBe(
+      "建造护盾充能站（Build_ShieldBattery_Screen）",
+    );
+    expect(actionLabel("Train_Adept")).toBe("训练使徒（Train_Adept）");
+    expect(actionLabel("Train_VoidRay")).toBe("训练虚空辉光舰（Train_VoidRay）");
+    expect(fieldLabel("producer_tag")).toBe("生产建筑 Tag");
+    expect(fieldLabel("confirmation_kind")).toBe("生产确认方式");
+    expect(semanticScalar("production", "effect_kind")).toBe("生产（production）");
+    expect(semanticScalar("producer_order", "confirmation_kind")).toBe(
+      "生产订单（producer_order）",
+    );
+    expect(semanticScalar("production_provenance_missing", "failure_code")).toBe(
+      "生产效果证据缺少必要来源信息（production_provenance_missing）",
+    );
+    expect(semanticScalar("production_source_invalidated", "failure_code")).toBe(
+      "生产建筑在执行前已失效（production_source_invalidated）",
+    );
+    expect(eventSummary(confirmed)).toBe("训练使徒 · 成功 · 效果验证");
+    expect(eventSummary(acceptanceOnly)).toBe(
+      "训练虚空辉光舰 · 成功 · PySC2 接受 · 尚未验证生产订单或新单位",
+    );
+    expect(eventSemanticPayload(confirmed)).toMatchObject({
+      effect_evidence: {
+        effect_kind: "production",
+        producer_tag: "0x1",
+        confirmation_kind: "producer_order",
+      },
+    });
+    expect(eventSemanticPayload(acceptanceOnly)).toMatchObject({
+      effect_evidence: "训练动作仅确认 PySC2 接受，未验证生产订单或新单位；不计入生产效果成功率。",
     });
   });
 

@@ -188,6 +188,12 @@ export function eventCategory(event: StoredEvent): Exclude<EventCategory, "all">
   const action = actionName(event)?.toLowerCase();
   if (source === "reflex" || type.includes("reflex")) return "reflex";
   if (type === "goal_progress") return "planner";
+  if (
+    action?.startsWith("train_") ||
+    payloadText.includes('"train_') ||
+    payloadText.includes('"effect_kind":"production"') ||
+    type.includes("production")
+  ) return "production";
   if (action?.includes("build") || payloadText.includes("structure") || type.includes("build")) return "build";
   if (action?.includes("attack") || payloadText.includes("combatgroup") || type.includes("combat")) return "combat";
   if (["planner", "module", "context", "plan"].some((token) => type.includes(token))) return "planner";

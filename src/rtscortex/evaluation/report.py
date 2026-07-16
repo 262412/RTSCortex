@@ -217,6 +217,8 @@ def _acceptance_gates(
     plan_samples = episode.plan_accept_gap_samples if episode is not None else 0
     accepted_builds = execution.build_funnel.get("pysc2_accepted", 0)
     proposed_builds = execution.build_funnel.get("proposed", 0)
+    accepted_production = execution.production_funnel.get("pysc2_accepted", 0)
+    production_applicable = execution.production_metrics_applicable
     return (
         _gate("semantic_control_noops", execution.control_noops, "==", 0, "count"),
         _gate("planner_noop_proposals", execution.planner_noop_proposals, "==", 0, "count"),
@@ -366,6 +368,38 @@ def _acceptance_gates(
             0.05,
             "ratio",
             applicable=proposed_builds > 0,
+        ),
+        _gate(
+            "production_acceptance_only",
+            execution.production_funnel.get("acceptance_only", 0),
+            "==",
+            0,
+            "count",
+            applicable=production_applicable,
+        ),
+        _gate(
+            "production_provenance_coverage",
+            execution.production_provenance_coverage,
+            ">=",
+            1.0,
+            "ratio",
+            applicable=production_applicable and accepted_production > 0,
+        ),
+        _gate(
+            "production_effect_confirmed_rate",
+            execution.production_effect_confirmed_rate,
+            ">=",
+            0.90,
+            "ratio",
+            applicable=production_applicable and accepted_production > 0,
+        ),
+        _gate(
+            "production_timeout_rate",
+            execution.production_timeout_rate,
+            "<=",
+            0.10,
+            "ratio",
+            applicable=production_applicable and accepted_production > 0,
         ),
     )
 
@@ -747,6 +781,32 @@ def _render_execution(
             "  - Effect confirmed by new structure "
             f"{_code(report.effect_evidence.new_structure_tag)}."
         )
+    if report.effect_evidence and report.effect_evidence.effect_kind == "production":
+        evidence = report.effect_evidence
+        producer = evidence.producer_type or "unknown producer"
+        producer_tag = evidence.producer_tag or "unknown"
+        unit_type = evidence.expected_unit_type or "unknown unit"
+        if evidence.confirmation_kind == "producer_order":
+            lines.append(
+                "  - Production confirmed by order on "
+                f"{_code(producer)} {_code(producer_tag)} for {_code(unit_type)}."
+            )
+        elif evidence.confirmation_kind == "new_unit":
+            lines.append(
+                "  - Production confirmed by new unit "
+                f"{_code(evidence.new_unit_tag or 'unknown')} ({_code(unit_type)})."
+            )
+    elif (
+        report.action_name is not None
+        and report.action_name.startswith("Train_")
+        and report.status.value == "succeeded"
+        and report.execution_stage is not None
+        and report.execution_stage.value == "pysc2_acceptance"
+    ):
+        lines.append(
+            "  - Production acceptance only (deprecated): PySC2 accepted the Train action, "
+            "but no producer order or new unit was verified."
+        )
     if report.game_result:
         lines.append(f"  - Game result: {_code(report.game_result)}")
     return lines
@@ -861,6 +921,49 @@ def _render_execution_metrics(metrics: ExecutionMetrics) -> list[str]:
                 f"`{metrics.build_pre_dispatch_rejection_rate:.1%}` "
                 f"(`{metrics.build_pre_dispatch_rejections}` commands)."
             ),
+            "",
+            "### Production funnel",
+            "",
+            (
+                "| Raw Planner proposed | Candidate validated | Translator accepted | "
+                "PySC2 accepted | Order confirmed | Unit fallback confirmed | "
+                "Effect confirmed | Acceptance only (deprecated) |"
+            ),
+            "|---:|---:|---:|---:|---:|---:|---:|---:|",
+            (
+                f"| {metrics.production_funnel.get('proposed', 0)} | "
+                f"{metrics.production_funnel.get('candidate_validated', 0)} | "
+                f"{metrics.production_funnel.get('translator_accepted', 0)} | "
+                f"{metrics.production_funnel.get('pysc2_accepted', 0)} | "
+                f"{metrics.production_funnel.get('order_confirmed', 0)} | "
+                f"{metrics.production_funnel.get('unit_fallback_confirmed', 0)} | "
+                f"{metrics.production_funnel.get('effect_confirmed', 0)} | "
+                f"{metrics.production_funnel.get('acceptance_only', 0)} |"
+            ),
+            (
+                "- Production effect confirmed rate: "
+                f"`{metrics.production_effect_confirmed_rate:.1%}`; provenance coverage: "
+                f"`{metrics.production_provenance_coverage:.1%}`; timeout rate: "
+                f"`{metrics.production_timeout_rate:.1%}` "
+                f"(`{metrics.production_effect_timeouts}` commands)."
+            ),
+            (
+                "- Production confirmation latency p50/p95: "
+                f"`{metrics.confirmation_latency_game_loops_p50:.0f}/"
+                f"{metrics.confirmation_latency_game_loops_p95:.0f}` game loops "
+                f"(`{metrics.confirmation_latency_game_loops_samples}` samples)."
+            ),
+            (
+                "- Production metric gates: "
+                + (
+                    "protocol v1.1 applicable."
+                    if metrics.production_metrics_applicable
+                    else "not applicable to legacy/no-production reports; acceptance-only is "
+                    "shown for compatibility only."
+                )
+            ),
+            *_render_count_table("Production by action", metrics.production_by_action),
+            *_render_count_table("Production by producer", metrics.production_by_producer),
             "",
             "### Safety and attribution invariants",
             "",

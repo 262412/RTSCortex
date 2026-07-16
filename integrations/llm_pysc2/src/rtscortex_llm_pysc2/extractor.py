@@ -3,10 +3,16 @@
 from __future__ import annotations
 
 import math
+from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Optional
+
+from rtscortex_llm_pysc2.production import (
+    production_spec,
+    production_spec_for_order,
+)
 
 SUPPORTED_ARGUMENTS = frozenset({"minimap", "screen", "tag"})
 SCREEN_WORLD_GRID = 24.0
@@ -34,13 +40,6 @@ class BuildSpec:
     mineral_cost: int
     vespene_cost: int = 0
     prerequisites: tuple[str, ...] = ()
-
-
-@dataclass(frozen=True)
-class ProductionCost:
-    minerals: int
-    vespene: int
-    supply: int
 
 
 @dataclass(frozen=True)
@@ -74,24 +73,22 @@ BUILD_SPECS = {
         vespene_cost=150,
         prerequisites=("CyberneticsCore",),
     ),
+    "Build_ShieldBattery_Screen": BuildSpec(
+        "ShieldBattery",
+        "screen",
+        2,
+        True,
+        100,
+        prerequisites=("CyberneticsCore",),
+    ),
 }
 
 SCREEN_POINT_ACTIONS = frozenset({"Move_Screen", "Ability_Blink_Screen"})
 MINIMAP_POINT_ACTIONS = frozenset({"Move_Minimap"})
 SELECT_BLINK_ACTION = "Select_Unit_Blink_Screen"
 PRODUCTION_ACTION_PREFIXES = ("Train_", "Research_")
-PRODUCTION_PREREQUISITES = {
-    "Train_Adept": ("CyberneticsCore",),
-    "Train_Stalker": ("CyberneticsCore",),
-    "Train_VoidRay": ("Stargate",),
-}
-PRODUCTION_COSTS = {
-    "Research_WarpGate": ProductionCost(minerals=50, vespene=50, supply=0),
-    "Train_Zealot": ProductionCost(minerals=100, vespene=0, supply=2),
-    "Train_Stalker": ProductionCost(minerals=125, vespene=50, supply=2),
-    "Train_Adept": ProductionCost(minerals=100, vespene=25, supply=2),
-    "Train_VoidRay": ProductionCost(minerals=250, vespene=150, supply=4),
-}
+RESEARCH_PREREQUISITES = {"Research_WarpGate": ("CyberneticsCore",)}
+RESEARCH_COSTS = {"Research_WarpGate": (50, 50, 0)}
 
 
 def semantic_argument_candidates(
@@ -121,8 +118,13 @@ def production_source_tag(
     action_name = str(action.get("name", ""))
     if not is_production_action(action_name):
         return None
-    cost = PRODUCTION_COSTS.get(action_name)
-    if cost is not None and not _production_cost_is_available(observation, cost):
+    spec = production_spec(action_name)
+    cost = (
+        None
+        if spec is None
+        else (spec.minerals, spec.vespene, spec.supply)
+    ) or RESEARCH_COSTS.get(action_name)
+    if cost is not None and not _production_cost_is_available(observation, *cost):
         return None
     source_types = {
         int(action_source_types[function_id])
@@ -132,7 +134,9 @@ def production_source_tag(
     if len(source_types) != 1:
         return None
     raw_units = list(_value(observation, "raw_units", ()))
-    prerequisites = PRODUCTION_PREREQUISITES.get(action_name, ())
+    prerequisites = (
+        spec.prerequisites if spec is not None else RESEARCH_PREREQUISITES.get(action_name, ())
+    )
     completed_structures = {
         _unit_name(unit, unit_names)
         for unit in raw_units
@@ -141,28 +145,40 @@ def production_source_tag(
     if not set(prerequisites).issubset(completed_structures):
         return None
     source_type = next(iter(source_types))
-    candidates = sorted(
-        int(_value(unit, "tag", 0))
+    candidates = [
+        unit
         for unit in raw_units
         if int(_value(unit, "alliance", 0)) == 1
         and int(_value(unit, "unit_type", 0)) == source_type
         and _build_progress(unit) >= 1.0
-        and int(_value(unit, "order_length", 0)) == 0
         and int(_value(unit, "active", 0)) == 0
         and int(_value(unit, "tag", 0)) > 0
-    )
-    return candidates[0] if candidates else None
+    ]
+    if not candidates:
+        return None
+    # Upstream ``find_idle_unit_tag`` selects the first matching raw unit. Do
+    # not sort or skip ahead, otherwise the cached producer provenance can
+    # silently refer to a different building than translator primitive 573.
+    selected = candidates[0]
+    if int(_value(selected, "order_length", 0)) != 0:
+        return None
+    return int(_value(selected, "tag", 0))
 
 
-def _production_cost_is_available(observation: Any, cost: ProductionCost) -> bool:
+def _production_cost_is_available(
+    observation: Any,
+    minerals: int,
+    vespene: int,
+    supply: int,
+) -> bool:
     player = _value(observation, "player_common", _value(observation, "player", None))
     if player is None:
         return False
     free_supply = int(_value(player, "food_cap", 0)) - int(_value(player, "food_used", 0))
     return (
-        int(_value(player, "minerals", 0)) >= cost.minerals
-        and int(_value(player, "vespene", 0)) >= cost.vespene
-        and free_supply >= cost.supply
+        int(_value(player, "minerals", 0)) >= minerals
+        and int(_value(player, "vespene", 0)) >= vespene
+        and free_supply >= supply
     )
 
 
@@ -256,7 +272,10 @@ class TimeStepExtractor:
             "game_loop": int(_scalar(_value(observation, "game_loop", 0))),
             "observed_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             "player_common": _extract_player(player),
-            "production_queue": _extract_production_queue(observation),
+            "production_queue": _extract_production_queue(
+                observation,
+                unit_names=self.unit_names,
+            ),
             "units": [self._extract_unit(unit) for unit in raw_units],
             "upgrades": [f"upgrade:{int(value)}" for value in _value(observation, "upgrades", ())],
             "teams": teams,
@@ -306,21 +325,82 @@ def _extract_player(player: Any) -> dict[str, int]:
     }
 
 
-def _extract_production_queue(observation: Any) -> list[dict[str, Any]]:
-    result = []
+def _extract_production_queue(
+    observation: Any,
+    *,
+    unit_names: Mapping[int, str],
+) -> list[dict[str, Any]]:
+    """Project known unit orders with their exact producer tags.
+
+    PySC2's top-level ``production_queue`` does not identify its producer. Raw
+    unit orders do, so supported direct-training actions are projected from
+    those first. Unknown top-level queue entries remain available as legacy
+    ``ability:<id>`` diagnostics.
+    """
+
+    result: list[dict[str, Any]] = []
+    producer_counts: Counter[str] = Counter()
+    for unit in _value(observation, "raw_units", ()):
+        if int(_value(unit, "alliance", 0)) != 1:
+            continue
+        producer_type = _unit_name(unit, unit_names)
+        producer_tag = int(_value(unit, "tag", 0))
+        if producer_tag <= 0:
+            continue
+        for order_id, progress in _unit_order_entries(unit):
+            spec = production_spec_for_order(order_id)
+            if spec is None or spec.producer_type != producer_type:
+                continue
+            producer_counts[spec.action_name] += 1
+            result.append(
+                {
+                    "name": spec.action_name,
+                    "producer_tag": producer_tag,
+                    "progress": progress,
+                }
+            )
+
     for item in _value(observation, "production_queue", ()):
         ability_id = int(_value(item, "ability_id", 0))
-        progress = float(_value(item, "build_progress", 0.0))
-        if progress > 1.0:
-            progress /= 100.0
+        spec = production_spec_for_order(ability_id)
+        if spec is not None and producer_counts[spec.action_name] > 0:
+            producer_counts[spec.action_name] -= 1
+            continue
         result.append(
             {
-                "name": f"ability:{ability_id}",
+                "name": spec.action_name if spec is not None else f"ability:{ability_id}",
                 "producer_tag": None,
-                "progress": min(max(progress, 0.0), 1.0),
+                "progress": _normalized_progress(_value(item, "build_progress", 0.0)),
             }
         )
     return result
+
+
+def _unit_order_entries(unit: Any) -> tuple[tuple[int, float], ...]:
+    explicit = _value(unit, "orders", None)
+    if explicit is not None:
+        return tuple(
+            (
+                int(_value(order, "ability_id", _value(order, "order_id", order))),
+                _normalized_progress(_value(order, "progress", 0.0)),
+            )
+            for order in explicit
+        )
+    count = min(max(int(_value(unit, "order_length", 0)), 0), 4)
+    return tuple(
+        (
+            int(_value(unit, f"order_id_{index}", 0)),
+            _normalized_progress(_value(unit, f"order_progress_{index}", 0.0)),
+        )
+        for index in range(count)
+    )
+
+
+def _normalized_progress(value: Any) -> float:
+    progress = float(value)
+    if progress > 1.0:
+        progress /= 100.0
+    return min(max(progress, 0.0), 1.0)
 
 
 def _extract_team_actions(

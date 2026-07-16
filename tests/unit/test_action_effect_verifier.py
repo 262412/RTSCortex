@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from rtscortex_llm_pysc2.effect_verifier import ActionEffectVerifier
+from rtscortex_llm_pysc2.production import PRODUCTION_SPECS, ProductionSpec
 from rtscortex_llm_pysc2.routing import RoutedCommand
 
 
@@ -642,6 +643,363 @@ def test_stargate_raw_build_order_marks_order_seen_for_diagnostics() -> None:
     assert verdict.evidence is not None
     assert verdict.evidence["order_seen"] is True
     assert verdict.evidence["order_last_seen_game_loop"] == 105
+
+
+def test_shield_battery_order_48_and_new_tag_confirm_build_effect() -> None:
+    verifier = ActionEffectVerifier(timeout_game_loops=10)
+    command = RoutedCommand(
+        command_id="command-shield-battery",
+        actor="Builder/Builder-Probe-1",
+        team_name="Builder-Probe-1",
+        name="Build_ShieldBattery_Screen",
+        source="planner",
+        requested_arguments=([65, 65],),
+        resolved_arguments=([65, 65],),
+        rendered_action="<Build_ShieldBattery_Screen([65,65])>",
+    )
+    verifier.track(command)
+    verifier.prepare(
+        command.command_id,
+        _observation(game_loop=100, minerals=200, builder_orders=[]),
+        0xABC,
+    )
+    verifier.accept_primitive(command.command_id, game_loop=101)
+
+    assert verifier.observe(_observation(game_loop=105, minerals=100, builder_orders=[48])) == []
+    current = _observation(
+        game_loop=106,
+        minerals=100,
+        structures=["Nexus", "ShieldBattery"],
+        builder_orders=[48],
+    )
+    battery = next(
+        unit for unit in current["raw_units"] if unit["unit_type"] == "ShieldBattery"
+    )
+    battery["x"] = 31.875
+    battery["y"] = 30
+
+    verdict = verifier.observe(current)[0]
+
+    assert verdict.success is True
+    assert verdict.evidence is not None
+    assert verdict.evidence["target_type"] == "ShieldBattery"
+    assert verdict.evidence["observed_structure_tag"] == "0x2"
+    assert verdict.evidence["order_seen"] is True
+
+
+def test_all_supported_train_actions_confirm_the_exact_producer_order() -> None:
+    for index, spec in enumerate(PRODUCTION_SPECS.values()):
+        verifier = ActionEffectVerifier(timeout_game_loops=10)
+        command = _production_command(spec, command_id=f"train-{index}")
+        producer_tag = 0xA00 + index
+        verifier.track(command)
+        verifier.prepare(
+            command.command_id,
+            _production_observation(spec, game_loop=100, producer_tag=producer_tag),
+            None,
+            producer_tag=producer_tag,
+        )
+        verifier.accept_primitive(command.command_id, game_loop=101)
+
+        verdict = verifier.observe(
+            _production_observation(
+                spec,
+                game_loop=102,
+                producer_tag=producer_tag,
+                producer_orders=[spec.raw_order_id],
+            )
+        )[0]
+
+        assert verdict.success is True
+        assert verdict.evidence is not None
+        assert verdict.evidence["producer_tag"] == hex(producer_tag)
+        assert verdict.evidence["producer_type"] == spec.producer_type
+        assert verdict.evidence["expected_unit_type"] == spec.unit_type
+        assert verdict.evidence["expected_order_id"] == spec.raw_order_id
+        assert verdict.evidence["production_order_seen"] is True
+        assert verdict.evidence["confirmation_kind"] == "producer_order"
+
+
+def test_new_unit_near_the_exact_producer_can_confirm_missed_short_order() -> None:
+    spec = PRODUCTION_SPECS["Train_Adept"]
+    verifier = ActionEffectVerifier(timeout_game_loops=10)
+    command = _production_command(spec)
+    verifier.track(command)
+    verifier.prepare(
+        command.command_id,
+        _production_observation(spec, game_loop=100, producer_position=(20, 20)),
+        None,
+        producer_tag=0xA00,
+    )
+    verifier.accept_primitive(command.command_id, game_loop=101)
+
+    far = _production_observation(
+        spec,
+        game_loop=102,
+        producer_position=(20, 20),
+        trained_units=[(0xB00, (40, 40))],
+    )
+    assert verifier.observe(far) == []
+
+    near = _production_observation(
+        spec,
+        game_loop=103,
+        producer_position=(20, 20),
+        trained_units=[(0xB00, (40, 40)), (0xB01, (24, 20))],
+    )
+    verdict = verifier.observe(near)[0]
+
+    assert verdict.success is True
+    assert verdict.evidence is not None
+    assert verdict.evidence["confirmation_kind"] == "new_unit"
+    assert verdict.evidence["new_unit_tag"] == "0xb01"
+    assert verdict.evidence["production_order_seen"] is False
+
+
+def test_one_producer_order_transition_confirms_only_one_pending_command() -> None:
+    spec = PRODUCTION_SPECS["Train_Zealot"]
+    verifier = ActionEffectVerifier(timeout_game_loops=20)
+    commands = [
+        _production_command(spec, command_id="train-a"),
+        _production_command(spec, command_id="train-b"),
+    ]
+    baseline = _production_observation(spec, game_loop=100)
+    for command in commands:
+        verifier.track(command)
+        verifier.prepare(command.command_id, baseline, None, producer_tag=0xA00)
+        verifier.accept_primitive(command.command_id, game_loop=101)
+
+    active = _production_observation(
+        spec,
+        game_loop=102,
+        producer_orders=[spec.raw_order_id],
+    )
+    first = verifier.observe(active)
+
+    assert [verdict.command_id for verdict in first] == ["train-a"]
+    assert verifier.observe(active) == []
+    assert verifier.observe(_production_observation(spec, game_loop=103)) == []
+
+    second = verifier.observe(
+        _production_observation(
+            spec,
+            game_loop=104,
+            producer_orders=[spec.raw_order_id],
+        )
+    )
+    assert [verdict.command_id for verdict in second] == ["train-b"]
+
+
+def test_earlier_accepted_command_claims_order_before_lexicographically_smaller_id() -> None:
+    spec = PRODUCTION_SPECS["Train_Zealot"]
+    verifier = ActionEffectVerifier(timeout_game_loops=20)
+    older = _production_command(spec, command_id="train-z-older")
+    newer = _production_command(spec, command_id="train-a-newer")
+    baseline = _production_observation(spec, game_loop=100)
+    for command, accepted_loop in ((older, 101), (newer, 102)):
+        verifier.track(command)
+        verifier.prepare(command.command_id, baseline, None, producer_tag=0xA00)
+        verifier.accept_primitive(command.command_id, game_loop=accepted_loop)
+
+    verdicts = verifier.observe(
+        _production_observation(
+            spec,
+            game_loop=103,
+            producer_orders=[spec.raw_order_id],
+        )
+    )
+
+    assert [verdict.command_id for verdict in verdicts] == ["train-z-older"]
+
+
+def test_concurrent_new_units_match_nearest_producers_one_to_one() -> None:
+    spec = PRODUCTION_SPECS["Train_Phoenix"]
+    verifier = ActionEffectVerifier(timeout_game_loops=10)
+    commands = [
+        (_production_command(spec, command_id="phoenix-left"), 0xA00),
+        (_production_command(spec, command_id="phoenix-right"), 0xA01),
+    ]
+    baseline = _production_observation(
+        spec,
+        game_loop=100,
+        producers=[(0xA00, (10, 10), []), (0xA01, (30, 10), [])],
+    )
+    for command, producer_tag in commands:
+        verifier.track(command)
+        verifier.prepare(command.command_id, baseline, None, producer_tag=producer_tag)
+        verifier.accept_primitive(command.command_id, game_loop=101)
+
+    current = _production_observation(
+        spec,
+        game_loop=102,
+        producers=[(0xA00, (10, 10), []), (0xA01, (30, 10), [])],
+        trained_units=[(0xB00, (12, 10)), (0xB01, (29, 10))],
+    )
+    verdicts = verifier.observe(current)
+
+    evidence = {
+        verdict.command_id: verdict.evidence for verdict in verdicts if verdict.evidence is not None
+    }
+    assert evidence["phoenix-left"]["new_unit_tag"] == "0xb00"
+    assert evidence["phoenix-right"]["new_unit_tag"] == "0xb01"
+
+
+def test_production_timeout_distinguishes_missing_empty_and_replaced_producer() -> None:
+    spec = PRODUCTION_SPECS["Train_Oracle"]
+    cases = [
+        ([], True, "no_production_order_observed"),
+        ([13], True, "production_order_replaced"),
+        ([], False, "producer_not_observable"),
+    ]
+    for index, (orders, producer_visible, expected_code) in enumerate(cases):
+        verifier = ActionEffectVerifier(timeout_game_loops=10)
+        command = _production_command(spec, command_id=f"oracle-{index}")
+        verifier.track(command)
+        verifier.prepare(
+            command.command_id,
+            _production_observation(spec, game_loop=100),
+            None,
+            producer_tag=0xA00,
+        )
+        verifier.accept_primitive(command.command_id, game_loop=101)
+        current = _production_observation(
+            spec,
+            game_loop=111,
+            producer_orders=orders,
+            include_default_producer=producer_visible,
+        )
+
+        verdict = verifier.observe(current)[0]
+
+        assert verdict.success is False
+        assert verdict.failure_code == expected_code
+
+
+def test_accepted_production_is_unconfirmed_at_episode_end() -> None:
+    spec = PRODUCTION_SPECS["Train_VoidRay"]
+    verifier = ActionEffectVerifier(timeout_game_loops=10)
+    command = _production_command(spec)
+    verifier.track(command)
+    verifier.prepare(
+        command.command_id,
+        _production_observation(spec, game_loop=100),
+        None,
+        producer_tag=0xA00,
+    )
+    verifier.accept_primitive(command.command_id, game_loop=101)
+
+    verdict = verifier.fail_pending("episode ended before gameplay effect was confirmed")[0]
+
+    assert verdict.status == "unconfirmed"
+    assert verdict.failure_code == "episode_ended_unconfirmed"
+    assert verdict.evidence is not None
+    assert verdict.evidence["effect_kind"] == "production"
+    assert verifier.is_tracked(command.command_id) is False
+
+
+def test_resources_and_top_level_queue_cannot_confirm_production() -> None:
+    spec = PRODUCTION_SPECS["Train_Stalker"]
+    verifier = ActionEffectVerifier(timeout_game_loops=10)
+    command = _production_command(spec)
+    baseline = _production_observation(spec, game_loop=100)
+    verifier.track(command)
+    verifier.prepare(command.command_id, baseline, None, producer_tag=0xA00)
+    verifier.accept_primitive(command.command_id, game_loop=101)
+
+    changed = _production_observation(spec, game_loop=102)
+    changed["player_common"] = {"minerals": 375, "vespene": 450, "food_used": 22}
+    changed["production_queue"] = [{"ability_id": spec.ability_id, "build_progress": 0.2}]
+    assert verifier.observe(changed) == []
+
+    changed["game_loop"] = 111
+    verdict = verifier.observe(changed)[0]
+
+    assert verdict.success is False
+    assert verdict.failure_code == "no_production_order_observed"
+
+
+def test_pending_production_does_not_block_auto_worker_management() -> None:
+    spec = PRODUCTION_SPECS["Train_Zealot"]
+    verifier = ActionEffectVerifier(timeout_game_loops=10)
+    command = _production_command(spec)
+
+    verifier.track(command)
+
+    assert verifier.blocks_auto_worker_management is False
+
+
+def _production_command(
+    spec: ProductionSpec,
+    *,
+    command_id: str = "command-train",
+) -> RoutedCommand:
+    return RoutedCommand(
+        command_id=command_id,
+        actor="Developer/Empty",
+        team_name="Empty",
+        name=spec.action_name,
+        source="planner",
+        requested_arguments=(),
+        resolved_arguments=(),
+        rendered_action=f"<{spec.action_name}()>",
+    )
+
+
+def _production_observation(
+    spec: ProductionSpec,
+    *,
+    game_loop: int,
+    producer_tag: int = 0xA00,
+    producer_position: tuple[float, float] = (20, 20),
+    producer_orders: list[int] | None = None,
+    producers: list[tuple[int, tuple[float, float], list[int]]] | None = None,
+    trained_units: list[tuple[int, tuple[float, float]]] | None = None,
+    include_default_producer: bool = True,
+) -> dict[str, Any]:
+    producer_definitions = producers
+    if producer_definitions is None:
+        producer_definitions = (
+            [(producer_tag, producer_position, producer_orders or [])]
+            if include_default_producer
+            else []
+        )
+    raw_units: list[dict[str, Any]] = []
+    for tag, position, orders in producer_definitions:
+        raw_units.append(
+            {
+                "tag": tag,
+                "unit_type": spec.producer_type,
+                "alliance": 1,
+                "is_structure": True,
+                "order_length": len(orders),
+                **{f"order_id_{index}": order for index, order in enumerate(orders)},
+                "build_progress": 100,
+                "x": position[0],
+                "y": position[1],
+            }
+        )
+    raw_units.extend(
+        {
+            "tag": tag,
+            "unit_type": spec.unit_type,
+            "alliance": 1,
+            "is_structure": False,
+            "order_length": 0,
+            "build_progress": 100,
+            "x": position[0],
+            "y": position[1],
+        }
+        for tag, position in trained_units or []
+    )
+    return {
+        "game_loop": game_loop,
+        "player_common": {
+            "minerals": 500,
+            "vespene": 500,
+            "food_used": 20,
+        },
+        "raw_units": raw_units,
+    }
 
 
 def _build_command(

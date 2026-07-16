@@ -1,8 +1,14 @@
 from __future__ import annotations
 
+import json
+from collections import Counter
+from pathlib import Path
+
 from rtscortex.contracts import ActionArgumentType, AvailableAction, EconomyState, UnitState
+from rtscortex.policy.corpus import load_policy_corpus
 from rtscortex.policy.hima.mapping import HIMA_RUNTIME_MAPPINGS, HIMAMacroActionMapper
 from rtscortex.policy.hima.models import HIMA_PARSER_VERSION, HIMA_VOCABULARY_VERSION
+from rtscortex.policy.hima.parser import HIMAProposalParser
 from rtscortex.policy.models import (
     MacroActionStep,
     MacroPolicyProposal,
@@ -11,6 +17,12 @@ from rtscortex.policy.models import (
     PolicyObservationFixture,
 )
 from tests.helpers import make_observation
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PINNED_CORPUS_MANIFEST = PROJECT_ROOT / "benchmarks/policy/protoss_v0_2/manifest.yaml"
+HIMA_PROTOSS_A_OUTPUTS = (
+    PROJECT_ROOT / "tests/fixtures/hima_protoss_a_v02_raw_outputs.jsonl"
+)
 
 
 def _proposal(
@@ -60,18 +72,21 @@ def _macro_ready_state(
 
 
 def test_mapping_registry_exposes_first_expanded_protoss_semantics() -> None:
-    assert len(HIMA_RUNTIME_MAPPINGS) == 11
+    assert len(HIMA_RUNTIME_MAPPINGS) == 14
     assert {item.macro_action for item in HIMA_RUNTIME_MAPPINGS} == {
         "TRAIN ZEALOT",
         "TRAIN STALKER",
         "TRAIN ADEPT",
+        "TRAIN PHOENIX",
         "TRAIN VOIDRAY",
+        "TRAIN ORACLE",
         "BUILD PYLON",
         "BUILD GATEWAY",
         "BUILD CYBERNETICSCORE",
         "BUILD ASSIMILATOR",
         "BUILD NEXUS",
         "BUILD STARGATE",
+        "BUILD SHIELDBATTERY",
         "RESEARCH WARPGATERESEARCH",
     }
     mappings = {
@@ -80,6 +95,103 @@ def test_mapping_registry_exposes_first_expanded_protoss_semantics() -> None:
     assert mappings["TRAIN ADEPT"] == ("Train_Adept",)
     assert mappings["BUILD STARGATE"] == ("Build_Stargate_Screen",)
     assert mappings["TRAIN VOIDRAY"] == ("Train_VoidRay",)
+    assert mappings["TRAIN ORACLE"] == ("Train_Oracle",)
+    assert mappings["TRAIN PHOENIX"] == ("Train_Phoenix",)
+    assert mappings["BUILD SHIELDBATTERY"] == ("Build_ShieldBattery_Screen",)
+
+
+def test_mapper_uses_exact_oracle_phoenix_and_shield_battery_runtime_actions() -> None:
+    base = make_observation(include_enemy=False)
+    observation = base.model_copy(
+        update={
+            "state": base.state.model_copy(
+                update=_macro_ready_state(
+                    structures=[
+                        UnitState(
+                            unit_id="core-1",
+                            unit_type="CyberneticsCore",
+                            alliance="self",
+                        ),
+                        UnitState(
+                            unit_id="stargate-1",
+                            unit_type="Stargate",
+                            alliance="self",
+                        ),
+                    ]
+                )
+            ),
+            "available_actions": [
+                AvailableAction(
+                    name="Train_Oracle",
+                    actor_scopes=["Developer/Empty"],
+                ),
+                AvailableAction(
+                    name="Train_Phoenix",
+                    actor_scopes=["Developer/Empty"],
+                ),
+                AvailableAction(
+                    name="Build_ShieldBattery_Screen",
+                    argument_names=["screen"],
+                    argument_types=[ActionArgumentType.POSITION],
+                    actor_scopes=["Builder/Probe-1"],
+                    argument_candidates=[[[65, 90]]],
+                ),
+            ],
+        }
+    )
+    fixture = PolicyObservationFixture(fixture_id="stargate-options", observation=observation)
+
+    expected = (
+        ("TRAIN ORACLE", "train", "Train_Oracle"),
+        ("TRAIN PHOENIX", "train", "Train_Phoenix"),
+        ("BUILD SHIELDBATTERY", "build", "Build_ShieldBattery_Screen"),
+    )
+    for macro_action, category, runtime_action in expected:
+        assessment = HIMAMacroActionMapper().assess(
+            _proposal(_step(0, macro_action, category)),
+            fixture,
+        )[0]
+        assert assessment.classification is PolicyActionClassification.MAPPED_LEGAL_NOW
+        assert assessment.runtime_action == runtime_action
+
+
+def test_hima_protoss_a_fixed_outputs_have_expanded_mapping_golden() -> None:
+    fixtures = {
+        fixture.fixture_id: fixture
+        for fixture in load_policy_corpus(PINNED_CORPUS_MANIFEST)
+    }
+    parser = HIMAProposalParser()
+    mapper = HIMAMacroActionMapper()
+    effective_counts: Counter[str] = Counter()
+    evaluated_fixture_ids: list[str] = []
+
+    for line in HIMA_PROTOSS_A_OUTPUTS.read_text(encoding="utf-8").splitlines():
+        item = json.loads(line)
+        fixture_id = item["fixture_id"]
+        evaluated_fixture_ids.append(fixture_id)
+        proposal = parser.parse(item["raw_output"])
+        for assessment in mapper.assess(proposal, fixtures[fixture_id]):
+            effective_counts[assessment.classification.value] += assessment.repeat
+
+    assert evaluated_fixture_ids == list(fixtures)
+    assert effective_counts == {
+        "parse_error": 2,
+        "unsupported_by_runtime": 961,
+        "mapped_future": 582,
+        "mapped_legal_now": 14,
+        "mapped_deferred": 91,
+    }
+    assert sum(
+        effective_counts[classification]
+        for classification in (
+            "mapped_future",
+            "mapped_legal_now",
+            "mapped_deferred",
+            "illegal_action",
+            "obsolete",
+        )
+    ) == 687
+    assert sum(effective_counts.values()) == 1_650
 
 
 def test_mapper_binds_frontier_actor_and_candidate_from_observation() -> None:

@@ -173,6 +173,67 @@ def test_coordinator_defers_build_report_until_raw_state_confirms_effect() -> No
     assert coordinator.observe_effects(_raw_effect_observation(game_loop=268, minerals=175)) == []
 
 
+def test_coordinator_defers_train_report_until_exact_producer_order() -> None:
+    runtime = FakeRuntime(_train_batch())
+    coordinator = BridgeCoordinator(runtime)
+    coordinator.decide(_train_snapshot(), {"Developer": ["Empty"]})
+    coordinator.prepare_effect(
+        "command-adept",
+        _raw_production_observation(game_loop=224),
+        builder_tag=None,
+        producer_tag=0xA00,
+    )
+    coordinator.record_primitive(
+        "command-adept",
+        "Train_Adept_quick",
+        success=True,
+        requested_function_id=457,
+        emitted_function_id=457,
+    )
+
+    assert coordinator.complete_command("command-adept", game_loop=225) is None
+    assert runtime.execution_reports == []
+
+    reports = coordinator.observe_effects(
+        _raw_production_observation(game_loop=226, producer_orders=[54])
+    )
+
+    assert len(reports) == 1
+    report = ExecutionReport.model_validate(reports[0])
+    assert report.status.value == "succeeded"
+    assert report.execution_stage is not None
+    assert report.execution_stage.value == "effect_verification"
+    assert report.effect_evidence is not None
+    assert report.effect_evidence.effect_kind == "production"
+    assert report.effect_evidence.producer_tag == "0xa00"
+    assert report.effect_evidence.expected_unit_type == "Adept"
+    assert report.effect_evidence.expected_order_id == 54
+    assert report.effect_evidence.confirmation_kind == "producer_order"
+
+
+def test_coordinator_reports_accepted_train_unconfirmed_at_episode_end() -> None:
+    runtime = FakeRuntime(_train_batch())
+    coordinator = BridgeCoordinator(runtime)
+    coordinator.decide(_train_snapshot(), {"Developer": ["Empty"]})
+    coordinator.prepare_effect(
+        "command-adept",
+        _raw_production_observation(game_loop=224),
+        builder_tag=None,
+        producer_tag=0xA00,
+    )
+    coordinator.record_primitive("command-adept", "Train_Adept_quick", success=True)
+    assert coordinator.complete_command("command-adept", game_loop=225) is None
+
+    coordinator.end_episode({"outcome": "draw"})
+
+    assert len(runtime.execution_reports) == 1
+    report = ExecutionReport.model_validate(runtime.execution_reports[0])
+    assert report.status.value == "unconfirmed"
+    assert report.failure_code == "episode_ended_unconfirmed"
+    assert report.effect_evidence is not None
+    assert report.effect_evidence.effect_kind == "production"
+
+
 def test_coordinator_does_not_report_one_structure_for_two_commands() -> None:
     runtime = FakeRuntime(_concurrent_build_batch())
     coordinator = BridgeCoordinator(runtime)
@@ -368,6 +429,25 @@ def _move_snapshot() -> dict[str, Any]:
     return snapshot
 
 
+def _train_snapshot() -> dict[str, Any]:
+    snapshot = load_fixture("observation_snapshot.json")
+    snapshot["teams"] = [
+        {
+            "agent_name": "Developer",
+            "team_name": "Empty",
+            "available_actions": [
+                {
+                    "name": "Train_Adept",
+                    "argument_names": [],
+                    "argument_types": [],
+                    "argument_candidates": None,
+                }
+            ],
+        }
+    ]
+    return snapshot
+
+
 def _concurrent_build_snapshot() -> dict[str, Any]:
     snapshot = _build_snapshot()
     action = snapshot["teams"][0]["available_actions"][0]
@@ -427,6 +507,34 @@ def _move_batch() -> dict[str, Any]:
                 "actor": "Builder/Builder-Probe-1",
                 "name": "Move_Minimap",
                 "arguments": [[48, 48]],
+                "priority": 50,
+                "ttl_game_loops": 112,
+                "created_game_loop": 224,
+                "source": "planner",
+                "preconditions": {},
+            }
+        ],
+        "rejected_commands": [],
+    }
+
+
+def _train_batch() -> dict[str, Any]:
+    return {
+        "protocol_version": "1.1",
+        "run_id": "run-fixture",
+        "episode_id": "episode-pvz-task1",
+        "step_id": 7,
+        "decision_id": "decision-train",
+        "strategic_goal": "Train an Adept",
+        "summary": "Start Gateway production",
+        "planner_pending": False,
+        "idle_reason": None,
+        "commands": [
+            {
+                "command_id": "command-adept",
+                "actor": "Developer/Empty",
+                "name": "Train_Adept",
+                "arguments": [],
                 "priority": 50,
                 "ttl_game_loops": 112,
                 "created_game_loop": 224,
@@ -529,6 +637,34 @@ def _raw_move_observation(
             camera[y][x] = 1
     observation["feature_minimap"] = {"camera": camera}
     return observation
+
+
+def _raw_production_observation(
+    *,
+    game_loop: int,
+    producer_orders: list[int] | None = None,
+) -> dict[str, Any]:
+    orders = producer_orders or []
+    return {
+        "game_loop": [game_loop],
+        "player_common": {
+            "minerals": 500,
+            "vespene": 200,
+            "food_used": 20,
+        },
+        "raw_units": [
+            {
+                "tag": 0xA00,
+                "unit_type": "Gateway",
+                "alliance": 1,
+                "order_length": len(orders),
+                **{f"order_id_{index}": order for index, order in enumerate(orders)},
+                "build_progress": 100,
+                "x": 30,
+                "y": 30,
+            }
+        ],
+    }
 
 
 class FakeRuntime:

@@ -135,6 +135,7 @@ const FIELD_LABELS: Record<string, string> = {
   pysc2_function: "PySC2 调用",
   primitive_trace: "底层操作链",
   effect_evidence: "效果证据",
+  effect_kind: "效果类型",
   accepted: "SC2 已接受",
   function: "底层函数",
   origin: "操作来源",
@@ -146,8 +147,10 @@ const FIELD_LABELS: Record<string, string> = {
   raw_reason: "底层原因",
   dispatch_loop: "派发时刻",
   accept_loop: "接受时刻",
+  accepted_loop: "接受时刻",
   confirm_loop: "确认时刻",
   dispatch_game_loop: "派发时刻",
+  dispatched_loop: "派发时刻",
   confirmed_game_loop: "效果确认时刻",
   confirmed_loop: "确认时刻",
   elapsed_game_loops: "验证耗时",
@@ -157,9 +160,19 @@ const FIELD_LABELS: Record<string, string> = {
   target_tag: "目标 Tag",
   target_position: "目标位置",
   expected_structure: "预期建筑",
+  producer_tag: "生产建筑 Tag",
+  producer_type: "生产建筑类型",
+  expected_unit_type: "预期单位",
+  expected_order_id: "预期生产订单 ID",
   baseline_structure_tags: "原有同类建筑",
+  baseline_unit_tags: "原有同类单位",
   order_seen: "观察到建造订单",
   worker_orders: "工人订单",
+  new_unit_tag: "新单位 Tag",
+  baseline_producer_orders: "生产建筑原有订单",
+  producer_orders: "生产建筑当前订单",
+  production_order_seen: "观察到生产订单",
+  confirmation_kind: "生产确认方式",
   resource_delta: "资源变化",
   mineral_delta: "晶体矿变化",
   builder_displacement: "建造工位移",
@@ -209,9 +222,15 @@ const ACTION_LABELS: Record<string, string> = {
   Build_Cybernetics_Core_Screen: "建造控制芯核",
   Build_Assimilator_Near: "在气矿建造吸收舱",
   Build_Nexus_Near: "在扩张点建造星灵枢纽",
+  Build_Stargate_Screen: "建造星门",
+  Build_ShieldBattery_Screen: "建造护盾充能站",
   Train_Probe: "训练探机",
   Train_Zealot: "训练狂热者",
   Train_Stalker: "训练追猎者",
+  Train_Adept: "训练使徒",
+  Train_VoidRay: "训练虚空辉光舰",
+  Train_Oracle: "训练先知",
+  Train_Phoenix: "训练凤凰战机",
   Research_Warp_Gate: "研究折跃门",
   Research_WarpGate: "研究折跃门",
   Retreat: "撤退",
@@ -245,6 +264,9 @@ const VALUE_LABELS: Record<string, string> = {
   achieved: "目标已达成",
   structure: "建筑",
   unit: "单位",
+  production: "生产",
+  producer_order: "生产订单",
+  new_unit: "新单位出现",
   upgrade: "科技升级",
   goal_dependency: "前序目标尚未完成",
   missing_prerequisite: "缺少科技前置条件",
@@ -287,11 +309,16 @@ const VALUE_LABELS: Record<string, string> = {
   bridge_integrity_error: "Bridge 归因异常",
   candidate_invalidated: "候选参数在派发前失效",
   production_source_unavailable: "生产建筑当前不可用",
+  production_source_invalidated: "生产建筑在执行前已失效",
+  production_provenance_missing: "生产效果证据缺少必要来源信息",
   actor_not_available: "执行者当前不可用",
   no_build_order_observed: "未观察到建造订单",
   worker_order_replaced: "工人订单被替换",
   target_not_created: "目标建筑未出现",
   builder_not_observable: "无法继续观察建造工",
+  producer_not_observable: "无法继续观察生产建筑",
+  no_production_order_observed: "未观察到生产订单",
+  production_order_replaced: "生产订单被替换",
   episode_ended_unconfirmed: "对局结束时效果仍未确认",
   episode_ended_before_dispatch: "对局结束前动作尚未派发",
   worker_terminated_before_execution_report: "Worker 终止前未回报执行结果",
@@ -304,6 +331,7 @@ const CATEGORY_LABELS: Record<Exclude<EventCategory, "all"> | "system", string> 
   planner: "规划",
   reflex: "快速反应",
   build: "建造",
+  production: "生产",
   combat: "战斗",
   failure: "失败",
   system: "系统",
@@ -413,6 +441,8 @@ export function semanticScalar(value: string | number | boolean | null, key?: st
     "failure_code",
     "idle_reason",
     "reason",
+    "effect_kind",
+    "confirmation_kind",
   ].includes(key ?? "");
   return translated && protocolEnum ? `${translated}（${value}）` : translated ?? value;
 }
@@ -506,10 +536,17 @@ export function eventSummary(event: StoredEvent): string {
   }
   if (event.event_type === "execution" || event.event_type === "validation_failed") {
     const stage = readString(payload, "execution_stage");
+    const acceptanceOnlyProduction =
+      event.event_type === "execution" &&
+      action?.startsWith("Train_") &&
+      status === "succeeded" &&
+      stage === "pysc2_acceptance" &&
+      (payload.effect_evidence === null || payload.effect_evidence === undefined);
     return [
       action ? actionLabel(action, false) : "动作",
       status ? semanticScalar(status) : event.event_type === "validation_failed" ? "验证失败" : "已执行",
       stage ? semanticScalar(stage) : undefined,
+      acceptanceOnlyProduction ? "尚未验证生产订单或新单位" : undefined,
       failure ? semanticScalar(failure) : undefined,
     ].filter(Boolean).join(" · ");
   }
@@ -613,7 +650,27 @@ export function eventSemanticPayload(event: StoredEvent): JsonValue {
   if (event.event_type === "execution") {
     const status = readString(payload, "status");
     const stage = readString(payload, "execution_stage");
-    if (payload.effect_evidence === null && status === "succeeded" && stage === "pysc2_acceptance") {
+    const action = readString(payload, "action_name");
+    const lacksEffectEvidence = payload.effect_evidence === null || payload.effect_evidence === undefined;
+    if (
+      action?.startsWith("Train_") &&
+      lacksEffectEvidence &&
+      status === "succeeded" &&
+      stage === "pysc2_acceptance"
+    ) {
+      return compactObject([
+        ["action_name", payload.action_name],
+        ["actor", payload.actor],
+        ["status", payload.status],
+        ["execution_stage", payload.execution_stage],
+        ["pysc2_function", payload.pysc2_function],
+        ["requested_arguments", payload.requested_arguments],
+        ["resolved_arguments", payload.resolved_arguments],
+        ["primitive_trace", payload.primitive_trace],
+        ["effect_evidence", "训练动作仅确认 PySC2 接受，未验证生产订单或新单位；不计入生产效果成功率。"],
+      ]);
+    }
+    if (lacksEffectEvidence && status === "succeeded" && stage === "pysc2_acceptance") {
       return compactObject([
         ["action_name", payload.action_name],
         ["actor", payload.actor],
