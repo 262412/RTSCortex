@@ -192,6 +192,58 @@ def test_hima_sidecar_process_waits_for_socket_and_cleans_up(tmp_path: Path) -> 
     assert (tmp_path / "stdout.log").read_text(encoding="utf-8") == "1 1\n"
 
 
+def test_hima_sidecar_restart_replaces_process_without_closing_client(
+    tmp_path: Path,
+) -> None:
+    model_id = "SNUMPR/Protoss-a"
+    revision = HIMA_PINNED_REVISIONS[model_id]
+    socket_path = tmp_path / "hima.sock"
+    script = tmp_path / "worker.py"
+    script.write_text(
+        "import pathlib, sys, time\n"
+        "pathlib.Path(sys.argv[1]).touch()\n"
+        "print('started', flush=True)\n"
+        "time.sleep(30)\n",
+        encoding="utf-8",
+    )
+    client = _FakeHealthClient(
+        HIMALiveHealth(
+            model_id=model_id,
+            model_revision=revision,
+            adapter_version=HIMA_ADAPTER_VERSION,
+            parser_version=HIMA_PARSER_VERSION,
+            vocabulary_version=HIMA_VOCABULARY_VERSION,
+        )
+    )
+    process = HIMASidecarProcess(
+        HIMASidecarSpec(
+            command=(sys.executable, str(script), str(socket_path)),
+            socket_path=socket_path,
+            stdout_path=tmp_path / "stdout.log",
+            stderr_path=tmp_path / "stderr.log",
+            ready_timeout_seconds=2.0,
+            shutdown_timeout_seconds=2.0,
+        ),
+        client,
+        expected_model_id=model_id,
+        expected_model_revision=revision,
+    )
+
+    async def exercise() -> None:
+        await process.start()
+        first_process = process._process
+        await process.restart()
+        assert client.closed is False
+        assert process._process is not first_process
+        assert process.health is not None
+        await process.close()
+
+    asyncio.run(exercise())
+
+    assert client.closed is True
+    assert (tmp_path / "stdout.log").read_text(encoding="utf-8") == "started\nstarted\n"
+
+
 def test_hima_sidecar_serializes_concurrent_start_calls(tmp_path: Path) -> None:
     model_id = "SNUMPR/Protoss-a"
     revision = HIMA_PINNED_REVISIONS[model_id]

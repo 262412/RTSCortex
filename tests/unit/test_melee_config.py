@@ -197,7 +197,7 @@ def test_melee_config_keeps_only_the_minimum_protoss_chain(
     ]
 
 
-def test_melee_config_reserves_builder_from_worker_management(
+def test_melee_config_enables_gas_management_with_reserved_builder(
     melee_config_type: tuple[type[Any], list[Any]],
 ) -> None:
     config_type, _ = melee_config_type
@@ -205,7 +205,7 @@ def test_melee_config_reserves_builder_from_worker_management(
     config = config_type()
 
     assert config.ENABLE_INIT_STEPS is True
-    assert config.ENABLE_AUTO_WORKER_MANAGE is False
+    assert config.ENABLE_AUTO_WORKER_MANAGE is True
     assert config.ENABLE_AUTO_WORKER_TRAINING is True
     assert config.AGENTS_ALWAYS_DISABLE == []
 

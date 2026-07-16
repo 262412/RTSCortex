@@ -43,7 +43,9 @@ def test_prepare_live_worker_builds_fixed_pysc2_command(tmp_path: Path) -> None:
         "keep the action pending\n"
         "agent.last_execution_abort = {\n"
         "'failure_code': 'actor_not_available'\n"
-        "team head unit is unavailable before action translation\n",
+        "team head unit is unavailable before action translation\n"
+        "except FileExistsError:\n"
+        "llm_pysc2_global_log_id = max(llm_pysc2_global_log_id, self.log_id)\n",
         encoding="utf-8",
     )
     runner_source = tmp_path / "third_party/LLM-PySC2/pysc2/bin/agent.py"
@@ -66,7 +68,11 @@ def test_prepare_live_worker_builds_fixed_pysc2_command(tmp_path: Path) -> None:
         "Advance confirmed-death state on every observation\n"
         "tag for tag, steps in self.unit_disappear_steps.items() if steps >= 40\n"
         "tag for tag in agent.unit_tag_list if tag not in self.unit_uid_disappear\n"
-        "tag for tag in team['unit_tags'] if tag not in self.unit_uid_disappear\n",
+        "tag for tag in team['unit_tags'] if tag not in self.unit_uid_disappear\n"
+        "self.config.ENABLE_AUTO_WORKER_MANAGE and self.is_all_nexus_full is False\n"
+        "_rtscortex_reserved_worker_tags\n"
+        "HoldPosition_quick('now')\n"
+        "Reserved worker\n",
         encoding="utf-8",
     )
 
@@ -148,6 +154,7 @@ def test_prepare_live_worker_reports_all_missing_prerequisites(tmp_path: Path) -
     assert "transient-unit grace patch is not applied" in message
     assert "Nexus resource-clearance patch is not applied" in message
     assert "Nexus exact-screen-scale patch is not applied" in message
+    assert "gas-rebalance worker-management patch is not applied" in message
 
 
 def test_prepare_live_worker_accepts_2s3z_on_sc2_410(tmp_path: Path) -> None:
@@ -336,7 +343,9 @@ def _write_worker_patch_sources(project_root: Path) -> None:
         "keep the action pending\n"
         "agent.last_execution_abort = {\n"
         "'failure_code': 'actor_not_available'\n"
-        "team head unit is unavailable before action translation\n",
+        "team head unit is unavailable before action translation\n"
+        "except FileExistsError:\n"
+        "llm_pysc2_global_log_id = max(llm_pysc2_global_log_id, self.log_id)\n",
         encoding="utf-8",
     )
     runner_source = project_root / "third_party/LLM-PySC2/pysc2/bin/agent.py"
@@ -359,7 +368,11 @@ def _write_worker_patch_sources(project_root: Path) -> None:
         "Advance confirmed-death state on every observation\n"
         "tag for tag, steps in self.unit_disappear_steps.items() if steps >= 40\n"
         "tag for tag in agent.unit_tag_list if tag not in self.unit_uid_disappear\n"
-        "tag for tag in team['unit_tags'] if tag not in self.unit_uid_disappear\n",
+        "tag for tag in team['unit_tags'] if tag not in self.unit_uid_disappear\n"
+        "self.config.ENABLE_AUTO_WORKER_MANAGE and self.is_all_nexus_full is False\n"
+        "_rtscortex_reserved_worker_tags\n"
+        "HoldPosition_quick('now')\n"
+        "Reserved worker\n",
         encoding="utf-8",
     )
 

@@ -69,7 +69,11 @@ screen position, or directly dispatch an action.
 HIMA output is parsed against its pinned 60-action Protoss vocabulary and projected into
 the currently mapped RTSCortex macro actions. Managed Probe production is transparent;
 unsupported dependencies and parse errors block the frontier instead of being skipped.
-Only a frontier classified as `mapped_legal_now` can become a `MacroIntent`.
+Only a frontier classified as `mapped_legal_now` can become a `MacroIntent`. Two bounded
+liveness exceptions may select a later `mapped_legal_now` step from the same plan: a Pylon
+can preempt a deferred frontier during a supply emergency, and a gas-blocked Stargate can
+yield to Zealot, low-supply Pylon, or Nexus. The selected fallback still passes through the
+same current candidate domain and safety chain.
 
 ### Candidate-bound motor path
 
@@ -99,10 +103,12 @@ snapshot revision, load failure, or health mismatch fails closed. With `required
 the same startup failure is recorded and deterministic Reflex remains available. A
 semantic parse, mapping, or unusable-frontier failure produces only
 `macro_plan_rejected` and requests a new plan; `specialist_failed` is reserved for process,
-transport, timeout, and inference failures. A timed-out generation suspends further macro requests for the run because a
-cancelled Python waiter cannot safely prove that GPU inference stopped. Automatic sidecar
-respawn is not implemented in v0.3; the `restart_limit` setting is reserved for that
-future lifecycle work.
+transport, timeout, and inference failures. A timed-out generation immediately suspends
+further macro requests because a cancelled Python waiter cannot safely prove that GPU
+inference stopped. When a process owner
+is available and the configured `restart_limit` has not been exhausted, Runtime terminates
+and restarts the sidecar, repeats the exact health/provenance check, and resumes urgent
+planning. Without a sidecar owner, or after the limit is exhausted, it remains suspended.
 
 ### Current scope boundary
 
@@ -113,6 +119,8 @@ Implemented in v0.3:
 - HIMA macro-plan projection, dependency-safe Runtime frontier, measurable goal progress,
   and successful-action feedback over the most recent 60 game seconds;
 - deterministic Reflex intents and deterministic observation-bound candidate selection;
+- bounded supply/resource frontier fallbacks, deterministic gas-worker rebalance, placement
+  deduplication/resampling, and timeout recovery;
 - durable plan, intent, candidate, selection, lineage, lifecycle, execution, and effect
   events suitable for reports and the Live Console;
 - a privacy-minimized executor corpus exporter, deterministic split verifier, and
@@ -123,7 +131,6 @@ Not implemented in v0.3:
 - a learned or SC2-specialized tactical subagent;
 - a learned tiny motor/executor model, checkpoint loader, or SFT/RL training;
 - model routing, ensembles, quantization, CPU/GPU offload, or automatic GPU selection;
-- automatic HIMA sidecar restart after a post-start failure;
 - StarWM prediction, VLM perception, or air-unit special-ability micro.
 
 The checked-in live canary targets HIMA Protoss-a. The configuration schema and process
@@ -200,7 +207,8 @@ terminate the SC2 episode.
 
 Cortex adds `situation_assessed`, `macro_plan_accepted`/`macro_plan_rejected`,
 `intent_emitted`, `candidate_set_built`, `executor_selection`, `command_lineage`, and
-`specialist_ready`/`specialist_failed` to the durable event stream. `command_lineage`
+`specialist_ready`/`specialist_failed`/`specialist_recovered` plus
+`macro_frontier_preempted` to the durable event stream. `command_lineage`
 joins a dispatched wire command back through candidate, selection, intent, source specialist,
 and macro plan. The report calculates candidate-domain violations, executor latency, and
 missing/orphan lineage counts; the Console presents the same chain without requiring the

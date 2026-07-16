@@ -1,0 +1,16 @@
+--- a/llm_pysc2/agents/main_agent_funcs.py
++++ b/llm_pysc2/agents/main_agent_funcs.py
+@@ -801,6 +801,13 @@
+           source_worker = unit
+       if source_worker is None:
+         logger.critical(f"Do not find any idle worker !")
++      elif source_worker.tag in getattr(self, '_rtscortex_reserved_worker_tags', set()):
++        func_id, func_call = (274, actions.FUNCTIONS.HoldPosition_quick('now'))
++        logger.info(f"[ID {self.log_id}] 4.1.2 Reserved worker {source_worker.tag}: {func_call}")
++        func_call = func_call if func_id in obs.observation.available_actions else actions.FUNCTIONS.no_op()
++        func_id = func_id if func_id in obs.observation.available_actions else 0
++        self.func_id_history.append(func_id)
++        return func_call
+       else:
+         for unit in obs.observation.raw_units:
+           if unit.tag in possible_working_place_nexus_tag_list:

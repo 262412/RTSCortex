@@ -100,6 +100,9 @@ jobs:
             ../../integrations/llm_pysc2/patches/0008-enforce-nexus-resource-clearance.patch
             ../../integrations/llm_pysc2/patches/0009-use-exact-nexus-screen-scale.patch
             ../../integrations/llm_pysc2/patches/0010-report-max-frame-truncation.patch
+            ../../integrations/llm_pysc2/patches/0011-allocate-log-directories-atomically.patch
+            ../../integrations/llm_pysc2/patches/0012-bind-gas-rebalance-to-worker-management.patch
+            ../../integrations/llm_pysc2/patches/0013-preserve-reserved-builder-worker.patch
           )
           applied=()
           cleanup() {

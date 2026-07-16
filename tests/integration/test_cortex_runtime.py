@@ -115,6 +115,37 @@ class _TimeoutMacroClient(_FakeMacroClient):
         raise TimeoutError("macro request timed out")
 
 
+class _TimeoutOnceMacroClient(_FakeMacroClient):
+    async def propose(
+        self,
+        context: HIMAInputContext,
+        *,
+        request_id: str | None = None,
+    ) -> HIMALiveProposalResponse:
+        if not self.contexts:
+            self.contexts.append(context)
+            await asyncio.sleep(0)
+            raise TimeoutError("macro request timed out once")
+        return await super().propose(context, request_id=request_id)
+
+
+class _RecoveringMacroSidecar:
+    def __init__(self, client: _FakeMacroClient) -> None:
+        self.client = client
+        self.restart_count = 0
+        self.closed = False
+
+    async def start(self) -> HIMALiveHealth:
+        return await self.client.health()
+
+    async def restart(self) -> HIMALiveHealth:
+        self.restart_count += 1
+        return await self.client.health()
+
+    async def close(self) -> None:
+        self.closed = True
+
+
 def _config(
     tmp_path: Path,
     *,
@@ -416,6 +447,185 @@ def test_resource_deferred_frontier_satisfies_required_startup_barrier(
     asyncio.run(exercise())
 
 
+def test_supply_emergency_pylon_preempts_blocked_technology_frontier(
+    tmp_path: Path,
+) -> None:
+    client = _FakeMacroClient("Actions: ['Stargate', 'Pylon']")
+    runtime = CortexRuntimeEngine(
+        config=_config(tmp_path),
+        store=_store(tmp_path),
+        provider=FakeProvider(),
+        macro_client=client,
+    )
+    observation = _macro_observation(step_id=0, game_loop=0).model_copy(
+        update={
+            "state": _macro_observation(step_id=0, game_loop=0).state.model_copy(
+                update={
+                    "economy": EconomyState(
+                        minerals=250,
+                        vespene=0,
+                        supply_used=14,
+                        supply_cap=15,
+                        workers=14,
+                    )
+                }
+            )
+        }
+    )
+
+    async def exercise() -> None:
+        await runtime.start()
+        await runtime.tick(observation)
+        for _ in range(5):
+            await asyncio.sleep(0)
+        batch = await runtime.tick(
+            observation.model_copy(update={"step_id": 1, "game_loop": 1})
+        )
+
+        assert [command.name for command in batch.commands] == ["Build_Pylon_Screen"]
+        assert runtime._macro_plan is not None
+        assert runtime._macro_plan_frozen is False
+        preemptions = runtime.store.events_of_type(
+            "cortex-run", "episode-1", "macro_frontier_preempted"
+        )
+        assert preemptions[-1].payload["reason"] == "supply_emergency"
+        assert preemptions[-1].payload["blocked_action"] == "BUILD STARGATE"
+        await runtime.close()
+
+    asyncio.run(exercise())
+
+
+def test_gas_blocked_stargate_uses_legal_zealot_fallback(tmp_path: Path) -> None:
+    client = _FakeMacroClient("Actions: ['Stargate', 'Zealot', 'Nexus']")
+    runtime = CortexRuntimeEngine(
+        config=_config(tmp_path),
+        store=_store(tmp_path),
+        provider=FakeProvider(),
+        macro_client=client,
+    )
+    observation = ObservationEnvelope(
+        run_id="cortex-run",
+        episode_id="episode-1",
+        step_id=0,
+        game_loop=0,
+        state=SC2State(
+            economy=EconomyState(
+                minerals=500,
+                vespene=0,
+                supply_used=20,
+                supply_cap=31,
+                workers=18,
+            ),
+            own_structures=[
+                UnitState(unit_id="0x1", unit_type="Gateway", alliance="self"),
+                UnitState(
+                    unit_id="0x2", unit_type="CyberneticsCore", alliance="self"
+                ),
+            ],
+        ),
+        available_actions=[
+            AvailableAction(
+                name="Train_Zealot",
+                actor_scopes=["Developer/Empty"],
+                argument_candidates=None,
+            ),
+            AvailableAction(
+                name="Build_Nexus_Near",
+                argument_names=["tag"],
+                argument_types=[ActionArgumentType.TAG],
+                actor_scopes=["Builder/Probe-1"],
+                argument_candidates=[["0x99"]],
+            ),
+        ],
+    )
+
+    async def exercise() -> None:
+        await runtime.start()
+        await runtime.tick(observation)
+        for _ in range(5):
+            await asyncio.sleep(0)
+        batch = await runtime.tick(
+            observation.model_copy(update={"step_id": 1, "game_loop": 1})
+        )
+
+        assert [command.name for command in batch.commands] == ["Train_Zealot"]
+        preemptions = runtime.store.events_of_type(
+            "cortex-run", "episode-1", "macro_frontier_preempted"
+        )
+        assert preemptions[-1].payload["reason"] == "resource_fallback"
+        assert preemptions[-1].payload["blocked_reason"] == "insufficient_vespene"
+        await runtime.close()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(
+    ("supply_used", "expected_action"),
+    [(28, "Build_Pylon_Screen"), (20, "Build_Nexus_Near")],
+)
+def test_gas_blocked_stargate_uses_supply_or_expansion_fallback(
+    tmp_path: Path,
+    supply_used: int,
+    expected_action: str,
+) -> None:
+    client = _FakeMacroClient("Actions: ['Stargate', 'Pylon', 'Nexus']")
+    runtime = CortexRuntimeEngine(
+        config=_config(tmp_path),
+        store=_store(tmp_path),
+        provider=FakeProvider(),
+        macro_client=client,
+    )
+    observation = ObservationEnvelope(
+        run_id="cortex-run",
+        episode_id="episode-1",
+        step_id=0,
+        game_loop=0,
+        state=SC2State(
+            economy=EconomyState(
+                minerals=500,
+                vespene=0,
+                supply_used=supply_used,
+                supply_cap=31,
+                workers=18,
+            ),
+            own_structures=[
+                UnitState(
+                    unit_id="0x2", unit_type="CyberneticsCore", alliance="self"
+                )
+            ],
+        ),
+        available_actions=[
+            AvailableAction(
+                name="Build_Pylon_Screen",
+                argument_names=["screen"],
+                argument_types=[ActionArgumentType.POSITION],
+                actor_scopes=["Builder/Probe-1"],
+                argument_candidates=[[[65, 90]]],
+            ),
+            AvailableAction(
+                name="Build_Nexus_Near",
+                argument_names=["tag"],
+                argument_types=[ActionArgumentType.TAG],
+                actor_scopes=["Builder/Probe-1"],
+                argument_candidates=[["0x99"]],
+            ),
+        ],
+    )
+
+    async def exercise() -> None:
+        await runtime.start()
+        await runtime.tick(observation)
+        for _ in range(5):
+            await asyncio.sleep(0)
+        batch = await runtime.tick(
+            observation.model_copy(update={"step_id": 1, "game_loop": 1})
+        )
+        assert [command.name for command in batch.commands] == [expected_action]
+        await runtime.close()
+
+    asyncio.run(exercise())
+
+
 def test_episode_transition_drains_and_discards_previous_macro_request(
     tmp_path: Path,
 ) -> None:
@@ -547,6 +757,46 @@ def test_required_timed_out_macro_specialist_fails_closed_on_next_episode(
         await runtime.close()
 
     asyncio.run(exercise())
+
+
+def test_timed_out_macro_specialist_restarts_and_resumes_requests(tmp_path: Path) -> None:
+    client = _TimeoutOnceMacroClient()
+    sidecar = _RecoveringMacroSidecar(client)
+    runtime = CortexRuntimeEngine(
+        config=_config(tmp_path),
+        store=_store(tmp_path),
+        provider=FakeProvider(),
+        macro_client=client,
+        macro_sidecar=sidecar,
+    )
+
+    async def exercise() -> None:
+        await runtime.start()
+        await runtime.tick(_macro_observation(step_id=0, game_loop=0))
+        for _ in range(5):
+            await asyncio.sleep(0)
+        await runtime.tick(_macro_observation(step_id=1, game_loop=1))
+        for _ in range(10):
+            await asyncio.sleep(0)
+
+        assert sidecar.restart_count == 1
+        assert runtime._macro_requests_suspended is False
+
+        retry = await runtime.tick(_macro_observation(step_id=2, game_loop=2))
+        assert retry.planner_pending is True
+        for _ in range(5):
+            await asyncio.sleep(0)
+        resumed = await runtime.tick(_macro_observation(step_id=3, game_loop=3))
+        assert [command.name for command in resumed.commands] == ["Build_Pylon_Screen"]
+        recovered = runtime.store.events_of_type(
+            "cortex-run", "episode-1", "specialist_recovered"
+        )
+        assert len(recovered) == 1
+        assert recovered[0].payload["restart_attempt"] == 1
+        await runtime.close()
+
+    asyncio.run(exercise())
+    assert sidecar.closed is True
 
 
 def test_reflex_dispatch_also_has_typed_candidate_and_lineage(tmp_path: Path) -> None:

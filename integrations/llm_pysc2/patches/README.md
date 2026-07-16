@@ -44,12 +44,36 @@ git -C third_party/LLM-PySC2 apply --check \
   ../../integrations/llm_pysc2/patches/0010-report-max-frame-truncation.patch
 git -C third_party/LLM-PySC2 apply \
   ../../integrations/llm_pysc2/patches/0010-report-max-frame-truncation.patch
+git -C third_party/LLM-PySC2 apply --check \
+  ../../integrations/llm_pysc2/patches/0011-allocate-log-directories-atomically.patch
+git -C third_party/LLM-PySC2 apply \
+  ../../integrations/llm_pysc2/patches/0011-allocate-log-directories-atomically.patch
+git -C third_party/LLM-PySC2 apply --check \
+  ../../integrations/llm_pysc2/patches/0012-bind-gas-rebalance-to-worker-management.patch
+git -C third_party/LLM-PySC2 apply \
+  ../../integrations/llm_pysc2/patches/0012-bind-gas-rebalance-to-worker-management.patch
+git -C third_party/LLM-PySC2 apply --check \
+  ../../integrations/llm_pysc2/patches/0013-preserve-reserved-builder-worker.patch
+git -C third_party/LLM-PySC2 apply \
+  ../../integrations/llm_pysc2/patches/0013-preserve-reserved-builder-worker.patch
 ```
 
 After the live run, restore the clean pinned checkout by reversing exactly these reviewed
 patches in reverse order:
 
 ```bash
+git -C third_party/LLM-PySC2 apply --reverse --check \
+  ../../integrations/llm_pysc2/patches/0013-preserve-reserved-builder-worker.patch
+git -C third_party/LLM-PySC2 apply --reverse \
+  ../../integrations/llm_pysc2/patches/0013-preserve-reserved-builder-worker.patch
+git -C third_party/LLM-PySC2 apply --reverse --check \
+  ../../integrations/llm_pysc2/patches/0012-bind-gas-rebalance-to-worker-management.patch
+git -C third_party/LLM-PySC2 apply --reverse \
+  ../../integrations/llm_pysc2/patches/0012-bind-gas-rebalance-to-worker-management.patch
+git -C third_party/LLM-PySC2 apply --reverse --check \
+  ../../integrations/llm_pysc2/patches/0011-allocate-log-directories-atomically.patch
+git -C third_party/LLM-PySC2 apply --reverse \
+  ../../integrations/llm_pysc2/patches/0011-allocate-log-directories-atomically.patch
 git -C third_party/LLM-PySC2 apply --reverse --check \
   ../../integrations/llm_pysc2/patches/0010-report-max-frame-truncation.patch
 git -C third_party/LLM-PySC2 apply --reverse \
@@ -159,7 +183,24 @@ PySC2 returns at `max_agent_steps`. The RTSCortex bridge uses the hook to post o
 `truncated` episode result and finalize pending commands instead of relying on the supervisor
 to guess why a clean worker process exited.
 
-CI applies all ten patches in order under Python 3.9, compiles and imports both projects, and
+`0011-allocate-log-directories-atomically.patch` replaces the process-local logger counter
+condition with an atomic `mkdir` claim. Concurrent live workers that start within the same
+second now select distinct upstream log directories instead of one worker spinning forever.
+
+`0012-bind-gas-rebalance-to-worker-management.patch` makes mineral-to-gas worker rebalancing
+obey `ENABLE_AUTO_WORKER_MANAGE` instead of the unrelated worker-training flag. The Bridge
+selects the exact nearest mineral Probe with stable tag tie-breaking before the upstream
+stop-and-reassign sequence runs.
+
+`0013-preserve-reserved-builder-worker.patch` prevents upstream idle-worker selection from
+reassigning the dedicated Builder Probe to minerals or gas. The Bridge publishes reserved
+Builder tags before worker management; if PySC2 selects one as idle, upstream gives it a stable
+HoldPosition order and continues the ordinary worker rebalance on a later tick. The melee profile
+keeps worker management enabled so the deterministic gas rebalance can run; if the Builder is
+already present in a gas slot, the Bridge evicts that exact tag before filling the slot with an
+ordinary worker.
+
+CI applies all thirteen patches in order under Python 3.9, compiles and imports both projects, and
 runs `integrations/llm_pysc2/tests/python39_contract_smoke.py`. The smoke locks the v1.1
 candidate mapping, multi-argument translator rejection, Nexus camera-settlement primitive,
 exact Nexus anchor, floating-point resource clearance, visible complete-footprint behavior,
@@ -167,8 +208,8 @@ gas clearance, raw-unit team persistence,
 and explicit pre-translation abort markers, including transient disappearance recovery. CI then
 reverses the patches in reverse order and requires a clean submodule checkout.
 
-The patches deliberately do not change camera calibration, initial team assignment, automatic
-economy, or unrelated translator behavior. Patch 0007 preserves insertion order while removing
+The patches deliberately do not change camera calibration, initial team assignment, or unrelated
+translator behavior. Patch 0007 preserves insertion order while removing
 duplicate team tags and delays member removal until death is confirmed. Observation mapping,
 runtime calls, action routing, and execution feedback live in this bridge package rather than in
 the upstream checkout.

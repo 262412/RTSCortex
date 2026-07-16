@@ -148,11 +148,20 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
         self._rtscortex_translation_attempt: Optional[dict[str, Any]] = None
         self._rtscortex_semantic_action: Optional[dict[str, Any]] = None
         self._rtscortex_production_source_tag: Optional[int] = None
+        self._rtscortex_rejected_build_positions: dict[
+            str, set[tuple[int, int]]
+        ] = {}
+        self._rtscortex_rejected_build_targets: dict[
+            str, set[tuple[float, float]]
+        ] = {}
+        self._rtscortex_active_build_route: Optional[
+            tuple[str, tuple[int, int], Optional[tuple[float, float]]]
+        ] = None
         broker.register(self)
 
     def get_func(self, obs: Any) -> Any:
         if not self.func_list and self.action_list:
-            self._rtscortex_semantic_action = self.action_list[0]
+            self._rtscortex_semantic_action = _isolate_next_action(self.action_list)
             if production_spec(str(self.action_list[0].get("name", ""))) is None:
                 self._rtscortex_production_source_tag = None
         action: dict[str, Any] = (
@@ -181,11 +190,22 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
                 )
                 if provenance is not None:
                     if is_screen_build:
+                        rejected_positions = self._rtscortex_rejected_build_positions.get(
+                            action_name, set()
+                        )
+                        target_key = _build_world_target_key(provenance.world_target)
                         resolved = _resolve_build_action_position(
                             action,
                             obs.observation,
                             world_target=provenance.world_target,
                             preferred_anchor_tag=provenance.anchor_tag,
+                            excluded_positions=rejected_positions,
+                            force_resample=(
+                                target_key
+                                in self._rtscortex_rejected_build_targets.get(
+                                    action_name, set()
+                                )
+                            ),
                         )
                     else:
                         resolved = _resolve_screen_point_action_position(
@@ -203,6 +223,16 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
                             ),
                         )
             if (is_screen_build or is_screen_point) and resolved is None:
+                if is_screen_build:
+                    requested = _screen_argument(action)
+                    if requested is not None:
+                        self._rtscortex_rejected_build_positions.setdefault(
+                            action_name, set()
+                        ).add(_screen_position_key(requested))
+                    if provenance is not None:
+                        self._rtscortex_rejected_build_targets.setdefault(
+                            action_name, set()
+                        ).add(_build_world_target_key(provenance.world_target))
                 predispatch_failure_code = (
                     "no_legal_placement" if is_screen_build else "candidate_invalidated"
                 )
@@ -418,6 +448,12 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
             return result
         if dispatch.final_primitive and translated_position is not None:
             self.broker.resolve_arguments(dispatch.command_id, [translated_position])
+            route = self.broker.screen_route_provenance(dispatch.command_id)
+            self._rtscortex_active_build_route = (
+                action_name,
+                _screen_position_key(translated_position),
+                None if route is None else _build_world_target_key(route.world_target),
+            )
         self._rtscortex_translation_attempt = {
             "dispatch": dispatch,
             "emitted_function_id": int(attempt.get("emitted_function_id", requested_id)),
@@ -611,12 +647,18 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
         self.decision_broker.observe_effects(obs.observation)
         if _is_terminal(obs):
             return _finish_terminal(self, obs, _base_agent_step, _no_op)
+        worker_management_blocked = (
+            self.decision_broker.coordinator.effect_verifier.blocks_auto_worker_management
+        )
+        _prime_deterministic_gas_rebalance(
+            self,
+            obs.observation,
+            blocked=worker_management_blocked,
+        )
         upstream_step = super().step
         action = _run_with_auto_worker_management_guard(
             self.config,
-            blocked=(
-                self.decision_broker.coordinator.effect_verifier.blocks_auto_worker_management
-            ),
+            blocked=worker_management_blocked,
             upstream_step=lambda: upstream_step(obs),
         )
         self._consume_execution_aborts(obs)
@@ -718,6 +760,20 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
                 )
                 if self._pending_primitive_agent is not None:
                     self._pending_primitive_agent.func_list.clear()
+                    route = getattr(
+                        self._pending_primitive_agent,
+                        "_rtscortex_active_build_route",
+                        None,
+                    )
+                    if route is not None:
+                        action_name, position, world_target = route
+                        self._pending_primitive_agent._rtscortex_rejected_build_positions.setdefault(
+                            action_name, set()
+                        ).add(position)
+                        if world_target is not None:
+                            self._pending_primitive_agent._rtscortex_rejected_build_targets.setdefault(
+                                action_name, set()
+                            ).add(world_target)
         self.decision_broker.settle_primitive(
             dispatch,
             success=not action_results,
@@ -725,6 +781,8 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
             game_loop=_observation_game_loop(obs.observation),
         )
         self._pending_primitive = None
+        if self._pending_primitive_agent is not None:
+            self._pending_primitive_agent._rtscortex_active_build_route = None
         self._pending_primitive_agent = None
 
     def _capture_primitive(self, action: Any, obs: Any) -> None:
@@ -1012,6 +1070,119 @@ def _run_with_auto_worker_management_guard(
         config.ENABLE_AUTO_WORKER_TRAINING = worker_training_enabled
 
 
+def _prime_deterministic_gas_rebalance(
+    main_agent: Any,
+    observation: Any,
+    *,
+    blocked: bool,
+) -> bool:
+    """Choose one exact mineral worker when a completed gas slot is undersaturated."""
+
+    reserved_builder_tags = _reserved_builder_worker_tags(main_agent)
+    main_agent._rtscortex_reserved_worker_tags = reserved_builder_tags
+    if (
+        blocked
+        or not bool(getattr(main_agent.config, "ENABLE_AUTO_WORKER_MANAGE", False))
+        or bool(getattr(main_agent, "main_loop_lock", False))
+        or getattr(main_agent, "stop_worker", None) is not None
+        or getattr(main_agent, "stop_worker_nexus_tag", None) is not None
+    ):
+        return False
+    raw_by_tag = {
+        int(getattr(unit, "tag", 0)): unit
+        for unit in getattr(observation, "raw_units", ())
+        if int(getattr(unit, "tag", 0)) > 0
+    }
+    harvest_order_ids = {102, 103, 154, 356, 357, 358, 359, 360, 361, 362}
+    nexus_info_dict = getattr(main_agent, "nexus_info_dict", {})
+    for _nexus_key, info in sorted(
+        nexus_info_dict.items(), key=lambda item: int(item[0])
+    ):
+        nexus = info.get("nexus")
+        if nexus is None:
+            continue
+        for gas_slot, worker_tags in (
+            ("g1", info.get("worker_g1_tag_list", ())),
+            ("g2", info.get("worker_g2_tag_list", ())),
+        ):
+            reserved_on_gas = sorted(
+                reserved_builder_tags.intersection(int(tag) for tag in worker_tags)
+            )
+            for worker_tag in reserved_on_gas:
+                worker = raw_by_tag.get(worker_tag)
+                if worker is None:
+                    continue
+                main_agent.stop_worker_nexus_tag = int(nexus.tag)
+                main_agent.stop_worker_at = gas_slot
+                main_agent.stop_worker = worker
+                return True
+
+    choices: list[tuple[float, int, int, Any]] = []
+    for _nexus_key, info in sorted(
+        nexus_info_dict.items(), key=lambda item: int(item[0])
+    ):
+        nexus = info.get("nexus")
+        if nexus is None:
+            continue
+        undersaturated = [
+            gas
+            for gas, workers in (
+                (info.get("gas_building_1"), info.get("worker_g1_tag_list", ())),
+                (info.get("gas_building_2"), info.get("worker_g2_tag_list", ())),
+            )
+            if gas is not None
+            and float(getattr(gas, "build_progress", 0.0)) in {1.0, 100.0}
+            and len(workers) < 3
+        ]
+        if not undersaturated:
+            continue
+        target = min(undersaturated, key=lambda gas: int(gas.tag))
+        for worker_tag in sorted(set(info.get("worker_m_tag_list", ()))):
+            if int(worker_tag) in reserved_builder_tags:
+                continue
+            worker = raw_by_tag.get(int(worker_tag))
+            if worker is None:
+                continue
+            if int(getattr(worker, "order_id_0", 356)) not in harvest_order_ids:
+                continue
+            distance = (float(worker.x) - float(target.x)) ** 2 + (
+                float(worker.y) - float(target.y)
+            ) ** 2
+            choices.append((distance, int(worker.tag), int(nexus.tag), worker))
+    if not choices:
+        return False
+    _, _, nexus_tag, worker = min(choices)
+    main_agent.stop_worker_nexus_tag = nexus_tag
+    main_agent.stop_worker_at = "m"
+    main_agent.stop_worker = worker
+    return True
+
+
+def _reserved_builder_worker_tags(main_agent: Any) -> set[int]:
+    agents = getattr(main_agent, "agents", {})
+    if not isinstance(agents, Mapping):
+        return set()
+    builder = agents.get("Builder")
+    if builder is None:
+        return set()
+
+    tags: set[int] = set()
+    current = getattr(builder, "team_unit_tag_curr", None)
+    if current is not None and int(current) > 0:
+        tags.add(int(current))
+    for attribute in ("unit_tag_list", "team_unit_tag_list"):
+        tags.update(
+            int(tag)
+            for tag in getattr(builder, attribute, ())
+            if int(tag) > 0
+        )
+    for team in getattr(builder, "teams", ()):
+        if not isinstance(team, Mapping):
+            continue
+        tags.update(int(tag) for tag in team.get("unit_tags", ()) if int(tag) > 0)
+    return tags
+
+
 def _translated_build_position(
     action_name: str,
     arguments: Any,
@@ -1199,6 +1370,8 @@ def _resolve_build_action_position(
     *,
     world_target: Optional[tuple[float, float]] = None,
     preferred_anchor_tag: Optional[int] = None,
+    excluded_positions: set[tuple[int, int]] | None = None,
+    force_resample: bool = False,
 ) -> Optional[list[int]]:
     action_name = str(action.get("name", ""))
     requested = _screen_argument(action)
@@ -1208,17 +1381,31 @@ def _resolve_build_action_position(
             action_name,
             world_target,
             preferred_anchor_tag=preferred_anchor_tag,
+            excluded_positions=excluded_positions or set(),
+            force_resample=force_resample,
         )
         if position is None:
             return None
     else:
-        candidates = build_screen_candidates(observation, action_name)
+        candidates = [
+            candidate
+            for candidate in build_screen_candidates(observation, action_name)
+            if tuple(candidate) not in (excluded_positions or set())
+        ]
         if not candidates:
             return None
         position = _nearest_current_build_candidate(observation, candidates, requested)
         if position is None:
             return None
     return _replace_screen_action_position(action, position)
+
+
+def _build_world_target_key(world_target: tuple[float, float]) -> tuple[float, float]:
+    return (round(world_target[0], 3), round(world_target[1], 3))
+
+
+def _screen_position_key(position: list[int]) -> tuple[int, int]:
+    return (int(position[0]), int(position[1]))
 
 
 def _resolve_screen_point_action_position(
@@ -1261,6 +1448,14 @@ def _replace_screen_action_position(
         refreshed_functions.append((function_id, function, refreshed_arguments))
     action["func"] = refreshed_functions
     return position
+
+
+def _isolate_next_action(action_list: list[dict[str, Any]]) -> dict[str, Any]:
+    """Detach one routed action from the upstream reusable action templates."""
+
+    action = copy.deepcopy(action_list[0])
+    action_list[0] = action
+    return action
 
 
 def _nearest_current_build_candidate(

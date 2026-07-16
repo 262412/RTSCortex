@@ -123,9 +123,10 @@ class RTSCortexMeleeConfig(ProtossAgentConfig):  # type: ignore[misc]
 
         self.AGENTS_ALWAYS_DISABLE = []
         self.ENABLE_INIT_STEPS = True
-        # ``select_idle_worker`` cannot exclude the dedicated Builder probe. Keep
-        # automatic training, but reserve that actor from economy reassignment.
-        self.ENABLE_AUTO_WORKER_MANAGE = False
+        # Gas saturation uses upstream worker-management primitives. Patch 0013
+        # keeps the dedicated Builder Probe reserved while ordinary workers are
+        # stopped and reassigned deterministically by the Bridge.
+        self.ENABLE_AUTO_WORKER_MANAGE = True
         self.ENABLE_AUTO_WORKER_TRAINING = True
         _ensure_no_operation(self.AGENTS)
 

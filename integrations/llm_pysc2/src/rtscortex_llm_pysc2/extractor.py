@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from collections import Counter
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -500,7 +500,12 @@ def _available_team_actions(
             continue
         argument_types = tuple("tag" if name == "tag" else "position" for name in argument_names)
         function_ids = [int(triple[0]) for triple in action.get("func", ())]
-        if available_ids is not None and any(value not in available_ids for value in function_ids):
+        build_spec = BUILD_SPECS.get(action_name)
+        if (
+            build_spec is None
+            and available_ids is not None
+            and any(value not in available_ids for value in function_ids)
+        ):
             continue
         required_sources = {
             action_source_types[function_id]
@@ -538,7 +543,6 @@ def _available_team_actions(
                     require_power=True,
                 )
             ]
-        build_spec = BUILD_SPECS.get(action_name)
         needs_screen_provenance = action_name in SCREEN_POINT_ACTIONS or (
             build_spec is not None and build_spec.placement_kind == "screen"
         )
@@ -1293,6 +1297,8 @@ def resolve_screen_build_world_target(
     world_target: tuple[float, float],
     *,
     preferred_anchor_tag: Optional[int] = None,
+    excluded_positions: Collection[tuple[int, int]] = (),
+    force_resample: bool = False,
 ) -> Optional[list[int]]:
     """Reproject a routed build target and validate it against the current camera."""
 
@@ -1310,10 +1316,21 @@ def resolve_screen_build_world_target(
     height, width = dimensions
     if not (0 <= projected[0] < width and 0 <= projected[1] < height):
         return None
-    if _build_screen_position_is_legal(observation, spec, projected):
+    excluded = set(excluded_positions)
+    if force_resample:
+        excluded.add((projected[0], projected[1]))
+    if (
+        not force_resample
+        and tuple(projected) not in excluded
+        and _build_screen_position_is_legal(observation, spec, projected)
+    ):
         return projected
 
-    candidates = _build_screen_candidates(observation, action_name, limit=None)
+    candidates = [
+        candidate
+        for candidate in _build_screen_candidates(observation, action_name, limit=None)
+        if tuple(candidate) not in excluded
+    ]
     stride = max(4, int(height / SCREEN_WORLD_GRID))
     ranked = sorted(
         (
@@ -1324,7 +1341,7 @@ def resolve_screen_build_world_target(
         )
         for candidate in candidates
     )
-    if not ranked or ranked[0][0] > (2 * stride) ** 2:
+    if not ranked or ranked[0][0] > (6 * stride) ** 2:
         return None
     return ranked[0][3]
 

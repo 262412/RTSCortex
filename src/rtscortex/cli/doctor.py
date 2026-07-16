@@ -15,7 +15,9 @@ import httpx
 from rtscortex.config import ExperimentConfig
 from rtscortex.runtime.live import (
     LiveEnvironmentError,
+    atomic_log_directory_patch_is_applied,
     build_feature_plane_patch_is_applied,
+    gas_rebalance_worker_management_patch_is_applied,
     live_scenario_spec,
     max_frames_episode_hook_patch_is_applied,
     near_placement_patch_is_applied,
@@ -23,6 +25,7 @@ from rtscortex.runtime.live import (
     nexus_resource_clearance_patch_is_applied,
     pretranslation_abort_patch_is_applied,
     random_seed_patch_is_applied,
+    reserved_builder_worker_patch_is_applied,
     sc2_build,
     transient_unit_grace_patch_is_applied,
     translation_result_patch_is_applied,
@@ -196,6 +199,12 @@ def _worker_patch_check(project_root: Path, *, required: bool) -> Check:
         missing.append("0009-use-exact-nexus-screen-scale.patch")
     if not max_frames_episode_hook_patch_is_applied(project_root):
         missing.append("0010-report-max-frame-truncation.patch")
+    if not atomic_log_directory_patch_is_applied(project_root):
+        missing.append("0011-allocate-log-directories-atomically.patch")
+    if not gas_rebalance_worker_management_patch_is_applied(project_root):
+        missing.append("0012-bind-gas-rebalance-to-worker-management.patch")
+    if not reserved_builder_worker_patch_is_applied(project_root):
+        missing.append("0013-preserve-reserved-builder-worker.patch")
     status = "ok" if not missing else ("error" if required else "optional")
     detail = "all worker patches applied" if not missing else "apply " + ", ".join(missing)
     return Check("worker_patch", status, detail)

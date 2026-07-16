@@ -119,6 +119,8 @@ class CortexExecutorSettings(SettingsModel):
     kind: Literal["deterministic"] = "deterministic"
     timeout_ms: float = Field(default=10.0, gt=0.0)
     fallback: Literal["deterministic"] = "deterministic"
+    supply_emergency_free_supply: int = Field(default=2, ge=0)
+    resource_fallback_pylon_free_supply: int = Field(default=4, ge=0)
 
 
 class CortexExplanationSettings(SettingsModel):

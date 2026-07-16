@@ -149,9 +149,10 @@ nvidia-smi
 
 There is currently no quantization, CPU/GPU offload, automatic device selection, VRAM
 reservation, or pre-launch memory estimator. An unavailable device or out-of-memory load
-causes sidecar readiness to fail and prevents the SC2 Worker from starting. The
-`cortex.macro.restart_limit` field is reserved; v0.3 does not respawn a sidecar that dies
-after it became ready.
+causes sidecar readiness to fail and prevents the SC2 Worker from starting. After a
+post-start request timeout, Runtime suspends new requests, terminates the stuck sidecar,
+starts it again, revalidates its exact model identity, and resumes urgent planning. The
+number of automatic recoveries is bounded by `cortex.macro.restart_limit`.
 
 ### Safe launch
 
@@ -179,7 +180,8 @@ loops and is an action-closure/observability smoke, not a full match or win-rate
 
 The run directory adds `hima-sidecar.stdout.log` and `hima-sidecar.stderr.log` alongside
 the normal SQLite, JSONL, Worker logs, timeline, and report. RGB frames and `.SC2Replay`
-remain non-persistent. The Live Console exposes the HIMA identity and health, macro plan,
+remain non-persistent. Sidecar restarts append to the same two logs. The Live Console exposes
+the HIMA identity and health, macro plan,
 intent, candidate set, executor choice, command lineage, Bridge primitives, PySC2
 acceptance, and effect-verification result without giving the browser a control endpoint.
 
@@ -194,6 +196,8 @@ uv run rtscortex report ~/scratch/outputs/RTSCortex/<cortex-run-directory>
 Use the report and Console to verify:
 
 - `specialist_ready` identifies the configured HIMA model and exact pinned revision;
+- a recovered timeout produces `specialist_failed` followed by exactly one
+  `specialist_recovered` per successful bounded restart;
 - every accepted macro plan records adapter, parser, vocabulary, and source-model
   provenance; semantic proposal rejection is an explicit `macro_plan_rejected`, while
   process, transport, timeout, or inference failure is an explicit `specialist_failed`;
@@ -237,6 +241,18 @@ vespene, supply, and prerequisite requirements are all currently satisfied; this
 50-mineral/50-vespene Warp Gate research cost, the 150-mineral/150-vespene Stargate,
 the 100-mineral powered Shield Battery after Cybernetics Core, and the full Adept, Void Ray,
 Oracle, and Phoenix production costs.
+
+The live Cortex executor also applies four deterministic liveness rules without bypassing
+the normal candidate and validation chain:
+
+- with at most two free supply, a legal Pylon step later in the current HIMA plan may
+  preempt a deferred technology frontier;
+- while Stargate is deferred specifically for insufficient vespene, legal later steps are
+  considered in stable order: Zealot, Pylon when at most four supply remains, then Nexus;
+- each completed undersaturated Assimilator causes one nearest mineral Probe to be selected
+  with tag-based tie-breaking and passed through upstream worker reallocation;
+- a failed screen-build world target and resolved screen position are excluded from the next
+  bounded resampling pass, preventing identical placement retries.
 
 Validate and launch the deterministic Fake-provider smoke with:
 

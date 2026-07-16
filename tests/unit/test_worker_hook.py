@@ -32,10 +32,14 @@ from rtscortex_llm_pysc2.worker import (
     _canonical_pysc2_arguments,
     _execution_team_name,
     _finish_terminal,
+    _isolate_next_action,
     _pending_plan_idle_delay,
+    _prime_deterministic_gas_rebalance,
     _production_source_invalid_reason,
     _production_source_world_position,
     _refresh_build_action_position,
+    _replace_screen_action_position,
+    _resolve_build_action_position,
     _run_with_auto_worker_management_guard,
     _scenario_config,
     _semantic_target_failure,
@@ -447,11 +451,222 @@ def test_auto_worker_management_guard_restores_flag_after_upstream_error() -> No
     assert config.ENABLE_AUTO_WORKER_TRAINING is True
 
 
+def test_deterministic_gas_rebalance_selects_nearest_stable_mineral_worker() -> None:
+    assimilator = SimpleNamespace(tag=500, x=20.0, y=20.0, build_progress=100)
+    workers = [
+        SimpleNamespace(tag=30, x=5.0, y=5.0),
+        SimpleNamespace(tag=20, x=19.0, y=19.0),
+        SimpleNamespace(tag=10, x=19.0, y=19.0),
+    ]
+    agent = SimpleNamespace(
+        config=SimpleNamespace(ENABLE_AUTO_WORKER_MANAGE=True),
+        main_loop_lock=False,
+        stop_worker=None,
+        stop_worker_nexus_tag=None,
+        stop_worker_at=None,
+        nexus_info_dict={
+            "100": {
+                "nexus": SimpleNamespace(tag=100),
+                "gas_building_1": assimilator,
+                "gas_building_2": None,
+                "worker_g1_tag_list": [],
+                "worker_g2_tag_list": [],
+                "worker_m_tag_list": [30, 20, 10],
+            }
+        },
+    )
+    observation = SimpleNamespace(raw_units=workers)
+
+    selected = _prime_deterministic_gas_rebalance(
+        agent,
+        observation,
+        blocked=False,
+    )
+
+    assert selected is True
+    assert agent.stop_worker.tag == 10
+    assert agent.stop_worker_nexus_tag == 100
+    assert agent.stop_worker_at == "m"
+
+
+def test_deterministic_gas_rebalance_excludes_reserved_builder_worker() -> None:
+    assimilator = SimpleNamespace(tag=500, x=20.0, y=20.0, build_progress=100)
+    workers = [
+        SimpleNamespace(tag=10, x=19.0, y=19.0),
+        SimpleNamespace(tag=20, x=18.0, y=18.0),
+    ]
+    builder = SimpleNamespace(
+        unit_tag_list=[10],
+        team_unit_tag_list=[],
+        team_unit_tag_curr=None,
+        teams=[{"unit_tags": [10]}],
+    )
+    agent = SimpleNamespace(
+        config=SimpleNamespace(ENABLE_AUTO_WORKER_MANAGE=True),
+        main_loop_lock=False,
+        stop_worker=None,
+        stop_worker_nexus_tag=None,
+        stop_worker_at=None,
+        agents={"Builder": builder},
+        nexus_info_dict={
+            "100": {
+                "nexus": SimpleNamespace(tag=100),
+                "gas_building_1": assimilator,
+                "gas_building_2": None,
+                "worker_g1_tag_list": [],
+                "worker_g2_tag_list": [],
+                "worker_m_tag_list": [10, 20],
+            }
+        },
+    )
+
+    selected = _prime_deterministic_gas_rebalance(
+        agent,
+        SimpleNamespace(raw_units=workers),
+        blocked=False,
+    )
+
+    assert selected is True
+    assert agent.stop_worker.tag == 20
+    assert agent._rtscortex_reserved_worker_tags == {10}
+
+
+def test_deterministic_gas_rebalance_evicts_builder_already_on_gas() -> None:
+    assimilator = SimpleNamespace(tag=500, x=20.0, y=20.0, build_progress=100)
+    builder_worker = SimpleNamespace(tag=10, x=20.0, y=20.0)
+    ordinary_worker = SimpleNamespace(tag=20, x=18.0, y=18.0)
+    builder = SimpleNamespace(
+        unit_tag_list=[10],
+        team_unit_tag_list=[],
+        team_unit_tag_curr=None,
+        teams=[{"unit_tags": [10]}],
+    )
+    agent = SimpleNamespace(
+        config=SimpleNamespace(ENABLE_AUTO_WORKER_MANAGE=True),
+        main_loop_lock=False,
+        stop_worker=None,
+        stop_worker_nexus_tag=None,
+        stop_worker_at=None,
+        agents={"Builder": builder},
+        nexus_info_dict={
+            "100": {
+                "nexus": SimpleNamespace(tag=100),
+                "gas_building_1": assimilator,
+                "gas_building_2": None,
+                "worker_g1_tag_list": [10],
+                "worker_g2_tag_list": [],
+                "worker_m_tag_list": [20],
+            }
+        },
+    )
+
+    selected = _prime_deterministic_gas_rebalance(
+        agent,
+        SimpleNamespace(raw_units=[builder_worker, ordinary_worker]),
+        blocked=False,
+    )
+
+    assert selected is True
+    assert agent.stop_worker is builder_worker
+    assert agent.stop_worker_nexus_tag == 100
+    assert agent.stop_worker_at == "g1"
+
+
+def test_deterministic_gas_rebalance_respects_effect_and_main_loop_guards() -> None:
+    builder = SimpleNamespace(
+        unit_tag_list=[10],
+        team_unit_tag_list=[],
+        team_unit_tag_curr=None,
+        teams=[{"unit_tags": [10]}],
+    )
+    agent = SimpleNamespace(
+        config=SimpleNamespace(ENABLE_AUTO_WORKER_MANAGE=True),
+        main_loop_lock=False,
+        stop_worker=None,
+        stop_worker_nexus_tag=None,
+        agents={"Builder": builder},
+        nexus_info_dict={},
+    )
+
+    assert (
+        _prime_deterministic_gas_rebalance(
+            agent,
+            SimpleNamespace(raw_units=[]),
+            blocked=True,
+        )
+        is False
+    )
+    assert agent._rtscortex_reserved_worker_tags == {10}
+    agent.main_loop_lock = True
+    assert (
+        _prime_deterministic_gas_rebalance(
+            agent,
+            SimpleNamespace(raw_units=[]),
+            blocked=False,
+        )
+        is False
+    )
+    assert agent._rtscortex_reserved_worker_tags == {10}
+
+
 def test_translated_build_position_extracts_final_screen_argument() -> None:
     assert _translated_build_position("Build_Nexus_Near", [(90, 70)]) == [90, 70]
     assert _translated_build_position("Build_Pylon_Screen", ["now", [65, 55]]) == [65, 55]
     assert _translated_build_position("Move_Screen", [[65, 55]]) is None
     assert _translated_build_position("Build_Nexus_Near", ["invalid"]) is None
+
+
+def test_build_dispatch_does_not_mutate_reusable_action_template() -> None:
+    template = {
+        "name": "Build_Pylon_Screen",
+        "arg": ["screen"],
+        "func": [(70, None, ("now", [0, 0]))],
+    }
+    action_list = [
+        {
+            "name": template["name"],
+            "arg": template["arg"],
+            "func": template["func"],
+        }
+    ]
+
+    isolated = _isolate_next_action(action_list)
+    _replace_screen_action_position(isolated, [65, 35])
+
+    assert isolated["arg"] == [[65, 35]]
+    assert template["arg"] == ["screen"]
+    assert action_list[0] is isolated
+
+
+def test_build_position_resampling_excludes_previously_failed_candidate() -> None:
+    observation = SimpleNamespace(
+        feature_screen=SimpleNamespace(
+            buildable=UniformGrid(1),
+            pathable=UniformGrid(1),
+            player_relative=UniformGrid(0),
+            power=UniformGrid(0),
+        ),
+        feature_units=[],
+    )
+    candidates = build_screen_candidates(observation, "Build_Pylon_Screen")
+    assert len(candidates) >= 2
+    requested = candidates[0]
+    action = {
+        "name": "Build_Pylon_Screen",
+        "arg": [list(requested)],
+        "func": [(70, object(), ("now", list(requested)))],
+    }
+
+    resolved = _resolve_build_action_position(
+        action,
+        observation,
+        excluded_positions={(requested[0], requested[1])},
+    )
+
+    assert resolved is not None
+    assert resolved != requested
+    assert resolved in candidates
+    assert action["arg"] == [resolved]
 
 
 def test_timestep_extractor_maps_sc2_attack_alerts() -> None:
@@ -492,8 +707,56 @@ def test_timestep_extractor_adds_structured_pylon_screen_candidates() -> None:
         if action["name"] == "Build_Pylon_Screen"
     )
     assert pylon["argument_candidates"]
+
     assert all(len(candidate) == 1 for candidate in pylon["argument_candidates"])
     assert "RTSCortex Build Candidates" not in snapshot["text_observation"]
+
+
+def test_timestep_extractor_keeps_build_when_primitive_is_temporarily_unavailable() -> None:
+    timestep = _fake_timestep()
+    timestep.observation.available_actions = [0]
+    timestep.observation.feature_screen = SimpleNamespace(
+        buildable=UniformGrid(1),
+        pathable=UniformGrid(1),
+        player_relative=UniformGrid(0),
+        power=UniformGrid(0),
+    )
+    agent = FakeAgent("Builder", "Builder-Probe-1", timestep, StubBroker())
+    agent.config.AGENTS["Builder"]["action"][311].append(
+        {"name": "Build_Pylon_Screen", "arg": ["screen"], "func": [(70, None, ())]}
+    )
+
+    snapshot = TimeStepExtractor(
+        "run-worker",
+        "episode-worker",
+        action_source_types={70: 311},
+    ).extract(
+        timestep,
+        {"Builder": agent},
+        {"Builder": "builder observation"},
+        step_id=1,
+    )
+
+    pylon = next(
+        action
+        for action in snapshot["teams"][0]["available_actions"]
+        if action["name"] == "Build_Pylon_Screen"
+    )
+    assert pylon["argument_candidates"]
+
+    without_probe = TimeStepExtractor(
+        "run-worker",
+        "episode-worker",
+        action_source_types={70: 999},
+    ).extract(
+        timestep,
+        {"Builder": agent},
+        {"Builder": "builder observation"},
+        step_id=2,
+    )
+    assert "Build_Pylon_Screen" not in {
+        action["name"] for action in without_probe["teams"][0]["available_actions"]
+    }
 
 
 def test_timestep_extractor_enumerates_stable_pathable_move_and_blink_candidates() -> None:

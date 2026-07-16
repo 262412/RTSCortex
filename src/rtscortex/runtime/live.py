@@ -204,6 +204,16 @@ def prepare_live_worker(
             "the PySC2 max-frame episode hook patch is not applied; see "
             "integrations/llm_pysc2/patches/README.md"
         )
+    if not atomic_log_directory_patch_is_applied(project_root):
+        errors.append(
+            "the LLM-PySC2 concurrent log-directory patch is not applied; see "
+            "integrations/llm_pysc2/patches/README.md"
+        )
+    if not gas_rebalance_worker_management_patch_is_applied(project_root):
+        errors.append(
+            "the LLM-PySC2 gas-rebalance worker-management patch is not applied; see "
+            "integrations/llm_pysc2/patches/README.md"
+        )
 
     if errors:
         raise LiveEnvironmentError("Live environment validation failed:\n- " + "\n- ".join(errors))
@@ -915,6 +925,52 @@ def max_frames_episode_hook_patch_is_applied(project_root: Path) -> bool:
         for marker in (
             'getattr(agent, "on_episode_truncated", None)',
             "on_episode_truncated(total_frames)",
+        )
+    )
+
+
+def atomic_log_directory_patch_is_applied(project_root: Path) -> bool:
+    """Return whether concurrent workers allocate upstream log directories atomically."""
+
+    source = project_root / "third_party/LLM-PySC2/llm_pysc2/agents/llm_pysc2_agent_main.py"
+    if not source.is_file():
+        return False
+    text = source.read_text(encoding="utf-8")
+    return all(
+        marker in text
+        for marker in (
+            "except FileExistsError:",
+            "llm_pysc2_global_log_id = max(llm_pysc2_global_log_id, self.log_id)",
+        )
+    )
+
+
+def gas_rebalance_worker_management_patch_is_applied(project_root: Path) -> bool:
+    """Return whether gas rebalancing is governed by the worker-management flag."""
+
+    source = project_root / "third_party/LLM-PySC2/llm_pysc2/agents/main_agent_funcs.py"
+    if not source.is_file():
+        return False
+    text = source.read_text(encoding="utf-8")
+    return (
+        "self.config.ENABLE_AUTO_WORKER_MANAGE and self.is_all_nexus_full is False"
+        in text
+    )
+
+
+def reserved_builder_worker_patch_is_applied(project_root: Path) -> bool:
+    """Return whether automatic worker assignment preserves Builder actors."""
+
+    source = project_root / "third_party/LLM-PySC2/llm_pysc2/agents/main_agent_funcs.py"
+    if not source.is_file():
+        return False
+    text = source.read_text(encoding="utf-8")
+    return all(
+        marker in text
+        for marker in (
+            "_rtscortex_reserved_worker_tags",
+            "HoldPosition_quick('now')",
+            "Reserved worker",
         )
     )
 

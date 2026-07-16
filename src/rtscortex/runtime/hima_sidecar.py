@@ -203,8 +203,8 @@ class HIMASidecarProcess:
                     f"HIMA sidecar socket already exists: {self.spec.socket_path}"
                 )
             self._owns_socket = True
-            self._stdout = self.spec.stdout_path.open("xb")
-            self._stderr = self.spec.stderr_path.open("xb")
+            self._stdout = self.spec.stdout_path.open("ab")
+            self._stderr = self.spec.stderr_path.open("ab")
             environment = dict(os.environ)
             environment.update(self.spec.environment or {})
             environment["HF_HUB_OFFLINE"] = "1"
@@ -301,8 +301,20 @@ class HIMASidecarProcess:
                     f"{actual!r} != {expected!r}"
                 )
 
+    async def restart(self) -> HIMALiveHealth:
+        """Replace a stuck worker while preserving the reusable UDS client."""
+
+        async with self._start_lock:
+            await self._stop(close_client=False)
+            return await self._start_once()
+
     async def close(self) -> None:
         """Stop the worker and release its client, logs, and socket."""
+
+        await self._stop(close_client=True)
+
+    async def _stop(self, *, close_client: bool) -> None:
+        """Release process resources, optionally finalizing the transport client."""
 
         process = self._process
         self._process = None
@@ -319,7 +331,8 @@ class HIMASidecarProcess:
                 with contextlib.suppress(ProcessLookupError):
                     process.kill()
                 await process.wait()
-        await self.client.close()
+        if close_client:
+            await self.client.close()
         for stream in (self._stdout, self._stderr):
             if stream is not None:
                 stream.close()

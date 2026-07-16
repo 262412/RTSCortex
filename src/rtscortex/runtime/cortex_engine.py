@@ -100,6 +100,8 @@ class MacroPolicySidecar(Protocol):
 
     async def start(self) -> HIMALiveHealth: ...
 
+    async def restart(self) -> HIMALiveHealth: ...
+
     async def close(self) -> None: ...
 
 
@@ -160,6 +162,8 @@ class CortexRuntimeEngine(RuntimeEngine):
         self._macro_source_observation: ObservationEnvelope | None = None
         self._macro_task_started_at: float | None = None
         self._macro_task_outcome_revision: int | None = None
+        self._macro_recovery_task: asyncio.Task[None] | None = None
+        self._macro_restart_attempts = 0
         self._macro_outcome_revision = 0
         self._next_macro_retry_game_loop: int | None = None
         self._macro_plan: MacroPlan | None = None
@@ -712,7 +716,14 @@ class CortexRuntimeEngine(RuntimeEngine):
                 observation,
                 self._recent_hima_actions(observation.game_loop),
             )
-            if not plan.steps or not _macro_frontier_is_usable(frontier):
+            fallback = self._fallback_frontier(
+                response.proposal,
+                observation,
+                frontier,
+            )
+            if not plan.steps or not (
+                _macro_frontier_is_usable(frontier) or fallback is not None
+            ):
                 classification = (
                     "empty_plan"
                     if not plan.steps
@@ -749,9 +760,8 @@ class CortexRuntimeEngine(RuntimeEngine):
                 IdleReason.PLANNER_TIMEOUT if timed_out else IdleReason.NO_LEGAL_ACTION
             )
             if timed_out:
-                # Cancelling an asyncio.to_thread waiter cannot cancel GPU inference.
-                # Suspend further requests until the sidecar is explicitly restarted.
                 self._macro_requests_suspended = True
+                self._schedule_macro_recovery(observation)
             else:
                 self._next_macro_retry_game_loop = (
                     observation.game_loop
@@ -919,6 +929,39 @@ class CortexRuntimeEngine(RuntimeEngine):
         )
         if frontier is None:
             return None
+        blocked_frontier = frontier
+        fallback = self._fallback_frontier(
+            remaining_proposal,
+            observation,
+            blocked_frontier,
+        )
+        if fallback is not None:
+            self._set_macro_step_status(
+                blocked_frontier.ordinal,
+                MacroStepStatus.DEFERRED,
+                blocked_frontier.reason_code,
+            )
+            reason = (
+                "supply_emergency"
+                if fallback.source_action == "BUILD PYLON"
+                and self._free_supply(observation)
+                <= self.config.cortex.executor.supply_emergency_free_supply
+                else "resource_fallback"
+            )
+            self._record_cortex_event(
+                observation,
+                "macro_frontier_preempted",
+                {
+                    "reason": reason,
+                    "blocked_action": blocked_frontier.source_action,
+                    "blocked_runtime_action": blocked_frontier.runtime_action,
+                    "blocked_reason": blocked_frontier.reason_code,
+                    "fallback_action": fallback.source_action,
+                    "fallback_runtime_action": fallback.runtime_action,
+                    "free_supply": self._free_supply(observation),
+                },
+            )
+            frontier = fallback
         if frontier.classification is PolicyActionClassification.MAPPED_DEFERRED:
             if _deferred_frontier_requires_replan(frontier):
                 self._set_macro_step_status(
@@ -997,6 +1040,138 @@ class CortexRuntimeEngine(RuntimeEngine):
             semantic_action=frontier.source_action,
             macro_step_ordinal=frontier.ordinal,
         )
+
+    def _fallback_frontier(
+        self,
+        proposal: MacroPolicyProposal,
+        observation: ObservationEnvelope,
+        blocked_frontier: PolicyActionAssessment | None,
+    ) -> PolicyActionAssessment | None:
+        """Select a legal, bounded macro fallback without relaxing validation."""
+
+        if (
+            blocked_frontier is None
+            or blocked_frontier.classification
+            is not PolicyActionClassification.MAPPED_DEFERRED
+        ):
+            return None
+        free_supply = self._free_supply(observation)
+        if (
+            blocked_frontier.source_action != "BUILD PYLON"
+            and free_supply
+            <= self.config.cortex.executor.supply_emergency_free_supply
+        ):
+            emergency = self._legal_proposal_step(
+                proposal,
+                observation,
+                "BUILD PYLON",
+            )
+            if emergency is not None:
+                return emergency
+        if not (
+            blocked_frontier.source_action == "BUILD STARGATE"
+            and blocked_frontier.reason_code == "insufficient_vespene"
+        ):
+            return None
+        fallback_actions = ["TRAIN ZEALOT"]
+        if (
+            free_supply
+            <= self.config.cortex.executor.resource_fallback_pylon_free_supply
+        ):
+            fallback_actions.append("BUILD PYLON")
+        fallback_actions.append("BUILD NEXUS")
+        for action_name in fallback_actions:
+            fallback = self._legal_proposal_step(
+                proposal,
+                observation,
+                action_name,
+            )
+            if fallback is not None:
+                return fallback
+        return None
+
+    def _legal_proposal_step(
+        self,
+        proposal: MacroPolicyProposal,
+        observation: ObservationEnvelope,
+        semantic_action: str,
+    ) -> PolicyActionAssessment | None:
+        previous_actions = self._recent_hima_actions(observation.game_loop)
+        for step in sorted(proposal.steps, key=lambda item: item.ordinal):
+            if step.canonical_action != semantic_action:
+                continue
+            isolated = proposal.model_copy(
+                update={"steps": [step], "diagnostics": []}
+            )
+            assessment = runtime_frontier(
+                isolated,
+                observation,
+                previous_actions,
+            )
+            if (
+                assessment is not None
+                and assessment.classification
+                is PolicyActionClassification.MAPPED_LEGAL_NOW
+            ):
+                return assessment
+        return None
+
+    @staticmethod
+    def _free_supply(observation: ObservationEnvelope) -> int:
+        economy = observation.state.economy
+        return max(0, economy.supply_cap - economy.supply_used)
+
+    def _schedule_macro_recovery(self, observation: ObservationEnvelope) -> None:
+        if (
+            self._macro_sidecar is None
+            or self._macro_recovery_task is not None
+            or self._macro_restart_attempts >= self.config.cortex.macro.restart_limit
+        ):
+            return
+        self._macro_recovery_task = asyncio.create_task(
+            self._recover_macro_specialist(observation)
+        )
+
+    async def _recover_macro_specialist(
+        self,
+        observation: ObservationEnvelope,
+    ) -> None:
+        assert self._macro_sidecar is not None
+        self._macro_restart_attempts += 1
+        attempt = self._macro_restart_attempts
+        try:
+            try:
+                self._macro_health = await self._macro_sidecar.restart()
+            except Exception as error:
+                self._record_cortex_event(
+                    observation,
+                    "specialist_recovery_failed",
+                    {
+                        "role": CortexRole.MACRO.value,
+                        "restart_attempt": attempt,
+                        "restart_limit": self.config.cortex.macro.restart_limit,
+                        "error_type": type(error).__name__,
+                        "message": str(error),
+                    },
+                )
+                return
+            self._macro_requests_suspended = False
+            self._next_macro_retry_game_loop = None
+            self._last_planner_failure = None
+            self._urgent_replan_requested = True
+            self._record_cortex_event(
+                observation,
+                "specialist_recovered",
+                {
+                    "role": CortexRole.MACRO.value,
+                    "restart_attempt": attempt,
+                    "restart_limit": self.config.cortex.macro.restart_limit,
+                    "model_id": self._macro_health.model_id,
+                    "model_revision": self._macro_health.model_revision,
+                },
+            )
+        finally:
+            self._macro_recovery_task = None
 
     def _prepare_reflex_command(
         self,
@@ -1394,4 +1569,9 @@ class CortexRuntimeEngine(RuntimeEngine):
             self._macro_task = None
         self._macro_source_observation = None
         self._macro_task_started_at = None
+        if self._macro_recovery_task is not None:
+            self._macro_recovery_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._macro_recovery_task
+            self._macro_recovery_task = None
         await super()._cancel_planner()
