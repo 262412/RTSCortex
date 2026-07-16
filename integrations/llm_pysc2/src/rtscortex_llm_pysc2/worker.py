@@ -543,6 +543,7 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
         )
         self.runtime_client.health()
         unit_names, building_types = _unit_metadata()
+        upgrade_names = _upgrade_metadata()
         coordinator = BridgeCoordinator(
             self.runtime_client,
             effect_verifier=ActionEffectVerifier(
@@ -554,6 +555,7 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
             self.worker_settings.run_id,
             self.worker_settings.episode_id,
             unit_names=unit_names,
+            upgrade_names=upgrade_names,
             building_types=building_types,
             action_source_types=_production_action_source_types(),
         )
@@ -927,6 +929,11 @@ def _unit_metadata() -> tuple[dict[int, str], tuple[int, ...]]:
         names.update({int(value): value.name for value in race})
     utils = importlib.import_module("llm_pysc2.lib.utils")
     return names, tuple(int(value) for value in utils.BUILDING_TYPE)
+
+
+def _upgrade_metadata() -> dict[int, str]:
+    upgrades = importlib.import_module("pysc2.lib.upgrades")
+    return {int(value): value.name for value in upgrades.Upgrades}
 
 
 def _production_action_source_types() -> dict[int, int]:

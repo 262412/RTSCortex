@@ -6,36 +6,14 @@ import { EventDetailDrawer } from "./components/EventDetailDrawer";
 import { EventTimeline } from "./components/EventTimeline";
 import { FramePanel } from "./components/FramePanel";
 import { StatusHeader } from "./components/StatusHeader";
-import { findLatest, moduleName, moduleOutput, readNumber } from "./data";
-import type { JsonObject, JsonValue, StoredEvent } from "./types";
+import { findLatest, moduleName } from "./data";
+import {
+  decisionRailProjection,
+  modelTelemetryProjection,
+  plannerProjection,
+} from "./projection";
+import type { StoredEvent } from "./types";
 import { useConsole } from "./useConsole";
-
-const plannerTerminalEvents = new Set([
-  "planner_cycle",
-  "planner_timeout",
-  "planner_error",
-  "plan_accepted",
-  "module_failed",
-]);
-
-function latestModule(events: StoredEvent[], name: string): StoredEvent | undefined {
-  return findLatest(
-    events,
-    (event) => event.event_type === "module_result" && moduleName(event)?.toLowerCase() === name,
-  );
-}
-
-function asObject(value: JsonValue | undefined): JsonObject | undefined {
-  return typeof value === "object" && value !== null && !Array.isArray(value) ? value : undefined;
-}
-
-function proposedActions(planning: StoredEvent | undefined, action: StoredEvent | undefined): JsonValue | undefined {
-  const planningOutput = asObject(moduleOutput(planning));
-  const plan = asObject(planningOutput?.plan);
-  if (plan?.proposed_actions !== undefined) return plan.proposed_actions;
-  const legacyActionOutput = asObject(moduleOutput(action));
-  return legacyActionOutput?.commands;
-}
 
 function useElapsed(started: StoredEvent | undefined, running: boolean): number | undefined {
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
@@ -55,9 +33,10 @@ function useElapsed(started: StoredEvent | undefined, running: boolean): number 
 export function App() {
   const { state, dispatch } = useConsole();
   const events = state.events;
-  const plannerStarted = findLatest(events, (event) => event.event_type === "planner_started");
-  const plannerTerminal = findLatest(events, (event) => plannerTerminalEvents.has(event.event_type));
-  const plannerRunning = Boolean(plannerStarted && (!plannerTerminal || plannerStarted.event_id > plannerTerminal.event_id));
+  const { started: plannerStarted, running: plannerRunning } = useMemo(
+    () => plannerProjection(events),
+    [events],
+  );
   const plannerElapsedSeconds = useElapsed(plannerStarted, plannerRunning);
 
   const moduleStarted = findLatest(events, (event) => event.event_type === "module_started");
@@ -68,47 +47,8 @@ export function App() {
   const moduleRunning = Boolean(moduleStarted && (!moduleTerminal || moduleStarted.event_id > moduleTerminal.event_id));
   const moduleElapsedSeconds = useElapsed(moduleStarted, moduleRunning);
 
-  const projection = useMemo(() => {
-    const currentPlanner = findLatest(events, (event) => event.event_type === "planner_started");
-    const cycleEvents = currentPlanner
-      ? events.filter((event) => event.event_id >= currentPlanner.event_id)
-      : events;
-    const planning = latestModule(cycleEvents, "planning");
-    const action = latestModule(cycleEvents, "action");
-    return {
-      reflection: latestModule(cycleEvents, "reflection"),
-      goalProgress: findLatest(events, (event) => event.event_type === "goal_progress"),
-      plan: findLatest(events, (event) => event.event_type === "plan_accepted") ?? planning,
-      candidateActions: proposedActions(planning, action),
-      context: findLatest(cycleEvents, (event) => event.event_type === "context_prepared"),
-      decision: findLatest(cycleEvents, (event) => event.event_type === "decision"),
-      execution: findLatest(events, (event) => event.event_type === "execution"),
-      observation: findLatest(events, (event) => event.event_type === "observation"),
-    };
-  }, [events]);
-
-  const modelTelemetry = useMemo(() => {
-    const calls = events.filter(
-      (event) => event.event_type === "module_result" && event.payload.model_call === true,
-    );
-    const totals = calls.reduce(
-      (accumulator, event) => {
-        const usage = event.payload.usage;
-        if (typeof usage !== "object" || usage === null || Array.isArray(usage)) return accumulator;
-        accumulator.prompt_tokens += readNumber(usage, "prompt_tokens") ?? 0;
-        accumulator.completion_tokens += readNumber(usage, "completion_tokens") ?? 0;
-        accumulator.total_tokens += readNumber(usage, "total_tokens") ?? 0;
-        return accumulator;
-      },
-      { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-    );
-    const latest = calls.at(-1);
-    return {
-      retained_request_count: calls.length,
-      latest_latency_ms: latest ? Math.round(readNumber(latest.payload, "latency_ms") ?? 0) : 0,
-      ...totals,
-    };
-  }, [events]);
+  const projection = useMemo(() => decisionRailProjection(events), [events]);
+  const modelTelemetry = useMemo(() => modelTelemetryProjection(events), [events]);
 
   const selectedEvent =
     state.selectedEventId === null ? null : events.find((event) => event.event_id === state.selectedEventId) ?? null;
@@ -147,6 +87,7 @@ export function App() {
           staleAfterSeconds={state.session?.stale_after_seconds ?? 2}
         />
         <DecisionRail
+          situation={projection.situation}
           reflection={projection.reflection}
           goalProgress={projection.goalProgress}
           plan={projection.plan}

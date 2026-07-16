@@ -130,4 +130,27 @@ describe("event projection", () => {
     expect(eventCategory(failedTrain)).toBe("failure");
     expect(eventCategory(warp)).toBe("system");
   });
+
+  it("classifies Cortex intents and failures for timeline filtering", () => {
+    const macro = storedEvent(8, "intent_emitted", {
+      role: "macro",
+      action_name: "Build_Pylon_Screen",
+    });
+    const reflex = storedEvent(9, "intent_emitted", {
+      role: "reflex",
+      action_name: "Attack_Unit",
+    });
+    const candidateSet = storedEvent(10, "candidate_set_built", {
+      candidates: [{ candidate_id: "candidate-1", action_name: "Build_Pylon_Screen" }],
+    });
+    const specialistFailure = storedEvent(11, "specialist_failed", {
+      role: "macro",
+      failure_code: "timeout",
+    });
+
+    expect(eventCategory(macro)).toBe("build");
+    expect(eventCategory(reflex)).toBe("reflex");
+    expect(eventCategory(candidateSet)).toBe("build");
+    expect(eventCategory(specialistFailure)).toBe("failure");
+  });
 });

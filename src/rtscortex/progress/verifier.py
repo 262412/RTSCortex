@@ -652,7 +652,12 @@ def _state_counts(
         ]
         completed = sum(1 for unit in matching if _is_complete(unit.status))
         return completed, len(matching) - completed
-    completed = sum(1 for upgrade in state.upgrades if _canonical(upgrade) == canonical_target)
+    canonical_upgrade_target = _canonical_upgrade(target)
+    completed = sum(
+        1
+        for upgrade in state.upgrades
+        if _canonical_upgrade(upgrade) == canonical_upgrade_target
+    )
     return completed, 0
 
 
@@ -692,3 +697,8 @@ def _is_achieved(item: GoalProgressItem) -> bool:
 
 def _canonical(value: str) -> str:
     return "".join(character for character in value.casefold() if character.isalnum())
+
+
+def _canonical_upgrade(value: str) -> str:
+    canonical = _canonical(value)
+    return "warpgate" if canonical in {"warpgate", "warpgateresearch"} else canonical

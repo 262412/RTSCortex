@@ -343,11 +343,20 @@ class LiveProcessSupervisor:
         self._stdout: BinaryIO | None = None
         self._stderr: BinaryIO | None = None
         self._worker_metrics_path = self.run_dir / "worker.metrics.json"
+        self._ownership_path = self.socket_path.with_name(
+            f"{self.socket_path.name}.lock"
+        )
+        self._owns_run = False
+        self._owns_runtime_socket = False
 
     async def run(self) -> EpisodeResult:
         """Run until the worker exits, always closing every owned resource."""
 
         try:
+            self._acquire_run_ownership()
+            if self.console_port is not None:
+                ensure_console_port_available(self.console_port)
+            await self.runtime.start()
             await self._start_server()
             await self._start_console_server()
             if self.console_hub is not None:
@@ -390,15 +399,53 @@ class LiveProcessSupervisor:
                 )
             raise
         finally:
-            await self._stop_worker()
-            await self._stop_console_server()
-            await self._stop_server()
-            await self.runtime.close()
+            try:
+                await self._stop_worker()
+                await self._stop_console_server()
+                await self._stop_server()
+            finally:
+                try:
+                    await self.runtime.close()
+                finally:
+                    self._release_run_ownership()
+
+    def _acquire_run_ownership(self) -> None:
+        self.socket_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            descriptor = os.open(
+                self._ownership_path,
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                0o600,
+            )
+        except FileExistsError as error:
+            raise LiveEnvironmentError(
+                f"live run is already owned: {self._ownership_path}"
+            ) from error
+        try:
+            os.write(
+                descriptor,
+                f"pid={os.getpid()} run_id={self.run_id}\n".encode(),
+            )
+        finally:
+            os.close(descriptor)
+        self._owns_run = True
+        if self.socket_path.exists():
+            raise LiveEnvironmentError(
+                f"runtime socket already exists: {self.socket_path}"
+            )
+
+    def _release_run_ownership(self) -> None:
+        if not self._owns_run:
+            return
+        with contextlib.suppress(OSError):
+            self._ownership_path.unlink()
+        self._owns_run = False
 
     async def _start_server(self) -> None:
         self.socket_path.parent.mkdir(parents=True, exist_ok=True)
         if self.socket_path.exists():
             raise LiveEnvironmentError(f"runtime socket already exists: {self.socket_path}")
+        self._owns_runtime_socket = True
         config = uvicorn.Config(
             create_app(self.runtime, console_hub=self.console_hub),
             uds=str(self.socket_path),
@@ -553,7 +600,9 @@ class LiveProcessSupervisor:
                     await self._server_task
             except (Exception, asyncio.CancelledError):
                 pass
-        self.socket_path.unlink(missing_ok=True)
+        if self._owns_runtime_socket:
+            self.socket_path.unlink(missing_ok=True)
+            self._owns_runtime_socket = False
 
     async def _stop_console_server(self) -> None:
         if self._console_server is not None:

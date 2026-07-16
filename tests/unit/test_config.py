@@ -1,9 +1,19 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from pydantic import ValidationError
 
-from rtscortex.config import ConsoleSettings, EnvironmentSettings, ExperimentConfig, RuntimeSettings
+from rtscortex.config import (
+    AgentSettings,
+    ConsoleSettings,
+    CortexMacroSettings,
+    CortexSettings,
+    EnvironmentSettings,
+    ExperimentConfig,
+    RuntimeSettings,
+)
 
 
 def test_environment_settings_accept_melee_runtime_controls() -> None:
@@ -80,3 +90,35 @@ def test_console_settings_are_disabled_and_bounded_by_default() -> None:
 def test_console_settings_reject_invalid_values(field: str, value: int) -> None:
     with pytest.raises(ValidationError):
         ConsoleSettings.model_validate({field: value})
+
+
+def test_cortex_settings_are_opt_in_and_do_not_change_legacy_default() -> None:
+    config = ExperimentConfig()
+
+    assert config.agent.variant == "planner_reflection_memory_reflex"
+    assert config.cortex.macro.kind == "disabled"
+    assert config.cortex.executor.kind == "deterministic"
+    assert config.cortex.explanation.enabled is False
+    assert AgentSettings(variant="cortex").variant == "cortex"
+
+
+def test_hima_cortex_macro_requires_an_explicit_model_path() -> None:
+    with pytest.raises(ValidationError, match="requires model_path"):
+        CortexMacroSettings(kind="hima")
+
+
+def test_expanded_config_expands_cortex_runtime_paths() -> None:
+    config = ExperimentConfig(
+        agent=AgentSettings(variant="cortex"),
+        cortex=CortexSettings(
+            macro=CortexMacroSettings(
+                kind="hima",
+                python_executable=Path("~/fastscratch/envs/rtscortex-hima/bin/python"),
+                model_path=Path("~/fastscratch/models/hima-a"),
+            )
+        ),
+    ).expanded()
+
+    assert config.cortex.macro.python_executable.is_absolute()
+    assert config.cortex.macro.model_path is not None
+    assert config.cortex.macro.model_path.is_absolute()

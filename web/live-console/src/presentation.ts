@@ -24,6 +24,17 @@ const EVENT_TITLES: Record<string, string> = {
   execution: "动作执行结果",
   validation_failed: "动作验证失败",
   goal_progress: "目标进度检查",
+  situation_assessed: "战况分析完成",
+  macro_plan_accepted: "专用宏观计划已采用",
+  macro_plan_rejected: "专用宏观计划被拒绝",
+  macro_step_updated: "宏观计划步骤已更新",
+  intent_emitted: "决策意图已生成",
+  candidate_set_built: "合法执行候选已生成",
+  executor_selection: "快速执行器已选择",
+  command_lineage: "动作决策链已关联",
+  specialist_failed: "专用模型运行失败",
+  specialist_ready: "专用模型已就绪",
+  specialist_recovered: "专用模型已恢复",
   episode_summary: "对局总结",
   episode_result: "对局结果",
 };
@@ -88,7 +99,36 @@ const FIELD_LABELS: Record<string, string> = {
   advancing_actions: "可推进动作",
   unique_next_action: "唯一下一动作",
   defensive_hold_required: "当前必须防守",
+  assessment: "战况分析",
+  game_phase: "游戏阶段",
+  threat_level: "威胁等级",
+  army_readiness: "军队准备度",
+  information_gaps: "信息缺口",
+  source_kind: "分析来源",
+  role: "模型职责",
+  specialist: "专用模块",
+  model_id: "模型 ID",
+  plan_id: "计划 ID",
+  macro_plan_id: "宏观计划 ID",
+  intent: "决策意图",
+  intent_id: "意图 ID",
+  intent_kind: "意图类型",
+  candidate_id: "候选 ID",
+  selected_candidate_id: "选中候选 ID",
+  candidate_count: "合法候选数量",
+  candidates: "合法执行候选",
+  executor: "快速执行器",
+  executor_id: "快速执行器 ID",
+  confidence: "选择置信度",
+  abstain: "放弃选择",
+  fallback: "使用确定性回退",
+  fallback_reason: "回退原因",
+  lineage: "动作决策链",
   steps: "计划步骤",
+  semantic_action: "SC2 宏动作",
+  runtime_actions: "可执行 Runtime 动作",
+  completed_repeats: "已完成次数",
+  repeat: "目标次数",
   proposed_actions: "模型建议动作",
   planner_candidates: "规划器候选动作",
   reflex_candidates: "快速反应候选动作",
@@ -243,6 +283,12 @@ const VALUE_LABELS: Record<string, string> = {
   action: "动作生成",
   planner: "规划器",
   reflex: "快速反应",
+  situation: "战况分析",
+  macro: "宏观决策",
+  tactical: "战术决策",
+  motor: "快速执行",
+  deterministic: "确定性规则",
+  deterministic_reflex: "确定性战术与快速反应",
   fallback: "回退策略",
   translator: "动作翻译器",
   orchestration: "环境编排",
@@ -250,6 +296,7 @@ const VALUE_LABELS: Record<string, string> = {
   pending: "等待处理",
   deferred: "暂缓执行",
   dispatched: "已派发",
+  confirmed: "已确认",
   succeeded: "成功",
   success: "成功",
   failed: "失败",
@@ -295,6 +342,20 @@ const VALUE_LABELS: Record<string, string> = {
   no_legal_action: "当前没有合法动作",
   planner_timeout: "规划器超时",
   noop_baseline: "空动作基线",
+  early: "开局阶段",
+  technology: "科技阶段",
+  combat: "战斗阶段",
+  low: "低",
+  medium: "中",
+  high: "高",
+  none: "无",
+  critical: "紧急",
+  empty: "尚无军队",
+  forming: "正在集结",
+  ready: "已准备",
+  engaged: "正在交战",
+  not_ready: "尚未准备",
+  abstain: "主动放弃选择",
   friendly_target: "目标属于己方",
   target_not_visible: "目标当前不可见",
   no_legal_placement: "没有合法建造位置",
@@ -373,6 +434,7 @@ function commandObjects(payload: JsonObject): JsonObject[] {
   const batch = asObject(payload.batch);
   const candidates = [
     payload.commands,
+    payload.candidates,
     batch?.commands,
     payload.validated_candidates,
     payload.planner_candidates,
@@ -443,6 +505,12 @@ export function semanticScalar(value: string | number | boolean | null, key?: st
     "reason",
     "effect_kind",
     "confirmation_kind",
+    "role",
+    "source_kind",
+    "game_phase",
+    "threat_level",
+    "army_readiness",
+    "selection",
   ].includes(key ?? "");
   return translated && protocolEnum ? `${translated}（${value}）` : translated ?? value;
 }
@@ -465,7 +533,7 @@ export function eventSummary(event: StoredEvent): string {
   const module = moduleName(event);
   const latency = readNumber(payload, "latency_ms");
   const status = readString(payload, "status", "state");
-  const failure = readString(payload, "failure_code", "failure_reason", "reason");
+  const failure = readString(payload, "failure_code", "failure_reason", "reason", "message");
   const action = actionFromEvent(event);
   const commands = commandObjects(payload);
 
@@ -521,6 +589,81 @@ export function eventSummary(event: StoredEvent): string {
       nextAction ? `下一步：${actionLabel(nextAction, false)}` : undefined,
       blockers > 0 ? `阻塞 ${blockers} 项` : undefined,
     ].filter(Boolean).join(" · ");
+  }
+  if (event.event_type === "situation_assessed") {
+    const assessment = asObject(payload.assessment) ?? payload;
+    const source = readString(payload, "source_kind", "source_id", "source", "model") ?? "unknown";
+    const phase = readString(assessment, "game_phase", "phase") ?? "unknown";
+    const threat = readString(assessment, "threat_level", "threat") ?? "unknown";
+    const readiness = readString(assessment, "army_readiness", "readiness") ?? "unknown";
+    return `来源：${semanticScalar(source, "source_kind")} · 阶段：${semanticScalar(phase, "game_phase")} · 威胁：${semanticScalar(threat, "threat_level")} · 军队：${semanticScalar(readiness, "army_readiness")}`;
+  }
+  if (event.event_type === "macro_plan_accepted" || event.event_type === "macro_plan_rejected") {
+    const plan = asObject(payload.plan) ?? payload;
+    const planId = readString(payload, "plan_id") ?? readString(plan, "plan_id") ?? "unknown";
+    const model = readString(payload, "model_id", "source_model_id", "model", "specialist") ?? readString(plan, "source_model_id", "model_id") ?? "unknown";
+    if (event.event_type === "macro_plan_rejected") {
+      return `计划 ${planId} · ${model} · ${failure ? semanticScalar(failure) : "原因未记录"}`;
+    }
+    const steps = asArray(plan.steps ?? payload.steps).length;
+    const frontier = readString(payload, "runtime_frontier", "frontier_action");
+    return `计划 ${planId} · ${model} · ${steps} 步${frontier ? ` · 当前：${actionLabel(frontier, false)}` : ""}`;
+  }
+  if (event.event_type === "macro_step_updated") {
+    const step = asObject(payload.step) ?? payload;
+    const semanticAction = readString(step, "semantic_action", "action") ?? "unknown";
+    const runtimeAction = asArray(step.runtime_actions).find((value): value is string => typeof value === "string");
+    const stepStatus = readString(step, "status") ?? "unknown";
+    const completed = readNumber(step, "completed_repeats") ?? 0;
+    const repeat = readNumber(step, "repeat") ?? 1;
+    const reason = readString(step, "reason");
+    return `${actionLabel(runtimeAction ?? semanticAction, false)} · ${semanticScalar(stepStatus)} · ${completed}/${repeat}${reason ? ` · ${semanticScalar(reason)}` : ""}`;
+  }
+  if (event.event_type === "intent_emitted") {
+    const intent = asObject(payload.intent) ?? payload;
+    const role = readString(payload, "role", "source_role", "intent_kind", "source") ?? readString(intent, "role", "source_role", "intent_kind", "source");
+    const intentId = readString(payload, "intent_id") ?? readString(intent, "intent_id");
+    const intentAction = readString(payload, "action_name", "action")
+      ?? readString(intent, "action_name", "action")
+      ?? asArray(intent.action_names).find((value): value is string => typeof value === "string");
+    return [
+      role ? semanticScalar(role, "role") : "未知职责",
+      intentAction ? actionLabel(intentAction, false) : "未指定动作",
+      intentId,
+    ].filter(Boolean).join(" · ");
+  }
+  if (event.event_type === "candidate_set_built") {
+    const candidates = asArray(payload.candidates);
+    const count = readNumber(payload, "candidate_count") ?? candidates.length;
+    const names = candidates.slice(0, 3).map(asObject).map((candidate) => commandAction(candidate)).filter((name): name is string => Boolean(name));
+    return `为意图 ${readString(payload, "intent_id") ?? "unknown"} 生成 ${count} 个合法候选${names.length ? `：${names.map((name) => actionLabel(name, false)).join("、")}` : ""}`;
+  }
+  if (event.event_type === "executor_selection") {
+    const executor = readString(payload, "executor_id", "executor", "model") ?? "unknown";
+    const selected = readString(payload, "selected_candidate_id", "candidate_id");
+    const fallback = readString(payload, "fallback_reason");
+    return [
+      executor,
+      selected ? `选择 ${selected}` : "主动放弃选择",
+      latency === undefined ? undefined : formatDuration(latency),
+      fallback ? `回退：${semanticScalar(fallback)}` : undefined,
+    ].filter(Boolean).join(" · ");
+  }
+  if (event.event_type === "command_lineage") {
+    const lineage = asObject(payload.lineage) ?? payload;
+    const lineageCommand = readString(payload, "command_id") ?? readString(lineage, "command_id") ?? "unknown";
+    const planId = readString(payload, "macro_plan_id", "plan_id") ?? readString(lineage, "macro_plan_id", "plan_id") ?? "none";
+    const intentId = readString(payload, "intent_id") ?? readString(lineage, "intent_id") ?? "unknown";
+    const candidateId = readString(payload, "candidate_id") ?? readString(lineage, "candidate_id") ?? "unknown";
+    return `${lineageCommand} · 计划 ${planId} → 意图 ${intentId} → 候选 ${candidateId}`;
+  }
+  if (["specialist_failed", "specialist_ready", "specialist_recovered"].includes(event.event_type)) {
+    const role = readString(payload, "role", "specialist", "module") ?? "unknown";
+    const model = readString(payload, "model_id", "model") ?? "unknown";
+    if (event.event_type === "specialist_failed") {
+      return `${semanticScalar(role, "role")} · ${model} · ${failure ? semanticScalar(failure) : "原因未记录"}`;
+    }
+    return `${semanticScalar(role, "role")} · ${model} ${event.event_type === "specialist_ready" ? "已就绪" : "已恢复"}`;
   }
   if (event.event_type === "decision") {
     const batch = asObject(payload.batch);
@@ -618,6 +761,37 @@ export function eventSemanticPayload(event: StoredEvent): JsonValue {
       ["unique_next_action", payload.unique_next_action],
       ["defensive_hold_required", payload.defensive_hold_required],
       ["game_loop", payload.game_loop],
+    ]);
+  }
+  if (event.event_type === "situation_assessed") {
+    const assessment = asObject(payload.assessment) ?? payload;
+    return compactObject([
+      ["source_kind", payload.source_kind ?? payload.source ?? payload.model],
+      ["game_phase", assessment.game_phase ?? assessment.phase],
+      ["threat_level", assessment.threat_level ?? assessment.threat],
+      ["army_readiness", assessment.army_readiness ?? assessment.readiness],
+      ["information_gaps", assessment.information_gaps],
+      ["assessment", payload.assessment],
+    ]);
+  }
+  if (["macro_plan_accepted", "macro_plan_rejected", "macro_step_updated", "intent_emitted", "candidate_set_built", "executor_selection", "command_lineage", "specialist_failed", "specialist_ready", "specialist_recovered"].includes(event.event_type)) {
+    return compactObject([
+      ["role", payload.role ?? payload.source_role ?? payload.intent_kind ?? payload.specialist],
+      ["model_id", payload.model_id ?? payload.source_model_id ?? payload.model],
+      ["plan_id", payload.plan_id ?? payload.macro_plan_id],
+      ["intent_id", payload.intent_id],
+      ["candidate_id", payload.selected_candidate_id ?? payload.candidate_id],
+      ["executor_id", payload.executor_id ?? payload.executor],
+      ["action_name", payload.action_name ?? payload.action],
+      ["status", payload.status],
+      ["reason", payload.reason ?? payload.failure_code ?? payload.failure_reason ?? payload.message],
+      ["latency_ms", payload.latency_ms],
+      ["fallback_reason", payload.fallback_reason],
+      ["plan", payload.plan],
+      ["steps", payload.step],
+      ["intent", payload.intent],
+      ["candidates", payload.candidates],
+      ["lineage", payload.lineage],
     ]);
   }
   if (event.event_type === "decision") {

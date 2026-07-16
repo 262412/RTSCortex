@@ -225,12 +225,17 @@ class TimeStepExtractor:
         episode_id: str,
         *,
         unit_names: Optional[Mapping[int, str]] = None,
+        upgrade_names: Optional[Mapping[int, str]] = None,
         building_types: Sequence[int] = (),
         action_source_types: Optional[Mapping[int, int]] = None,
     ) -> None:
         self.run_id = run_id
         self.episode_id = episode_id
         self.unit_names = dict(unit_names or {})
+        self.upgrade_names = {
+            int(upgrade_id): str(name)
+            for upgrade_id, name in (upgrade_names or {}).items()
+        }
         self.building_types = frozenset(int(value) for value in building_types)
         self.action_source_types = {
             int(function_id): int(unit_type)
@@ -277,7 +282,10 @@ class TimeStepExtractor:
                 unit_names=self.unit_names,
             ),
             "units": [self._extract_unit(unit) for unit in raw_units],
-            "upgrades": [f"upgrade:{int(value)}" for value in _value(observation, "upgrades", ())],
+            "upgrades": [
+                self.upgrade_names.get(int(value), f"upgrade:{int(value)}")
+                for value in _value(observation, "upgrades", ())
+            ],
             "teams": teams,
             "text_observation": text_observation,
             "alerts": [_alert_name(value) for value in _value(observation, "alerts", ())],

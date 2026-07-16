@@ -172,6 +172,70 @@ def test_episode_metrics_cover_runtime_telemetry() -> None:
     assert aggregate["execution"]["meaningful_action_success_rate"] == 0.5
 
 
+def test_episode_metrics_include_cortex_hima_requests_and_plans() -> None:
+    events = [
+        _event(1, "observation", {}, second=0),
+        _event(
+            2,
+            "macro_plan_accepted",
+            {
+                "plan_id": "plan-1",
+                "accepted_game_loop": 100,
+                "latency_ms": 100.0,
+                "is_revision": False,
+                "generation_metadata": {
+                    "prompt_token_count": 10,
+                    "completion_token_count": 3,
+                },
+            },
+        ),
+        _event(
+            3,
+            "macro_plan_rejected",
+            {
+                "latency_ms": 120.0,
+                "generation_metadata": {
+                    "prompt_token_count": 11,
+                    "completion_token_count": 4,
+                },
+            },
+        ),
+        _event(
+            4,
+            "macro_plan_accepted",
+            {
+                "plan_id": "plan-2",
+                "accepted_game_loop": 230,
+                "latency_ms": 110.0,
+                "is_revision": True,
+                "generation_metadata": None,
+            },
+        ),
+        _event(5, "episode_result", {}, second=5),
+    ]
+    result = EpisodeResult(
+        run_id="run-1",
+        episode_id="episode-1",
+        scenario="test",
+        seed=0,
+        outcome=EpisodeOutcome.TRUNCATED,
+        steps=1,
+    )
+
+    metrics = compute_episode_metrics(events, result)
+
+    assert metrics.model_requests == 3
+    assert metrics.prompt_tokens == 21
+    assert metrics.completion_tokens == 7
+    assert metrics.total_tokens == 28
+    assert metrics.planner_latency_ms_p50 == 110.0
+    assert metrics.planner_latency_ms_p95 == 119.0
+    assert metrics.plans_accepted == 2
+    assert metrics.plan_revisions == 1
+    assert metrics.plan_accept_gap_game_loops_p50 == 130.0
+    assert metrics.plan_accept_gap_samples == 1
+
+
 def test_execution_metrics_separate_control_noops_and_terminal_states() -> None:
     decision = _event(
         1,

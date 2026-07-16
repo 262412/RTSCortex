@@ -36,6 +36,7 @@ async def run_mock_episode(
     episode_id: str,
     seed: int,
 ) -> EpisodeResult:
+    await runtime.start()
     adapter = MockSC2Adapter(
         scenario=config.environment.scenario,
         max_steps=config.environment.max_steps,

@@ -1,4 +1,4 @@
-"""Shadow-only HIMA policy subagent and local Transformers text generation."""
+"""HIMA policy proposal generation and local Transformers inference."""
 
 from __future__ import annotations
 
@@ -9,7 +9,11 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Final, Protocol
 
-from rtscortex.policy.hima.models import HIMA_ADAPTER_VERSION
+from rtscortex.policy.hima.models import (
+    HIMA_ADAPTER_VERSION,
+    HIMAInputContext,
+    HIMAObservationSnapshot,
+)
 from rtscortex.policy.hima.observation import HIMAObservationAdapter
 from rtscortex.policy.hima.parser import HIMAProposalParser
 from rtscortex.policy.models import (
@@ -33,6 +37,12 @@ class HIMATextGenerator(Protocol):
     """Generate one HIMA response from one user-only observation message."""
 
     async def generate(self, *, user_message: str) -> str: ...
+
+
+class HIMAPersistentTextGenerator(HIMATextGenerator, Protocol):
+    """A generator whose local checkpoint can be loaded before serving traffic."""
+
+    async def load(self) -> None: ...
 
 
 class HIMAPolicySubagent:
@@ -65,7 +75,25 @@ class HIMAPolicySubagent:
     async def propose(self, fixture: PolicyObservationFixture) -> MacroPolicyProposal:
         """Return a parsed advisory macro proposal for one immutable fixture."""
 
-        _, user_message = self.adapter.prepare(fixture)
+        context = HIMAInputContext(
+            observation=fixture.observation,
+            previous_actions=tuple(fixture.previous_actions),
+        )
+        return await self.propose_context(context)
+
+    async def propose_context(self, context: HIMAInputContext) -> MacroPolicyProposal:
+        """Return a proposal using the same projection for live and offline inputs."""
+
+        snapshot = self.adapter.adapt_context(context)
+        return await self.propose_snapshot(snapshot)
+
+    async def propose_snapshot(
+        self,
+        snapshot: HIMAObservationSnapshot,
+    ) -> MacroPolicyProposal:
+        """Generate from one already-projected, auditable HIMA observation."""
+
+        user_message = self.adapter.serialize(snapshot)
         raw_output = await self.generator.generate(user_message=user_message)
         metadata = getattr(self.generator, "last_generation_metadata", None)
         if metadata is not None and not isinstance(metadata, PolicyGenerationMetadata):
@@ -131,6 +159,21 @@ class TransformersHIMAGenerator:
         self._torch: Any | None = None
         self._tokenizer: Any | None = None
         self._model: Any | None = None
+
+    @property
+    def loaded(self) -> bool:
+        """Whether this process currently holds the tokenizer and model."""
+
+        return (
+            self._torch is not None
+            and self._tokenizer is not None
+            and self._model is not None
+        )
+
+    async def load(self) -> None:
+        """Load the pinned local checkpoint once without blocking the event loop."""
+
+        await asyncio.to_thread(self._load)
 
     async def generate(self, *, user_message: str) -> str:
         """Generate deterministically off the event loop using a single user message."""

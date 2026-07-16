@@ -170,6 +170,25 @@ def test_adapter_excludes_in_progress_structures_instead_of_double_counting() ->
     assert "Train_Zealot" not in snapshot.unit
 
 
+def test_adapter_normalizes_live_pysc2_upgrade_names_and_legacy_ids() -> None:
+    base = _fixture()
+    fixture = base.model_copy(
+        update={
+            "observation": base.observation.model_copy(
+                update={
+                    "state": base.observation.state.model_copy(
+                        update={"upgrades": ["upgrade:84", "Blink"]}
+                    )
+                }
+            )
+        }
+    )
+
+    snapshot = HIMAObservationAdapter().adapt(fixture)
+
+    assert snapshot.research == ("WarpGateResearch", "BlinkTech")
+
+
 def test_adapter_normalizes_previous_actions_and_rejects_unknown_tokens() -> None:
     fixture = _fixture().model_copy(
         update={"previous_actions": ["TRAIN PROBE", "RESEARCH WARPGATE"]}

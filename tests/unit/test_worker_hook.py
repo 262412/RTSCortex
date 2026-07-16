@@ -53,6 +53,7 @@ def test_timestep_extractor_produces_json_safe_five_part_snapshot() -> None:
         "run-worker",
         "episode-worker",
         unit_names={311: "Adept", 59: "Nexus", 104: "Drone"},
+        upgrade_names={84: "WarpGateResearch"},
         building_types=(59,),
     ).extract(
         _fake_timestep(),
@@ -69,6 +70,7 @@ def test_timestep_extractor_produces_json_safe_five_part_snapshot() -> None:
     assert envelope.state.own_units[0].unit_type == "Adept"
     assert envelope.state.own_structures[0].unit_type == "Nexus"
     assert envelope.state.visible_enemies[0].unit_type == "Drone"
+    assert envelope.state.upgrades == ["WarpGateResearch"]
     assert envelope.available_actions[1].argument_names == ["tag"]
     assert envelope.available_actions[1].argument_types == ["tag"]
     assert "Unsupported" not in {action.name for action in envelope.available_actions}

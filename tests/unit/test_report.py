@@ -585,6 +585,62 @@ def test_report_exposes_production_funnel_provenance_and_acceptance_only_gate(
     assert "#### Production by producer" in report
 
 
+def test_cortex_integrity_violations_fail_hard_acceptance(tmp_path: Path) -> None:
+    result = EpisodeResult(
+        run_id="live-run",
+        episode_id="episode-0",
+        scenario="mock",
+        seed=0,
+        outcome=EpisodeOutcome.DRAW,
+        score=0.0,
+        steps=1,
+    )
+    events = [
+        _event(
+            1,
+            "candidate_set_built",
+            {
+                "intent_id": "intent-a",
+                "candidates": [{"candidate_id": "candidate-a"}],
+            },
+        ),
+        _event(
+            2,
+            "executor_selection",
+            {
+                "intent_id": "intent-b",
+                "selection_id": "selection-b",
+                "candidate_id": "candidate-a",
+                "executor_id": "broken-executor",
+            },
+        ),
+        _event(
+            3,
+            "command_lineage",
+            {
+                "command_id": "command-b",
+                "intent_id": "intent-b",
+                "selection_id": "selection-b",
+                "candidate_id": "candidate-a",
+            },
+        ),
+        _event(4, "command_lifecycle", {"command_id": "command-b", "status": "dispatched"}),
+        _event(5, "episode_result", result.model_dump(mode="json")),
+    ]
+    run_dir = tmp_path / "cortex-integrity"
+    _write_journal(run_dir, events)
+
+    artifacts = write_run_reports(run_dir)
+    summary = json.loads(artifacts.summary_path.read_text(encoding="utf-8"))
+    episode = summary["runs"]["live-run"]["episodes"]["episode-0"]
+    gates = episode["hard_acceptance"]["gates"]
+
+    assert gates["cortex_executor_candidate_violations"]["passed"] is False
+    assert gates["cortex_lineage_integrity_violations"]["passed"] is False
+    assert gates["cortex_missing_command_lineage"]["passed"] is False
+    assert episode["hard_acceptance"]["passed"] is False
+
+
 def test_real_legacy_full_match_report_freezes_baseline_lines() -> None:
     fixture = Path(__file__).parents[1] / "fixtures" / "legacy_full_match_characterization.jsonl"
 

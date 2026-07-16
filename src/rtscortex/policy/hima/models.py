@@ -8,16 +8,26 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from rtscortex.contracts import ObservationEnvelope
+
 HIMA_ADAPTER_VERSION: Literal["hima-github-json-v2"] = "hima-github-json-v2"
 HIMA_PARSER_VERSION = "hima-protoss-parser-v2"
 HIMA_VOCABULARY_VERSION = "hima-protoss-60-v2"
 HIMA_UPSTREAM_REVISION = "6b2a4084f9d6c0d7739aedb860685cf9dfd90d35"
+HIMA_LIVE_PROTOCOL_VERSION: Literal["1.0"] = "1.0"
 
 
 class HIMAModel(BaseModel):
     """Base model for immutable HIMA adapter data."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+class HIMAInputContext(HIMAModel):
+    """Runtime-neutral input from which the exact HIMA payload is projected."""
+
+    observation: ObservationEnvelope
+    previous_actions: tuple[str, ...] = ()
 
 
 class HIMAObservationSnapshot(HIMAModel):
@@ -52,6 +62,30 @@ class HIMAObservationSnapshot(HIMAModel):
             separators=(",", ":"),
         ).encode()
         return sha256(payload).hexdigest()
+
+
+class HIMALiveProposalRequest(HIMAModel):
+    """One correlated request sent to the isolated HIMA policy process."""
+
+    protocol_version: Literal["1.0"] = HIMA_LIVE_PROTOCOL_VERSION
+    request_id: str = Field(min_length=1)
+    run_id: str = Field(min_length=1)
+    episode_id: str = Field(min_length=1)
+    step_id: int = Field(ge=0)
+    game_loop: int = Field(ge=0)
+    snapshot: HIMAObservationSnapshot
+
+
+class HIMALiveHealth(HIMAModel):
+    """Readiness and immutable model identity reported by the HIMA process."""
+
+    status: Literal["ready"] = "ready"
+    protocol_version: Literal["1.0"] = HIMA_LIVE_PROTOCOL_VERSION
+    model_id: str = Field(min_length=1)
+    model_revision: str = Field(min_length=1)
+    adapter_version: str = Field(min_length=1)
+    parser_version: str = Field(min_length=1)
+    vocabulary_version: str = Field(min_length=1)
 
 
 class HIMAMacroAction(HIMAModel):

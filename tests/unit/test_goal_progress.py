@@ -124,6 +124,22 @@ def test_verifier_identifies_unique_first_action_in_ordered_opening() -> None:
     assert report.step_id == 4
 
 
+def test_warp_gate_goal_accepts_the_canonical_live_upgrade_name() -> None:
+    verifier = GoalProgressVerifier()
+    goal = verifier.goal_from_action_names(
+        strategic_goal="Unlock Warp Gate",
+        action_names=["Research_WarpGate"],
+    )
+
+    report = verifier.verify(
+        _observation(upgrades=["WarpGateResearch"]),
+        goal,
+    )
+
+    assert report.status == GoalProgressStatus.ACHIEVED
+    assert report.achieved[0].target == "WarpGate"
+
+
 def test_verifier_waits_for_an_in_progress_requirement_without_reissuing_it() -> None:
     verifier = GoalProgressVerifier()
     goal = verifier.goal_from_action_names(

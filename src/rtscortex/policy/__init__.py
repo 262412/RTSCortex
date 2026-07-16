@@ -1,4 +1,4 @@
-"""Public, shadow-only policy comparison API."""
+"""Public policy comparison and isolated live-policy API."""
 
 from rtscortex.policy.capabilities import (
     DEFAULT_RUNTIME_CAPABILITIES,
@@ -36,15 +36,31 @@ from rtscortex.policy.corpus import (
     state_fingerprint,
     verify_policy_corpus,
 )
+from rtscortex.policy.hima.live import (
+    HIMALiveBusyError,
+    HIMALivePolicyClient,
+    HIMALivePolicyService,
+    HIMALiveProposalResponse,
+    HIMALiveProtocolError,
+    HIMALiveTimeoutError,
+    create_hima_live_app,
+)
 from rtscortex.policy.hima.mapping import (
     HIMA_RUNTIME_MAPPINGS,
     HIMAMacroActionMapper,
     HIMAMacroMapping,
 )
+from rtscortex.policy.hima.models import (
+    HIMA_LIVE_PROTOCOL_VERSION,
+    HIMAInputContext,
+    HIMALiveHealth,
+    HIMALiveProposalRequest,
+)
 from rtscortex.policy.hima.observation import HIMAObservationAdapter
 from rtscortex.policy.hima.parser import HIMAProposalParser
 from rtscortex.policy.hima.subagent import (
     HIMA_PINNED_REVISIONS,
+    HIMAPersistentTextGenerator,
     HIMAPolicySubagent,
     HIMATextGenerator,
     TransformersHIMAGenerator,
@@ -112,6 +128,7 @@ __all__ = [
     "HIERNET_SC2_SPEC",
     "HierNetComparisonConfig",
     "HIMA_PINNED_REVISIONS",
+    "HIMA_LIVE_PROTOCOL_VERSION",
     "HIMA_PROTOSS_SPECS",
     "HIMA_PROTOSS_ACTIONS",
     "HIMA_RUNTIME_MAPPINGS",
@@ -119,7 +136,17 @@ __all__ = [
     "HIMAComparisonConfig",
     "HIMAMacroActionMapper",
     "HIMAMacroMapping",
+    "HIMAInputContext",
+    "HIMALiveBusyError",
+    "HIMALiveHealth",
+    "HIMALivePolicyClient",
+    "HIMALivePolicyService",
+    "HIMALiveProposalRequest",
+    "HIMALiveProposalResponse",
+    "HIMALiveProtocolError",
+    "HIMALiveTimeoutError",
     "HIMAObservationAdapter",
+    "HIMAPersistentTextGenerator",
     "HIMAPolicySubagent",
     "HIMAProposalParser",
     "HIMATextGenerator",
@@ -171,6 +198,7 @@ __all__ = [
     "build_policy_corpus",
     "build_policy_corpus_from_file",
     "build_protoss_opening_goal",
+    "create_hima_live_app",
     "default_shadow_registrations",
     "hima_vocabulary_version",
     "load_policy_comparison_config",

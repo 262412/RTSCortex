@@ -59,6 +59,169 @@ The Blizzard download page currently exposes Linux packages only through SC2 4.1
 92440; a real create-game test shows Base75689 crashes while loading them. `doctor` and
 the live preflight therefore reject older builds instead of relying on path checks alone.
 
+## SC2-native Cortex v0.3 canary
+
+`configs/experiments/live_simple64_hima_a_cortex.yaml` is the first live specialist
+configuration. It does not replace HIMA with a generic chat model and it does not allow
+HIMA to emit PySC2 commands. Responsibility is split as follows:
+
+```text
+ObservationEnvelope
+  ├─ deterministic SituationAssessment
+  ├─ own-state HIMA adapter → private UDS → HIMA Protoss-a → MacroPlan
+  └─ deterministic ReflexEngine
+              │ MacroIntent / ReflexIntent
+              ▼
+      current AvailableAction candidates
+              ▼
+      deterministic fast executor
+              ▼
+ProgressGuard → Validator → Arbiter → ActionBatch v1.1
+              ▼
+unchanged LLM-PySC2 Bridge → PySC2 → effect verifiers
+```
+
+HIMA receives the exact upstream five-field payload: supply used, supply capacity,
+completed own unit/structure counts, completed research, and confirmed recent macro
+actions. It receives neither enemy state nor executable coordinates/tags. The Runtime
+re-evaluates the dependency-safe macro frontier against every current observation and
+only compiles `mapped_legal_now` into an intent. The candidate compiler then enumerates
+complete actors and arguments from the Worker's current `available_actions`; the fast
+executor can select one of those candidates or abstain, but cannot invent another action.
+
+The current canary uses no Qwen endpoint. `provider.kind: fake` is intentionally inert in
+the Cortex factory; HIMA owns macro proposals and all other current roles are deterministic.
+
+### HIMA environment and license gate
+
+The HIMA sidecar needs a separate Python environment which can import the current
+RTSCortex source plus PyTorch, Transformers, FastAPI, Uvicorn, and HTTPX. Check it before
+allocating SC2:
+
+```bash
+~/fastscratch/envs/rtscortex-hima/bin/python -c \
+  "import rtscortex, torch, transformers; print(rtscortex.__file__)"
+```
+
+The model path must resolve to the exact pinned Hugging Face snapshot for the selected
+candidate. Branch names, copied directories without snapshot provenance, swapped
+Protoss-a/b/c checkpoints, and a different revision are rejected. The checked-in
+Protoss-a example expects:
+
+```text
+~/fastscratch/cache/huggingface/hub/
+  models--SNUMPR--Protoss-a/
+  snapshots/95348eea419b2e2d9717d747ca30e05a0cba787d
+```
+
+HIMA model cards do not declare a weight license. This is independent of the Blizzard
+StarCraft II license. The checked-in example therefore fails closed with:
+
+```yaml
+cortex:
+  macro:
+    allow_unlicensed_weights: false
+```
+
+Do not change that value silently. After explicitly accepting the risk for HIMA weights,
+make a local configuration copy and set it to `true` there:
+
+```bash
+cp configs/experiments/live_simple64_hima_a_cortex.yaml \
+  ~/scratch/live_simple64_hima_a_cortex.local.yaml
+$EDITOR ~/scratch/live_simple64_hima_a_cortex.local.yaml
+```
+
+The sidecar and Transformers loader both force offline mode, and model/tokenizer loading
+uses `local_files_only=True`. RTSCortex will not contact Hugging Face or download a missing
+checkpoint during a live run; missing local files are startup errors.
+
+### GPU boundary
+
+The current generator loads the complete checkpoint in FP16 onto the configured device,
+normally `cuda:0`, and keeps it resident in one sidecar process. Requests are serialized,
+so one run never launches concurrent HIMA generations. Run it only inside an assigned GPU
+allocation and check free memory before launch:
+
+```bash
+nvidia-smi
+```
+
+There is currently no quantization, CPU/GPU offload, automatic device selection, VRAM
+reservation, or pre-launch memory estimator. An unavailable device or out-of-memory load
+causes sidecar readiness to fail and prevents the SC2 Worker from starting. The
+`cortex.macro.restart_limit` field is reserved; v0.3 does not respawn a sidecar that dies
+after it became ready.
+
+### Safe launch
+
+First run the existing SC2/Worker checks. `doctor` does not load HIMA or prove that the
+selected GPU has enough memory; the subsequent `run` performs exact checkpoint, license,
+Python executable, sidecar load, and model/revision health checks.
+
+```bash
+SC2PATH=~/scratch/StarCraftII \
+  uv run rtscortex doctor \
+  --config ~/scratch/live_simple64_hima_a_cortex.local.yaml \
+  --require-sc2
+
+SC2PATH=~/scratch/StarCraftII \
+  uv run rtscortex run \
+  --config ~/scratch/live_simple64_hima_a_cortex.local.yaml \
+  --console --console-port 8765
+```
+
+The Runtime loads and health-checks the HIMA process before starting its control API and
+the SC2 Worker. After the first SC2 observation, `pause_until_first_plan: true` holds game
+advancement until the required initial macro proposal is accepted or fails. Later HIMA
+calls are single-flight and asynchronous. The checked-in canary is bounded to 1,024 game
+loops and is an action-closure/observability smoke, not a full match or win-rate benchmark.
+
+The run directory adds `hima-sidecar.stdout.log` and `hima-sidecar.stderr.log` alongside
+the normal SQLite, JSONL, Worker logs, timeline, and report. RGB frames and `.SC2Replay`
+remain non-persistent. The Live Console exposes the HIMA identity and health, macro plan,
+intent, candidate set, executor choice, command lineage, Bridge primitives, PySC2
+acceptance, and effect-verification result without giving the browser a control endpoint.
+
+### v0.3 acceptance checklist
+
+Regenerate the report after the run if needed:
+
+```bash
+uv run rtscortex report ~/scratch/outputs/RTSCortex/<cortex-run-directory>
+```
+
+Use the report and Console to verify:
+
+- `specialist_ready` identifies the configured HIMA model and exact pinned revision;
+- every accepted macro plan records adapter, parser, vocabulary, and source-model
+  provenance; semantic proposal rejection is an explicit `macro_plan_rejected`, while
+  process, transport, timeout, or inference failure is an explicit `specialist_failed`;
+- every selected candidate was present in its emitted candidate set, so reported
+  candidate-domain violations are zero;
+- every dispatched Cortex command has exactly one `command_lineage`, with zero missing or
+  orphan lineage records;
+- the lineage is readable end-to-end as macro plan → intent → candidate → executor
+  selection → v1.1 command → primitive → terminal effect result;
+- Build, production, and movement success still require their existing target-matched
+  effect evidence; PySC2 acceptance alone is not promoted to success;
+- deterministic executor p95 latency remains below the configured 10 ms target in the
+  report. This is an observed acceptance check in v0.3, not an enforced runtime deadline;
+- stopping the Console does not terminate the Runtime, HIMA sidecar, Worker, or SC2;
+- no model download, RGB image file, or replay file appears in the run directory.
+
+### Deliberate v0.3 limitations
+
+The typed `TacticalIntent` contract exists, but no tactical specialist currently emits it.
+Urgent reactions are still owned by deterministic Reflex rules. The fast executor is a
+stable deterministic ranker, not a learned small model. A privacy-minimized corpus exporter
+and saved-candidate benchmark are available (see
+[`fast-executor-data.md`](architecture/fast-executor-data.md)), but there is no training
+pipeline, checkpoint loader, confidence calibration, or learned-policy fallback yet.
+Situation assessment is deterministic rather than model-based. HIMA remains an own-state
+Protoss macro specialist, not a combat, map-understanding, or visual model. StarWM, VLM
+perception, specialist ensembles, and air-unit special-ability micro remain future modules.
+
 ## Recommended Simple64 Ladder/Melee smoke
 
 `Simple64` is the recommended compute-center live path. It uses the RTSCortex-owned

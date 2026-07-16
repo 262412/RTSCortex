@@ -5,9 +5,10 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import uuid
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
 import typer
 import uvicorn
@@ -17,6 +18,13 @@ from rtscortex.api import create_app
 from rtscortex.cli.doctor import run_doctor
 from rtscortex.config import ExperimentConfig, load_config
 from rtscortex.console import ConsoleSession, LiveConsoleHub, create_console_app
+from rtscortex.cortex import (
+    ExecutorCorpusError,
+    ExecutorSplit,
+    benchmark_executor_corpus,
+    build_executor_corpus,
+    verify_executor_corpus,
+)
 from rtscortex.evaluation import (
     ReportError,
     RunReportArtifacts,
@@ -57,14 +65,41 @@ policy_corpus_app = typer.Typer(
     no_args_is_help=True,
     help="Build and verify immutable policy-comparison corpora.",
 )
+executor_corpus_app = typer.Typer(
+    no_args_is_help=True,
+    help="Build and verify privacy-minimized fast-executor corpora.",
+)
 app.add_typer(policy_corpus_app, name="policy-corpus")
+app.add_typer(executor_corpus_app, name="executor-corpus")
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 CONSOLE_STATIC_DIR = Path(__file__).resolve().parents[1] / "console" / "static"
 
 
 def _run_id(prefix: str) -> str:
-    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    return f"{prefix}-{stamp}"
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    return f"{prefix}-{stamp}-{uuid.uuid4().hex[:8]}"
+
+
+def _reserve_run_dir(output_root: Path, prefix: str) -> tuple[str, Path]:
+    """Atomically reserve a collision-resistant artifact directory."""
+
+    output_root.mkdir(parents=True, exist_ok=True)
+    for _ in range(3):
+        run_id = _run_id(prefix)
+        run_dir = output_root / run_id
+        try:
+            run_dir.mkdir(exist_ok=False)
+        except FileExistsError:
+            continue
+        return run_id, run_dir
+    raise RuntimeError("could not reserve a unique run directory")
+
+
+def _active_model_label(config: ExperimentConfig) -> str:
+    if config.agent.variant == "cortex" and config.cortex.macro.kind == "hima":
+        suffix = config.cortex.macro.candidate.removeprefix("protoss-")
+        return f"SNUMPR/Protoss-{suffix}"
+    return config.provider.model
 
 
 def _snapshot_config(config: ExperimentConfig, run_dir: Path) -> None:
@@ -164,9 +199,8 @@ def run_experiment(
         except LiveEnvironmentError as error:
             raise typer.BadParameter(str(error), param_hint="--console-port") from error
         console_static_dir = _require_console_static_dir()
-    run_id = _run_id(config.agent.variant)
+    run_id, run_dir = _reserve_run_dir(config.run.output_root, config.agent.variant)
     episode_id = "episode-0"
-    run_dir = config.run.output_root / run_id
     live_worker: LiveWorkerSpec | None = None
     runtime_socket: Path | None = None
     if config.environment.adapter == "llm_pysc2":
@@ -214,7 +248,7 @@ def run_experiment(
                     status="starting",
                     scenario=config.environment.scenario,
                     seed=config.run.seed,
-                    model=config.provider.model,
+                    model=_active_model_label(config),
                     stale_after_seconds=config.console.stale_after_seconds,
                     frontend_event_limit=config.console.frontend_event_limit,
                 )
@@ -315,7 +349,7 @@ def serve_console(
         status="historical",
         scenario=config.environment.scenario,
         seed=config.run.seed,
-        model=config.provider.model,
+        model=_active_model_label(config),
         stale_after_seconds=config.console.stale_after_seconds,
         frontend_event_limit=config.console.frontend_event_limit,
     )
@@ -414,6 +448,81 @@ def policy_corpus_build(
     )
     typer.echo(f"Manifest: {result.manifest_path}")
     typer.echo(f"Fixtures: {result.fixtures_path}")
+
+
+@executor_corpus_app.command("build")
+def executor_corpus_build(
+    sources: Annotated[
+        list[Path],
+        typer.Argument(
+            exists=True,
+            help="One or more run directories or events.jsonl journals.",
+        ),
+    ],
+    output_dir: Annotated[Path, typer.Option("--output-dir", file_okay=False)],
+    split_seed: Annotated[str, typer.Option("--split-seed")] = (
+        "rtscortex-fast-executor-v0.1"
+    ),
+) -> None:
+    """Export labeled executor selections without RGB, prompts, tags, or coordinates."""
+
+    try:
+        result = build_executor_corpus(
+            sources,
+            output_dir.expanduser().resolve(),
+            split_seed=split_seed,
+        )
+    except (OSError, ExecutorCorpusError, ValueError) as error:
+        raise typer.BadParameter(str(error), param_hint="SOURCES") from error
+    typer.echo(result.manifest.model_dump_json(indent=2))
+    typer.echo(f"Manifest: {result.manifest_path}")
+
+
+@executor_corpus_app.command("verify")
+def executor_corpus_verify(
+    manifest: Annotated[Path, typer.Argument(exists=True, dir_okay=False)],
+    verify_sources: Annotated[
+        bool,
+        typer.Option(
+            "--verify-sources",
+            help="Also verify privacy-safe source journal fingerprints.",
+        ),
+    ] = False,
+) -> None:
+    """Verify executor corpus hashes, conservation, and episode split isolation."""
+
+    verification = verify_executor_corpus(
+        manifest.expanduser().resolve(),
+        verify_sources=verify_sources,
+    )
+    typer.echo(verification.model_dump_json(indent=2))
+    if not verification.valid:
+        raise typer.Exit(code=1)
+
+
+@app.command("executor-benchmark")
+def executor_benchmark(
+    manifest: Annotated[Path, typer.Argument(exists=True, dir_okay=False)],
+    repetitions: Annotated[int, typer.Option(min=1)] = 100,
+    split: Annotated[
+        str,
+        typer.Option(help="Corpus split to evaluate: test, validation, train, or all."),
+    ] = "test",
+) -> None:
+    """Benchmark deterministic ranking over saved candidate features."""
+
+    try:
+        selected_split: ExecutorSplit | Literal["all"] = (
+            "all" if split == "all" else ExecutorSplit(split)
+        )
+        result = benchmark_executor_corpus(
+            manifest.expanduser().resolve(),
+            repetitions=repetitions,
+            split=selected_split,
+        )
+    except (OSError, ExecutorCorpusError, ValueError) as error:
+        raise typer.BadParameter(str(error), param_hint="MANIFEST") from error
+    typer.echo(result.model_dump_json(indent=2))
 
 
 @policy_corpus_app.command("verify")
@@ -598,29 +707,25 @@ def serve(
     """Serve the versioned runtime API over a Unix socket or loopback TCP."""
 
     config = load_config(config_path)
-    run_id = _run_id("server")
-    run_dir = config.run.output_root / run_id
+    if socket_path is not None and tcp:
+        raise typer.BadParameter("--socket and --tcp cannot be used together")
+    run_id, run_dir = _reserve_run_dir(config.run.output_root, "server")
     _snapshot_config(config, run_dir)
     runtime = build_runtime(config, run_dir)
-    api = create_app(runtime)
-    try:
-        if socket_path is not None and tcp:
-            raise typer.BadParameter("--socket and --tcp cannot be used together")
-        use_socket = socket_path is not None or (os.name != "nt" and not tcp)
-        if use_socket:
-            resolved_socket = (
-                socket_path.expanduser()
-                if socket_path is not None
-                else config.run.runtime_root / run_id / "runtime.sock"
-            )
-            resolved_socket.parent.mkdir(parents=True, exist_ok=True)
-            typer.echo(f"Runtime socket: {resolved_socket}")
-            uvicorn.run(api, uds=str(resolved_socket), log_level="info")
-        else:
-            typer.echo(f"Runtime endpoint: http://{host}:{port}")
-            uvicorn.run(api, host=host, port=port, log_level="info")
-    finally:
-        asyncio.run(runtime.close())
+    api = create_app(runtime, manage_runtime_lifecycle=True)
+    use_socket = socket_path is not None or (os.name != "nt" and not tcp)
+    if use_socket:
+        resolved_socket = (
+            socket_path.expanduser()
+            if socket_path is not None
+            else config.run.runtime_root / run_id / "runtime.sock"
+        )
+        resolved_socket.parent.mkdir(parents=True, exist_ok=True)
+        typer.echo(f"Runtime socket: {resolved_socket}")
+        uvicorn.run(api, uds=str(resolved_socket), log_level="info")
+    else:
+        typer.echo(f"Runtime endpoint: http://{host}:{port}")
+        uvicorn.run(api, host=host, port=port, log_level="info")
 
 
 if __name__ == "__main__":

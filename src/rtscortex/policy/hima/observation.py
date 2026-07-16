@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from collections import Counter
 
-from rtscortex.policy.hima.models import HIMAObservationSnapshot
+from rtscortex.policy.hima.models import HIMAInputContext, HIMAObservationSnapshot
 from rtscortex.policy.hima.vocabulary import HIMA_PROTOSS_ACTIONS, resolve_hima_action
 from rtscortex.policy.models import PolicyObservationFixture
 
@@ -25,6 +25,42 @@ _RESEARCH_NAMES = {
     for action in HIMA_PROTOSS_ACTIONS
     if action.category == "research"
 }
+_RESEARCH_ALIASES = {
+    "blink": "BlinkTech",
+    "resonatingglaives": "AdeptPiercingAttack",
+    "psistorm": "PsiStormTech",
+    "shadowstrike": "DarkTemplarBlinkUpgrade",
+    "graviticbooster": "ObserverGraviticBooster",
+    "anionpulsecrystals": "PhoenixRangeUpgrade",
+    "fluxvanes": "VoidRaySpeedUpgrade",
+}
+_RESEARCH_IDS = {
+    39: "ProtossGroundWeaponsLevel1",
+    40: "ProtossGroundWeaponsLevel2",
+    41: "ProtossGroundWeaponsLevel3",
+    42: "ProtossGroundArmorsLevel1",
+    43: "ProtossGroundArmorsLevel2",
+    44: "ProtossGroundArmorsLevel3",
+    45: "ProtossShieldsLevel1",
+    46: "ProtossShieldsLevel2",
+    47: "ProtossShieldsLevel3",
+    48: "ObserverGraviticBooster",
+    49: "GraviticDrive",
+    50: "ExtendedThermalLance",
+    52: "PsiStormTech",
+    78: "ProtossAirWeaponsLevel1",
+    79: "ProtossAirWeaponsLevel2",
+    80: "ProtossAirWeaponsLevel3",
+    81: "ProtossAirArmorsLevel1",
+    82: "ProtossAirArmorsLevel2",
+    83: "ProtossAirArmorsLevel3",
+    84: "WarpGateResearch",
+    86: "Charge",
+    87: "BlinkTech",
+    99: "PhoenixRangeUpgrade",
+    130: "AdeptPiercingAttack",
+    141: "DarkTemplarBlinkUpgrade",
+}
 _UNIT_ORDER = tuple(
     action.upstream_name
     for action in HIMA_PROTOSS_ACTIONS
@@ -41,7 +77,19 @@ class HIMAObservationAdapter:
     """Build the exact upstream five-field, own-state-only JSON payload."""
 
     def adapt(self, fixture: PolicyObservationFixture) -> HIMAObservationSnapshot:
-        state = fixture.observation.state
+        """Compatibility entrypoint for immutable comparison fixtures."""
+
+        return self.adapt_context(
+            HIMAInputContext(
+                observation=fixture.observation,
+                previous_actions=tuple(fixture.previous_actions),
+            )
+        )
+
+    def adapt_context(self, context: HIMAInputContext) -> HIMAObservationSnapshot:
+        """Project one offline or live context through the same HIMA contract."""
+
+        state = context.observation.state
         unit_counts: Counter[str] = Counter()
         for unit in state.own_units:
             name = _TRAIN_NAMES.get(unit.unit_type.casefold())
@@ -67,11 +115,11 @@ class HIMAObservationAdapter:
         completed_research = {
             name
             for raw_name in state.upgrades
-            if (name := _RESEARCH_NAMES.get(raw_name.casefold())) is not None
+            if (name := _normalize_research(raw_name)) is not None
         }
         previous_action = tuple(
             _normalize_previous_action(raw_action)
-            for raw_action in fixture.previous_actions
+            for raw_action in context.previous_actions
         )
         return HIMAObservationSnapshot(
             supply_used=state.economy.supply_used,
@@ -95,6 +143,15 @@ class HIMAObservationAdapter:
         snapshot = self.adapt(fixture)
         return snapshot, self.serialize(snapshot)
 
+    def prepare_context(
+        self,
+        context: HIMAInputContext,
+    ) -> tuple[HIMAObservationSnapshot, str]:
+        """Return the exact snapshot and message for a live or offline context."""
+
+        snapshot = self.adapt_context(context)
+        return snapshot, self.serialize(snapshot)
+
 
 def _normalize_previous_action(raw_action: str) -> str:
     action = resolve_hima_action(raw_action)
@@ -103,6 +160,24 @@ def _normalize_previous_action(raw_action: str) -> str:
             f"previous HIMA action is not in the pinned Protoss vocabulary: {raw_action}"
         )
     return action.upstream_name
+
+
+def _normalize_research(raw_name: str) -> str | None:
+    normalized = raw_name.casefold()
+    direct = _RESEARCH_NAMES.get(normalized)
+    if direct is not None:
+        return direct
+    alias = _RESEARCH_ALIASES.get(normalized)
+    if alias is not None:
+        return alias
+    prefix = "upgrade:"
+    if not normalized.startswith(prefix):
+        return None
+    try:
+        upgrade_id = int(normalized.removeprefix(prefix))
+    except ValueError:
+        return None
+    return _RESEARCH_IDS.get(upgrade_id)
 
 
 def _is_completed_structure(status: str | None) -> bool:

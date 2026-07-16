@@ -78,11 +78,59 @@ AgentVariant: TypeAlias = Literal[
     "reflex_only",
     "planner_only",
     "planner_reflection_memory_reflex",
+    "cortex",
 ]
 
 
 class AgentSettings(SettingsModel):
     variant: AgentVariant = "planner_reflection_memory_reflex"
+
+
+class CortexSituationSettings(SettingsModel):
+    kind: Literal["deterministic"] = "deterministic"
+
+
+class CortexMacroSettings(SettingsModel):
+    kind: Literal["disabled", "hima"] = "disabled"
+    candidate: Literal["protoss-a", "protoss-b", "protoss-c"] = "protoss-a"
+    python_executable: Path = Path("~/fastscratch/envs/rtscortex-hima/bin/python")
+    model_path: Path | None = None
+    device: str = "cuda:0"
+    allow_unlicensed_weights: bool = False
+    required: bool = True
+    interval_game_loops: int = Field(default=112, ge=1)
+    plan_ttl_game_loops: int = Field(default=448, ge=1)
+    timeout_seconds: float = Field(default=12.0, gt=0.0)
+    max_new_tokens: int = Field(default=512, ge=1)
+    restart_limit: int = Field(default=1, ge=0)
+
+    @model_validator(mode="after")
+    def require_hima_model_path(self) -> CortexMacroSettings:
+        if self.kind == "hima" and self.model_path is None:
+            raise ValueError("cortex HIMA macro policy requires model_path")
+        return self
+
+
+class CortexTacticalSettings(SettingsModel):
+    kind: Literal["deterministic_reflex"] = "deterministic_reflex"
+
+
+class CortexExecutorSettings(SettingsModel):
+    kind: Literal["deterministic"] = "deterministic"
+    timeout_ms: float = Field(default=10.0, gt=0.0)
+    fallback: Literal["deterministic"] = "deterministic"
+
+
+class CortexExplanationSettings(SettingsModel):
+    enabled: bool = False
+
+
+class CortexSettings(SettingsModel):
+    situation: CortexSituationSettings = Field(default_factory=CortexSituationSettings)
+    macro: CortexMacroSettings = Field(default_factory=CortexMacroSettings)
+    tactical: CortexTacticalSettings = Field(default_factory=CortexTacticalSettings)
+    executor: CortexExecutorSettings = Field(default_factory=CortexExecutorSettings)
+    explanation: CortexExplanationSettings = Field(default_factory=CortexExplanationSettings)
 
 
 class ReflexSettings(SettingsModel):
@@ -134,6 +182,7 @@ class ExperimentConfig(SettingsModel):
     environment: EnvironmentSettings = Field(default_factory=EnvironmentSettings)
     runtime: RuntimeSettings = Field(default_factory=RuntimeSettings)
     agent: AgentSettings = Field(default_factory=AgentSettings)
+    cortex: CortexSettings = Field(default_factory=CortexSettings)
     reflex: ReflexSettings = Field(default_factory=ReflexSettings)
     memory: MemorySettings = Field(default_factory=MemorySettings)
     context: ContextSettings = Field(default_factory=ContextSettings)
@@ -148,6 +197,11 @@ class ExperimentConfig(SettingsModel):
         if self.environment.sc2_path is not None:
             data["environment"]["sc2_path"] = self.environment.sc2_path.expanduser()
         data["environment"]["worker_python"] = self.environment.worker_python.expanduser()
+        data["cortex"]["macro"]["python_executable"] = (
+            self.cortex.macro.python_executable.expanduser()
+        )
+        if self.cortex.macro.model_path is not None:
+            data["cortex"]["macro"]["model_path"] = self.cortex.macro.model_path.expanduser()
         return ExperimentConfig.model_validate(data)
 
 

@@ -322,7 +322,9 @@ def compute_episode_metrics(
     planner_latencies = [
         float(event.payload["latency_ms"])
         for event in events
-        if event.event_type == "planner_cycle" and "latency_ms" in event.payload
+        if event.event_type
+        in {"planner_cycle", "macro_plan_accepted", "macro_plan_rejected"}
+        and "latency_ms" in event.payload
     ]
     reflex_latencies = [
         float(event.payload["reflex_latency_ms"])
@@ -338,7 +340,11 @@ def compute_episode_metrics(
     model_events = [
         event
         for event in events
-        if event.event_type == "module_result" and event.payload.get("model_call") is True
+        if (
+            event.event_type == "module_result"
+            and event.payload.get("model_call") is True
+        )
+        or event.event_type in {"macro_plan_accepted", "macro_plan_rejected"}
     ]
     prompt_tokens = sum(_usage_value(event, "prompt_tokens") for event in model_events)
     completion_tokens = sum(_usage_value(event, "completion_tokens") for event in model_events)
@@ -349,7 +355,11 @@ def compute_episode_metrics(
     ) / 1_000_000
 
     reflex_preemptions = sum(len(event.payload.get("preemptions", [])) for event in decisions)
-    plan_events = [event for event in events if event.event_type == "plan_accepted"]
+    plan_events = [
+        event
+        for event in events
+        if event.event_type in {"plan_accepted", "macro_plan_accepted"}
+    ]
     plan_revisions = sum(event.payload.get("is_revision") is True for event in plan_events)
     revision_opportunities = max(0, len(plan_events) - 1)
     plan_ages = [
@@ -1659,9 +1669,17 @@ def _merge_counts(groups: list[dict[str, int]]) -> dict[str, int]:
 
 def _usage_value(event: StoredEvent, name: str) -> int:
     usage = event.payload.get("usage")
-    if not isinstance(usage, dict):
+    if isinstance(usage, dict):
+        value = usage.get(name, 0)
+        return int(value) if isinstance(value, int | float) else 0
+    metadata = event.payload.get("generation_metadata")
+    if not isinstance(metadata, dict):
         return 0
-    value = usage.get(name, 0)
+    metadata_name = {
+        "prompt_tokens": "prompt_token_count",
+        "completion_tokens": "completion_token_count",
+    }.get(name, name)
+    value = metadata.get(metadata_name, 0)
     return int(value) if isinstance(value, int | float) else 0
 
 

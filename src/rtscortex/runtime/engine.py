@@ -186,6 +186,14 @@ class RuntimeEngine:
         self._episode_key: tuple[str, str] | None = None
         self._last_goal_progress_fingerprint: str | None = None
 
+    async def start(self) -> None:
+        """Prepare optional runtime resources before an episode starts.
+
+        The legacy runtime owns no asynchronous startup resources.  Specialized
+        runtimes override this hook so process and model validation can fail
+        before the environment worker launches.
+        """
+
     async def tick(self, observation: ObservationEnvelope) -> ActionBatch:
         tick_started = time.perf_counter()
         await self._activate_episode(observation)
@@ -1444,6 +1452,6 @@ class RuntimeEngine:
     async def _cancel_planner(self) -> None:
         if self._planner_task is not None:
             self._planner_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
+            with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._planner_task
             self._planner_task = None

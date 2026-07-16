@@ -19,6 +19,10 @@ def test_policy_v02_public_api_is_exported_from_stable_packages() -> None:
         "run_policy_comparison",
         "write_policy_comparison_reports",
         "HIMAObservationAdapter",
+        "HIMAInputContext",
+        "HIMALivePolicyClient",
+        "HIMALiveProposalRequest",
+        "HIMALiveProposalResponse",
         "HIMAProposalParser",
         "HIMAMacroActionMapper",
         "HIMAPolicySubagent",
@@ -26,6 +30,10 @@ def test_policy_v02_public_api_is_exported_from_stable_packages() -> None:
     }
     hima_names = {
         "HIMAObservationAdapter",
+        "HIMAInputContext",
+        "HIMALivePolicyClient",
+        "HIMALiveProposalRequest",
+        "HIMALiveProposalResponse",
         "HIMAProposalParser",
         "HIMAMacroActionMapper",
         "HIMAPolicySubagent",

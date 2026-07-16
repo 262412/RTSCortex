@@ -161,3 +161,31 @@ def test_runtime_api_accepts_console_frames_only_when_hub_is_enabled(tmp_path: P
             await runtime.close()
 
     asyncio.run(execute())
+
+
+def test_managed_api_lifespan_starts_and_closes_runtime(tmp_path: Path) -> None:
+    class TrackingRuntime(RuntimeEngine):
+        started = False
+        closed = False
+
+        async def start(self) -> None:
+            self.started = True
+
+        async def close(self) -> None:
+            self.closed = True
+            await super().close()
+
+    runtime = TrackingRuntime(
+        config=make_config(tmp_path),
+        store=EventStore(tmp_path / "events.sqlite3", tmp_path / "events.jsonl"),
+        provider=FakeProvider(),
+    )
+    app = create_app(runtime, manage_runtime_lifecycle=True)
+
+    async def exercise() -> None:
+        async with app.router.lifespan_context(app):
+            assert runtime.started is True
+            assert runtime.closed is False
+        assert runtime.closed is True
+
+    asyncio.run(exercise())

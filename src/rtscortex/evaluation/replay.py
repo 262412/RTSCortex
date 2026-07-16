@@ -56,6 +56,7 @@ async def replay_event_log(
     skipped_legacy_executions = 0
     dispatched: dict[tuple[str, str, str], ActionCommand] = {}
     try:
+        await runtime.start()
         for event in events:
             if event.event_type != "observation":
                 continue

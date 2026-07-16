@@ -232,6 +232,82 @@ describe("Chinese event presentation", () => {
     expect(semanticScalar("missing_prerequisite", "kind")).toBe("缺少科技前置条件");
   });
 
+  it("presents the Cortex specialist-to-executor pipeline without raw JSON", () => {
+    const situation = event("situation_assessed", {
+      source_kind: "deterministic",
+      assessment: {
+        game_phase: "early",
+        threat_level: "low",
+        army_readiness: "not_ready",
+      },
+    });
+    const macro = event("macro_plan_accepted", {
+      model_id: "hima-a",
+      plan: { plan_id: "plan-1", steps: [{ action: "Pylon" }, { action: "Gateway" }] },
+      runtime_frontier: "Build_Pylon_Screen",
+    });
+    const intent = event("intent_emitted", {
+      role: "macro",
+      intent_id: "intent-1",
+      intent: { action_names: ["Build_Pylon_Screen"] },
+    });
+    const candidates = event("candidate_set_built", {
+      intent_id: "intent-1",
+      candidates: [
+        {
+          candidate_id: "candidate-1",
+          action_name: "Build_Pylon_Screen",
+          actor: "Builder/Probe-1",
+        },
+      ],
+    });
+    const selection = event("executor_selection", {
+      executor_id: "deterministic",
+      selected_candidate_id: "candidate-1",
+      latency_ms: 1.4,
+    });
+    const lineage = event("command_lineage", {
+      command_id: "command-1",
+      macro_plan_id: "plan-1",
+      intent_id: "intent-1",
+      candidate_id: "candidate-1",
+    });
+    const macroStep = event("macro_step_updated", {
+      plan_id: "plan-1",
+      step: {
+        semantic_action: "BUILD PYLON",
+        runtime_actions: ["Build_Pylon_Screen"],
+        status: "confirmed",
+        completed_repeats: 1,
+        repeat: 1,
+      },
+    });
+    const failure = event("specialist_failed", {
+      role: "macro",
+      model_id: "hima-a",
+      message: "request timed out",
+    });
+
+    expect(eventTitle(situation)).toBe("战况分析完成");
+    expect(eventSummary(situation)).toBe(
+      "来源：确定性规则（deterministic） · 阶段：开局阶段（early） · 威胁：低（low） · 军队：尚未准备（not_ready）",
+    );
+    expect(eventSummary(macro)).toBe("计划 plan-1 · hima-a · 2 步 · 当前：建造水晶塔");
+    expect(eventSummary(intent)).toBe("宏观决策（macro） · 建造水晶塔 · intent-1");
+    expect(eventSummary(candidates)).toBe("为意图 intent-1 生成 1 个合法候选：建造水晶塔");
+    expect(eventSummary(selection)).toBe("deterministic · 选择 candidate-1 · 1 毫秒");
+    expect(eventSummary(lineage)).toBe(
+      "command-1 · 计划 plan-1 → 意图 intent-1 → 候选 candidate-1",
+    );
+    expect(eventSummary(macroStep)).toBe("建造水晶塔 · 已确认 · 1/1");
+    expect(eventSummary(failure)).toBe("宏观决策（macro） · hima-a · request timed out");
+    expect(eventSemanticPayload(selection)).toEqual({
+      candidate_id: "candidate-1",
+      executor_id: "deterministic",
+      latency_ms: 1.4,
+    });
+  });
+
   it("falls back safely for future event types", () => {
     const unknown = event("world_model_projection", { horizon: 32 });
     expect(eventTitle(unknown)).toBe("world model projection");
