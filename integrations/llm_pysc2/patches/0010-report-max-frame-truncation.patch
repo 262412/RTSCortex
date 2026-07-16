@@ -1,0 +1,15 @@
+diff --git a/pysc2/env/run_loop.py b/pysc2/env/run_loop.py
+index 09d6724..60bd8a5 100644
+--- a/pysc2/env/run_loop.py
++++ b/pysc2/env/run_loop.py
+@@ -38,6 +38,10 @@ def run_loop(agents, env, max_frames=0, max_episodes=0):
+         actions = [agent.step(timestep)
+                    for agent, timestep in zip(agents, timesteps)]
+         if max_frames and total_frames >= max_frames:
++          for agent in agents:
++            on_episode_truncated = getattr(agent, "on_episode_truncated", None)
++            if on_episode_truncated is not None:
++              on_episode_truncated(total_frames)
+           return
+         if timesteps[0].last():
+           break

@@ -52,6 +52,13 @@ def test_prepare_live_worker_builds_fixed_pysc2_command(tmp_path: Path) -> None:
         'flags.DEFINE_integer("random_seed", None, "Random seed")\nrandom_seed=FLAGS.random_seed\n',
         encoding="utf-8",
     )
+    run_loop_source = tmp_path / "third_party/LLM-PySC2/pysc2/env/run_loop.py"
+    run_loop_source.parent.mkdir(parents=True, exist_ok=True)
+    run_loop_source.write_text(
+        'on_episode_truncated = getattr(agent, "on_episode_truncated", None)\n'
+        "on_episode_truncated(total_frames)\n",
+        encoding="utf-8",
+    )
     _write_build_coordinate_patch_source(tmp_path)
     _write_translation_result_patch_source(tmp_path)
     funcs_source = tmp_path / "third_party/LLM-PySC2/llm_pysc2/agents/main_agent_funcs.py"
@@ -336,6 +343,13 @@ def _write_worker_patch_sources(project_root: Path) -> None:
     runner_source.parent.mkdir(parents=True)
     runner_source.write_text(
         'flags.DEFINE_integer("random_seed", None, "Random seed")\nrandom_seed=FLAGS.random_seed\n',
+        encoding="utf-8",
+    )
+    run_loop_source = project_root / "third_party/LLM-PySC2/pysc2/env/run_loop.py"
+    run_loop_source.parent.mkdir(parents=True, exist_ok=True)
+    run_loop_source.write_text(
+        'on_episode_truncated = getattr(agent, "on_episode_truncated", None)\n'
+        "on_episode_truncated(total_frames)\n",
         encoding="utf-8",
     )
     _write_build_coordinate_patch_source(project_root)

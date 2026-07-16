@@ -199,6 +199,11 @@ def prepare_live_worker(
             "the LLM-PySC2 Nexus exact-screen-scale patch is not applied; see "
             "integrations/llm_pysc2/patches/README.md"
         )
+    if not max_frames_episode_hook_patch_is_applied(project_root):
+        errors.append(
+            "the PySC2 max-frame episode hook patch is not applied; see "
+            "integrations/llm_pysc2/patches/README.md"
+        )
 
     if errors:
         raise LiveEnvironmentError("Live environment validation failed:\n- " + "\n- ".join(errors))
@@ -894,6 +899,22 @@ def nexus_exact_screen_scale_patch_is_applied(project_root: Path) -> bool:
             "minimum, ideal, maximum = 6 * pixel_scale, 7.5 * pixel_scale, 9 * pixel_scale",
             "feature_screen.visibility_map[y][x] != features.Visibility.VISIBLE",
             "unit.display_type != 1 or not unit.is_on_screen",
+        )
+    )
+
+
+def max_frames_episode_hook_patch_is_applied(project_root: Path) -> bool:
+    """Return whether PySC2 reports a clean max-frame truncation to the agent."""
+
+    source = project_root / "third_party/LLM-PySC2/pysc2/env/run_loop.py"
+    if not source.is_file():
+        return False
+    text = source.read_text(encoding="utf-8")
+    return all(
+        marker in text
+        for marker in (
+            'getattr(agent, "on_episode_truncated", None)',
+            "on_episode_truncated(total_frames)",
         )
     )
 

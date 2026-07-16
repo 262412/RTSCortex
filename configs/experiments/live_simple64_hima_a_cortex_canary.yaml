@@ -1,0 +1,80 @@
+run:
+  output_root: ~/scratch/outputs/RTSCortex
+  runtime_root: ~/fastscratch/rtscortex_runtime
+  seed: 0
+environment:
+  adapter: llm_pysc2
+  scenario: Simple64
+  max_steps: 2500
+  agent_race: protoss
+  opponent_race: zerg
+  opponent_difficulty: very_easy
+  opponent_build: macro
+  step_mul: 1
+  game_steps_per_episode: 2500
+  simulation_speed_multiplier: 0.25
+  pause_until_first_plan: true
+  action_effect_timeout_game_loops: 112
+  worker_python: ~/fastscratch/envs/rtscortex-llm-pysc2/bin/python
+  server_ready_timeout_seconds: 15.0
+  shutdown_timeout_seconds: 10.0
+runtime:
+  deterministic: false
+  planning_interval_game_loops: 112
+  planner_command_ttl_game_loops: 112
+  planner_timeout_seconds: 15.0
+  max_actions: 5
+agent:
+  variant: cortex
+cortex:
+  situation:
+    kind: deterministic
+  macro:
+    kind: hima
+    candidate: protoss-a
+    python_executable: ~/fastscratch/envs/rtscortex-hima/bin/python
+    model_path: ~/fastscratch/cache/huggingface/hub/models--SNUMPR--Protoss-a/snapshots/95348eea419b2e2d9717d747ca30e05a0cba787d
+    device: cuda:0
+    # HIMA model cards do not declare a weight license. The project owner
+    # explicitly accepted that risk for the v0.3 Protoss-a canary on 2026-07-16.
+    allow_unlicensed_weights: true
+    required: true
+    interval_game_loops: 112
+    plan_ttl_game_loops: 448
+    timeout_seconds: 12.0
+    max_new_tokens: 512
+    restart_limit: 1
+  tactical:
+    kind: deterministic_reflex
+  executor:
+    kind: deterministic
+    timeout_ms: 10.0
+    fallback: deterministic
+  explanation:
+    enabled: false
+reflex:
+  enabled: true
+  low_health_threshold: 0.25
+  target_latency_ms: 50.0
+memory:
+  short_term_window: 20
+context:
+  max_prompt_chars: 9000
+  max_recent_events: 8
+  max_lessons: 6
+  max_episode_summaries: 1
+provider:
+  # Cortex does not construct this provider; the fast executor is deterministic.
+  kind: fake
+  model: fake-planner-v1
+evaluation:
+  seeds: [0]
+console:
+  enabled: false
+  port: 8765
+  frame_fps: 2.0
+  rgb_screen_size: 256
+  rgb_minimap_size: 128
+  jpeg_quality: 75
+  stale_after_seconds: 2.0
+  frontend_event_limit: 5000

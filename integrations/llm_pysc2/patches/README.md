@@ -40,12 +40,20 @@ git -C third_party/LLM-PySC2 apply --check \
   ../../integrations/llm_pysc2/patches/0009-use-exact-nexus-screen-scale.patch
 git -C third_party/LLM-PySC2 apply \
   ../../integrations/llm_pysc2/patches/0009-use-exact-nexus-screen-scale.patch
+git -C third_party/LLM-PySC2 apply --check \
+  ../../integrations/llm_pysc2/patches/0010-report-max-frame-truncation.patch
+git -C third_party/LLM-PySC2 apply \
+  ../../integrations/llm_pysc2/patches/0010-report-max-frame-truncation.patch
 ```
 
 After the live run, restore the clean pinned checkout by reversing exactly these reviewed
 patches in reverse order:
 
 ```bash
+git -C third_party/LLM-PySC2 apply --reverse --check \
+  ../../integrations/llm_pysc2/patches/0010-report-max-frame-truncation.patch
+git -C third_party/LLM-PySC2 apply --reverse \
+  ../../integrations/llm_pysc2/patches/0010-report-max-frame-truncation.patch
 git -C third_party/LLM-PySC2 apply --reverse --check \
   ../../integrations/llm_pysc2/patches/0009-use-exact-nexus-screen-scale.patch
 git -C third_party/LLM-PySC2 apply --reverse \
@@ -146,7 +154,12 @@ from the integer sampling stride. Resource-ring and townhall distances therefore
 `size_screen / 24` conversion, while footprint bounds cover the full 5x5 Nexus area. The exact
 anchor and every footprint pixel must also be currently visible before placement is emitted.
 
-CI applies all nine patches in order under Python 3.9, compiles and imports both projects, and
+`0010-report-max-frame-truncation.patch` invokes an optional agent lifecycle hook before
+PySC2 returns at `max_agent_steps`. The RTSCortex bridge uses the hook to post one explicit
+`truncated` episode result and finalize pending commands instead of relying on the supervisor
+to guess why a clean worker process exited.
+
+CI applies all ten patches in order under Python 3.9, compiles and imports both projects, and
 runs `integrations/llm_pysc2/tests/python39_contract_smoke.py`. The smoke locks the v1.1
 candidate mapping, multi-argument translator rejection, Nexus camera-settlement primitive,
 exact Nexus anchor, floating-point resource clearance, visible complete-footprint behavior,

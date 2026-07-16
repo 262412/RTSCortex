@@ -238,4 +238,17 @@ def test_live_hima_cortex_example_is_safe_by_default() -> None:
     assert config.cortex.macro.kind == "hima"
     assert config.cortex.macro.candidate == "protoss-a"
     assert config.cortex.macro.allow_unlicensed_weights is False
+
+
+def test_live_hima_cortex_canary_records_explicit_license_acceptance() -> None:
+    config = load_config(
+        PROJECT_ROOT / "configs/experiments/live_simple64_hima_a_cortex_canary.yaml"
+    )
+
+    assert config.agent.variant == "cortex"
+    assert config.cortex.macro.kind == "hima"
+    assert config.cortex.macro.candidate == "protoss-a"
+    assert config.cortex.macro.allow_unlicensed_weights is True
+    assert config.environment.max_steps == 2_500
+    assert config.environment.game_steps_per_episode == 2_500
     assert config.provider.kind == "fake"

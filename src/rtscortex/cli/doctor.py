@@ -17,6 +17,7 @@ from rtscortex.runtime.live import (
     LiveEnvironmentError,
     build_feature_plane_patch_is_applied,
     live_scenario_spec,
+    max_frames_episode_hook_patch_is_applied,
     near_placement_patch_is_applied,
     nexus_exact_screen_scale_patch_is_applied,
     nexus_resource_clearance_patch_is_applied,
@@ -193,6 +194,8 @@ def _worker_patch_check(project_root: Path, *, required: bool) -> Check:
         missing.append("0008-enforce-nexus-resource-clearance.patch")
     if not nexus_exact_screen_scale_patch_is_applied(project_root):
         missing.append("0009-use-exact-nexus-screen-scale.patch")
+    if not max_frames_episode_hook_patch_is_applied(project_root):
+        missing.append("0010-report-max-frame-truncation.patch")
     status = "ok" if not missing else ("error" if required else "optional")
     detail = "all worker patches applied" if not missing else "apply " + ", ".join(missing)
     return Check("worker_patch", status, detail)

@@ -11,6 +11,7 @@ from llm_pysc2.agents.llm_pysc2_agent import LLMAgent
 from llm_pysc2.agents.llm_pysc2_agent_main import MainAgent
 from llm_pysc2.agents.main_agent_funcs import main_agent_func1
 from llm_pysc2.lib import llm_action
+from pysc2.env import run_loop
 from pysc2.lib import actions, features
 from rtscortex_llm_pysc2.effect_verifier import _BUILD_RAW_FUNCTION_IDS
 from rtscortex_llm_pysc2.observation import _map_argument_candidates
@@ -29,6 +30,40 @@ def _assert_candidate_mapping() -> None:
     )
     assert [function_id for function_id, _, _ in nexus["func"]] == [573, 0, 65]
     assert "return translator settlement no_op" in inspect.getsource(MainAgent.step)
+
+
+def _assert_max_frame_hook() -> None:
+    calls = []
+
+    class Agent:
+        def setup(self, observation_spec, action_spec) -> None:
+            del observation_spec, action_spec
+
+        def reset(self) -> None:
+            pass
+
+        def step(self, timestep):
+            del timestep
+            return "noop"
+
+        def on_episode_truncated(self, total_frames: int) -> None:
+            calls.append(total_frames)
+
+    class Environment:
+        def observation_spec(self):
+            return [object()]
+
+        def action_spec(self):
+            return [object()]
+
+        def reset(self):
+            return [SimpleNamespace(last=lambda: False)]
+
+        def step(self, actions):
+            raise AssertionError(f"unexpected step: {actions}")
+
+    run_loop.run_loop([Agent()], Environment(), max_frames=1, max_episodes=1)
+    assert calls == [1]
 
 
 def _assert_build_order_ids_use_raw_function_domain() -> None:
@@ -565,6 +600,7 @@ def _assert_exact_anchor_and_footprint() -> None:
 
 def main() -> None:
     _assert_candidate_mapping()
+    _assert_max_frame_hook()
     _assert_build_order_ids_use_raw_function_domain()
     _assert_direct_production_contract()
     _assert_raw_unit_presence_controls_team_lifecycle()

@@ -262,6 +262,51 @@ def test_worker_error_episode_preserves_bridge_counters() -> None:
     ]
 
 
+def test_worker_max_frame_hook_reports_explicit_truncation() -> None:
+    runtime = FakeRuntime()
+    broker = SharedDecisionBroker(
+        BridgeCoordinator(runtime),
+        TimeStepExtractor("run-worker", "episode-worker"),
+    )
+    main_agent = cast(Any, object.__new__(RTSCortexMainAgent))
+    main_agent.worker_settings = WorkerSettings(
+        run_id="run-worker",
+        episode_id="episode-worker",
+        socket_path=None,
+        runtime_url="http://rtscortex",
+        seed=7,
+    )
+    main_agent.decision_broker = broker
+    main_agent.transport_noop_primitives = 4
+    main_agent._episode_reported = False
+    main_agent._frame_publisher = None
+    closed: list[bool] = []
+    main_agent.runtime_client = SimpleNamespace(close=lambda: closed.append(True))
+
+    main_agent.on_episode_truncated(2_500)
+
+    assert main_agent._episode_reported is True
+    assert closed == [True]
+    assert runtime.episode_results == [
+        {
+            "protocol_version": "1.1",
+            "run_id": "run-worker",
+            "episode_id": "episode-worker",
+            "scenario": "pvz_task1_level1",
+            "seed": 7,
+            "outcome": "truncated",
+            "score": 0.0,
+            "steps": 2_500,
+            "metrics": {
+                "transport_noop_primitives": 4,
+                "unattributed_primitives": 0,
+                "candidate_outside_pysc2_dispatches": 0,
+            },
+            "failure_reason": "max_agent_steps_reached",
+        }
+    ]
+
+
 def test_worker_settings_prefer_canonical_runtime_environment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -124,6 +124,13 @@ def test_worker_patch_is_required_only_for_live_runs(tmp_path: Path) -> None:
         'flags.DEFINE_integer("random_seed", None, "Random seed")\nrandom_seed=FLAGS.random_seed\n',
         encoding="utf-8",
     )
+    run_loop_source = tmp_path / "third_party/LLM-PySC2/pysc2/env/run_loop.py"
+    run_loop_source.parent.mkdir(parents=True, exist_ok=True)
+    run_loop_source.write_text(
+        'on_episode_truncated = getattr(agent, "on_episode_truncated", None)\n'
+        "on_episode_truncated(total_frames)\n",
+        encoding="utf-8",
+    )
 
     action_source = tmp_path / "third_party/LLM-PySC2/llm_pysc2/lib/llm_action.py"
     action_source.parent.mkdir(parents=True)
@@ -174,6 +181,16 @@ def test_worker_patch_is_required_only_for_live_runs(tmp_path: Path) -> None:
     )
 
     assert _worker_patch_check(tmp_path, required=True).status == "ok"
+
+    run_loop_source.write_text("", encoding="utf-8")
+    truncation_check = _worker_patch_check(tmp_path, required=True)
+    assert truncation_check.status == "error"
+    assert "0010-report-max-frame-truncation.patch" in truncation_check.detail
+    run_loop_source.write_text(
+        'on_episode_truncated = getattr(agent, "on_episode_truncated", None)\n'
+        "on_episode_truncated(total_frames)\n",
+        encoding="utf-8",
+    )
 
     complete_action_source = action_source.read_text(encoding="utf-8")
     action_source.write_text(

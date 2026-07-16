@@ -99,6 +99,7 @@ jobs:
             ../../integrations/llm_pysc2/patches/0007-preserve-transient-team-units.patch
             ../../integrations/llm_pysc2/patches/0008-enforce-nexus-resource-clearance.patch
             ../../integrations/llm_pysc2/patches/0009-use-exact-nexus-screen-scale.patch
+            ../../integrations/llm_pysc2/patches/0010-report-max-frame-truncation.patch
           )
           applied=()
           cleanup() {

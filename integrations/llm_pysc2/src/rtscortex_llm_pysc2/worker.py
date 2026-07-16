@@ -846,6 +846,33 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
             return
         self._episode_reported = True
 
+    def on_episode_truncated(self, total_frames: int) -> None:
+        """Report an explicit terminal result when PySC2 reaches its frame limit."""
+
+        if self._episode_reported:
+            return
+        result = {
+            "protocol_version": "1.1",
+            "run_id": self.worker_settings.run_id,
+            "episode_id": self.worker_settings.episode_id,
+            "scenario": self.worker_settings.scenario,
+            "seed": self.worker_settings.seed,
+            "outcome": "truncated",
+            "score": 0.0,
+            "steps": int(total_frames),
+            "metrics": {
+                "transport_noop_primitives": self.transport_noop_primitives,
+                **self.decision_broker.metrics(),
+            },
+            "failure_reason": "max_agent_steps_reached",
+        }
+        try:
+            self.decision_broker.end_episode(result)
+            self._episode_reported = True
+        finally:
+            self._close_frame_publisher()
+            self.runtime_client.close()
+
 
 def _require_upstream() -> None:
     if _UPSTREAM_IMPORT_ERROR is not None:
