@@ -308,6 +308,39 @@ describe("Chinese event presentation", () => {
     });
   });
 
+  it("explains Race Brain coordination and Playbook learning", () => {
+    const coordinated = event("race_brain_coordinated", {
+      selected_member_id: "hima-protoss-b",
+      members: [{}, {}, {}],
+      valid_member_count: 2,
+      degraded_member_ids: ["hima-protoss-c"],
+      playbook_lesson_ids: ["lesson-1"],
+      rationale: "mapped_legal_now, promoted playbook support",
+    });
+    const retrieved = event("playbook_retrieved", {
+      phase: "technology",
+      hit_count: 2,
+      lesson_ids: ["lesson-1", "lesson-2"],
+    });
+    const promoted = event("playbook_lesson_promoted", {
+      statement: "BUILD STARGATE had a verified effect in winning episodes.",
+      support_count: 2,
+    });
+
+    expect(eventTitle(coordinated)).toBe("种族大脑已汇总三位专家");
+    expect(eventSummary(coordinated)).toContain(
+      "3 位 HIMA 专家已提案 · 1 位输出异常 · 采用 hima-protoss-b · 引用 1 条战术经验",
+    );
+    expect(eventSummary(retrieved)).toBe("科技阶段（technology） · 找到 2 条可复用战术经验");
+    expect(eventSummary(promoted)).toContain("已晋升 · 2 局支持");
+
+    const revalidated = event("macro_proposal_revalidated", {
+      source_game_loop: 112,
+      current_game_loop: 184,
+    });
+    expect(eventSummary(revalidated)).toContain("loop 112 → 184");
+  });
+
   it("falls back safely for future event types", () => {
     const unknown = event("world_model_projection", { horizon: 32 });
     expect(eventTitle(unknown)).toBe("world model projection");

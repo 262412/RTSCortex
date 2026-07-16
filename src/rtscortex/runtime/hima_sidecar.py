@@ -33,6 +33,12 @@ HIMA_CANDIDATE_MODEL_IDS: Final[Mapping[str, str]] = MappingProxyType(
         "protoss-a": "SNUMPR/Protoss-a",
         "protoss-b": "SNUMPR/Protoss-b",
         "protoss-c": "SNUMPR/Protoss-c",
+        "terran-a": "SNUMPR/Terran-a",
+        "terran-b": "SNUMPR/Terran-b",
+        "terran-c": "SNUMPR/Terran-c",
+        "zerg-a": "SNUMPR/Zerg-a",
+        "zerg-b": "SNUMPR/Zerg-b",
+        "zerg-c": "SNUMPR/Zerg-c",
     }
 )
 

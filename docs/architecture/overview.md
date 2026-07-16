@@ -22,7 +22,7 @@ the Worker API, the LLM-PySC2 translator, or PySC2 execution semantics.
 ## SC2-native Cortex v0.3
 
 The v0.3 vertical slice gives game knowledge and low-level execution different owners.
-HIMA proposes an ordered Protoss macro policy, while deterministic components interpret
+A HIMA specialist proposes an ordered Protoss macro policy, while deterministic components interpret
 the current observation, handle urgent reactions, and choose only from exact executable
 candidates.
 
@@ -137,6 +137,65 @@ The checked-in live canary targets HIMA Protoss-a. The configuration schema and 
 identity checks also support Protoss-b/c, but those candidates require their own exact local
 snapshot and independent live acceptance run.
 
+## Race Brain Ensemble and CortexPlaybook v0.4
+
+HIMA does not publish a separate all-race strategic-planner checkpoint. Its released model
+family contains three specialist clusters for each race, while the upstream strategic
+planner is a general language-model coordinator. RTSCortex v0.4 therefore keeps SC2-trained
+knowledge in the three checkpoints for the active race and uses a deterministic,
+environment-aware coordinator instead of allowing one cluster to impersonate the whole
+race brain.
+
+```mermaid
+flowchart LR
+    OBS["Observation + SituationAssessment"] --> A["HIMA race cluster A"]
+    OBS --> B["HIMA race cluster B"]
+    OBS --> C["HIMA race cluster C"]
+    PB["CortexPlaybook promoted lessons"] --> COORD["Deterministic strategic coordinator"]
+    A --> COORD
+    B --> COORD
+    C --> COORD
+    COORD --> FRONTIER["Selected typed MacroPlan"]
+    FRONTIER --> MOTOR["Intent to Fast Executor to Validator"]
+    MOTOR --> BRIDGE["Bridge to PySC2"]
+    BRIDGE --> REVIEW["Effects and post-game review"]
+    REVIEW --> PB
+```
+
+All three members receive the same pinned five-field HIMA projection. Members assigned to
+the same device generate in stable `a`, `b`, `c` order, while independent device groups run
+concurrently. The coordinator restores canonical `a`, `b`, `c` result order before scoring
+each proposal by current Runtime frontier classification, current threat, ordered plan
+depth, and matching promoted Playbook lessons.
+It records every proposal, score, selection reason, checkpoint revision, and cited lesson ID
+in `race_brain_coordinated`; only the selected proposal enters the unchanged safety and
+dispatch path. Playbook data never changes HIMA's upstream input contract.
+
+The coordination event also records `valid_member_count` and `degraded_member_ids`. A
+checkpoint that emits an unknown action token remains visible as a degraded member, but it
+cannot outrank another member with a valid Runtime frontier. RTSCortex does not guess a
+mapping for model-specific placeholders such as `supply:12` or skip an invalid earlier step.
+
+The public race-brain catalog covers the nine released HIMA checkpoints: Protoss, Terran,
+and Zerg `a/b/c`. Live v0.4 dispatch is intentionally restricted to Protoss because the
+current HIMA observation vocabulary and RTSCortex macro-action mapping are Protoss-specific.
+A Terran or Zerg ensemble configuration fails before model startup with an explicit missing
+adapter/mapping error; registration is not presented as execution support.
+
+CortexPlaybook is a separate cross-run SQLite database. Post-game review stores every macro
+decision with source run, command lineage, effect evidence, consequence, failure owner, and
+confidence. Translation, PySC2, placement, or effect-verification failures remain diagnostic
+cases and are never promoted as tactical rules. A positive lesson is promoted only after the
+same race, opponent, phase, and semantic action has produced a verified effect in at least
+two winning episodes. Retrieval requires exact race and opponent matches, then ranks phase,
+map, tags, confidence, and support count. This conservative policy makes the notebook
+iterative without allowing one noisy loss or an engineering fault to poison later games.
+
+The durable v0.4 observability events are `race_brain_coordinated`, `playbook_retrieved`,
+`playbook_case_recorded`, `playbook_lesson_candidate`, `playbook_lesson_promoted`, and
+`postgame_review_completed`. They use the existing EventStore/WebSocket path and are visible
+in Live Console without opening a second control interface.
+
 The canonical `SC2State` contains economy, production queue, own units, own structures,
 and visible enemies. This is sufficient for the v0.1 runtime and deliberately matches the
 semantic boundary needed by a future action-conditioned world model.
@@ -156,6 +215,10 @@ semantic boundary needed by a future action-conditioned world model.
 - Planner context contains a compact snapshot of every active `pending`, `deferred`, and
   `dispatched` command. Accepting an equivalent plan retains the existing command ID instead
   of refreshing its TTL or creating another dispatch.
+- If an action reaches a terminal outcome while a specialist request is running, the
+  returned proposal is rebuilt and revalidated against the latest observation. It is
+  accepted only when the current Runtime frontier remains legal; state changes no longer
+  force an otherwise valid three-model proposal to be discarded.
 - Each actor has at most one in-flight dispatched command. Planner work for a busy actor is
   deferred, and Reflex work is suppressed until that command reaches one terminal report.
 - Multiple Planner commands for one actor remain ordered in lifecycle state; the Runtime

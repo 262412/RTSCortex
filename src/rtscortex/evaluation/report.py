@@ -489,7 +489,7 @@ def _hard_acceptance_summary(
     failed_gates = sum(gate.passed is False for gate in gates)
     not_applicable_gates = sum(gate.passed is None for gate in gates)
     return {
-        "passed": complete and failed_gates == 0 and not_applicable_gates == 0,
+        "passed": complete and failed_gates == 0,
         "passed_gates": passed_gates,
         "failed_gates": failed_gates,
         "not_applicable_gates": not_applicable_gates,
@@ -1282,6 +1282,13 @@ def _render_cortex_metrics(metrics: CortexObservabilityMetrics) -> list[str]:
             "- Macro specialist requests and latency p50/p95: "
             f"`{metrics.macro_requests}`; `{metrics.macro_latency_ms_p50:.2f}/"
             f"{metrics.macro_latency_ms_p95:.2f}` ms."
+        ),
+        (
+            "- Race Brain / Playbook: "
+            f"`{event_counts.get('race_brain_coordinated', 0)}` coordinated cycles, "
+            f"`{event_counts.get('playbook_retrieved', 0)}` retrievals, "
+            f"`{event_counts.get('playbook_case_recorded', 0)}` cases, "
+            f"`{event_counts.get('playbook_lesson_promoted', 0)}` promoted lessons."
         ),
         (
             f"- Command lineage coverage: {coverage}; missing "

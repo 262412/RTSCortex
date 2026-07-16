@@ -50,6 +50,24 @@ and launch commands.
 See [the architecture overview](docs/architecture/overview.md) for the data flow and
 extension contracts.
 
+The SC2-native v0.4 profile uses all three HIMA specialists for the active Protoss race,
+a deterministic environment-aware coordinator, and a persistent cross-run
+CortexPlaybook. The single HIMA-a profiles remain canary/regression baselines. Once the
+three pinned local snapshots pass `doctor`, launch the ensemble with:
+
+```bash
+uv run rtscortex doctor \
+  --config configs/experiments/live_simple64_hima_ensemble_cortex_v0_4.yaml
+uv run rtscortex run \
+  --config configs/experiments/live_simple64_hima_ensemble_cortex_v0_4.yaml \
+  --console
+uv run rtscortex playbook show --promoted-only
+```
+
+Terran and Zerg a/b/c checkpoint identities are pinned in the public Race Brain catalog,
+but live dispatch remains unavailable until their race-specific observation vocabularies
+and Runtime action mappings are implemented.
+
 Policy Comparison v0.2 provides a 48-state, six-stratum shadow benchmark for the current
 Qwen planner and optional local HIMA Protoss specialists. It never dispatches candidate
 actions and never downloads model weights. Start with the fully offline workflow:

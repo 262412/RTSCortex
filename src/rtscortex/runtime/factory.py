@@ -4,10 +4,17 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
+from typing import cast
 
 from rtscortex.config import ExperimentConfig
 from rtscortex.contracts import LLMProvider
+from rtscortex.cortex.race_brain import (
+    HIMACluster,
+    HIMAEnsemblePolicyClient,
+    HIMAEnsembleSidecar,
+)
 from rtscortex.memory import EventStore
+from rtscortex.playbook import CortexPlaybookReviewer, PlaybookStore
 from rtscortex.policy.hima.live import HIMALivePolicyClient
 from rtscortex.providers import FakeProvider, OpenAICompatibleProvider
 from rtscortex.runtime.engine import RuntimeEngine
@@ -59,8 +66,8 @@ def _build_cortex_runtime(
 ) -> RuntimeEngine:
     from rtscortex.runtime.cortex_engine import CortexRuntimeEngine
 
-    macro_client: HIMALivePolicyClient | None = None
-    macro_sidecar: HIMASidecarProcess | None = None
+    macro_client: HIMALivePolicyClient | HIMAEnsemblePolicyClient | None = None
+    macro_sidecar: HIMASidecarProcess | HIMAEnsembleSidecar | None = None
     macro_startup_failure: Exception | None = None
     if config.cortex.macro.kind == "hima":
         try:
@@ -69,6 +76,26 @@ def _build_cortex_runtime(
             if config.cortex.macro.required:
                 raise
             macro_startup_failure = error
+    elif config.cortex.macro.kind == "hima_ensemble":
+        try:
+            macro_client, macro_sidecar = _build_hima_ensemble(config, run_dir)
+        except Exception as error:
+            if config.cortex.macro.required:
+                raise
+            macro_startup_failure = error
+    playbook_store = (
+        PlaybookStore(config.cortex.playbook.database_path)
+        if config.cortex.playbook.enabled
+        else None
+    )
+    playbook_reviewer = (
+        CortexPlaybookReviewer(
+            playbook_store,
+            promotion_support=config.cortex.playbook.promotion_support,
+        )
+        if playbook_store is not None
+        else None
+    )
     return CortexRuntimeEngine(
         config=config,
         store=store,
@@ -76,6 +103,8 @@ def _build_cortex_runtime(
         macro_client=macro_client,
         macro_sidecar=macro_sidecar,
         macro_startup_failure=macro_startup_failure,
+        playbook_store=playbook_store,
+        playbook_reviewer=playbook_reviewer,
     )
 
 
@@ -93,7 +122,7 @@ def _build_hima_sidecar(
     )
 
     runtime_root = config.run.runtime_root.expanduser().resolve()
-    socket_path = _hima_socket_path(runtime_root, run_dir)
+    socket_path = _hima_socket_path(runtime_root, run_dir, macro.candidate)
     command = hima_sidecar_command(
         macro.python_executable.expanduser(),
         socket_path=socket_path,
@@ -125,10 +154,76 @@ def _build_hima_sidecar(
     return client, sidecar
 
 
-def _hima_socket_path(runtime_root: Path, run_dir: Path) -> Path:
+def _build_hima_ensemble(
+    config: ExperimentConfig,
+    run_dir: Path,
+) -> tuple[HIMAEnsemblePolicyClient, HIMAEnsembleSidecar]:
+    macro = config.cortex.macro
+    candidates = [member.candidate for member in macro.ensemble_members]
+    race = candidates[0].rsplit("-", 1)[0]
+    if race != "protoss":
+        raise HIMASidecarError(
+            f"HIMA {race} checkpoints are registered but live {race} observation, "
+            "vocabulary and Runtime action mappings are not implemented yet"
+        )
+    clients: dict[str, HIMALivePolicyClient] = {}
+    sidecars: list[HIMASidecarProcess] = []
+    clusters_by_device: dict[str, list[HIMACluster]] = {}
+    runtime_root = config.run.runtime_root.expanduser().resolve()
+    for member in sorted(macro.ensemble_members, key=lambda item: item.candidate):
+        cluster = cast(HIMACluster, member.candidate.rsplit("-", 1)[1])
+        checkpoint = validate_local_hima_checkpoint(
+            candidate=member.candidate,
+            model_path=member.model_path,
+            allow_unlicensed_weights=macro.allow_unlicensed_weights,
+        )
+        socket_path = _hima_socket_path(runtime_root, run_dir, member.candidate)
+        command = hima_sidecar_command(
+            macro.python_executable.expanduser(),
+            socket_path=socket_path,
+            model_id=checkpoint.model_id,
+            model_path=checkpoint.model_path,
+            device=member.device,
+            max_new_tokens=macro.max_new_tokens,
+            allow_unlicensed_weights=macro.allow_unlicensed_weights,
+        )
+        validate_sidecar_executable(command)
+        client = HIMALivePolicyClient.for_unix_socket(
+            socket_path,
+            timeout_seconds=macro.timeout_seconds,
+            expected_model_id=checkpoint.model_id,
+        )
+        sidecar = HIMASidecarProcess(
+            HIMASidecarSpec(
+                command=command,
+                socket_path=socket_path,
+                stdout_path=run_dir / f"hima-{member.candidate}.stdout.log",
+                stderr_path=run_dir / f"hima-{member.candidate}.stderr.log",
+                shutdown_timeout_seconds=config.environment.shutdown_timeout_seconds,
+            ),
+            client,
+            expected_model_id=checkpoint.model_id,
+            expected_model_revision=checkpoint.revision,
+        )
+        clients[cluster] = client
+        sidecars.append(sidecar)
+        clusters_by_device.setdefault(member.device, []).append(cluster)
+    ensemble_client = HIMAEnsemblePolicyClient(
+        clients,
+        race="protoss",
+        execution_groups=tuple(tuple(group) for group in clusters_by_device.values()),
+    )
+    return ensemble_client, HIMAEnsembleSidecar(sidecars, ensemble_client)
+
+
+def _hima_socket_path(
+    runtime_root: Path,
+    run_dir: Path,
+    identity: str = "single",
+) -> Path:
     """Return a deterministic short UDS path scoped to one run directory."""
 
-    run_identity = str(run_dir.expanduser().resolve()).encode()
+    run_identity = f"{run_dir.expanduser().resolve()}|{identity}".encode()
     digest = hashlib.sha256(run_identity).hexdigest()[:16]
     socket_path = runtime_root / "hima" / f"{digest}.sock"
     if len(str(socket_path).encode()) > _UDS_PATH_LIMIT:

@@ -9,6 +9,17 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 RaceName: TypeAlias = Literal["random", "protoss", "terran", "zerg"]
+HIMACandidate: TypeAlias = Literal[
+    "protoss-a",
+    "protoss-b",
+    "protoss-c",
+    "terran-a",
+    "terran-b",
+    "terran-c",
+    "zerg-a",
+    "zerg-b",
+    "zerg-c",
+]
 BotDifficulty: TypeAlias = Literal[
     "very_easy",
     "easy",
@@ -90,8 +101,14 @@ class CortexSituationSettings(SettingsModel):
     kind: Literal["deterministic"] = "deterministic"
 
 
+class CortexHIMAEnsembleMemberSettings(SettingsModel):
+    candidate: HIMACandidate
+    model_path: Path
+    device: str = "cuda:0"
+
+
 class CortexMacroSettings(SettingsModel):
-    kind: Literal["disabled", "hima"] = "disabled"
+    kind: Literal["disabled", "hima", "hima_ensemble"] = "disabled"
     candidate: Literal["protoss-a", "protoss-b", "protoss-c"] = "protoss-a"
     python_executable: Path = Path("~/fastscratch/envs/rtscortex-hima/bin/python")
     model_path: Path | None = None
@@ -103,11 +120,25 @@ class CortexMacroSettings(SettingsModel):
     timeout_seconds: float = Field(default=12.0, gt=0.0)
     max_new_tokens: int = Field(default=512, ge=1)
     restart_limit: int = Field(default=1, ge=0)
+    ensemble_members: list[CortexHIMAEnsembleMemberSettings] = Field(default_factory=list)
+    coordinator: Literal["deterministic_v1"] = "deterministic_v1"
 
     @model_validator(mode="after")
     def require_hima_model_path(self) -> CortexMacroSettings:
         if self.kind == "hima" and self.model_path is None:
             raise ValueError("cortex HIMA macro policy requires model_path")
+        if self.kind == "hima_ensemble":
+            candidates = [member.candidate for member in self.ensemble_members]
+            if len(candidates) != 3 or len(set(candidates)) != 3:
+                raise ValueError("HIMA ensemble requires exactly three distinct members")
+            races = {candidate.rsplit("-", 1)[0] for candidate in candidates}
+            clusters = {candidate.rsplit("-", 1)[1] for candidate in candidates}
+            if len(races) != 1 or clusters != {"a", "b", "c"}:
+                raise ValueError(
+                    "HIMA ensemble members must be the a/b/c checkpoints for one race"
+                )
+        elif self.ensemble_members:
+            raise ValueError("ensemble_members are only valid for kind=hima_ensemble")
         return self
 
 
@@ -127,12 +158,22 @@ class CortexExplanationSettings(SettingsModel):
     enabled: bool = False
 
 
+class CortexPlaybookSettings(SettingsModel):
+    enabled: bool = False
+    database_path: Path = Path("~/scratch/outputs/RTSCortex/cortex-playbook.sqlite3")
+    top_k: int = Field(default=6, ge=1, le=20)
+    min_confidence: float = Field(default=0.6, ge=0.0, le=1.0)
+    promotion_support: int = Field(default=2, ge=1)
+    include_candidates: bool = False
+
+
 class CortexSettings(SettingsModel):
     situation: CortexSituationSettings = Field(default_factory=CortexSituationSettings)
     macro: CortexMacroSettings = Field(default_factory=CortexMacroSettings)
     tactical: CortexTacticalSettings = Field(default_factory=CortexTacticalSettings)
     executor: CortexExecutorSettings = Field(default_factory=CortexExecutorSettings)
     explanation: CortexExplanationSettings = Field(default_factory=CortexExplanationSettings)
+    playbook: CortexPlaybookSettings = Field(default_factory=CortexPlaybookSettings)
 
 
 class ReflexSettings(SettingsModel):
@@ -192,6 +233,18 @@ class ExperimentConfig(SettingsModel):
     evaluation: EvaluationSettings = Field(default_factory=EvaluationSettings)
     console: ConsoleSettings = Field(default_factory=ConsoleSettings)
 
+    @model_validator(mode="after")
+    def validate_race_brain_matches_agent(self) -> ExperimentConfig:
+        if self.cortex.macro.kind != "hima_ensemble":
+            return self
+        race = self.cortex.macro.ensemble_members[0].candidate.rsplit("-", 1)[0]
+        if self.environment.agent_race != race:
+            raise ValueError(
+                "HIMA ensemble race must match environment.agent_race; "
+                f"received {race} brain for {self.environment.agent_race} agent"
+            )
+        return self
+
     def expanded(self) -> ExperimentConfig:
         data = self.model_dump()
         data["run"]["output_root"] = self.run.output_root.expanduser()
@@ -204,6 +257,11 @@ class ExperimentConfig(SettingsModel):
         )
         if self.cortex.macro.model_path is not None:
             data["cortex"]["macro"]["model_path"] = self.cortex.macro.model_path.expanduser()
+        for member in data["cortex"]["macro"]["ensemble_members"]:
+            member["model_path"] = Path(member["model_path"]).expanduser()
+        data["cortex"]["playbook"]["database_path"] = (
+            self.cortex.playbook.database_path.expanduser()
+        )
         return ExperimentConfig.model_validate(data)
 
 

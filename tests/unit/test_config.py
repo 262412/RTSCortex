@@ -8,6 +8,7 @@ from pydantic import ValidationError
 from rtscortex.config import (
     AgentSettings,
     ConsoleSettings,
+    CortexHIMAEnsembleMemberSettings,
     CortexMacroSettings,
     CortexSettings,
     EnvironmentSettings,
@@ -122,3 +123,52 @@ def test_expanded_config_expands_cortex_runtime_paths() -> None:
     assert config.cortex.macro.python_executable.is_absolute()
     assert config.cortex.macro.model_path is not None
     assert config.cortex.macro.model_path.is_absolute()
+
+
+def test_hima_ensemble_requires_one_race_and_all_three_clusters() -> None:
+    members = [
+        CortexHIMAEnsembleMemberSettings(
+            candidate=f"protoss-{cluster}",  # type: ignore[arg-type]
+            model_path=Path(f"/models/{cluster}"),
+        )
+        for cluster in ("a", "b", "c")
+    ]
+
+    settings = CortexMacroSettings(kind="hima_ensemble", ensemble_members=members)
+
+    assert [member.candidate for member in settings.ensemble_members] == [
+        "protoss-a",
+        "protoss-b",
+        "protoss-c",
+    ]
+
+
+def test_hima_ensemble_rejects_mixed_races_and_agent_mismatch() -> None:
+    with pytest.raises(ValidationError, match="a/b/c checkpoints for one race"):
+        CortexMacroSettings.model_validate(
+            {
+                "kind": "hima_ensemble",
+                "ensemble_members": [
+                    {"candidate": "protoss-a", "model_path": "/models/a"},
+                    {"candidate": "terran-b", "model_path": "/models/b"},
+                    {"candidate": "protoss-c", "model_path": "/models/c"},
+                ],
+            }
+        )
+
+    with pytest.raises(ValidationError, match="race must match"):
+        ExperimentConfig.model_validate(
+            {
+                "environment": {"agent_race": "terran"},
+                "agent": {"variant": "cortex"},
+                "cortex": {
+                    "macro": {
+                        "kind": "hima_ensemble",
+                        "ensemble_members": [
+                            {"candidate": f"protoss-{cluster}", "model_path": f"/models/{cluster}"}
+                            for cluster in ("a", "b", "c")
+                        ],
+                    }
+                },
+            }
+        )

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import json
 import time
 from dataclasses import asdict, dataclass
 from typing import Any, Protocol
@@ -16,6 +17,7 @@ from rtscortex.contracts import (
     ActionBatch,
     ActionCommand,
     ActionSource,
+    EpisodeResult,
     ExecutionReport,
     ExecutionStatus,
     IdleReason,
@@ -40,10 +42,26 @@ from rtscortex.cortex import (
     macro_plan_from_hima,
     runtime_frontier,
 )
+from rtscortex.cortex.race_brain import (
+    HIMAEnsemblePolicyClient,
+    MacroPolicyHealth,
+    MacroPolicyResponse,
+    RaceBrainHealth,
+    RaceBrainProposalResponse,
+    RaceBrainStrategicContext,
+    selected_hima_response,
+)
 from rtscortex.memory import EventStore
+from rtscortex.playbook import (
+    CortexPlaybookReviewer,
+    LessonStatus,
+    PlaybookContext,
+    PlaybookQuery,
+    PlaybookSelection,
+    PlaybookStore,
+)
 from rtscortex.policy.hima import (
     HIMAInputContext,
-    HIMALiveHealth,
     HIMALiveProposalResponse,
 )
 from rtscortex.policy.models import (
@@ -83,14 +101,14 @@ def _macro_frontier_is_usable(frontier: PolicyActionAssessment | None) -> bool:
 class MacroPolicyClient(Protocol):
     """The narrow transport surface required by the Cortex runtime."""
 
-    async def health(self) -> HIMALiveHealth: ...
+    async def health(self) -> MacroPolicyHealth: ...
 
     async def propose(
         self,
         context: HIMAInputContext,
         *,
         request_id: str | None = None,
-    ) -> HIMALiveProposalResponse: ...
+    ) -> MacroPolicyResponse: ...
 
     async def close(self) -> None: ...
 
@@ -98,9 +116,9 @@ class MacroPolicyClient(Protocol):
 class MacroPolicySidecar(Protocol):
     """Lifecycle owner for a process-isolated macro specialist."""
 
-    async def start(self) -> HIMALiveHealth: ...
+    async def start(self) -> MacroPolicyHealth: ...
 
-    async def restart(self) -> HIMALiveHealth: ...
+    async def restart(self) -> MacroPolicyHealth: ...
 
     async def close(self) -> None: ...
 
@@ -132,17 +150,19 @@ class CortexRuntimeEngine(RuntimeEngine):
         macro_client: MacroPolicyClient | None = None,
         macro_sidecar: MacroPolicySidecar | None = None,
         macro_startup_failure: Exception | None = None,
+        playbook_store: PlaybookStore | None = None,
+        playbook_reviewer: CortexPlaybookReviewer | None = None,
     ) -> None:
         if config.agent.variant != "cortex":
             raise ValueError("CortexRuntimeEngine requires agent.variant=cortex")
         if macro_sidecar is not None and macro_client is None:
             raise ValueError("a macro sidecar requires its matching client")
         if (
-            config.cortex.macro.kind == "hima"
+            config.cortex.macro.kind in {"hima", "hima_ensemble"}
             and macro_client is None
             and macro_startup_failure is None
         ):
-            raise ValueError("cortex.macro.kind=hima requires a live macro client")
+            raise ValueError("enabled cortex macro policy requires a live macro client")
         if macro_startup_failure is not None and config.cortex.macro.required:
             raise ValueError("required macro specialists cannot start in degraded mode")
         if config.cortex.macro.kind == "disabled" and macro_client is not None:
@@ -154,11 +174,11 @@ class CortexRuntimeEngine(RuntimeEngine):
         )
         self._macro_client = macro_client
         self._macro_sidecar = macro_sidecar
-        self._macro_health: HIMALiveHealth | None = None
+        self._macro_health: MacroPolicyHealth | None = None
         self._macro_startup_failure = macro_startup_failure
         self._macro_requests_suspended = macro_startup_failure is not None
         self._macro_health_announced_for: tuple[str, str] | None = None
-        self._macro_task: asyncio.Task[HIMALiveProposalResponse] | None = None
+        self._macro_task: asyncio.Task[MacroPolicyResponse] | None = None
         self._macro_source_observation: ObservationEnvelope | None = None
         self._macro_task_started_at: float | None = None
         self._macro_task_outcome_revision: int | None = None
@@ -168,6 +188,10 @@ class CortexRuntimeEngine(RuntimeEngine):
         self._next_macro_retry_game_loop: int | None = None
         self._macro_plan: MacroPlan | None = None
         self._macro_proposal: MacroPolicyProposal | None = None
+        self._playbook_store = playbook_store
+        self._playbook_reviewer = playbook_reviewer
+        self._playbook_selection: PlaybookSelection | None = None
+        self._playbook_selection_fingerprint: tuple[str, ...] | None = None
         self._macro_goal: GoalSpec | None = None
         self._macro_plan_frozen = False
         self._macro_inflight_command_id: str | None = None
@@ -215,12 +239,13 @@ class CortexRuntimeEngine(RuntimeEngine):
 
         assessment = self._situation.assess(observation)
         self._record_cortex_event(observation, "situation_assessed", assessment)
+        self._refresh_playbook(observation, assessment)
 
         goal_progress = self._macro_goal_progress(observation)
         self._record_goal_progress_if_changed(observation, goal_progress)
 
         if self._should_start_macro(observation):
-            await self._begin_macro_cycle(observation)
+            await self._begin_macro_cycle(observation, assessment)
             if (
                 self.config.environment.pause_until_first_plan
                 and self._macro_plan is None
@@ -439,6 +464,8 @@ class CortexRuntimeEngine(RuntimeEngine):
         self._macro_health_announced_for = None
         self._macro_plan = None
         self._macro_proposal = None
+        self._playbook_selection = None
+        self._playbook_selection_fingerprint = None
         self._macro_goal = None
         self._macro_plan_frozen = False
         self._macro_inflight_command_id = None
@@ -463,8 +490,12 @@ class CortexRuntimeEngine(RuntimeEngine):
             self._macro_plan = MacroPlan.model_validate(plan_payload)
             raw_response = self._macro_plan.raw_proposal
             if raw_response:
-                response = HIMALiveProposalResponse.model_validate(raw_response)
-                self._macro_proposal = response.proposal
+                if "selected" in raw_response:
+                    coordinated = RaceBrainProposalResponse.model_validate(raw_response)
+                    self._macro_proposal = coordinated.selected.proposal
+                else:
+                    response = HIMALiveProposalResponse.model_validate(raw_response)
+                    self._macro_proposal = response.proposal
             goal_payload = plan_event.payload.get("goal_spec")
             if goal_payload is not None:
                 self._macro_goal = GoalSpec.model_validate(goal_payload)
@@ -590,6 +621,14 @@ class CortexRuntimeEngine(RuntimeEngine):
                 "model_id": self._macro_health.model_id,
                 "model_revision": self._macro_health.model_revision,
                 "status": self._macro_health.status,
+                "members": (
+                    [
+                        member.model_dump(mode="json")
+                        for member in self._macro_health.members
+                    ]
+                    if isinstance(self._macro_health, RaceBrainHealth)
+                    else None
+                ),
             },
         )
 
@@ -616,7 +655,11 @@ class CortexRuntimeEngine(RuntimeEngine):
             >= self.config.cortex.macro.interval_game_loops
         )
 
-    async def _begin_macro_cycle(self, observation: ObservationEnvelope) -> None:
+    async def _begin_macro_cycle(
+        self,
+        observation: ObservationEnvelope,
+        assessment: SituationAssessment,
+    ) -> None:
         assert self._macro_client is not None
         macro_client = self._macro_client
         self._last_planner_started_game_loop = observation.game_loop
@@ -644,15 +687,25 @@ class CortexRuntimeEngine(RuntimeEngine):
             },
         )
 
-        async def request() -> HIMALiveProposalResponse:
-            return await asyncio.wait_for(
-                macro_client.propose(
-                    HIMAInputContext(
-                        observation=observation,
-                        previous_actions=tuple(previous_actions),
+        async def request() -> MacroPolicyResponse:
+            context = HIMAInputContext(
+                observation=observation,
+                previous_actions=tuple(previous_actions),
+            )
+            if isinstance(macro_client, HIMAEnsemblePolicyClient):
+                return await asyncio.wait_for(
+                    macro_client.propose(
+                        context,
+                        request_id=request_id,
+                        strategic_context=RaceBrainStrategicContext(
+                            situation=assessment,
+                            playbook=self._playbook_selection,
+                        ),
                     ),
-                    request_id=request_id,
-                ),
+                    timeout=self.config.cortex.macro.timeout_seconds,
+                )
+            return await asyncio.wait_for(
+                macro_client.propose(context, request_id=request_id),
                 timeout=self.config.cortex.macro.timeout_seconds,
             )
 
@@ -682,35 +735,59 @@ class CortexRuntimeEngine(RuntimeEngine):
         self._macro_task_started_at = None
         self._macro_task_outcome_revision = None
         latency_ms = 0.0 if started_at is None else (time.perf_counter() - started_at) * 1_000
-        if source_outcome_revision != self._macro_outcome_revision:
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                task.result()
-            self._urgent_replan_requested = True
-            self._record_cortex_event(
-                observation,
-                "macro_plan_rejected",
-                {
-                    "role": CortexRole.MACRO.value,
-                    "model_id": (
-                        None if self._macro_health is None else self._macro_health.model_id
-                    ),
-                    "reason": "stale_after_macro_outcome",
-                    "latency_ms": latency_ms,
-                    "source_outcome_revision": source_outcome_revision,
-                    "current_outcome_revision": self._macro_outcome_revision,
-                },
-            )
-            return
+        revalidate_after_outcome = source_outcome_revision != self._macro_outcome_revision
+        policy_response: MacroPolicyResponse | None = None
         response: HIMALiveProposalResponse | None = None
         try:
-            response = task.result()
+            policy_response = task.result()
+            response = selected_hima_response(policy_response)
             if source_observation is None:
                 raise RuntimeError("macro proposal completed without its source observation")
+            if revalidate_after_outcome:
+                self._record_cortex_event(
+                    observation,
+                    "macro_proposal_revalidated",
+                    {
+                        "role": CortexRole.MACRO.value,
+                        "model_id": (
+                            None
+                            if self._macro_health is None
+                            else self._macro_health.model_id
+                        ),
+                        "source_game_loop": source_observation.game_loop,
+                        "current_game_loop": observation.game_loop,
+                        "source_outcome_revision": source_outcome_revision,
+                        "current_outcome_revision": self._macro_outcome_revision,
+                    },
+                )
             plan = macro_plan_from_hima(
                 response,
                 source_observation,
                 self.config.cortex.macro.plan_ttl_game_loops,
+                current_observation=(observation if revalidate_after_outcome else None),
             )
+            if isinstance(policy_response, RaceBrainProposalResponse):
+                raw = policy_response.model_dump(mode="json")
+                plan_digest = hashlib.sha256(
+                    json.dumps(raw, sort_keys=True, separators=(",", ":")).encode()
+                ).hexdigest()
+                plan = plan.model_copy(
+                    update={
+                        "plan_id": f"macro-plan:{plan_digest}",
+                        "source_model_id": f"hima-{policy_response.race}-ensemble",
+                        "source_model_revision": (
+                            self._macro_health.model_revision
+                            if isinstance(self._macro_health, RaceBrainHealth)
+                            else "member_revisions_in_raw_proposal"
+                        ),
+                        "raw_proposal": raw,
+                    }
+                )
+                self._record_cortex_event(
+                    observation,
+                    "race_brain_coordinated",
+                    policy_response,
+                )
             frontier = runtime_frontier(
                 response.proposal,
                 observation,
@@ -779,8 +856,7 @@ class CortexRuntimeEngine(RuntimeEngine):
                 "requests_suspended": self._macro_requests_suspended,
                 "generation_metadata": (
                     None
-                    if response is None
-                    or response.proposal.generation_metadata is None
+                    if response is None or response.proposal.generation_metadata is None
                     else response.proposal.generation_metadata.model_dump(mode="json")
                 ),
             }
@@ -1515,6 +1591,93 @@ class CortexRuntimeEngine(RuntimeEngine):
             payload=payload,
         )
 
+    def _refresh_playbook(
+        self,
+        observation: ObservationEnvelope,
+        assessment: SituationAssessment,
+    ) -> None:
+        if self._playbook_store is None:
+            self._playbook_selection = None
+            return
+        query = PlaybookQuery(
+            context=PlaybookContext(
+                agent_race=self.config.environment.agent_race,
+                opponent_race=self.config.environment.opponent_race,
+                phase=assessment.phase,
+                map_name=self.config.environment.scenario,
+                tags=tuple(assessment.threats),
+            ),
+            top_k=self.config.cortex.playbook.top_k,
+            min_confidence=self.config.cortex.playbook.min_confidence,
+            include_candidates=self.config.cortex.playbook.include_candidates,
+        )
+        selection = self._playbook_store.retrieve(query)
+        fingerprint = (assessment.phase.value, *selection.lesson_ids)
+        self._playbook_selection = selection
+        if fingerprint == self._playbook_selection_fingerprint:
+            return
+        self._playbook_selection_fingerprint = fingerprint
+        self._record_cortex_event(
+            observation,
+            "playbook_retrieved",
+            {
+                "phase": assessment.phase.value,
+                "lesson_ids": list(selection.lesson_ids),
+                "hit_count": len(selection.hits),
+                "hits": [hit.model_dump(mode="json") for hit in selection.hits],
+            },
+        )
+
+    def end_episode(self, result: EpisodeResult) -> None:
+        already_recorded = self._episode_result_fingerprint is not None
+        super().end_episode(result)
+        if already_recorded or self._playbook_reviewer is None:
+            return
+        events = self.store.events_after(
+            result.run_id,
+            0,
+            100_000,
+            episode_id=result.episode_id,
+        )
+        cases, lessons = self._playbook_reviewer.review_episode(
+            events,
+            result,
+            agent_race=self.config.environment.agent_race,
+            opponent_race=self.config.environment.opponent_race,
+        )
+        for case in cases:
+            self.store.append_event(
+                run_id=result.run_id,
+                episode_id=result.episode_id,
+                step_id=result.steps,
+                event_type="playbook_case_recorded",
+                payload=case,
+            )
+        for lesson in lessons:
+            event_type = (
+                "playbook_lesson_promoted"
+                if lesson.status is LessonStatus.PROMOTED
+                else "playbook_lesson_candidate"
+            )
+            self.store.append_event(
+                run_id=result.run_id,
+                episode_id=result.episode_id,
+                step_id=result.steps,
+                event_type=event_type,
+                payload=lesson,
+            )
+        self.store.append_event(
+            run_id=result.run_id,
+            episode_id=result.episode_id,
+            step_id=result.steps,
+            event_type="postgame_review_completed",
+            payload={
+                "case_count": len(cases),
+                "lesson_update_count": len(lessons),
+                "playbook_path": str(self._playbook_reviewer.store.database_path),
+            },
+        )
+
     @staticmethod
     def _intent_id(
         observation: ObservationEnvelope,
@@ -1559,7 +1722,11 @@ class CortexRuntimeEngine(RuntimeEngine):
                     if close is not None:
                         await close()
                 finally:
-                    self.store.close()
+                    try:
+                        if self._playbook_store is not None:
+                            self._playbook_store.close()
+                    finally:
+                        self.store.close()
 
     async def _cancel_planner(self) -> None:
         if self._macro_task is not None:

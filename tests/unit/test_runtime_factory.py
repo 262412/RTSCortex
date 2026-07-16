@@ -9,6 +9,7 @@ import pytest
 
 from rtscortex.config import (
     AgentSettings,
+    CortexHIMAEnsembleMemberSettings,
     CortexMacroSettings,
     CortexSettings,
     ExperimentConfig,
@@ -21,19 +22,14 @@ from rtscortex.policy.hima import HIMA_PINNED_REVISIONS
 from rtscortex.providers import FakeProvider
 from rtscortex.runtime import factory
 from rtscortex.runtime.cortex_engine import CortexRuntimeEngine
-from rtscortex.runtime.hima_sidecar import HIMASidecarError
+from rtscortex.runtime.hima_sidecar import HIMASidecarError, HIMASidecarProcess
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _snapshot_path(root: Path, model_id: str) -> Path:
     revision = HIMA_PINNED_REVISIONS[model_id]
-    path = (
-        root
-        / f"models--{model_id.replace('/', '--')}"
-        / "snapshots"
-        / revision
-    )
+    path = root / f"models--{model_id.replace('/', '--')}" / "snapshots" / revision
     path.mkdir(parents=True)
     return path
 
@@ -149,6 +145,49 @@ def test_hima_sidecar_build_fails_closed_without_license_ack(
         factory._build_hima_sidecar(config, tmp_path / "run")
 
 
+def test_build_hima_ensemble_creates_three_distinct_pinned_sidecars(tmp_path: Path) -> None:
+    members = []
+    for cluster in ("a", "b", "c"):
+        candidate = f"protoss-{cluster}"
+        model_id = f"SNUMPR/Protoss-{cluster}"
+        members.append(
+            CortexHIMAEnsembleMemberSettings.model_validate(
+                {
+                    "candidate": candidate,
+                    "model_path": _snapshot_path(tmp_path / "hub", model_id),
+                }
+            )
+        )
+    config = ExperimentConfig(
+        run=RunSettings(runtime_root=Path("/tmp") / f"rtsce-{tmp_path.name[-8:]}"),
+        agent=AgentSettings(variant="cortex"),
+        cortex=CortexSettings(
+            macro=CortexMacroSettings(
+                kind="hima_ensemble",
+                python_executable=Path(sys.executable),
+                ensemble_members=members,
+                allow_unlicensed_weights=True,
+            )
+        ),
+    )
+
+    client, group = factory._build_hima_ensemble(config, tmp_path / "run")
+
+    assert client.race == "protoss"
+    assert len(group._sidecars) == 3
+    assert all(isinstance(sidecar, HIMASidecarProcess) for sidecar in group._sidecars)
+    typed_sidecars = [
+        sidecar for sidecar in group._sidecars if isinstance(sidecar, HIMASidecarProcess)
+    ]
+    assert len({sidecar.spec.socket_path for sidecar in typed_sidecars}) == 3
+    assert [sidecar.expected_model_id for sidecar in typed_sidecars] == [
+        "SNUMPR/Protoss-a",
+        "SNUMPR/Protoss-b",
+        "SNUMPR/Protoss-c",
+    ]
+    asyncio.run(client.close())
+
+
 def test_optional_hima_factory_failure_builds_degraded_reflex_runtime(
     tmp_path: Path,
 ) -> None:
@@ -230,9 +269,7 @@ def test_hima_socket_path_rejects_an_overlong_runtime_root(tmp_path: Path) -> No
 
 
 def test_live_hima_cortex_example_is_safe_by_default() -> None:
-    config = load_config(
-        PROJECT_ROOT / "configs/experiments/live_simple64_hima_a_cortex.yaml"
-    )
+    config = load_config(PROJECT_ROOT / "configs/experiments/live_simple64_hima_a_cortex.yaml")
 
     assert config.agent.variant == "cortex"
     assert config.cortex.macro.kind == "hima"
@@ -265,3 +302,24 @@ def test_live_hima_cortex_regression_uses_long_multi_seed_window() -> None:
     assert config.environment.game_steps_per_episode == 10_000
     assert config.evaluation.seeds == [0, 1, 2]
     assert config.provider.kind == "fake"
+
+
+def test_live_hima_ensemble_v0_4_enables_cross_run_playbook() -> None:
+    config = load_config(
+        PROJECT_ROOT / "configs/experiments/live_simple64_hima_ensemble_cortex_v0_4.yaml"
+    )
+
+    assert config.cortex.macro.kind == "hima_ensemble"
+    assert [member.candidate for member in config.cortex.macro.ensemble_members] == [
+        "protoss-a",
+        "protoss-b",
+        "protoss-c",
+    ]
+    assert config.cortex.macro.allow_unlicensed_weights is True
+    assert [member.device for member in config.cortex.macro.ensemble_members] == [
+        "cuda:0",
+        "cuda:1",
+        "cuda:1",
+    ]
+    assert config.cortex.playbook.enabled is True
+    assert config.cortex.playbook.database_path.is_absolute()

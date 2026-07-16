@@ -68,6 +68,18 @@ from rtscortex.cortex.models import (
     TacticalIntent,
     ThreatLevel,
 )
+from rtscortex.cortex.race_brain import (
+    HIMAEnsemblePolicyClient,
+    HIMAEnsembleSidecar,
+    MacroPolicyHealth,
+    MacroPolicyResponse,
+    RaceBrainHealth,
+    RaceBrainMemberHealth,
+    RaceBrainMemberProposal,
+    RaceBrainProposalResponse,
+    RaceBrainStrategicContext,
+    selected_hima_response,
+)
 from rtscortex.cortex.situation import DeterministicSituationAnalyzer
 
 __all__ = [
@@ -105,14 +117,23 @@ __all__ = [
     "FastExecutor",
     "FastExecutorContext",
     "GamePhase",
+    "HIMAEnsemblePolicyClient",
+    "HIMAEnsembleSidecar",
     "IntentCandidateCompiler",
     "IntentTarget",
     "IntentTargetKind",
     "MacroIntent",
+    "MacroPolicyHealth",
+    "MacroPolicyResponse",
     "MacroPlan",
     "MacroStep",
     "MacroStepStatus",
     "ReflexIntent",
+    "RaceBrainHealth",
+    "RaceBrainMemberHealth",
+    "RaceBrainMemberProposal",
+    "RaceBrainProposalResponse",
+    "RaceBrainStrategicContext",
     "SavedCandidatePolicy",
     "SituationAnalyzer",
     "SituationAssessment",
@@ -131,5 +152,6 @@ __all__ = [
     "load_executor_corpus",
     "observation_fingerprint",
     "runtime_frontier",
+    "selected_hima_response",
     "verify_executor_corpus",
 ]

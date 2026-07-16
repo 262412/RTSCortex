@@ -21,7 +21,9 @@ from rtscortex.contracts import (
     ExecutionStatus,
 )
 from rtscortex.evaluation.report import (
+    AcceptanceGate,
     ReportError,
+    _hard_acceptance_summary,
     render_timeline,
     write_run_reports,
     write_timeline_report,
@@ -54,6 +56,34 @@ def _write_journal(run_dir: Path, events: list[StoredEvent]) -> None:
         "".join(json.dumps(asdict(event), sort_keys=True) + "\n" for event in events),
         encoding="utf-8",
     )
+
+
+def test_hard_acceptance_allows_not_applicable_gates() -> None:
+    gates = (
+        AcceptanceGate(
+            name="meaningful_command_success_rate",
+            value=1.0,
+            comparison=">=",
+            threshold=0.7,
+            unit="ratio",
+            passed=True,
+        ),
+        AcceptanceGate(
+            name="production_effect_confirmed_rate",
+            value=0.0,
+            comparison=">=",
+            threshold=0.9,
+            unit="ratio",
+            passed=None,
+        ),
+    )
+
+    summary = _hard_acceptance_summary(gates, complete=True)
+
+    assert summary["passed"] is True
+    assert summary["passed_gates"] == 1
+    assert summary["failed_gates"] == 0
+    assert summary["not_applicable_gates"] == 1
 
 
 def test_timeline_renders_live_state_reasoning_actions_and_execution(tmp_path: Path) -> None:

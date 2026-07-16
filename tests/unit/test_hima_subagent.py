@@ -38,20 +38,13 @@ class RecordingGenerator:
 
 def _snapshot_path(tmp_path: Path, model_id: str) -> Path:
     revision = HIMA_PINNED_REVISIONS[model_id]
-    path = (
-        tmp_path
-        / f"models--{model_id.replace('/', '--')}"
-        / "snapshots"
-        / revision
-    )
+    path = tmp_path / f"models--{model_id.replace('/', '--')}" / "snapshots" / revision
     path.mkdir(parents=True)
     return path
 
 
 def test_hima_subagent_adapts_one_user_message_and_parses_macro_proposal() -> None:
-    generator = RecordingGenerator(
-        "Final Actions Summary: <TRAIN PROBE> x 4 <BUILD PYLON>"
-    )
+    generator = RecordingGenerator("Final Actions Summary: <TRAIN PROBE> x 4 <BUILD PYLON>")
     subagent = HIMAPolicySubagent(
         HIMA_PROTOSS_SPECS[0],
         generator,
@@ -110,11 +103,17 @@ def test_hima_subagent_rejects_non_hima_or_unpinned_specs() -> None:
         )
 
 
-def test_pinned_hima_revisions_cover_all_three_official_candidates() -> None:
+def test_pinned_hima_revisions_cover_all_nine_official_race_candidates() -> None:
     assert dict(HIMA_PINNED_REVISIONS) == {
         "SNUMPR/Protoss-a": "95348eea419b2e2d9717d747ca30e05a0cba787d",
         "SNUMPR/Protoss-b": "6b0faaf7c3f7a9544d9fa595a8077cc72a8747a6",
         "SNUMPR/Protoss-c": "09ae752994bcd458d3b91f5b97dcdacd626edccb",
+        "SNUMPR/Terran-a": "192e1117a64417cd70f7e663008e61f6c5ced9b8",
+        "SNUMPR/Terran-b": "f9eec984998e727598336813b0b63b7dad3012c8",
+        "SNUMPR/Terran-c": "32df87695ea1d3b69a8d1592b14857572d540012",
+        "SNUMPR/Zerg-a": "c2bb6b08f531cd96d46c83e004c1312066855a46",
+        "SNUMPR/Zerg-b": "8b74c24921ee921445b27b1e7ce13523cbde9c0a",
+        "SNUMPR/Zerg-c": "79322205ba70ccd56a72645164178aa027d2fbf6",
     }
 
 
@@ -275,13 +274,9 @@ def test_transformers_generator_is_lazy_local_only_user_only_and_deterministic(
 
     assert result == "Actions: ['Probe', 'Pylon']"
     assert imports == ["torch", "transformers"]
-    assert tokenizer.messages == [
-        {"role": "user", "content": '{"supply_used":12}'}
-    ]
+    assert tokenizer.messages == [{"role": "user", "content": '{"supply_used":12}'}]
     assert all(message["role"] != "system" for message in tokenizer.messages)
-    assert tokenizer_factory.calls == [
-        (str(snapshot), {"local_files_only": True})
-    ]
+    assert tokenizer_factory.calls == [(str(snapshot), {"local_files_only": True})]
     assert model_factory.calls == [
         (
             str(snapshot),

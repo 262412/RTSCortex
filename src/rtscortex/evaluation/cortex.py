@@ -23,6 +23,13 @@ CORTEX_EVENT_TYPES = frozenset(
         "specialist_failed",
         "specialist_ready",
         "specialist_recovered",
+        "race_brain_coordinated",
+        "macro_proposal_revalidated",
+        "playbook_retrieved",
+        "playbook_case_recorded",
+        "playbook_lesson_candidate",
+        "playbook_lesson_promoted",
+        "postgame_review_completed",
     }
 )
 

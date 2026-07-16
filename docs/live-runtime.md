@@ -81,6 +81,27 @@ ProgressGuard → Validator → Arbiter → ActionBatch v1.1
 unchanged LLM-PySC2 Bridge → PySC2 → effect verifiers
 ```
 
+This single-checkpoint profile remains a canary and regression baseline. The v0.4
+operational profile is
+`configs/experiments/live_simple64_hima_ensemble_cortex_v0_4.yaml`: it starts Protoss
+`a/b/c`, asks all three specialists for every macro cycle, and lets the deterministic Race
+Brain coordinator choose the current legal plan with matching CortexPlaybook evidence. It
+requires all three exact local snapshots; startup stays offline and fails before SC2 when
+one snapshot is missing or has the wrong revision.
+
+The checked-in configuration targets the current dual-L4 host: Protoss-a uses `cuda:0`,
+while Protoss-b/c use `cuda:1`. This keeps all three checkpoints resident without pushing a
+single 22 GiB device to its startup limit. Separate device groups infer concurrently;
+members sharing one device remain sequential. Operators with one larger GPU may point all
+three members at the same device and retain fully sequential generation.
+
+The persistent tactical notebook can be inspected without starting SC2:
+
+```bash
+uv run rtscortex playbook show \
+  --database ~/scratch/outputs/RTSCortex/cortex-playbook.sqlite3
+```
+
 HIMA receives the exact upstream five-field payload: supply used, supply capacity,
 completed own unit/structure counts, completed research, and confirmed recent macro
 actions. It receives neither enemy state nor executable coordinates/tags. The Runtime

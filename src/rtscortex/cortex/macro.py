@@ -34,6 +34,8 @@ def macro_plan_from_hima(
     response: HIMALiveProposalResponse,
     observation: ObservationEnvelope,
     ttl_game_loops: int,
+    *,
+    current_observation: ObservationEnvelope | None = None,
 ) -> MacroPlan:
     """Project one correlated HIMA response into a typed, immutable macro plan."""
 
@@ -52,10 +54,17 @@ def macro_plan_from_hima(
     ):
         raise ValueError("HIMA response does not match the source observation")
 
+    projection_observation = current_observation or observation
+    if (
+        projection_observation.run_id,
+        projection_observation.episode_id,
+    ) != (observation.run_id, observation.episode_id):
+        raise ValueError("current observation does not match the source episode")
+
     proposal = response.proposal
     assessments = HIMAMacroActionMapper().assess(
         proposal,
-        _live_fixture(observation),
+        _live_fixture(projection_observation),
     )
     assessment_by_step = {
         (assessment.ordinal, assessment.source_action): assessment
@@ -84,11 +93,11 @@ def macro_plan_from_hima(
     ).hexdigest()
     return MacroPlan(
         plan_id=f"macro-plan:{plan_digest}",
-        run_id=observation.run_id,
-        episode_id=observation.episode_id,
-        source_step_id=observation.step_id,
-        created_game_loop=observation.game_loop,
-        expires_game_loop=observation.game_loop + ttl_game_loops,
+        run_id=projection_observation.run_id,
+        episode_id=projection_observation.episode_id,
+        source_step_id=projection_observation.step_id,
+        created_game_loop=projection_observation.game_loop,
+        expires_game_loop=projection_observation.game_loop + ttl_game_loops,
         strategic_objective=(
             proposal.strategic_objective.strip() or "Follow HIMA macro proposal"
         ),
@@ -149,6 +158,10 @@ def _hard_parse_blocker_ordinal(
     """Return the first parser failure encoded in the source HIMA response."""
 
     proposal_payload = plan.raw_proposal.get("proposal")
+    if proposal_payload is None:
+        selected = plan.raw_proposal.get("selected")
+        if isinstance(selected, dict):
+            proposal_payload = selected.get("proposal")
     if not isinstance(proposal_payload, dict):
         return None
     proposal = MacroPolicyProposal.model_validate(proposal_payload)

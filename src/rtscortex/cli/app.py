@@ -34,6 +34,7 @@ from rtscortex.evaluation import (
 )
 from rtscortex.evaluation.replay import replay_event_log
 from rtscortex.memory import EventStore, read_event_log
+from rtscortex.playbook import PlaybookStore
 from rtscortex.policy import (
     LLMPlanningPolicySubagent,
     PolicyShadowComparison,
@@ -69,8 +70,13 @@ executor_corpus_app = typer.Typer(
     no_args_is_help=True,
     help="Build and verify privacy-minimized fast-executor corpora.",
 )
+playbook_app = typer.Typer(
+    no_args_is_help=True,
+    help="Inspect the persistent cross-episode CortexPlaybook.",
+)
 app.add_typer(policy_corpus_app, name="policy-corpus")
 app.add_typer(executor_corpus_app, name="executor-corpus")
+app.add_typer(playbook_app, name="playbook")
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 CONSOLE_STATIC_DIR = Path(__file__).resolve().parents[1] / "console" / "static"
 
@@ -99,7 +105,45 @@ def _active_model_label(config: ExperimentConfig) -> str:
     if config.agent.variant == "cortex" and config.cortex.macro.kind == "hima":
         suffix = config.cortex.macro.candidate.removeprefix("protoss-")
         return f"SNUMPR/Protoss-{suffix}"
+    if config.agent.variant == "cortex" and config.cortex.macro.kind == "hima_ensemble":
+        race = config.cortex.macro.ensemble_members[0].candidate.rsplit("-", 1)[0]
+        return f"HIMA {race.title()} a/b/c Ensemble"
     return config.provider.model
+
+
+@playbook_app.command("show")
+def playbook_show(
+    database: Annotated[
+        Path,
+        typer.Option("--database", dir_okay=False, help="CortexPlaybook SQLite path."),
+    ] = Path("~/scratch/outputs/RTSCortex/cortex-playbook.sqlite3"),
+    promoted_only: Annotated[
+        bool,
+        typer.Option("--promoted-only", help="Hide lessons that still need more evidence."),
+    ] = False,
+) -> None:
+    """Print the current reusable tactical notebook as structured JSON."""
+
+    path = database.expanduser()
+    if not path.is_file():
+        raise typer.BadParameter(
+            f"playbook database does not exist: {path}",
+            param_hint="--database",
+        )
+    store = PlaybookStore(path)
+    try:
+        lessons = store.lessons()
+    finally:
+        store.close()
+    if promoted_only:
+        lessons = [lesson for lesson in lessons if lesson.status.value == "promoted"]
+    typer.echo(
+        json.dumps(
+            [lesson.model_dump(mode="json") for lesson in lessons],
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
 
 
 def _snapshot_config(config: ExperimentConfig, run_dir: Path) -> None:

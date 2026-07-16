@@ -29,6 +29,12 @@ HIMA_PINNED_REVISIONS: Final[Mapping[str, str]] = MappingProxyType(
         "SNUMPR/Protoss-a": "95348eea419b2e2d9717d747ca30e05a0cba787d",
         "SNUMPR/Protoss-b": "6b0faaf7c3f7a9544d9fa595a8077cc72a8747a6",
         "SNUMPR/Protoss-c": "09ae752994bcd458d3b91f5b97dcdacd626edccb",
+        "SNUMPR/Terran-a": "192e1117a64417cd70f7e663008e61f6c5ced9b8",
+        "SNUMPR/Terran-b": "f9eec984998e727598336813b0b63b7dad3012c8",
+        "SNUMPR/Terran-c": "32df87695ea1d3b69a8d1592b14857572d540012",
+        "SNUMPR/Zerg-a": "c2bb6b08f531cd96d46c83e004c1312066855a46",
+        "SNUMPR/Zerg-b": "8b74c24921ee921445b27b1e7ce13523cbde9c0a",
+        "SNUMPR/Zerg-c": "79322205ba70ccd56a72645164178aa027d2fbf6",
     }
 )
 

@@ -109,7 +109,9 @@ from rtscortex.policy.shadow import (
 )
 from rtscortex.policy.subagents import (
     HIERNET_SC2_SPEC,
+    HIMA_ALL_SPECS,
     HIMA_PROTOSS_SPECS,
+    HIMA_RACE_SPECS,
     QWEN3_8B_SPEC,
     LLMPlanningPolicySubagent,
     PolicySubagent,
@@ -128,8 +130,10 @@ __all__ = [
     "HIERNET_SC2_SPEC",
     "HierNetComparisonConfig",
     "HIMA_PINNED_REVISIONS",
+    "HIMA_ALL_SPECS",
     "HIMA_LIVE_PROTOCOL_VERSION",
     "HIMA_PROTOSS_SPECS",
+    "HIMA_RACE_SPECS",
     "HIMA_PROTOSS_ACTIONS",
     "HIMA_RUNTIME_MAPPINGS",
     "HIMA_VARIANTS",

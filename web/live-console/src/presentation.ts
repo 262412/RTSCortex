@@ -35,6 +35,13 @@ const EVENT_TITLES: Record<string, string> = {
   specialist_failed: "专用模型运行失败",
   specialist_ready: "专用模型已就绪",
   specialist_recovered: "专用模型已恢复",
+  race_brain_coordinated: "种族大脑已汇总三位专家",
+  macro_proposal_revalidated: "宏观提案已按最新战况复核",
+  playbook_retrieved: "战术笔记已检索",
+  playbook_case_recorded: "关键决策案例已记录",
+  playbook_lesson_candidate: "候选战术经验已更新",
+  playbook_lesson_promoted: "战术经验已晋升",
+  postgame_review_completed: "赛后复盘已完成",
   episode_summary: "对局总结",
   episode_result: "对局结果",
 };
@@ -108,6 +115,22 @@ const FIELD_LABELS: Record<string, string> = {
   role: "模型职责",
   specialist: "专用模块",
   model_id: "模型 ID",
+  selected_member_id: "选中的专家",
+  coordinator_version: "协调器版本",
+  valid_member_count: "有效专家数",
+  degraded_member_ids: "降级专家",
+  score_reasons: "评分依据",
+  playbook_lesson_ids: "引用战术经验",
+  lesson_ids: "经验 ID",
+  hit_count: "匹配经验数",
+  quality: "决策质量",
+  failure_owner: "失败归属",
+  consequence: "观察到的后果",
+  statement: "战术经验",
+  recommended_action: "建议动作",
+  avoid_action: "应避免动作",
+  support_count: "支持对局数",
+  contradiction_count: "矛盾对局数",
   plan_id: "计划 ID",
   macro_plan_id: "宏观计划 ID",
   intent: "决策意图",
@@ -608,6 +631,40 @@ export function eventSummary(event: StoredEvent): string {
     const steps = asArray(plan.steps ?? payload.steps).length;
     const frontier = readString(payload, "runtime_frontier", "frontier_action");
     return `计划 ${planId} · ${model} · ${steps} 步${frontier ? ` · 当前：${actionLabel(frontier, false)}` : ""}`;
+  }
+  if (event.event_type === "race_brain_coordinated") {
+    const selected = readString(payload, "selected_member_id") ?? "unknown";
+    const rationale = readString(payload, "rationale");
+    const members = asArray(payload.members).length;
+    const degraded = asArray(payload.degraded_member_ids).length;
+    const lessons = asArray(payload.playbook_lesson_ids).length;
+    return `${members} 位 HIMA 专家已提案${degraded ? ` · ${degraded} 位输出异常` : ""} · 采用 ${selected}${lessons ? ` · 引用 ${lessons} 条战术经验` : ""}${rationale ? ` · ${truncate(rationale)}` : ""}`;
+  }
+  if (event.event_type === "macro_proposal_revalidated") {
+    const sourceLoop = readNumber(payload, "source_game_loop") ?? 0;
+    const currentLoop = readNumber(payload, "current_game_loop") ?? 0;
+    return `提案生成期间动作结果发生变化 · loop ${sourceLoop} → ${currentLoop} · 已重新检查当前合法动作`;
+  }
+  if (event.event_type === "playbook_retrieved") {
+    const count = readNumber(payload, "hit_count") ?? asArray(payload.lesson_ids).length;
+    const phase = readString(payload, "phase");
+    return `${phase ? `${semanticScalar(phase, "game_phase")} · ` : ""}找到 ${count} 条可复用战术经验`;
+  }
+  if (event.event_type === "playbook_case_recorded") {
+    const semanticAction = readString(payload, "semantic_action") ?? "unknown";
+    const quality = readString(payload, "quality") ?? "unknown";
+    const consequence = readString(payload, "consequence");
+    return `${actionLabel(semanticAction, false)} · ${semanticScalar(quality)}${consequence ? ` · ${truncate(consequence)}` : ""}`;
+  }
+  if (event.event_type === "playbook_lesson_candidate" || event.event_type === "playbook_lesson_promoted") {
+    const statement = readString(payload, "statement") ?? "战术经验已更新";
+    const support = readNumber(payload, "support_count") ?? 0;
+    return `${event.event_type === "playbook_lesson_promoted" ? "已晋升" : "仍待验证"} · ${support} 局支持 · ${truncate(statement)}`;
+  }
+  if (event.event_type === "postgame_review_completed") {
+    const cases = readNumber(payload, "case_count") ?? 0;
+    const lessons = readNumber(payload, "lesson_update_count") ?? 0;
+    return `复盘 ${cases} 个关键决策 · 更新 ${lessons} 条战术经验`;
   }
   if (event.event_type === "macro_step_updated") {
     const step = asObject(payload.step) ?? payload;
