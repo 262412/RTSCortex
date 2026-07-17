@@ -146,7 +146,7 @@ def create_console_app(
                 except TimeoutError:
                     message = HeartbeatMessage(latest_event_id=store.latest_event_id(hub.run_id))
                 await websocket.send_json(message.model_dump(mode="json"))
-        except WebSocketDisconnect:
+        except (WebSocketDisconnect, asyncio.CancelledError, RuntimeError):
             pass
         finally:
             subscription.close()

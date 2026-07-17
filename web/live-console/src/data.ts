@@ -157,7 +157,7 @@ export function actionName(event: StoredEvent): string | undefined {
     if (name) return name;
   }
   const batch = asObject(payload.batch);
-  for (const value of [payload.commands, batch?.commands, payload.planner_candidates, payload.reflex_candidates]) {
+  for (const value of [payload.commands, payload.candidates, batch?.commands, payload.planner_candidates, payload.reflex_candidates]) {
     if (!Array.isArray(value)) continue;
     for (const command of value) {
       const nested = asObject(command);
@@ -184,11 +184,19 @@ export function eventCategory(event: StoredEvent): Exclude<EventCategory, "all">
   if (isFailure(event)) return "failure";
   const payloadText = JSON.stringify(event.payload).toLowerCase();
   const type = event.event_type.toLowerCase();
-  const source = readString(event.payload, "source")?.toLowerCase();
+  const source = readString(event.payload, "source", "role", "source_role", "intent_kind")?.toLowerCase();
   const action = actionName(event)?.toLowerCase();
   if (source === "reflex" || type.includes("reflex")) return "reflex";
+  if (type === "goal_progress") return "planner";
+  if (
+    action?.startsWith("train_") ||
+    payloadText.includes('"train_') ||
+    payloadText.includes('"effect_kind":"production"') ||
+    type.includes("production")
+  ) return "production";
   if (action?.includes("build") || payloadText.includes("structure") || type.includes("build")) return "build";
   if (action?.includes("attack") || payloadText.includes("combatgroup") || type.includes("combat")) return "combat";
+  if (["situation_assessed", "macro_plan_accepted", "macro_plan_rejected", "macro_step_updated", "intent_emitted", "candidate_set_built", "executor_selection", "command_lineage", "race_brain_coordinated", "playbook_retrieved", "playbook_case_recorded", "playbook_lesson_candidate", "playbook_lesson_promoted", "postgame_review_completed"].includes(type)) return "planner";
   if (["planner", "module", "context", "plan"].some((token) => type.includes(token))) return "planner";
   return "system";
 }

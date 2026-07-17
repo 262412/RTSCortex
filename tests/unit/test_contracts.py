@@ -309,6 +309,36 @@ def test_effect_evidence_accepts_move_start_provenance() -> None:
     assert EffectEvidence.model_validate_json(evidence.model_dump_json()) == evidence
 
 
+def test_effect_evidence_round_trips_production_provenance_without_breaking_legacy() -> None:
+    evidence = EffectEvidence(
+        effect_kind="production",
+        producer_tag="0xabc",
+        producer_type="Stargate",
+        expected_unit_type="VoidRay",
+        expected_order_id=57,
+        baseline_unit_tags=["0x1"],
+        new_unit_tag="0x2",
+        baseline_producer_orders=[16],
+        producer_orders=[57],
+        production_order_seen=True,
+        confirmation_kind="producer_order",
+        accepted_game_loop=100,
+        confirmed_game_loop=108,
+    )
+
+    assert EffectEvidence.model_validate_json(evidence.model_dump_json()) == evidence
+    legacy = EffectEvidence(target_type="Pylon", new_structure_tag="0x10")
+    assert legacy.effect_kind is None
+    assert legacy.baseline_unit_tags == []
+    assert legacy.production_order_seen is False
+    assert legacy.confirmation_kind is None
+
+    with pytest.raises(ValidationError):
+        EffectEvidence(effect_kind="accepted")  # type: ignore[arg-type]
+    with pytest.raises(ValidationError):
+        EffectEvidence(confirmation_kind="acceptance_only")  # type: ignore[arg-type]
+
+
 def test_episode_result_contract_round_trip_and_invalid_samples() -> None:
     result = EpisodeResult(
         run_id="run-1",

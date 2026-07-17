@@ -64,7 +64,7 @@ export function SemanticValue({ value, field, compact = false, depth = 0 }: Sema
       <ol className={`semantic-list ${depth > 1 ? "nested" : ""}`}>
         {value.map((item, index) => (
           <li key={`${field ?? "item"}-${index}`}>
-            <SemanticValue value={item} compact={compact} depth={depth + 1} />
+            <SemanticValue value={item} field={field} compact={compact} depth={depth + 1} />
           </li>
         ))}
       </ol>

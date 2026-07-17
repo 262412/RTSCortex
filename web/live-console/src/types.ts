@@ -72,4 +72,4 @@ export type ConsoleAction =
   | { type: "select_event"; eventId: number | null }
   | { type: "error"; error: string | null };
 
-export type EventCategory = "all" | "planner" | "reflex" | "build" | "combat" | "failure";
+export type EventCategory = "all" | "planner" | "reflex" | "build" | "production" | "combat" | "failure";

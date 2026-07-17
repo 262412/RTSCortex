@@ -78,9 +78,10 @@ def _compact_event(event: StoredEvent) -> dict[str, Any] | None:
 
 
 REFLECTION_SYSTEM_PROMPT = (
-    "Evaluate the previous decision from matching execution and current state. A no_op never "
-    "proves a plan action ran; never infer execution from summaries. Return concise "
-    "evidence-backed lessons."
+    "Use matching execution and deterministic goal_progress to evaluate the previous decision. "
+    "A no_op never proves a plan action ran. Report whether the goal advanced, then return "
+    "concise "
+    "evidence-backed lessons; never infer execution from summaries."
 )
 
 
@@ -93,7 +94,10 @@ PLANNING_SYSTEM_PROMPT = (
     "position uses two integer coordinates in a nested array such as [[80,80]]. Use "
     "only a complete argument list from that action and actor's argument_candidates. "
     "Never emit No_Operation; return an empty proposed_actions list when no legal action "
-    "exists. An Attack_Unit target must be an enemy tag from argument_candidates. A Build_ "
+    "exists. Stop and Hold_Position are forbidden when goal_progress reports an advancing "
+    "action unless defensive_hold_required is true. Prefer goal_progress.unique_next_action "
+    "when it is present. An Attack_Unit target must be an enemy tag from argument_candidates. "
+    "A Build_ "
     "action already moves its worker into range and performs placement. Never pair "
     "Move_Screen or Move_Minimap with a Build_ action for the same actor; emit only the "
     "Build_ action. Do not move the Builder merely to wait for minerals: keep it near the "
@@ -192,11 +196,23 @@ class ReflectionModule:
 
     async def run(self, context: AgentContext) -> ModuleResult:
         if context.last_decision is None:
-            return ModuleResult(module=self.name, updates={"reflection": None, "lessons": []})
+            return ModuleResult(
+                module=self.name,
+                updates={
+                    "reflection": None,
+                    "lessons": [],
+                    "goal_progress": (
+                        None
+                        if context.goal_progress is None
+                        else context.goal_progress.model_dump(mode="json")
+                    ),
+                },
+            )
         prompt_context = build_reflection_context(
             observation=context.observation,
             last_decision=context.last_decision,
             last_execution=context.last_execution,
+            goal_progress=context.goal_progress,
             budget=self.context_budget,
             system_prompt=REFLECTION_SYSTEM_PROMPT,
         )
@@ -210,6 +226,11 @@ class ReflectionModule:
             updates={
                 "reflection": output.summary,
                 "lessons": output.lessons,
+                "goal_progress": (
+                    None
+                    if context.goal_progress is None
+                    else context.goal_progress.model_dump(mode="json")
+                ),
                 "context_compaction": prompt_context.statistics,
             },
             model_call=True,
@@ -230,6 +251,7 @@ class PlanningModule:
             memory=context.memory,
             active_plan=context.active_plan,
             last_execution=context.last_execution,
+            goal_progress=context.goal_progress,
             budget=self.context_budget,
             system_prompt=PLANNING_SYSTEM_PROMPT,
         )
@@ -243,6 +265,11 @@ class PlanningModule:
             module=self.name,
             updates={
                 "plan": output.model_dump(mode="json"),
+                "goal_progress": (
+                    None
+                    if context.goal_progress is None
+                    else context.goal_progress.model_dump(mode="json")
+                ),
                 "context_compaction": prompt_context.statistics,
             },
             model_call=True,

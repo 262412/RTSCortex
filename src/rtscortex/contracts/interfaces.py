@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Protocol, TypeVar
+from typing import TYPE_CHECKING, Any, Protocol, TypeVar
 
 from pydantic import BaseModel
 
@@ -15,6 +15,9 @@ from rtscortex.contracts.models import (
     ObservationEnvelope,
     SC2State,
 )
+
+if TYPE_CHECKING:
+    from rtscortex.progress.models import GoalProgressReport
 
 
 @dataclass(frozen=True)
@@ -52,6 +55,7 @@ class AgentContext:
     last_execution: ExecutionReport | None = None
     last_decision: ActionBatch | None = None
     active_plan: ActivePlanSnapshot | None = None
+    goal_progress: GoalProgressReport | None = None
 
 
 @dataclass(frozen=True)

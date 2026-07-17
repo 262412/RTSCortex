@@ -9,8 +9,21 @@ from llm_pysc2.agents.configs.config import (  # type: ignore[import-not-found]
     ProtossAgentConfig,
 )
 
-_MELEE_AGENTS = ("Builder", "Developer", "CombatGroup0", "CombatGroup1")
-_SINGLE_TEAM_AGENTS = ("CombatGroup0", "CombatGroup1")
+_MELEE_AGENTS = (
+    "Builder",
+    "Developer",
+    "CombatGroup0",
+    "CombatGroup1",
+    "CombatGroup3",
+    "CombatGroup7",
+    "CombatGroup8",
+)
+_SINGLE_TEAM_AGENTS = (
+    "CombatGroup0",
+    "CombatGroup1",
+    "CombatGroup3",
+    "CombatGroup7",
+)
 _ACTION_NAMES = {
     "Builder": {
         "No_Operation",
@@ -20,14 +33,21 @@ _ACTION_NAMES = {
         "Move_Screen",
         "Build_Pylon_Screen",
         "Build_Gateway_Screen",
+        "Build_Forge_Screen",
         "Build_Assimilator_Near",
         "Build_CyberneticsCore_Screen",
         "Build_Nexus_Near",
+        "Build_Stargate_Screen",
+        "Build_ShieldBattery_Screen",
     },
     "Developer": {
         "No_Operation",
         "Train_Zealot",
         "Train_Stalker",
+        "Train_Adept",
+        "Train_VoidRay",
+        "Train_Oracle",
+        "Train_Phoenix",
         "Research_WarpGate",
         "Warp_Zealot_Near",
         "Warp_Stalker_Near",
@@ -50,11 +70,35 @@ _ACTION_NAMES = {
         "Ability_Blink_Screen",
         "Select_Unit_Blink_Screen",
     },
+    "CombatGroup3": {
+        "No_Operation",
+        "Stop",
+        "Hold_Position",
+        "Move_Minimap",
+        "Move_Screen",
+        "Attack_Unit",
+    },
+    "CombatGroup7": {
+        "No_Operation",
+        "Stop",
+        "Hold_Position",
+        "Move_Minimap",
+        "Move_Screen",
+        "Attack_Unit",
+    },
+    # Oracle and Phoenix have different target and ability semantics. The first
+    # live slice keeps both upstream teams but exposes movement only, so neither
+    # unit can receive an unsafe generic Attack or an unverified special ability.
+    "CombatGroup8": {
+        "No_Operation",
+        "Move_Minimap",
+        "Move_Screen",
+    },
 }
 
 
 class RTSCortexMeleeConfig(ProtossAgentConfig):  # type: ignore[misc]
-    """Retain only the economy, production, Zealot, and Stalker control chain."""
+    """Retain the supported Protoss macro chain and its combat groups."""
 
     AGENTS: dict[str, dict[str, Any]]
     AGENTS_ALWAYS_DISABLE: list[str]
@@ -80,9 +124,10 @@ class RTSCortexMeleeConfig(ProtossAgentConfig):  # type: ignore[misc]
 
         self.AGENTS_ALWAYS_DISABLE = []
         self.ENABLE_INIT_STEPS = True
-        # ``select_idle_worker`` cannot exclude the dedicated Builder probe. Keep
-        # automatic training, but reserve that actor from economy reassignment.
-        self.ENABLE_AUTO_WORKER_MANAGE = False
+        # Gas saturation uses upstream worker-management primitives. Patch 0013
+        # keeps the dedicated Builder Probe reserved while ordinary workers are
+        # stopped and reassigned deterministically by the Bridge.
+        self.ENABLE_AUTO_WORKER_MANAGE = True
         self.ENABLE_AUTO_WORKER_TRAINING = True
         _ensure_no_operation(self.AGENTS)
 

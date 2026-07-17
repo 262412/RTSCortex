@@ -59,15 +59,226 @@ The Blizzard download page currently exposes Linux packages only through SC2 4.1
 92440; a real create-game test shows Base75689 crashes while loading them. `doctor` and
 the live preflight therefore reject older builds instead of relying on path checks alone.
 
+## SC2-native Cortex v0.3 canary
+
+`configs/experiments/live_simple64_hima_a_cortex.yaml` is the first live specialist
+configuration. It does not replace HIMA with a generic chat model and it does not allow
+HIMA to emit PySC2 commands. Responsibility is split as follows:
+
+```text
+ObservationEnvelope
+  ├─ deterministic SituationAssessment
+  ├─ own-state HIMA adapter → private UDS → HIMA Protoss-a → MacroPlan
+  └─ deterministic ReflexEngine
+              │ MacroIntent / ReflexIntent
+              ▼
+      current AvailableAction candidates
+              ▼
+      deterministic fast executor
+              ▼
+ProgressGuard → Validator → Arbiter → ActionBatch v1.1
+              ▼
+unchanged LLM-PySC2 Bridge → PySC2 → effect verifiers
+```
+
+This single-checkpoint profile remains a canary and regression baseline. The v0.4
+operational profile is
+`configs/experiments/live_simple64_hima_ensemble_cortex_v0_4.yaml`: it starts Protoss
+`a/b/c`, asks all three specialists for every macro cycle, and lets the deterministic Race
+Brain coordinator choose the current legal plan with matching CortexPlaybook evidence. It
+requires all three exact local snapshots; startup stays offline and fails before SC2 when
+one snapshot is missing or has the wrong revision.
+
+The checked-in configuration targets the current dual-L4 host: Protoss-a uses `cuda:0`,
+while Protoss-b/c use `cuda:1`. This keeps all three checkpoints resident without pushing a
+single 22 GiB device to its startup limit. Separate device groups infer concurrently;
+members sharing one device remain sequential. Operators with one larger GPU may point all
+three members at the same device and retain fully sequential generation.
+
+The persistent tactical notebook can be inspected without starting SC2:
+
+```bash
+uv run rtscortex playbook show \
+  --database ~/scratch/outputs/RTSCortex/cortex-playbook.sqlite3
+```
+
+HIMA receives the exact upstream five-field payload: supply used, supply capacity,
+completed own unit/structure counts, completed research, and confirmed recent macro
+actions. It receives neither enemy state nor executable coordinates/tags. The Runtime
+re-evaluates the dependency-safe macro frontier against every current observation and
+only compiles `mapped_legal_now` into an intent. The candidate compiler then enumerates
+complete actors and arguments from the Worker's current `available_actions`; the fast
+executor can select one of those candidates or abstain, but cannot invent another action.
+
+The current canary uses no Qwen endpoint. `provider.kind: fake` is intentionally inert in
+the Cortex factory; HIMA owns macro proposals and all other current roles are deterministic.
+
+### HIMA environment and license gate
+
+The HIMA sidecar needs a separate Python environment which can import the current
+RTSCortex source plus PyTorch, Transformers, FastAPI, Uvicorn, and HTTPX. Check it before
+allocating SC2:
+
+```bash
+~/fastscratch/envs/rtscortex-hima/bin/python -c \
+  "import rtscortex, torch, transformers; print(rtscortex.__file__)"
+```
+
+The model path must resolve to the exact pinned Hugging Face snapshot for the selected
+candidate. Branch names, copied directories without snapshot provenance, swapped
+Protoss-a/b/c checkpoints, and a different revision are rejected. The checked-in
+Protoss-a example expects:
+
+```text
+~/fastscratch/cache/huggingface/hub/
+  models--SNUMPR--Protoss-a/
+  snapshots/95348eea419b2e2d9717d747ca30e05a0cba787d
+```
+
+HIMA model cards do not declare a weight license. This is independent of the Blizzard
+StarCraft II license. The checked-in example therefore fails closed with:
+
+```yaml
+cortex:
+  macro:
+    allow_unlicensed_weights: false
+```
+
+Do not change that value silently. After explicitly accepting the risk for HIMA weights,
+make a local configuration copy and set it to `true` there:
+
+```bash
+cp configs/experiments/live_simple64_hima_a_cortex.yaml \
+  ~/scratch/live_simple64_hima_a_cortex.local.yaml
+$EDITOR ~/scratch/live_simple64_hima_a_cortex.local.yaml
+```
+
+The sidecar and Transformers loader both force offline mode, and model/tokenizer loading
+uses `local_files_only=True`. RTSCortex will not contact Hugging Face or download a missing
+checkpoint during a live run; missing local files are startup errors.
+
+### GPU boundary
+
+The current generator loads the complete checkpoint in FP16 onto the configured device,
+normally `cuda:0`, and keeps it resident in one sidecar process. Requests are serialized,
+so one run never launches concurrent HIMA generations. Run it only inside an assigned GPU
+allocation and check free memory before launch:
+
+```bash
+nvidia-smi
+```
+
+There is currently no quantization, CPU/GPU offload, automatic device selection, VRAM
+reservation, or pre-launch memory estimator. An unavailable device or out-of-memory load
+causes sidecar readiness to fail and prevents the SC2 Worker from starting. After a
+post-start request timeout, Runtime suspends new requests, terminates the stuck sidecar,
+starts it again, revalidates its exact model identity, and resumes urgent planning. The
+number of automatic recoveries is bounded by `cortex.macro.restart_limit`.
+
+### Safe launch
+
+First run the existing SC2/Worker checks. `doctor` does not load HIMA or prove that the
+selected GPU has enough memory; the subsequent `run` performs exact checkpoint, license,
+Python executable, sidecar load, and model/revision health checks.
+
+```bash
+SC2PATH=~/scratch/StarCraftII \
+  uv run rtscortex doctor \
+  --config ~/scratch/live_simple64_hima_a_cortex.local.yaml \
+  --require-sc2
+
+SC2PATH=~/scratch/StarCraftII \
+  uv run rtscortex run \
+  --config ~/scratch/live_simple64_hima_a_cortex.local.yaml \
+  --console --console-port 8765
+```
+
+The Runtime loads and health-checks the HIMA process before starting its control API and
+the SC2 Worker. After the first SC2 observation, `pause_until_first_plan: true` holds game
+advancement until the required initial macro proposal is accepted or fails. Later HIMA
+calls are single-flight and asynchronous. The checked-in canary is bounded to 1,024 game
+loops and is an action-closure/observability smoke, not a full match or win-rate benchmark.
+
+The run directory adds `hima-sidecar.stdout.log` and `hima-sidecar.stderr.log` alongside
+the normal SQLite, JSONL, Worker logs, timeline, and report. RGB frames and `.SC2Replay`
+remain non-persistent. Sidecar restarts append to the same two logs. The Live Console exposes
+the HIMA identity and health, macro plan,
+intent, candidate set, executor choice, command lineage, Bridge primitives, PySC2
+acceptance, and effect-verification result without giving the browser a control endpoint.
+
+### v0.3 acceptance checklist
+
+Regenerate the report after the run if needed:
+
+```bash
+uv run rtscortex report ~/scratch/outputs/RTSCortex/<cortex-run-directory>
+```
+
+Use the report and Console to verify:
+
+- `specialist_ready` identifies the configured HIMA model and exact pinned revision;
+- a recovered timeout produces `specialist_failed` followed by exactly one
+  `specialist_recovered` per successful bounded restart;
+- every accepted macro plan records adapter, parser, vocabulary, and source-model
+  provenance; semantic proposal rejection is an explicit `macro_plan_rejected`, while
+  process, transport, timeout, or inference failure is an explicit `specialist_failed`;
+- every selected candidate was present in its emitted candidate set, so reported
+  candidate-domain violations are zero;
+- every dispatched Cortex command has exactly one `command_lineage`, with zero missing or
+  orphan lineage records;
+- the lineage is readable end-to-end as macro plan → intent → candidate → executor
+  selection → v1.1 command → primitive → terminal effect result;
+- Build, production, and movement success still require their existing target-matched
+  effect evidence; PySC2 acceptance alone is not promoted to success;
+- deterministic executor p95 latency remains below the configured 10 ms target in the
+  report. This is an observed acceptance check in v0.3, not an enforced runtime deadline;
+- stopping the Console does not terminate the Runtime, HIMA sidecar, Worker, or SC2;
+- no model download, RGB image file, or replay file appears in the run directory.
+
+### Deliberate current limitations
+
+`DeterministicTacticalAgent` now emits observation-bound intents for proactive advance,
+visible-enemy focus fire, target reacquisition, and low-health retreat. Reflex remains the
+higher-priority emergency layer. Tactical targeting is deterministic and currently omits learned
+micro, air-unit special abilities, terrain reasoning, and opponent strategy prediction. The fast executor is a
+stable deterministic ranker, not a learned small model. A privacy-minimized corpus exporter
+and saved-candidate benchmark are available (see
+[`fast-executor-data.md`](architecture/fast-executor-data.md)), but there is no training
+pipeline, checkpoint loader, confidence calibration, or learned-policy fallback yet.
+Situation assessment is deterministic rather than model-based. HIMA remains an own-state
+Protoss macro specialist, not a combat, map-understanding, or visual model. StarWM, VLM
+perception, specialist ensembles, and air-unit special-ability micro remain future modules.
+
 ## Recommended Simple64 Ladder/Melee smoke
 
 `Simple64` is the recommended compute-center live path. It uses the RTSCortex-owned
-minimal Protoss melee configuration for building, production, Zealot, and Stalker
-control while leaving SC2 lifecycle and PySC2 execution in LLM-PySC2. The opponent is a
-built-in VeryEasy Zerg bot using the Macro build.
+Protoss melee configuration for the Gateway-to-Stargate macro chain and Zealot, Stalker,
+Adept, Void Ray, Oracle, and Phoenix control while leaving SC2 lifecycle and PySC2
+execution in LLM-PySC2. Oracle and Phoenix retain their two distinct upstream teams, but
+the initial profile exposes only no-op and movement for them. Generic Attack, Stop, Hold,
+Pulsar Beam, Revelation, Stasis Trap, and Graviton Beam remain disabled until their
+unit-specific target and effect semantics are implemented. The opponent is a built-in
+VeryEasy Zerg bot using the Macro build.
 Production and research actions are exposed only when their completed idle source, mineral,
 vespene, supply, and prerequisite requirements are all currently satisfied; this includes the
-50-mineral/50-vespene Warp Gate research cost.
+50-mineral/50-vespene Warp Gate research cost, the 150-mineral/150-vespene Stargate,
+the 100-mineral powered Shield Battery after Cybernetics Core, and the full Adept, Void Ray,
+Oracle, and Phoenix production costs.
+
+The live Cortex executor also applies deterministic liveness rules without bypassing
+the normal candidate and validation chain:
+
+- with at most two free supply, a legal Pylon step later in the current HIMA plan may
+  preempt a deferred technology frontier;
+- while Stargate is deferred specifically for insufficient vespene, legal later steps are
+  considered in stable order: Zealot, Pylon when at most four supply remains, then Nexus;
+- when all nearby main-base geysers are occupied, an unavailable additional Assimilator can
+  yield to a legal Nexus step; redundant Pylon steps are consumed and the next legal frontier
+  is evaluated in the same observation instead of waiting for another model response;
+- each completed undersaturated Assimilator causes one nearest mineral Probe to be selected
+  with tag-based tie-breaking and passed through upstream worker reallocation;
+- a failed screen-build world target and resolved screen position are excluded from the next
+  bounded resampling pass, preventing identical placement retries.
 
 Validate and launch the deterministic Fake-provider smoke with:
 
@@ -152,6 +363,50 @@ only actions needed in the current decision cycle, with one action per actor, an
 repeat a successful action or an active-plan command that remains valid. Full observations
 remain in `events.jsonl`, so reducing model input does not reduce experiment traceability.
 
+### Deterministic goal progress and policy shadowing
+
+For accepted plans that contain supported Protoss state-changing actions, Runtime creates a
+typed `GoalSpec` and evaluates it on every observation with `GoalProgressVerifier`. The
+result records completed and missing requirements, deterministic blockers, every action
+that can advance the goal now, and `unique_next_action` only when exactly one such action
+exists. Resource totals, production queues, completed/in-progress structures, units,
+upgrades, prerequisites, action availability, and defensive alerts are state evidence;
+the LLM does not decide whether its own goal advanced.
+
+The same `GoalProgressReport` is supplied to Reflection and Planning and emitted as a
+durable `goal_progress` event for the Live Console. `ProgressGuard` removes `Stop`,
+`Hold_Position`, and semantic no-op commands while a goal can advance or its effect is
+already in progress, unless the observation explicitly requires a defensive hold. An
+empty follow-up plan retains the last measurable goal, so waiting for a build effect does
+not erase its progress state.
+
+The legacy single-run shadow command remains available for small historical checks:
+
+```bash
+uv run rtscortex policy-shadow \
+  ~/scratch/outputs/RTSCortex/<run-directory> \
+  --limit 11 --stride 6
+```
+
+It loads the current OpenAI-compatible Qwen configuration from the run snapshot. Use
+`--no-current-qwen` to keep that compatibility path completely offline.
+
+Formal Policy Comparison v0.2 uses the checked-in, provenance-rich 48-state corpus and
+generates both machine and Markdown reports:
+
+```bash
+uv run rtscortex policy-corpus verify \
+  benchmarks/policy/protoss_v0_2/manifest.yaml
+uv run rtscortex policy-compare \
+  --config configs/policy/comparison_v0_2.offline.yaml
+```
+
+The offline configuration does not call Qwen or load/download HIMA. Local HIMA specialists
+remain unavailable until absolute pinned snapshot paths and the explicit unlicensed-weight
+acknowledgement are configured. They are then evaluated one model subprocess at a time and
+still have no dispatch capability. See [Policy Comparison v0.2](policy-comparison.md) for
+the strict HIMA input contract, corpus strata, classification rules, and artifacts.
+
 ### Build position handling
 
 The bridge derives one structured candidate domain for every exposed target or position
@@ -194,6 +449,12 @@ inside the mineral line. These distances use the exact floating-point `screen_si
 conversion; the final anchor, candidate center, and complete footprint must be visible.
 RTSCortex repeats the complete-footprint visibility check against the translator's resolved
 screen position before allowing the final Nexus primitive to enter PySC2.
+
+Gateway and Stargate production preserve the exact producer tag selected before translation.
+After the translator-owned camera primitive, the Worker waits for a fresh feature observation in
+which that exact allied producer is visible before consuming `select_point`. The wait is bounded;
+failure becomes `producer_not_observable` rather than a generic translation error, and the Worker
+never substitutes another producer between camera, selection, final primitive, and effect proof.
 
 Build execution now uses two-phase confirmation. First, the next SC2 observation must show
 that PySC2 accepted the primitive. The `ActionEffectVerifier` then defers the final
@@ -246,6 +507,11 @@ confirmed disappearance removes the unit and emits a command-owned
 or duplicate a command. Death confirmation advances on every SC2 observation even while the
 upstream action loop is locked, preventing a permanently missing team head from stalling the
 environment worker.
+The Worker also measures the gap from each SC2 observation to the latest Runtime decision. At
+`environment.observation_gap_watchdog_game_loops` it disables optional worker automation and asks
+the reviewed upstream hook to skip team gathering until a new Runtime decision arrives. If the
+gap reaches `environment.observation_gap_hard_limit_game_loops`, the run fails explicitly instead
+of allowing a seed-1-style multi-thousand-loop blind interval.
 An actor disappearing while its upstream team is executing transport `No_Operation` clears that
 control action without producing an execution report; unattributed semantic actions remain a
 fatal Bridge integrity violation.

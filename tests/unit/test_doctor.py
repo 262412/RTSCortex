@@ -114,7 +114,9 @@ def test_worker_patch_is_required_only_for_live_runs(tmp_path: Path) -> None:
         "keep the action pending\n"
         "agent.last_execution_abort = {\n"
         "'failure_code': 'actor_not_available'\n"
-        "team head unit is unavailable before action translation\n",
+        "team head unit is unavailable before action translation\n"
+        "except FileExistsError:\n"
+        "llm_pysc2_global_log_id = max(llm_pysc2_global_log_id, self.log_id)\n",
         encoding="utf-8",
     )
 
@@ -122,6 +124,13 @@ def test_worker_patch_is_required_only_for_live_runs(tmp_path: Path) -> None:
     runner_source.parent.mkdir(parents=True)
     runner_source.write_text(
         'flags.DEFINE_integer("random_seed", None, "Random seed")\nrandom_seed=FLAGS.random_seed\n',
+        encoding="utf-8",
+    )
+    run_loop_source = tmp_path / "third_party/LLM-PySC2/pysc2/env/run_loop.py"
+    run_loop_source.parent.mkdir(parents=True, exist_ok=True)
+    run_loop_source.write_text(
+        'on_episode_truncated = getattr(agent, "on_episode_truncated", None)\n'
+        "on_episode_truncated(total_frames)\n",
         encoding="utf-8",
     )
 
@@ -169,11 +178,42 @@ def test_worker_patch_is_required_only_for_live_runs(tmp_path: Path) -> None:
         "Advance confirmed-death state on every observation\n"
         "tag for tag, steps in self.unit_disappear_steps.items() if steps >= 40\n"
         "tag for tag in agent.unit_tag_list if tag not in self.unit_uid_disappear\n"
-        "tag for tag in team['unit_tags'] if tag not in self.unit_uid_disappear\n",
+        "tag for tag in team['unit_tags'] if tag not in self.unit_uid_disappear\n"
+        "self.config.ENABLE_AUTO_WORKER_MANAGE and self.is_all_nexus_full is False\n"
+        "_rtscortex_reserved_worker_tags\n"
+        "HoldPosition_quick('now')\n"
+        "Reserved worker\n"
+        "Refresh worker targets from the current raw observation\n"
+        "if target_nexus is None:\n"
+        "reversed(possible_working_place_nexus_tag_list)\n"
+        "Stale worker workplace\n"
+        "if len(working_place_unit_list) == 0:\n"
+        "_rtscortex_force_runtime_decision\n"
+        "_rtscortex_accept_visible_team_unit\n",
         encoding="utf-8",
     )
 
     assert _worker_patch_check(tmp_path, required=True).status == "ok"
+
+    complete_main_source = source.read_text(encoding="utf-8")
+    source.write_text(
+        complete_main_source.replace("except FileExistsError:\n", ""),
+        encoding="utf-8",
+    )
+    concurrent_log_check = _worker_patch_check(tmp_path, required=True)
+    assert concurrent_log_check.status == "error"
+    assert "0011-allocate-log-directories-atomically.patch" in concurrent_log_check.detail
+    source.write_text(complete_main_source, encoding="utf-8")
+
+    run_loop_source.write_text("", encoding="utf-8")
+    truncation_check = _worker_patch_check(tmp_path, required=True)
+    assert truncation_check.status == "error"
+    assert "0010-report-max-frame-truncation.patch" in truncation_check.detail
+    run_loop_source.write_text(
+        'on_episode_truncated = getattr(agent, "on_episode_truncated", None)\n'
+        "on_episode_truncated(total_frames)\n",
+        encoding="utf-8",
+    )
 
     complete_action_source = action_source.read_text(encoding="utf-8")
     action_source.write_text(
@@ -193,6 +233,44 @@ def test_worker_patch_is_required_only_for_live_runs(tmp_path: Path) -> None:
     locked_death_check = _worker_patch_check(tmp_path, required=True)
     assert locked_death_check.status == "error"
     assert "0007-preserve-transient-team-units.patch" in locked_death_check.detail
+    funcs_source.write_text(complete_funcs_source, encoding="utf-8")
+
+    funcs_source.write_text(
+        complete_funcs_source.replace("_rtscortex_reserved_worker_tags\n", ""),
+        encoding="utf-8",
+    )
+    reserved_worker_check = _worker_patch_check(tmp_path, required=True)
+    assert reserved_worker_check.status == "error"
+    assert "0013-preserve-reserved-builder-worker.patch" in reserved_worker_check.detail
+    funcs_source.write_text(complete_funcs_source, encoding="utf-8")
+
+    funcs_source.write_text(
+        complete_funcs_source.replace(
+            "Refresh worker targets from the current raw observation\n", ""
+        ),
+        encoding="utf-8",
+    )
+    workplace_refresh_check = _worker_patch_check(tmp_path, required=True)
+    assert workplace_refresh_check.status == "error"
+    assert "0014-refresh-worker-workplaces.patch" in workplace_refresh_check.detail
+    funcs_source.write_text(complete_funcs_source, encoding="utf-8")
+
+    funcs_source.write_text(
+        complete_funcs_source.replace("_rtscortex_force_runtime_decision\n", ""),
+        encoding="utf-8",
+    )
+    watchdog_check = _worker_patch_check(tmp_path, required=True)
+    assert watchdog_check.status == "error"
+    assert "0015-observation-gap-watchdog.patch" in watchdog_check.detail
+    funcs_source.write_text(complete_funcs_source, encoding="utf-8")
+
+    funcs_source.write_text(
+        complete_funcs_source.replace("_rtscortex_accept_visible_team_unit\n", ""),
+        encoding="utf-8",
+    )
+    visible_selection_check = _worker_patch_check(tmp_path, required=True)
+    assert visible_selection_check.status == "error"
+    assert "0016-accept-visible-team-unit.patch" in visible_selection_check.detail
     funcs_source.write_text(complete_funcs_source, encoding="utf-8")
 
     complete_main_source = source.read_text(encoding="utf-8")

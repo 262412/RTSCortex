@@ -43,13 +43,22 @@ def test_prepare_live_worker_builds_fixed_pysc2_command(tmp_path: Path) -> None:
         "keep the action pending\n"
         "agent.last_execution_abort = {\n"
         "'failure_code': 'actor_not_available'\n"
-        "team head unit is unavailable before action translation\n",
+        "team head unit is unavailable before action translation\n"
+        "except FileExistsError:\n"
+        "llm_pysc2_global_log_id = max(llm_pysc2_global_log_id, self.log_id)\n",
         encoding="utf-8",
     )
     runner_source = tmp_path / "third_party/LLM-PySC2/pysc2/bin/agent.py"
     runner_source.parent.mkdir(parents=True)
     runner_source.write_text(
         'flags.DEFINE_integer("random_seed", None, "Random seed")\nrandom_seed=FLAGS.random_seed\n',
+        encoding="utf-8",
+    )
+    run_loop_source = tmp_path / "third_party/LLM-PySC2/pysc2/env/run_loop.py"
+    run_loop_source.parent.mkdir(parents=True, exist_ok=True)
+    run_loop_source.write_text(
+        'on_episode_truncated = getattr(agent, "on_episode_truncated", None)\n'
+        "on_episode_truncated(total_frames)\n",
         encoding="utf-8",
     )
     _write_build_coordinate_patch_source(tmp_path)
@@ -59,7 +68,18 @@ def test_prepare_live_worker_builds_fixed_pysc2_command(tmp_path: Path) -> None:
         "Advance confirmed-death state on every observation\n"
         "tag for tag, steps in self.unit_disappear_steps.items() if steps >= 40\n"
         "tag for tag in agent.unit_tag_list if tag not in self.unit_uid_disappear\n"
-        "tag for tag in team['unit_tags'] if tag not in self.unit_uid_disappear\n",
+        "tag for tag in team['unit_tags'] if tag not in self.unit_uid_disappear\n"
+        "self.config.ENABLE_AUTO_WORKER_MANAGE and self.is_all_nexus_full is False\n"
+        "_rtscortex_reserved_worker_tags\n"
+        "HoldPosition_quick('now')\n"
+        "Reserved worker\n"
+        "Refresh worker targets from the current raw observation\n"
+        "if target_nexus is None:\n"
+        "reversed(possible_working_place_nexus_tag_list)\n"
+        "Stale worker workplace\n"
+        "if len(working_place_unit_list) == 0:\n"
+        "_rtscortex_force_runtime_decision\n"
+        "_rtscortex_accept_visible_team_unit\n",
         encoding="utf-8",
     )
 
@@ -141,6 +161,9 @@ def test_prepare_live_worker_reports_all_missing_prerequisites(tmp_path: Path) -
     assert "transient-unit grace patch is not applied" in message
     assert "Nexus resource-clearance patch is not applied" in message
     assert "Nexus exact-screen-scale patch is not applied" in message
+    assert "gas-rebalance worker-management patch is not applied" in message
+    assert "reserved-builder worker patch is not applied" in message
+    assert "worker-workplace refresh patch is not applied" in message
 
 
 def test_prepare_live_worker_accepts_2s3z_on_sc2_410(tmp_path: Path) -> None:
@@ -329,13 +352,22 @@ def _write_worker_patch_sources(project_root: Path) -> None:
         "keep the action pending\n"
         "agent.last_execution_abort = {\n"
         "'failure_code': 'actor_not_available'\n"
-        "team head unit is unavailable before action translation\n",
+        "team head unit is unavailable before action translation\n"
+        "except FileExistsError:\n"
+        "llm_pysc2_global_log_id = max(llm_pysc2_global_log_id, self.log_id)\n",
         encoding="utf-8",
     )
     runner_source = project_root / "third_party/LLM-PySC2/pysc2/bin/agent.py"
     runner_source.parent.mkdir(parents=True)
     runner_source.write_text(
         'flags.DEFINE_integer("random_seed", None, "Random seed")\nrandom_seed=FLAGS.random_seed\n',
+        encoding="utf-8",
+    )
+    run_loop_source = project_root / "third_party/LLM-PySC2/pysc2/env/run_loop.py"
+    run_loop_source.parent.mkdir(parents=True, exist_ok=True)
+    run_loop_source.write_text(
+        'on_episode_truncated = getattr(agent, "on_episode_truncated", None)\n'
+        "on_episode_truncated(total_frames)\n",
         encoding="utf-8",
     )
     _write_build_coordinate_patch_source(project_root)
@@ -345,7 +377,18 @@ def _write_worker_patch_sources(project_root: Path) -> None:
         "Advance confirmed-death state on every observation\n"
         "tag for tag, steps in self.unit_disappear_steps.items() if steps >= 40\n"
         "tag for tag in agent.unit_tag_list if tag not in self.unit_uid_disappear\n"
-        "tag for tag in team['unit_tags'] if tag not in self.unit_uid_disappear\n",
+        "tag for tag in team['unit_tags'] if tag not in self.unit_uid_disappear\n"
+        "self.config.ENABLE_AUTO_WORKER_MANAGE and self.is_all_nexus_full is False\n"
+        "_rtscortex_reserved_worker_tags\n"
+        "HoldPosition_quick('now')\n"
+        "Reserved worker\n"
+        "Refresh worker targets from the current raw observation\n"
+        "if target_nexus is None:\n"
+        "reversed(possible_working_place_nexus_tag_list)\n"
+        "Stale worker workplace\n"
+        "if len(working_place_unit_list) == 0:\n"
+        "_rtscortex_force_runtime_decision\n"
+        "_rtscortex_accept_visible_team_unit\n",
         encoding="utf-8",
     )
 

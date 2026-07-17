@@ -1,0 +1,11 @@
+--- a/llm_pysc2/agents/main_agent_funcs.py
++++ b/llm_pysc2/agents/main_agent_funcs.py
+@@ -893,7 +893,7 @@
+       #     print(f"unit {units.get_unit_type(unit.unit_type)} {unit.tag} {unit.x} {unit.y}")
+ 
+   # 超采的工人停止工作，进入闲置状态，然后自动重新分配工作
+-  if not self.main_loop_lock and self.config.ENABLE_AUTO_WORKER_TRAINING and self.is_all_nexus_full is False:
++  if not self.main_loop_lock and self.config.ENABLE_AUTO_WORKER_MANAGE and self.is_all_nexus_full is False:
+     for key in self.nexus_info_dict.keys():
+       nexus_info = self.nexus_info_dict[key]
+ 

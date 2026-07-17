@@ -37,7 +37,12 @@ from rtscortex_llm_pysc2.extractor import (
 )
 from rtscortex_llm_pysc2.frame_stream import RGBFramePublisher, RuntimeFrameUploader
 from rtscortex_llm_pysc2.hook import RuntimeQueryMixin
+from rtscortex_llm_pysc2.production import ProductionSpec, production_spec
 from rtscortex_llm_pysc2.protocol import RuntimeClient
+
+PRODUCTION_CAMERA_SETTLE_MAX_OBSERVATIONS = 4
+DEFAULT_OBSERVATION_GAP_WATCHDOG_GAME_LOOPS = 448
+DEFAULT_OBSERVATION_GAP_HARD_LIMIT_GAME_LOOPS = 1792
 
 try:
     _upstream_agents = importlib.import_module("llm_pysc2.agents")
@@ -64,6 +69,8 @@ class WorkerSettings:
     pause_until_first_plan: bool = False
     runtime_request_timeout_seconds: float = 60.0
     action_effect_timeout_game_loops: int = DEFAULT_ACTION_EFFECT_TIMEOUT_GAME_LOOPS
+    observation_gap_watchdog_game_loops: int = DEFAULT_OBSERVATION_GAP_WATCHDOG_GAME_LOOPS
+    observation_gap_hard_limit_game_loops: int = DEFAULT_OBSERVATION_GAP_HARD_LIMIT_GAME_LOOPS
     console_enabled: bool = False
     console_frame_fps: float = 2.0
     console_jpeg_quality: int = 75
@@ -93,6 +100,24 @@ class WorkerSettings:
         )
         if action_effect_timeout_game_loops <= 0:
             raise RuntimeError("RTSCORTEX_ACTION_EFFECT_TIMEOUT_GAME_LOOPS must be positive")
+        observation_gap_watchdog_game_loops = int(
+            os.environ.get(
+                "RTSCORTEX_OBSERVATION_GAP_WATCHDOG_GAME_LOOPS",
+                str(DEFAULT_OBSERVATION_GAP_WATCHDOG_GAME_LOOPS),
+            )
+        )
+        observation_gap_hard_limit_game_loops = int(
+            os.environ.get(
+                "RTSCORTEX_OBSERVATION_GAP_HARD_LIMIT_GAME_LOOPS",
+                str(DEFAULT_OBSERVATION_GAP_HARD_LIMIT_GAME_LOOPS),
+            )
+        )
+        if observation_gap_watchdog_game_loops <= 0:
+            raise RuntimeError("RTSCORTEX_OBSERVATION_GAP_WATCHDOG_GAME_LOOPS must be positive")
+        if observation_gap_hard_limit_game_loops <= observation_gap_watchdog_game_loops:
+            raise RuntimeError(
+                "RTSCORTEX_OBSERVATION_GAP_HARD_LIMIT_GAME_LOOPS must exceed the watchdog threshold"
+            )
         pause_until_first_plan = _environment_bool("RTSCORTEX_PAUSE_UNTIL_FIRST_PLAN", False)
         console_enabled = _environment_bool("RTSCORTEX_CONSOLE_ENABLED", False)
         console_frame_fps = float(os.environ.get("RTSCORTEX_CONSOLE_FRAME_FPS", "2"))
@@ -116,6 +141,8 @@ class WorkerSettings:
             pause_until_first_plan=pause_until_first_plan,
             runtime_request_timeout_seconds=runtime_request_timeout_seconds,
             action_effect_timeout_game_loops=action_effect_timeout_game_loops,
+            observation_gap_watchdog_game_loops=observation_gap_watchdog_game_loops,
+            observation_gap_hard_limit_game_loops=observation_gap_hard_limit_game_loops,
             console_enabled=console_enabled,
             console_frame_fps=console_frame_fps,
             console_jpeg_quality=console_jpeg_quality,
@@ -146,17 +173,32 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
         self.unit_names = dict(unit_names)
         self._rtscortex_translation_attempt: Optional[dict[str, Any]] = None
         self._rtscortex_semantic_action: Optional[dict[str, Any]] = None
+        self._rtscortex_production_source_tag: Optional[int] = None
+        self._rtscortex_production_camera_waits = 0
+        self._rtscortex_camera_settlement_noop = False
+        self._rtscortex_rejected_build_positions: dict[str, set[tuple[int, int]]] = {}
+        self._rtscortex_rejected_build_targets: dict[str, set[tuple[float, float]]] = {}
+        self._rtscortex_active_build_route: Optional[
+            tuple[str, tuple[int, int], Optional[tuple[float, float]]]
+        ] = None
         broker.register(self)
 
     def get_func(self, obs: Any) -> Any:
+        self._rtscortex_camera_settlement_noop = False
         if not self.func_list and self.action_list:
-            self._rtscortex_semantic_action = self.action_list[0]
+            self._rtscortex_semantic_action = _isolate_next_action(self.action_list)
+            self._rtscortex_production_camera_waits = 0
+            if production_spec(str(self.action_list[0].get("name", ""))) is None:
+                self._rtscortex_production_source_tag = None
         action: dict[str, Any] = (
             self._rtscortex_semantic_action
             if self._rtscortex_semantic_action is not None
             else {"name": getattr(self, "curr_action_name", "")}
         )
         semantic_action_name = str(action.get("name", ""))
+        if self._wait_for_production_camera(semantic_action_name, obs):
+            self._rtscortex_camera_settlement_noop = True
+            return 0, _no_op()
         if not self.func_list and self.action_list:
             action_name = semantic_action_name
             if self._reject_unavailable_production_action(action, obs):
@@ -177,11 +219,20 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
                 )
                 if provenance is not None:
                     if is_screen_build:
+                        rejected_positions = self._rtscortex_rejected_build_positions.get(
+                            action_name, set()
+                        )
+                        target_key = _build_world_target_key(provenance.world_target)
                         resolved = _resolve_build_action_position(
                             action,
                             obs.observation,
                             world_target=provenance.world_target,
                             preferred_anchor_tag=provenance.anchor_tag,
+                            excluded_positions=rejected_positions,
+                            force_resample=(
+                                target_key
+                                in self._rtscortex_rejected_build_targets.get(action_name, set())
+                            ),
                         )
                     else:
                         resolved = _resolve_screen_point_action_position(
@@ -199,6 +250,16 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
                             ),
                         )
             if (is_screen_build or is_screen_point) and resolved is None:
+                if is_screen_build:
+                    requested = _screen_argument(action)
+                    if requested is not None:
+                        self._rtscortex_rejected_build_positions.setdefault(action_name, set()).add(
+                            _screen_position_key(requested)
+                        )
+                    if provenance is not None:
+                        self._rtscortex_rejected_build_targets.setdefault(action_name, set()).add(
+                            _build_world_target_key(provenance.world_target)
+                        )
                 predispatch_failure_code = (
                     "no_legal_placement" if is_screen_build else "candidate_invalidated"
                 )
@@ -295,6 +356,35 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
         ordinal = int(attempt.get("ordinal", 0))
         total = int(attempt.get("total", 1))
         final_primitive = not accepted or ordinal + 1 >= total
+        train_spec = production_spec(action_name)
+        producer_tag, provenance_failure = self._validated_production_source_tag(
+            action_name,
+            attempt,
+        )
+        if provenance_failure is not None:
+            failure_code, reason = provenance_failure
+            self._settle_production_command_failure(
+                action_name,
+                obs,
+                failure_code=failure_code,
+                reason=reason,
+            )
+            return 0, _no_op()
+        if train_spec is not None and final_primitive:
+            invalid_reason = _production_source_invalid_reason(
+                obs.observation,
+                producer_tag,
+                train_spec,
+                self.unit_names,
+            )
+            if invalid_reason is not None:
+                self._settle_production_command_failure(
+                    action_name,
+                    obs,
+                    failure_code="production_source_invalidated",
+                    reason=invalid_reason,
+                )
+                return 0, _no_op()
         translated_position = _translated_build_position(
             action_name,
             attempt.get("resolved_arguments"),
@@ -384,15 +474,95 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
             return result
         if dispatch.final_primitive and translated_position is not None:
             self.broker.resolve_arguments(dispatch.command_id, [translated_position])
+            route = self.broker.screen_route_provenance(dispatch.command_id)
+            self._rtscortex_active_build_route = (
+                action_name,
+                _screen_position_key(translated_position),
+                None if route is None else _build_world_target_key(route.world_target),
+            )
         self._rtscortex_translation_attempt = {
             "dispatch": dispatch,
             "emitted_function_id": int(attempt.get("emitted_function_id", requested_id)),
             "expected_arguments": attempt.get("resolved_arguments", []),
             "candidate_constrained": _is_candidate_constrained_action(action_name),
+            "producer_tag": producer_tag,
         }
         if dispatch.final_primitive:
             self._rtscortex_semantic_action = None
+            self._rtscortex_production_source_tag = None
+            self._rtscortex_production_camera_waits = 0
         return result
+
+    def _wait_for_production_camera(self, action_name: str, obs: Any) -> bool:
+        """Wait for a post-camera feature observation before selecting a producer."""
+
+        if production_spec(action_name) is None or not self.func_list:
+            return False
+        next_function_id = int(self.func_list[0][0])
+        if next_function_id != 2 or int(self._rtscortex_translation_ordinal) != 1:
+            return False
+        producer_tag = self._rtscortex_production_source_tag
+        if producer_tag is None:
+            return False
+        if _producer_is_visible(
+            obs.observation,
+            producer_tag,
+            size_screen=int(self.size_screen),
+        ):
+            self._rtscortex_production_camera_waits = 0
+            return False
+        self._rtscortex_production_camera_waits += 1
+        if self._rtscortex_production_camera_waits <= (PRODUCTION_CAMERA_SETTLE_MAX_OBSERVATIONS):
+            return True
+        self._settle_production_command_failure(
+            action_name,
+            obs,
+            failure_code="producer_not_observable",
+            reason=(
+                f"producer tag {hex(producer_tag)} did not become visible after camera "
+                f"settlement ({PRODUCTION_CAMERA_SETTLE_MAX_OBSERVATIONS} observations)"
+            ),
+        )
+        self._rtscortex_production_camera_waits = 0
+        return True
+
+    def _validated_production_source_tag(
+        self,
+        action_name: str,
+        attempt: Mapping[str, Any],
+    ) -> tuple[Optional[int], Optional[tuple[str, str]]]:
+        """Bind production to the exact raw producer selected by the translator."""
+
+        if production_spec(action_name) is None:
+            return None, None
+        source_tag = self._rtscortex_production_source_tag
+        ordinal = int(attempt.get("ordinal", 0))
+        requested_id = int(attempt.get("requested_function_id", 0))
+        if ordinal == 0:
+            requested_arguments = attempt.get("requested_arguments")
+            translator_source_tag = (
+                int(requested_arguments[0])
+                if isinstance(requested_arguments, (list, tuple))
+                and len(requested_arguments) == 1
+                and isinstance(requested_arguments[0], int)
+                and not isinstance(requested_arguments[0], bool)
+                else None
+            )
+            if requested_id != 573 or translator_source_tag is None:
+                return None, (
+                    "production_provenance_missing",
+                    "production primitive 573 did not expose one exact translator "
+                    f"source tag: function {requested_id}, arguments "
+                    f"{requested_arguments!r}",
+                )
+            source_tag = translator_source_tag
+            self._rtscortex_production_source_tag = source_tag
+        if source_tag is None:
+            return None, (
+                "production_provenance_missing",
+                "production provenance missing before translator dispatch",
+            )
+        return source_tag, None
 
     def _reject_unavailable_production_action(
         self,
@@ -409,6 +579,8 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
             action_source_types=self.broker.extractor.action_source_types,
         )
         if source_tag is not None:
+            if production_spec(action_name) is not None:
+                self._rtscortex_production_source_tag = source_tag
             return False
         self._settle_production_source_failure(
             action_name,
@@ -425,11 +597,26 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
         obs: Any,
         reason: str,
     ) -> None:
+        self._settle_production_command_failure(
+            action_name,
+            obs,
+            failure_code="production_source_unavailable",
+            reason=reason,
+        )
+
+    def _settle_production_command_failure(
+        self,
+        action_name: str,
+        obs: Any,
+        *,
+        failure_code: str,
+        reason: str,
+    ) -> None:
         dispatch = self.broker.reject_command(
             self.name,
             _execution_team_name(self),
             action_name,
-            failure_code="production_source_unavailable",
+            failure_code=failure_code,
         )
         if dispatch is None:
             self.broker.raise_unattributed_integrity(
@@ -443,6 +630,8 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
         )
         self.func_list.clear()
         self._rtscortex_semantic_action = None
+        self._rtscortex_production_source_tag = None
+        self._rtscortex_production_camera_waits = 0
 
 
 class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
@@ -459,6 +648,7 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
         )
         self.runtime_client.health()
         unit_names, building_types = _unit_metadata()
+        upgrade_names = _upgrade_metadata()
         coordinator = BridgeCoordinator(
             self.runtime_client,
             effect_verifier=ActionEffectVerifier(
@@ -470,6 +660,7 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
             self.worker_settings.run_id,
             self.worker_settings.episode_id,
             unit_names=unit_names,
+            upgrade_names=upgrade_names,
             building_types=building_types,
             action_source_types=_production_action_source_types(),
         )
@@ -481,6 +672,9 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
         self._pending_primitive: Optional[PrimitiveDispatch] = None
         self._pending_primitive_agent: Optional[Any] = None
         self.transport_noop_primitives = 0
+        self._observation_watchdog_active = False
+        self._observation_watchdog_baseline_loop: Optional[int] = None
+        self._rtscortex_force_runtime_decision = False
         self._episode_reported = False
         self.initial_planning_barrier = InitialPlanningBarrier()
         self.game_clock = (
@@ -496,6 +690,7 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
             unit_names=unit_names,
         )
         super().__init__(config, subagent)
+        self._rtscortex_accept_visible_team_unit = True
         _apply_scenario_bootstrap(self, self.worker_settings.scenario)
         if self.worker_settings.console_enabled:
             self._frame_publisher = RGBFramePublisher(
@@ -525,12 +720,23 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
         self.decision_broker.observe_effects(obs.observation)
         if _is_terminal(obs):
             return _finish_terminal(self, obs, _base_agent_step, _no_op)
+        observation_loop = _observation_game_loop(obs.observation)
+        watchdog_active = self._update_observation_gap_watchdog(observation_loop)
+        if watchdog_active:
+            _release_runtime_observation_barrier(self)
+        worker_management_blocked = (
+            self.decision_broker.coordinator.effect_verifier.blocks_auto_worker_management
+            or watchdog_active
+        )
+        _prime_deterministic_gas_rebalance(
+            self,
+            obs.observation,
+            blocked=worker_management_blocked,
+        )
         upstream_step = super().step
         action = _run_with_auto_worker_management_guard(
             self.config,
-            blocked=(
-                self.decision_broker.coordinator.effect_verifier.blocks_auto_worker_management
-            ),
+            blocked=worker_management_blocked,
             upstream_step=lambda: upstream_step(obs),
         )
         self._consume_execution_aborts(obs)
@@ -632,6 +838,20 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
                 )
                 if self._pending_primitive_agent is not None:
                     self._pending_primitive_agent.func_list.clear()
+                    route = getattr(
+                        self._pending_primitive_agent,
+                        "_rtscortex_active_build_route",
+                        None,
+                    )
+                    if route is not None:
+                        action_name, position, world_target = route
+                        self._pending_primitive_agent._rtscortex_rejected_build_positions.setdefault(
+                            action_name, set()
+                        ).add(position)
+                        if world_target is not None:
+                            self._pending_primitive_agent._rtscortex_rejected_build_targets.setdefault(
+                                action_name, set()
+                            ).add(world_target)
         self.decision_broker.settle_primitive(
             dispatch,
             success=not action_results,
@@ -639,12 +859,17 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
             game_loop=_observation_game_loop(obs.observation),
         )
         self._pending_primitive = None
+        if self._pending_primitive_agent is not None:
+            self._pending_primitive_agent._rtscortex_active_build_route = None
         self._pending_primitive_agent = None
 
     def _capture_primitive(self, action: Any, obs: Any) -> None:
         if self._pending_primitive is not None or not self.AGENT_NAMES:
             return
         agent = self.agents[self.AGENT_NAMES[self.agent_id]]
+        if bool(getattr(agent, "_rtscortex_camera_settlement_noop", False)):
+            agent._rtscortex_camera_settlement_noop = False
+            return
         attempt = getattr(agent, "_rtscortex_translation_attempt", None)
         function_id = getattr(action, "function", None)
         if isinstance(attempt, Mapping) and function_id is not None:
@@ -686,6 +911,7 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
                     dispatch,
                     obs.observation,
                     builder_tag=_execution_unit_tag(agent),
+                    producer_tag=attempt.get("producer_tag"),
                 )
             self._pending_primitive = dispatch
             self._pending_primitive_agent = agent
@@ -712,6 +938,39 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
             return
         self._pending_primitive = dispatch
         self._pending_primitive_agent = agent
+
+    def _update_observation_gap_watchdog(self, game_loop: int) -> bool:
+        """Preempt optional upstream automation when Runtime observations stall."""
+
+        last_decision_loop = self.decision_broker.last_decision_game_loop
+        if last_decision_loop is None:
+            return False
+        if (
+            self._observation_watchdog_active
+            and self._observation_watchdog_baseline_loop is not None
+            and last_decision_loop > self._observation_watchdog_baseline_loop
+        ):
+            self._observation_watchdog_active = False
+            self._observation_watchdog_baseline_loop = None
+            self._rtscortex_force_runtime_decision = False
+        gap = game_loop - last_decision_loop
+        if (
+            not self._observation_watchdog_active
+            and gap > self.worker_settings.observation_gap_watchdog_game_loops
+        ):
+            self._observation_watchdog_active = True
+            self._observation_watchdog_baseline_loop = last_decision_loop
+            self._rtscortex_force_runtime_decision = True
+            self.decision_broker.record_observation_gap_watchdog_trigger()
+        if (
+            self._observation_watchdog_active
+            and gap > self.worker_settings.observation_gap_hard_limit_game_loops
+        ):
+            raise RuntimeError(
+                "observation_gap_watchdog_timeout: no Runtime decision for "
+                f"{gap} game loops (last decision loop {last_decision_loop})"
+            )
+        return self._observation_watchdog_active
 
     def _report_episode(self, obs: Any) -> None:
         reward = float(getattr(obs, "reward", 0.0) or 0.0)
@@ -758,6 +1017,33 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
         except Exception:
             return
         self._episode_reported = True
+
+    def on_episode_truncated(self, total_frames: int) -> None:
+        """Report an explicit terminal result when PySC2 reaches its frame limit."""
+
+        if self._episode_reported:
+            return
+        result = {
+            "protocol_version": "1.1",
+            "run_id": self.worker_settings.run_id,
+            "episode_id": self.worker_settings.episode_id,
+            "scenario": self.worker_settings.scenario,
+            "seed": self.worker_settings.seed,
+            "outcome": "truncated",
+            "score": 0.0,
+            "steps": int(total_frames),
+            "metrics": {
+                "transport_noop_primitives": self.transport_noop_primitives,
+                **self.decision_broker.metrics(),
+            },
+            "failure_reason": "max_agent_steps_reached",
+        }
+        try:
+            self.decision_broker.end_episode(result)
+            self._episode_reported = True
+        finally:
+            self._close_frame_publisher()
+            self.runtime_client.close()
 
 
 def _require_upstream() -> None:
@@ -844,6 +1130,11 @@ def _unit_metadata() -> tuple[dict[int, str], tuple[int, ...]]:
     return names, tuple(int(value) for value in utils.BUILDING_TYPE)
 
 
+def _upgrade_metadata() -> dict[int, str]:
+    upgrades = importlib.import_module("pysc2.lib.upgrades")
+    return {int(value): value.name for value in upgrades.Upgrades}
+
+
 def _production_action_source_types() -> dict[int, int]:
     actions = importlib.import_module("pysc2.lib.actions")
     llm_action = importlib.import_module("llm_pysc2.lib.llm_action")
@@ -893,6 +1184,134 @@ def _run_with_auto_worker_management_guard(
         config.ENABLE_AUTO_WORKER_TRAINING = worker_training_enabled
 
 
+def _prime_deterministic_gas_rebalance(
+    main_agent: Any,
+    observation: Any,
+    *,
+    blocked: bool,
+) -> bool:
+    """Choose one exact mineral worker when a completed gas slot is undersaturated."""
+
+    reserved_builder_tags = _reserved_builder_worker_tags(main_agent)
+    main_agent._rtscortex_reserved_worker_tags = reserved_builder_tags
+    if (
+        blocked
+        or not bool(getattr(main_agent.config, "ENABLE_AUTO_WORKER_MANAGE", False))
+        or bool(getattr(main_agent, "main_loop_lock", False))
+        or getattr(main_agent, "stop_worker", None) is not None
+        or getattr(main_agent, "stop_worker_nexus_tag", None) is not None
+    ):
+        return False
+    raw_by_tag = {
+        int(getattr(unit, "tag", 0)): unit
+        for unit in getattr(observation, "raw_units", ())
+        if int(getattr(unit, "tag", 0)) > 0
+    }
+    harvest_order_ids = {102, 103, 154, 356, 357, 358, 359, 360, 361, 362}
+    nexus_info_dict = getattr(main_agent, "nexus_info_dict", {})
+    for _nexus_key, info in sorted(nexus_info_dict.items(), key=lambda item: int(item[0])):
+        nexus = info.get("nexus")
+        if nexus is None:
+            continue
+        for gas_slot, worker_tags in (
+            ("g1", info.get("worker_g1_tag_list", ())),
+            ("g2", info.get("worker_g2_tag_list", ())),
+        ):
+            reserved_on_gas = sorted(
+                reserved_builder_tags.intersection(int(tag) for tag in worker_tags)
+            )
+            for worker_tag in reserved_on_gas:
+                worker = raw_by_tag.get(worker_tag)
+                if worker is None:
+                    continue
+                main_agent.stop_worker_nexus_tag = int(nexus.tag)
+                main_agent.stop_worker_at = gas_slot
+                main_agent.stop_worker = worker
+                return True
+
+    choices: list[tuple[float, int, int, Any]] = []
+    for _nexus_key, info in sorted(nexus_info_dict.items(), key=lambda item: int(item[0])):
+        nexus = info.get("nexus")
+        if nexus is None:
+            continue
+        undersaturated = [
+            gas
+            for gas, workers in (
+                (info.get("gas_building_1"), info.get("worker_g1_tag_list", ())),
+                (info.get("gas_building_2"), info.get("worker_g2_tag_list", ())),
+            )
+            if gas is not None
+            and float(getattr(gas, "build_progress", 0.0)) in {1.0, 100.0}
+            and len(workers) < 3
+        ]
+        if not undersaturated:
+            continue
+        target = min(undersaturated, key=lambda gas: int(gas.tag))
+        for worker_tag in sorted(set(info.get("worker_m_tag_list", ()))):
+            if int(worker_tag) in reserved_builder_tags:
+                continue
+            worker = raw_by_tag.get(int(worker_tag))
+            if worker is None:
+                continue
+            if int(getattr(worker, "order_id_0", 356)) not in harvest_order_ids:
+                continue
+            distance = (float(worker.x) - float(target.x)) ** 2 + (
+                float(worker.y) - float(target.y)
+            ) ** 2
+            choices.append((distance, int(worker.tag), int(nexus.tag), worker))
+    if not choices:
+        return False
+    _, _, nexus_tag, worker = min(choices)
+    main_agent.stop_worker_nexus_tag = nexus_tag
+    main_agent.stop_worker_at = "m"
+    main_agent.stop_worker = worker
+    return True
+
+
+def _reserved_builder_worker_tags(main_agent: Any) -> set[int]:
+    agents = getattr(main_agent, "agents", {})
+    if not isinstance(agents, Mapping):
+        return set()
+    builder = agents.get("Builder")
+    if builder is None:
+        return set()
+
+    tags: set[int] = set()
+    current = getattr(builder, "team_unit_tag_curr", None)
+    if current is not None and int(current) > 0:
+        tags.add(int(current))
+    for attribute in ("unit_tag_list", "team_unit_tag_list"):
+        tags.update(int(tag) for tag in getattr(builder, attribute, ()) if int(tag) > 0)
+    for team in getattr(builder, "teams", ()):
+        if not isinstance(team, Mapping):
+            continue
+        tags.update(int(tag) for tag in team.get("unit_tags", ()) if int(tag) > 0)
+    return tags
+
+
+def _release_runtime_observation_barrier(main_agent: Any) -> None:
+    """Let current raw state reach Runtime when optional team selection stalls."""
+
+    disappeared = {int(tag) for tag in getattr(main_agent, "unit_uid_disappear", ())}
+    agents = getattr(main_agent, "agents", {})
+    if not isinstance(agents, Mapping):
+        return
+    for agent in agents.values():
+        if not getattr(agent, "enable", False) or not agent._is_waiting_query():
+            continue
+        observed_tags = getattr(agent, "team_unit_tag_list", None)
+        if not isinstance(observed_tags, list):
+            continue
+        for team in getattr(agent, "teams", ()):
+            if not isinstance(team, Mapping):
+                continue
+            live_tags = [
+                int(tag) for tag in team.get("unit_tags", ()) if int(tag) not in disappeared
+            ]
+            required_tags = live_tags if team.get("select_type") == "select" else live_tags[:1]
+            observed_tags.extend(tag for tag in required_tags if tag not in observed_tags)
+
+
 def _translated_build_position(
     action_name: str,
     arguments: Any,
@@ -930,6 +1349,108 @@ def _execution_team_name(agent: Any) -> Optional[str]:
 def _execution_unit_tag(agent: Any) -> Optional[int]:
     value = getattr(agent, "team_unit_tag_curr", None)
     return None if value is None else int(value)
+
+
+def _production_source_invalid_reason(
+    observation: Any,
+    source_tag: Optional[int],
+    spec: ProductionSpec,
+    unit_names: Mapping[int, str],
+) -> Optional[str]:
+    if source_tag is None:
+        return f"{spec.action_name} producer provenance is unavailable at final dispatch"
+    raw_units = (
+        observation.get("raw_units", ())
+        if isinstance(observation, Mapping)
+        else getattr(observation, "raw_units", ())
+    )
+    source = next(
+        (
+            unit
+            for unit in raw_units
+            if int(unit.get("tag", -1) if isinstance(unit, Mapping) else getattr(unit, "tag", -1))
+            == source_tag
+        ),
+        None,
+    )
+    if source is None:
+        return f"{spec.action_name} producer {hex(source_tag)} disappeared before final dispatch"
+
+    def value(name: str, default: Any) -> Any:
+        return (
+            source.get(name, default)
+            if isinstance(source, Mapping)
+            else getattr(source, name, default)
+        )
+
+    unit_type = value("unit_type", "")
+    source_name = (
+        str(unit_type)
+        if isinstance(unit_type, str)
+        else unit_names.get(int(unit_type), f"unit:{int(unit_type)}")
+    )
+    if int(value("alliance", 0)) != 1 or source_name != spec.producer_type:
+        return (
+            f"{spec.action_name} producer {hex(source_tag)} changed identity to "
+            f"{source_name!r} alliance {int(value('alliance', 0))}"
+        )
+    progress = float(value("build_progress", 0.0))
+    normalized_progress = progress / 100.0 if progress > 1.0 else progress
+    if normalized_progress < 1.0:
+        return f"{spec.action_name} producer {hex(source_tag)} is no longer complete"
+    if int(value("active", 0)) != 0 or int(value("order_length", 0)) != 0:
+        return f"{spec.action_name} producer {hex(source_tag)} became busy before final dispatch"
+    return None
+
+
+def _producer_is_visible(
+    observation: Any,
+    producer_tag: int,
+    *,
+    size_screen: int,
+) -> bool:
+    feature_units = (
+        observation.get("feature_units", ())
+        if isinstance(observation, Mapping)
+        else getattr(observation, "feature_units", ())
+    )
+    for unit in feature_units:
+        tag = unit.get("tag", 0) if isinstance(unit, Mapping) else getattr(unit, "tag", 0)
+        alliance = (
+            unit.get("alliance", 0) if isinstance(unit, Mapping) else getattr(unit, "alliance", 0)
+        )
+        is_on_screen = (
+            unit.get("is_on_screen", True)
+            if isinstance(unit, Mapping)
+            else getattr(unit, "is_on_screen", True)
+        )
+        x = unit.get("x", 0) if isinstance(unit, Mapping) else getattr(unit, "x", 0)
+        y = unit.get("y", 0) if isinstance(unit, Mapping) else getattr(unit, "y", 0)
+        if (
+            int(tag) == producer_tag
+            and int(alliance) == 1
+            and bool(is_on_screen)
+            and 0 < float(x) < size_screen
+            and 0 < float(y) < size_screen
+        ):
+            return True
+    return False
+
+
+def _single_position(arguments: Any) -> Optional[tuple[float, float]]:
+    if not isinstance(arguments, (list, tuple)):
+        return None
+    for value in arguments:
+        if (
+            isinstance(value, (list, tuple))
+            and len(value) == 2
+            and all(
+                isinstance(coordinate, (int, float)) and not isinstance(coordinate, bool)
+                for coordinate in value
+            )
+        ):
+            return float(value[0]), float(value[1])
+    return None
 
 
 def _observation_game_loop(observation: Any) -> int:
@@ -970,6 +1491,8 @@ def _resolve_build_action_position(
     *,
     world_target: Optional[tuple[float, float]] = None,
     preferred_anchor_tag: Optional[int] = None,
+    excluded_positions: set[tuple[int, int]] | None = None,
+    force_resample: bool = False,
 ) -> Optional[list[int]]:
     action_name = str(action.get("name", ""))
     requested = _screen_argument(action)
@@ -979,17 +1502,31 @@ def _resolve_build_action_position(
             action_name,
             world_target,
             preferred_anchor_tag=preferred_anchor_tag,
+            excluded_positions=excluded_positions or set(),
+            force_resample=force_resample,
         )
         if position is None:
             return None
     else:
-        candidates = build_screen_candidates(observation, action_name)
+        candidates = [
+            candidate
+            for candidate in build_screen_candidates(observation, action_name)
+            if tuple(candidate) not in (excluded_positions or set())
+        ]
         if not candidates:
             return None
         position = _nearest_current_build_candidate(observation, candidates, requested)
         if position is None:
             return None
     return _replace_screen_action_position(action, position)
+
+
+def _build_world_target_key(world_target: tuple[float, float]) -> tuple[float, float]:
+    return (round(world_target[0], 3), round(world_target[1], 3))
+
+
+def _screen_position_key(position: list[int]) -> tuple[int, int]:
+    return (int(position[0]), int(position[1]))
 
 
 def _resolve_screen_point_action_position(
@@ -1032,6 +1569,14 @@ def _replace_screen_action_position(
         refreshed_functions.append((function_id, function, refreshed_arguments))
     action["func"] = refreshed_functions
     return position
+
+
+def _isolate_next_action(action_list: list[dict[str, Any]]) -> dict[str, Any]:
+    """Detach one routed action from the upstream reusable action templates."""
+
+    action = copy.deepcopy(action_list[0])
+    action_list[0] = action
+    return action
 
 
 def _nearest_current_build_candidate(

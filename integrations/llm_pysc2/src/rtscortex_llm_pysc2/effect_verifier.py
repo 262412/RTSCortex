@@ -7,6 +7,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Optional
 
+from rtscortex_llm_pysc2.effect_types import EffectVerdict
+from rtscortex_llm_pysc2.production_effect_verifier import ProductionEffectVerifier
 from rtscortex_llm_pysc2.routing import RoutedCommand
 
 DEFAULT_ACTION_EFFECT_TIMEOUT_GAME_LOOPS = 112
@@ -21,22 +23,13 @@ POST_ORDER_EFFECT_GRACE_GAME_LOOPS = 32
 _BUILD_RAW_FUNCTION_IDS = {
     "Assimilator": 36,
     "CyberneticsCore": 47,
+    "Forge": 38,
     "Gateway": 37,
     "Nexus": 34,
     "Pylon": 35,
+    "ShieldBattery": 48,
+    "Stargate": 42,
 }
-
-
-@dataclass(frozen=True)
-class EffectVerdict:
-    """One final gameplay-effect verdict for a deferred command."""
-
-    command_id: str
-    success: bool
-    failure_reason: Optional[str] = None
-    status: str = "failed"
-    failure_code: Optional[str] = None
-    evidence: Optional[dict[str, Any]] = None
 
 
 @dataclass(frozen=True)
@@ -111,15 +104,21 @@ class ActionEffectVerifier:
         self._pending: dict[str, _PendingBuild] = {}
         self._pending_moves: dict[str, _PendingMove] = {}
         self._claimed_structure_tags: set[int] = set()
+        self.production = ProductionEffectVerifier(
+            timeout_game_loops=timeout_game_loops,
+            unit_names=self.unit_names,
+        )
 
     def track(self, command: RoutedCommand) -> bool:
         """Register an effectful command, returning false for immediate actions."""
 
+        if self.is_tracked(command.command_id):
+            raise ValueError(f"command {command.command_id!r} is already tracked")
+        if self.production.track(command):
+            return True
         target = _target_structure(command.name)
         if target is None and command.name != "Move_Minimap":
             return False
-        if self.is_tracked(command.command_id):
-            raise ValueError(f"command {command.command_id!r} is already tracked")
         if command.name == "Move_Minimap":
             arguments = command.resolved_arguments or command.requested_arguments
             target_position = _position_argument(arguments)
@@ -140,7 +139,11 @@ class ActionEffectVerifier:
         return True
 
     def is_tracked(self, command_id: str) -> bool:
-        return command_id in self._pending or command_id in self._pending_moves
+        return (
+            command_id in self._pending
+            or command_id in self._pending_moves
+            or self.production.is_tracked(command_id)
+        )
 
     @property
     def blocks_auto_worker_management(self) -> bool:
@@ -149,6 +152,8 @@ class ActionEffectVerifier:
         return bool(self._pending)
 
     def resolve_arguments(self, command_id: str, arguments: list[Any]) -> None:
+        if self.production.is_tracked(command_id):
+            return
         pending_move = self._pending_moves.get(command_id)
         if pending_move is not None:
             target_position = _position_argument(arguments)
@@ -159,9 +164,19 @@ class ActionEffectVerifier:
             return
         self._get(command_id).resolved_arguments = tuple(arguments)
 
-    def prepare(self, command_id: str, observation: Any, builder_tag: Optional[int]) -> None:
+    def prepare(
+        self,
+        command_id: str,
+        observation: Any,
+        builder_tag: Optional[int],
+        *,
+        producer_tag: Optional[int] = None,
+    ) -> None:
         """Capture state immediately before the final effectful primitive."""
 
+        if self.production.is_tracked(command_id):
+            self.production.prepare(command_id, observation, producer_tag)
+            return
         pending_move = self._pending_moves.get(command_id)
         if pending_move is not None:
             pending_move.builder_tag = None if builder_tag is None else int(builder_tag)
@@ -182,6 +197,9 @@ class ActionEffectVerifier:
     def accept_primitive(self, command_id: str, *, game_loop: int) -> None:
         """Mark the PySC2 primitive accepted while keeping the report deferred."""
 
+        if self.production.is_tracked(command_id):
+            self.production.accept_primitive(command_id, game_loop=game_loop)
+            return
         pending_move = self._pending_moves.get(command_id)
         if pending_move is not None:
             if pending_move.dispatched_game_loop is None:
@@ -197,11 +215,13 @@ class ActionEffectVerifier:
     def cancel(self, command_id: str) -> None:
         self._pending.pop(command_id, None)
         self._pending_moves.pop(command_id, None)
+        self.production.cancel(command_id)
 
     def observe(self, observation: Any) -> list[EffectVerdict]:
         """Evaluate all accepted effectful commands against one observation."""
 
-        verdicts = self._observe_moves(observation)
+        verdicts = self.production.observe(observation)
+        verdicts.extend(self._observe_moves(observation))
         accepted = [
             pending
             for pending in self._pending.values()
@@ -329,7 +349,7 @@ class ActionEffectVerifier:
     def fail_pending(self, reason: str) -> list[EffectVerdict]:
         """Mark accepted commands unconfirmed when no later observation can arrive."""
 
-        verdicts = []
+        verdicts = self.production.fail_pending(reason)
         for command_id, pending in list(self._pending.items()):
             if pending.accepted_game_loop is None:
                 continue
@@ -868,3 +888,6 @@ def _value(value: Any, name: str, default: Any) -> Any:
     if isinstance(value, Mapping):
         return value.get(name, default)
     return getattr(value, name, default)
+
+
+__all__ = ["ActionEffectVerifier", "EffectVerdict"]

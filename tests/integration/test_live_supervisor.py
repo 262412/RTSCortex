@@ -228,12 +228,36 @@ def test_supervisor_waits_for_server_and_returns_reported_result(tmp_path: Path)
     assert result.outcome is EpisodeOutcome.VICTORY
     assert result.steps == 3
     assert not supervisor.socket_path.exists()
+    assert not supervisor._ownership_path.exists()
     assert (supervisor.run_dir / "worker.stdout.log").is_file()
     events = list(read_event_log(supervisor.run_dir / "events.jsonl"))
     assert [event.event_type for event in events[-2:]] == [
         "episode_result",
         "episode_summary",
     ]
+
+
+def test_supervisor_ownership_collision_fails_before_runtime_start(
+    tmp_path: Path,
+) -> None:
+    supervisor = _supervisor(tmp_path, SUCCESS_WORKER)
+    supervisor._ownership_path.parent.mkdir(parents=True, exist_ok=True)
+    supervisor._ownership_path.write_text("pid=someone-else\n", encoding="utf-8")
+    started = False
+    original_start = supervisor.runtime.start
+
+    async def tracked_start() -> None:
+        nonlocal started
+        started = True
+        await original_start()
+
+    supervisor.runtime.start = tracked_start  # type: ignore[method-assign]
+
+    with pytest.raises(LiveEnvironmentError, match="already owned"):
+        asyncio.run(supervisor.run())
+
+    assert started is False
+    assert supervisor._ownership_path.read_text(encoding="utf-8") == "pid=someone-else\n"
 
 
 def test_supervisor_serves_read_only_console_without_exposing_control_api(

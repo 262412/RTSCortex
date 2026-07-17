@@ -5,9 +5,10 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import uuid
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
 import typer
 import uvicorn
@@ -17,6 +18,13 @@ from rtscortex.api import create_app
 from rtscortex.cli.doctor import run_doctor
 from rtscortex.config import ExperimentConfig, load_config
 from rtscortex.console import ConsoleSession, LiveConsoleHub, create_console_app
+from rtscortex.cortex import (
+    ExecutorCorpusError,
+    ExecutorSplit,
+    benchmark_executor_corpus,
+    build_executor_corpus,
+    verify_executor_corpus,
+)
 from rtscortex.evaluation import (
     ReportError,
     RunReportArtifacts,
@@ -26,6 +34,22 @@ from rtscortex.evaluation import (
 )
 from rtscortex.evaluation.replay import replay_event_log
 from rtscortex.memory import EventStore, read_event_log
+from rtscortex.playbook import PlaybookStore
+from rtscortex.policy import (
+    LLMPlanningPolicySubagent,
+    PolicyShadowComparison,
+    PolicyShadowRunner,
+    attach_goal_progress,
+    build_protoss_opening_goal,
+    default_shadow_registrations,
+    load_historical_observations,
+)
+from rtscortex.policy.comparison import (
+    load_policy_comparison_config,
+    run_policy_comparison,
+)
+from rtscortex.policy.corpus import build_policy_corpus_from_file, verify_policy_corpus
+from rtscortex.providers import OpenAICompatibleProvider
 from rtscortex.runtime.factory import build_runtime
 from rtscortex.runtime.live import (
     LiveEnvironmentError,
@@ -38,13 +62,88 @@ from rtscortex.runtime.live import (
 )
 
 app = typer.Typer(no_args_is_help=True, help="RTSCortex agent runtime")
+policy_corpus_app = typer.Typer(
+    no_args_is_help=True,
+    help="Build and verify immutable policy-comparison corpora.",
+)
+executor_corpus_app = typer.Typer(
+    no_args_is_help=True,
+    help="Build and verify privacy-minimized fast-executor corpora.",
+)
+playbook_app = typer.Typer(
+    no_args_is_help=True,
+    help="Inspect the persistent cross-episode CortexPlaybook.",
+)
+app.add_typer(policy_corpus_app, name="policy-corpus")
+app.add_typer(executor_corpus_app, name="executor-corpus")
+app.add_typer(playbook_app, name="playbook")
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 CONSOLE_STATIC_DIR = Path(__file__).resolve().parents[1] / "console" / "static"
 
 
 def _run_id(prefix: str) -> str:
-    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    return f"{prefix}-{stamp}"
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    return f"{prefix}-{stamp}-{uuid.uuid4().hex[:8]}"
+
+
+def _reserve_run_dir(output_root: Path, prefix: str) -> tuple[str, Path]:
+    """Atomically reserve a collision-resistant artifact directory."""
+
+    output_root.mkdir(parents=True, exist_ok=True)
+    for _ in range(3):
+        run_id = _run_id(prefix)
+        run_dir = output_root / run_id
+        try:
+            run_dir.mkdir(exist_ok=False)
+        except FileExistsError:
+            continue
+        return run_id, run_dir
+    raise RuntimeError("could not reserve a unique run directory")
+
+
+def _active_model_label(config: ExperimentConfig) -> str:
+    if config.agent.variant == "cortex" and config.cortex.macro.kind == "hima":
+        suffix = config.cortex.macro.candidate.removeprefix("protoss-")
+        return f"SNUMPR/Protoss-{suffix}"
+    if config.agent.variant == "cortex" and config.cortex.macro.kind == "hima_ensemble":
+        race = config.cortex.macro.ensemble_members[0].candidate.rsplit("-", 1)[0]
+        return f"HIMA {race.title()} a/b/c Ensemble"
+    return config.provider.model
+
+
+@playbook_app.command("show")
+def playbook_show(
+    database: Annotated[
+        Path,
+        typer.Option("--database", dir_okay=False, help="CortexPlaybook SQLite path."),
+    ] = Path("~/scratch/outputs/RTSCortex/cortex-playbook.sqlite3"),
+    promoted_only: Annotated[
+        bool,
+        typer.Option("--promoted-only", help="Hide lessons that still need more evidence."),
+    ] = False,
+) -> None:
+    """Print the current reusable tactical notebook as structured JSON."""
+
+    path = database.expanduser()
+    if not path.is_file():
+        raise typer.BadParameter(
+            f"playbook database does not exist: {path}",
+            param_hint="--database",
+        )
+    store = PlaybookStore(path)
+    try:
+        lessons = store.lessons()
+    finally:
+        store.close()
+    if promoted_only:
+        lessons = [lesson for lesson in lessons if lesson.status.value == "promoted"]
+    typer.echo(
+        json.dumps(
+            [lesson.model_dump(mode="json") for lesson in lessons],
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
 
 
 def _snapshot_config(config: ExperimentConfig, run_dir: Path) -> None:
@@ -144,9 +243,8 @@ def run_experiment(
         except LiveEnvironmentError as error:
             raise typer.BadParameter(str(error), param_hint="--console-port") from error
         console_static_dir = _require_console_static_dir()
-    run_id = _run_id(config.agent.variant)
+    run_id, run_dir = _reserve_run_dir(config.run.output_root, config.agent.variant)
     episode_id = "episode-0"
-    run_dir = config.run.output_root / run_id
     live_worker: LiveWorkerSpec | None = None
     runtime_socket: Path | None = None
     if config.environment.adapter == "llm_pysc2":
@@ -175,6 +273,12 @@ def run_experiment(
                 "RTSCORTEX_ACTION_EFFECT_TIMEOUT_GAME_LOOPS": str(
                     config.environment.action_effect_timeout_game_loops
                 ),
+                "RTSCORTEX_OBSERVATION_GAP_WATCHDOG_GAME_LOOPS": str(
+                    config.environment.observation_gap_watchdog_game_loops
+                ),
+                "RTSCORTEX_OBSERVATION_GAP_HARD_LIMIT_GAME_LOOPS": str(
+                    config.environment.observation_gap_hard_limit_game_loops
+                ),
                 "RTSCORTEX_CONSOLE_ENABLED": str(config.console.enabled).lower(),
                 "RTSCORTEX_CONSOLE_FRAME_FPS": str(config.console.frame_fps),
                 "RTSCORTEX_CONSOLE_JPEG_QUALITY": str(config.console.jpeg_quality),
@@ -194,7 +298,7 @@ def run_experiment(
                     status="starting",
                     scenario=config.environment.scenario,
                     seed=config.run.seed,
-                    model=config.provider.model,
+                    model=_active_model_label(config),
                     stale_after_seconds=config.console.stale_after_seconds,
                     frontend_event_limit=config.console.frontend_event_limit,
                 )
@@ -295,7 +399,7 @@ def serve_console(
         status="historical",
         scenario=config.environment.scenario,
         seed=config.run.seed,
-        model=config.provider.model,
+        model=_active_model_label(config),
         stale_after_seconds=config.console.stale_after_seconds,
         frontend_event_limit=config.console.frontend_event_limit,
     )
@@ -361,6 +465,284 @@ def replay(
         raise typer.Exit(code=1)
 
 
+@policy_corpus_app.command("build")
+def policy_corpus_build(
+    config_path: Annotated[
+        Path,
+        typer.Option("--config", exists=True, dir_okay=False),
+    ],
+    output_dir: Annotated[Path, typer.Option("--output-dir", file_okay=False)],
+) -> None:
+    """Build a deterministic, provenance-rich policy fixture corpus."""
+
+    try:
+        result = build_policy_corpus_from_file(
+            config_path.expanduser().resolve(),
+            output_dir.expanduser().resolve(),
+        )
+    except (OSError, ValueError) as error:
+        raise typer.BadParameter(str(error), param_hint="--config") from error
+    typer.echo(
+        json.dumps(
+            {
+                "fixture_count": result.manifest.fixture_count,
+                "stratum_counts": {
+                    key.value: value for key, value in result.manifest.stratum_counts.items()
+                },
+                "seeds": result.manifest.seeds,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+    typer.echo(f"Manifest: {result.manifest_path}")
+    typer.echo(f"Fixtures: {result.fixtures_path}")
+
+
+@executor_corpus_app.command("build")
+def executor_corpus_build(
+    sources: Annotated[
+        list[Path],
+        typer.Argument(
+            exists=True,
+            help="One or more run directories or events.jsonl journals.",
+        ),
+    ],
+    output_dir: Annotated[Path, typer.Option("--output-dir", file_okay=False)],
+    split_seed: Annotated[str, typer.Option("--split-seed")] = ("rtscortex-fast-executor-v0.1"),
+) -> None:
+    """Export labeled executor selections without RGB, prompts, tags, or coordinates."""
+
+    try:
+        result = build_executor_corpus(
+            sources,
+            output_dir.expanduser().resolve(),
+            split_seed=split_seed,
+        )
+    except (OSError, ExecutorCorpusError, ValueError) as error:
+        raise typer.BadParameter(str(error), param_hint="SOURCES") from error
+    typer.echo(result.manifest.model_dump_json(indent=2))
+    typer.echo(f"Manifest: {result.manifest_path}")
+
+
+@executor_corpus_app.command("verify")
+def executor_corpus_verify(
+    manifest: Annotated[Path, typer.Argument(exists=True, dir_okay=False)],
+    verify_sources: Annotated[
+        bool,
+        typer.Option(
+            "--verify-sources",
+            help="Also verify privacy-safe source journal fingerprints.",
+        ),
+    ] = False,
+) -> None:
+    """Verify executor corpus hashes, conservation, and episode split isolation."""
+
+    verification = verify_executor_corpus(
+        manifest.expanduser().resolve(),
+        verify_sources=verify_sources,
+    )
+    typer.echo(verification.model_dump_json(indent=2))
+    if not verification.valid:
+        raise typer.Exit(code=1)
+
+
+@app.command("executor-benchmark")
+def executor_benchmark(
+    manifest: Annotated[Path, typer.Argument(exists=True, dir_okay=False)],
+    repetitions: Annotated[int, typer.Option(min=1)] = 100,
+    split: Annotated[
+        str,
+        typer.Option(help="Corpus split to evaluate: test, validation, train, or all."),
+    ] = "test",
+) -> None:
+    """Benchmark deterministic ranking over saved candidate features."""
+
+    try:
+        selected_split: ExecutorSplit | Literal["all"] = (
+            "all" if split == "all" else ExecutorSplit(split)
+        )
+        result = benchmark_executor_corpus(
+            manifest.expanduser().resolve(),
+            repetitions=repetitions,
+            split=selected_split,
+        )
+    except (OSError, ExecutorCorpusError, ValueError) as error:
+        raise typer.BadParameter(str(error), param_hint="MANIFEST") from error
+    typer.echo(result.model_dump_json(indent=2))
+
+
+@policy_corpus_app.command("verify")
+def policy_corpus_verify(
+    manifest: Annotated[Path, typer.Argument(exists=True, dir_okay=False)],
+    verify_sources: Annotated[
+        bool,
+        typer.Option(
+            "--verify-sources",
+            help="Also hash and cross-check every original journal.",
+        ),
+    ] = False,
+) -> None:
+    """Verify corpus hashes, balance, ordering, and optional source journals."""
+
+    try:
+        verification = verify_policy_corpus(
+            manifest.expanduser().resolve(),
+            verify_sources=verify_sources,
+        )
+    except (OSError, ValueError) as error:
+        raise typer.BadParameter(str(error), param_hint="MANIFEST") from error
+    typer.echo(verification.model_dump_json(indent=2))
+    if not verification.valid:
+        raise typer.Exit(code=1)
+
+
+@app.command("policy-compare")
+def policy_compare(
+    config_path: Annotated[
+        Path,
+        typer.Option("--config", exists=True, dir_okay=False),
+    ],
+    output_dir: Annotated[
+        Path | None,
+        typer.Option(
+            "--output-dir",
+            file_okay=False,
+            help="Override the timestamped output directory from the config.",
+        ),
+    ] = None,
+) -> None:
+    """Compare Qwen, HIMA, and HierNet candidates on one immutable corpus."""
+
+    try:
+        config = load_policy_comparison_config(
+            config_path.expanduser().resolve(),
+            base_dir=PROJECT_ROOT,
+        )
+        artifacts = run_policy_comparison(config, output_dir=output_dir)
+    except (OSError, ValueError) as error:
+        raise typer.BadParameter(str(error), param_hint="--config") from error
+    typer.echo(
+        json.dumps(
+            [summary.model_dump(mode="json") for summary in artifacts.comparison.summaries],
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+    typer.echo(f"Comparison: {artifacts.reports.comparison_path}")
+    typer.echo(f"Report: {artifacts.reports.report_path}")
+    typer.echo(f"Artifacts: {artifacts.output_dir}")
+
+
+async def _run_policy_shadow(
+    *,
+    config: ExperimentConfig | None,
+    journal_path: Path,
+    limit: int,
+    stride: int,
+    use_current_qwen: bool,
+) -> PolicyShadowComparison:
+    fixtures = load_historical_observations(
+        journal_path,
+        limit=limit,
+        stride=stride,
+    )
+    if not fixtures:
+        raise ValueError("events.jsonl contains no observation events")
+    fixtures = attach_goal_progress(fixtures, build_protoss_opening_goal())
+
+    provider: OpenAICompatibleProvider | None = None
+    current_qwen = None
+    if use_current_qwen:
+        if config is None or config.provider.kind != "openai_compatible":
+            raise ValueError(
+                "current Qwen comparison requires provider.kind=openai_compatible "
+                "in RUN_DIR/config.yaml"
+            )
+        provider = OpenAICompatibleProvider(
+            base_url=config.provider.base_url,
+            model=config.provider.model,
+            api_key_env=config.provider.api_key_env,
+            timeout_seconds=config.provider.timeout_seconds,
+            max_tokens=config.provider.max_tokens,
+            enable_thinking=config.provider.enable_thinking,
+        )
+        current_qwen = LLMPlanningPolicySubagent(provider)
+
+    try:
+        return await PolicyShadowRunner().compare(
+            fixtures,
+            default_shadow_registrations(current_qwen=current_qwen),
+        )
+    finally:
+        if provider is not None:
+            await provider.close()
+
+
+@app.command("policy-shadow")
+def policy_shadow(
+    run_dir: Annotated[Path, typer.Argument(exists=True, file_okay=False)],
+    limit: Annotated[int, typer.Option(min=1, help="Maximum historical observations.")] = 10,
+    stride: Annotated[
+        int,
+        typer.Option(min=1, help="Select every Nth observation in journal order."),
+    ] = 1,
+    output: Annotated[
+        Path | None,
+        typer.Option("--output", dir_okay=False, help="Comparison JSON artifact path."),
+    ] = None,
+    current_qwen: Annotated[
+        bool,
+        typer.Option(
+            "--current-qwen/--no-current-qwen",
+            help="Evaluate the OpenAI-compatible Qwen provider from the run config.",
+        ),
+    ] = True,
+) -> None:
+    """Compare shadow policies on the same historical Protoss observations."""
+
+    journal_path = run_dir / "events.jsonl"
+    if not journal_path.is_file():
+        raise typer.BadParameter(
+            "run directory is missing events.jsonl",
+            param_hint="RUN_DIR",
+        )
+    config: ExperimentConfig | None = None
+    if current_qwen:
+        config_path = run_dir / "config.yaml"
+        if not config_path.is_file():
+            raise typer.BadParameter(
+                "run directory is missing config.yaml",
+                param_hint="RUN_DIR",
+            )
+        config = load_config(config_path)
+
+    try:
+        comparison = asyncio.run(
+            _run_policy_shadow(
+                config=config,
+                journal_path=journal_path,
+                limit=limit,
+                stride=stride,
+                use_current_qwen=current_qwen,
+            )
+        )
+    except ValueError as error:
+        raise typer.BadParameter(str(error), param_hint="RUN_DIR") from error
+
+    target = (output or run_dir / "policy-shadow-comparison.json").expanduser()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(comparison.model_dump_json(indent=2) + "\n", encoding="utf-8")
+    typer.echo(
+        json.dumps(
+            [summary.model_dump(mode="json") for summary in comparison.summaries],
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+    typer.echo(f"Artifact: {target}")
+
+
 @app.command()
 def serve(
     config_path: Annotated[Path, typer.Option("--config", exists=True, dir_okay=False)],
@@ -372,29 +754,25 @@ def serve(
     """Serve the versioned runtime API over a Unix socket or loopback TCP."""
 
     config = load_config(config_path)
-    run_id = _run_id("server")
-    run_dir = config.run.output_root / run_id
+    if socket_path is not None and tcp:
+        raise typer.BadParameter("--socket and --tcp cannot be used together")
+    run_id, run_dir = _reserve_run_dir(config.run.output_root, "server")
     _snapshot_config(config, run_dir)
     runtime = build_runtime(config, run_dir)
-    api = create_app(runtime)
-    try:
-        if socket_path is not None and tcp:
-            raise typer.BadParameter("--socket and --tcp cannot be used together")
-        use_socket = socket_path is not None or (os.name != "nt" and not tcp)
-        if use_socket:
-            resolved_socket = (
-                socket_path.expanduser()
-                if socket_path is not None
-                else config.run.runtime_root / run_id / "runtime.sock"
-            )
-            resolved_socket.parent.mkdir(parents=True, exist_ok=True)
-            typer.echo(f"Runtime socket: {resolved_socket}")
-            uvicorn.run(api, uds=str(resolved_socket), log_level="info")
-        else:
-            typer.echo(f"Runtime endpoint: http://{host}:{port}")
-            uvicorn.run(api, host=host, port=port, log_level="info")
-    finally:
-        asyncio.run(runtime.close())
+    api = create_app(runtime, manage_runtime_lifecycle=True)
+    use_socket = socket_path is not None or (os.name != "nt" and not tcp)
+    if use_socket:
+        resolved_socket = (
+            socket_path.expanduser()
+            if socket_path is not None
+            else config.run.runtime_root / run_id / "runtime.sock"
+        )
+        resolved_socket.parent.mkdir(parents=True, exist_ok=True)
+        typer.echo(f"Runtime socket: {resolved_socket}")
+        uvicorn.run(api, uds=str(resolved_socket), log_level="info")
+    else:
+        typer.echo(f"Runtime endpoint: http://{host}:{port}")
+        uvicorn.run(api, host=host, port=port, log_level="info")
 
 
 if __name__ == "__main__":

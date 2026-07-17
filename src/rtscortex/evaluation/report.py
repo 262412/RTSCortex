@@ -20,6 +20,11 @@ from rtscortex.contracts import (
     ObservationEnvelope,
     UnitState,
 )
+from rtscortex.evaluation.cortex import (
+    CORTEX_EVENT_TYPES,
+    CortexObservabilityMetrics,
+    compute_cortex_observability,
+)
 from rtscortex.evaluation.metrics import (
     EpisodeMetrics,
     ExecutionMetrics,
@@ -129,7 +134,8 @@ def _build_run_summary(events: Sequence[StoredEvent]) -> dict[str, object]:
         episode_metrics = (
             compute_episode_metrics(episode_events, result) if result is not None else None
         )
-        gates = _acceptance_gates(execution, episode_metrics)
+        cortex = compute_cortex_observability(episode_events)
+        gates = _acceptance_gates(execution, episode_metrics, cortex)
         run = runs.setdefault(run_id, {"episodes": {}})
         run_episodes = run["episodes"]
         assert isinstance(run_episodes, dict)
@@ -145,6 +151,7 @@ def _build_run_summary(events: Sequence[StoredEvent]) -> dict[str, object]:
             ),
             "classification_conservation": _classification_conservation(execution),
             "terminal_reports": _terminal_report_summary(execution),
+            "cortex": cortex.as_dict(),
             "hard_acceptance": _hard_acceptance_summary(
                 gates,
                 complete=result is not None,
@@ -204,6 +211,7 @@ def _terminal_report_summary(metrics: ExecutionMetrics) -> dict[str, int | float
 def _acceptance_gates(
     execution: ExecutionMetrics,
     episode: EpisodeMetrics | None,
+    cortex: CortexObservabilityMetrics | None = None,
 ) -> tuple[AcceptanceGate, ...]:
     classified = sum(
         execution.status_counts.get(status, 0)
@@ -217,6 +225,9 @@ def _acceptance_gates(
     plan_samples = episode.plan_accept_gap_samples if episode is not None else 0
     accepted_builds = execution.build_funnel.get("pysc2_accepted", 0)
     proposed_builds = execution.build_funnel.get("proposed", 0)
+    accepted_production = execution.production_funnel.get("pysc2_accepted", 0)
+    production_applicable = execution.production_metrics_applicable
+    cortex_metrics = cortex or CortexObservabilityMetrics()
     return (
         _gate("semantic_control_noops", execution.control_noops, "==", 0, "count"),
         _gate("planner_noop_proposals", execution.planner_noop_proposals, "==", 0, "count"),
@@ -367,6 +378,78 @@ def _acceptance_gates(
             "ratio",
             applicable=proposed_builds > 0,
         ),
+        _gate(
+            "production_acceptance_only",
+            execution.production_funnel.get("acceptance_only", 0),
+            "==",
+            0,
+            "count",
+            applicable=production_applicable,
+        ),
+        _gate(
+            "production_provenance_coverage",
+            execution.production_provenance_coverage,
+            ">=",
+            1.0,
+            "ratio",
+            applicable=production_applicable and accepted_production > 0,
+        ),
+        _gate(
+            "production_effect_confirmed_rate",
+            execution.production_effect_confirmed_rate,
+            ">=",
+            0.90,
+            "ratio",
+            applicable=production_applicable and accepted_production > 0,
+        ),
+        _gate(
+            "production_timeout_rate",
+            execution.production_timeout_rate,
+            "<=",
+            0.10,
+            "ratio",
+            applicable=production_applicable and accepted_production > 0,
+        ),
+        _gate(
+            "cortex_executor_candidate_violations",
+            cortex_metrics.executor_candidate_violations,
+            "==",
+            0,
+            "count",
+            applicable=cortex_metrics.observed,
+        ),
+        _gate(
+            "cortex_lineage_integrity_violations",
+            cortex_metrics.lineage_integrity_violations,
+            "==",
+            0,
+            "count",
+            applicable=cortex_metrics.observed,
+        ),
+        _gate(
+            "cortex_duplicate_command_lineage",
+            cortex_metrics.duplicate_lineage_commands,
+            "==",
+            0,
+            "count",
+            applicable=cortex_metrics.observed,
+        ),
+        _gate(
+            "cortex_missing_command_lineage",
+            cortex_metrics.missing_lineage_commands,
+            "==",
+            0,
+            "count",
+            applicable=cortex_metrics.observed,
+        ),
+        _gate(
+            "cortex_orphan_command_lineage",
+            cortex_metrics.orphan_lineage_commands,
+            "==",
+            0,
+            "count",
+            applicable=cortex_metrics.observed,
+        ),
     )
 
 
@@ -406,7 +489,7 @@ def _hard_acceptance_summary(
     failed_gates = sum(gate.passed is False for gate in gates)
     not_applicable_gates = sum(gate.passed is None for gate in gates)
     return {
-        "passed": complete and failed_gates == 0 and not_applicable_gates == 0,
+        "passed": complete and failed_gates == 0,
         "passed_gates": passed_gates,
         "failed_gates": failed_gates,
         "not_applicable_gates": not_applicable_gates,
@@ -441,7 +524,16 @@ def _render_episode(
     summary = _last_model(events, "episode_summary", EpisodeSummary)
     observations = [event for event in events if event.event_type == "observation"]
     decisions = [event for event in events if event.event_type == "decision"]
-    plans = [event for event in events if event.event_type == "plan_accepted"]
+    legacy_plans = [event for event in events if event.event_type == "plan_accepted"]
+    macro_plan_events = [
+        event
+        for event in events
+        if event.event_type in {"macro_plan_accepted", "macro_plan_rejected"}
+    ]
+    plans = [
+        *legacy_plans,
+        *(event for event in macro_plan_events if event.event_type == "macro_plan_accepted"),
+    ]
     executions = [event for event in events if event.event_type == "execution"]
     model_events = [
         event
@@ -451,9 +543,12 @@ def _render_episode(
     rejected = sum(len(_payload_list(event, "batch", "rejected_commands")) for event in decisions)
     successful_executions = sum(event.payload.get("success") is True for event in executions)
     execution_metrics = compute_execution_metrics(events)
+    cortex_metrics = compute_cortex_observability(events)
     episode_metrics = compute_episode_metrics(events, result) if result is not None else None
     command_index = _decision_command_index(decisions)
     total_tokens = sum(_total_tokens(event.payload.get("usage")) for event in model_events)
+    total_tokens += sum(_macro_generation_tokens(event) for event in macro_plan_events)
+    model_call_count = len(model_events) + len(macro_plan_events)
 
     scenario = result.scenario if result is not None else summary.scenario if summary else "unknown"
     seed = result.seed if result is not None else summary.seed if summary else None
@@ -465,7 +560,7 @@ def _render_episode(
         if executions
         else "0/0"
     )
-    provider_models = _provider_models(model_events)
+    provider_models = _provider_models([*model_events, *macro_plan_events])
 
     lines = [
         f"## Episode {_code(episode_id)}",
@@ -489,7 +584,7 @@ def _render_episode(
         "|---:|---:|---:|---:|---:|---:|---:|",
         (
             f"| {len(observations)} | {len(decisions)} | {len(plans)} | {execution_rate} | "
-            f"{rejected} | {len(model_events)} | {total_tokens} |"
+            f"{rejected} | {model_call_count} | {total_tokens} |"
         ),
     ]
     if episode_metrics is not None:
@@ -532,9 +627,10 @@ def _render_episode(
         lines.extend(["", "- No terminal episode result was recorded; this run is incomplete."])
 
     lines.extend(_render_execution_metrics(execution_metrics))
+    lines.extend(_render_cortex_metrics(cortex_metrics))
     lines.extend(
         _render_hard_acceptance(
-            _acceptance_gates(execution_metrics, episode_metrics),
+            _acceptance_gates(execution_metrics, episode_metrics, cortex_metrics),
             complete=result is not None,
         )
     )
@@ -618,6 +714,8 @@ def _render_event(
         status = _inline(event.payload.get("status", "unknown"))
         latency = _milliseconds(event.payload.get("latency_ms"))
         return [f"- Event {event.event_id} · Planner cycle: {status} · {latency}."]
+    if event.event_type in CORTEX_EVENT_TYPES:
+        return _render_cortex_event(event)
     if event.event_type == "episode_summary":
         summary = _validate(event, EpisodeSummary)
         lines = [f"- Event {event.event_id} · Episode summary: {_inline(summary.summary)}"]
@@ -747,9 +845,189 @@ def _render_execution(
             "  - Effect confirmed by new structure "
             f"{_code(report.effect_evidence.new_structure_tag)}."
         )
+    if report.effect_evidence and report.effect_evidence.effect_kind == "production":
+        evidence = report.effect_evidence
+        producer = evidence.producer_type or "unknown producer"
+        producer_tag = evidence.producer_tag or "unknown"
+        unit_type = evidence.expected_unit_type or "unknown unit"
+        if evidence.confirmation_kind == "producer_order":
+            lines.append(
+                "  - Production confirmed by order on "
+                f"{_code(producer)} {_code(producer_tag)} for {_code(unit_type)}."
+            )
+        elif evidence.confirmation_kind == "new_unit":
+            lines.append(
+                "  - Production confirmed by new unit "
+                f"{_code(evidence.new_unit_tag or 'unknown')} ({_code(unit_type)})."
+            )
+    elif (
+        report.action_name is not None
+        and report.action_name.startswith("Train_")
+        and report.status.value == "succeeded"
+        and report.execution_stage is not None
+        and report.execution_stage.value == "pysc2_acceptance"
+    ):
+        lines.append(
+            "  - Production acceptance only (deprecated): PySC2 accepted the Train action, "
+            "but no producer order or new unit was verified."
+        )
     if report.game_result:
         lines.append(f"  - Game result: {_code(report.game_result)}")
     return lines
+
+
+def _render_cortex_event(event: StoredEvent) -> list[str]:
+    payload = event.payload
+    event_id = event.event_id
+    if event.event_type == "situation_assessed":
+        assessment = _nested_payload(payload, "assessment")
+        phase = _payload_text(assessment, "game_phase", "phase") or "unknown"
+        threat = _payload_text(assessment, "threat_level", "threat") or "unknown"
+        readiness = _payload_text(assessment, "army_readiness", "readiness") or "unknown"
+        source = _payload_text(payload, "source_kind", "source", "model") or "unknown"
+        return [
+            f"- Event {event_id} · Situation assessed by {_code(source)}: phase "
+            f"{_code(phase)}; threat {_code(threat)}; readiness {_code(readiness)}."
+        ]
+    if event.event_type in {"macro_plan_accepted", "macro_plan_rejected"}:
+        plan = _nested_payload(payload, "plan")
+        plan_id = _payload_text(payload, "plan_id") or _payload_text(plan, "plan_id") or "unknown"
+        model = (
+            _payload_text(payload, "model_id", "source_model_id", "model", "specialist")
+            or _payload_text(plan, "source_model_id", "model_id")
+            or "unknown"
+        )
+        if event.event_type == "macro_plan_rejected":
+            reason = _payload_text(
+                payload,
+                "reason",
+                "failure_code",
+                "failure_reason",
+                "message",
+            )
+            return [
+                f"- Event {event_id} · Macro plan {_code(plan_id)} from {_code(model)} "
+                f"rejected: {_inline(reason or 'unspecified')}."
+            ]
+        steps = plan.get("steps", payload.get("steps", []))
+        step_count = len(steps) if isinstance(steps, list) else 0
+        frontier = _payload_text(payload, "runtime_frontier", "frontier_action")
+        detail = f"; frontier {_code(frontier)}" if frontier else ""
+        return [
+            f"- Event {event_id} · Macro plan {_code(plan_id)} from {_code(model)} accepted "
+            f"with `{step_count}` steps{detail}."
+        ]
+    if event.event_type == "macro_step_updated":
+        step = _nested_payload(payload, "step")
+        action = _payload_text(step, "semantic_action", "action") or "unknown"
+        status = _payload_text(step, "status") or "unknown"
+        completed = step.get("completed_repeats", 0)
+        repeat = step.get("repeat", 1)
+        reason = _payload_text(step, "reason")
+        suffix = f"; reason {_inline(reason)}" if reason else ""
+        return [
+            f"- Event {event_id} · Macro step {_code(action)} is {_code(status)} "
+            f"(`{completed}/{repeat}`){suffix}."
+        ]
+    if event.event_type == "intent_emitted":
+        intent = _nested_payload(payload, "intent")
+        intent_id = _payload_text(payload, "intent_id") or _payload_text(intent, "intent_id")
+        role = _payload_text(
+            payload, "role", "source_role", "intent_kind", "source"
+        ) or _payload_text(intent, "role", "source_role", "intent_kind", "source")
+        intent_action = _payload_text(payload, "action_name", "action") or _payload_text(
+            intent, "action_name", "action"
+        )
+        if intent_action is None:
+            action_names = intent.get("action_names")
+            if isinstance(action_names, list) and action_names:
+                first_action = action_names[0]
+                if isinstance(first_action, str):
+                    intent_action = first_action
+        return [
+            f"- Event {event_id} · {_inline(role or 'unknown')} intent "
+            f"{_code(intent_id or 'unknown')}: {_code(intent_action or 'no action')}."
+        ]
+    if event.event_type == "candidate_set_built":
+        candidates = payload.get("candidates", [])
+        candidate_count = len(candidates) if isinstance(candidates, list) else 0
+        declared_count = payload.get("candidate_count")
+        if isinstance(declared_count, int) and not isinstance(declared_count, bool):
+            candidate_count = declared_count
+        intent_id = _payload_text(payload, "intent_id") or "unknown"
+        actions = _candidate_actions(candidates)
+        suffix = f": {', '.join(_code(action) for action in actions)}" if actions else "."
+        return [
+            f"- Event {event_id} · Built `{candidate_count}` executable candidates for "
+            f"intent {_code(intent_id)}{suffix}"
+        ]
+    if event.event_type == "executor_selection":
+        executor = _payload_text(payload, "executor_id", "executor", "model") or "unknown"
+        selected = _payload_text(payload, "selected_candidate_id", "candidate_id")
+        latency = _milliseconds(payload.get("latency_ms"))
+        choice = f"selected {_code(selected)}" if selected else "abstained"
+        fallback = _payload_text(payload, "fallback_reason")
+        suffix = f"; fallback {_inline(fallback)}" if fallback else ""
+        return [f"- Event {event_id} · Executor {_code(executor)} {choice} in {latency}{suffix}."]
+    if event.event_type == "command_lineage":
+        lineage = _nested_payload(payload, "lineage")
+        command_id = _payload_text(payload, "command_id") or _payload_text(lineage, "command_id")
+        intent_id = _payload_text(payload, "intent_id") or _payload_text(lineage, "intent_id")
+        candidate_id = _payload_text(payload, "candidate_id") or _payload_text(
+            lineage, "candidate_id"
+        )
+        lineage_plan_id = _payload_text(payload, "macro_plan_id", "plan_id") or _payload_text(
+            lineage, "macro_plan_id", "plan_id"
+        )
+        return [
+            f"- Event {event_id} · Command lineage {_code(command_id or 'unknown')}: plan "
+            f"{_code(lineage_plan_id or 'none')} → intent {_code(intent_id or 'unknown')} → "
+            "candidate "
+            f"{_code(candidate_id or 'unknown')}."
+        ]
+    role = _payload_text(payload, "role", "specialist", "module") or "unknown"
+    model = _payload_text(payload, "model_id", "model") or "unknown"
+    if event.event_type == "specialist_failed":
+        reason = _payload_text(
+            payload,
+            "reason",
+            "failure_code",
+            "failure_reason",
+            "message",
+        )
+        return [
+            f"- Event {event_id} · Specialist {_code(role)}/{_code(model)} failed: "
+            f"{_inline(reason or 'unspecified')}."
+        ]
+    if event.event_type == "specialist_ready":
+        return [f"- Event {event_id} · Specialist {_code(role)}/{_code(model)} is ready."]
+    return [f"- Event {event_id} · Specialist {_code(role)}/{_code(model)} recovered."]
+
+
+def _nested_payload(payload: dict[str, Any], key: str) -> dict[str, Any]:
+    value = payload.get(key)
+    return value if isinstance(value, dict) else payload
+
+
+def _payload_text(payload: dict[str, Any], *keys: str) -> str | None:
+    for key in keys:
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _candidate_actions(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    actions: list[str] = []
+    for candidate in value:
+        if not isinstance(candidate, dict):
+            continue
+        action = _payload_text(candidate, "action_name", "action", "name")
+        if action and action not in actions:
+            actions.append(action)
+    return actions[:4]
 
 
 def _decision_command_index(decisions: Sequence[StoredEvent]) -> dict[str, ActionCommand]:
@@ -862,6 +1140,49 @@ def _render_execution_metrics(metrics: ExecutionMetrics) -> list[str]:
                 f"(`{metrics.build_pre_dispatch_rejections}` commands)."
             ),
             "",
+            "### Production funnel",
+            "",
+            (
+                "| Raw Planner proposed | Candidate validated | Translator accepted | "
+                "PySC2 accepted | Order confirmed | Unit fallback confirmed | "
+                "Effect confirmed | Acceptance only (deprecated) |"
+            ),
+            "|---:|---:|---:|---:|---:|---:|---:|---:|",
+            (
+                f"| {metrics.production_funnel.get('proposed', 0)} | "
+                f"{metrics.production_funnel.get('candidate_validated', 0)} | "
+                f"{metrics.production_funnel.get('translator_accepted', 0)} | "
+                f"{metrics.production_funnel.get('pysc2_accepted', 0)} | "
+                f"{metrics.production_funnel.get('order_confirmed', 0)} | "
+                f"{metrics.production_funnel.get('unit_fallback_confirmed', 0)} | "
+                f"{metrics.production_funnel.get('effect_confirmed', 0)} | "
+                f"{metrics.production_funnel.get('acceptance_only', 0)} |"
+            ),
+            (
+                "- Production effect confirmed rate: "
+                f"`{metrics.production_effect_confirmed_rate:.1%}`; provenance coverage: "
+                f"`{metrics.production_provenance_coverage:.1%}`; timeout rate: "
+                f"`{metrics.production_timeout_rate:.1%}` "
+                f"(`{metrics.production_effect_timeouts}` commands)."
+            ),
+            (
+                "- Production confirmation latency p50/p95: "
+                f"`{metrics.confirmation_latency_game_loops_p50:.0f}/"
+                f"{metrics.confirmation_latency_game_loops_p95:.0f}` game loops "
+                f"(`{metrics.confirmation_latency_game_loops_samples}` samples)."
+            ),
+            (
+                "- Production metric gates: "
+                + (
+                    "protocol v1.1 applicable."
+                    if metrics.production_metrics_applicable
+                    else "not applicable to legacy/no-production reports; acceptance-only is "
+                    "shown for compatibility only."
+                )
+            ),
+            *_render_count_table("Production by action", metrics.production_by_action),
+            *_render_count_table("Production by producer", metrics.production_by_producer),
+            "",
             "### Safety and attribution invariants",
             "",
             (
@@ -911,6 +1232,70 @@ def _render_execution_metrics(metrics: ExecutionMetrics) -> list[str]:
             metrics.failure_by_action_stage_code,
         )
     )
+    return lines
+
+
+def _render_cortex_metrics(metrics: CortexObservabilityMetrics) -> list[str]:
+    if not metrics.observed:
+        return []
+    event_counts = metrics.event_counts
+    coverage = (
+        f"`{metrics.lineage_commands}/{metrics.dispatched_commands}` "
+        f"({metrics.command_lineage_coverage:.1%})"
+        if metrics.dispatched_commands
+        else "not applicable (no dispatched Cortex commands)"
+    )
+    lines = [
+        "",
+        "### Cortex observability",
+        "",
+        "| Situation | Macro accepted | Macro rejected | Intents | Candidate sets | "
+        "Executor selections |",
+        "|---:|---:|---:|---:|---:|---:|",
+        (
+            f"| {event_counts.get('situation_assessed', 0)} | "
+            f"{event_counts.get('macro_plan_accepted', 0)} | "
+            f"{event_counts.get('macro_plan_rejected', 0)} | "
+            f"{event_counts.get('intent_emitted', 0)} | "
+            f"{event_counts.get('candidate_set_built', 0)} | "
+            f"{event_counts.get('executor_selection', 0)} |"
+        ),
+        (
+            "- Executor outcomes: "
+            f"`{metrics.executor_selections}` selected, "
+            f"`{metrics.executor_abstentions}` abstained, "
+            f"`{metrics.executor_fallbacks}` fallback; candidate-domain violations "
+            f"`{metrics.executor_candidate_violations}`."
+        ),
+        (
+            "- Executor latency p50/p95: "
+            f"`{metrics.executor_latency_ms_p50:.2f}/"
+            f"{metrics.executor_latency_ms_p95:.2f}` ms."
+        ),
+        (
+            "- Macro specialist requests and latency p50/p95: "
+            f"`{metrics.macro_requests}`; `{metrics.macro_latency_ms_p50:.2f}/"
+            f"{metrics.macro_latency_ms_p95:.2f}` ms."
+        ),
+        (
+            "- Race Brain / Playbook: "
+            f"`{event_counts.get('race_brain_coordinated', 0)}` coordinated cycles, "
+            f"`{event_counts.get('playbook_retrieved', 0)}` retrievals, "
+            f"`{event_counts.get('playbook_case_recorded', 0)}` cases, "
+            f"`{event_counts.get('playbook_lesson_promoted', 0)}` promoted lessons."
+        ),
+        (
+            f"- Command lineage coverage: {coverage}; missing "
+            f"`{metrics.missing_lineage_commands}`, orphan `{metrics.orphan_lineage_commands}`, "
+            f"duplicates `{metrics.duplicate_lineage_commands}`, integrity violations "
+            f"`{metrics.lineage_integrity_violations}`."
+        ),
+        *_render_count_table("Cortex intents by role", metrics.intent_counts),
+        *_render_count_table("Cortex selections by executor", metrics.executor_counts),
+        *_render_count_table("Specialist failures", metrics.specialist_failure_counts),
+        *_render_count_table("Specialists ready", metrics.specialist_ready_counts),
+        *_render_count_table("Specialist recoveries", metrics.specialist_recovery_counts),
+    ]
     return lines
 
 
@@ -1165,12 +1550,45 @@ def _payload_list(event: StoredEvent, container: str, field: str) -> list[object
 def _provider_models(events: list[StoredEvent]) -> str:
     identities: list[str] = []
     for event in events:
-        provider = event.payload.get("provider", "unknown")
-        model = event.payload.get("model", "unknown")
+        if event.event_type in {"macro_plan_accepted", "macro_plan_rejected"}:
+            plan = _nested_payload(event.payload, "plan")
+            provider = "hima"
+            model = (
+                _payload_text(
+                    event.payload,
+                    "model_id",
+                    "source_model_id",
+                    "model",
+                )
+                or _payload_text(plan, "source_model_id", "model_id")
+                or "unknown"
+            )
+        else:
+            provider = event.payload.get("provider", "unknown")
+            model = event.payload.get("model", "unknown")
         identity = f"{_code(provider)}/{_code(model)}"
         if identity not in identities:
             identities.append(identity)
     return ", ".join(identities) if identities else "none"
+
+
+def _macro_generation_tokens(event: StoredEvent) -> int:
+    metadata = event.payload.get("generation_metadata")
+    if not isinstance(metadata, dict):
+        plan = _nested_payload(event.payload, "plan")
+        raw_response = plan.get("raw_proposal")
+        if isinstance(raw_response, dict):
+            proposal = raw_response.get("proposal")
+            if isinstance(proposal, dict):
+                nested = proposal.get("generation_metadata")
+                metadata = nested if isinstance(nested, dict) else None
+    if not isinstance(metadata, dict):
+        return 0
+    prompt = metadata.get("prompt_token_count", 0)
+    completion = metadata.get("completion_token_count", 0)
+    prompt_value = int(prompt) if isinstance(prompt, int | float) else 0
+    completion_value = int(completion) if isinstance(completion, int | float) else 0
+    return prompt_value + completion_value
 
 
 def _total_tokens(usage: object) -> int:

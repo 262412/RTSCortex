@@ -40,12 +40,68 @@ git -C third_party/LLM-PySC2 apply --check \
   ../../integrations/llm_pysc2/patches/0009-use-exact-nexus-screen-scale.patch
 git -C third_party/LLM-PySC2 apply \
   ../../integrations/llm_pysc2/patches/0009-use-exact-nexus-screen-scale.patch
+git -C third_party/LLM-PySC2 apply --check \
+  ../../integrations/llm_pysc2/patches/0010-report-max-frame-truncation.patch
+git -C third_party/LLM-PySC2 apply \
+  ../../integrations/llm_pysc2/patches/0010-report-max-frame-truncation.patch
+git -C third_party/LLM-PySC2 apply --check \
+  ../../integrations/llm_pysc2/patches/0011-allocate-log-directories-atomically.patch
+git -C third_party/LLM-PySC2 apply \
+  ../../integrations/llm_pysc2/patches/0011-allocate-log-directories-atomically.patch
+git -C third_party/LLM-PySC2 apply --check \
+  ../../integrations/llm_pysc2/patches/0012-bind-gas-rebalance-to-worker-management.patch
+git -C third_party/LLM-PySC2 apply \
+  ../../integrations/llm_pysc2/patches/0012-bind-gas-rebalance-to-worker-management.patch
+git -C third_party/LLM-PySC2 apply --check \
+  ../../integrations/llm_pysc2/patches/0013-preserve-reserved-builder-worker.patch
+git -C third_party/LLM-PySC2 apply \
+  ../../integrations/llm_pysc2/patches/0013-preserve-reserved-builder-worker.patch
+git -C third_party/LLM-PySC2 apply --check \
+  ../../integrations/llm_pysc2/patches/0014-refresh-worker-workplaces.patch
+git -C third_party/LLM-PySC2 apply \
+  ../../integrations/llm_pysc2/patches/0014-refresh-worker-workplaces.patch
+git -C third_party/LLM-PySC2 apply --check \
+  ../../integrations/llm_pysc2/patches/0015-observation-gap-watchdog.patch
+git -C third_party/LLM-PySC2 apply \
+  ../../integrations/llm_pysc2/patches/0015-observation-gap-watchdog.patch
+git -C third_party/LLM-PySC2 apply --check \
+  ../../integrations/llm_pysc2/patches/0016-accept-visible-team-unit.patch
+git -C third_party/LLM-PySC2 apply \
+  ../../integrations/llm_pysc2/patches/0016-accept-visible-team-unit.patch
 ```
 
 After the live run, restore the clean pinned checkout by reversing exactly these reviewed
 patches in reverse order:
 
 ```bash
+git -C third_party/LLM-PySC2 apply --reverse --check \
+  ../../integrations/llm_pysc2/patches/0016-accept-visible-team-unit.patch
+git -C third_party/LLM-PySC2 apply --reverse \
+  ../../integrations/llm_pysc2/patches/0016-accept-visible-team-unit.patch
+git -C third_party/LLM-PySC2 apply --reverse --check \
+  ../../integrations/llm_pysc2/patches/0015-observation-gap-watchdog.patch
+git -C third_party/LLM-PySC2 apply --reverse \
+  ../../integrations/llm_pysc2/patches/0015-observation-gap-watchdog.patch
+git -C third_party/LLM-PySC2 apply --reverse --check \
+  ../../integrations/llm_pysc2/patches/0014-refresh-worker-workplaces.patch
+git -C third_party/LLM-PySC2 apply --reverse \
+  ../../integrations/llm_pysc2/patches/0014-refresh-worker-workplaces.patch
+git -C third_party/LLM-PySC2 apply --reverse --check \
+  ../../integrations/llm_pysc2/patches/0013-preserve-reserved-builder-worker.patch
+git -C third_party/LLM-PySC2 apply --reverse \
+  ../../integrations/llm_pysc2/patches/0013-preserve-reserved-builder-worker.patch
+git -C third_party/LLM-PySC2 apply --reverse --check \
+  ../../integrations/llm_pysc2/patches/0012-bind-gas-rebalance-to-worker-management.patch
+git -C third_party/LLM-PySC2 apply --reverse \
+  ../../integrations/llm_pysc2/patches/0012-bind-gas-rebalance-to-worker-management.patch
+git -C third_party/LLM-PySC2 apply --reverse --check \
+  ../../integrations/llm_pysc2/patches/0011-allocate-log-directories-atomically.patch
+git -C third_party/LLM-PySC2 apply --reverse \
+  ../../integrations/llm_pysc2/patches/0011-allocate-log-directories-atomically.patch
+git -C third_party/LLM-PySC2 apply --reverse --check \
+  ../../integrations/llm_pysc2/patches/0010-report-max-frame-truncation.patch
+git -C third_party/LLM-PySC2 apply --reverse \
+  ../../integrations/llm_pysc2/patches/0010-report-max-frame-truncation.patch
 git -C third_party/LLM-PySC2 apply --reverse --check \
   ../../integrations/llm_pysc2/patches/0009-use-exact-nexus-screen-scale.patch
 git -C third_party/LLM-PySC2 apply --reverse \
@@ -146,7 +202,43 @@ from the integer sampling stride. Resource-ring and townhall distances therefore
 `size_screen / 24` conversion, while footprint bounds cover the full 5x5 Nexus area. The exact
 anchor and every footprint pixel must also be currently visible before placement is emitted.
 
-CI applies all nine patches in order under Python 3.9, compiles and imports both projects, and
+`0010-report-max-frame-truncation.patch` invokes an optional agent lifecycle hook before
+PySC2 returns at `max_agent_steps`. The RTSCortex bridge uses the hook to post one explicit
+`truncated` episode result and finalize pending commands instead of relying on the supervisor
+to guess why a clean worker process exited.
+
+`0011-allocate-log-directories-atomically.patch` replaces the process-local logger counter
+condition with an atomic `mkdir` claim. Concurrent live workers that start within the same
+second now select distinct upstream log directories instead of one worker spinning forever.
+
+`0012-bind-gas-rebalance-to-worker-management.patch` makes mineral-to-gas worker rebalancing
+obey `ENABLE_AUTO_WORKER_MANAGE` instead of the unrelated worker-training flag. The Bridge
+selects the exact nearest mineral Probe with stable tag tie-breaking before the upstream
+stop-and-reassign sequence runs.
+
+`0013-preserve-reserved-builder-worker.patch` prevents upstream idle-worker selection from
+reassigning the dedicated Builder Probe to minerals or gas. The Bridge publishes reserved
+Builder tags before worker management; if PySC2 selects one as idle, upstream gives it a stable
+HoldPosition order and continues the ordinary worker rebalance on a later tick. The melee profile
+keeps worker management enabled so the deterministic gas rebalance can run; if the Builder is
+already present in a gas slot, the Bridge evicts that exact tag before filling the slot with an
+ordinary worker.
+
+`0014-refresh-worker-workplaces.patch` rebuilds each Nexus resource list from the current raw
+observation so depleted mineral fields and destroyed gas buildings cannot remain valid worker
+targets. Before assignment, it revalidates the selected Nexus and workplace, prefers the newest
+observation-bound entry, and returns a transport no-op when no current resource target remains
+instead of indexing an empty list.
+
+`0015-observation-gap-watchdog.patch` lets the Worker skip optional upstream team gathering
+when the gap since the latest Runtime decision exceeds the configured game-loop threshold.
+
+`0016-accept-visible-team-unit.patch` stops camera centering from interrupting the existing
+point-to-rectangle selection fallback when a team unit is already visible. RTSCortex enables
+this behavior because its Runtime observation is global; selection remains required later for
+actual feature actions.
+
+CI applies all sixteen patches in order under Python 3.9, compiles and imports both projects, and
 runs `integrations/llm_pysc2/tests/python39_contract_smoke.py`. The smoke locks the v1.1
 candidate mapping, multi-argument translator rejection, Nexus camera-settlement primitive,
 exact Nexus anchor, floating-point resource clearance, visible complete-footprint behavior,
@@ -154,8 +246,8 @@ gas clearance, raw-unit team persistence,
 and explicit pre-translation abort markers, including transient disappearance recovery. CI then
 reverses the patches in reverse order and requires a clean submodule checkout.
 
-The patches deliberately do not change camera calibration, initial team assignment, automatic
-economy, or unrelated translator behavior. Patch 0007 preserves insertion order while removing
+The patches deliberately do not change camera calibration, initial team assignment, or unrelated
+translator behavior. Patch 0007 preserves insertion order while removing
 duplicate team tags and delays member removal until death is confirmed. Observation mapping,
 runtime calls, action routing, and execution feedback live in this bridge package rather than in
 the upstream checkout.

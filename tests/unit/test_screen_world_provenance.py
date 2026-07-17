@@ -277,7 +277,8 @@ def test_agent_reprojects_before_current_candidate_domain_check(
     translated_positions: list[list[int]] = []
 
     def upstream_get_func(agent: Any, _obs: Any) -> tuple[int, str]:
-        resolved = [int(value) for value in action["arg"][0]]
+        executing_action = agent.action_list[0]
+        resolved = [int(value) for value in executing_action["arg"][0]]
         translated_positions.append(resolved)
         agent.last_translation_result = {
             "action_name": "Build_Pylon_Screen",
@@ -290,8 +291,8 @@ def test_agent_reprojects_before_current_candidate_domain_check(
             "resolved_arguments": [resolved],
         }
         # The real upstream translator consumes parts of this mutable action.
-        action["arg"].clear()
-        action["func"].clear()
+        executing_action["arg"].clear()
+        executing_action["func"].clear()
         return 35, "translated"
 
     monkeypatch.setattr(RuntimeQueryMixin, "get_func", upstream_get_func, raising=False)
@@ -308,6 +309,9 @@ def test_agent_reprojects_before_current_candidate_domain_check(
     agent.curr_action_name = "Build_Pylon_Screen"
     agent.broker = cast(Any, broker)
     agent._rtscortex_translation_attempt = None
+    agent._rtscortex_rejected_build_positions = {}
+    agent._rtscortex_rejected_build_targets = {}
+    agent._rtscortex_active_build_route = None
 
     result = agent.get_func(SimpleNamespace(observation=observation))
 
@@ -360,7 +364,8 @@ def test_agent_reprojects_move_screen_and_records_resolved_arguments(
     translated_positions: list[list[int]] = []
 
     def upstream_get_func(agent: Any, _obs: Any) -> tuple[int, str]:
-        resolved = [int(value) for value in action["arg"][0]]
+        executing_action = agent.action_list[0]
+        resolved = [int(value) for value in executing_action["arg"][0]]
         translated_positions.append(resolved)
         agent.last_translation_result = {
             "action_name": "Move_Screen",
@@ -372,8 +377,8 @@ def test_agent_reprojects_move_screen_and_records_resolved_arguments(
             "total": 1,
             "resolved_arguments": [resolved],
         }
-        action["arg"].clear()
-        action["func"].clear()
+        executing_action["arg"].clear()
+        executing_action["func"].clear()
         return 12, "translated"
 
     monkeypatch.setattr(RuntimeQueryMixin, "get_func", upstream_get_func, raising=False)

@@ -13,19 +13,27 @@ from pathlib import Path
 import httpx
 
 from rtscortex.config import ExperimentConfig
+from rtscortex.runtime.hima_sidecar import HIMASidecarError, validate_local_hima_checkpoint
 from rtscortex.runtime.live import (
     LiveEnvironmentError,
+    atomic_log_directory_patch_is_applied,
     build_feature_plane_patch_is_applied,
+    gas_rebalance_worker_management_patch_is_applied,
     live_scenario_spec,
+    max_frames_episode_hook_patch_is_applied,
     near_placement_patch_is_applied,
     nexus_exact_screen_scale_patch_is_applied,
     nexus_resource_clearance_patch_is_applied,
+    observation_gap_watchdog_patch_is_applied,
     pretranslation_abort_patch_is_applied,
     random_seed_patch_is_applied,
+    reserved_builder_worker_patch_is_applied,
     sc2_build,
     transient_unit_grace_patch_is_applied,
     translation_result_patch_is_applied,
+    visible_team_selection_patch_is_applied,
     waiting_response_patch_is_applied,
+    worker_workplace_refresh_patch_is_applied,
 )
 
 EXPECTED_LLM_PYSC2_COMMIT = "551c863475c0c4a96a181080974d24b59589e9f3"
@@ -55,6 +63,8 @@ def run_doctor(
     checks.append(_core_venv_check(project_root / ".venv"))
     if config is not None and config.provider.kind == "openai_compatible":
         checks.append(_provider_check(config))
+    if config is not None and config.cortex.macro.kind != "disabled":
+        checks.extend(_hima_checks(config))
     submodule = project_root / "third_party" / "LLM-PySC2"
     commit = _git_commit(submodule)
     checks.append(
@@ -86,6 +96,41 @@ def run_doctor(
         )
     )
     checks.append(_socket_parent_check())
+    return checks
+
+
+def _hima_checks(config: ExperimentConfig) -> list[Check]:
+    macro = config.cortex.macro
+    checks = [
+        Check(
+            "hima_python",
+            "ok" if macro.python_executable.is_file() else "error",
+            str(macro.python_executable),
+        )
+    ]
+    candidates: list[tuple[str, Path]]
+    if macro.kind == "hima":
+        assert macro.model_path is not None
+        candidates = [(macro.candidate, macro.model_path)]
+    else:
+        candidates = [(member.candidate, member.model_path) for member in macro.ensemble_members]
+    for candidate, path in candidates:
+        try:
+            checkpoint = validate_local_hima_checkpoint(
+                candidate=candidate,
+                model_path=path,
+                allow_unlicensed_weights=macro.allow_unlicensed_weights,
+            )
+        except HIMASidecarError as error:
+            checks.append(Check(f"hima_{candidate}", "error", str(error)))
+        else:
+            checks.append(
+                Check(
+                    f"hima_{candidate}",
+                    "ok",
+                    f"{checkpoint.model_id}@{checkpoint.revision}",
+                )
+            )
     return checks
 
 
@@ -193,6 +238,20 @@ def _worker_patch_check(project_root: Path, *, required: bool) -> Check:
         missing.append("0008-enforce-nexus-resource-clearance.patch")
     if not nexus_exact_screen_scale_patch_is_applied(project_root):
         missing.append("0009-use-exact-nexus-screen-scale.patch")
+    if not max_frames_episode_hook_patch_is_applied(project_root):
+        missing.append("0010-report-max-frame-truncation.patch")
+    if not atomic_log_directory_patch_is_applied(project_root):
+        missing.append("0011-allocate-log-directories-atomically.patch")
+    if not gas_rebalance_worker_management_patch_is_applied(project_root):
+        missing.append("0012-bind-gas-rebalance-to-worker-management.patch")
+    if not reserved_builder_worker_patch_is_applied(project_root):
+        missing.append("0013-preserve-reserved-builder-worker.patch")
+    if not worker_workplace_refresh_patch_is_applied(project_root):
+        missing.append("0014-refresh-worker-workplaces.patch")
+    if not observation_gap_watchdog_patch_is_applied(project_root):
+        missing.append("0015-observation-gap-watchdog.patch")
+    if not visible_team_selection_patch_is_applied(project_root):
+        missing.append("0016-accept-visible-team-unit.patch")
     status = "ok" if not missing else ("error" if required else "optional")
     detail = "all worker patches applied" if not missing else "apply " + ", ".join(missing)
     return Check("worker_patch", status, detail)

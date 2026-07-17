@@ -9,6 +9,17 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 RaceName: TypeAlias = Literal["random", "protoss", "terran", "zerg"]
+HIMACandidate: TypeAlias = Literal[
+    "protoss-a",
+    "protoss-b",
+    "protoss-c",
+    "terran-a",
+    "terran-b",
+    "terran-c",
+    "zerg-a",
+    "zerg-b",
+    "zerg-c",
+]
 BotDifficulty: TypeAlias = Literal[
     "very_easy",
     "easy",
@@ -50,8 +61,18 @@ class EnvironmentSettings(SettingsModel):
     worker_python: Path = Path("~/fastscratch/envs/rtscortex-llm-pysc2/bin/python")
     pending_plan_step_delay_seconds: float = Field(default=0.0, ge=0.0)
     action_effect_timeout_game_loops: int = Field(default=112, ge=1)
+    observation_gap_watchdog_game_loops: int = Field(default=448, ge=1)
+    observation_gap_hard_limit_game_loops: int = Field(default=1792, ge=2)
     server_ready_timeout_seconds: float = Field(default=15.0, gt=0.0)
     shutdown_timeout_seconds: float = Field(default=10.0, gt=0.0)
+
+    @model_validator(mode="after")
+    def validate_observation_gap_limits(self) -> EnvironmentSettings:
+        if self.observation_gap_hard_limit_game_loops <= self.observation_gap_watchdog_game_loops:
+            raise ValueError(
+                "observation_gap_hard_limit_game_loops must exceed the watchdog threshold"
+            )
+        return self
 
 
 class RuntimeSettings(SettingsModel):
@@ -78,11 +99,93 @@ AgentVariant: TypeAlias = Literal[
     "reflex_only",
     "planner_only",
     "planner_reflection_memory_reflex",
+    "cortex",
 ]
 
 
 class AgentSettings(SettingsModel):
     variant: AgentVariant = "planner_reflection_memory_reflex"
+
+
+class CortexSituationSettings(SettingsModel):
+    kind: Literal["deterministic"] = "deterministic"
+
+
+class CortexHIMAEnsembleMemberSettings(SettingsModel):
+    candidate: HIMACandidate
+    model_path: Path
+    device: str = "cuda:0"
+
+
+class CortexMacroSettings(SettingsModel):
+    kind: Literal["disabled", "hima", "hima_ensemble"] = "disabled"
+    candidate: Literal["protoss-a", "protoss-b", "protoss-c"] = "protoss-a"
+    python_executable: Path = Path("~/fastscratch/envs/rtscortex-hima/bin/python")
+    model_path: Path | None = None
+    device: str = "cuda:0"
+    allow_unlicensed_weights: bool = False
+    required: bool = True
+    interval_game_loops: int = Field(default=112, ge=1)
+    plan_ttl_game_loops: int = Field(default=448, ge=1)
+    timeout_seconds: float = Field(default=12.0, gt=0.0)
+    max_new_tokens: int = Field(default=512, ge=1)
+    restart_limit: int = Field(default=1, ge=0)
+    ensemble_members: list[CortexHIMAEnsembleMemberSettings] = Field(default_factory=list)
+    coordinator: Literal["deterministic_v1"] = "deterministic_v1"
+
+    @model_validator(mode="after")
+    def require_hima_model_path(self) -> CortexMacroSettings:
+        if self.kind == "hima" and self.model_path is None:
+            raise ValueError("cortex HIMA macro policy requires model_path")
+        if self.kind == "hima_ensemble":
+            candidates = [member.candidate for member in self.ensemble_members]
+            if len(candidates) != 3 or len(set(candidates)) != 3:
+                raise ValueError("HIMA ensemble requires exactly three distinct members")
+            races = {candidate.rsplit("-", 1)[0] for candidate in candidates}
+            clusters = {candidate.rsplit("-", 1)[1] for candidate in candidates}
+            if len(races) != 1 or clusters != {"a", "b", "c"}:
+                raise ValueError("HIMA ensemble members must be the a/b/c checkpoints for one race")
+        elif self.ensemble_members:
+            raise ValueError("ensemble_members are only valid for kind=hima_ensemble")
+        return self
+
+
+class CortexTacticalSettings(SettingsModel):
+    kind: Literal["deterministic", "deterministic_reflex"] = "deterministic"
+    retreat_health_threshold: float = Field(default=0.3, ge=0.0, le=1.0)
+    minimum_advance_army_supply: int = Field(default=4, ge=1)
+    reacquire_cooldown_game_loops: int = Field(default=112, ge=1)
+
+
+class CortexExecutorSettings(SettingsModel):
+    kind: Literal["deterministic"] = "deterministic"
+    timeout_ms: float = Field(default=10.0, gt=0.0)
+    fallback: Literal["deterministic"] = "deterministic"
+    supply_emergency_free_supply: int = Field(default=2, ge=0)
+    resource_fallback_pylon_free_supply: int = Field(default=4, ge=0)
+    pylon_redundancy_free_supply: int = Field(default=16, ge=1)
+
+
+class CortexExplanationSettings(SettingsModel):
+    enabled: bool = False
+
+
+class CortexPlaybookSettings(SettingsModel):
+    enabled: bool = False
+    database_path: Path = Path("~/scratch/outputs/RTSCortex/cortex-playbook.sqlite3")
+    top_k: int = Field(default=6, ge=1, le=20)
+    min_confidence: float = Field(default=0.6, ge=0.0, le=1.0)
+    promotion_support: int = Field(default=2, ge=1)
+    include_candidates: bool = False
+
+
+class CortexSettings(SettingsModel):
+    situation: CortexSituationSettings = Field(default_factory=CortexSituationSettings)
+    macro: CortexMacroSettings = Field(default_factory=CortexMacroSettings)
+    tactical: CortexTacticalSettings = Field(default_factory=CortexTacticalSettings)
+    executor: CortexExecutorSettings = Field(default_factory=CortexExecutorSettings)
+    explanation: CortexExplanationSettings = Field(default_factory=CortexExplanationSettings)
+    playbook: CortexPlaybookSettings = Field(default_factory=CortexPlaybookSettings)
 
 
 class ReflexSettings(SettingsModel):
@@ -134,12 +237,25 @@ class ExperimentConfig(SettingsModel):
     environment: EnvironmentSettings = Field(default_factory=EnvironmentSettings)
     runtime: RuntimeSettings = Field(default_factory=RuntimeSettings)
     agent: AgentSettings = Field(default_factory=AgentSettings)
+    cortex: CortexSettings = Field(default_factory=CortexSettings)
     reflex: ReflexSettings = Field(default_factory=ReflexSettings)
     memory: MemorySettings = Field(default_factory=MemorySettings)
     context: ContextSettings = Field(default_factory=ContextSettings)
     provider: ProviderSettings = Field(default_factory=ProviderSettings)
     evaluation: EvaluationSettings = Field(default_factory=EvaluationSettings)
     console: ConsoleSettings = Field(default_factory=ConsoleSettings)
+
+    @model_validator(mode="after")
+    def validate_race_brain_matches_agent(self) -> ExperimentConfig:
+        if self.cortex.macro.kind != "hima_ensemble":
+            return self
+        race = self.cortex.macro.ensemble_members[0].candidate.rsplit("-", 1)[0]
+        if self.environment.agent_race != race:
+            raise ValueError(
+                "HIMA ensemble race must match environment.agent_race; "
+                f"received {race} brain for {self.environment.agent_race} agent"
+            )
+        return self
 
     def expanded(self) -> ExperimentConfig:
         data = self.model_dump()
@@ -148,6 +264,16 @@ class ExperimentConfig(SettingsModel):
         if self.environment.sc2_path is not None:
             data["environment"]["sc2_path"] = self.environment.sc2_path.expanduser()
         data["environment"]["worker_python"] = self.environment.worker_python.expanduser()
+        data["cortex"]["macro"]["python_executable"] = (
+            self.cortex.macro.python_executable.expanduser()
+        )
+        if self.cortex.macro.model_path is not None:
+            data["cortex"]["macro"]["model_path"] = self.cortex.macro.model_path.expanduser()
+        for member in data["cortex"]["macro"]["ensemble_members"]:
+            member["model_path"] = Path(member["model_path"]).expanduser()
+        data["cortex"]["playbook"]["database_path"] = (
+            self.cortex.playbook.database_path.expanduser()
+        )
         return ExperimentConfig.model_validate(data)
 
 

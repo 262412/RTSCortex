@@ -199,6 +199,41 @@ def prepare_live_worker(
             "the LLM-PySC2 Nexus exact-screen-scale patch is not applied; see "
             "integrations/llm_pysc2/patches/README.md"
         )
+    if not max_frames_episode_hook_patch_is_applied(project_root):
+        errors.append(
+            "the PySC2 max-frame episode hook patch is not applied; see "
+            "integrations/llm_pysc2/patches/README.md"
+        )
+    if not atomic_log_directory_patch_is_applied(project_root):
+        errors.append(
+            "the LLM-PySC2 concurrent log-directory patch is not applied; see "
+            "integrations/llm_pysc2/patches/README.md"
+        )
+    if not gas_rebalance_worker_management_patch_is_applied(project_root):
+        errors.append(
+            "the LLM-PySC2 gas-rebalance worker-management patch is not applied; see "
+            "integrations/llm_pysc2/patches/README.md"
+        )
+    if not reserved_builder_worker_patch_is_applied(project_root):
+        errors.append(
+            "the LLM-PySC2 reserved-builder worker patch is not applied; see "
+            "integrations/llm_pysc2/patches/README.md"
+        )
+    if not worker_workplace_refresh_patch_is_applied(project_root):
+        errors.append(
+            "the LLM-PySC2 worker-workplace refresh patch is not applied; see "
+            "integrations/llm_pysc2/patches/README.md"
+        )
+    if not observation_gap_watchdog_patch_is_applied(project_root):
+        errors.append(
+            "the LLM-PySC2 observation-gap watchdog patch is not applied; see "
+            "integrations/llm_pysc2/patches/README.md"
+        )
+    if not visible_team_selection_patch_is_applied(project_root):
+        errors.append(
+            "the LLM-PySC2 visible-team selection patch is not applied; see "
+            "integrations/llm_pysc2/patches/README.md"
+        )
 
     if errors:
         raise LiveEnvironmentError("Live environment validation failed:\n- " + "\n- ".join(errors))
@@ -343,11 +378,18 @@ class LiveProcessSupervisor:
         self._stdout: BinaryIO | None = None
         self._stderr: BinaryIO | None = None
         self._worker_metrics_path = self.run_dir / "worker.metrics.json"
+        self._ownership_path = self.socket_path.with_name(f"{self.socket_path.name}.lock")
+        self._owns_run = False
+        self._owns_runtime_socket = False
 
     async def run(self) -> EpisodeResult:
         """Run until the worker exits, always closing every owned resource."""
 
         try:
+            self._acquire_run_ownership()
+            if self.console_port is not None:
+                ensure_console_port_available(self.console_port)
+            await self.runtime.start()
             await self._start_server()
             await self._start_console_server()
             if self.console_hub is not None:
@@ -390,15 +432,51 @@ class LiveProcessSupervisor:
                 )
             raise
         finally:
-            await self._stop_worker()
-            await self._stop_console_server()
-            await self._stop_server()
-            await self.runtime.close()
+            try:
+                await self._stop_worker()
+                await self._stop_console_server()
+                await self._stop_server()
+            finally:
+                try:
+                    await self.runtime.close()
+                finally:
+                    self._release_run_ownership()
+
+    def _acquire_run_ownership(self) -> None:
+        self.socket_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            descriptor = os.open(
+                self._ownership_path,
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                0o600,
+            )
+        except FileExistsError as error:
+            raise LiveEnvironmentError(
+                f"live run is already owned: {self._ownership_path}"
+            ) from error
+        try:
+            os.write(
+                descriptor,
+                f"pid={os.getpid()} run_id={self.run_id}\n".encode(),
+            )
+        finally:
+            os.close(descriptor)
+        self._owns_run = True
+        if self.socket_path.exists():
+            raise LiveEnvironmentError(f"runtime socket already exists: {self.socket_path}")
+
+    def _release_run_ownership(self) -> None:
+        if not self._owns_run:
+            return
+        with contextlib.suppress(OSError):
+            self._ownership_path.unlink()
+        self._owns_run = False
 
     async def _start_server(self) -> None:
         self.socket_path.parent.mkdir(parents=True, exist_ok=True)
         if self.socket_path.exists():
             raise LiveEnvironmentError(f"runtime socket already exists: {self.socket_path}")
+        self._owns_runtime_socket = True
         config = uvicorn.Config(
             create_app(self.runtime, console_hub=self.console_hub),
             uds=str(self.socket_path),
@@ -553,7 +631,9 @@ class LiveProcessSupervisor:
                     await self._server_task
             except (Exception, asyncio.CancelledError):
                 pass
-        self.socket_path.unlink(missing_ok=True)
+        if self._owns_runtime_socket:
+            self.socket_path.unlink(missing_ok=True)
+            self._owns_runtime_socket = False
 
     async def _stop_console_server(self) -> None:
         if self._console_server is not None:
@@ -847,6 +927,102 @@ def nexus_exact_screen_scale_patch_is_applied(project_root: Path) -> bool:
             "unit.display_type != 1 or not unit.is_on_screen",
         )
     )
+
+
+def max_frames_episode_hook_patch_is_applied(project_root: Path) -> bool:
+    """Return whether PySC2 reports a clean max-frame truncation to the agent."""
+
+    source = project_root / "third_party/LLM-PySC2/pysc2/env/run_loop.py"
+    if not source.is_file():
+        return False
+    text = source.read_text(encoding="utf-8")
+    return all(
+        marker in text
+        for marker in (
+            'getattr(agent, "on_episode_truncated", None)',
+            "on_episode_truncated(total_frames)",
+        )
+    )
+
+
+def atomic_log_directory_patch_is_applied(project_root: Path) -> bool:
+    """Return whether concurrent workers allocate upstream log directories atomically."""
+
+    source = project_root / "third_party/LLM-PySC2/llm_pysc2/agents/llm_pysc2_agent_main.py"
+    if not source.is_file():
+        return False
+    text = source.read_text(encoding="utf-8")
+    return all(
+        marker in text
+        for marker in (
+            "except FileExistsError:",
+            "llm_pysc2_global_log_id = max(llm_pysc2_global_log_id, self.log_id)",
+        )
+    )
+
+
+def gas_rebalance_worker_management_patch_is_applied(project_root: Path) -> bool:
+    """Return whether gas rebalancing is governed by the worker-management flag."""
+
+    source = project_root / "third_party/LLM-PySC2/llm_pysc2/agents/main_agent_funcs.py"
+    if not source.is_file():
+        return False
+    text = source.read_text(encoding="utf-8")
+    return "self.config.ENABLE_AUTO_WORKER_MANAGE and self.is_all_nexus_full is False" in text
+
+
+def reserved_builder_worker_patch_is_applied(project_root: Path) -> bool:
+    """Return whether automatic worker assignment preserves Builder actors."""
+
+    source = project_root / "third_party/LLM-PySC2/llm_pysc2/agents/main_agent_funcs.py"
+    if not source.is_file():
+        return False
+    text = source.read_text(encoding="utf-8")
+    return all(
+        marker in text
+        for marker in (
+            "_rtscortex_reserved_worker_tags",
+            "HoldPosition_quick('now')",
+            "Reserved worker",
+        )
+    )
+
+
+def worker_workplace_refresh_patch_is_applied(project_root: Path) -> bool:
+    """Return whether worker assignment rejects depleted or missing targets."""
+
+    source = project_root / "third_party/LLM-PySC2/llm_pysc2/agents/main_agent_funcs.py"
+    if not source.is_file():
+        return False
+    text = source.read_text(encoding="utf-8")
+    return all(
+        marker in text
+        for marker in (
+            "Refresh worker targets from the current raw observation",
+            "if target_nexus is None:",
+            "reversed(possible_working_place_nexus_tag_list)",
+            "Stale worker workplace",
+            "if len(working_place_unit_list) == 0:",
+        )
+    )
+
+
+def observation_gap_watchdog_patch_is_applied(project_root: Path) -> bool:
+    """Return whether optional upstream gathering honors the Worker watchdog."""
+
+    source = project_root / "third_party/LLM-PySC2/llm_pysc2/agents/main_agent_funcs.py"
+    if not source.is_file():
+        return False
+    return "_rtscortex_force_runtime_decision" in source.read_text(encoding="utf-8")
+
+
+def visible_team_selection_patch_is_applied(project_root: Path) -> bool:
+    """Return whether visible team units bypass redundant camera centering."""
+
+    source = project_root / "third_party/LLM-PySC2/llm_pysc2/agents/main_agent_funcs.py"
+    if not source.is_file():
+        return False
+    return "_rtscortex_accept_visible_team_unit" in source.read_text(encoding="utf-8")
 
 
 def _signal_process(worker: asyncio.subprocess.Process, sig: signal.Signals) -> None:

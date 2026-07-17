@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import json
 import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -16,10 +17,12 @@ from rtscortex_llm_pysc2.extractor import (
     current_team_order,
     nexus_placement_footprint_is_visible,
     production_source_tag,
+    screen_build_position_is_legal,
     semantic_argument_candidates,
 )
 from rtscortex_llm_pysc2.hook import RuntimeDecisionBroker, RuntimeQueryMixin
 from rtscortex_llm_pysc2.observation import ObservationMapper
+from rtscortex_llm_pysc2.production import PRODUCTION_SPECS
 from rtscortex_llm_pysc2.routing import RoutedActionBatch, RoutedCommand
 from rtscortex_llm_pysc2.worker import (
     RTSCortexLLMAgent,
@@ -30,8 +33,15 @@ from rtscortex_llm_pysc2.worker import (
     _canonical_pysc2_arguments,
     _execution_team_name,
     _finish_terminal,
+    _isolate_next_action,
     _pending_plan_idle_delay,
+    _prime_deterministic_gas_rebalance,
+    _producer_is_visible,
+    _production_source_invalid_reason,
     _refresh_build_action_position,
+    _release_runtime_observation_barrier,
+    _replace_screen_action_position,
+    _resolve_build_action_position,
     _run_with_auto_worker_management_guard,
     _scenario_config,
     _semantic_target_failure,
@@ -49,6 +59,7 @@ def test_timestep_extractor_produces_json_safe_five_part_snapshot() -> None:
         "run-worker",
         "episode-worker",
         unit_names={311: "Adept", 59: "Nexus", 104: "Drone"},
+        upgrade_names={84: "WarpGateResearch"},
         building_types=(59,),
     ).extract(
         _fake_timestep(),
@@ -65,6 +76,7 @@ def test_timestep_extractor_produces_json_safe_five_part_snapshot() -> None:
     assert envelope.state.own_units[0].unit_type == "Adept"
     assert envelope.state.own_structures[0].unit_type == "Nexus"
     assert envelope.state.visible_enemies[0].unit_type == "Drone"
+    assert envelope.state.upgrades == ["WarpGateResearch"]
     assert envelope.available_actions[1].argument_names == ["tag"]
     assert envelope.available_actions[1].argument_types == ["tag"]
     assert "Unsupported" not in {action.name for action in envelope.available_actions}
@@ -196,6 +208,41 @@ def test_broker_times_out_if_an_enabled_agent_never_submits() -> None:
     assert runtime.tick_calls == 0
 
 
+def test_broker_releases_barrier_when_missing_combat_agent_is_disabled() -> None:
+    runtime = FakeRuntime()
+    broker = SharedDecisionBroker(
+        BridgeCoordinator(runtime),
+        TimeStepExtractor("run-worker", "episode-worker"),
+        decision_timeout_seconds=1.0,
+    )
+    timestep = _fake_timestep()
+    first = FakeAgent("AgentA", "A", timestep, broker)
+    second = FakeAgent("AgentB", "B", timestep, broker)
+    departed = FakeAgent("CombatGroup0", "C", timestep, broker)
+    for agent in (first, second, departed):
+        broker.register(agent)
+
+    errors: list[BaseException] = []
+
+    def submit(agent: FakeAgent) -> None:
+        try:
+            broker.submit(agent, timestep, f"observation from {agent.name}")
+        except BaseException as error:  # pragma: no cover - asserted below
+            errors.append(error)
+
+    threads = [threading.Thread(target=submit, args=(agent,)) for agent in (first, second)]
+    for thread in threads:
+        thread.start()
+    time.sleep(0.1)
+    departed.enable = False
+    for thread in threads:
+        thread.join(timeout=2)
+
+    assert errors == []
+    assert all(not thread.is_alive() for thread in threads)
+    assert runtime.tick_calls == 1
+
+
 def test_terminal_seam_skips_main_loop_reports_and_closes() -> None:
     events: list[str] = []
     agent = TerminalAgent(events)
@@ -250,8 +297,55 @@ def test_worker_error_episode_preserves_bridge_counters() -> None:
                 "transport_noop_primitives": 4,
                 "unattributed_primitives": 1,
                 "candidate_outside_pysc2_dispatches": 0,
+                "observation_gap_watchdog_triggers": 0,
             },
             "failure_reason": "RuntimeError: bridge failed",
+        }
+    ]
+
+
+def test_worker_max_frame_hook_reports_explicit_truncation() -> None:
+    runtime = FakeRuntime()
+    broker = SharedDecisionBroker(
+        BridgeCoordinator(runtime),
+        TimeStepExtractor("run-worker", "episode-worker"),
+    )
+    main_agent = cast(Any, object.__new__(RTSCortexMainAgent))
+    main_agent.worker_settings = WorkerSettings(
+        run_id="run-worker",
+        episode_id="episode-worker",
+        socket_path=None,
+        runtime_url="http://rtscortex",
+        seed=7,
+    )
+    main_agent.decision_broker = broker
+    main_agent.transport_noop_primitives = 4
+    main_agent._episode_reported = False
+    main_agent._frame_publisher = None
+    closed: list[bool] = []
+    main_agent.runtime_client = SimpleNamespace(close=lambda: closed.append(True))
+
+    main_agent.on_episode_truncated(2_500)
+
+    assert main_agent._episode_reported is True
+    assert closed == [True]
+    assert runtime.episode_results == [
+        {
+            "protocol_version": "1.1",
+            "run_id": "run-worker",
+            "episode_id": "episode-worker",
+            "scenario": "pvz_task1_level1",
+            "seed": 7,
+            "outcome": "truncated",
+            "score": 0.0,
+            "steps": 2_500,
+            "metrics": {
+                "transport_noop_primitives": 4,
+                "unattributed_primitives": 0,
+                "candidate_outside_pysc2_dispatches": 0,
+                "observation_gap_watchdog_triggers": 0,
+            },
+            "failure_reason": "max_agent_steps_reached",
         }
     ]
 
@@ -270,6 +364,8 @@ def test_worker_settings_prefer_canonical_runtime_environment(
     monkeypatch.setenv("RTSCORTEX_PAUSE_UNTIL_FIRST_PLAN", "true")
     monkeypatch.setenv("RTSCORTEX_RUNTIME_REQUEST_TIMEOUT_SECONDS", "50")
     monkeypatch.setenv("RTSCORTEX_ACTION_EFFECT_TIMEOUT_GAME_LOOPS", "96")
+    monkeypatch.setenv("RTSCORTEX_OBSERVATION_GAP_WATCHDOG_GAME_LOOPS", "448")
+    monkeypatch.setenv("RTSCORTEX_OBSERVATION_GAP_HARD_LIMIT_GAME_LOOPS", "1792")
 
     settings = WorkerSettings.from_environment()
 
@@ -281,6 +377,191 @@ def test_worker_settings_prefer_canonical_runtime_environment(
     assert settings.pause_until_first_plan is True
     assert settings.runtime_request_timeout_seconds == 50.0
     assert settings.action_effect_timeout_game_loops == 96
+    assert settings.observation_gap_watchdog_game_loops == 448
+    assert settings.observation_gap_hard_limit_game_loops == 1792
+
+
+def test_production_camera_waits_for_exact_producer_feature_observation() -> None:
+    timestep = _fake_timestep()
+    agent = cast(Any, object.__new__(RTSCortexLLMAgent))
+    agent.func_list = [(2, object(), ("select", 0xBBB)), (503, object(), ())]
+    agent._rtscortex_translation_ordinal = 1
+    agent._rtscortex_production_source_tag = 0xBBB
+    agent._rtscortex_production_camera_waits = 0
+    agent.size_screen = 128
+
+    assert agent._wait_for_production_camera("Train_Zealot", timestep) is True
+    assert agent._rtscortex_production_camera_waits == 1
+
+    producer = _unit(0xBBB, 62, 1, 32, 32, 500, 255)
+    producer.is_on_screen = True
+    timestep.observation.feature_units.append(producer)
+
+    assert (
+        _producer_is_visible(
+            timestep.observation,
+            0xBBB,
+            size_screen=128,
+        )
+        is True
+    )
+    assert agent._wait_for_production_camera("Train_Zealot", timestep) is False
+    assert agent._rtscortex_production_camera_waits == 0
+
+    producer.x = 0
+    assert (
+        _producer_is_visible(
+            timestep.observation,
+            0xBBB,
+            size_screen=128,
+        )
+        is False
+    )
+
+
+def test_production_camera_settlement_timeout_is_structured_failure() -> None:
+    runtime = FakeRuntime()
+    coordinator = BridgeCoordinator(runtime)
+    broker = SharedDecisionBroker(
+        coordinator,
+        TimeStepExtractor("run-worker", "episode-worker"),
+    )
+    command = RoutedCommand(
+        command_id="command-camera-timeout",
+        actor="Developer/Empty",
+        team_name="Empty",
+        name="Train_Adept",
+        rendered_action="<Train_Adept()>",
+    )
+    _register_bridge_route(
+        broker,
+        coordinator,
+        _bridge_route("Developer", ("Empty",), command, step_id=70),
+    )
+    camera = broker.claim_primitive(
+        "Developer",
+        "Empty",
+        "Train_Adept",
+        "llm_pysc2_move_camera",
+        final_primitive=False,
+        ordinal=0,
+        total=3,
+        requested_function_id=573,
+        emitted_function_id=573,
+    )
+    assert camera is not None
+    broker.settle_primitive(camera, success=True, game_loop=224)
+    agent = cast(Any, object.__new__(RTSCortexLLMAgent))
+    agent.name = "Developer"
+    agent.broker = broker
+    agent.func_list = [(2, object(), ("select", 0xBBB)), (457, object(), ())]
+    agent.action_list = []
+    agent._rtscortex_translation_ordinal = 1
+    agent._rtscortex_production_source_tag = 0xBBB
+    agent._rtscortex_production_camera_waits = 0
+    agent.size_screen = 128
+    agent._rtscortex_semantic_action = {"name": "Train_Adept"}
+    agent.team_unit_team_curr = None
+    agent.team_unit_tag_curr = None
+    agent.team_unit_tag_list = []
+    agent.flag_enable_empty_unit_group = True
+    timestep = _fake_timestep()
+
+    for _ in range(5):
+        assert agent._wait_for_production_camera("Train_Adept", timestep) is True
+    broker.end_episode(_episode_result())
+
+    assert len(runtime.execution_reports) == 1
+    report = runtime.execution_reports[0]
+    assert report["status"] == "failed"
+    assert report["failure_code"] == "producer_not_observable"
+    assert report["execution_stage"] == "translation"
+
+
+def test_observation_gap_watchdog_preempts_once_and_recovers() -> None:
+    broker = SimpleNamespace(last_decision_game_loop=100, triggers=0)
+    broker.record_observation_gap_watchdog_trigger = lambda: setattr(
+        broker, "triggers", broker.triggers + 1
+    )
+    agent = cast(Any, object.__new__(RTSCortexMainAgent))
+    agent.decision_broker = broker
+    agent.worker_settings = WorkerSettings(
+        run_id="run-watchdog",
+        episode_id="episode-watchdog",
+        socket_path=None,
+        runtime_url="http://rtscortex",
+        seed=0,
+        observation_gap_watchdog_game_loops=10,
+        observation_gap_hard_limit_game_loops=40,
+    )
+    agent._observation_watchdog_active = False
+    agent._observation_watchdog_baseline_loop = None
+    agent._rtscortex_force_runtime_decision = False
+
+    assert agent._update_observation_gap_watchdog(111) is True
+    assert agent._rtscortex_force_runtime_decision is True
+    assert broker.triggers == 1
+    assert agent._update_observation_gap_watchdog(112) is True
+    assert broker.triggers == 1
+
+    broker.last_decision_game_loop = 120
+    assert agent._update_observation_gap_watchdog(121) is False
+    assert agent._rtscortex_force_runtime_decision is False
+
+
+def test_observation_gap_watchdog_fails_before_unbounded_stall() -> None:
+    broker = SimpleNamespace(last_decision_game_loop=100, triggers=0)
+    broker.record_observation_gap_watchdog_trigger = lambda: setattr(
+        broker, "triggers", broker.triggers + 1
+    )
+    agent = cast(Any, object.__new__(RTSCortexMainAgent))
+    agent.decision_broker = broker
+    agent.worker_settings = WorkerSettings(
+        run_id="run-watchdog",
+        episode_id="episode-watchdog",
+        socket_path=None,
+        runtime_url="http://rtscortex",
+        seed=0,
+        observation_gap_watchdog_game_loops=10,
+        observation_gap_hard_limit_game_loops=40,
+    )
+    agent._observation_watchdog_active = False
+    agent._observation_watchdog_baseline_loop = None
+    agent._rtscortex_force_runtime_decision = False
+
+    with pytest.raises(RuntimeError, match="observation_gap_watchdog_timeout"):
+        agent._update_observation_gap_watchdog(141)
+
+
+def test_observation_gap_watchdog_releases_optional_team_selection_barrier() -> None:
+    exact = SimpleNamespace(
+        enable=True,
+        teams=[{"select_type": "select", "unit_tags": [0xA, 0xB]}],
+        team_unit_tag_list=[],
+        _is_waiting_query=lambda: True,
+    )
+    grouped = SimpleNamespace(
+        enable=True,
+        teams=[{"select_type": "select_all_type", "unit_tags": [0xC, 0xD]}],
+        team_unit_tag_list=[],
+        _is_waiting_query=lambda: True,
+    )
+    busy = SimpleNamespace(
+        enable=True,
+        teams=[{"select_type": "select", "unit_tags": [0xE]}],
+        team_unit_tag_list=[],
+        _is_waiting_query=lambda: False,
+    )
+    main_agent = SimpleNamespace(
+        agents={"Builder": exact, "CombatGroup": grouped, "Busy": busy},
+        unit_uid_disappear={0xB},
+    )
+
+    _release_runtime_observation_barrier(main_agent)
+
+    assert exact.team_unit_tag_list == [0xA]
+    assert grouped.team_unit_tag_list == [0xC]
+    assert busy.team_unit_tag_list == []
 
 
 def test_shared_broker_exposes_pending_planner_state() -> None:
@@ -396,11 +677,222 @@ def test_auto_worker_management_guard_restores_flag_after_upstream_error() -> No
     assert config.ENABLE_AUTO_WORKER_TRAINING is True
 
 
+def test_deterministic_gas_rebalance_selects_nearest_stable_mineral_worker() -> None:
+    assimilator = SimpleNamespace(tag=500, x=20.0, y=20.0, build_progress=100)
+    workers = [
+        SimpleNamespace(tag=30, x=5.0, y=5.0),
+        SimpleNamespace(tag=20, x=19.0, y=19.0),
+        SimpleNamespace(tag=10, x=19.0, y=19.0),
+    ]
+    agent = SimpleNamespace(
+        config=SimpleNamespace(ENABLE_AUTO_WORKER_MANAGE=True),
+        main_loop_lock=False,
+        stop_worker=None,
+        stop_worker_nexus_tag=None,
+        stop_worker_at=None,
+        nexus_info_dict={
+            "100": {
+                "nexus": SimpleNamespace(tag=100),
+                "gas_building_1": assimilator,
+                "gas_building_2": None,
+                "worker_g1_tag_list": [],
+                "worker_g2_tag_list": [],
+                "worker_m_tag_list": [30, 20, 10],
+            }
+        },
+    )
+    observation = SimpleNamespace(raw_units=workers)
+
+    selected = _prime_deterministic_gas_rebalance(
+        agent,
+        observation,
+        blocked=False,
+    )
+
+    assert selected is True
+    assert agent.stop_worker.tag == 10
+    assert agent.stop_worker_nexus_tag == 100
+    assert agent.stop_worker_at == "m"
+
+
+def test_deterministic_gas_rebalance_excludes_reserved_builder_worker() -> None:
+    assimilator = SimpleNamespace(tag=500, x=20.0, y=20.0, build_progress=100)
+    workers = [
+        SimpleNamespace(tag=10, x=19.0, y=19.0),
+        SimpleNamespace(tag=20, x=18.0, y=18.0),
+    ]
+    builder = SimpleNamespace(
+        unit_tag_list=[10],
+        team_unit_tag_list=[],
+        team_unit_tag_curr=None,
+        teams=[{"unit_tags": [10]}],
+    )
+    agent = SimpleNamespace(
+        config=SimpleNamespace(ENABLE_AUTO_WORKER_MANAGE=True),
+        main_loop_lock=False,
+        stop_worker=None,
+        stop_worker_nexus_tag=None,
+        stop_worker_at=None,
+        agents={"Builder": builder},
+        nexus_info_dict={
+            "100": {
+                "nexus": SimpleNamespace(tag=100),
+                "gas_building_1": assimilator,
+                "gas_building_2": None,
+                "worker_g1_tag_list": [],
+                "worker_g2_tag_list": [],
+                "worker_m_tag_list": [10, 20],
+            }
+        },
+    )
+
+    selected = _prime_deterministic_gas_rebalance(
+        agent,
+        SimpleNamespace(raw_units=workers),
+        blocked=False,
+    )
+
+    assert selected is True
+    assert agent.stop_worker.tag == 20
+    assert agent._rtscortex_reserved_worker_tags == {10}
+
+
+def test_deterministic_gas_rebalance_evicts_builder_already_on_gas() -> None:
+    assimilator = SimpleNamespace(tag=500, x=20.0, y=20.0, build_progress=100)
+    builder_worker = SimpleNamespace(tag=10, x=20.0, y=20.0)
+    ordinary_worker = SimpleNamespace(tag=20, x=18.0, y=18.0)
+    builder = SimpleNamespace(
+        unit_tag_list=[10],
+        team_unit_tag_list=[],
+        team_unit_tag_curr=None,
+        teams=[{"unit_tags": [10]}],
+    )
+    agent = SimpleNamespace(
+        config=SimpleNamespace(ENABLE_AUTO_WORKER_MANAGE=True),
+        main_loop_lock=False,
+        stop_worker=None,
+        stop_worker_nexus_tag=None,
+        stop_worker_at=None,
+        agents={"Builder": builder},
+        nexus_info_dict={
+            "100": {
+                "nexus": SimpleNamespace(tag=100),
+                "gas_building_1": assimilator,
+                "gas_building_2": None,
+                "worker_g1_tag_list": [10],
+                "worker_g2_tag_list": [],
+                "worker_m_tag_list": [20],
+            }
+        },
+    )
+
+    selected = _prime_deterministic_gas_rebalance(
+        agent,
+        SimpleNamespace(raw_units=[builder_worker, ordinary_worker]),
+        blocked=False,
+    )
+
+    assert selected is True
+    assert agent.stop_worker is builder_worker
+    assert agent.stop_worker_nexus_tag == 100
+    assert agent.stop_worker_at == "g1"
+
+
+def test_deterministic_gas_rebalance_respects_effect_and_main_loop_guards() -> None:
+    builder = SimpleNamespace(
+        unit_tag_list=[10],
+        team_unit_tag_list=[],
+        team_unit_tag_curr=None,
+        teams=[{"unit_tags": [10]}],
+    )
+    agent = SimpleNamespace(
+        config=SimpleNamespace(ENABLE_AUTO_WORKER_MANAGE=True),
+        main_loop_lock=False,
+        stop_worker=None,
+        stop_worker_nexus_tag=None,
+        agents={"Builder": builder},
+        nexus_info_dict={},
+    )
+
+    assert (
+        _prime_deterministic_gas_rebalance(
+            agent,
+            SimpleNamespace(raw_units=[]),
+            blocked=True,
+        )
+        is False
+    )
+    assert agent._rtscortex_reserved_worker_tags == {10}
+    agent.main_loop_lock = True
+    assert (
+        _prime_deterministic_gas_rebalance(
+            agent,
+            SimpleNamespace(raw_units=[]),
+            blocked=False,
+        )
+        is False
+    )
+    assert agent._rtscortex_reserved_worker_tags == {10}
+
+
 def test_translated_build_position_extracts_final_screen_argument() -> None:
     assert _translated_build_position("Build_Nexus_Near", [(90, 70)]) == [90, 70]
     assert _translated_build_position("Build_Pylon_Screen", ["now", [65, 55]]) == [65, 55]
     assert _translated_build_position("Move_Screen", [[65, 55]]) is None
     assert _translated_build_position("Build_Nexus_Near", ["invalid"]) is None
+
+
+def test_build_dispatch_does_not_mutate_reusable_action_template() -> None:
+    template = {
+        "name": "Build_Pylon_Screen",
+        "arg": ["screen"],
+        "func": [(70, None, ("now", [0, 0]))],
+    }
+    action_list = [
+        {
+            "name": template["name"],
+            "arg": template["arg"],
+            "func": template["func"],
+        }
+    ]
+
+    isolated = _isolate_next_action(action_list)
+    _replace_screen_action_position(isolated, [65, 35])
+
+    assert isolated["arg"] == [[65, 35]]
+    assert template["arg"] == ["screen"]
+    assert action_list[0] is isolated
+
+
+def test_build_position_resampling_excludes_previously_failed_candidate() -> None:
+    observation = SimpleNamespace(
+        feature_screen=SimpleNamespace(
+            buildable=UniformGrid(1),
+            pathable=UniformGrid(1),
+            player_relative=UniformGrid(0),
+            power=UniformGrid(0),
+        ),
+        feature_units=[],
+    )
+    candidates = build_screen_candidates(observation, "Build_Pylon_Screen")
+    assert len(candidates) >= 2
+    requested = candidates[0]
+    action = {
+        "name": "Build_Pylon_Screen",
+        "arg": [list(requested)],
+        "func": [(70, object(), ("now", list(requested)))],
+    }
+
+    resolved = _resolve_build_action_position(
+        action,
+        observation,
+        excluded_positions={(requested[0], requested[1])},
+    )
+
+    assert resolved is not None
+    assert resolved != requested
+    assert resolved in candidates
+    assert action["arg"] == [resolved]
 
 
 def test_timestep_extractor_maps_sc2_attack_alerts() -> None:
@@ -441,8 +933,56 @@ def test_timestep_extractor_adds_structured_pylon_screen_candidates() -> None:
         if action["name"] == "Build_Pylon_Screen"
     )
     assert pylon["argument_candidates"]
+
     assert all(len(candidate) == 1 for candidate in pylon["argument_candidates"])
     assert "RTSCortex Build Candidates" not in snapshot["text_observation"]
+
+
+def test_timestep_extractor_keeps_build_when_primitive_is_temporarily_unavailable() -> None:
+    timestep = _fake_timestep()
+    timestep.observation.available_actions = [0]
+    timestep.observation.feature_screen = SimpleNamespace(
+        buildable=UniformGrid(1),
+        pathable=UniformGrid(1),
+        player_relative=UniformGrid(0),
+        power=UniformGrid(0),
+    )
+    agent = FakeAgent("Builder", "Builder-Probe-1", timestep, StubBroker())
+    agent.config.AGENTS["Builder"]["action"][311].append(
+        {"name": "Build_Pylon_Screen", "arg": ["screen"], "func": [(70, None, ())]}
+    )
+
+    snapshot = TimeStepExtractor(
+        "run-worker",
+        "episode-worker",
+        action_source_types={70: 311},
+    ).extract(
+        timestep,
+        {"Builder": agent},
+        {"Builder": "builder observation"},
+        step_id=1,
+    )
+
+    pylon = next(
+        action
+        for action in snapshot["teams"][0]["available_actions"]
+        if action["name"] == "Build_Pylon_Screen"
+    )
+    assert pylon["argument_candidates"]
+
+    without_probe = TimeStepExtractor(
+        "run-worker",
+        "episode-worker",
+        action_source_types={70: 999},
+    ).extract(
+        timestep,
+        {"Builder": agent},
+        {"Builder": "builder observation"},
+        step_id=2,
+    )
+    assert "Build_Pylon_Screen" not in {
+        action["name"] for action in without_probe["teams"][0]["available_actions"]
+    }
 
 
 def test_timestep_extractor_enumerates_stable_pathable_move_and_blink_candidates() -> None:
@@ -905,6 +1445,149 @@ def test_cybernetics_core_candidates_require_completed_gateway_and_power() -> No
 
     assert candidates
     assert all(len(candidate) == 1 and len(candidate[0]) == 2 for candidate in candidates)
+
+
+def test_stargate_candidates_require_completed_core_and_full_resource_cost() -> None:
+    observation = SimpleNamespace(
+        player_common=SimpleNamespace(minerals=150, vespene=150),
+        raw_units=[],
+        feature_units=[],
+        feature_screen=SimpleNamespace(
+            buildable=UniformGrid(1),
+            pathable=UniformGrid(1),
+            player_relative=UniformGrid(0),
+            power=UniformGrid(1),
+        ),
+    )
+    unit_names = {72: "CyberneticsCore"}
+
+    assert (
+        semantic_argument_candidates(
+            observation,
+            "Build_Stargate_Screen",
+            unit_names=unit_names,
+        )
+        == []
+    )
+
+    core = _unit(0xDEF, 72, 1, 36, 35, 500, 255)
+    core.build_progress = 50
+    observation.raw_units.append(core)
+    assert (
+        semantic_argument_candidates(
+            observation,
+            "Build_Stargate_Screen",
+            unit_names=unit_names,
+        )
+        == []
+    )
+
+    core.build_progress = 100
+    observation.player_common.minerals = 149
+    assert (
+        semantic_argument_candidates(
+            observation,
+            "Build_Stargate_Screen",
+            unit_names=unit_names,
+        )
+        == []
+    )
+
+    observation.player_common.minerals = 150
+    observation.player_common.vespene = 149
+    assert (
+        semantic_argument_candidates(
+            observation,
+            "Build_Stargate_Screen",
+            unit_names=unit_names,
+        )
+        == []
+    )
+
+    observation.player_common.vespene = 150
+    candidates = semantic_argument_candidates(
+        observation,
+        "Build_Stargate_Screen",
+        unit_names=unit_names,
+    )
+    assert candidates
+    assert all(len(candidate) == 1 and len(candidate[0]) == 2 for candidate in candidates)
+
+
+def test_shield_battery_requires_core_power_and_clear_full_footprint() -> None:
+    buildable = [[0 for _ in range(128)] for _ in range(128)]
+    pathable = [[0 for _ in range(128)] for _ in range(128)]
+    power = [[0 for _ in range(128)] for _ in range(128)]
+    for y in range(59, 71):
+        for x in range(59, 71):
+            buildable[y][x] = 1
+            pathable[y][x] = 1
+            power[y][x] = 1
+    observation = SimpleNamespace(
+        player_common=SimpleNamespace(minerals=100, vespene=0),
+        raw_units=[],
+        feature_units=[],
+        feature_screen=SimpleNamespace(
+            buildable=Grid(buildable),
+            pathable=Grid(pathable),
+            player_relative=UniformGrid(0),
+            power=Grid(power),
+        ),
+    )
+    unit_names = {72: "CyberneticsCore"}
+
+    assert (
+        semantic_argument_candidates(
+            observation,
+            "Build_ShieldBattery_Screen",
+            unit_names=unit_names,
+        )
+        == []
+    )
+
+    core = _unit(0xC0E, 72, 1, 30, 30, 500, 255)
+    core.build_progress = 100
+    observation.raw_units.append(core)
+    assert [65, 65] in build_screen_candidates(
+        observation,
+        "Build_ShieldBattery_Screen",
+    )
+    assert screen_build_position_is_legal(
+        observation,
+        "Build_ShieldBattery_Screen",
+        [65, 65],
+        unit_names=unit_names,
+    )
+    assert not screen_build_position_is_legal(
+        observation,
+        "Build_ShieldBattery_Screen",
+        [5, 5],
+        unit_names=unit_names,
+    )
+
+    pathable[65][65] = 0
+    assert not screen_build_position_is_legal(
+        observation,
+        "Build_ShieldBattery_Screen",
+        [65, 65],
+        unit_names=unit_names,
+    )
+    pathable[65][65] = 1
+    power[65][65] = 0
+    assert not screen_build_position_is_legal(
+        observation,
+        "Build_ShieldBattery_Screen",
+        [65, 65],
+        unit_names=unit_names,
+    )
+    power[65][65] = 1
+    observation.feature_units.append(SimpleNamespace(x=65, y=65, radius=0.5, is_on_screen=True))
+    assert not screen_build_position_is_legal(
+        observation,
+        "Build_ShieldBattery_Screen",
+        [65, 65],
+        unit_names=unit_names,
+    )
 
 
 def test_assimilator_candidates_require_nearby_unoccupied_visible_geyser() -> None:
@@ -1414,6 +2097,7 @@ def test_candidate_outside_dispatch_counter_is_persisted_and_fails_command(
     assert json.loads(metrics_path.read_text(encoding="utf-8")) == {
         "unattributed_primitives": 0,
         "candidate_outside_pysc2_dispatches": 0,
+        "observation_gap_watchdog_triggers": 0,
     }
 
     with pytest.raises(RuntimeError, match="outside the current candidate set"):
@@ -1748,6 +2432,266 @@ def test_production_source_resolver_returns_the_idle_completed_structure_tag() -
     )
 
 
+def test_production_source_follows_upstream_raw_order_instead_of_tag_order() -> None:
+    timestep = _fake_timestep()
+    first = _unit(0xBBB, 62, 1, 36, 35, 500, 255)
+    second = _unit(0xAAA, 62, 1, 37, 35, 500, 255)
+    for gateway in (first, second):
+        gateway.build_progress = 100
+        gateway.active = 0
+    timestep.observation.raw_units.extend([first, second])
+
+    resolved = production_source_tag(
+        timestep.observation,
+        {"name": "Train_Zealot", "func": [(503, None, ())]},
+        unit_names={62: "Gateway"},
+        action_source_types={503: 62},
+    )
+
+    assert resolved == 0xBBB
+
+
+def test_train_registry_pins_six_worker_actions_and_raw_orders() -> None:
+    assert {action: spec.raw_order_id for action, spec in PRODUCTION_SPECS.items()} == {
+        "Train_Zealot": 49,
+        "Train_Stalker": 50,
+        "Train_Adept": 54,
+        "Train_Phoenix": 55,
+        "Train_VoidRay": 57,
+        "Train_Oracle": 58,
+    }
+
+
+@pytest.mark.parametrize("action_name", ["Train_Phoenix", "Train_Oracle"])
+def test_stargate_train_availability_uses_registry_costs(action_name: str) -> None:
+    spec = PRODUCTION_SPECS[action_name]
+    timestep = _fake_timestep()
+    timestep.observation.player.minerals = spec.minerals
+    timestep.observation.player.vespene = spec.vespene
+    timestep.observation.player.food_used = 10
+    timestep.observation.player.food_cap = 10 + spec.supply
+    stargate = _unit(0x57A, 67, 1, 36, 35, 500, 255)
+    stargate.build_progress = 100
+    stargate.active = 0
+    timestep.observation.raw_units.append(stargate)
+
+    assert (
+        production_source_tag(
+            timestep.observation,
+            {"name": action_name, "func": [(spec.feature_function_id, None, ())]},
+            unit_names={67: "Stargate"},
+            action_source_types={spec.feature_function_id: 67},
+        )
+        == 0x57A
+    )
+
+    timestep.observation.player.vespene -= 1
+    assert (
+        production_source_tag(
+            timestep.observation,
+            {"name": action_name, "func": [(spec.feature_function_id, None, ())]},
+            unit_names={67: "Stargate"},
+            action_source_types={spec.feature_function_id: 67},
+        )
+        is None
+    )
+
+
+def test_extractor_projects_production_queue_with_exact_producer_tag() -> None:
+    timestep = _fake_timestep()
+    gateway = _unit(0xBBB, 62, 1, 36, 35, 500, 255)
+    gateway.build_progress = 100
+    gateway.active = 1
+    gateway.order_length = 1
+    gateway.order_id_0 = 49
+    gateway.order_progress_0 = 0.25
+    timestep.observation.raw_units.append(gateway)
+    timestep.observation.production_queue = [SimpleNamespace(ability_id=916, build_progress=25)]
+
+    snapshot = TimeStepExtractor(
+        "run-worker",
+        "episode-worker",
+        unit_names={62: "Gateway"},
+    ).extract(timestep, {}, {}, step_id=1)
+
+    assert snapshot["production_queue"] == [
+        {"name": "Train_Zealot", "producer_tag": 0xBBB, "progress": 0.25}
+    ]
+
+
+def test_translator_source_tag_replaces_stale_preflight_provenance() -> None:
+    timestep = _fake_timestep()
+    first = _unit(0xBBB, 62, 1, 36, 35, 500, 255)
+    second = _unit(0xAAA, 62, 1, 37, 35, 500, 255)
+    for gateway in (first, second):
+        gateway.build_progress = 100
+        gateway.active = 0
+    timestep.observation.raw_units.extend([first, second])
+    broker = SharedDecisionBroker(
+        BridgeCoordinator(FakeRuntime()),
+        TimeStepExtractor(
+            "run-worker",
+            "episode-worker",
+            unit_names={62: "Gateway"},
+            action_source_types={503: 62},
+        ),
+    )
+    agent = cast(Any, object.__new__(RTSCortexLLMAgent))
+    agent.name = "Developer"
+    agent.broker = broker
+    agent.unit_names = {62: "Gateway"}
+    agent.team_unit_team_curr = None
+    agent.team_unit_tag_curr = None
+    agent.team_unit_tag_list = []
+    agent.flag_enable_empty_unit_group = True
+    action = {"name": "Train_Zealot", "func": [(503, None, ())]}
+
+    assert agent._reject_unavailable_production_action(action, timestep) is False
+    assert agent._rtscortex_production_source_tag == 0xBBB
+    producer_tag, failure = agent._validated_production_source_tag(
+        "Train_Zealot",
+        {
+            "ordinal": 0,
+            "requested_function_id": 573,
+            "requested_arguments": [0xAAA],
+            "resolved_arguments": [(39.0, 68.0)],
+        },
+    )
+
+    assert producer_tag == 0xAAA
+    assert failure is None
+    assert agent._rtscortex_production_source_tag == 0xAAA
+
+
+def test_missing_production_provenance_publishes_one_translation_failure() -> None:
+    runtime = FakeRuntime()
+    coordinator = BridgeCoordinator(runtime)
+    broker = SharedDecisionBroker(
+        coordinator,
+        TimeStepExtractor("run-worker", "episode-worker"),
+    )
+    command = RoutedCommand(
+        command_id="command-train-provenance",
+        actor="Developer/Empty",
+        team_name="Empty",
+        name="Train_Zealot",
+        rendered_action="<Train_Zealot()>",
+    )
+    _register_bridge_route(
+        broker,
+        coordinator,
+        _bridge_route("Developer", ("Empty",), command, step_id=68),
+    )
+    agent = cast(Any, object.__new__(RTSCortexLLMAgent))
+    agent.name = "Developer"
+    agent.broker = broker
+    agent._rtscortex_production_source_tag = None
+    agent.team_unit_team_curr = None
+    agent.team_unit_tag_curr = None
+    agent.team_unit_tag_list = []
+    agent.flag_enable_empty_unit_group = True
+    agent.func_list = []
+    agent._rtscortex_semantic_action = {"name": "Train_Zealot"}
+    timestep = _fake_timestep()
+
+    producer_tag, failure = agent._validated_production_source_tag(
+        "Train_Zealot",
+        {
+            "ordinal": 0,
+            "requested_function_id": 573,
+            "requested_arguments": [],
+            "resolved_arguments": [(1, 2)],
+        },
+    )
+    assert producer_tag is None
+    assert failure is not None
+    failure_code, reason = failure
+    agent._settle_production_command_failure(
+        "Train_Zealot",
+        timestep,
+        failure_code=failure_code,
+        reason=reason,
+    )
+    broker.end_episode(_episode_result())
+
+    assert len(runtime.execution_reports) == 1
+    report = runtime.execution_reports[0]
+    assert report["status"] == "failed"
+    assert report["execution_stage"] == "translation"
+    assert report["failure_code"] == "production_provenance_missing"
+
+
+def test_disappearing_producer_after_camera_select_is_one_predispatch_failure() -> None:
+    runtime = FakeRuntime()
+    coordinator = BridgeCoordinator(runtime)
+    broker = SharedDecisionBroker(
+        coordinator,
+        TimeStepExtractor("run-worker", "episode-worker"),
+    )
+    command = RoutedCommand(
+        command_id="command-train-invalidated",
+        actor="Developer/Empty",
+        team_name="Empty",
+        name="Train_Zealot",
+        rendered_action="<Train_Zealot()>",
+    )
+    _register_bridge_route(
+        broker,
+        coordinator,
+        _bridge_route("Developer", ("Empty",), command, step_id=69),
+    )
+    for ordinal, function_name, function_id in (
+        (0, "llm_pysc2_move_camera", 573),
+        (1, "select_point", 2),
+    ):
+        dispatch = broker.claim_primitive(
+            "Developer",
+            "Empty",
+            "Train_Zealot",
+            function_name,
+            final_primitive=False,
+            ordinal=ordinal,
+            total=3,
+            requested_function_id=function_id,
+            emitted_function_id=function_id,
+        )
+        assert dispatch is not None
+        broker.settle_primitive(dispatch, success=True, game_loop=224 + ordinal)
+
+    timestep = _fake_timestep()
+    reason = _production_source_invalid_reason(
+        timestep.observation,
+        0xBBB,
+        PRODUCTION_SPECS["Train_Zealot"],
+        {62: "Gateway"},
+    )
+    assert reason is not None
+    agent = cast(Any, object.__new__(RTSCortexLLMAgent))
+    agent.name = "Developer"
+    agent.broker = broker
+    agent.team_unit_team_curr = None
+    agent.team_unit_tag_curr = None
+    agent.team_unit_tag_list = []
+    agent.flag_enable_empty_unit_group = True
+    agent.func_list = []
+    agent._rtscortex_semantic_action = {"name": "Train_Zealot"}
+    agent._rtscortex_production_source_tag = 0xBBB
+    agent._settle_production_command_failure(
+        "Train_Zealot",
+        timestep,
+        failure_code="production_source_invalidated",
+        reason=reason,
+    )
+    broker.end_episode(_episode_result())
+
+    assert len(runtime.execution_reports) == 1
+    report = runtime.execution_reports[0]
+    assert report["status"] == "failed"
+    assert report["execution_stage"] == "pre_dispatch"
+    assert report["failure_code"] == "production_source_invalidated"
+    assert len(report["primitive_trace"]) == 3
+
+
 @pytest.mark.parametrize(
     ("action_name", "minerals", "vespene", "food_used", "food_cap", "expected"),
     [
@@ -1790,6 +2734,90 @@ def test_known_simple64_production_cost_boundaries(
     )
 
     assert (resolved == 0xABC) is expected
+
+
+@pytest.mark.parametrize(
+    ("minerals", "vespene", "food_used", "food_cap", "core_complete", "expected"),
+    [
+        (100, 25, 13, 15, True, True),
+        (99, 25, 13, 15, True, False),
+        (100, 24, 13, 15, True, False),
+        (100, 25, 14, 15, True, False),
+        (100, 25, 13, 15, False, False),
+    ],
+)
+def test_train_adept_requires_full_cost_supply_core_and_gateway_source(
+    minerals: int,
+    vespene: int,
+    food_used: int,
+    food_cap: int,
+    core_complete: bool,
+    expected: bool,
+) -> None:
+    timestep = _fake_timestep()
+    timestep.observation.player.minerals = minerals
+    timestep.observation.player.vespene = vespene
+    timestep.observation.player.food_used = food_used
+    timestep.observation.player.food_cap = food_cap
+    gateway = _unit(0xADE, 62, 1, 35, 35, 500, 255)
+    gateway.build_progress = 100
+    gateway.active = 0
+    stargate = _unit(0x57A, 67, 1, 36, 35, 500, 255)
+    stargate.build_progress = 100
+    stargate.active = 0
+    timestep.observation.raw_units.extend([gateway, stargate])
+    if core_complete:
+        core = _unit(0xC0E, 72, 1, 37, 35, 500, 255)
+        core.build_progress = 100
+        timestep.observation.raw_units.append(core)
+
+    resolved = production_source_tag(
+        timestep.observation,
+        {"name": "Train_Adept", "func": [(457, None, ())]},
+        unit_names={62: "Gateway", 67: "Stargate", 72: "CyberneticsCore"},
+        action_source_types={457: 62},
+    )
+
+    assert (resolved == 0xADE) is expected
+
+
+@pytest.mark.parametrize(
+    ("minerals", "vespene", "food_used", "food_cap", "expected"),
+    [
+        (250, 150, 11, 15, True),
+        (249, 150, 11, 15, False),
+        (250, 149, 11, 15, False),
+        (250, 150, 12, 15, False),
+    ],
+)
+def test_train_voidray_requires_full_cost_supply_and_stargate_source(
+    minerals: int,
+    vespene: int,
+    food_used: int,
+    food_cap: int,
+    expected: bool,
+) -> None:
+    timestep = _fake_timestep()
+    timestep.observation.player.minerals = minerals
+    timestep.observation.player.vespene = vespene
+    timestep.observation.player.food_used = food_used
+    timestep.observation.player.food_cap = food_cap
+    gateway = _unit(0x6A7, 62, 1, 35, 35, 500, 255)
+    gateway.build_progress = 100
+    gateway.active = 0
+    stargate = _unit(0x57A, 67, 1, 36, 35, 500, 255)
+    stargate.build_progress = 100
+    stargate.active = 0
+    timestep.observation.raw_units.extend([gateway, stargate])
+
+    resolved = production_source_tag(
+        timestep.observation,
+        {"name": "Train_VoidRay", "func": [(500, None, ())]},
+        unit_names={62: "Gateway", 67: "Stargate"},
+        action_source_types={500: 67},
+    )
+
+    assert (resolved == 0x57A) is expected
 
 
 def test_full_supply_hides_zealot_despite_completed_idle_gateway() -> None:
@@ -2626,7 +3654,7 @@ def test_broker_forwards_raw_observations_for_deferred_effect_verification() -> 
     broker.observe_effects(observation)
 
     assert coordinator.calls == [
-        ("prepare", "command-pylon", observation, 0xABC),
+        ("prepare", "command-pylon", observation, 0xABC, None),
         ("primitive", "command-pylon", "Build_Pylon_screen", True),
         ("complete", "command-pylon", 225),
         ("observe", observation),
@@ -2916,8 +3944,9 @@ class EffectRecordingCoordinator:
         observation: Any,
         *,
         builder_tag: int | None,
+        producer_tag: int | None = None,
     ) -> None:
-        self.calls.append(("prepare", command_id, observation, builder_tag))
+        self.calls.append(("prepare", command_id, observation, builder_tag, producer_tag))
 
     def record_primitive(
         self,

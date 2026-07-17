@@ -11,3 +11,7 @@ their license texts.
   reference and is not bundled.
 - **SwarmBrain** — research-paper reference only. No source is copied.
 - **StarWM** — research and interface reference only. No repository source is copied.
+- **HIMA**, SNUMPR Lab — research, interface, and model-evaluation reference only. RTSCortex
+  does not vendor HIMA source or model weights. The public Hugging Face checkpoints do not
+  declare a standard license identifier, so local use is disabled until the operator provides
+  an explicit acknowledgement; RTSCortex never downloads these weights automatically.

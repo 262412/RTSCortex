@@ -98,4 +98,59 @@ describe("event projection", () => {
     expect(eventMatches(observation, "all", false)).toBe(false);
     expect(eventMatches(observation, "all", true)).toBe(true);
   });
+
+  it("keeps goal progress in the planning timeline even for structure goals", () => {
+    const progress = storedEvent(4, "goal_progress", {
+      status: "actionable",
+      missing: [{ kind: "structure", target: "Gateway" }],
+    });
+
+    expect(eventCategory(progress)).toBe("planner");
+  });
+
+  it("classifies direct training and production evidence under the production filter", () => {
+    const train = storedEvent(5, "execution", {
+      action_name: "Train_Adept",
+      status: "succeeded",
+      execution_stage: "effect_verification",
+      effect_evidence: { effect_kind: "production", confirmation_kind: "producer_order" },
+    });
+    const failedTrain = storedEvent(6, "execution", {
+      action_name: "Train_VoidRay",
+      status: "failed",
+      failure_code: "no_production_order_observed",
+    });
+    const warp = storedEvent(7, "execution", {
+      action_name: "Warp_Zealot_Near",
+      status: "succeeded",
+    });
+
+    expect(eventCategory(train)).toBe("production");
+    expect(eventMatches(train, "production", false)).toBe(true);
+    expect(eventCategory(failedTrain)).toBe("failure");
+    expect(eventCategory(warp)).toBe("system");
+  });
+
+  it("classifies Cortex intents and failures for timeline filtering", () => {
+    const macro = storedEvent(8, "intent_emitted", {
+      role: "macro",
+      action_name: "Build_Pylon_Screen",
+    });
+    const reflex = storedEvent(9, "intent_emitted", {
+      role: "reflex",
+      action_name: "Attack_Unit",
+    });
+    const candidateSet = storedEvent(10, "candidate_set_built", {
+      candidates: [{ candidate_id: "candidate-1", action_name: "Build_Pylon_Screen" }],
+    });
+    const specialistFailure = storedEvent(11, "specialist_failed", {
+      role: "macro",
+      failure_code: "timeout",
+    });
+
+    expect(eventCategory(macro)).toBe("build");
+    expect(eventCategory(reflex)).toBe("reflex");
+    expect(eventCategory(candidateSet)).toBe("build");
+    expect(eventCategory(specialistFailure)).toBe("failure");
+  });
 });

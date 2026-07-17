@@ -1,0 +1,33 @@
+diff --git a/llm_pysc2/agents/llm_pysc2_agent_main.py b/llm_pysc2/agents/llm_pysc2_agent_main.py
+index b806c6a..849795d 100644
+--- a/llm_pysc2/agents/llm_pysc2_agent_main.py
++++ b/llm_pysc2/agents/llm_pysc2_agent_main.py
+@@ -125,18 +125,20 @@ class MainAgent(base_agent.BaseAgent):
+     if not os.path.exists(base_log_dir + f"/log_analyse.py"):
+       copyfile(f"{os.path.dirname(os.path.abspath(__file__))}/../lib/log_analyse.py", base_log_dir + f"/log_analyse.py")
+ 
+-    self.log_id = -1
++    self.log_id = 0
+     while True:
+       self.log_id += 1
+       self.log_dir_path = f"{os.path.dirname(os.path.abspath(__file__))}/../../llm_log/{self.start_time}-{self.log_id}"
+-      if not os.path.exists(self.log_dir_path) and self.log_id == llm_pysc2_global_log_id + 1:
+-        llm_pysc2_global_log_id += 1
+-        self.log_error_path = self.log_dir_path + f"/log_error.txt"
+-        self.log_success_path = self.log_dir_path + f"/log_success.txt"
+-        self.log_debug_path = self.log_dir_path + f"/log_debug.txt"
+-        self.log_info_path = self.log_dir_path + f"/log_info.txt"
++      try:
+         os.mkdir(self.log_dir_path)
+-        break
++      except FileExistsError:
++        continue
++      llm_pysc2_global_log_id = max(llm_pysc2_global_log_id, self.log_id)
++      self.log_error_path = self.log_dir_path + f"/log_error.txt"
++      self.log_success_path = self.log_dir_path + f"/log_success.txt"
++      self.log_debug_path = self.log_dir_path + f"/log_debug.txt"
++      self.log_info_path = self.log_dir_path + f"/log_info.txt"
++      break
+ 
+     if not os.path.exists(self.log_error_path):
+       with open(self.log_error_path, 'w') as f:

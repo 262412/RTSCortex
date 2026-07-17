@@ -1,4 +1,4 @@
-import { BrainCircuit, Braces, CheckCircle2, Clock3, Crosshair, Database, ShieldCheck, Workflow, XCircle } from "lucide-react";
+import { BrainCircuit, Braces, CheckCircle2, Clock3, Crosshair, Database, ShieldCheck, Target, Workflow, XCircle } from "lucide-react";
 
 import { moduleOutput } from "../data";
 import { eventSemanticPayload, moduleSemanticOutput, semanticScalar } from "../presentation";
@@ -6,7 +6,9 @@ import type { JsonValue, StoredEvent } from "../types";
 import { SemanticValue } from "./SemanticValue";
 
 interface DecisionRailProps {
+  situation?: StoredEvent;
   reflection?: StoredEvent;
+  goalProgress?: StoredEvent;
   plan?: StoredEvent;
   candidateActions?: JsonValue;
   context?: StoredEvent;
@@ -40,7 +42,9 @@ function InsightCard({ title, icon, value, tone = "default", empty = "Waiting fo
 }
 
 export function DecisionRail({
+  situation,
   reflection,
+  goalProgress,
   plan,
   candidateActions,
   context,
@@ -54,7 +58,11 @@ export function DecisionRail({
   const executionPayload = execution?.payload;
   const executionStatus = typeof executionPayload?.status === "string" ? executionPayload.status : undefined;
   const executionTone = executionStatus === "succeeded" ? "success" : executionStatus === "failed" ? "danger" : "default";
-  const planValue = plan?.event_type === "plan_accepted" ? eventSemanticPayload(plan) : moduleOutput(plan);
+  const progressStatus = typeof goalProgress?.payload.status === "string" ? goalProgress.payload.status : undefined;
+  const progressTone = progressStatus === "achieved" ? "success" : progressStatus === "blocked" ? "danger" : "active";
+  const planValue = plan && ["plan_accepted", "macro_plan_accepted"].includes(plan.event_type)
+    ? eventSemanticPayload(plan)
+    : moduleOutput(plan);
 
   return (
     <aside className="decision-rail" aria-label="Agent decision pipeline">
@@ -71,8 +79,21 @@ export function DecisionRail({
 
       <div className="insight-stack">
         <InsightCard title="模型调用" icon={<Clock3 size={15} />} value={modelTelemetry} />
+        <InsightCard
+          title="当前战况分析"
+          icon={<BrainCircuit size={15} />}
+          value={situation ? eventSemanticPayload(situation) : undefined}
+          empty="等待战况分析"
+        />
         <InsightCard title="上下文压缩" icon={<Database size={15} />} value={context?.payload} />
         <InsightCard title="复盘反思" icon={<BrainCircuit size={15} />} value={moduleSemanticOutput(reflection)} />
+        <InsightCard
+          title="目标进度检查（复盘依据）"
+          icon={<Target size={15} />}
+          value={goalProgress ? eventSemanticPayload(goalProgress) : undefined}
+          tone={progressTone}
+          empty="等待确定性目标进度检查"
+        />
         <InsightCard title="当前采用的计划" icon={<Workflow size={15} />} value={planValue} />
         <InsightCard title="模型建议动作" icon={<Crosshair size={15} />} value={candidateActions} />
         <InsightCard title="验证与派发" icon={<ShieldCheck size={15} />} value={decision ? eventSemanticPayload(decision) : undefined} />

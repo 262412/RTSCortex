@@ -9,11 +9,18 @@ from types import SimpleNamespace
 
 from llm_pysc2.agents.llm_pysc2_agent import LLMAgent
 from llm_pysc2.agents.llm_pysc2_agent_main import MainAgent
-from llm_pysc2.agents.main_agent_funcs import main_agent_func1
+from llm_pysc2.agents.main_agent_funcs import (
+    get_camera_func_smart,
+    main_agent_func1,
+    main_agent_func2,
+    main_agent_func4,
+)
 from llm_pysc2.lib import llm_action
+from pysc2.env import run_loop
 from pysc2.lib import actions, features
 from rtscortex_llm_pysc2.effect_verifier import _BUILD_RAW_FUNCTION_IDS
 from rtscortex_llm_pysc2.observation import _map_argument_candidates
+from rtscortex_llm_pysc2.production import PRODUCTION_SPECS
 
 
 def _assert_candidate_mapping() -> None:
@@ -30,18 +37,145 @@ def _assert_candidate_mapping() -> None:
     assert "return translator settlement no_op" in inspect.getsource(MainAgent.step)
 
 
+def _assert_reserved_builder_worker_guard() -> None:
+    source = inspect.getsource(main_agent_func2)
+    assert "_rtscortex_reserved_worker_tags" in source
+    assert "Reserved worker" in source
+    assert "HoldPosition_quick('now')" in source
+
+
+def _assert_worker_assignment_revalidates_workplaces() -> None:
+    source = inspect.getsource(main_agent_func2)
+    assert "Refresh worker targets from the current raw observation" in source
+    assert "if target_nexus is None:" in source
+    assert "reversed(possible_working_place_nexus_tag_list)" in source
+    assert "Stale worker workplace" in source
+    assert "if len(working_place_unit_list) == 0:" in source
+
+
+def _assert_max_frame_hook() -> None:
+    calls = []
+
+    class Agent:
+        def setup(self, observation_spec, action_spec) -> None:
+            del observation_spec, action_spec
+
+        def reset(self) -> None:
+            pass
+
+        def step(self, timestep):
+            del timestep
+            return "noop"
+
+        def on_episode_truncated(self, total_frames: int) -> None:
+            calls.append(total_frames)
+
+    class Environment:
+        def observation_spec(self):
+            return [object()]
+
+        def action_spec(self):
+            return [object()]
+
+        def reset(self):
+            return [SimpleNamespace(last=lambda: False)]
+
+        def step(self, actions):
+            raise AssertionError(f"unexpected step: {actions}")
+
+    run_loop.run_loop([Agent()], Environment(), max_frames=1, max_episodes=1)
+    assert calls == [1]
+
+
+def _assert_atomic_log_directory_allocation() -> None:
+    source = inspect.getsource(MainAgent._initialize_logger)
+    assert "except FileExistsError:" in source
+    assert "llm_pysc2_global_log_id = max" in source
+
+
+def _assert_gas_rebalance_uses_worker_management_flag() -> None:
+    source = inspect.getsource(main_agent_func2)
+    assert "ENABLE_AUTO_WORKER_MANAGE and self.is_all_nexus_full is False" in source
+
+
+def _assert_observation_gap_watchdog_preempts_optional_gathering() -> None:
+    assert "_rtscortex_force_runtime_decision" in inspect.getsource(main_agent_func4)
+
+
+def _assert_visible_team_unit_bypasses_camera_recentering() -> None:
+    assert "_rtscortex_accept_visible_team_unit" in inspect.getsource(get_camera_func_smart)
+    unit = SimpleNamespace(tag=0xA, x=90, y=65)
+    observation = SimpleNamespace(
+        observation=SimpleNamespace(raw_units=[unit], feature_units=[unit])
+    )
+    main_agent = SimpleNamespace(
+        log_id=0,
+        size_screen=128,
+        _rtscortex_accept_visible_team_unit=True,
+    )
+
+    function_id, _ = get_camera_func_smart(main_agent, observation, unit.tag)
+
+    assert function_id == 0
+
+
 def _assert_build_order_ids_use_raw_function_domain() -> None:
     ability_ids = {
         "Assimilator": 882,
         "CyberneticsCore": 894,
+        "Forge": 884,
         "Gateway": 883,
         "Nexus": 880,
         "Pylon": 881,
+        "ShieldBattery": 895,
+        "Stargate": 889,
     }
     assert _BUILD_RAW_FUNCTION_IDS == {
         structure: int(actions.RAW_ABILITY_ID_TO_FUNC_ID[ability_id])
         for structure, ability_id in ability_ids.items()
     }
+
+
+def _assert_direct_production_contract() -> None:
+    expected = {
+        "Train_Zealot": (503, 49, "Gateway", "Zealot", 100, 0, 2, ("Gateway",)),
+        "Train_Stalker": (
+            493,
+            50,
+            "Gateway",
+            "Stalker",
+            125,
+            50,
+            2,
+            ("Gateway", "CyberneticsCore"),
+        ),
+        "Train_Adept": (
+            457,
+            54,
+            "Gateway",
+            "Adept",
+            100,
+            25,
+            2,
+            ("Gateway", "CyberneticsCore"),
+        ),
+        "Train_Phoenix": (484, 55, "Stargate", "Phoenix", 150, 100, 2, ("Stargate",)),
+        "Train_VoidRay": (500, 57, "Stargate", "VoidRay", 250, 150, 4, ("Stargate",)),
+        "Train_Oracle": (482, 58, "Stargate", "Oracle", 150, 150, 3, ("Stargate",)),
+    }
+    assert {
+        action_name: (
+            spec.feature_function_id,
+            spec.raw_order_id,
+            spec.producer_type,
+            spec.unit_type,
+            spec.minerals,
+            spec.vespene,
+            spec.supply,
+            spec.prerequisites,
+        )
+        for action_name, spec in PRODUCTION_SPECS.items()
+    } == expected
 
 
 def _agent_with_tracked_team() -> LLMAgent:
@@ -211,6 +345,7 @@ def _assert_multi_argument_rejection() -> None:
         "ordinal": 0,
         "total": 1,
         "accepted": False,
+        "requested_arguments": ["invalid-queue", [64, 64]],
         "resolved_arguments": [],
         "reason": "invalid-queue",
     }
@@ -520,7 +655,15 @@ def _assert_exact_anchor_and_footprint() -> None:
 
 def main() -> None:
     _assert_candidate_mapping()
+    _assert_reserved_builder_worker_guard()
+    _assert_worker_assignment_revalidates_workplaces()
+    _assert_max_frame_hook()
+    _assert_atomic_log_directory_allocation()
+    _assert_gas_rebalance_uses_worker_management_flag()
+    _assert_observation_gap_watchdog_preempts_optional_gathering()
+    _assert_visible_team_unit_bypasses_camera_recentering()
     _assert_build_order_ids_use_raw_function_domain()
+    _assert_direct_production_contract()
     _assert_raw_unit_presence_controls_team_lifecycle()
     _assert_transient_disappearance_grace()
     _assert_confirmed_disappearance_removes_actor()

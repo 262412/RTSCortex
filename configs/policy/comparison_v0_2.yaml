@@ -1,0 +1,14 @@
+format_version: "0.2"
+corpus_manifest: benchmarks/policy/protoss_v0_2/manifest.yaml
+output_root: ~/scratch/outputs/RTSCortex
+qwen:
+  enabled: true
+  experiment_config: configs/experiments/live_simple64_qwen3_8b.yaml
+hima:
+  enabled: [a, b, c]
+  python_executable: ~/fastscratch/envs/rtscortex-hima/bin/python
+  device: cuda:0
+  allow_unlicensed_weights: false
+  model_paths: {}
+hiernet:
+  enabled: false

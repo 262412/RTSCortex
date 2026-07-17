@@ -72,7 +72,7 @@ index 5b2c72d..96a8b40 100644
        func_id, func_call = (0, actions.FUNCTIONS.no_op())
  
      # 保存动作信息
-@@ -554,6 +571,18 @@ class LLMAgent:
+@@ -554,6 +571,19 @@ class LLMAgent:
      if len(self.action_list) == 0:
        self.first_action = True  # 本小队最后一个动作已经执行完毕
      logger.info(f"[ID {self.log_id}] LLMAgent {self.name} get_func(): Get Func {func_id}, {func_call}")
@@ -85,6 +85,7 @@ index 5b2c72d..96a8b40 100644
 +      'ordinal': translation_ordinal,
 +      'total': self._rtscortex_translation_total,
 +      'accepted': func_id == requested_function_id,
++      'requested_arguments': list(llm_pysc2_args),
 +      'resolved_arguments': pysc2_args if func_id == requested_function_id else [],
 +      'reason': validation_reason,
 +    }

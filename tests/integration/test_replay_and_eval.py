@@ -324,12 +324,18 @@ def test_evaluation_writes_all_report_formats(tmp_path: Path) -> None:
     assert "plan_revision_rate" in full_metrics
     assert "model_cost_usd" in full_metrics
     assert "action_success_rate" in full_metrics["deprecated_fields"]
+    assert "production_funnel" in full_metrics["execution"]
+    assert "production_provenance_coverage" in full_metrics["execution"]
+    assert "production_by_action" in full_metrics["execution"]
+    assert "production_by_producer" in full_metrics["execution"]
 
     report = (output / "report.md").read_text(encoding="utf-8")
     assert "Planner p50/p95 ms" in report
     assert "## Decision activity" in report
     assert "## Meaningful outcomes" in report
     assert "## Build funnel" in report
+    assert "## Production funnel" in report
+    assert "### Production breakdown" in report
     assert "## Failure taxonomy" in report
     assert "Terminal coverage" in report
     assert "Failure classification" in report

@@ -3,10 +3,16 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping, Sequence
+from collections import Counter
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Optional
+
+from rtscortex_llm_pysc2.production import (
+    production_spec,
+    production_spec_for_order,
+)
 
 SUPPORTED_ARGUMENTS = frozenset({"minimap", "screen", "tag"})
 SCREEN_WORLD_GRID = 24.0
@@ -32,14 +38,8 @@ class BuildSpec:
     footprint: int
     requires_power: bool
     mineral_cost: int
+    vespene_cost: int = 0
     prerequisites: tuple[str, ...] = ()
-
-
-@dataclass(frozen=True)
-class ProductionCost:
-    minerals: int
-    vespene: int
-    supply: int
 
 
 @dataclass(frozen=True)
@@ -54,30 +54,42 @@ class ScreenCandidateProvenance:
 BUILD_SPECS = {
     "Build_Pylon_Screen": BuildSpec("Pylon", "screen", 2, False, 100),
     "Build_Gateway_Screen": BuildSpec("Gateway", "screen", 3, True, 150),
+    "Build_Forge_Screen": BuildSpec("Forge", "screen", 3, True, 150),
     "Build_CyberneticsCore_Screen": BuildSpec(
         "CyberneticsCore",
         "screen",
         3,
         True,
         150,
-        ("Gateway",),
+        prerequisites=("Gateway",),
     ),
     "Build_Assimilator_Near": BuildSpec("Assimilator", "geyser", 3, False, 75),
     "Build_Nexus_Near": BuildSpec("Nexus", "expansion", 5, False, 400),
+    "Build_Stargate_Screen": BuildSpec(
+        "Stargate",
+        "screen",
+        3,
+        True,
+        150,
+        vespene_cost=150,
+        prerequisites=("CyberneticsCore",),
+    ),
+    "Build_ShieldBattery_Screen": BuildSpec(
+        "ShieldBattery",
+        "screen",
+        2,
+        True,
+        100,
+        prerequisites=("CyberneticsCore",),
+    ),
 }
 
 SCREEN_POINT_ACTIONS = frozenset({"Move_Screen", "Ability_Blink_Screen"})
 MINIMAP_POINT_ACTIONS = frozenset({"Move_Minimap"})
 SELECT_BLINK_ACTION = "Select_Unit_Blink_Screen"
 PRODUCTION_ACTION_PREFIXES = ("Train_", "Research_")
-PRODUCTION_PREREQUISITES = {
-    "Train_Stalker": ("CyberneticsCore",),
-}
-PRODUCTION_COSTS = {
-    "Research_WarpGate": ProductionCost(minerals=50, vespene=50, supply=0),
-    "Train_Zealot": ProductionCost(minerals=100, vespene=0, supply=2),
-    "Train_Stalker": ProductionCost(minerals=125, vespene=50, supply=2),
-}
+RESEARCH_PREREQUISITES = {"Research_WarpGate": ("CyberneticsCore",)}
+RESEARCH_COSTS = {"Research_WarpGate": (50, 50, 0)}
 
 
 def semantic_argument_candidates(
@@ -88,7 +100,12 @@ def semantic_argument_candidates(
 ) -> Optional[list[list[Any]]]:
     """Return the single semantic candidate domain used at observe and dispatch time."""
 
-    return _argument_candidates(observation, action_name, unit_names=unit_names)
+    return _argument_candidates(
+        observation,
+        action_name,
+        unit_names=unit_names,
+        include_home_minimap=True,
+    )
 
 
 def is_production_action(action_name: str) -> bool:
@@ -107,8 +124,11 @@ def production_source_tag(
     action_name = str(action.get("name", ""))
     if not is_production_action(action_name):
         return None
-    cost = PRODUCTION_COSTS.get(action_name)
-    if cost is not None and not _production_cost_is_available(observation, cost):
+    spec = production_spec(action_name)
+    cost = (
+        None if spec is None else (spec.minerals, spec.vespene, spec.supply)
+    ) or RESEARCH_COSTS.get(action_name)
+    if cost is not None and not _production_cost_is_available(observation, *cost):
         return None
     source_types = {
         int(action_source_types[function_id])
@@ -118,7 +138,9 @@ def production_source_tag(
     if len(source_types) != 1:
         return None
     raw_units = list(_value(observation, "raw_units", ()))
-    prerequisites = PRODUCTION_PREREQUISITES.get(action_name, ())
+    prerequisites = (
+        spec.prerequisites if spec is not None else RESEARCH_PREREQUISITES.get(action_name, ())
+    )
     completed_structures = {
         _unit_name(unit, unit_names)
         for unit in raw_units
@@ -127,28 +149,40 @@ def production_source_tag(
     if not set(prerequisites).issubset(completed_structures):
         return None
     source_type = next(iter(source_types))
-    candidates = sorted(
-        int(_value(unit, "tag", 0))
+    candidates = [
+        unit
         for unit in raw_units
         if int(_value(unit, "alliance", 0)) == 1
         and int(_value(unit, "unit_type", 0)) == source_type
         and _build_progress(unit) >= 1.0
-        and int(_value(unit, "order_length", 0)) == 0
         and int(_value(unit, "active", 0)) == 0
         and int(_value(unit, "tag", 0)) > 0
-    )
-    return candidates[0] if candidates else None
+    ]
+    if not candidates:
+        return None
+    # Upstream ``find_idle_unit_tag`` selects the first matching raw unit. Do
+    # not sort or skip ahead, otherwise the cached producer provenance can
+    # silently refer to a different building than translator primitive 573.
+    selected = candidates[0]
+    if int(_value(selected, "order_length", 0)) != 0:
+        return None
+    return int(_value(selected, "tag", 0))
 
 
-def _production_cost_is_available(observation: Any, cost: ProductionCost) -> bool:
+def _production_cost_is_available(
+    observation: Any,
+    minerals: int,
+    vespene: int,
+    supply: int,
+) -> bool:
     player = _value(observation, "player_common", _value(observation, "player", None))
     if player is None:
         return False
     free_supply = int(_value(player, "food_cap", 0)) - int(_value(player, "food_used", 0))
     return (
-        int(_value(player, "minerals", 0)) >= cost.minerals
-        and int(_value(player, "vespene", 0)) >= cost.vespene
-        and free_supply >= cost.supply
+        int(_value(player, "minerals", 0)) >= minerals
+        and int(_value(player, "vespene", 0)) >= vespene
+        and free_supply >= supply
     )
 
 
@@ -195,12 +229,16 @@ class TimeStepExtractor:
         episode_id: str,
         *,
         unit_names: Optional[Mapping[int, str]] = None,
+        upgrade_names: Optional[Mapping[int, str]] = None,
         building_types: Sequence[int] = (),
         action_source_types: Optional[Mapping[int, int]] = None,
     ) -> None:
         self.run_id = run_id
         self.episode_id = episode_id
         self.unit_names = dict(unit_names or {})
+        self.upgrade_names = {
+            int(upgrade_id): str(name) for upgrade_id, name in (upgrade_names or {}).items()
+        }
         self.building_types = frozenset(int(value) for value in building_types)
         self.action_source_types = {
             int(function_id): int(unit_type)
@@ -242,9 +280,15 @@ class TimeStepExtractor:
             "game_loop": int(_scalar(_value(observation, "game_loop", 0))),
             "observed_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             "player_common": _extract_player(player),
-            "production_queue": _extract_production_queue(observation),
+            "production_queue": _extract_production_queue(
+                observation,
+                unit_names=self.unit_names,
+            ),
             "units": [self._extract_unit(unit) for unit in raw_units],
-            "upgrades": [f"upgrade:{int(value)}" for value in _value(observation, "upgrades", ())],
+            "upgrades": [
+                self.upgrade_names.get(int(value), f"upgrade:{int(value)}")
+                for value in _value(observation, "upgrades", ())
+            ],
             "teams": teams,
             "text_observation": text_observation,
             "alerts": [_alert_name(value) for value in _value(observation, "alerts", ())],
@@ -292,21 +336,82 @@ def _extract_player(player: Any) -> dict[str, int]:
     }
 
 
-def _extract_production_queue(observation: Any) -> list[dict[str, Any]]:
-    result = []
+def _extract_production_queue(
+    observation: Any,
+    *,
+    unit_names: Mapping[int, str],
+) -> list[dict[str, Any]]:
+    """Project known unit orders with their exact producer tags.
+
+    PySC2's top-level ``production_queue`` does not identify its producer. Raw
+    unit orders do, so supported direct-training actions are projected from
+    those first. Unknown top-level queue entries remain available as legacy
+    ``ability:<id>`` diagnostics.
+    """
+
+    result: list[dict[str, Any]] = []
+    producer_counts: Counter[str] = Counter()
+    for unit in _value(observation, "raw_units", ()):
+        if int(_value(unit, "alliance", 0)) != 1:
+            continue
+        producer_type = _unit_name(unit, unit_names)
+        producer_tag = int(_value(unit, "tag", 0))
+        if producer_tag <= 0:
+            continue
+        for order_id, progress in _unit_order_entries(unit):
+            spec = production_spec_for_order(order_id)
+            if spec is None or spec.producer_type != producer_type:
+                continue
+            producer_counts[spec.action_name] += 1
+            result.append(
+                {
+                    "name": spec.action_name,
+                    "producer_tag": producer_tag,
+                    "progress": progress,
+                }
+            )
+
     for item in _value(observation, "production_queue", ()):
         ability_id = int(_value(item, "ability_id", 0))
-        progress = float(_value(item, "build_progress", 0.0))
-        if progress > 1.0:
-            progress /= 100.0
+        spec = production_spec_for_order(ability_id)
+        if spec is not None and producer_counts[spec.action_name] > 0:
+            producer_counts[spec.action_name] -= 1
+            continue
         result.append(
             {
-                "name": f"ability:{ability_id}",
+                "name": spec.action_name if spec is not None else f"ability:{ability_id}",
                 "producer_tag": None,
-                "progress": min(max(progress, 0.0), 1.0),
+                "progress": _normalized_progress(_value(item, "build_progress", 0.0)),
             }
         )
     return result
+
+
+def _unit_order_entries(unit: Any) -> tuple[tuple[int, float], ...]:
+    explicit = _value(unit, "orders", None)
+    if explicit is not None:
+        return tuple(
+            (
+                int(_value(order, "ability_id", _value(order, "order_id", order))),
+                _normalized_progress(_value(order, "progress", 0.0)),
+            )
+            for order in explicit
+        )
+    count = min(max(int(_value(unit, "order_length", 0)), 0), 4)
+    return tuple(
+        (
+            int(_value(unit, f"order_id_{index}", 0)),
+            _normalized_progress(_value(unit, f"order_progress_{index}", 0.0)),
+        )
+        for index in range(count)
+    )
+
+
+def _normalized_progress(value: Any) -> float:
+    progress = float(value)
+    if progress > 1.0:
+        progress /= 100.0
+    return min(max(progress, 0.0), 1.0)
 
 
 def _extract_team_actions(
@@ -398,7 +503,12 @@ def _available_team_actions(
             continue
         argument_types = tuple("tag" if name == "tag" else "position" for name in argument_names)
         function_ids = [int(triple[0]) for triple in action.get("func", ())]
-        if available_ids is not None and any(value not in available_ids for value in function_ids):
+        build_spec = BUILD_SPECS.get(action_name)
+        if (
+            build_spec is None
+            and available_ids is not None
+            and any(value not in available_ids for value in function_ids)
+        ):
             continue
         required_sources = {
             action_source_types[function_id]
@@ -422,6 +532,7 @@ def _available_team_actions(
             observation,
             action_name,
             unit_names=unit_names,
+            include_home_minimap=agent.name.startswith("CombatGroup"),
         )
         if (
             agent.name == "Builder"
@@ -436,7 +547,6 @@ def _available_team_actions(
                     require_power=True,
                 )
             ]
-        build_spec = BUILD_SPECS.get(action_name)
         needs_screen_provenance = action_name in SCREEN_POINT_ACTIONS or (
             build_spec is not None and build_spec.placement_kind == "screen"
         )
@@ -519,6 +629,7 @@ def _argument_candidates(
     action_name: str,
     *,
     unit_names: Mapping[int, str],
+    include_home_minimap: bool,
 ) -> Optional[list[list[Any]]]:
     if action_name == "Attack_Unit":
         return [
@@ -537,7 +648,13 @@ def _argument_candidates(
             )
         ]
     if action_name in MINIMAP_POINT_ACTIONS:
-        return [[candidate] for candidate in _movement_minimap_candidates(observation)]
+        return [
+            [candidate]
+            for candidate in _movement_minimap_candidates(
+                observation,
+                include_home=include_home_minimap,
+            )
+        ]
     if action_name == SELECT_BLINK_ACTION:
         positions = _movement_screen_candidates(observation, blink=True)
         stalker_tags = sorted(
@@ -630,7 +747,12 @@ def _movement_screen_candidates(
     return [[x, y] for _, y, x in candidates[:8]]
 
 
-def _movement_minimap_candidates(observation: Any, *, limit: int = 8) -> list[list[int]]:
+def _movement_minimap_candidates(
+    observation: Any,
+    *,
+    limit: int = 8,
+    include_home: bool = False,
+) -> list[list[int]]:
     """Return stable pathable scouting targets across the minimap.
 
     Neutral minimap clusters are preferred because they normally identify melee resource
@@ -649,6 +771,7 @@ def _movement_minimap_candidates(observation: Any, *, limit: int = 8) -> list[li
     visibility_dimensions = _plane_dimensions(visibility)
 
     resource_targets: list[tuple[float, int, int]] = []
+    own_points: list[tuple[int, int]] = []
     if _plane_dimensions(player_relative) == dimensions:
         neutral_points = {
             (x, y) for y in range(height) for x in range(width) if int(player_relative[y][x]) == 3
@@ -694,7 +817,8 @@ def _movement_minimap_candidates(observation: Any, *, limit: int = 8) -> list[li
 
     search_radius = max(4, min(height, width) // 8)
     candidates: list[list[int]] = []
-    for target_x, target_y in desired:
+    offensive_limit = max(0, limit - 1 if include_home else limit)
+    for target_x, target_y in desired if offensive_limit else ():
         candidate = _nearest_pathable_minimap_point(
             pathable,
             target_x,
@@ -713,8 +837,23 @@ def _movement_minimap_candidates(observation: Any, *, limit: int = 8) -> list[li
         ):
             continue
         candidates.append(candidate)
-        if len(candidates) >= limit:
+        if len(candidates) >= offensive_limit:
             break
+    if include_home and own_points:
+        home_x = int(round(sum(point[0] for point in own_points) / len(own_points)))
+        home_y = int(round(sum(point[1] for point in own_points) / len(own_points)))
+        home = _nearest_pathable_minimap_point(
+            pathable,
+            home_x,
+            home_y,
+            width=width,
+            height=height,
+            search_radius=search_radius,
+        )
+        if home is not None and home not in candidates:
+            # The final candidate is the stable home/retreat target. Tactical
+            # compilation excludes it for advances and selects it for retreats.
+            candidates.append(home)
     return candidates
 
 
@@ -791,8 +930,11 @@ def _build_prerequisites_satisfied(
     unit_names: Mapping[int, str],
 ) -> bool:
     player = _value(observation, "player_common", _value(observation, "player", None))
-    if player is not None and int(_value(player, "minerals", 0)) < spec.mineral_cost:
-        return False
+    if player is not None:
+        if int(_value(player, "minerals", 0)) < spec.mineral_cost:
+            return False
+        if int(_value(player, "vespene", 0)) < spec.vespene_cost:
+            return False
     completed = {
         _unit_name(unit, unit_names)
         for unit in _value(observation, "raw_units", ())
@@ -1188,6 +1330,8 @@ def resolve_screen_build_world_target(
     world_target: tuple[float, float],
     *,
     preferred_anchor_tag: Optional[int] = None,
+    excluded_positions: Collection[tuple[int, int]] = (),
+    force_resample: bool = False,
 ) -> Optional[list[int]]:
     """Reproject a routed build target and validate it against the current camera."""
 
@@ -1205,10 +1349,21 @@ def resolve_screen_build_world_target(
     height, width = dimensions
     if not (0 <= projected[0] < width and 0 <= projected[1] < height):
         return None
-    if _build_screen_position_is_legal(observation, spec, projected):
+    excluded = set(excluded_positions)
+    if force_resample:
+        excluded.add((projected[0], projected[1]))
+    if (
+        not force_resample
+        and tuple(projected) not in excluded
+        and _build_screen_position_is_legal(observation, spec, projected)
+    ):
         return projected
 
-    candidates = _build_screen_candidates(observation, action_name, limit=None)
+    candidates = [
+        candidate
+        for candidate in _build_screen_candidates(observation, action_name, limit=None)
+        if tuple(candidate) not in excluded
+    ]
     stride = max(4, int(height / SCREEN_WORLD_GRID))
     ranked = sorted(
         (
@@ -1219,7 +1374,7 @@ def resolve_screen_build_world_target(
         )
         for candidate in candidates
     )
-    if not ranked or ranked[0][0] > (2 * stride) ** 2:
+    if not ranked or ranked[0][0] > (6 * stride) ** 2:
         return None
     return ranked[0][3]
 

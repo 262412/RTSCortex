@@ -1,5 +1,7 @@
 """FastAPI transport for environment workers."""
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Annotated
 
 from fastapi import FastAPI, Header, HTTPException, Request, Response
@@ -22,8 +24,21 @@ def create_app(
     engine: RuntimeEngine,
     *,
     console_hub: LiveConsoleHub | None = None,
+    manage_runtime_lifecycle: bool = False,
 ) -> FastAPI:
-    app = FastAPI(title="RTSCortex Runtime", version=__version__)
+    @asynccontextmanager
+    async def runtime_lifespan(_: FastAPI) -> AsyncIterator[None]:
+        try:
+            await engine.start()
+            yield
+        finally:
+            await engine.close()
+
+    app = FastAPI(
+        title="RTSCortex Runtime",
+        version=__version__,
+        lifespan=runtime_lifespan if manage_runtime_lifecycle else None,
+    )
 
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:

@@ -7,6 +7,7 @@ from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Condition
+from time import monotonic
 from typing import Any, NoReturn, Optional
 
 from rtscortex_llm_pysc2.coordinator import BridgeCoordinator, BridgeDecision
@@ -83,11 +84,13 @@ class SharedDecisionBroker:
         self._active_commands: dict[tuple[str, str], _ActiveCommand] = {}
         self._screen_route_provenance: dict[str, ScreenRouteProvenance] = {}
         self._planner_pending = False
+        self._last_decision_game_loop: Optional[int] = None
         self._initial_decision_started = False
         self._initial_decision_complete = False
         self._initial_decision_error: Optional[Exception] = None
         self.unattributed_primitives = 0
         self.candidate_outside_pysc2_dispatches = 0
+        self.observation_gap_watchdog_triggers = 0
         self._metrics_path = None if metrics_path is None else Path(metrics_path)
         with self._condition:
             self._persist_metrics_locked()
@@ -99,7 +102,20 @@ class SharedDecisionBroker:
             return {
                 "unattributed_primitives": self.unattributed_primitives,
                 "candidate_outside_pysc2_dispatches": (self.candidate_outside_pysc2_dispatches),
+                "observation_gap_watchdog_triggers": self.observation_gap_watchdog_triggers,
             }
+
+    @property
+    def last_decision_game_loop(self) -> Optional[int]:
+        """Return the game loop represented by the latest Runtime decision."""
+
+        with self._condition:
+            return self._last_decision_game_loop
+
+    def record_observation_gap_watchdog_trigger(self) -> None:
+        with self._condition:
+            self.observation_gap_watchdog_triggers += 1
+            self._persist_metrics_locked()
 
     def record_unattributed_primitive(self) -> None:
         with self._condition:
@@ -214,7 +230,6 @@ class SharedDecisionBroker:
 
     def submit(self, agent: Any, timestep: Any, text_observation: str) -> str:
         step_id = int(agent.main_loop_step)
-        leader = False
         with self._condition:
             state = self._states.setdefault(step_id, _DecisionState())
             if state.error is not None:
@@ -224,30 +239,42 @@ class SharedDecisionBroker:
             if agent.name in state.submissions:
                 raise ValueError(f"agent {agent.name!r} submitted step {step_id} twice")
             state.submissions[agent.name] = _Submission(agent, timestep, text_observation)
-            expected = {name for name, value in self._agents.items() if value.enable}
-            if set(state.submissions) == expected and not state.in_flight:
-                state.in_flight = True
-                leader = True
-                if not self._initial_decision_started:
-                    self._initial_decision_started = True
-                    self._condition.notify_all()
+            self._condition.notify_all()
 
-        if leader:
-            self._decide(step_id)
+        deadline = monotonic() + self.decision_timeout_seconds
+        while state.decision is None and state.error is None:
+            leader = False
+            with self._condition:
+                expected = {name for name, value in self._agents.items() if value.enable}
+                # Combat agents can be disabled after losing their final unit while
+                # Builder/Developer threads are already waiting at this barrier.
+                # Re-evaluate the live participant set instead of retaining a stale
+                # name until the full decision timeout expires. Submitted agents are
+                # still included in the snapshot even if they become disabled later.
+                if not state.in_flight and expected.issubset(state.submissions):
+                    state.in_flight = True
+                    leader = True
+                    if not self._initial_decision_started:
+                        self._initial_decision_started = True
+                        self._condition.notify_all()
+                else:
+                    remaining = deadline - monotonic()
+                    if remaining <= 0:
+                        missing = sorted(expected.difference(state.submissions))
+                        state.error = TimeoutError(
+                            "not all enabled agents submitted runtime step "
+                            f"{step_id}; missing={missing}"
+                        )
+                        if not self._initial_decision_complete:
+                            self._initial_decision_error = state.error
+                        self._states.pop(step_id, None)
+                        self._condition.notify_all()
+                    else:
+                        self._condition.wait(timeout=min(0.05, remaining))
+            if leader:
+                self._decide(step_id)
 
         with self._condition:
-            ready = self._condition.wait_for(
-                lambda: state.decision is not None or state.error is not None,
-                timeout=self.decision_timeout_seconds,
-            )
-            if not ready:
-                state.error = TimeoutError(
-                    f"not all enabled agents submitted runtime step {step_id}"
-                )
-                if not self._initial_decision_complete:
-                    self._initial_decision_error = state.error
-                self._states.pop(step_id, None)
-                self._condition.notify_all()
             if state.error is not None:
                 raise RuntimeError(
                     f"shared runtime decision failed at step {step_id}"
@@ -580,11 +607,13 @@ class SharedDecisionBroker:
         observation: Any,
         *,
         builder_tag: Optional[int],
+        producer_tag: Optional[int] = None,
     ) -> None:
         self.coordinator.prepare_effect(
             dispatch.command_id,
             observation,
             builder_tag=builder_tag,
+            producer_tag=producer_tag,
         )
 
     def observe_effects(self, observation: Any) -> None:
@@ -660,6 +689,7 @@ class SharedDecisionBroker:
                 {
                     "unattributed_primitives": self.unattributed_primitives,
                     "candidate_outside_pysc2_dispatches": (self.candidate_outside_pysc2_dispatches),
+                    "observation_gap_watchdog_triggers": (self.observation_gap_watchdog_triggers),
                 }
             ),
             encoding="utf-8",
@@ -694,6 +724,7 @@ class SharedDecisionBroker:
 
         with self._condition:
             state.decision = decision
+            self._last_decision_game_loop = int(snapshot["game_loop"])
             self._initial_decision_complete = True
             self._planner_pending = bool(decision.action_batch.get("planner_pending", False))
             for route in decision.routes.values():
