@@ -46,9 +46,7 @@ def run_worker(request_path: Path, response_path: Path) -> None:
             [
                 PolicySubagentRegistration(
                     spec=spec,
-                    availability=PolicyAvailability(
-                        status=PolicyAvailabilityStatus.AVAILABLE
-                    ),
+                    availability=PolicyAvailability(status=PolicyAvailabilityStatus.AVAILABLE),
                     subagent=subagent,
                 )
             ],

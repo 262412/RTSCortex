@@ -121,9 +121,7 @@ def test_runtime_feeds_progress_to_planner_and_console_events(tmp_path: Path) ->
     try:
         batch = asyncio.run(runtime.tick(first))
 
-        assert [command.name for command in batch.commands] == [
-            "Build_Gateway_Screen"
-        ]
+        assert [command.name for command in batch.commands] == ["Build_Gateway_Screen"]
         assert len(provider.schemas) == 1
         assert '"Stop"' in provider.schemas[0]
         assert '"Hold_Position"' in provider.schemas[0]
@@ -157,8 +155,6 @@ def test_runtime_feeds_progress_to_planner_and_console_events(tmp_path: Path) ->
         assert planning_events[-1].payload["output"]["goal_progress"] is not None
         assert runtime._cached_plan is not None
         assert runtime._cached_plan.goal_spec is not None
-        assert len(
-            store.events_of_type(first.run_id, first.episode_id, "goal_progress")
-        ) == before
+        assert len(store.events_of_type(first.run_id, first.episode_id, "goal_progress")) == before
     finally:
         asyncio.run(runtime.close())

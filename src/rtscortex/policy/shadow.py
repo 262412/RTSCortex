@@ -191,11 +191,7 @@ def _record(
         availability=registration.availability,
         status=status,
         proposal=proposal,
-        goal_id=(
-            fixture.goal_progress.goal_id
-            if fixture.goal_progress is not None
-            else None
-        ),
+        goal_id=(fixture.goal_progress.goal_id if fixture.goal_progress is not None else None),
         latency_ms=latency_ms,
         error=error,
         proposed_action_count=scores.proposed_action_count,
@@ -300,9 +296,7 @@ def _score_proposal(
             proposed_action_count=proposed_count,
             legal_action_count=legal_count,
             goal_advancing_action_count=goal_advancing_count,
-            legal_action_rate=(
-                legal_count / proposed_count if proposed_count else None
-            ),
+            legal_action_rate=(legal_count / proposed_count if proposed_count else None),
             goal_advancing_action_rate=(
                 goal_advancing_count / proposed_count
                 if proposed_count and has_progress_opportunity
@@ -332,27 +326,19 @@ def _score_proposal(
     report = fixture.goal_progress
     advancing_names = set(report.advancing_actions) if report is not None else set()
     goal_advancing_count = sum(
-        command.command_id in legal_ids and command.name in advancing_names
-        for command in commands
+        command.command_id in legal_ids and command.name in advancing_names for command in commands
     )
     controls_forbidden = bool(
         report is not None
         and not report.defensive_hold_required
-        and (
-            report.advancing_actions
-            or report.status is GoalProgressStatus.IN_PROGRESS
-        )
+        and (report.advancing_actions or report.status is GoalProgressStatus.IN_PROGRESS)
     )
     control_violations = (
-        sum(command.name in CONTROL_ACTIONS for command in commands)
-        if controls_forbidden
-        else 0
+        sum(command.name in CONTROL_ACTIONS for command in commands) if controls_forbidden else 0
     )
     proposed_count = len(commands)
     has_progress_opportunity = bool(report is not None and report.advancing_actions)
-    failures_by_id = {
-        failure.command.command_id: failure for failure in validated.failures
-    }
+    failures_by_id = {failure.command.command_id: failure for failure in validated.failures}
     assessments = [
         _native_action_assessment(
             action_name=command.name,
@@ -421,9 +407,7 @@ def _native_action_assessment(
             is_frontier=ordinal == 0,
         )
     failure = failures_by_id.get(command_id)
-    disposition = (
-        failure.disposition if failure is not None else ValidationDisposition.REJECTED
-    )
+    disposition = failure.disposition if failure is not None else ValidationDisposition.REJECTED
     reason = failure.reason if failure is not None else "validator_rejected"
     classification = {
         ValidationDisposition.DEFERRED: PolicyActionClassification.MAPPED_DEFERRED,
@@ -450,16 +434,12 @@ def _scores_from_assessments(
     effective_action_count: int = 0,
 ) -> _ProposalScores:
     logical_counts = {
-        classification: sum(
-            item.classification is classification for item in assessments
-        )
+        classification: sum(item.classification is classification for item in assessments)
         for classification in PolicyActionClassification
     }
     effective_counts = {
         classification: sum(
-            item.repeat
-            for item in assessments
-            if item.classification is classification
+            item.repeat for item in assessments if item.classification is classification
         )
         for classification in PolicyActionClassification
     }
@@ -506,12 +486,8 @@ def _scores_from_assessments(
             PolicyActionClassification.UNSUPPORTED_BY_RUNTIME
         ],
         mapped_future_count=logical_counts[PolicyActionClassification.MAPPED_FUTURE],
-        mapped_legal_now_count=logical_counts[
-            PolicyActionClassification.MAPPED_LEGAL_NOW
-        ],
-        mapped_deferred_count=logical_counts[
-            PolicyActionClassification.MAPPED_DEFERRED
-        ],
+        mapped_legal_now_count=logical_counts[PolicyActionClassification.MAPPED_LEGAL_NOW],
+        mapped_deferred_count=logical_counts[PolicyActionClassification.MAPPED_DEFERRED],
         illegal_action_count=logical_counts[PolicyActionClassification.ILLEGAL_ACTION],
         obsolete_count=logical_counts[PolicyActionClassification.OBSOLETE],
         parse_validity=(
@@ -520,14 +496,10 @@ def _scores_from_assessments(
             else None
         ),
         mapping_coverage=(
-            mapped_count / parsed_known_action_count
-            if parsed_known_action_count
-            else None
+            mapped_count / parsed_known_action_count if parsed_known_action_count else None
         ),
         frontier_illegal_rate=(
-            frontier_illegal / len(frontier_evaluated)
-            if frontier_evaluated
-            else None
+            frontier_illegal / len(frontier_evaluated) if frontier_evaluated else None
         ),
     )
 
@@ -537,9 +509,7 @@ def _classification_vector(
 ) -> PolicyActionClassificationCounts:
     return PolicyActionClassificationCounts(
         parse_error=counts[PolicyActionClassification.PARSE_ERROR],
-        unsupported_by_runtime=counts[
-            PolicyActionClassification.UNSUPPORTED_BY_RUNTIME
-        ],
+        unsupported_by_runtime=counts[PolicyActionClassification.UNSUPPORTED_BY_RUNTIME],
         mapped_future=counts[PolicyActionClassification.MAPPED_FUTURE],
         mapped_legal_now=counts[PolicyActionClassification.MAPPED_LEGAL_NOW],
         mapped_deferred=counts[PolicyActionClassification.MAPPED_DEFERRED],
@@ -555,9 +525,7 @@ def _summarize(
     summaries: list[PolicyShadowSummary] = []
     for registration in registrations:
         candidate_records = [
-            record
-            for record in records
-            if record.spec.subagent_id == registration.spec.subagent_id
+            record for record in records if record.spec.subagent_id == registration.spec.subagent_id
         ]
         summaries.append(
             _summarize_candidate(
@@ -583,18 +551,14 @@ def _summarize_candidate(
     goal_opportunity_fixtures = sum(
         record.goal_advancing_action_rate is not None for record in records
     )
-    discovered_macro_steps = sum(
-        record.discovered_macro_step_count for record in records
-    )
+    discovered_macro_steps = sum(record.discovered_macro_step_count for record in records)
     parsed_known_actions = sum(record.parsed_known_action_count for record in records)
     mapped_future = sum(record.mapped_future_count for record in records)
     mapped_legal = sum(record.mapped_legal_now_count for record in records)
     mapped_deferred = sum(record.mapped_deferred_count for record in records)
     illegal_actions = sum(record.illegal_action_count for record in records)
     obsolete = sum(record.obsolete_count for record in records)
-    mapped_actions = (
-        mapped_future + mapped_legal + mapped_deferred + illegal_actions + obsolete
-    )
+    mapped_actions = mapped_future + mapped_legal + mapped_deferred + illegal_actions + obsolete
     frontier_assessments = [
         assessment
         for record in records
@@ -625,19 +589,15 @@ def _summarize_candidate(
         obsolete=obsolete,
     )
     effective_vector = PolicyActionClassificationCounts(
-        parse_error=sum(
-            record.effective_classification_counts.parse_error for record in records
-        ),
+        parse_error=sum(record.effective_classification_counts.parse_error for record in records),
         unsupported_by_runtime=sum(
-            record.effective_classification_counts.unsupported_by_runtime
-            for record in records
+            record.effective_classification_counts.unsupported_by_runtime for record in records
         ),
         mapped_future=sum(
             record.effective_classification_counts.mapped_future for record in records
         ),
         mapped_legal_now=sum(
-            record.effective_classification_counts.mapped_legal_now
-            for record in records
+            record.effective_classification_counts.mapped_legal_now for record in records
         ),
         mapped_deferred=sum(
             record.effective_classification_counts.mapped_deferred for record in records
@@ -645,19 +605,13 @@ def _summarize_candidate(
         illegal_action=sum(
             record.effective_classification_counts.illegal_action for record in records
         ),
-        obsolete=sum(
-            record.effective_classification_counts.obsolete for record in records
-        ),
+        obsolete=sum(record.effective_classification_counts.obsolete for record in records),
     )
     return PolicyShadowSummary(
         subagent_id=subagent_id,
         fixtures=len(records),
-        completed=sum(
-            record.status is PolicyShadowStatus.COMPLETED for record in records
-        ),
-        unavailable=sum(
-            record.status is PolicyShadowStatus.UNAVAILABLE for record in records
-        ),
+        completed=sum(record.status is PolicyShadowStatus.COMPLETED for record in records),
+        unavailable=sum(record.status is PolicyShadowStatus.UNAVAILABLE for record in records),
         skipped=sum(record.status is PolicyShadowStatus.SKIPPED for record in records),
         failed=sum(record.status is PolicyShadowStatus.FAILED for record in records),
         proposals=proposal_count,
@@ -687,17 +641,11 @@ def _summarize_candidate(
         illegal_action_count=illegal_actions,
         obsolete_count=obsolete,
         parse_validity=(
-            parsed_known_actions / discovered_macro_steps
-            if discovered_macro_steps
-            else None
+            parsed_known_actions / discovered_macro_steps if discovered_macro_steps else None
         ),
-        mapping_coverage=(
-            mapped_actions / parsed_known_actions if parsed_known_actions else None
-        ),
+        mapping_coverage=(mapped_actions / parsed_known_actions if parsed_known_actions else None),
         frontier_illegal_rate=(
-            frontier_illegal / len(frontier_assessments)
-            if frontier_assessments
-            else None
+            frontier_illegal / len(frontier_assessments) if frontier_assessments else None
         ),
     )
 

@@ -32,9 +32,7 @@ from rtscortex.policy.corpus import (
 from rtscortex.policy.models import PolicyFixtureStratum
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-PINNED_CORPUS_MANIFEST = (
-    PROJECT_ROOT / "benchmarks/policy/protoss_v0_2/manifest.yaml"
-)
+PINNED_CORPUS_MANIFEST = PROJECT_ROOT / "benchmarks/policy/protoss_v0_2/manifest.yaml"
 
 
 def test_build_load_and_verify_balanced_corpus(tmp_path: Path) -> None:
@@ -135,9 +133,7 @@ def test_checked_in_corpus_has_exact_stage_aware_condition_coverage() -> None:
         PolicyFixtureStratum.IN_PROGRESS,
     ):
         phase_counts = Counter(
-            fixture.phase_tags[0]
-            for fixture in fixtures
-            if fixture.primary_stratum is condition
+            fixture.phase_tags[0] for fixture in fixtures if fixture.primary_stratum is condition
         )
         assert phase_counts == {
             PolicyFixtureStratum.EARLY.value: 2,

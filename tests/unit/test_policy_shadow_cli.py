@@ -17,9 +17,7 @@ def _write_observation_journal(run_dir: Path, *, count: int = 3) -> None:
     observation = make_observation()
     entries = []
     for index in range(count):
-        current = observation.model_copy(
-            update={"step_id": index, "game_loop": index * 16}
-        )
+        current = observation.model_copy(update={"step_id": index, "game_loop": index * 16})
         entries.append(
             {
                 "event_id": index + 1,
@@ -152,9 +150,7 @@ provider:
     assert provider.closed is True
     assert provider.user_payloads[0]["goal_spec"]["goal_id"] == "protoss-opening-v1"
     assert provider.user_payloads[0]["goal_progress"]["goal_id"] == "protoss-opening-v1"
-    artifact = json.loads(
-        (run_dir / "policy-shadow-comparison.json").read_text(encoding="utf-8")
-    )
+    artifact = json.loads((run_dir / "policy-shadow-comparison.json").read_text(encoding="utf-8"))
     assert artifact["records"][0]["status"] == "completed"
     assert [record["status"] for record in artifact["records"][1:]] == [
         "unavailable",

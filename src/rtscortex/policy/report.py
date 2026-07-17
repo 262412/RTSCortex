@@ -72,8 +72,7 @@ def build_policy_comparison_summary(
         for fixture in comparison.fixtures
     }
     corpus_strata = Counter(
-        fixture_strata.get(fixture_id, _UNLABELED_STRATUM)
-        for fixture_id in comparison.fixture_ids
+        fixture_strata.get(fixture_id, _UNLABELED_STRATUM) for fixture_id in comparison.fixture_ids
     )
     for stratum in (*_STRATA, _UNLABELED_STRATUM):
         corpus_strata.setdefault(stratum, 0)
@@ -87,9 +86,7 @@ def build_policy_comparison_summary(
     candidates: dict[str, object] = {}
     for candidate_id in candidate_ids:
         records = [
-            record
-            for record in comparison.records
-            if record.spec.subagent_id == candidate_id
+            record for record in comparison.records if record.spec.subagent_id == candidate_id
         ]
         candidate = _aggregate_records(records)
         candidate["by_stratum"] = {
@@ -97,8 +94,7 @@ def build_policy_comparison_summary(
                 [
                     record
                     for record in records
-                    if fixture_strata.get(record.fixture_id, _UNLABELED_STRATUM)
-                    == stratum
+                    if fixture_strata.get(record.fixture_id, _UNLABELED_STRATUM) == stratum
                 ]
             )
             for stratum in (*_STRATA, _UNLABELED_STRATUM)
@@ -121,8 +117,7 @@ def build_policy_comparison_summary(
             "labeled_fixtures": sum(corpus_strata[stratum] for stratum in _STRATA),
             "unlabeled_fixtures": corpus_strata[_UNLABELED_STRATUM],
             "strata": {
-                stratum: corpus_strata[stratum]
-                for stratum in (*_STRATA, _UNLABELED_STRATUM)
+                stratum: corpus_strata[stratum] for stratum in (*_STRATA, _UNLABELED_STRATUM)
             },
         },
         "candidates": candidates,
@@ -153,8 +148,7 @@ def render_policy_comparison_report(comparison: PolicyShadowComparison) -> str:
         "|---|---:|",
     ]
     lines.extend(
-        f"| `{stratum}` | {strata[stratum]} |"
-        for stratum in (*_STRATA, _UNLABELED_STRATUM)
+        f"| `{stratum}` | {strata[stratum]} |" for stratum in (*_STRATA, _UNLABELED_STRATUM)
     )
 
     lines.extend(
@@ -363,8 +357,7 @@ def render_policy_comparison_report(comparison: PolicyShadowComparison) -> str:
             "",
             "## Logical Runtime outcomes by corpus stratum",
             "",
-            "| Stratum | Candidate | Unsupported | Runtime legal | Deferred | Illegal | "
-            "Obsolete |",
+            "| Stratum | Candidate | Unsupported | Runtime legal | Deferred | Illegal | Obsolete |",
             "|---|---|---:|---:|---:|---:|---:|",
         ]
     )
@@ -490,24 +483,16 @@ def _aggregate_records(records: Sequence[PolicyShadowRecord]) -> dict[str, objec
     else:
         availability_status = "mixed"
     availability_reasons = sorted(
-        {
-            record.availability.reason
-            for record in records
-            if record.availability.reason is not None
-        }
+        {record.availability.reason for record in records if record.availability.reason is not None}
     )
 
     identity = _candidate_identity(records)
     macro_records = [
-        record
-        for record in records
-        if isinstance(record.proposal, MacroPolicyProposal)
+        record for record in records if isinstance(record.proposal, MacroPolicyProposal)
     ]
     macro_applicable = bool(macro_records)
     assessments = [
-        assessment
-        for record in macro_records
-        for assessment in record.action_assessments
+        assessment for record in macro_records for assessment in record.action_assessments
     ]
     logical_counts = _classification_counts(assessments, effective=False)
     effective_counts = _classification_counts(assessments, effective=True)
@@ -542,18 +527,10 @@ def _aggregate_records(records: Sequence[PolicyShadowRecord]) -> dict[str, objec
 
     logical_total = _as_int(logical_classification["total"])
     logical_parse_errors = logical_counts[PolicyActionClassification.PARSE_ERROR.value]
-    logical_unsupported = logical_counts[
-        PolicyActionClassification.UNSUPPORTED_BY_RUNTIME.value
-    ]
-    logical_mapped_future = logical_counts[
-        PolicyActionClassification.MAPPED_FUTURE.value
-    ]
-    logical_mapped_legal = logical_counts[
-        PolicyActionClassification.MAPPED_LEGAL_NOW.value
-    ]
-    logical_mapped_deferred = logical_counts[
-        PolicyActionClassification.MAPPED_DEFERRED.value
-    ]
+    logical_unsupported = logical_counts[PolicyActionClassification.UNSUPPORTED_BY_RUNTIME.value]
+    logical_mapped_future = logical_counts[PolicyActionClassification.MAPPED_FUTURE.value]
+    logical_mapped_legal = logical_counts[PolicyActionClassification.MAPPED_LEGAL_NOW.value]
+    logical_mapped_deferred = logical_counts[PolicyActionClassification.MAPPED_DEFERRED.value]
     logical_illegal = logical_counts[PolicyActionClassification.ILLEGAL_ACTION.value]
     logical_obsolete = logical_counts[PolicyActionClassification.OBSOLETE.value]
     logical_runtime_mapped = sum(logical_counts[name] for name in _MAPPED_CLASSIFICATIONS)
@@ -582,9 +559,7 @@ def _aggregate_records(records: Sequence[PolicyShadowRecord]) -> dict[str, objec
             "counts": dict(sorted(availability_counts.items())),
             "reasons": availability_reasons,
         },
-        "outcomes": {
-            status.value: status_counts[status.value] for status in PolicyShadowStatus
-        },
+        "outcomes": {status.value: status_counts[status.value] for status in PolicyShadowStatus},
         "completion_rate": _ratio(
             status_counts[PolicyShadowStatus.COMPLETED.value],
             len(records),
@@ -608,9 +583,7 @@ def _aggregate_records(records: Sequence[PolicyShadowRecord]) -> dict[str, objec
             "parsed_known_actions": logical_parsed,
             "effective_actions": _as_int(effective_classification["total"]),
             "parse_errors": logical_parse_errors,
-            "parse_validity": (
-                _ratio(logical_parsed, logical_total) if macro_applicable else None
-            ),
+            "parse_validity": (_ratio(logical_parsed, logical_total) if macro_applicable else None),
             "unsupported_by_runtime": logical_unsupported,
             "runtime_mapped_actions": logical_runtime_mapped,
             "mapped_future": logical_mapped_future,
@@ -697,9 +670,7 @@ def _candidate_identity(records: Sequence[PolicyShadowRecord]) -> dict[str, obje
     first = records[0] if records else None
     model_id = first.spec.model_id if first is not None else ""
     macro_proposals = [
-        record.proposal
-        for record in records
-        if isinstance(record.proposal, MacroPolicyProposal)
+        record.proposal for record in records if isinstance(record.proposal, MacroPolicyProposal)
     ]
     generation_metadata = [
         proposal.generation_metadata
@@ -718,9 +689,7 @@ def _candidate_identity(records: Sequence[PolicyShadowRecord]) -> dict[str, obje
     return {
         "display_name": first.spec.display_name if first is not None else "",
         "model_id": model_id,
-        "provider_kind": (
-            first.spec.provider_kind.value if first is not None else "unknown"
-        ),
+        "provider_kind": (first.spec.provider_kind.value if first is not None else "unknown"),
         "pinned_revision": pinned_revision,
         "observed_model_revisions": sorted(
             {metadata.model_revision for metadata in generation_metadata}

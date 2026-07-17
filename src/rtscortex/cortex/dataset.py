@@ -99,10 +99,7 @@ class ExecutorSelectionLabel(_CorpusModel):
 
     @model_validator(mode="after")
     def validate_selection(self) -> ExecutorSelectionLabel:
-        if (
-            self.status is CandidateSelectionStatus.SELECTED
-            and self.selected_candidate_id is None
-        ):
+        if self.status is CandidateSelectionStatus.SELECTED and self.selected_candidate_id is None:
             raise ValueError("selected labels require selected_candidate_id")
         if self.status is CandidateSelectionStatus.ABSTAINED:
             if self.selected_candidate_id is not None:
@@ -153,13 +150,10 @@ class ExecutorCorpusSample(_CorpusModel):
         if len(self.intent_action_names) != len(set(self.intent_action_names)):
             raise ValueError("intent action names must be unique")
         if any(
-            candidate.action_name not in self.intent_action_names
-            for candidate in self.candidates
+            candidate.action_name not in self.intent_action_names for candidate in self.candidates
         ):
             raise ValueError("candidate actions must belong to the intent action domain")
-        compile_ordinals = [
-            candidate.features.compile_ordinal for candidate in self.candidates
-        ]
+        compile_ordinals = [candidate.features.compile_ordinal for candidate in self.candidates]
         if len(compile_ordinals) != len(set(compile_ordinals)):
             raise ValueError("candidate compile ordinals must be unique")
         return self
@@ -319,9 +313,7 @@ def build_executor_corpus(
     exclusions.update(cross_split_exclusions)
     ordered = tuple(sorted(samples, key=_sample_sort_key))
     if not ordered:
-        details = ", ".join(
-            f"{reason}={count}" for reason, count in sorted(exclusions.items())
-        )
+        details = ", ".join(f"{reason}={count}" for reason, count in sorted(exclusions.items()))
         suffix = f" ({details})" if details else ""
         raise ExecutorCorpusError(f"no valid executor samples were found{suffix}")
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -346,9 +338,7 @@ def build_executor_corpus(
             duplicate_selection_events=duplicate_selections,
             duplicate_sample_fingerprints=duplicate_sample_fingerprints,
             repeated_observation_fingerprints=repeated_observation_fingerprints,
-            repeated_semantic_feature_fingerprints=(
-                repeated_semantic_feature_fingerprints
-            ),
+            repeated_semantic_feature_fingerprints=(repeated_semantic_feature_fingerprints),
         ),
         distributions=_distributions(ordered),
     )
@@ -431,9 +421,7 @@ def verify_executor_corpus(
         try:
             split_samples = _read_samples(path)
         except Exception as error:
-            errors.append(
-                f"{split_name.value} cannot be decoded: {type(error).__name__}: {error}"
-            )
+            errors.append(f"{split_name.value} cannot be decoded: {type(error).__name__}: {error}")
             continue
         if len(split_samples) != artifact.sample_count:
             errors.append(f"{split_name.value} sample count does not match manifest")
@@ -464,9 +452,7 @@ def verify_executor_corpus(
             errors.append(f"episode {episode_key!r} spans multiple splits")
     for fingerprint, assigned in semantic_splits.items():
         if len(assigned) != 1:
-            errors.append(
-                f"semantic feature fingerprint {fingerprint} spans multiple splits"
-            )
+            errors.append(f"semantic feature fingerprint {fingerprint} spans multiple splits")
     for sample in samples:
         expected_split = executor_episode_split(
             sample.run_id,
@@ -479,9 +465,7 @@ def verify_executor_corpus(
     duplicates = _duplicate_metrics(samples, manifest)
     if duplicates != manifest.duplicates:
         errors.append("duplicate metrics do not match corpus samples")
-    if sum(manifest.exclusion_reasons.values()) != (
-        manifest.conservation.excluded_selections
-    ):
+    if sum(manifest.exclusion_reasons.values()) != (manifest.conservation.excluded_selections):
         errors.append("exclusion reasons do not conserve excluded selections")
     if len(samples) + manifest.conservation.excluded_selections != (
         manifest.conservation.selection_events
@@ -685,9 +669,7 @@ def _sample_from_selection(
     key = (event.run_id, event.episode_id, selection.intent_id)
     intent_event = indexes.intents.get(key)
     candidate_event = indexes.candidate_sets.get(key)
-    observation_event = indexes.observations.get(
-        (event.run_id, event.episode_id, event.step_id)
-    )
+    observation_event = indexes.observations.get((event.run_id, event.episode_id, event.step_id))
     if intent_event is None:
         raise ExecutorCorpusError("missing_intent")
     if candidate_event is None:
@@ -719,9 +701,7 @@ def _sample_from_selection(
     if any(candidate.intent_id != selection.intent_id for candidate in candidates):
         raise ExecutorCorpusError("candidate_intent_mismatch")
     expected_fingerprint = observation_fingerprint(observation)
-    if any(
-        candidate.observation_fingerprint != expected_fingerprint for candidate in candidates
-    ):
+    if any(candidate.observation_fingerprint != expected_fingerprint for candidate in candidates):
         raise ExecutorCorpusError("observation_fingerprint_mismatch")
     candidate_by_id = {candidate.candidate_id: candidate for candidate in candidates}
     if (
@@ -733,9 +713,7 @@ def _sample_from_selection(
     # boundary persists them: corpus-local identifiers are derived exclusively
     # from the compact safe projection and semantic ranks.
     selected_candidate = (
-        None
-        if selection.candidate_id is None
-        else candidate_by_id[selection.candidate_id]
+        None if selection.candidate_id is None else candidate_by_id[selection.candidate_id]
     )
     lineage, terminal = _linked_outcome(
         event,
@@ -744,9 +722,7 @@ def _sample_from_selection(
         indexes,
     )
     compact_features = _compact_observation(observation)
-    semantic_feature_fingerprint = _sha256_json(
-        compact_features.model_dump(mode="json")
-    )
+    semantic_feature_fingerprint = _sha256_json(compact_features.model_dump(mode="json"))
     safe_observation_fingerprint = _local_id_digest(
         {
             "kind": "observation",
@@ -791,9 +767,7 @@ def _sample_from_selection(
             )
         )
     safe_selected_candidate_id = (
-        None
-        if selection.candidate_id is None
-        else safe_candidate_by_raw_id[selection.candidate_id]
+        None if selection.candidate_id is None else safe_candidate_by_raw_id[selection.candidate_id]
     )
     safe_selection_id = _local_id(
         "selection",
@@ -823,9 +797,7 @@ def _sample_from_selection(
             {
                 "selection_id": safe_selection_id,
                 "selected_candidate_id": safe_selected_candidate_id,
-                "action_name": (
-                    None if terminal is None else terminal.action_name
-                ),
+                "action_name": (None if terminal is None else terminal.action_name),
             },
         )
     )
@@ -939,9 +911,7 @@ def _linked_outcome(
     return lineage, ExecutorTerminalOutcome(
         status=status,
         failure_code=(
-            None
-            if status is ExecutionStatus.SUCCEEDED
-            else "lifecycle_terminal_without_execution"
+            None if status is ExecutionStatus.SUCCEEDED else "lifecycle_terminal_without_execution"
         ),
         action_name=_text(command, "name"),
     )
@@ -959,9 +929,7 @@ def _compact_observation(observation: ObservationEnvelope) -> CompactObservation
         visible_enemy_counts=_type_counts(
             unit.unit_type for unit in observation.state.visible_enemies
         ),
-        production_counts=_type_counts(
-            item.name for item in observation.state.production_queue
-        ),
+        production_counts=_type_counts(item.name for item in observation.state.production_queue),
         upgrades=sorted(set(observation.state.upgrades)),
         available_actions=sorted({action.name for action in observation.available_actions}),
         alert_count=len(observation.alerts),
@@ -1006,18 +974,13 @@ def _source_manifest(
         journal_path=os.path.relpath(journal.path, start=manifest_dir.resolve()),
         source_fingerprint=journal.source_fingerprint,
         event_count=len(events),
-        selection_event_count=sum(
-            event.event_type == "executor_selection" for event in events
-        ),
+        selection_event_count=sum(event.event_type == "executor_selection" for event in events),
         protocol_v11_observation_count=sum(
-            event.event_type == "observation"
-            and event.payload.get("protocol_version") == "1.1"
+            event.event_type == "observation" and event.payload.get("protocol_version") == "1.1"
             for event in events
         ),
         run_ids=sorted({event.run_id for event in events}),
-        episode_keys=sorted(
-            {f"{event.run_id}/{event.episode_id}" for event in events}
-        ),
+        episode_keys=sorted({f"{event.run_id}/{event.episode_id}" for event in events}),
     )
 
 
@@ -1037,9 +1000,7 @@ def _conservation(
 def _conservation_from_samples(
     samples: Sequence[ExecutorCorpusSample],
 ) -> ExecutorCorpusConservation:
-    selected = sum(
-        sample.label.status is CandidateSelectionStatus.SELECTED for sample in samples
-    )
+    selected = sum(sample.label.status is CandidateSelectionStatus.SELECTED for sample in samples)
     lineages = sum(sample.command_id is not None for sample in samples)
     terminal = sum(sample.terminal_outcome is not None for sample in samples)
     return ExecutorCorpusConservation(
@@ -1127,11 +1088,7 @@ def _verify_sources(
 ) -> None:
     for source in manifest.sources:
         locator = Path(source.journal_path)
-        path = (
-            locator
-            if locator.is_absolute()
-            else (manifest_path.parent / locator).resolve()
-        )
+        path = locator if locator.is_absolute() else (manifest_path.parent / locator).resolve()
         if not path.is_file():
             errors.append(f"source journal is missing: {path}")
         else:
@@ -1139,8 +1096,7 @@ def _verify_sources(
                 events = tuple(read_event_log(path))
             except Exception as error:
                 errors.append(
-                    f"source journal cannot be decoded: {path}: "
-                    f"{type(error).__name__}: {error}"
+                    f"source journal cannot be decoded: {path}: {type(error).__name__}: {error}"
                 )
                 continue
             if _safe_source_fingerprint(events) != source.source_fingerprint:
@@ -1395,9 +1351,7 @@ def _safe_event_projection(
                 "status": report.status.value,
                 "success": report.success,
                 "execution_stage": (
-                    None
-                    if report.execution_stage is None
-                    else report.execution_stage.value
+                    None if report.execution_stage is None else report.execution_stage.value
                 ),
                 "failure_code": _safe_code(report.failure_code),
                 "action_name": report.action_name,

@@ -175,9 +175,7 @@ class HIMASidecarProcess:
         self._stderr: BinaryIO | None = None
         self._health: HIMALiveHealth | None = None
         self._start_lock = asyncio.Lock()
-        self._ownership_path = self.spec.socket_path.with_name(
-            f"{self.spec.socket_path.name}.lock"
-        )
+        self._ownership_path = self.spec.socket_path.with_name(f"{self.spec.socket_path.name}.lock")
         self._owns_socket = False
         self._owns_lock = False
 
@@ -287,8 +285,7 @@ class HIMASidecarProcess:
             raise HIMASidecarError(f"HIMA sidecar is not ready: {health.status}")
         if health.model_id != self.expected_model_id:
             raise HIMASidecarError(
-                f"HIMA sidecar model mismatch: {health.model_id!r} != "
-                f"{self.expected_model_id!r}"
+                f"HIMA sidecar model mismatch: {health.model_id!r} != {self.expected_model_id!r}"
             )
         if health.model_revision != self.expected_model_revision:
             raise HIMASidecarError(
@@ -303,8 +300,7 @@ class HIMASidecarProcess:
         for component, (actual, expected) in versions.items():
             if actual != expected:
                 raise HIMASidecarError(
-                    f"HIMA sidecar {component} version mismatch: "
-                    f"{actual!r} != {expected!r}"
+                    f"HIMA sidecar {component} version mismatch: {actual!r} != {expected!r}"
                 )
 
     async def restart(self) -> HIMALiveHealth:
@@ -361,6 +357,4 @@ def validate_sidecar_executable(command: Sequence[str]) -> None:
         raise HIMASidecarError("HIMA sidecar command cannot be empty")
     executable = Path(command[0]).expanduser()
     if not executable.is_file() or not os.access(executable, os.X_OK):
-        raise HIMASidecarError(
-            f"HIMA Python is missing or not executable: {executable}"
-        )
+        raise HIMASidecarError(f"HIMA Python is missing or not executable: {executable}")

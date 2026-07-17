@@ -126,9 +126,7 @@ def production_source_tag(
         return None
     spec = production_spec(action_name)
     cost = (
-        None
-        if spec is None
-        else (spec.minerals, spec.vespene, spec.supply)
+        None if spec is None else (spec.minerals, spec.vespene, spec.supply)
     ) or RESEARCH_COSTS.get(action_name)
     if cost is not None and not _production_cost_is_available(observation, *cost):
         return None
@@ -239,8 +237,7 @@ class TimeStepExtractor:
         self.episode_id = episode_id
         self.unit_names = dict(unit_names or {})
         self.upgrade_names = {
-            int(upgrade_id): str(name)
-            for upgrade_id, name in (upgrade_names or {}).items()
+            int(upgrade_id): str(name) for upgrade_id, name in (upgrade_names or {}).items()
         }
         self.building_types = frozenset(int(value) for value in building_types)
         self.action_source_types = {

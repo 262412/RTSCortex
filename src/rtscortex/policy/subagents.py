@@ -84,23 +84,25 @@ _HIMA_RACES: tuple[Literal["Protoss", "Terran", "Zerg"], ...] = (
     "Terran",
     "Zerg",
 )
-HIMA_RACE_SPECS = MappingProxyType({
-    race.lower(): tuple(
-        PolicySubagentSpec(
-            subagent_id=f"hima-{race.lower()}-{specialist}",
-            display_name=f"HIMA {race}-{specialist}",
-            provider_kind=PolicyProviderKind.HUGGING_FACE_TRANSFORMERS,
-            model_id=f"SNUMPR/{race}-{specialist}",
-            role=f"upstream {race} specialist cluster {specialist.upper()}",
-            race=race,
-            action_interface=f"HIMA GitHub JSON state to ordered {race} macro actions",
-            requires_external_weights=True,
-            license_id=None,
+HIMA_RACE_SPECS = MappingProxyType(
+    {
+        race.lower(): tuple(
+            PolicySubagentSpec(
+                subagent_id=f"hima-{race.lower()}-{specialist}",
+                display_name=f"HIMA {race}-{specialist}",
+                provider_kind=PolicyProviderKind.HUGGING_FACE_TRANSFORMERS,
+                model_id=f"SNUMPR/{race}-{specialist}",
+                role=f"upstream {race} specialist cluster {specialist.upper()}",
+                race=race,
+                action_interface=f"HIMA GitHub JSON state to ordered {race} macro actions",
+                requires_external_weights=True,
+                license_id=None,
+            )
+            for specialist in ("a", "b", "c")
         )
-        for specialist in ("a", "b", "c")
-    )
-    for race in _HIMA_RACES
-})
+        for race in _HIMA_RACES
+    }
+)
 HIMA_ALL_SPECS = tuple(
     spec for race in ("protoss", "terran", "zerg") for spec in HIMA_RACE_SPECS[race]
 )

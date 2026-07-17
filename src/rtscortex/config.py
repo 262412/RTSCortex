@@ -68,10 +68,7 @@ class EnvironmentSettings(SettingsModel):
 
     @model_validator(mode="after")
     def validate_observation_gap_limits(self) -> EnvironmentSettings:
-        if (
-            self.observation_gap_hard_limit_game_loops
-            <= self.observation_gap_watchdog_game_loops
-        ):
+        if self.observation_gap_hard_limit_game_loops <= self.observation_gap_watchdog_game_loops:
             raise ValueError(
                 "observation_gap_hard_limit_game_loops must exceed the watchdog threshold"
             )
@@ -147,9 +144,7 @@ class CortexMacroSettings(SettingsModel):
             races = {candidate.rsplit("-", 1)[0] for candidate in candidates}
             clusters = {candidate.rsplit("-", 1)[1] for candidate in candidates}
             if len(races) != 1 or clusters != {"a", "b", "c"}:
-                raise ValueError(
-                    "HIMA ensemble members must be the a/b/c checkpoints for one race"
-                )
+                raise ValueError("HIMA ensemble members must be the a/b/c checkpoints for one race")
         elif self.ensemble_members:
             raise ValueError("ensemble_members are only valid for kind=hima_ensemble")
         return self

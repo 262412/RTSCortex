@@ -125,9 +125,7 @@ def production_spec(action_name: str) -> Optional[ProductionSpec]:
 def production_spec_for_order(order_id: int) -> Optional[ProductionSpec]:
     """Resolve either a raw function ID or an SC2 ability ID."""
 
-    return PRODUCTION_SPECS_BY_RAW_ORDER.get(order_id) or PRODUCTION_SPECS_BY_ABILITY.get(
-        order_id
-    )
+    return PRODUCTION_SPECS_BY_RAW_ORDER.get(order_id) or PRODUCTION_SPECS_BY_ABILITY.get(order_id)
 
 
 __all__ = [

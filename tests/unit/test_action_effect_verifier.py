@@ -672,9 +672,7 @@ def test_shield_battery_order_48_and_new_tag_confirm_build_effect() -> None:
         structures=["Nexus", "ShieldBattery"],
         builder_orders=[48],
     )
-    battery = next(
-        unit for unit in current["raw_units"] if unit["unit_type"] == "ShieldBattery"
-    )
+    battery = next(unit for unit in current["raw_units"] if unit["unit_type"] == "ShieldBattery")
     battery["x"] = 31.875
     battery["y"] = 30
 

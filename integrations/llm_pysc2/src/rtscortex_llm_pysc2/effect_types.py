@@ -16,4 +16,3 @@ class EffectVerdict:
     status: str = "failed"
     failure_code: Optional[str] = None
     evidence: Optional[dict[str, Any]] = None
-

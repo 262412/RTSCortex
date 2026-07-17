@@ -397,20 +397,26 @@ def test_production_camera_waits_for_exact_producer_feature_observation() -> Non
     producer.is_on_screen = True
     timestep.observation.feature_units.append(producer)
 
-    assert _producer_is_visible(
-        timestep.observation,
-        0xBBB,
-        size_screen=128,
-    ) is True
+    assert (
+        _producer_is_visible(
+            timestep.observation,
+            0xBBB,
+            size_screen=128,
+        )
+        is True
+    )
     assert agent._wait_for_production_camera("Train_Zealot", timestep) is False
     assert agent._rtscortex_production_camera_waits == 0
 
     producer.x = 0
-    assert _producer_is_visible(
-        timestep.observation,
-        0xBBB,
-        size_screen=128,
-    ) is False
+    assert (
+        _producer_is_visible(
+            timestep.observation,
+            0xBBB,
+            size_screen=128,
+        )
+        is False
+    )
 
 
 def test_production_camera_settlement_timeout_is_structured_failure() -> None:
@@ -1575,9 +1581,7 @@ def test_shield_battery_requires_core_power_and_clear_full_footprint() -> None:
         unit_names=unit_names,
     )
     power[65][65] = 1
-    observation.feature_units.append(
-        SimpleNamespace(x=65, y=65, radius=0.5, is_on_screen=True)
-    )
+    observation.feature_units.append(SimpleNamespace(x=65, y=65, radius=0.5, is_on_screen=True))
     assert not screen_build_position_is_legal(
         observation,
         "Build_ShieldBattery_Screen",
@@ -2448,9 +2452,7 @@ def test_production_source_follows_upstream_raw_order_instead_of_tag_order() -> 
 
 
 def test_train_registry_pins_six_worker_actions_and_raw_orders() -> None:
-    assert {
-        action: spec.raw_order_id for action, spec in PRODUCTION_SPECS.items()
-    } == {
+    assert {action: spec.raw_order_id for action, spec in PRODUCTION_SPECS.items()} == {
         "Train_Zealot": 49,
         "Train_Stalker": 50,
         "Train_Adept": 54,
@@ -2504,9 +2506,7 @@ def test_extractor_projects_production_queue_with_exact_producer_tag() -> None:
     gateway.order_id_0 = 49
     gateway.order_progress_0 = 0.25
     timestep.observation.raw_units.append(gateway)
-    timestep.observation.production_queue = [
-        SimpleNamespace(ability_id=916, build_progress=25)
-    ]
+    timestep.observation.production_queue = [SimpleNamespace(ability_id=916, build_progress=25)]
 
     snapshot = TimeStepExtractor(
         "run-worker",

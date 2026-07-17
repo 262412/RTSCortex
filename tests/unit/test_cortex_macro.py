@@ -103,9 +103,7 @@ def test_macro_plan_bounds_long_hima_objective_before_goal_projection() -> None:
     )
     response = response.model_copy(
         update={
-            "proposal": response.proposal.model_copy(
-                update={"strategic_objective": long_objective}
-            )
+            "proposal": response.proposal.model_copy(update={"strategic_objective": long_objective})
         }
     )
 
@@ -141,10 +139,7 @@ def test_runtime_frontier_does_not_skip_unsupported_dependency() -> None:
 
     assert frontier is not None
     assert frontier.source_action == "TRAIN SENTRY"
-    assert (
-        frontier.classification
-        is PolicyActionClassification.UNSUPPORTED_BY_RUNTIME
-    )
+    assert frontier.classification is PolicyActionClassification.UNSUPPORTED_BY_RUNTIME
     assert frontier.reason_code == "not_implemented"
     assert frontier.runtime_action is None
     assert frontier.is_runtime_frontier
@@ -163,9 +158,7 @@ def test_runtime_frontier_treats_parse_error_as_hard_blocker() -> None:
 
 def test_macro_goal_uses_measurable_prefix_and_stops_at_hard_blocker() -> None:
     observation = _pylon_observation()
-    response = _response(
-        "Actions: ['Probe', 'Pylon', 'Pylon', 'Sentry', 'Gateway']"
-    )
+    response = _response("Actions: ['Probe', 'Pylon', 'Pylon', 'Sentry', 'Gateway']")
     plan = macro_plan_from_hima(response, observation, ttl_game_loops=448)
 
     goal = macro_goal_spec(plan, observation)
@@ -191,9 +184,7 @@ def test_macro_goal_stops_before_unknown_token_parse_diagnostic() -> None:
     goal = macro_goal_spec(plan, observation)
 
     assert goal is not None
-    assert [item.action_name for item in goal.requirements] == [
-        "Build_Pylon_Screen"
-    ]
+    assert [item.action_name for item in goal.requirements] == ["Build_Pylon_Screen"]
     assert [step.ordinal for step in plan.steps] == [0, 2]
     assert plan.steps[1].semantic_action == "BUILD GATEWAY"
 
@@ -238,10 +229,7 @@ def test_macro_goal_accepts_later_state_but_rejects_another_episode() -> None:
 
 def test_runtime_actions_map_back_to_exact_official_hima_tokens() -> None:
     assert hima_previous_action_for_runtime_action("Build_Pylon_Screen") == "Pylon"
-    assert (
-        hima_previous_action_for_runtime_action("Research_WarpGate")
-        == "WarpGateResearch"
-    )
+    assert hima_previous_action_for_runtime_action("Research_WarpGate") == "WarpGateResearch"
     assert hima_previous_action_for_runtime_action("Attack_Unit") is None
     assert hima_previous_actions_for_runtime_actions(
         ["Build_Pylon_Screen", "Attack_Unit", "Train_Oracle"]

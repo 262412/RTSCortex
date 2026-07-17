@@ -165,9 +165,7 @@ def test_verifier_waits_for_an_in_progress_requirement_without_reissuing_it() ->
     assert report.missing[0].in_progress_count == 1
     assert report.advancing_actions == []
     assert report.unique_next_action is None
-    assert GoalBlockerKind.EFFECT_IN_PROGRESS in {
-        blocker.kind for blocker in report.blockers
-    }
+    assert GoalBlockerKind.EFFECT_IN_PROGRESS in {blocker.kind for blocker in report.blockers}
 
 
 def test_production_queue_counts_as_progress_but_not_completion() -> None:
@@ -284,9 +282,7 @@ def test_verifier_resolves_implicit_tech_tree_prerequisites() -> None:
 
     assert report.advancing_actions == ["Build_Pylon_Screen"]
     assert report.unique_next_action == "Build_Pylon_Screen"
-    assert GoalBlockerKind.MISSING_PREREQUISITE in {
-        blocker.kind for blocker in report.blockers
-    }
+    assert GoalBlockerKind.MISSING_PREREQUISITE in {blocker.kind for blocker in report.blockers}
 
 
 def test_verifier_reports_resource_blocker_instead_of_an_illegal_action() -> None:
@@ -390,9 +386,7 @@ def test_active_plan_projection_ignores_control_commands() -> None:
 
     goal = verifier.goal_from_active_plan(active_plan)
 
-    assert [requirement.action_name for requirement in goal.requirements] == [
-        "Build_Pylon_Screen"
-    ]
+    assert [requirement.action_name for requirement in goal.requirements] == ["Build_Pylon_Screen"]
 
 
 def test_goal_graph_rejects_cycles_and_unknown_actions() -> None:
@@ -628,9 +622,7 @@ def test_worker_and_runtime_production_specs_remain_contract_equivalent() -> Non
     """Keep the Python 3.9 Worker registry aligned with the Python 3.11 Runtime."""
 
     runtime_specs = {
-        spec.name: spec
-        for spec in PROTOSS_SIMPLE64_ACTION_SPECS
-        if spec.name in PRODUCTION_SPECS
+        spec.name: spec for spec in PROTOSS_SIMPLE64_ACTION_SPECS if spec.name in PRODUCTION_SPECS
     }
 
     assert set(runtime_specs) == set(PRODUCTION_SPECS)

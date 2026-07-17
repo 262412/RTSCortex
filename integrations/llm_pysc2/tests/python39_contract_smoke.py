@@ -103,9 +103,7 @@ def _assert_observation_gap_watchdog_preempts_optional_gathering() -> None:
 
 
 def _assert_visible_team_unit_bypasses_camera_recentering() -> None:
-    assert "_rtscortex_accept_visible_team_unit" in inspect.getsource(
-        get_camera_func_smart
-    )
+    assert "_rtscortex_accept_visible_team_unit" in inspect.getsource(get_camera_func_smart)
     unit = SimpleNamespace(tag=0xA, x=90, y=65)
     observation = SimpleNamespace(
         observation=SimpleNamespace(raw_units=[unit], feature_units=[unit])

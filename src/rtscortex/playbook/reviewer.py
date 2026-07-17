@@ -136,15 +136,11 @@ class CortexPlaybookReviewer:
         if signature is None:
             return None
         matching = [
-            candidate
-            for candidate in self.store.cases()
-            if _case_signature(candidate) == signature
+            candidate for candidate in self.store.cases() if _case_signature(candidate) == signature
         ]
         source_ids = tuple(dict.fromkeys(candidate.case_id for candidate in matching))
         source_episode_ids = tuple(
-            dict.fromkeys(
-                f"{candidate.run_id}/{candidate.episode_id}" for candidate in matching
-            )
+            dict.fromkeys(f"{candidate.run_id}/{candidate.episode_id}" for candidate in matching)
         )
         support = len(source_episode_ids)
         status = (

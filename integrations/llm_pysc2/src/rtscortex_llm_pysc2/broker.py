@@ -245,9 +245,7 @@ class SharedDecisionBroker:
         while state.decision is None and state.error is None:
             leader = False
             with self._condition:
-                expected = {
-                    name for name, value in self._agents.items() if value.enable
-                }
+                expected = {name for name, value in self._agents.items() if value.enable}
                 # Combat agents can be disabled after losing their final unit while
                 # Builder/Developer threads are already waiting at this barrier.
                 # Re-evaluate the live participant set instead of retaining a stale
@@ -691,9 +689,7 @@ class SharedDecisionBroker:
                 {
                     "unattributed_primitives": self.unattributed_primitives,
                     "candidate_outside_pysc2_dispatches": (self.candidate_outside_pysc2_dispatches),
-                    "observation_gap_watchdog_triggers": (
-                        self.observation_gap_watchdog_triggers
-                    ),
+                    "observation_gap_watchdog_triggers": (self.observation_gap_watchdog_triggers),
                 }
             ),
             encoding="utf-8",

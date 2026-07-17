@@ -84,9 +84,7 @@ _HIMA_PREVIOUS_ACTION_WINDOW_GAME_LOOPS = int(60 * 22.4)
 
 def _deferred_frontier_requires_replan(frontier: PolicyActionAssessment) -> bool:
     reason = frontier.reason_code or ""
-    return reason == "insufficient_supply" or reason.startswith(
-        "missing_prerequisite_"
-    )
+    return reason == "insufficient_supply" or reason.startswith("missing_prerequisite_")
 
 
 def _macro_frontier_is_usable(frontier: PolicyActionAssessment | None) -> bool:
@@ -202,15 +200,9 @@ class CortexRuntimeEngine(RuntimeEngine):
         self._previous_hima_actions: list[tuple[int, str]] = []
         self._situation = DeterministicSituationAnalyzer(valid_for_game_loops=1)
         self._tactical = DeterministicTacticalAgent(
-            retreat_health_threshold=(
-                config.cortex.tactical.retreat_health_threshold
-            ),
-            minimum_advance_army_supply=(
-                config.cortex.tactical.minimum_advance_army_supply
-            ),
-            reacquire_cooldown_game_loops=(
-                config.cortex.tactical.reacquire_cooldown_game_loops
-            ),
+            retreat_health_threshold=(config.cortex.tactical.retreat_health_threshold),
+            minimum_advance_army_supply=(config.cortex.tactical.minimum_advance_army_supply),
+            reacquire_cooldown_game_loops=(config.cortex.tactical.reacquire_cooldown_game_loops),
         )
         self._candidate_compiler = CandidateCompiler()
         self._executor = DeterministicCandidateExecutor()
@@ -293,28 +285,21 @@ class CortexRuntimeEngine(RuntimeEngine):
         reflex_prepared = [
             item
             for command in raw_reflex
-            if (item := self._prepare_reflex_command(observation, assessment, command))
-            is not None
+            if (item := self._prepare_reflex_command(observation, assessment, command)) is not None
         ]
         prepared.extend(reflex_prepared)
         reflex_latency_ms = (time.perf_counter() - reflex_started) * 1_000
 
         prepared_by_id = {item.command.command_id: item for item in prepared}
         macro_candidates = [
-            item.command
-            for item in prepared
-            if item.lineage.source_role is CortexRole.MACRO
+            item.command for item in prepared if item.lineage.source_role is CortexRole.MACRO
         ]
         tactical_candidates = [
-            item.command
-            for item in prepared
-            if item.lineage.source_role is CortexRole.TACTICAL
+            item.command for item in prepared if item.lineage.source_role is CortexRole.TACTICAL
         ]
         planner_candidates = [*macro_candidates, *tactical_candidates]
         reflex_candidates = [
-            item.command
-            for item in prepared
-            if item.lineage.source_role is CortexRole.REFLEX
+            item.command for item in prepared if item.lineage.source_role is CortexRole.REFLEX
         ]
         for command in planner_candidates:
             self._transition_command(command, CommandStatus.PENDING, observation)
@@ -441,13 +426,10 @@ class CortexRuntimeEngine(RuntimeEngine):
                     command.model_dump(mode="json") for command in busy_actor_candidates
                 ],
                 "validated_candidates": [
-                    command.model_dump(mode="json")
-                    for command in candidate_outcome.accepted
+                    command.model_dump(mode="json") for command in candidate_outcome.accepted
                 ],
                 "goal_progress": (
-                    None
-                    if goal_progress is None
-                    else goal_progress.model_dump(mode="json")
+                    None if goal_progress is None else goal_progress.model_dump(mode="json")
                 ),
             },
         )
@@ -464,8 +446,7 @@ class CortexRuntimeEngine(RuntimeEngine):
             active_commands = [
                 lifecycle.command.command_id
                 for lifecycle in self._command_states.values()
-                if lifecycle.status
-                in {*_ACTIONABLE_COMMAND_STATUSES, CommandStatus.DISPATCHED}
+                if lifecycle.status in {*_ACTIONABLE_COMMAND_STATUSES, CommandStatus.DISPATCHED}
             ]
             if active_commands:
                 raise RuntimeError(
@@ -564,10 +545,7 @@ class CortexRuntimeEngine(RuntimeEngine):
         ):
             report = ExecutionReport.model_validate(event.payload)
             recovered_lineage = self._command_lineages.get(report.command_id)
-            if (
-                recovered_lineage is None
-                or recovered_lineage.source_role is not CortexRole.MACRO
-            ):
+            if recovered_lineage is None or recovered_lineage.source_role is not CortexRole.MACRO:
                 continue
             if report.status is ExecutionStatus.SUCCEEDED and report.action_name is not None:
                 loop = self._execution_game_loop(report)
@@ -581,10 +559,7 @@ class CortexRuntimeEngine(RuntimeEngine):
         if self._macro_plan is not None:
             for command_id, succeeded in recovered_macro_outcomes:
                 metadata = self._macro_command_steps.get(command_id)
-                if (
-                    metadata is not None
-                    and metadata[0] == self._macro_plan.plan_id
-                ):
+                if metadata is not None and metadata[0] == self._macro_plan.plan_id:
                     self._advance_macro_step(
                         metadata[2],
                         succeeded=succeeded,
@@ -599,10 +574,7 @@ class CortexRuntimeEngine(RuntimeEngine):
             if lifecycle.status is not CommandStatus.DISPATCHED:
                 continue
             recovered_lineage = self._command_lineages.get(lifecycle.command.command_id)
-            if (
-                recovered_lineage is not None
-                and recovered_lineage.source_role is CortexRole.MACRO
-            ):
+            if recovered_lineage is not None and recovered_lineage.source_role is CortexRole.MACRO:
                 dispatched.append(lifecycle.command.command_id)
         if len(dispatched) > 1:
             raise RuntimeError("recovered more than one in-flight macro command")
@@ -651,10 +623,7 @@ class CortexRuntimeEngine(RuntimeEngine):
                 "model_revision": self._macro_health.model_revision,
                 "status": self._macro_health.status,
                 "members": (
-                    [
-                        member.model_dump(mode="json")
-                        for member in self._macro_health.members
-                    ]
+                    [member.model_dump(mode="json") for member in self._macro_health.members]
                     if isinstance(self._macro_health, RaceBrainHealth)
                     else None
                 ),
@@ -779,9 +748,7 @@ class CortexRuntimeEngine(RuntimeEngine):
                     {
                         "role": CortexRole.MACRO.value,
                         "model_id": (
-                            None
-                            if self._macro_health is None
-                            else self._macro_health.model_id
+                            None if self._macro_health is None else self._macro_health.model_id
                         ),
                         "source_game_loop": source_observation.game_loop,
                         "current_game_loop": observation.game_loop,
@@ -827,9 +794,7 @@ class CortexRuntimeEngine(RuntimeEngine):
                 observation,
                 frontier,
             )
-            if not plan.steps or not (
-                _macro_frontier_is_usable(frontier) or fallback is not None
-            ):
+            if not plan.steps or not (_macro_frontier_is_usable(frontier) or fallback is not None):
                 classification = (
                     "empty_plan"
                     if not plan.steps
@@ -870,15 +835,12 @@ class CortexRuntimeEngine(RuntimeEngine):
                 self._schedule_macro_recovery(observation)
             else:
                 self._next_macro_retry_game_loop = (
-                    observation.game_loop
-                    + self.config.cortex.macro.interval_game_loops
+                    observation.game_loop + self.config.cortex.macro.interval_game_loops
                 )
             self._urgent_replan_requested = not timed_out
             payload = {
                 "role": CortexRole.MACRO.value,
-                "model_id": (
-                    None if self._macro_health is None else self._macro_health.model_id
-                ),
+                "model_id": (None if self._macro_health is None else self._macro_health.model_id),
                 "error_type": type(error).__name__,
                 "message": str(error),
                 "latency_ms": latency_ms,
@@ -953,8 +915,7 @@ class CortexRuntimeEngine(RuntimeEngine):
             update={
                 "created_game_loop": observation.game_loop,
                 "expires_game_loop": (
-                    observation.game_loop
-                    + self.config.cortex.macro.plan_ttl_game_loops
+                    observation.game_loop + self.config.cortex.macro.plan_ttl_game_loops
                 ),
             }
         )
@@ -996,8 +957,7 @@ class CortexRuntimeEngine(RuntimeEngine):
                 "runtime_frontier": (
                     None
                     if frontier_assessment is None
-                    else frontier_assessment.runtime_action
-                    or frontier_assessment.source_action
+                    else frontier_assessment.runtime_action or frontier_assessment.source_action
                 ),
                 "goal_spec": None if goal is None else goal.model_dump(mode="json"),
             },
@@ -1038,9 +998,7 @@ class CortexRuntimeEngine(RuntimeEngine):
         ]
         if not remaining_steps:
             return None
-        remaining_proposal = self._macro_proposal.model_copy(
-            update={"steps": remaining_steps}
-        )
+        remaining_proposal = self._macro_proposal.model_copy(update={"steps": remaining_steps})
         frontier = runtime_frontier(
             remaining_proposal,
             observation,
@@ -1090,8 +1048,7 @@ class CortexRuntimeEngine(RuntimeEngine):
                 )
                 self._macro_plan_frozen = True
                 self._next_macro_retry_game_loop = (
-                    observation.game_loop
-                    + self.config.cortex.macro.interval_game_loops
+                    observation.game_loop + self.config.cortex.macro.interval_game_loops
                 )
                 self._urgent_replan_requested = True
                 return None
@@ -1161,8 +1118,7 @@ class CortexRuntimeEngine(RuntimeEngine):
             intent_id=self._intent_id(
                 observation,
                 CortexRole.MACRO,
-                f"{self._macro_plan.plan_id}:{frontier.ordinal}:"
-                f"{step.completed_repeats}",
+                f"{self._macro_plan.plan_id}:{frontier.ordinal}:{step.completed_repeats}",
             ),
             run_id=observation.run_id,
             episode_id=observation.episode_id,
@@ -1195,15 +1151,13 @@ class CortexRuntimeEngine(RuntimeEngine):
 
         if (
             blocked_frontier is None
-            or blocked_frontier.classification
-            is not PolicyActionClassification.MAPPED_DEFERRED
+            or blocked_frontier.classification is not PolicyActionClassification.MAPPED_DEFERRED
         ):
             return None
         free_supply = self._free_supply(observation)
         if (
             blocked_frontier.source_action != "BUILD PYLON"
-            and free_supply
-            <= self.config.cortex.executor.supply_emergency_free_supply
+            and free_supply <= self.config.cortex.executor.supply_emergency_free_supply
         ):
             emergency = self._legal_proposal_step(
                 proposal,
@@ -1213,8 +1167,7 @@ class CortexRuntimeEngine(RuntimeEngine):
             if emergency is not None:
                 return emergency
         nexus_count = sum(
-            structure.unit_type == "Nexus"
-            for structure in observation.state.own_structures
+            structure.unit_type == "Nexus" for structure in observation.state.own_structures
         )
         gas_saturated_before_expansion = (
             blocked_frontier.source_action == "BUILD ASSIMILATOR"
@@ -1233,10 +1186,7 @@ class CortexRuntimeEngine(RuntimeEngine):
         ):
             fallback_actions.append("BUILD NEXUS")
         fallback_actions.append("TRAIN ZEALOT")
-        if (
-            free_supply
-            <= self.config.cortex.executor.resource_fallback_pylon_free_supply
-        ):
+        if free_supply <= self.config.cortex.executor.resource_fallback_pylon_free_supply:
             fallback_actions.append("BUILD PYLON")
         if "BUILD NEXUS" not in fallback_actions:
             fallback_actions.append("BUILD NEXUS")
@@ -1260,9 +1210,7 @@ class CortexRuntimeEngine(RuntimeEngine):
         for step in sorted(proposal.steps, key=lambda item: item.ordinal):
             if step.canonical_action != semantic_action:
                 continue
-            isolated = proposal.model_copy(
-                update={"steps": [step], "diagnostics": []}
-            )
+            isolated = proposal.model_copy(update={"steps": [step], "diagnostics": []})
             assessment = runtime_frontier(
                 isolated,
                 observation,
@@ -1270,8 +1218,7 @@ class CortexRuntimeEngine(RuntimeEngine):
             )
             if (
                 assessment is not None
-                and assessment.classification
-                is PolicyActionClassification.MAPPED_LEGAL_NOW
+                and assessment.classification is PolicyActionClassification.MAPPED_LEGAL_NOW
             ):
                 return assessment
         return None
@@ -1288,9 +1235,7 @@ class CortexRuntimeEngine(RuntimeEngine):
             or self._macro_restart_attempts >= self.config.cortex.macro.restart_limit
         ):
             return
-        self._macro_recovery_task = asyncio.create_task(
-            self._recover_macro_specialist(observation)
-        )
+        self._macro_recovery_task = asyncio.create_task(self._recover_macro_specialist(observation))
 
     async def _recover_macro_specialist(
         self,
@@ -1501,9 +1446,7 @@ class CortexRuntimeEngine(RuntimeEngine):
         if succeeded and report.action_name is not None:
             token = hima_previous_action_for_runtime_action(report.action_name)
             if token is not None:
-                self._previous_hima_actions.append(
-                    (self._execution_game_loop(report), token)
-                )
+                self._previous_hima_actions.append((self._execution_game_loop(report), token))
         else:
             self._macro_plan_frozen = True
             self._urgent_replan_requested = True
@@ -1612,11 +1555,7 @@ class CortexRuntimeEngine(RuntimeEngine):
 
     @staticmethod
     def _execution_game_loop(report: ExecutionReport) -> int:
-        loops = [
-            entry.game_loop
-            for entry in report.primitive_trace
-            if entry.game_loop is not None
-        ]
+        loops = [entry.game_loop for entry in report.primitive_trace if entry.game_loop is not None]
         if report.effect_evidence is not None:
             loops.extend(
                 loop
@@ -1631,9 +1570,7 @@ class CortexRuntimeEngine(RuntimeEngine):
 
     @staticmethod
     def _is_timeout_error(error: Exception) -> bool:
-        return isinstance(error, TimeoutError) or type(error).__name__.endswith(
-            "Timeout"
-        )
+        return isinstance(error, TimeoutError) or type(error).__name__.endswith("Timeout")
 
     def _cortex_idle_reason(self) -> IdleReason:
         if self._macro_task is not None:
@@ -1657,8 +1594,7 @@ class CortexRuntimeEngine(RuntimeEngine):
         if progress.unique_next_action is not None:
             return f"Next verified macro action: {progress.unique_next_action}."
         return (
-            f"Macro goal is {progress.status.value}; "
-            "fast executor uses current legal candidates."
+            f"Macro goal is {progress.status.value}; fast executor uses current legal candidates."
         )
 
     def _record_cortex_event(

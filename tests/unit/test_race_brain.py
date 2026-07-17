@@ -189,10 +189,7 @@ def test_unsupported_frontier_is_a_runtime_gap_not_a_degraded_member() -> None:
 
 
 def test_race_brain_health_contains_all_checkpoint_provenance() -> None:
-    clients = {
-        cluster: _Client(cluster, "Actions: ['Pylon']")
-        for cluster in ("a", "b", "c")
-    }
+    clients = {cluster: _Client(cluster, "Actions: ['Pylon']") for cluster in ("a", "b", "c")}
     client = HIMAEnsemblePolicyClient(clients, race="protoss")
 
     health = asyncio.run(client.health())
@@ -209,17 +206,12 @@ def test_race_brain_health_contains_all_checkpoint_provenance() -> None:
 def test_race_brain_runs_device_groups_in_parallel_and_members_in_order() -> None:
     events: list[str] = []
     client = HIMAEnsemblePolicyClient(
-        {
-            cluster: _ScheduledClient(cluster, events)
-            for cluster in ("a", "b", "c")
-        },
+        {cluster: _ScheduledClient(cluster, events) for cluster in ("a", "b", "c")},
         race="protoss",
         execution_groups=(("a",), ("b", "c")),
     )
 
-    response = asyncio.run(
-        client.propose(HIMAInputContext(observation=_observation()))
-    )
+    response = asyncio.run(client.propose(HIMAInputContext(observation=_observation())))
 
     assert response.execution_groups == (("a",), ("b", "c"))
     assert events.index("start:a") < events.index("end:b")

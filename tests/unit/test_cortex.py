@@ -401,11 +401,7 @@ def test_executor_abstains_and_compiler_rejects_non_selected_outcome() -> None:
 
 def test_candidate_compiler_never_invents_an_actor_scope() -> None:
     observation = _observation().model_copy(
-        update={
-            "available_actions": [
-                AvailableAction(name="Build_Pylon_Screen", actor_scopes=[])
-            ]
-        }
+        update={"available_actions": [AvailableAction(name="Build_Pylon_Screen", actor_scopes=[])]}
     )
 
     context = CandidateCompiler().compile(observation, _macro_intent())

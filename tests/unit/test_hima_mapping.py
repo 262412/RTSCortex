@@ -20,9 +20,7 @@ from tests.helpers import make_observation
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 PINNED_CORPUS_MANIFEST = PROJECT_ROOT / "benchmarks/policy/protoss_v0_2/manifest.yaml"
-HIMA_PROTOSS_A_OUTPUTS = (
-    PROJECT_ROOT / "tests/fixtures/hima_protoss_a_v02_raw_outputs.jsonl"
-)
+HIMA_PROTOSS_A_OUTPUTS = PROJECT_ROOT / "tests/fixtures/hima_protoss_a_v02_raw_outputs.jsonl"
 
 
 def _proposal(
@@ -90,9 +88,7 @@ def test_mapping_registry_exposes_first_expanded_protoss_semantics() -> None:
         "BUILD SHIELDBATTERY",
         "RESEARCH WARPGATERESEARCH",
     }
-    mappings = {
-        item.macro_action: item.runtime_actions for item in HIMA_RUNTIME_MAPPINGS
-    }
+    mappings = {item.macro_action: item.runtime_actions for item in HIMA_RUNTIME_MAPPINGS}
     assert mappings["TRAIN ADEPT"] == ("Train_Adept",)
     assert mappings["BUILD STARGATE"] == ("Build_Stargate_Screen",)
     assert mappings["TRAIN VOIDRAY"] == ("Train_VoidRay",)
@@ -159,8 +155,7 @@ def test_mapper_uses_exact_oracle_phoenix_and_shield_battery_runtime_actions() -
 
 def test_hima_protoss_a_fixed_outputs_have_expanded_mapping_golden() -> None:
     fixtures = {
-        fixture.fixture_id: fixture
-        for fixture in load_policy_corpus(PINNED_CORPUS_MANIFEST)
+        fixture.fixture_id: fixture for fixture in load_policy_corpus(PINNED_CORPUS_MANIFEST)
     }
     parser = HIMAProposalParser()
     mapper = HIMAMacroActionMapper()
@@ -183,16 +178,19 @@ def test_hima_protoss_a_fixed_outputs_have_expanded_mapping_golden() -> None:
         "mapped_legal_now": 14,
         "mapped_deferred": 98,
     }
-    assert sum(
-        effective_counts[classification]
-        for classification in (
-            "mapped_future",
-            "mapped_legal_now",
-            "mapped_deferred",
-            "illegal_action",
-            "obsolete",
+    assert (
+        sum(
+            effective_counts[classification]
+            for classification in (
+                "mapped_future",
+                "mapped_legal_now",
+                "mapped_deferred",
+                "illegal_action",
+                "obsolete",
+            )
         )
-    ) == 699
+        == 699
+    )
     assert sum(effective_counts.values()) == 1_687
 
 
@@ -210,7 +208,7 @@ def test_mapper_binds_frontier_actor_and_candidate_from_observation() -> None:
                     actor_scopes=["Builder/Probe-1"],
                     argument_candidates=[[[65, 90]]],
                 )
-            ]
+            ],
         }
     )
     fixture = PolicyObservationFixture(fixture_id="opening", observation=observation)
@@ -297,7 +295,7 @@ def test_only_first_runtime_frontier_is_validated_against_current_state() -> Non
                     actor_scopes=["Builder/Probe-1"],
                     argument_candidates=[[[65, 90]]],
                 )
-            ]
+            ],
         }
     )
     fixture = PolicyObservationFixture(fixture_id="future", observation=observation)
@@ -334,7 +332,7 @@ def test_mapper_skips_deferred_step_to_earliest_legal_runtime_frontier() -> None
                     actor_scopes=["Builder/Probe-1"],
                     argument_candidates=[[[65, 90]]],
                 )
-            ]
+            ],
         }
     )
     fixture = PolicyObservationFixture(

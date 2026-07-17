@@ -173,9 +173,7 @@ def test_playbook_does_not_promote_bridge_failure_as_strategy(tmp_path: Path) ->
     assert failed.quality is DecisionQuality.EXECUTION_ERROR
     assert all(lesson.recommended_action != "BUILD NEXUS" for lesson in lessons)
     guard = next(
-        lesson
-        for lesson in lessons
-        if lesson.rule_kind is PlaybookRuleKind.EXECUTION_GUARD
+        lesson for lesson in lessons if lesson.rule_kind is PlaybookRuleKind.EXECUTION_GUARD
     )
     assert guard.status is LessonStatus.PROMOTED
     assert guard.avoid_action is None

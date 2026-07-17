@@ -271,8 +271,7 @@ class HIMALivePolicyClient:
             or health.vocabulary_version != HIMA_VOCABULARY_VERSION
         ):
             raise HIMALiveProtocolError(
-                "HIMA health adapter/parser/vocabulary versions do not match "
-                "this Runtime"
+                "HIMA health adapter/parser/vocabulary versions do not match this Runtime"
             )
         if self._expected_model_id is not None:
             expected_revision = HIMA_PINNED_REVISIONS[self._expected_model_id]

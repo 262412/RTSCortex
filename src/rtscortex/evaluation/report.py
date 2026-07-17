@@ -934,9 +934,7 @@ def _render_cortex_event(event: StoredEvent) -> list[str]:
         intent_id = _payload_text(payload, "intent_id") or _payload_text(intent, "intent_id")
         role = _payload_text(
             payload, "role", "source_role", "intent_kind", "source"
-        ) or _payload_text(
-            intent, "role", "source_role", "intent_kind", "source"
-        )
+        ) or _payload_text(intent, "role", "source_role", "intent_kind", "source")
         intent_action = _payload_text(payload, "action_name", "action") or _payload_text(
             intent, "action_name", "action"
         )
@@ -970,14 +968,10 @@ def _render_cortex_event(event: StoredEvent) -> list[str]:
         choice = f"selected {_code(selected)}" if selected else "abstained"
         fallback = _payload_text(payload, "fallback_reason")
         suffix = f"; fallback {_inline(fallback)}" if fallback else ""
-        return [
-            f"- Event {event_id} · Executor {_code(executor)} {choice} in {latency}{suffix}."
-        ]
+        return [f"- Event {event_id} · Executor {_code(executor)} {choice} in {latency}{suffix}."]
     if event.event_type == "command_lineage":
         lineage = _nested_payload(payload, "lineage")
-        command_id = _payload_text(payload, "command_id") or _payload_text(
-            lineage, "command_id"
-        )
+        command_id = _payload_text(payload, "command_id") or _payload_text(lineage, "command_id")
         intent_id = _payload_text(payload, "intent_id") or _payload_text(lineage, "intent_id")
         candidate_id = _payload_text(payload, "candidate_id") or _payload_text(
             lineage, "candidate_id"

@@ -61,12 +61,7 @@ class DeterministicSituationAnalyzer:
             readiness = ArmyReadiness.FORMING
         else:
             readiness = ArmyReadiness.EMPTY
-        threats = sorted(
-            {
-                enemy.unit_type
-                for enemy in enemies
-            }
-        )
+        threats = sorted({enemy.unit_type for enemy in enemies})
         information_gaps = [] if enemies else ["enemy_force_not_visible"]
         identity = "|".join(
             (

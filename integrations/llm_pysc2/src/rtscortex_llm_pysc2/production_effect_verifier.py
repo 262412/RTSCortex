@@ -276,8 +276,7 @@ class ProductionEffectVerifier:
                     if int(_value(unit, "alliance", 0)) == 1
                     and self._unit_name(unit) == pending.spec.unit_type
                     and int(_value(unit, "tag", 0)) > 0
-                )
-                ,
+                ),
                 key=lambda item: item.tag,
             )
         )
@@ -382,14 +381,12 @@ def _unit_orders(unit: Any) -> tuple[int, ...]:
     explicit = _value(unit, "orders", None)
     if explicit is not None:
         values = (
-            int(_value(order, "ability_id", _value(order, "order_id", order)))
-            for order in explicit
+            int(_value(order, "ability_id", _value(order, "order_id", order))) for order in explicit
         )
         return tuple(_normalized_order_id(value) for value in values)
     count = min(max(int(_value(unit, "order_length", 0)), 0), 4)
     return tuple(
-        _normalized_order_id(int(_value(unit, f"order_id_{index}", 0)))
-        for index in range(count)
+        _normalized_order_id(int(_value(unit, f"order_id_{index}", 0))) for index in range(count)
     )
 
 

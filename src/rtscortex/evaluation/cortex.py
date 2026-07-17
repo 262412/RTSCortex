@@ -97,10 +97,7 @@ def compute_cortex_observability(
     for event in cortex_events:
         payload = _object(event.payload)
         if event.event_type == "intent_emitted":
-            role = (
-                _text(payload, "role", "source_role", "intent_kind", "source")
-                or "unknown"
-            )
+            role = _text(payload, "role", "source_role", "intent_kind", "source") or "unknown"
             intent_counts[role] += 1
             intent_id = _text(payload, "intent_id")
             if intent_id is not None:
@@ -110,9 +107,7 @@ def compute_cortex_observability(
                 else:
                     emitted_intent_roles[intent_id] = role
         elif event.event_type == "macro_plan_accepted":
-            plan_id = _text(payload, "plan_id") or _text(
-                _object(payload.get("plan")), "plan_id"
-            )
+            plan_id = _text(payload, "plan_id") or _text(_object(payload.get("plan")), "plan_id")
             if plan_id is not None:
                 accepted_macro_plans[plan_id] += 1
                 if accepted_macro_plans[plan_id] > 1:
@@ -123,9 +118,7 @@ def compute_cortex_observability(
                 if intent_id in candidate_set_intents:
                     pipeline_identity_violations += 1
                 candidate_set_intents.add(intent_id)
-                candidate_domains.setdefault(intent_id, set()).update(
-                    _candidate_ids(payload)
-                )
+                candidate_domains.setdefault(intent_id, set()).update(_candidate_ids(payload))
         elif event.event_type == "executor_selection":
             executor = _text(payload, "executor_id", "executor", "model") or "unknown"
             executors[executor] += 1
@@ -205,9 +198,7 @@ def compute_cortex_observability(
             valid_lineage_counts[command_id] += 1
         else:
             lineage_integrity_violations += 1
-    duplicate_lineage_commands = sum(
-        count - 1 for count in lineage_counts.values() if count > 1
-    )
+    duplicate_lineage_commands = sum(count - 1 for count in lineage_counts.values() if count > 1)
     lineage_integrity_violations += duplicate_lineage_commands
     valid_lineages = {
         command_id

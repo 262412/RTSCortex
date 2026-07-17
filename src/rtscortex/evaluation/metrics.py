@@ -217,14 +217,10 @@ class EpisodeMetrics:
                 "production_effect_confirmed_rate": (
                     self.execution.production_effect_confirmed_rate
                 ),
-                "production_provenance_coverage": (
-                    self.execution.production_provenance_coverage
-                ),
+                "production_provenance_coverage": (self.execution.production_provenance_coverage),
                 "production_effect_timeouts": self.execution.production_effect_timeouts,
                 "production_timeout_rate": self.execution.production_timeout_rate,
-                "production_metrics_applicable": (
-                    self.execution.production_metrics_applicable
-                ),
+                "production_metrics_applicable": (self.execution.production_metrics_applicable),
                 "production_by_action": self.execution.production_by_action,
                 "production_by_producer": self.execution.production_by_producer,
                 "confirmation_latency_game_loops_p50": (
@@ -322,8 +318,7 @@ def compute_episode_metrics(
     planner_latencies = [
         float(event.payload["latency_ms"])
         for event in events
-        if event.event_type
-        in {"planner_cycle", "macro_plan_accepted", "macro_plan_rejected"}
+        if event.event_type in {"planner_cycle", "macro_plan_accepted", "macro_plan_rejected"}
         and "latency_ms" in event.payload
     ]
     reflex_latencies = [
@@ -340,10 +335,7 @@ def compute_episode_metrics(
     model_events = [
         event
         for event in events
-        if (
-            event.event_type == "module_result"
-            and event.payload.get("model_call") is True
-        )
+        if (event.event_type == "module_result" and event.payload.get("model_call") is True)
         or event.event_type in {"macro_plan_accepted", "macro_plan_rejected"}
     ]
     prompt_tokens = sum(_usage_value(event, "prompt_tokens") for event in model_events)
@@ -356,9 +348,7 @@ def compute_episode_metrics(
 
     reflex_preemptions = sum(len(event.payload.get("preemptions", [])) for event in decisions)
     plan_events = [
-        event
-        for event in events
-        if event.event_type in {"plan_accepted", "macro_plan_accepted"}
+        event for event in events if event.event_type in {"plan_accepted", "macro_plan_accepted"}
     ]
     plan_revisions = sum(event.payload.get("is_revision") is True for event in plan_events)
     revision_opportunities = max(0, len(plan_events) - 1)
@@ -419,9 +409,7 @@ def compute_episode_metrics(
             tick_latency_ms=tuple(tick_latencies),
             plan_age_game_loops=tuple(plan_ages),
             plan_accept_gap_game_loops=tuple(plan_accept_gaps),
-            confirmation_latency_game_loops=tuple(
-                _production_confirmation_latencies(events)
-            ),
+            confirmation_latency_game_loops=tuple(_production_confirmation_latencies(events)),
         ),
     )
 
@@ -442,9 +430,7 @@ def aggregate_episode_metrics(metrics: list[EpisodeMetrics]) -> dict[str, Any]:
         value for item in metrics for value in item.samples.plan_accept_gap_game_loops
     ]
     confirmation_latencies = [
-        value
-        for item in metrics
-        for value in item.samples.confirmation_latency_game_loops
+        value for item in metrics for value in item.samples.confirmation_latency_game_loops
     ]
     failure_reasons: dict[str, int] = {}
     for item in metrics:
@@ -481,15 +467,9 @@ def aggregate_episode_metrics(metrics: list[EpisodeMetrics]) -> dict[str, Any]:
     build_pre_dispatch_rejections = sum(
         item.execution.build_pre_dispatch_rejections for item in metrics
     )
-    production_funnel = _merge_counts(
-        [item.execution.production_funnel for item in metrics]
-    )
-    production_effect_timeouts = sum(
-        item.execution.production_effect_timeouts for item in metrics
-    )
-    production_by_action = _merge_counts(
-        [item.execution.production_by_action for item in metrics]
-    )
+    production_funnel = _merge_counts([item.execution.production_funnel for item in metrics])
+    production_effect_timeouts = sum(item.execution.production_effect_timeouts for item in metrics)
+    production_by_action = _merge_counts([item.execution.production_by_action for item in metrics])
     production_by_producer = _merge_counts(
         [item.execution.production_by_producer for item in metrics]
     )
@@ -598,12 +578,8 @@ def aggregate_episode_metrics(metrics: list[EpisodeMetrics]) -> dict[str, Any]:
         ),
         "production_by_action": production_by_action,
         "production_by_producer": production_by_producer,
-        "confirmation_latency_game_loops_p50": _percentile(
-            confirmation_latencies, 0.50
-        ),
-        "confirmation_latency_game_loops_p95": _percentile(
-            confirmation_latencies, 0.95
-        ),
+        "confirmation_latency_game_loops_p50": _percentile(confirmation_latencies, 0.50),
+        "confirmation_latency_game_loops_p95": _percentile(confirmation_latencies, 0.95),
         "confirmation_latency_game_loops_samples": len(confirmation_latencies),
         "planner_module_results": planner_module_results,
         "planner_proposal_audited_results": planner_proposal_audited_results,
@@ -859,18 +835,19 @@ def compute_execution_metrics(events: list[StoredEvent]) -> ExecutionMetrics:
             ):
                 production_translator_accepted_ids.add(command_id)
             final_translator_accepted = (
-                final_translator is not None
-                and final_translator.get("accepted") is True
+                final_translator is not None and final_translator.get("accepted") is True
             )
             if (
-                stage == "effect_verification"
-                and (final_translator is None or final_translator_accepted)
-            ) or (
-                stage == "episode_end" and final_translator_accepted
-            ) or (
-                stage == "pysc2_acceptance"
-                and status == "succeeded"
-                and (final_translator is None or final_translator_accepted)
+                (
+                    stage == "effect_verification"
+                    and (final_translator is None or final_translator_accepted)
+                )
+                or (stage == "episode_end" and final_translator_accepted)
+                or (
+                    stage == "pysc2_acceptance"
+                    and status == "succeeded"
+                    and (final_translator is None or final_translator_accepted)
+                )
             ):
                 production_pysc2_accepted_ids.add(command_id)
 
@@ -918,8 +895,7 @@ def compute_execution_metrics(events: list[StoredEvent]) -> ExecutionMetrics:
                 "no_production_order_observed",
                 "production_order_replaced",
             } or (
-                _is_train_action(action_name)
-                and code in {"effect_timeout", "target_not_created"}
+                _is_train_action(action_name) and code in {"effect_timeout", "target_not_created"}
             ):
                 production_effect_timeout_ids.add(command_id)
 
@@ -1069,9 +1045,7 @@ def compute_execution_metrics(events: list[StoredEvent]) -> ExecutionMetrics:
             "pysc2_accepted": len(production_pysc2_accepted_ids),
             "order_confirmed": len(production_order_confirmed_ids),
             "unit_fallback_confirmed": len(production_unit_confirmed_ids),
-            "effect_confirmed": len(
-                production_order_confirmed_ids | production_unit_confirmed_ids
-            ),
+            "effect_confirmed": len(production_order_confirmed_ids | production_unit_confirmed_ids),
             "acceptance_only": len(production_acceptance_only_ids),
         },
         production_effect_confirmed_rate=(
@@ -1097,9 +1071,7 @@ def compute_execution_metrics(events: list[StoredEvent]) -> ExecutionMetrics:
         ),
         production_metrics_applicable=(production_report_protocols == {"1.1"}),
         production_by_action=_counts_from_values(production_action_by_command.values()),
-        production_by_producer=_counts_from_values(
-            production_producer_by_command.values()
-        ),
+        production_by_producer=_counts_from_values(production_producer_by_command.values()),
         confirmation_latency_game_loops_p50=_percentile(
             list(production_confirmation_latencies.values()),
             0.50,
@@ -1108,9 +1080,7 @@ def compute_execution_metrics(events: list[StoredEvent]) -> ExecutionMetrics:
             list(production_confirmation_latencies.values()),
             0.95,
         ),
-        confirmation_latency_game_loops_samples=len(
-            production_confirmation_latencies
-        ),
+        confirmation_latency_game_loops_samples=len(production_confirmation_latencies),
         planner_module_results=proposal_audit.module_results,
         planner_proposal_audited_results=proposal_audit.audited_results,
         planner_proposal_audit_complete=(

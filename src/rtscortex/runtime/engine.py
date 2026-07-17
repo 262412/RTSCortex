@@ -127,9 +127,9 @@ _ALLOWED_COMMAND_TRANSITIONS = {
     },
 }
 
-_PROGRESS_ACTION_NAMES = frozenset(
-    action.name for action in PROTOSS_SIMPLE64_ACTION_SPECS
-)
+_PROGRESS_ACTION_NAMES = frozenset(action.name for action in PROTOSS_SIMPLE64_ACTION_SPECS)
+
+
 class RuntimeEngine:
     """Run a non-blocking strategic planner alongside a synchronous reflex path."""
 
@@ -605,9 +605,7 @@ class RuntimeEngine:
         )
         action = await self._run_module(self.action_module, action_context)
         measurable_actions = [
-            command.name
-            for command in action.commands
-            if command.name in _PROGRESS_ACTION_NAMES
+            command.name for command in action.commands if command.name in _PROGRESS_ACTION_NAMES
         ]
         goal_spec = (
             self.goal_progress_verifier.goal_from_action_names(
@@ -877,11 +875,7 @@ class RuntimeEngine:
             goal_spec=(
                 plan.goal_spec
                 if plan.goal_spec is not None
-                else (
-                    None
-                    if self._cached_plan is None
-                    else self._cached_plan.goal_spec
-                )
+                else (None if self._cached_plan is None else self._cached_plan.goal_spec)
             ),
         )
         fingerprint = self._plan_fingerprint(accepted_plan)
@@ -942,9 +936,7 @@ class RuntimeEngine:
                 "summary": plan.summary,
                 "commands": semantic_commands,
                 "goal_spec": (
-                    None
-                    if plan.goal_spec is None
-                    else plan.goal_spec.model_dump(mode="json")
+                    None if plan.goal_spec is None else plan.goal_spec.model_dump(mode="json")
                 ),
             },
             ensure_ascii=False,

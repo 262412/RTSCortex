@@ -298,9 +298,7 @@ def _run_qwen_candidate(
         )
     experiment = load_config(config.qwen.experiment_config)
     if experiment.provider.kind != "openai_compatible":
-        raise PolicyComparisonError(
-            "Qwen comparison requires provider.kind=openai_compatible"
-        )
+        raise PolicyComparisonError("Qwen comparison requires provider.kind=openai_compatible")
     spec = QWEN3_8B_SPEC.model_copy(update={"model_id": experiment.provider.model})
     provider = OpenAICompatibleProvider(
         base_url=experiment.provider.base_url,
@@ -318,9 +316,7 @@ def _run_qwen_candidate(
                 [
                     PolicySubagentRegistration(
                         spec=spec,
-                        availability=PolicyAvailability(
-                            status=PolicyAvailabilityStatus.AVAILABLE
-                        ),
+                        availability=PolicyAvailability(status=PolicyAvailabilityStatus.AVAILABLE),
                         subagent=LLMPlanningPolicySubagent(provider, spec=spec),
                     )
                 ],
@@ -570,9 +566,7 @@ def _merge_candidate_comparisons(
                 raise PolicyComparisonError(f"duplicate candidate record: {key}")
             records_by_key[key] = record
     expected = {
-        (fixture_id, candidate_id)
-        for fixture_id in fixture_ids
-        for candidate_id in candidate_ids
+        (fixture_id, candidate_id) for fixture_id in fixture_ids for candidate_id in candidate_ids
     }
     if set(records_by_key) != expected:
         raise PolicyComparisonError("candidate comparison response is incomplete")
@@ -595,11 +589,7 @@ def _write_candidate_artifacts(result: _CandidateResult, root: Path) -> None:
     candidate_id = comparison.candidate_ids[0]
     candidate_dir = root / candidate_id
     candidate_dir.mkdir(parents=True, exist_ok=False)
-    records = [
-        record
-        for record in comparison.records
-        if record.spec.subagent_id == candidate_id
-    ]
+    records = [record for record in comparison.records if record.spec.subagent_id == candidate_id]
     records_path = candidate_dir / "records.jsonl"
     records_path.write_text(
         "".join(record.model_dump_json() + "\n" for record in records),
@@ -613,9 +603,7 @@ def _write_candidate_artifacts(result: _CandidateResult, root: Path) -> None:
         "spec": first.spec.model_dump(mode="json") if first is not None else None,
         "model_id": first.spec.model_id if first is not None else None,
         "provider_kind": first.spec.provider_kind.value if first is not None else None,
-        "availability": (
-            first.availability.model_dump(mode="json") if first is not None else None
-        ),
+        "availability": (first.availability.model_dump(mode="json") if first is not None else None),
         "execution_backend": result.execution_backend,
         "revision": result.revision,
         "license_acknowledged": result.license_acknowledged,

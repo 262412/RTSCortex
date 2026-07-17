@@ -61,9 +61,7 @@ class HIMAProposalParser:
             diagnostics.append(
                 ParseDiagnostic(
                     code="output_too_long",
-                    message=(
-                        "HIMA output exceeded the parser character limit and was truncated."
-                    ),
+                    message=("HIMA output exceeded the parser character limit and was truncated."),
                 )
             )
         if truncated:
@@ -102,9 +100,7 @@ class HIMAProposalParser:
                     diagnostics.append(
                         ParseDiagnostic(
                             code="unknown_action_token",
-                            message=(
-                                "Token is not in the pinned Protoss macro-action vocabulary."
-                            ),
+                            message=("Token is not in the pinned Protoss macro-action vocabulary."),
                             raw_token=raw_token,
                             ordinal=ordinal,
                             repeat=repeat,
@@ -210,8 +206,7 @@ def _scan_angle_sequence(
                     ParseDiagnostic(
                         code="invalid_repeat",
                         message=(
-                            f"A HIMA macro-action repeat must be between 1 and "
-                            f"{MAX_ACTION_REPEAT}."
+                            f"A HIMA macro-action repeat must be between 1 and {MAX_ACTION_REPEAT}."
                         ),
                         raw_token=raw_token,
                         ordinal=ordinal,
@@ -269,9 +264,7 @@ def _extract_action_list(
             diagnostics.append(
                 ParseDiagnostic(
                     code="action_limit_exceeded",
-                    message=(
-                        f"HIMA output contains more than {MAX_ACTION_ITEMS} action items."
-                    ),
+                    message=(f"HIMA output contains more than {MAX_ACTION_ITEMS} action items."),
                     ordinal=ordinal,
                 )
             )
@@ -306,9 +299,7 @@ def _extract_nonstandard_action_items(
             diagnostics.append(
                 ParseDiagnostic(
                     code="action_limit_exceeded",
-                    message=(
-                        f"HIMA output contains more than {MAX_ACTION_ITEMS} action items."
-                    ),
+                    message=(f"HIMA output contains more than {MAX_ACTION_ITEMS} action items."),
                     ordinal=ordinal,
                 )
             )
@@ -324,8 +315,7 @@ def _extract_nonstandard_action_items(
                 ParseDiagnostic(
                     code="invalid_repeat",
                     message=(
-                        f"A HIMA macro-action repeat must be between 1 and "
-                        f"{MAX_ACTION_REPEAT}."
+                        f"A HIMA macro-action repeat must be between 1 and {MAX_ACTION_REPEAT}."
                     ),
                     raw_token=raw_token,
                     ordinal=ordinal,

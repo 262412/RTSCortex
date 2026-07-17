@@ -62,14 +62,10 @@ _RESEARCH_IDS = {
     141: "DarkTemplarBlinkUpgrade",
 }
 _UNIT_ORDER = tuple(
-    action.upstream_name
-    for action in HIMA_PROTOSS_ACTIONS
-    if action.category in {"train", "build"}
+    action.upstream_name for action in HIMA_PROTOSS_ACTIONS if action.category in {"train", "build"}
 )
 _RESEARCH_ORDER = tuple(
-    action.upstream_name
-    for action in HIMA_PROTOSS_ACTIONS
-    if action.category == "research"
+    action.upstream_name for action in HIMA_PROTOSS_ACTIONS if action.category == "research"
 )
 
 
@@ -107,27 +103,20 @@ class HIMAObservationAdapter:
             if name is not None:
                 unit_counts[name] += 1
 
-        visible_units = {
-            name: unit_counts[name]
-            for name in _UNIT_ORDER
-            if unit_counts[name] > 0
-        }
+        visible_units = {name: unit_counts[name] for name in _UNIT_ORDER if unit_counts[name] > 0}
         completed_research = {
             name
             for raw_name in state.upgrades
             if (name := _normalize_research(raw_name)) is not None
         }
         previous_action = tuple(
-            _normalize_previous_action(raw_action)
-            for raw_action in context.previous_actions
+            _normalize_previous_action(raw_action) for raw_action in context.previous_actions
         )
         return HIMAObservationSnapshot(
             supply_used=state.economy.supply_used,
             supply_capacity=state.economy.supply_cap,
             unit=visible_units,
-            research=tuple(
-                name for name in _RESEARCH_ORDER if name in completed_research
-            ),
+            research=tuple(name for name in _RESEARCH_ORDER if name in completed_research),
             previous_action=previous_action,
         )
 
@@ -184,6 +173,4 @@ def _is_completed_structure(status: str | None) -> bool:
     if status is None:
         return True
     normalized = status.strip().lower().replace("-", "_").replace(" ", "_")
-    return normalized not in _INCOMPLETE_STATUSES and not normalized.startswith(
-        "constructing"
-    )
+    return normalized not in _INCOMPLETE_STATUSES and not normalized.startswith("constructing")

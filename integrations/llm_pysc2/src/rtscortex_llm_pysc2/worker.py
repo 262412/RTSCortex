@@ -69,12 +69,8 @@ class WorkerSettings:
     pause_until_first_plan: bool = False
     runtime_request_timeout_seconds: float = 60.0
     action_effect_timeout_game_loops: int = DEFAULT_ACTION_EFFECT_TIMEOUT_GAME_LOOPS
-    observation_gap_watchdog_game_loops: int = (
-        DEFAULT_OBSERVATION_GAP_WATCHDOG_GAME_LOOPS
-    )
-    observation_gap_hard_limit_game_loops: int = (
-        DEFAULT_OBSERVATION_GAP_HARD_LIMIT_GAME_LOOPS
-    )
+    observation_gap_watchdog_game_loops: int = DEFAULT_OBSERVATION_GAP_WATCHDOG_GAME_LOOPS
+    observation_gap_hard_limit_game_loops: int = DEFAULT_OBSERVATION_GAP_HARD_LIMIT_GAME_LOOPS
     console_enabled: bool = False
     console_frame_fps: float = 2.0
     console_jpeg_quality: int = 75
@@ -117,9 +113,7 @@ class WorkerSettings:
             )
         )
         if observation_gap_watchdog_game_loops <= 0:
-            raise RuntimeError(
-                "RTSCORTEX_OBSERVATION_GAP_WATCHDOG_GAME_LOOPS must be positive"
-            )
+            raise RuntimeError("RTSCORTEX_OBSERVATION_GAP_WATCHDOG_GAME_LOOPS must be positive")
         if observation_gap_hard_limit_game_loops <= observation_gap_watchdog_game_loops:
             raise RuntimeError(
                 "RTSCORTEX_OBSERVATION_GAP_HARD_LIMIT_GAME_LOOPS must exceed the watchdog threshold"
@@ -182,12 +176,8 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
         self._rtscortex_production_source_tag: Optional[int] = None
         self._rtscortex_production_camera_waits = 0
         self._rtscortex_camera_settlement_noop = False
-        self._rtscortex_rejected_build_positions: dict[
-            str, set[tuple[int, int]]
-        ] = {}
-        self._rtscortex_rejected_build_targets: dict[
-            str, set[tuple[float, float]]
-        ] = {}
+        self._rtscortex_rejected_build_positions: dict[str, set[tuple[int, int]]] = {}
+        self._rtscortex_rejected_build_targets: dict[str, set[tuple[float, float]]] = {}
         self._rtscortex_active_build_route: Optional[
             tuple[str, tuple[int, int], Optional[tuple[float, float]]]
         ] = None
@@ -241,9 +231,7 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
                             excluded_positions=rejected_positions,
                             force_resample=(
                                 target_key
-                                in self._rtscortex_rejected_build_targets.get(
-                                    action_name, set()
-                                )
+                                in self._rtscortex_rejected_build_targets.get(action_name, set())
                             ),
                         )
                     else:
@@ -265,13 +253,13 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
                 if is_screen_build:
                     requested = _screen_argument(action)
                     if requested is not None:
-                        self._rtscortex_rejected_build_positions.setdefault(
-                            action_name, set()
-                        ).add(_screen_position_key(requested))
+                        self._rtscortex_rejected_build_positions.setdefault(action_name, set()).add(
+                            _screen_position_key(requested)
+                        )
                     if provenance is not None:
-                        self._rtscortex_rejected_build_targets.setdefault(
-                            action_name, set()
-                        ).add(_build_world_target_key(provenance.world_target))
+                        self._rtscortex_rejected_build_targets.setdefault(action_name, set()).add(
+                            _build_world_target_key(provenance.world_target)
+                        )
                 predispatch_failure_code = (
                     "no_legal_placement" if is_screen_build else "candidate_invalidated"
                 )
@@ -524,9 +512,7 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
             self._rtscortex_production_camera_waits = 0
             return False
         self._rtscortex_production_camera_waits += 1
-        if self._rtscortex_production_camera_waits <= (
-            PRODUCTION_CAMERA_SETTLE_MAX_OBSERVATIONS
-        ):
+        if self._rtscortex_production_camera_waits <= (PRODUCTION_CAMERA_SETTLE_MAX_OBSERVATIONS):
             return True
         self._settle_production_command_failure(
             action_name,
@@ -1223,9 +1209,7 @@ def _prime_deterministic_gas_rebalance(
     }
     harvest_order_ids = {102, 103, 154, 356, 357, 358, 359, 360, 361, 362}
     nexus_info_dict = getattr(main_agent, "nexus_info_dict", {})
-    for _nexus_key, info in sorted(
-        nexus_info_dict.items(), key=lambda item: int(item[0])
-    ):
+    for _nexus_key, info in sorted(nexus_info_dict.items(), key=lambda item: int(item[0])):
         nexus = info.get("nexus")
         if nexus is None:
             continue
@@ -1246,9 +1230,7 @@ def _prime_deterministic_gas_rebalance(
                 return True
 
     choices: list[tuple[float, int, int, Any]] = []
-    for _nexus_key, info in sorted(
-        nexus_info_dict.items(), key=lambda item: int(item[0])
-    ):
+    for _nexus_key, info in sorted(nexus_info_dict.items(), key=lambda item: int(item[0])):
         nexus = info.get("nexus")
         if nexus is None:
             continue
@@ -1299,11 +1281,7 @@ def _reserved_builder_worker_tags(main_agent: Any) -> set[int]:
     if current is not None and int(current) > 0:
         tags.add(int(current))
     for attribute in ("unit_tag_list", "team_unit_tag_list"):
-        tags.update(
-            int(tag)
-            for tag in getattr(builder, attribute, ())
-            if int(tag) > 0
-        )
+        tags.update(int(tag) for tag in getattr(builder, attribute, ()) if int(tag) > 0)
     for team in getattr(builder, "teams", ()):
         if not isinstance(team, Mapping):
             continue
@@ -1314,9 +1292,7 @@ def _reserved_builder_worker_tags(main_agent: Any) -> set[int]:
 def _release_runtime_observation_barrier(main_agent: Any) -> None:
     """Let current raw state reach Runtime when optional team selection stalls."""
 
-    disappeared = {
-        int(tag) for tag in getattr(main_agent, "unit_uid_disappear", ())
-    }
+    disappeared = {int(tag) for tag in getattr(main_agent, "unit_uid_disappear", ())}
     agents = getattr(main_agent, "agents", {})
     if not isinstance(agents, Mapping):
         return
@@ -1330,18 +1306,10 @@ def _release_runtime_observation_barrier(main_agent: Any) -> None:
             if not isinstance(team, Mapping):
                 continue
             live_tags = [
-                int(tag)
-                for tag in team.get("unit_tags", ())
-                if int(tag) not in disappeared
+                int(tag) for tag in team.get("unit_tags", ()) if int(tag) not in disappeared
             ]
-            required_tags = (
-                live_tags
-                if team.get("select_type") == "select"
-                else live_tags[:1]
-            )
-            observed_tags.extend(
-                tag for tag in required_tags if tag not in observed_tags
-            )
+            required_tags = live_tags if team.get("select_type") == "select" else live_tags[:1]
+            observed_tags.extend(tag for tag in required_tags if tag not in observed_tags)
 
 
 def _translated_build_position(
@@ -1400,9 +1368,7 @@ def _production_source_invalid_reason(
         (
             unit
             for unit in raw_units
-            if int(
-                unit.get("tag", -1) if isinstance(unit, Mapping) else getattr(unit, "tag", -1)
-            )
+            if int(unit.get("tag", -1) if isinstance(unit, Mapping) else getattr(unit, "tag", -1))
             == source_tag
         ),
         None,
@@ -1451,9 +1417,7 @@ def _producer_is_visible(
     for unit in feature_units:
         tag = unit.get("tag", 0) if isinstance(unit, Mapping) else getattr(unit, "tag", 0)
         alliance = (
-            unit.get("alliance", 0)
-            if isinstance(unit, Mapping)
-            else getattr(unit, "alliance", 0)
+            unit.get("alliance", 0) if isinstance(unit, Mapping) else getattr(unit, "alliance", 0)
         )
         is_on_screen = (
             unit.get("is_on_screen", True)

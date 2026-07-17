@@ -99,9 +99,7 @@ def test_report_uses_global_counts_and_excludes_unsupported_from_illegal_rate() 
     sequence_effective = cast(dict[str, object], sequence["effective"])
     runtime_logical = cast(dict[str, object], runtime["logical"])
     runtime_effective = cast(dict[str, object], runtime["effective"])
-    assert cast(dict[str, object], sequence_logical["counts"])[
-        "unsupported_by_runtime"
-    ] == 2
+    assert cast(dict[str, object], sequence_logical["counts"])["unsupported_by_runtime"] == 2
     assert sequence_logical["total"] == 2
     assert sequence_effective["total"] == 6
     assert runtime_logical["runtime_outcome_conserved"] is True
@@ -119,18 +117,14 @@ def test_report_uses_global_counts_and_excludes_unsupported_from_illegal_rate() 
     early = cast(dict[str, object], by_stratum["early"])
     early_parser = cast(dict[str, object], early["parser"])
     early_mapping = cast(dict[str, object], early["mapping"])
-    assert cast(dict[str, object], early_parser["logical"])[
-        "parse_validity"
-    ] == pytest.approx(3 / 4)
-    assert cast(dict[str, object], early_parser["effective"])[
-        "parse_validity"
-    ] == pytest.approx(9 / 10)
-    assert cast(dict[str, object], early_mapping["logical"])[
-        "coverage"
-    ] == pytest.approx(2 / 3)
-    assert cast(dict[str, object], early_mapping["effective"])[
-        "coverage"
-    ] == pytest.approx(5 / 9)
+    assert cast(dict[str, object], early_parser["logical"])["parse_validity"] == pytest.approx(
+        3 / 4
+    )
+    assert cast(dict[str, object], early_parser["effective"])["parse_validity"] == pytest.approx(
+        9 / 10
+    )
+    assert cast(dict[str, object], early_mapping["logical"])["coverage"] == pytest.approx(2 / 3)
+    assert cast(dict[str, object], early_mapping["effective"])["coverage"] == pytest.approx(5 / 9)
     assert cast(dict[str, object], early["latency_ms"])["p95"] == 10.0
 
     for stratum in (
@@ -212,10 +206,7 @@ def test_native_only_v01_style_records_report_macro_metrics_as_not_applicable() 
     assert parser["parse_validity"] is None
     assert parser["classification_conserved"] is True
     report = render_policy_comparison_report(comparison)
-    assert (
-        "| `qwen3-8b-current` | `logical` | N/A | N/A | N/A | N/A | N/A | N/A | N/A |"
-        in report
-    )
+    assert "| `qwen3-8b-current` | `logical` | N/A | N/A | N/A | N/A | N/A | N/A | N/A |" in report
     assert "Native-only v0.1 records show `N/A`" in report
 
 

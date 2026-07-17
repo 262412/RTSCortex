@@ -63,13 +63,7 @@ def test_executor_corpus_builds_minimized_episode_isolated_samples(tmp_path: Pat
         )
         for sample in samples
     )
-    assert len(
-        {
-            sample.split
-            for sample in samples
-            if sample.episode_id == "episode-selected"
-        }
-    ) == 1
+    assert len({sample.split for sample in samples if sample.episode_id == "episode-selected"}) == 1
 
     selected = next(sample for sample in samples if sample.label.selected_candidate_id)
     assert selected.command_id is not None
@@ -145,9 +139,7 @@ def test_corpus_local_ids_depend_only_on_the_safe_projection(tmp_path: Path) -> 
     for episode_id, first_sample in first_samples.items():
         second_sample = second_samples[episode_id]
         assert first_sample.sample_id == second_sample.sample_id
-        assert first_sample.observation_fingerprint == (
-            second_sample.observation_fingerprint
-        )
+        assert first_sample.observation_fingerprint == (second_sample.observation_fingerprint)
         assert first_sample.intent_id == second_sample.intent_id
         assert [candidate.candidate_id for candidate in first_sample.candidates] == [
             candidate.candidate_id for candidate in second_sample.candidates
@@ -158,24 +150,17 @@ def test_corpus_local_ids_depend_only_on_the_safe_projection(tmp_path: Path) -> 
         )
         assert first_sample.command_id == second_sample.command_id
 
-    assert _raw_runtime_identifiers(first_journal) != _raw_runtime_identifiers(
-        second_journal
-    )
+    assert _raw_runtime_identifiers(first_journal) != _raw_runtime_identifiers(second_journal)
 
 
 def test_source_verification_checks_safe_payload_changes(tmp_path: Path) -> None:
     journal = _write_cortex_journal(tmp_path)
     result = build_executor_corpus([journal], tmp_path / "corpus")
     records = [json.loads(line) for line in journal.read_text().splitlines()]
-    observation = next(
-        record for record in records if record["event_type"] == "observation"
-    )
+    observation = next(record for record in records if record["event_type"] == "observation")
     observation["payload"]["state"]["economy"]["minerals"] += 1
     journal.write_text(
-        "".join(
-            json.dumps(record, ensure_ascii=True, sort_keys=True) + "\n"
-            for record in records
-        ),
+        "".join(json.dumps(record, ensure_ascii=True, sort_keys=True) + "\n" for record in records),
         encoding="utf-8",
     )
 
@@ -193,8 +178,7 @@ def test_executor_corpus_rejects_nested_pipeline_identity_mismatch(
     intent = next(
         record
         for record in records
-        if record["event_type"] == "intent_emitted"
-        and record["episode_id"] == "episode-selected"
+        if record["event_type"] == "intent_emitted" and record["episode_id"] == "episode-selected"
     )
     intent["payload"]["intent"]["intent_id"] = "intent-tampered"
     _write_jsonl_records(journal, records)
@@ -213,8 +197,7 @@ def test_executor_corpus_rejects_observation_wrapper_identity_mismatch(
     observation = next(
         record
         for record in records
-        if record["event_type"] == "observation"
-        and record["episode_id"] == "episode-selected"
+        if record["event_type"] == "observation" and record["episode_id"] == "episode-selected"
     )
     observation["payload"]["run_id"] = "stale-run-id"
     _write_jsonl_records(journal, records)
@@ -233,8 +216,7 @@ def test_executor_corpus_rejects_execution_action_identity_mismatch(
     execution = next(
         record
         for record in records
-        if record["event_type"] == "execution"
-        and record["episode_id"] == "episode-selected"
+        if record["event_type"] == "execution" and record["episode_id"] == "episode-selected"
     )
     execution["payload"]["action_name"] = "Train_Oracle"
     _write_jsonl_records(journal, records)
@@ -367,9 +349,7 @@ def test_saved_policy_preserves_live_compile_order_for_tied_candidate_ranks(
     samples = load_executor_corpus(result.manifest_path)
 
     assert len(samples) == 1
-    assert [
-        candidate.features.compile_ordinal for candidate in samples[0].candidates
-    ] == [0, 1]
+    assert [candidate.features.compile_ordinal for candidate in samples[0].candidates] == [0, 1]
     assert samples[0].label.selected_candidate_id == samples[0].candidates[0].candidate_id
 
     benchmark = benchmark_executor_corpus(
@@ -458,10 +438,7 @@ def _write_cortex_journal(tmp_path: Path, *, enemy_tag: str = "0x1") -> Path:
 
 def _write_jsonl_records(path: Path, records: list[dict[str, object]]) -> None:
     path.write_text(
-        "".join(
-            json.dumps(record, ensure_ascii=True, sort_keys=True) + "\n"
-            for record in records
-        ),
+        "".join(json.dumps(record, ensure_ascii=True, sort_keys=True) + "\n" for record in records),
         encoding="utf-8",
     )
 
@@ -485,9 +462,7 @@ def _write_selection(
         include_enemy=include_enemy,
     )
     if include_enemy and enemy_tag != "0x1":
-        enemy = observation.state.visible_enemies[0].model_copy(
-            update={"unit_id": enemy_tag}
-        )
+        enemy = observation.state.visible_enemies[0].model_copy(update={"unit_id": enemy_tag})
         state = observation.state.model_copy(update={"visible_enemies": [enemy]})
         attack = observation.available_actions[0].model_copy(
             update={"argument_candidates": [[enemy_tag]]}
@@ -534,8 +509,8 @@ def _write_selection(
         macro_plan_id=f"plan-{episode_id.removeprefix('episode-')}",
     )
     context = CandidateCompiler().compile(observation, intent)
-    selection = DeterministicCandidateExecutor().select(context).model_copy(
-        update={"latency_ms": 0.25}
+    selection = (
+        DeterministicCandidateExecutor().select(context).model_copy(update={"latency_ms": 0.25})
     )
     store.append_event(
         run_id=observation.run_id,

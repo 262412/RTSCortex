@@ -487,8 +487,7 @@ def policy_corpus_build(
             {
                 "fixture_count": result.manifest.fixture_count,
                 "stratum_counts": {
-                    key.value: value
-                    for key, value in result.manifest.stratum_counts.items()
+                    key.value: value for key, value in result.manifest.stratum_counts.items()
                 },
                 "seeds": result.manifest.seeds,
             },
@@ -510,9 +509,7 @@ def executor_corpus_build(
         ),
     ],
     output_dir: Annotated[Path, typer.Option("--output-dir", file_okay=False)],
-    split_seed: Annotated[str, typer.Option("--split-seed")] = (
-        "rtscortex-fast-executor-v0.1"
-    ),
+    split_seed: Annotated[str, typer.Option("--split-seed")] = ("rtscortex-fast-executor-v0.1"),
 ) -> None:
     """Export labeled executor selections without RGB, prompts, tags, or coordinates."""
 

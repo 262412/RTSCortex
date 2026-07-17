@@ -128,9 +128,7 @@ def test_macro_record_rejects_nonconserved_logical_and_effective_counts() -> Non
         "step_id": fixture.observation.step_id,
         "game_loop": fixture.observation.game_loop,
         "spec": QWEN3_8B_SPEC,
-        "availability": PolicyAvailability(
-            status=PolicyAvailabilityStatus.AVAILABLE
-        ),
+        "availability": PolicyAvailability(status=PolicyAvailabilityStatus.AVAILABLE),
         "status": PolicyShadowStatus.COMPLETED,
         "proposal": proposal,
         "discovered_macro_step_count": 1,

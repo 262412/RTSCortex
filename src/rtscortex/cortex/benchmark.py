@@ -94,12 +94,8 @@ def benchmark_executor_corpus(
 
     if repetitions < 1:
         raise ValueError("repetitions must be positive")
-    manifest = ExecutorCorpusManifest.model_validate_json(
-        manifest_path.read_text(encoding="utf-8")
-    )
-    selected_split: ExecutorSplit | None = (
-        None if split == "all" else ExecutorSplit(split)
-    )
+    manifest = ExecutorCorpusManifest.model_validate_json(manifest_path.read_text(encoding="utf-8"))
+    selected_split: ExecutorSplit | None = None if split == "all" else ExecutorSplit(split)
     samples = load_executor_corpus(manifest_path, split=selected_split)
     if not samples:
         raise ValueError(f"executor benchmark split {split!s} contains no samples")
@@ -152,9 +148,7 @@ def benchmark_executor_corpus(
         measured_calls=len(latencies),
         agreement_count=selected_agreement,
         disagreement_count=selected_disagreement,
-        agreement_rate=(
-            selected_agreement / selected_labels if selected_labels else 0.0
-        ),
+        agreement_rate=(selected_agreement / selected_labels if selected_labels else 0.0),
         overall_agreement_count=overall_agreement,
         overall_disagreement_count=sample_count - overall_agreement,
         overall_agreement_rate=overall_agreement / sample_count,

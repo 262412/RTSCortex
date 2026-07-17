@@ -54,9 +54,7 @@ HIMA_RUNTIME_MAPPINGS: tuple[HIMAMacroMapping, ...] = (
 )
 
 _MAPPINGS_BY_MACRO = {mapping.macro_action: mapping for mapping in HIMA_RUNTIME_MAPPINGS}
-_PROGRESS_SPECS_BY_ACTION = {
-    spec.name: spec for spec in PROTOSS_SIMPLE64_ACTION_SPECS
-}
+_PROGRESS_SPECS_BY_ACTION = {spec.name: spec for spec in PROTOSS_SIMPLE64_ACTION_SPECS}
 _STEP_PARSE_ERROR_CODES = frozenset(
     {
         "action_limit_exceeded",
@@ -97,9 +95,7 @@ class HIMAMacroActionMapper:
         ]
         logical_ordinals = [step.ordinal for step in proposal.steps]
         logical_ordinals.extend(
-            diagnostic.ordinal
-            for diagnostic in parse_errors
-            if diagnostic.ordinal is not None
+            diagnostic.ordinal for diagnostic in parse_errors if diagnostic.ordinal is not None
         )
         logical_frontier_ordinal = min(logical_ordinals, default=None)
         probes: dict[int, _FrontierProbe] = {}
@@ -285,10 +281,7 @@ def _hard_state_blocker(
         return None
     state = fixture.observation.state
     for prerequisite in spec.prerequisites:
-        if (
-            _completed_count(state, prerequisite.kind, prerequisite.target)
-            >= prerequisite.count
-        ):
+        if _completed_count(state, prerequisite.kind, prerequisite.target) >= prerequisite.count:
             continue
         suffix = _reason_code(prerequisite.target)
         if _in_progress_count(state, prerequisite.kind, prerequisite.target) > 0:
@@ -360,8 +353,7 @@ def _candidate_commands(
     return [
         ActionCommand(
             command_id=(
-                f"shadow:hima:{fixture.fixture_id}:{step.ordinal}:"
-                f"{actor_index}:{candidate_index}"
+                f"shadow:hima:{fixture.fixture_id}:{step.ordinal}:{actor_index}:{candidate_index}"
             ),
             actor=actor,
             name=runtime_action,

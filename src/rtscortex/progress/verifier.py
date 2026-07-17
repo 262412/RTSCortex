@@ -49,18 +49,14 @@ PROTOSS_SIMPLE64_ACTION_SPECS: tuple[ProgressActionSpec, ...] = (
         GoalRequirementKind.STRUCTURE,
         "Gateway",
         minerals=150,
-        prerequisites=(
-            StatePrerequisite(GoalRequirementKind.STRUCTURE, "Pylon"),
-        ),
+        prerequisites=(StatePrerequisite(GoalRequirementKind.STRUCTURE, "Pylon"),),
     ),
     ProgressActionSpec(
         "Build_Forge_Screen",
         GoalRequirementKind.STRUCTURE,
         "Forge",
         minerals=150,
-        prerequisites=(
-            StatePrerequisite(GoalRequirementKind.STRUCTURE, "Pylon"),
-        ),
+        prerequisites=(StatePrerequisite(GoalRequirementKind.STRUCTURE, "Pylon"),),
     ),
     ProgressActionSpec(
         "Build_CyberneticsCore_Screen",
@@ -77,9 +73,7 @@ PROTOSS_SIMPLE64_ACTION_SPECS: tuple[ProgressActionSpec, ...] = (
         GoalRequirementKind.STRUCTURE,
         "Assimilator",
         minerals=75,
-        prerequisites=(
-            StatePrerequisite(GoalRequirementKind.STRUCTURE, "Nexus"),
-        ),
+        prerequisites=(StatePrerequisite(GoalRequirementKind.STRUCTURE, "Nexus"),),
     ),
     ProgressActionSpec(
         "Build_Nexus_Near",
@@ -93,18 +87,14 @@ PROTOSS_SIMPLE64_ACTION_SPECS: tuple[ProgressActionSpec, ...] = (
         "Stargate",
         minerals=150,
         vespene=150,
-        prerequisites=(
-            StatePrerequisite(GoalRequirementKind.STRUCTURE, "CyberneticsCore"),
-        ),
+        prerequisites=(StatePrerequisite(GoalRequirementKind.STRUCTURE, "CyberneticsCore"),),
     ),
     ProgressActionSpec(
         "Build_ShieldBattery_Screen",
         GoalRequirementKind.STRUCTURE,
         "ShieldBattery",
         minerals=100,
-        prerequisites=(
-            StatePrerequisite(GoalRequirementKind.STRUCTURE, "CyberneticsCore"),
-        ),
+        prerequisites=(StatePrerequisite(GoalRequirementKind.STRUCTURE, "CyberneticsCore"),),
     ),
     ProgressActionSpec(
         "Train_Probe",
@@ -112,9 +102,7 @@ PROTOSS_SIMPLE64_ACTION_SPECS: tuple[ProgressActionSpec, ...] = (
         "Probe",
         minerals=50,
         supply=1,
-        prerequisites=(
-            StatePrerequisite(GoalRequirementKind.STRUCTURE, "Nexus"),
-        ),
+        prerequisites=(StatePrerequisite(GoalRequirementKind.STRUCTURE, "Nexus"),),
     ),
     ProgressActionSpec(
         "Train_Zealot",
@@ -122,9 +110,7 @@ PROTOSS_SIMPLE64_ACTION_SPECS: tuple[ProgressActionSpec, ...] = (
         "Zealot",
         minerals=100,
         supply=2,
-        prerequisites=(
-            StatePrerequisite(GoalRequirementKind.STRUCTURE, "Gateway"),
-        ),
+        prerequisites=(StatePrerequisite(GoalRequirementKind.STRUCTURE, "Gateway"),),
     ),
     ProgressActionSpec(
         "Train_Stalker",
@@ -157,9 +143,7 @@ PROTOSS_SIMPLE64_ACTION_SPECS: tuple[ProgressActionSpec, ...] = (
         minerals=250,
         vespene=150,
         supply=4,
-        prerequisites=(
-            StatePrerequisite(GoalRequirementKind.STRUCTURE, "Stargate"),
-        ),
+        prerequisites=(StatePrerequisite(GoalRequirementKind.STRUCTURE, "Stargate"),),
     ),
     ProgressActionSpec(
         "Train_Oracle",
@@ -168,9 +152,7 @@ PROTOSS_SIMPLE64_ACTION_SPECS: tuple[ProgressActionSpec, ...] = (
         minerals=150,
         vespene=150,
         supply=3,
-        prerequisites=(
-            StatePrerequisite(GoalRequirementKind.STRUCTURE, "Stargate"),
-        ),
+        prerequisites=(StatePrerequisite(GoalRequirementKind.STRUCTURE, "Stargate"),),
     ),
     ProgressActionSpec(
         "Train_Phoenix",
@@ -179,9 +161,7 @@ PROTOSS_SIMPLE64_ACTION_SPECS: tuple[ProgressActionSpec, ...] = (
         minerals=150,
         vespene=100,
         supply=2,
-        prerequisites=(
-            StatePrerequisite(GoalRequirementKind.STRUCTURE, "Stargate"),
-        ),
+        prerequisites=(StatePrerequisite(GoalRequirementKind.STRUCTURE, "Stargate"),),
     ),
     ProgressActionSpec(
         "Research_WarpGate",
@@ -189,18 +169,12 @@ PROTOSS_SIMPLE64_ACTION_SPECS: tuple[ProgressActionSpec, ...] = (
         "WarpGate",
         minerals=50,
         vespene=50,
-        prerequisites=(
-            StatePrerequisite(GoalRequirementKind.STRUCTURE, "CyberneticsCore"),
-        ),
+        prerequisites=(StatePrerequisite(GoalRequirementKind.STRUCTURE, "CyberneticsCore"),),
     ),
 )
 
-_DEFENSIVE_ALERTS = frozenset(
-    {"under_attack", "building_under_attack", "unit_under_attack"}
-)
-_INCOMPLETE_STATUSES = frozenset(
-    {"constructing", "in_progress", "pending", "queued", "warping_in"}
-)
+_DEFENSIVE_ALERTS = frozenset({"under_attack", "building_under_attack", "unit_under_attack"})
+_INCOMPLETE_STATUSES = frozenset({"constructing", "in_progress", "pending", "queued", "warping_in"})
 
 
 class GoalProgressVerifier:
@@ -254,9 +228,7 @@ class GoalProgressVerifier:
                     count=target_count,
                     action_name=action.name,
                     depends_on=[] if previous_id is None else [previous_id],
-                    description=(
-                        f"Have at least {target_count} {action.effect_target}"
-                    ),
+                    description=(f"Have at least {target_count} {action.effect_target}"),
                 )
             )
             previous_id = requirement_id
@@ -386,9 +358,7 @@ class GoalProgressVerifier:
             missing=missing,
             blockers=blockers,
             advancing_actions=advancing_actions,
-            unique_next_action=(
-                advancing_actions[0] if len(advancing_actions) == 1 else None
-            ),
+            unique_next_action=(advancing_actions[0] if len(advancing_actions) == 1 else None),
             defensive_hold_required=defensive_hold_required,
         )
 
@@ -569,10 +539,7 @@ class GoalProgressVerifier:
                 action.name,
             )
             return
-        supply_free = (
-            observation.state.economy.supply_cap
-            - observation.state.economy.supply_used
-        )
+        supply_free = observation.state.economy.supply_cap - observation.state.economy.supply_used
         if supply_free < action.supply:
             self._add_blocker(
                 blockers,
@@ -608,15 +575,12 @@ class GoalProgressVerifier:
             action = self._actions_by_name.get(requirement.action_name)
             if action is None:
                 return None
-            if (
-                action.effect_kind != requirement.kind
-                or _canonical(action.effect_target) != _canonical(requirement.target)
-            ):
+            if action.effect_kind != requirement.kind or _canonical(
+                action.effect_target
+            ) != _canonical(requirement.target):
                 return None
             return action
-        return self._actions_by_effect.get(
-            (requirement.kind, _canonical(requirement.target))
-        )
+        return self._actions_by_effect.get((requirement.kind, _canonical(requirement.target)))
 
     @staticmethod
     def _add_blocker(
@@ -663,9 +627,7 @@ def _state_counts(
         return completed, len(matching) - completed
     canonical_upgrade_target = _canonical_upgrade(target)
     completed = sum(
-        1
-        for upgrade in state.upgrades
-        if _canonical_upgrade(upgrade) == canonical_upgrade_target
+        1 for upgrade in state.upgrades if _canonical_upgrade(upgrade) == canonical_upgrade_target
     )
     return completed, 0
 

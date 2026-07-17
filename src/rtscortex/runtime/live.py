@@ -378,9 +378,7 @@ class LiveProcessSupervisor:
         self._stdout: BinaryIO | None = None
         self._stderr: BinaryIO | None = None
         self._worker_metrics_path = self.run_dir / "worker.metrics.json"
-        self._ownership_path = self.socket_path.with_name(
-            f"{self.socket_path.name}.lock"
-        )
+        self._ownership_path = self.socket_path.with_name(f"{self.socket_path.name}.lock")
         self._owns_run = False
         self._owns_runtime_socket = False
 
@@ -465,9 +463,7 @@ class LiveProcessSupervisor:
             os.close(descriptor)
         self._owns_run = True
         if self.socket_path.exists():
-            raise LiveEnvironmentError(
-                f"runtime socket already exists: {self.socket_path}"
-            )
+            raise LiveEnvironmentError(f"runtime socket already exists: {self.socket_path}")
 
     def _release_run_ownership(self) -> None:
         if not self._owns_run:
@@ -972,10 +968,7 @@ def gas_rebalance_worker_management_patch_is_applied(project_root: Path) -> bool
     if not source.is_file():
         return False
     text = source.read_text(encoding="utf-8")
-    return (
-        "self.config.ENABLE_AUTO_WORKER_MANAGE and self.is_all_nexus_full is False"
-        in text
-    )
+    return "self.config.ENABLE_AUTO_WORKER_MANAGE and self.is_all_nexus_full is False" in text
 
 
 def reserved_builder_worker_patch_is_applied(project_root: Path) -> bool:

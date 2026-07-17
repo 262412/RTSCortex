@@ -19,9 +19,7 @@ from rtscortex.policy.models import (
 )
 from rtscortex.progress import GoalProgressVerifier, GoalSpec
 
-_MAPPINGS_BY_MACRO = {
-    mapping.macro_action: mapping for mapping in HIMA_RUNTIME_MAPPINGS
-}
+_MAPPINGS_BY_MACRO = {mapping.macro_action: mapping for mapping in HIMA_RUNTIME_MAPPINGS}
 _RUNTIME_TO_HIMA_TOKEN = {
     runtime_action: action.upstream_name
     for mapping in HIMA_RUNTIME_MAPPINGS
@@ -68,8 +66,7 @@ def macro_plan_from_hima(
         _live_fixture(projection_observation),
     )
     assessment_by_step = {
-        (assessment.ordinal, assessment.source_action): assessment
-        for assessment in assessments
+        (assessment.ordinal, assessment.source_action): assessment for assessment in assessments
     }
     steps = [
         _macro_step(
@@ -99,14 +96,10 @@ def macro_plan_from_hima(
         source_step_id=projection_observation.step_id,
         created_game_loop=projection_observation.game_loop,
         expires_game_loop=projection_observation.game_loop + ttl_game_loops,
-        strategic_objective=_bounded_strategic_objective(
-            proposal.strategic_objective
-        ),
+        strategic_objective=_bounded_strategic_objective(proposal.strategic_objective),
         steps=steps,
         source_model_id=metadata.model_id if metadata is not None else "hima-live",
-        source_model_revision=(
-            metadata.model_revision if metadata is not None else "not_recorded"
-        ),
+        source_model_revision=(metadata.model_revision if metadata is not None else "not_recorded"),
         adapter_version=proposal.adapter_version,
         parser_version=proposal.parser_version,
         vocabulary_version=proposal.vocabulary_version,
@@ -129,10 +122,7 @@ def macro_goal_spec(
     parse_blocker_ordinal = _hard_parse_blocker_ordinal(plan, observation)
     action_names: list[str] = []
     for step in sorted(plan.steps, key=lambda item: item.ordinal):
-        if (
-            parse_blocker_ordinal is not None
-            and step.ordinal >= parse_blocker_ordinal
-        ):
+        if parse_blocker_ordinal is not None and step.ordinal >= parse_blocker_ordinal:
             break
         if step.status is MacroStepStatus.BLOCKED:
             break
@@ -203,8 +193,7 @@ def runtime_frontier(
         for assessment in assessments
         if assessment.classification is PolicyActionClassification.PARSE_ERROR
         or (
-            assessment.classification
-            is PolicyActionClassification.UNSUPPORTED_BY_RUNTIME
+            assessment.classification is PolicyActionClassification.UNSUPPORTED_BY_RUNTIME
             and assessment.reason_code != "managed_automatically"
         )
     ]
@@ -282,8 +271,7 @@ def _live_fixture(
 ) -> PolicyObservationFixture:
     return PolicyObservationFixture(
         fixture_id=(
-            f"live:{observation.run_id}:{observation.episode_id}:"
-            f"step-{observation.step_id}"
+            f"live:{observation.run_id}:{observation.episode_id}:step-{observation.step_id}"
         ),
         observation=observation,
         previous_actions=list(previous_actions),

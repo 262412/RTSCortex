@@ -29,12 +29,7 @@ from rtscortex.runtime.hima_sidecar import (
 def _snapshot_path(root: Path, candidate: str) -> Path:
     model_id = HIMA_CANDIDATE_MODEL_IDS[candidate]
     revision = HIMA_PINNED_REVISIONS[model_id]
-    path = (
-        root
-        / f"models--{model_id.replace('/', '--')}"
-        / "snapshots"
-        / revision
-    )
+    path = root / f"models--{model_id.replace('/', '--')}" / "snapshots" / revision
     path.mkdir(parents=True)
     return path
 
@@ -250,9 +245,7 @@ def test_hima_sidecar_serializes_concurrent_start_calls(tmp_path: Path) -> None:
     socket_path = tmp_path / "hima.sock"
     script = tmp_path / "worker.py"
     script.write_text(
-        "import pathlib, sys, time\n"
-        "pathlib.Path(sys.argv[1]).touch()\n"
-        "time.sleep(30)\n",
+        "import pathlib, sys, time\npathlib.Path(sys.argv[1]).touch()\ntime.sleep(30)\n",
         encoding="utf-8",
     )
     client = _FakeHealthClient(
@@ -301,9 +294,7 @@ def test_hima_sidecar_readiness_probe_respects_the_startup_deadline(
     socket_path = tmp_path / "hima.sock"
     script = tmp_path / "worker.py"
     script.write_text(
-        "import pathlib, sys, time\n"
-        "pathlib.Path(sys.argv[1]).touch()\n"
-        "time.sleep(30)\n",
+        "import pathlib, sys, time\npathlib.Path(sys.argv[1]).touch()\ntime.sleep(30)\n",
         encoding="utf-8",
     )
     health = HIMALiveHealth(
@@ -404,9 +395,7 @@ def test_hima_sidecar_process_rejects_health_identity_mismatch(
     socket_path = tmp_path / "hima.sock"
     script = tmp_path / "worker.py"
     script.write_text(
-        "import pathlib, sys, time\n"
-        "pathlib.Path(sys.argv[1]).touch()\n"
-        "time.sleep(30)\n",
+        "import pathlib, sys, time\npathlib.Path(sys.argv[1]).touch()\ntime.sleep(30)\n",
         encoding="utf-8",
     )
     client = _FakeHealthClient(
@@ -446,9 +435,7 @@ def test_hima_sidecar_process_rejects_stale_protocol_component(
     socket_path = tmp_path / "hima.sock"
     script = tmp_path / "worker.py"
     script.write_text(
-        "import pathlib, sys, time\n"
-        "pathlib.Path(sys.argv[1]).touch()\n"
-        "time.sleep(30)\n",
+        "import pathlib, sys, time\npathlib.Path(sys.argv[1]).touch()\ntime.sleep(30)\n",
         encoding="utf-8",
     )
     client = _FakeHealthClient(

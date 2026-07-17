@@ -288,12 +288,8 @@ def test_cortex_runtime_dispatches_proactive_tactical_focus_fire(tmp_path: Path)
         game_loop=0,
         state=SC2State(
             economy=EconomyState(army_supply=4, supply_used=16, supply_cap=23),
-            own_units=[
-                UnitState(unit_id="0x10", unit_type="Adept", alliance="self")
-            ],
-            visible_enemies=[
-                UnitState(unit_id="0x20", unit_type="Zergling", alliance="enemy")
-            ],
+            own_units=[UnitState(unit_id="0x10", unit_type="Adept", alliance="self")],
+            visible_enemies=[UnitState(unit_id="0x20", unit_type="Zergling", alliance="enemy")],
         ),
         available_actions=[
             AvailableAction(
@@ -413,9 +409,7 @@ def test_slow_hima_plan_ttl_starts_at_acceptance_game_loop(tmp_path: Path) -> No
         assert runtime._macro_plan is not None
         assert runtime._macro_plan.created_game_loop == 500
         assert runtime._macro_plan.expires_game_loop == 948
-        event = store.events_of_type(
-            "cortex-run", "episode-1", "macro_plan_accepted"
-        )[-1]
+        event = store.events_of_type("cortex-run", "episode-1", "macro_plan_accepted")[-1]
         assert event.payload["proposal_source_game_loop"] == 0
         assert event.payload["accepted_game_loop"] == 500
         assert event.payload["acceptance_delay_game_loops"] == 500
@@ -642,16 +636,12 @@ def test_macro_skips_redundant_pylon_when_supply_headroom_is_already_large(
         await runtime.tick(observation)
         for _ in range(5):
             await asyncio.sleep(0)
-        batch = await runtime.tick(
-            observation.model_copy(update={"step_id": 1, "game_loop": 1})
-        )
+        batch = await runtime.tick(observation.model_copy(update={"step_id": 1, "game_loop": 1}))
 
         assert batch.commands == []
         assert runtime._macro_plan is not None
         assert runtime._macro_plan.steps[0].status.value == "obsolete"
-        events = runtime.store.events_of_type(
-            "cortex-run", "episode-1", "macro_step_deduplicated"
-        )
+        events = runtime.store.events_of_type("cortex-run", "episode-1", "macro_step_deduplicated")
         assert events[-1].payload["free_supply"] == 19
         await runtime.close()
 
@@ -679,9 +669,7 @@ def test_redundant_pylon_skip_advances_to_next_legal_step_in_same_tick(
                 supply_cap=31,
                 workers=12,
             ),
-            own_structures=[
-                UnitState(unit_id="0x1", unit_type="Pylon", alliance="self")
-            ],
+            own_structures=[UnitState(unit_id="0x1", unit_type="Pylon", alliance="self")],
         ),
         available_actions=[
             AvailableAction(
@@ -706,9 +694,7 @@ def test_redundant_pylon_skip_advances_to_next_legal_step_in_same_tick(
         await runtime.tick(observation)
         for _ in range(5):
             await asyncio.sleep(0)
-        batch = await runtime.tick(
-            observation.model_copy(update={"step_id": 1, "game_loop": 1})
-        )
+        batch = await runtime.tick(observation.model_copy(update={"step_id": 1, "game_loop": 1}))
 
         assert [command.name for command in batch.commands] == ["Build_Gateway_Screen"]
         deduplicated = runtime.store.events_of_type(
@@ -1310,9 +1296,7 @@ def test_refresh_started_before_old_plan_outcome_is_revalidated(
         assert runtime._macro_plan is not None
         assert runtime._macro_plan.plan_id != first_plan_id
         assert len(store.events_of_type("cortex-run", "episode-1", "macro_plan_accepted")) == 2
-        revalidated = store.events_of_type(
-            "cortex-run", "episode-1", "macro_proposal_revalidated"
-        )
+        revalidated = store.events_of_type("cortex-run", "episode-1", "macro_proposal_revalidated")
         assert len(revalidated) == 1
         assert revalidated[0].payload["source_outcome_revision"] == 1
         assert revalidated[0].payload["current_outcome_revision"] == 2

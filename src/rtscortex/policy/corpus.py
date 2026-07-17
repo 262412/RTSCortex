@@ -50,9 +50,7 @@ _CONDITION_PHASES: tuple[PolicyFixtureStratum, ...] = (
     PolicyFixtureStratum.PRODUCTION,
     PolicyFixtureStratum.COMBAT,
 )
-_PRODUCTION_STRUCTURES = frozenset(
-    {"gateway", "warpgate", "roboticsfacility", "stargate"}
-)
+_PRODUCTION_STRUCTURES = frozenset({"gateway", "warpgate", "roboticsfacility", "stargate"})
 _TECHNOLOGY_STRUCTURES = frozenset(
     {
         "cyberneticscore",
@@ -152,13 +150,11 @@ class PolicyCorpusBuildConfig(CorpusModel):
         configured_seeds = {source.seed for source in self.sources if source.seed is not None}
         if len(configured_seeds) < self.minimum_seeds:
             raise ValueError("configured sources do not cover minimum_seeds")
-        required_condition_fixtures = (
-            self.minimum_condition_fixtures_per_phase * len(_CONDITION_PHASES)
+        required_condition_fixtures = self.minimum_condition_fixtures_per_phase * len(
+            _CONDITION_PHASES
         )
         if required_condition_fixtures > self.fixtures_per_stratum:
-            raise ValueError(
-                "condition phase coverage exceeds fixtures_per_stratum"
-            )
+            raise ValueError("condition phase coverage exceeds fixtures_per_stratum")
         return self
 
 
@@ -297,9 +293,7 @@ def build_policy_corpus(
         max_per_episode_per_stratum=config.max_per_episode_per_stratum,
         minimum_episodes_per_stratum=config.minimum_episodes_per_stratum,
         minimum_seeds=config.minimum_seeds,
-        minimum_condition_fixtures_per_phase=(
-            config.minimum_condition_fixtures_per_phase
-        ),
+        minimum_condition_fixtures_per_phase=(config.minimum_condition_fixtures_per_phase),
         stratum_counts={stratum: stratum_counts[stratum] for stratum in CORPUS_STRATA},
         condition_phase_counts=condition_phase_counts,
         seeds=seeds,
@@ -377,9 +371,7 @@ def verify_policy_corpus(
         _verify_source_journals(manifest, fixtures, errors)
 
     counts = Counter(
-        fixture.primary_stratum
-        for fixture in fixtures
-        if fixture.primary_stratum is not None
+        fixture.primary_stratum for fixture in fixtures if fixture.primary_stratum is not None
     )
     seeds = sorted(
         {
@@ -524,9 +516,7 @@ def _make_candidate(
     classification: _Classification,
     previous_actions: list[str],
 ) -> _FixtureCandidate:
-    observation_sha256 = _sha256_bytes(
-        _canonical_json(observation.model_dump(mode="json"))
-    )
+    observation_sha256 = _sha256_bytes(_canonical_json(observation.model_dump(mode="json")))
     fixture_source = PolicyFixtureSource(
         run_id=observation.run_id,
         episode_id=observation.episode_id,
@@ -569,9 +559,9 @@ def _select_balanced(
         grouped: dict[tuple[str, str, str], list[_FixtureCandidate]] = defaultdict(list)
         for candidate in candidates[stratum]:
             observation = candidate.fixture.observation
-            grouped[
-                (candidate.source_id, observation.run_id, observation.episode_id)
-            ].append(candidate)
+            grouped[(candidate.source_id, observation.run_id, observation.episode_id)].append(
+                candidate
+            )
         spaced = {
             key: _apply_game_loop_gap(items, config.minimum_game_loop_gap)
             for key, items in grouped.items()
@@ -587,9 +577,7 @@ def _select_balanced(
                 max_per_episode=config.max_per_episode_per_stratum,
                 used_fingerprints=fingerprints,
             )
-            failures.extend(
-                f"{stratum.value}: {failure}" for failure in phase_failures
-            )
+            failures.extend(f"{stratum.value}: {failure}" for failure in phase_failures)
         else:
             chosen = _round_robin_stratum(
                 spaced,
@@ -598,10 +586,7 @@ def _select_balanced(
                 used_fingerprints=fingerprints,
             )
         episode_count = len(
-            {
-                (fixture.observation.run_id, fixture.observation.episode_id)
-                for fixture in chosen
-            }
+            {(fixture.observation.run_id, fixture.observation.episode_id) for fixture in chosen}
         )
         if len(chosen) != config.fixtures_per_stratum:
             failures.append(
@@ -615,9 +600,7 @@ def _select_balanced(
             )
         selected.extend(chosen)
         fingerprints.update(
-            fixture.state_fingerprint
-            for fixture in chosen
-            if fixture.state_fingerprint is not None
+            fixture.state_fingerprint for fixture in chosen if fixture.state_fingerprint is not None
         )
     if failures:
         raise PolicyCorpusInsufficientStates("; ".join(failures))
@@ -639,9 +622,7 @@ def _select_condition_stratum(
     for phase in _CONDITION_PHASES:
         phase_groups = {
             key: [
-                candidate
-                for candidate in candidates
-                if phase.value in candidate.fixture.phase_tags
+                candidate for candidate in candidates if phase.value in candidate.fixture.phase_tags
             ]
             for key, candidates in grouped.items()
         }
@@ -660,9 +641,7 @@ def _select_condition_stratum(
             if fixture.state_fingerprint is not None
         )
         if len(phase_selected) != phase_quota:
-            failures.append(
-                f"phase {phase.value} selected {len(phase_selected)}/{phase_quota}"
-            )
+            failures.append(f"phase {phase.value} selected {len(phase_selected)}/{phase_quota}")
 
     remaining = quota - len(selected)
     if remaining > 0:
@@ -777,9 +756,7 @@ def _classify_observation(
     if observation.state.upgrades:
         evidence.append(f"upgrades={len(observation.state.upgrades)}")
     technology_actions = sorted(
-        name
-        for name in action_names
-        if name.startswith("Research_") or "CyberneticsCore" in name
+        name for name in action_names if name.startswith("Research_") or "CyberneticsCore" in name
     )
     evidence.extend(f"available_action={name}" for name in technology_actions)
     if observation.state.production_queue:
@@ -802,18 +779,13 @@ def _observation_phase(observation: ObservationEnvelope) -> PolicyFixtureStratum
     structure_names = {
         _canonical(structure.unit_type) for structure in observation.state.own_structures
     }
-    defensive_alert = any(
-        "under_attack" in _canonical(alert) for alert in observation.alerts
-    )
+    defensive_alert = any("under_attack" in _canonical(alert) for alert in observation.alerts)
     if observation.state.visible_enemies or "Attack_Unit" in action_names or defensive_alert:
         return PolicyFixtureStratum.COMBAT
     if (
         observation.state.upgrades
         or structure_names & _TECHNOLOGY_STRUCTURES
-        or any(
-            name.startswith("Research_") or "CyberneticsCore" in name
-            for name in action_names
-        )
+        or any(name.startswith("Research_") or "CyberneticsCore" in name for name in action_names)
     ):
         return PolicyFixtureStratum.TECHNOLOGY
     has_incomplete_production_structure = any(
@@ -867,11 +839,7 @@ def _phase_goal(
         action = "Train_Stalker"
         use_baseline = True
     elif phase is PolicyFixtureStratum.COMBAT:
-        action = (
-            "Train_Stalker"
-            if "cyberneticscore" in completed_structures
-            else "Train_Zealot"
-        )
+        action = "Train_Stalker" if "cyberneticscore" in completed_structures else "Train_Zealot"
         use_baseline = True
     else:
         raise ValueError(f"unsupported policy corpus phase: {phase.value}")
@@ -950,13 +918,9 @@ def _effect_counts(
         if kind is GoalRequirementKind.STRUCTURE
         else observation.state.own_units
     )
-    matching = [
-        entity for entity in entities if _canonical(entity.unit_type) == canonical_target
-    ]
+    matching = [entity for entity in entities if _canonical(entity.unit_type) == canonical_target]
     incomplete = sum(
-        1
-        for entity in matching
-        if _canonical(entity.status or "") in _IN_PROGRESS_STATUSES
+        1 for entity in matching if _canonical(entity.status or "") in _IN_PROGRESS_STATUSES
     )
     return len(matching) - incomplete, incomplete
 
@@ -1011,9 +975,7 @@ def _verify_fixtures(
         if source is None:
             errors.append(f"{fixture.fixture_id}: source provenance is missing")
             continue
-        observation_hash = _sha256_bytes(
-            _canonical_json(observation.model_dump(mode="json"))
-        )
+        observation_hash = _sha256_bytes(_canonical_json(observation.model_dump(mode="json")))
         if source.observation_sha256 != observation_hash:
             errors.append(f"{fixture.fixture_id}: observation SHA256 mismatch")
         if source.journal_sha256 not in source_hashes:
@@ -1088,9 +1050,7 @@ def _verify_fixtures(
             )
     for key, count in episode_counts.items():
         if count > manifest.max_per_episode_per_stratum:
-            errors.append(
-                f"{key[0].value}:{key[1]}:{key[2]} exceeds per-episode maximum"
-            )
+            errors.append(f"{key[0].value}:{key[1]}:{key[2]} exceeds per-episode maximum")
     for key, game_loops in loops.items():
         ordered = sorted(game_loops)
         if any(
@@ -1172,8 +1132,7 @@ def _verify_source_journals(
             successful_executions=tuple(
                 event
                 for event in source_events
-                if event.event_type == "execution"
-                and _successful_hima_action(event) is not None
+                if event.event_type == "execution" and _successful_hima_action(event) is not None
             ),
         )
         if len(observations) != source.observation_count:
@@ -1190,9 +1149,7 @@ def _verify_source_journals(
                 errors.append(f"{fixture.fixture_id}: source observation is missing")
                 continue
             observation = ObservationEnvelope.model_validate(event.payload)
-            observation_hash = _sha256_bytes(
-                _canonical_json(observation.model_dump(mode="json"))
-            )
+            observation_hash = _sha256_bytes(_canonical_json(observation.model_dump(mode="json")))
             if observation_hash != fixture.source.observation_sha256:
                 errors.append(f"{fixture.fixture_id}: source observation payload changed")
             expected_previous_actions = _previous_actions_for_observation(
@@ -1215,9 +1172,7 @@ def _load_source(
     if not path.is_file():
         raise PolicyCorpusError(f"source journal does not exist: {path}")
     events = tuple(read_event_log(path))
-    observations = tuple(
-        event for event in events if event.event_type == "observation"
-    )
+    observations = tuple(event for event in events if event.event_type == "observation")
     if not observations:
         raise PolicyCorpusError(f"source journal contains no observations: {path}")
     return _LoadedSource(
@@ -1276,9 +1231,7 @@ def _successful_hima_action(event: StoredEvent) -> tuple[int, str] | None:
     if action is None:
         return None
     game_loops = [
-        entry.game_loop
-        for entry in report.primitive_trace
-        if entry.game_loop is not None
+        entry.game_loop for entry in report.primitive_trace if entry.game_loop is not None
     ]
     evidence = report.effect_evidence
     if evidence is not None:
@@ -1354,8 +1307,7 @@ def _read_fixtures(path: Path) -> list[PolicyObservationFixture]:
 
 def _encode_fixtures(fixtures: Sequence[PolicyObservationFixture]) -> bytes:
     lines = [
-        _canonical_json(fixture.model_dump(mode="json")).decode("utf-8")
-        for fixture in fixtures
+        _canonical_json(fixture.model_dump(mode="json")).decode("utf-8") for fixture in fixtures
     ]
     return (("\n".join(lines) + "\n") if lines else "").encode()
 
@@ -1371,9 +1323,7 @@ def _aggregate_units(units: Sequence[UnitState]) -> list[dict[str, str | int]]:
 
 
 def _aggregate_production(items: Sequence[ProductionItem]) -> list[dict[str, str | int]]:
-    counts = Counter(
-        (_canonical(item.name), min(10, int(item.progress * 10))) for item in items
-    )
+    counts = Counter((_canonical(item.name), min(10, int(item.progress * 10))) for item in items)
     return [
         {"name": name, "progress_tenth": progress, "count": count}
         for (name, progress), count in sorted(counts.items())

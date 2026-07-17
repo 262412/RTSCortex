@@ -80,8 +80,7 @@ class GoalSpec(ContractModel):
                 raise ValueError(f"unknown goal requirement dependencies: {rendered}")
 
         dependencies = {
-            requirement.requirement_id: requirement.depends_on
-            for requirement in self.requirements
+            requirement.requirement_id: requirement.depends_on for requirement in self.requirements
         }
         visiting: set[str] = set()
         visited: set[str] = set()

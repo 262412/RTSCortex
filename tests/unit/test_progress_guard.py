@@ -59,9 +59,7 @@ def test_progress_guard_rejects_controls_when_goal_can_advance() -> None:
 
     assert outcome.accepted == [build]
     assert [failure.command for failure in outcome.failures] == [stop, hold, no_op]
-    assert {failure.reason for failure in outcome.failures} == {
-        CONTROL_ACTION_BLOCKED_REASON
-    }
+    assert {failure.reason for failure in outcome.failures} == {CONTROL_ACTION_BLOCKED_REASON}
 
 
 def test_progress_guard_allows_control_when_defence_requires_it() -> None:
@@ -111,9 +109,7 @@ def test_progress_guard_projects_forbidden_controls_out_of_planner_schema() -> N
 
     projected = ProgressGuard().project_observation(observation, _report())
 
-    assert [action.name for action in projected.available_actions] == [
-        "Build_Gateway_Screen"
-    ]
+    assert [action.name for action in projected.available_actions] == ["Build_Gateway_Screen"]
     assert [action.name for action in observation.available_actions] == [
         "Build_Gateway_Screen",
         "Stop",

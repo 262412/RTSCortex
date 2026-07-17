@@ -107,8 +107,7 @@ class HIMAPolicySubagent:
         if metadata is not None:
             expected_revision = HIMA_PINNED_REVISIONS[self.spec.model_id]
             if (
-                metadata.provider_kind
-                is not PolicyProviderKind.HUGGING_FACE_TRANSFORMERS
+                metadata.provider_kind is not PolicyProviderKind.HUGGING_FACE_TRANSFORMERS
                 or metadata.model_id != self.spec.model_id
                 or metadata.model_revision != expected_revision
                 or not metadata.checkpoint_verified
@@ -170,11 +169,7 @@ class TransformersHIMAGenerator:
     def loaded(self) -> bool:
         """Whether this process currently holds the tokenizer and model."""
 
-        return (
-            self._torch is not None
-            and self._tokenizer is not None
-            and self._model is not None
-        )
+        return self._torch is not None and self._tokenizer is not None and self._model is not None
 
     async def load(self) -> None:
         """Load the pinned local checkpoint once without blocking the event loop."""

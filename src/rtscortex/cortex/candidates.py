@@ -48,9 +48,7 @@ class CandidateCompiler:
         busy = tuple(dict.fromkeys(busy_actors))
         busy_set = set(busy)
         advancing_actions = (
-            frozenset(goal_progress.advancing_actions)
-            if goal_progress is not None
-            else frozenset()
+            frozenset(goal_progress.advancing_actions) if goal_progress is not None else frozenset()
         )
         observation_hash = observation_fingerprint(observation)
         candidates: list[ExecutableCandidate] = []
@@ -179,10 +177,7 @@ def _candidate_arguments(
     candidates = [list(arguments) for arguments in action.argument_candidates]
     if not isinstance(intent, TacticalIntent):
         return candidates
-    if (
-        action.name == "Move_Minimap"
-        and intent.target.kind is IntentTargetKind.RETREAT_REGION
-    ):
+    if action.name == "Move_Minimap" and intent.target.kind is IntentTargetKind.RETREAT_REGION:
         return candidates[-1:]
     if (
         action.name == "Move_Minimap"
@@ -257,9 +252,10 @@ def _candidate_is_semantically_valid(
 ) -> bool:
     if candidate.action_name != "Attack_Unit":
         return True
-    if not (
-        candidate.actor == "army" or candidate.actor.startswith("CombatGroup")
-    ) or not candidate.arguments:
+    if (
+        not (candidate.actor == "army" or candidate.actor.startswith("CombatGroup"))
+        or not candidate.arguments
+    ):
         return False
     target = _normalize_tag(candidate.arguments[0])
     return target in {_normalize_tag(enemy.unit_id) for enemy in observation.state.visible_enemies}

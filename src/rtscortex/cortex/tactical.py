@@ -124,8 +124,7 @@ class DeterministicTacticalAgent:
 
         ready_to_advance = (
             assessment.army_readiness is ArmyReadiness.READY
-            or observation.state.economy.army_supply
-            >= self.minimum_advance_army_supply
+            or observation.state.economy.army_supply >= self.minimum_advance_army_supply
         )
         if not enemies and ready_to_advance and move_actors:
             eligible_actors = [

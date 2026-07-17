@@ -765,10 +765,7 @@ def test_legacy_incomplete_mock_journal_still_writes_report_and_cli_succeeds(
     assert episode["metrics"]["execution"]["control_noops"] == 1
     assert episode["metrics"]["execution"]["meaningful_commands"] == 0
     assert episode["hard_acceptance"]["passed"] is False
-    assert (
-        episode["hard_acceptance"]["gates"]["production_acceptance_only"]["passed"]
-        is None
-    )
+    assert episode["hard_acceptance"]["gates"]["production_acceptance_only"]["passed"] is None
     assert "`incomplete`" in report
     assert "No terminal episode result was recorded" in report
     assert "Structured output not recorded (legacy event)." in report

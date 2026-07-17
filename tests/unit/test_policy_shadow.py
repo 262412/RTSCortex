@@ -107,8 +107,7 @@ def test_default_catalog_reports_skipped_and_unavailable_explicitly() -> None:
         for item in registrations[1:]
     )
     assert all(
-        "no download attempted" in (item.availability.reason or "")
-        for item in registrations[1:]
+        "no download attempted" in (item.availability.reason or "") for item in registrations[1:]
     )
     assert all(item.subagent is None for item in registrations)
 
@@ -140,9 +139,7 @@ def test_runner_uses_identical_fixtures_and_never_creates_commands() -> None:
                 _available(first),
                 PolicySubagentRegistration(
                     spec=second.spec,
-                    availability=PolicyAvailability(
-                        status=PolicyAvailabilityStatus.AVAILABLE
-                    ),
+                    availability=PolicyAvailability(status=PolicyAvailabilityStatus.AVAILABLE),
                     subagent=second,
                 ),
             ],
@@ -275,24 +272,18 @@ def test_llm_adapter_compacts_historical_observation_before_model_call() -> None
     assert len(payload["observation"]["state"]["own_units"]) < len(units)
 
 
-def test_llm_adapter_drops_redundant_spatial_context_from_largest_corpus_fixture(
-) -> None:
+def test_llm_adapter_drops_redundant_spatial_context_from_largest_corpus_fixture() -> None:
     fixture_id = "protoss-v0.2:combat:seed-1-full:event-1019"
     manifest_path = (
-        Path(__file__).resolve().parents[2]
-        / "benchmarks/policy/protoss_v0_2/manifest.yaml"
+        Path(__file__).resolve().parents[2] / "benchmarks/policy/protoss_v0_2/manifest.yaml"
     )
     fixture = next(
-        item
-        for item in load_policy_corpus(manifest_path)
-        if item.fixture_id == fixture_id
+        item for item in load_policy_corpus(manifest_path) if item.fixture_id == fixture_id
     )
     assert fixture.goal_spec is not None
     assert fixture.goal_progress is not None
     original_observation = fixture.observation.model_dump(mode="json")
-    expected_projection, _ = model_observation(
-        project_planning_observation(fixture.observation)
-    )
+    expected_projection, _ = model_observation(project_planning_observation(fixture.observation))
     assert len(expected_projection["spatial_context"]) == 30
     hima_before = HIMAObservationAdapter().prepare(fixture)
     provider = CapturingPlanningProvider()
@@ -433,9 +424,7 @@ def test_shadow_metrics_distinguish_legality_progress_and_control_violations() -
         )
     )
 
-    comparison = asyncio.run(
-        PolicyShadowRunner().compare([fixture], [_available(subagent)])
-    )
+    comparison = asyncio.run(PolicyShadowRunner().compare([fixture], [_available(subagent)]))
 
     record = comparison.records[0]
     assert record.goal_id == "gateway-opening"
@@ -472,9 +461,7 @@ def test_shadow_metrics_forbid_control_while_goal_effect_is_in_progress() -> Non
     subagent = FixedProposalSubagent(
         PolicyProposal(
             strategic_goal="Wait for the Gateway",
-            proposed_actions=[
-                ActionProposal(actor="CombatGroup/Army-1", name="Hold_Position")
-            ],
+            proposed_actions=[ActionProposal(actor="CombatGroup/Army-1", name="Hold_Position")],
         )
     )
 

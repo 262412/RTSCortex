@@ -96,18 +96,14 @@ def test_parser_reads_official_advice_sequence_without_polluting_rationale() -> 
 
 def test_parser_format_precedence_is_actions_then_final_summary_then_advice() -> None:
     all_formats = HIMAProposalParser().parse(
-        "Final Actions Summary: <Pylon> "
-        "So my advice is <Gateway> "
-        "Actions: ['Probe']"
+        "Final Actions Summary: <Pylon> So my advice is <Gateway> Actions: ['Probe']"
     )
     final_over_advice = HIMAProposalParser().parse(
         "So my advice is <Gateway> Final Actions Summary: <Pylon>"
     )
 
     assert [step.canonical_action for step in all_formats.steps] == ["TRAIN PROBE"]
-    assert [step.canonical_action for step in final_over_advice.steps] == [
-        "BUILD PYLON"
-    ]
+    assert [step.canonical_action for step in final_over_advice.steps] == ["BUILD PYLON"]
 
 
 def test_parser_reads_json_actions_list() -> None:
@@ -154,9 +150,7 @@ def test_parser_reads_hima_mixed_counted_and_bare_actions_list() -> None:
 
 
 def test_parser_reports_invalid_counted_actions_repeat() -> None:
-    proposal = HIMAProposalParser().parse(
-        'Actions: ["Pylon": 0, "VoidRay": 33]'
-    )
+    proposal = HIMAProposalParser().parse('Actions: ["Pylon": 0, "VoidRay": 33]')
 
     assert proposal.steps == []
     assert [item.code for item in proposal.diagnostics] == [
@@ -166,9 +160,7 @@ def test_parser_reports_invalid_counted_actions_repeat() -> None:
 
 
 def test_parser_retains_unknown_token_diagnostic_and_source_ordinal() -> None:
-    proposal = HIMAProposalParser().parse(
-        'Actions: ["Probe", "Orthotomist", "Pylon"]'
-    )
+    proposal = HIMAProposalParser().parse('Actions: ["Probe", "Orthotomist", "Pylon"]')
 
     assert [step.ordinal for step in proposal.steps] == [0, 2]
     assert [step.canonical_action for step in proposal.steps] == [
@@ -179,11 +171,11 @@ def test_parser_retains_unknown_token_diagnostic_and_source_ordinal() -> None:
         {
             "code": "unknown_action_token",
             "message": "Token is not in the pinned Protoss macro-action vocabulary.",
-                "raw_token": "Orthotomist",
-                "ordinal": 1,
-                "repeat": 1,
-            }
-        ]
+            "raw_token": "Orthotomist",
+            "ordinal": 1,
+            "repeat": 1,
+        }
+    ]
 
 
 def test_parser_does_not_fuzzy_repair_unknown_angle_token() -> None:

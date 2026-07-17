@@ -110,9 +110,7 @@ class HIMAEnsemblePolicyClient:
         self._clients = dict(clients)
         self.race = race
         groups = execution_groups or (_HIMA_CLUSTERS,)
-        normalized: tuple[tuple[HIMACluster, ...], ...] = tuple(
-            tuple(group) for group in groups
-        )
+        normalized: tuple[tuple[HIMACluster, ...], ...] = tuple(tuple(group) for group in groups)
         flattened = tuple(cluster for group in normalized for cluster in group)
         if tuple(sorted(flattened)) != _HIMA_CLUSTERS or len(flattened) != 3:
             raise ValueError("execution groups must contain each a/b/c specialist once")
@@ -148,12 +146,16 @@ class HIMAEnsemblePolicyClient:
         request_id: str | None = None,
         strategic_context: RaceBrainStrategicContext | None = None,
     ) -> RaceBrainProposalResponse:
-        outer_request_id = request_id or hashlib.sha256(
-            (
-                f"{context.observation.run_id}|{context.observation.episode_id}|"
-                f"{context.observation.step_id}|ensemble"
-            ).encode()
-        ).hexdigest()
+        outer_request_id = (
+            request_id
+            or hashlib.sha256(
+                (
+                    f"{context.observation.run_id}|{context.observation.episode_id}|"
+                    f"{context.observation.step_id}|ensemble"
+                ).encode()
+            ).hexdigest()
+        )
+
         async def propose_group(
             group: Sequence[HIMACluster],
         ) -> list[tuple[HIMACluster, HIMALiveProposalResponse]]:
@@ -170,13 +172,9 @@ class HIMAEnsemblePolicyClient:
             *(propose_group(group) for group in self.execution_groups)
         )
         response_by_cluster = {
-            cluster: response
-            for group in grouped_responses
-            for cluster, response in group
+            cluster: response for group in grouped_responses for cluster, response in group
         }
-        responses = [
-            (cluster, response_by_cluster[cluster]) for cluster in _HIMA_CLUSTERS
-        ]
+        responses = [(cluster, response_by_cluster[cluster]) for cluster in _HIMA_CLUSTERS]
         members = _coordinate(responses, context, strategic_context, self.race)
         selected = max(members, key=lambda item: item.score)
         degraded_member_ids = tuple(

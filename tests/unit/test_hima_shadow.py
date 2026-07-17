@@ -88,9 +88,7 @@ def test_macro_runtime_frontier_contributes_legality_and_goal_progress_rates() -
         subagent=subagent,
     )
 
-    comparison = asyncio.run(
-        PolicyShadowRunner().compare([fixture], [registration])
-    )
+    comparison = asyncio.run(PolicyShadowRunner().compare([fixture], [registration]))
     record = comparison.records[0]
 
     assert record.proposed_action_count == 1
