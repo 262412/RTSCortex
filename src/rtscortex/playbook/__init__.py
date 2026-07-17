@@ -9,6 +9,7 @@ from rtscortex.playbook.models import (
     PlaybookHit,
     PlaybookLesson,
     PlaybookQuery,
+    PlaybookRuleKind,
     PlaybookSelection,
 )
 from rtscortex.playbook.reviewer import CortexPlaybookReviewer
@@ -24,6 +25,7 @@ __all__ = [
     "PlaybookHit",
     "PlaybookLesson",
     "PlaybookQuery",
+    "PlaybookRuleKind",
     "PlaybookSelection",
     "PlaybookStore",
 ]

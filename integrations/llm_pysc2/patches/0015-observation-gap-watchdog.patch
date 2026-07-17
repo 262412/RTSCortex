@@ -1,0 +1,13 @@
+diff --git a/llm_pysc2/agents/main_agent_funcs.py b/llm_pysc2/agents/main_agent_funcs.py
+--- a/llm_pysc2/agents/main_agent_funcs.py
++++ b/llm_pysc2/agents/main_agent_funcs.py
+@@ -1241,5 +1241,9 @@ def main_agent_func4(self, obs):
+   func_id, func_call = (None, None)
+ 
++  # RTSCortex watchdog: optional team gathering must never starve Runtime ticks.
++  if getattr(self, '_rtscortex_force_runtime_decision', False):
++    return func_call
++
+   # 小队聚拢模块
+   self.flag_locked_func4 = False
+ 

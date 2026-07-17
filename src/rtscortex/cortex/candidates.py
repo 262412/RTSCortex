@@ -21,7 +21,9 @@ from rtscortex.cortex.models import (
     CortexIntent,
     ExecutableCandidate,
     FastExecutorContext,
+    IntentTargetKind,
     ReflexIntent,
+    TacticalIntent,
 )
 from rtscortex.progress import GoalProgressReport
 
@@ -59,7 +61,7 @@ class CandidateCompiler:
             ]
             for action in matching_actions:
                 actors = _candidate_actors(action, intent.actor_scopes)
-                arguments = _candidate_arguments(action)
+                arguments = _candidate_arguments(action, intent, observation)
                 for actor_rank, actor in enumerate(actors):
                     if actor in busy_set:
                         continue
@@ -165,12 +167,47 @@ def _candidate_actors(action: AvailableAction, intent_actors: list[str]) -> list
     return available
 
 
-def _candidate_arguments(action: AvailableAction) -> list[list[Any]]:
+def _candidate_arguments(
+    action: AvailableAction,
+    intent: CortexIntent,
+    observation: ObservationEnvelope,
+) -> list[list[Any]]:
     if not action.argument_names:
         return [[]]
     if action.argument_candidates is None:
         return []
-    return [list(arguments) for arguments in action.argument_candidates]
+    candidates = [list(arguments) for arguments in action.argument_candidates]
+    if not isinstance(intent, TacticalIntent):
+        return candidates
+    if (
+        action.name == "Move_Minimap"
+        and intent.target.kind is IntentTargetKind.RETREAT_REGION
+    ):
+        return candidates[-1:]
+    if (
+        action.name == "Move_Minimap"
+        and intent.target.kind is IntentTargetKind.ENEMY
+        and len(candidates) > 1
+    ):
+        return candidates[:-1]
+    if action.name != "Attack_Unit" or intent.target.unit_type is None:
+        return candidates
+    enemy_by_tag = {
+        _normalize_tag(enemy.unit_id): enemy
+        for enemy in observation.state.visible_enemies
+        if enemy.unit_type == intent.target.unit_type
+    }
+    return sorted(
+        (
+            arguments
+            for arguments in candidates
+            if arguments and _normalize_tag(arguments[0]) in enemy_by_tag
+        ),
+        key=lambda arguments: (
+            enemy_by_tag[_normalize_tag(arguments[0])].health_fraction,
+            _normalize_tag(arguments[0]),
+        ),
+    )
 
 
 def _build_candidate(

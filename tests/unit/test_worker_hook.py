@@ -35,6 +35,7 @@ from rtscortex_llm_pysc2.worker import (
     _isolate_next_action,
     _pending_plan_idle_delay,
     _prime_deterministic_gas_rebalance,
+    _producer_is_visible,
     _production_source_invalid_reason,
     _production_source_world_position,
     _refresh_build_action_position,
@@ -260,6 +261,7 @@ def test_worker_error_episode_preserves_bridge_counters() -> None:
                 "transport_noop_primitives": 4,
                 "unattributed_primitives": 1,
                 "candidate_outside_pysc2_dispatches": 0,
+                "observation_gap_watchdog_triggers": 0,
             },
             "failure_reason": "RuntimeError: bridge failed",
         }
@@ -305,6 +307,7 @@ def test_worker_max_frame_hook_reports_explicit_truncation() -> None:
                 "transport_noop_primitives": 4,
                 "unattributed_primitives": 0,
                 "candidate_outside_pysc2_dispatches": 0,
+                "observation_gap_watchdog_triggers": 0,
             },
             "failure_reason": "max_agent_steps_reached",
         }
@@ -325,6 +328,8 @@ def test_worker_settings_prefer_canonical_runtime_environment(
     monkeypatch.setenv("RTSCORTEX_PAUSE_UNTIL_FIRST_PLAN", "true")
     monkeypatch.setenv("RTSCORTEX_RUNTIME_REQUEST_TIMEOUT_SECONDS", "50")
     monkeypatch.setenv("RTSCORTEX_ACTION_EFFECT_TIMEOUT_GAME_LOOPS", "96")
+    monkeypatch.setenv("RTSCORTEX_OBSERVATION_GAP_WATCHDOG_GAME_LOOPS", "448")
+    monkeypatch.setenv("RTSCORTEX_OBSERVATION_GAP_HARD_LIMIT_GAME_LOOPS", "1792")
 
     settings = WorkerSettings.from_environment()
 
@@ -336,6 +341,141 @@ def test_worker_settings_prefer_canonical_runtime_environment(
     assert settings.pause_until_first_plan is True
     assert settings.runtime_request_timeout_seconds == 50.0
     assert settings.action_effect_timeout_game_loops == 96
+    assert settings.observation_gap_watchdog_game_loops == 448
+    assert settings.observation_gap_hard_limit_game_loops == 1792
+
+
+def test_production_camera_waits_for_exact_producer_feature_observation() -> None:
+    timestep = _fake_timestep()
+    agent = cast(Any, object.__new__(RTSCortexLLMAgent))
+    agent.func_list = [(2, object(), ("select", 0xBBB)), (503, object(), ())]
+    agent._rtscortex_translation_ordinal = 1
+    agent._rtscortex_production_source_tag = 0xBBB
+    agent._rtscortex_production_camera_waits = 0
+
+    assert agent._wait_for_production_camera("Train_Zealot", timestep) is True
+    assert agent._rtscortex_production_camera_waits == 1
+
+    producer = _unit(0xBBB, 62, 1, 32, 32, 500, 255)
+    producer.is_on_screen = True
+    timestep.observation.feature_units.append(producer)
+
+    assert _producer_is_visible(timestep.observation, 0xBBB) is True
+    assert agent._wait_for_production_camera("Train_Zealot", timestep) is False
+    assert agent._rtscortex_production_camera_waits == 0
+
+
+def test_production_camera_settlement_timeout_is_structured_failure() -> None:
+    runtime = FakeRuntime()
+    coordinator = BridgeCoordinator(runtime)
+    broker = SharedDecisionBroker(
+        coordinator,
+        TimeStepExtractor("run-worker", "episode-worker"),
+    )
+    command = RoutedCommand(
+        command_id="command-camera-timeout",
+        actor="Developer/Empty",
+        team_name="Empty",
+        name="Train_Adept",
+        rendered_action="<Train_Adept()>",
+    )
+    _register_bridge_route(
+        broker,
+        coordinator,
+        _bridge_route("Developer", ("Empty",), command, step_id=70),
+    )
+    camera = broker.claim_primitive(
+        "Developer",
+        "Empty",
+        "Train_Adept",
+        "llm_pysc2_move_camera",
+        final_primitive=False,
+        ordinal=0,
+        total=3,
+        requested_function_id=573,
+        emitted_function_id=573,
+    )
+    assert camera is not None
+    broker.settle_primitive(camera, success=True, game_loop=224)
+    agent = cast(Any, object.__new__(RTSCortexLLMAgent))
+    agent.name = "Developer"
+    agent.broker = broker
+    agent.func_list = [(2, object(), ("select", 0xBBB)), (457, object(), ())]
+    agent.action_list = []
+    agent._rtscortex_translation_ordinal = 1
+    agent._rtscortex_production_source_tag = 0xBBB
+    agent._rtscortex_production_camera_waits = 0
+    agent._rtscortex_semantic_action = {"name": "Train_Adept"}
+    agent.team_unit_team_curr = None
+    agent.team_unit_tag_curr = None
+    agent.team_unit_tag_list = []
+    agent.flag_enable_empty_unit_group = True
+    timestep = _fake_timestep()
+
+    for _ in range(5):
+        assert agent._wait_for_production_camera("Train_Adept", timestep) is True
+    broker.end_episode(_episode_result())
+
+    assert len(runtime.execution_reports) == 1
+    report = runtime.execution_reports[0]
+    assert report["status"] == "failed"
+    assert report["failure_code"] == "producer_not_observable"
+    assert report["execution_stage"] == "translation"
+
+
+def test_observation_gap_watchdog_preempts_once_and_recovers() -> None:
+    broker = SimpleNamespace(last_decision_game_loop=100, triggers=0)
+    broker.record_observation_gap_watchdog_trigger = lambda: setattr(
+        broker, "triggers", broker.triggers + 1
+    )
+    agent = cast(Any, object.__new__(RTSCortexMainAgent))
+    agent.decision_broker = broker
+    agent.worker_settings = WorkerSettings(
+        run_id="run-watchdog",
+        episode_id="episode-watchdog",
+        socket_path=None,
+        runtime_url="http://rtscortex",
+        seed=0,
+        observation_gap_watchdog_game_loops=10,
+        observation_gap_hard_limit_game_loops=40,
+    )
+    agent._observation_watchdog_active = False
+    agent._observation_watchdog_baseline_loop = None
+    agent._rtscortex_force_runtime_decision = False
+
+    assert agent._update_observation_gap_watchdog(111) is True
+    assert agent._rtscortex_force_runtime_decision is True
+    assert broker.triggers == 1
+    assert agent._update_observation_gap_watchdog(112) is True
+    assert broker.triggers == 1
+
+    broker.last_decision_game_loop = 120
+    assert agent._update_observation_gap_watchdog(121) is False
+    assert agent._rtscortex_force_runtime_decision is False
+
+
+def test_observation_gap_watchdog_fails_before_unbounded_stall() -> None:
+    broker = SimpleNamespace(last_decision_game_loop=100, triggers=0)
+    broker.record_observation_gap_watchdog_trigger = lambda: setattr(
+        broker, "triggers", broker.triggers + 1
+    )
+    agent = cast(Any, object.__new__(RTSCortexMainAgent))
+    agent.decision_broker = broker
+    agent.worker_settings = WorkerSettings(
+        run_id="run-watchdog",
+        episode_id="episode-watchdog",
+        socket_path=None,
+        runtime_url="http://rtscortex",
+        seed=0,
+        observation_gap_watchdog_game_loops=10,
+        observation_gap_hard_limit_game_loops=40,
+    )
+    agent._observation_watchdog_active = False
+    agent._observation_watchdog_baseline_loop = None
+    agent._rtscortex_force_runtime_decision = False
+
+    with pytest.raises(RuntimeError, match="observation_gap_watchdog_timeout"):
+        agent._update_observation_gap_watchdog(141)
 
 
 def test_shared_broker_exposes_pending_planner_state() -> None:
@@ -1873,6 +2013,7 @@ def test_candidate_outside_dispatch_counter_is_persisted_and_fails_command(
     assert json.loads(metrics_path.read_text(encoding="utf-8")) == {
         "unattributed_primitives": 0,
         "candidate_outside_pysc2_dispatches": 0,
+        "observation_gap_watchdog_triggers": 0,
     }
 
     with pytest.raises(RuntimeError, match="outside the current candidate set"):

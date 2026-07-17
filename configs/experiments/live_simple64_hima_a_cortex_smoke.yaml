@@ -43,7 +43,7 @@ cortex:
     max_new_tokens: 512
     restart_limit: 1
   tactical:
-    kind: deterministic_reflex
+    kind: deterministic
   executor:
     kind: deterministic
     timeout_ms: 10.0

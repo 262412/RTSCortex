@@ -17,6 +17,7 @@ from rtscortex.cortex import (
     CandidateSelectionStatus,
     DeterministicCandidateExecutor,
     DeterministicSituationAnalyzer,
+    DeterministicTacticalAgent,
     EconomyStatus,
     FastExecutorContext,
     GamePhase,
@@ -161,6 +162,115 @@ def test_candidate_compiler_filters_friendly_attack_targets() -> None:
     context = CandidateCompiler().compile(observation, intent)
 
     assert [candidate.arguments for candidate in context.candidates] == [["0x20"]]
+
+
+def test_tactical_agent_focuses_one_target_and_reacquires_when_it_disappears() -> None:
+    observation = _observation().model_copy(
+        update={
+            "state": _observation().state.model_copy(
+                update={
+                    "visible_enemies": [
+                        UnitState(
+                            unit_id="0x20",
+                            unit_type="Zergling",
+                            alliance="enemy",
+                            health_fraction=0.2,
+                        ),
+                        UnitState(
+                            unit_id="0x21",
+                            unit_type="VoidRay",
+                            alliance="enemy",
+                        ),
+                    ]
+                }
+            ),
+            "available_actions": [
+                AvailableAction(
+                    name="Attack_Unit",
+                    argument_names=["tag"],
+                    argument_types=[ActionArgumentType.TAG],
+                    actor_scopes=["CombatGroup/Army-1", "CombatGroup/Army-2"],
+                    argument_candidates=[["0x20"], ["0x21"]],
+                )
+            ],
+        }
+    )
+    agent = DeterministicTacticalAgent(
+        retreat_health_threshold=0.3,
+        minimum_advance_army_supply=4,
+    )
+    assessment = DeterministicSituationAnalyzer().assess(observation)
+
+    first = agent.evaluate(observation, assessment)
+
+    assert len(first) == 2
+    assert {intent.target.unit_type for intent in first} == {"VoidRay"}
+    contexts = [CandidateCompiler().compile(observation, intent) for intent in first]
+    assert all(context.candidates[0].arguments == ["0x21"] for context in contexts)
+
+    next_observation = observation.model_copy(
+        update={
+            "step_id": 5,
+            "game_loop": 65,
+            "state": observation.state.model_copy(
+                update={"visible_enemies": [observation.state.visible_enemies[0]]}
+            ),
+            "available_actions": [
+                observation.available_actions[0].model_copy(
+                    update={"argument_candidates": [["0x20"]]}
+                )
+            ],
+        }
+    )
+    second = agent.evaluate(
+        next_observation,
+        DeterministicSituationAnalyzer().assess(next_observation),
+    )
+
+    assert second
+    assert second[0].target.unit_type == "Zergling"
+    assert second[0].objective.startswith("Reacquire")
+
+
+def test_tactical_retreat_selects_reserved_home_minimap_candidate() -> None:
+    observation = _observation().model_copy(
+        update={
+            "state": _observation().state.model_copy(
+                update={
+                    "own_units": [
+                        UnitState(
+                            unit_id="0x10",
+                            unit_type="Adept",
+                            alliance="self",
+                            health_fraction=0.2,
+                        )
+                    ]
+                }
+            ),
+            "available_actions": [
+                AvailableAction(
+                    name="Move_Minimap",
+                    argument_names=["minimap"],
+                    argument_types=[ActionArgumentType.POSITION],
+                    actor_scopes=["CombatGroup/Army-1"],
+                    argument_candidates=[[[90, 90]], [[12, 12]]],
+                )
+            ],
+        }
+    )
+    agent = DeterministicTacticalAgent(
+        retreat_health_threshold=0.3,
+        minimum_advance_army_supply=4,
+    )
+
+    [intent] = agent.evaluate(
+        observation,
+        DeterministicSituationAnalyzer().assess(observation),
+    )
+    context = CandidateCompiler().compile(observation, intent)
+
+    assert intent.target.kind is IntentTargetKind.RETREAT_REGION
+    assert [candidate.arguments for candidate in context.candidates] == [[[12, 12]]]
 
 
 def test_executor_prefers_goal_advancing_candidate_and_materializes_wire_command() -> None:

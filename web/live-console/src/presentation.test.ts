@@ -323,6 +323,7 @@ describe("Chinese event presentation", () => {
       lesson_ids: ["lesson-1", "lesson-2"],
     });
     const promoted = event("playbook_lesson_promoted", {
+      rule_kind: "execution_guard",
       statement: "BUILD STARGATE had a verified effect in winning episodes.",
       support_count: 2,
     });
@@ -332,7 +333,7 @@ describe("Chinese event presentation", () => {
       "3 位 HIMA 专家已提案 · 1 位输出异常 · 采用 hima-protoss-b · 引用 1 条战术经验",
     );
     expect(eventSummary(retrieved)).toBe("科技阶段（technology） · 找到 2 条可复用战术经验");
-    expect(eventSummary(promoted)).toContain("已晋升 · 2 局支持");
+    expect(eventSummary(promoted)).toContain("已晋升 · 执行保护规则（execution_guard） · 2 局支持");
 
     const revalidated = event("macro_proposal_revalidated", {
       source_game_loop: 112,

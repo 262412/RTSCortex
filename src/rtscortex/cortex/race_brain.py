@@ -12,7 +12,7 @@ from pydantic import Field
 from rtscortex.contracts.models import ContractModel
 from rtscortex.cortex.macro import runtime_frontier
 from rtscortex.cortex.models import SituationAssessment, ThreatLevel
-from rtscortex.playbook import PlaybookSelection
+from rtscortex.playbook import PlaybookRuleKind, PlaybookSelection
 from rtscortex.policy.hima import HIMAInputContext, HIMALiveHealth, HIMALiveProposalResponse
 from rtscortex.policy.models import PolicyActionAssessment, PolicyActionClassification
 
@@ -264,6 +264,7 @@ def _coordinate(
     race: str,
 ) -> list[RaceBrainMemberProposal]:
     recommendations = _playbook_recommendations(strategic_context)
+    avoid_actions = _playbook_avoid_actions(strategic_context)
     members: list[RaceBrainMemberProposal] = []
     for cluster, response in responses:
         frontier = runtime_frontier(
@@ -276,6 +277,7 @@ def _coordinate(
             frontier,
             strategic_context,
             recommendations,
+            avoid_actions,
         )
         members.append(
             RaceBrainMemberProposal(
@@ -295,6 +297,7 @@ def _proposal_score(
     frontier: PolicyActionAssessment | None,
     strategic_context: RaceBrainStrategicContext | None,
     recommendations: set[str],
+    avoid_actions: set[str],
 ) -> tuple[float, list[str]]:
     if frontier is None:
         score = -200.0
@@ -315,6 +318,9 @@ def _proposal_score(
         if action in recommendations:
             score += 20.0
             reasons.append("promoted playbook support")
+        if action in avoid_actions:
+            score -= 25.0
+            reasons.append("promoted playbook warning")
         if strategic_context is not None:
             situation = strategic_context.situation
             combat_action = any(
@@ -337,7 +343,21 @@ def _playbook_recommendations(
     return {
         action
         for hit in strategic_context.playbook.hits
+        if hit.lesson.rule_kind is PlaybookRuleKind.STRATEGY
         if (action := hit.lesson.recommended_action) is not None
+    }
+
+
+def _playbook_avoid_actions(
+    strategic_context: RaceBrainStrategicContext | None,
+) -> set[str]:
+    if strategic_context is None or strategic_context.playbook is None:
+        return set()
+    return {
+        action
+        for hit in strategic_context.playbook.hits
+        if hit.lesson.rule_kind is PlaybookRuleKind.STRATEGY
+        if (action := hit.lesson.avoid_action) is not None
     }
 
 

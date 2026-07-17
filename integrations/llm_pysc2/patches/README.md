@@ -60,12 +60,20 @@ git -C third_party/LLM-PySC2 apply --check \
   ../../integrations/llm_pysc2/patches/0014-refresh-worker-workplaces.patch
 git -C third_party/LLM-PySC2 apply \
   ../../integrations/llm_pysc2/patches/0014-refresh-worker-workplaces.patch
+git -C third_party/LLM-PySC2 apply --check \
+  ../../integrations/llm_pysc2/patches/0015-observation-gap-watchdog.patch
+git -C third_party/LLM-PySC2 apply \
+  ../../integrations/llm_pysc2/patches/0015-observation-gap-watchdog.patch
 ```
 
 After the live run, restore the clean pinned checkout by reversing exactly these reviewed
 patches in reverse order:
 
 ```bash
+git -C third_party/LLM-PySC2 apply --reverse --check \
+  ../../integrations/llm_pysc2/patches/0015-observation-gap-watchdog.patch
+git -C third_party/LLM-PySC2 apply --reverse \
+  ../../integrations/llm_pysc2/patches/0015-observation-gap-watchdog.patch
 git -C third_party/LLM-PySC2 apply --reverse --check \
   ../../integrations/llm_pysc2/patches/0014-refresh-worker-workplaces.patch
 git -C third_party/LLM-PySC2 apply --reverse \
@@ -214,7 +222,10 @@ targets. Before assignment, it revalidates the selected Nexus and workplace, pre
 observation-bound entry, and returns a transport no-op when no current resource target remains
 instead of indexing an empty list.
 
-CI applies all fourteen patches in order under Python 3.9, compiles and imports both projects, and
+`0015-observation-gap-watchdog.patch` lets the Worker skip optional upstream team gathering
+when the gap since the latest Runtime decision exceeds the configured game-loop threshold.
+
+CI applies all fifteen patches in order under Python 3.9, compiles and imports both projects, and
 runs `integrations/llm_pysc2/tests/python39_contract_smoke.py`. The smoke locks the v1.1
 candidate mapping, multi-argument translator rejection, Nexus camera-settlement primitive,
 exact Nexus anchor, floating-point resource clearance, visible complete-footprint behavior,

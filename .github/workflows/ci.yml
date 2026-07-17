@@ -103,6 +103,8 @@ jobs:
             ../../integrations/llm_pysc2/patches/0011-allocate-log-directories-atomically.patch
             ../../integrations/llm_pysc2/patches/0012-bind-gas-rebalance-to-worker-management.patch
             ../../integrations/llm_pysc2/patches/0013-preserve-reserved-builder-worker.patch
+            ../../integrations/llm_pysc2/patches/0014-refresh-worker-workplaces.patch
+            ../../integrations/llm_pysc2/patches/0015-observation-gap-watchdog.patch
           )
           applied=()
           cleanup() {

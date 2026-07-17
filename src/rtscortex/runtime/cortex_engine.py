@@ -31,12 +31,14 @@ from rtscortex.cortex import (
     CortexRole,
     DeterministicCandidateExecutor,
     DeterministicSituationAnalyzer,
+    DeterministicTacticalAgent,
     MacroIntent,
     MacroPlan,
     MacroStep,
     MacroStepStatus,
     ReflexIntent,
     SituationAssessment,
+    TacticalIntent,
     hima_previous_action_for_runtime_action,
     macro_goal_spec,
     macro_plan_from_hima,
@@ -199,6 +201,14 @@ class CortexRuntimeEngine(RuntimeEngine):
         self._command_lineages: dict[str, CommandLineage] = {}
         self._previous_hima_actions: list[tuple[int, str]] = []
         self._situation = DeterministicSituationAnalyzer(valid_for_game_loops=1)
+        self._tactical = DeterministicTacticalAgent(
+            retreat_health_threshold=(
+                config.cortex.tactical.retreat_health_threshold
+            ),
+            minimum_advance_army_supply=(
+                config.cortex.tactical.minimum_advance_army_supply
+            ),
+        )
         self._candidate_compiler = CandidateCompiler()
         self._executor = DeterministicCandidateExecutor()
 
@@ -264,6 +274,13 @@ class CortexRuntimeEngine(RuntimeEngine):
         if macro_prepared is not None:
             prepared.append(macro_prepared)
 
+        tactical_prepared = [
+            item
+            for intent in self._tactical.evaluate(observation, assessment)
+            if (item := self._compile_intent(observation, intent)) is not None
+        ]
+        prepared.extend(tactical_prepared)
+
         reflex_started = time.perf_counter()
         raw_reflex = [
             command
@@ -285,15 +302,21 @@ class CortexRuntimeEngine(RuntimeEngine):
             for item in prepared
             if item.lineage.source_role is CortexRole.MACRO
         ]
+        tactical_candidates = [
+            item.command
+            for item in prepared
+            if item.lineage.source_role is CortexRole.TACTICAL
+        ]
+        planner_candidates = [*macro_candidates, *tactical_candidates]
         reflex_candidates = [
             item.command
             for item in prepared
             if item.lineage.source_role is CortexRole.REFLEX
         ]
-        for command in macro_candidates:
+        for command in planner_candidates:
             self._transition_command(command, CommandStatus.PENDING, observation)
 
-        guarded_macro = self.progress_guard.filter_commands(macro_candidates, goal_progress)
+        guarded_macro = self.progress_guard.filter_commands(planner_candidates, goal_progress)
         guarded_reflex = self.progress_guard.filter_commands(reflex_candidates, goal_progress)
         rejected_commands = self._apply_validation_failures(
             [*guarded_macro.failures, *guarded_reflex.failures],
@@ -335,7 +358,7 @@ class CortexRuntimeEngine(RuntimeEngine):
         accepted_commands = outcome.accepted
         accepted_ids = {command.command_id for command in accepted_commands}
 
-        for command in macro_candidates:
+        for command in planner_candidates:
             lifecycle = self._command_states.get(command.command_id)
             if (
                 command.command_id not in accepted_ids
@@ -404,6 +427,9 @@ class CortexRuntimeEngine(RuntimeEngine):
                 "preemptions": [asdict(record) for record in arbitration.preemptions],
                 "macro_candidates": [
                     command.model_dump(mode="json") for command in macro_candidates
+                ],
+                "tactical_candidates": [
+                    command.model_dump(mode="json") for command in tactical_candidates
                 ],
                 "reflex_candidates": [
                     command.model_dump(mode="json") for command in reflex_candidates
@@ -919,6 +945,16 @@ class CortexRuntimeEngine(RuntimeEngine):
         *,
         latency_ms: float,
     ) -> None:
+        proposal_source_game_loop = plan.created_game_loop
+        plan = plan.model_copy(
+            update={
+                "created_game_loop": observation.game_loop,
+                "expires_game_loop": (
+                    observation.game_loop
+                    + self.config.cortex.macro.plan_ttl_game_loops
+                ),
+            }
+        )
         frontier_assessment = runtime_frontier(
             proposal,
             observation,
@@ -943,6 +979,10 @@ class CortexRuntimeEngine(RuntimeEngine):
                 "source_model_id": plan.source_model_id,
                 "source_model_revision": plan.source_model_revision,
                 "accepted_game_loop": observation.game_loop,
+                "proposal_source_game_loop": proposal_source_game_loop,
+                "acceptance_delay_game_loops": max(
+                    0, observation.game_loop - proposal_source_game_loop
+                ),
                 "is_revision": is_revision,
                 "latency_ms": latency_ms,
                 "generation_metadata": (
@@ -1082,6 +1122,31 @@ class CortexRuntimeEngine(RuntimeEngine):
             )
             return None
         if (
+            frontier.source_action == "BUILD PYLON"
+            and self._free_supply(observation)
+            >= self.config.cortex.executor.pylon_redundancy_free_supply
+        ):
+            self._set_macro_step_status(
+                frontier.ordinal,
+                MacroStepStatus.OBSOLETE,
+                "supply_headroom_satisfied",
+            )
+            self._record_cortex_event(
+                observation,
+                "macro_step_deduplicated",
+                {
+                    "semantic_action": frontier.source_action,
+                    "reason": "supply_headroom_satisfied",
+                    "free_supply": self._free_supply(observation),
+                },
+            )
+            self._request_macro_if_exhausted()
+            return self._prepare_macro_command(
+                observation,
+                assessment,
+                goal_progress,
+            )
+        if (
             frontier.classification is not PolicyActionClassification.MAPPED_LEGAL_NOW
             or frontier.runtime_action is None
         ):
@@ -1144,18 +1209,34 @@ class CortexRuntimeEngine(RuntimeEngine):
             )
             if emergency is not None:
                 return emergency
-        if not (
-            blocked_frontier.source_action == "BUILD STARGATE"
-            and blocked_frontier.reason_code == "insufficient_vespene"
+        nexus_count = sum(
+            structure.unit_type == "Nexus"
+            for structure in observation.state.own_structures
+        )
+        gas_saturated_before_expansion = (
+            blocked_frontier.source_action == "BUILD ASSIMILATOR"
+            and blocked_frontier.reason_code == "action_unavailable_now"
+            and nexus_count < 2
+            and observation.state.economy.minerals >= 400
+        )
+        if (
+            blocked_frontier.reason_code != "insufficient_vespene"
+            and not gas_saturated_before_expansion
         ):
             return None
-        fallback_actions = ["TRAIN ZEALOT"]
+        fallback_actions = []
+        if gas_saturated_before_expansion or (
+            observation.state.economy.minerals >= 800 and nexus_count < 2
+        ):
+            fallback_actions.append("BUILD NEXUS")
+        fallback_actions.append("TRAIN ZEALOT")
         if (
             free_supply
             <= self.config.cortex.executor.resource_fallback_pylon_free_supply
         ):
             fallback_actions.append("BUILD PYLON")
-        fallback_actions.append("BUILD NEXUS")
+        if "BUILD NEXUS" not in fallback_actions:
+            fallback_actions.append("BUILD NEXUS")
         for action_name in fallback_actions:
             fallback = self._legal_proposal_step(
                 proposal,
@@ -1287,7 +1368,7 @@ class CortexRuntimeEngine(RuntimeEngine):
     def _compile_intent(
         self,
         observation: ObservationEnvelope,
-        intent: MacroIntent | ReflexIntent,
+        intent: MacroIntent | TacticalIntent | ReflexIntent,
         *,
         goal_progress: GoalProgressReport | None = None,
         command_id: str | None = None,

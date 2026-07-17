@@ -9,6 +9,7 @@ from pydantic import Field, model_validator
 
 from rtscortex.contracts import CommandLifecycleSnapshot, ObservationEnvelope
 from rtscortex.contracts.models import ContractModel
+from rtscortex.game_phase import GamePhase as GamePhase
 from rtscortex.progress import GoalProgressReport
 
 
@@ -20,13 +21,6 @@ class CortexRole(StrEnum):
     TACTICAL = "tactical"
     REFLEX = "reflex"
     EXECUTOR = "executor"
-
-
-class GamePhase(StrEnum):
-    EARLY = "early"
-    TECHNOLOGY = "technology"
-    PRODUCTION = "production"
-    COMBAT = "combat"
 
 
 class ThreatLevel(StrEnum):

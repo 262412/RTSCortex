@@ -187,7 +187,8 @@ def test_worker_patch_is_required_only_for_live_runs(tmp_path: Path) -> None:
         "if target_nexus is None:\n"
         "reversed(possible_working_place_nexus_tag_list)\n"
         "Stale worker workplace\n"
-        "if len(working_place_unit_list) == 0:\n",
+        "if len(working_place_unit_list) == 0:\n"
+        "_rtscortex_force_runtime_decision\n",
         encoding="utf-8",
     )
 
@@ -251,6 +252,15 @@ def test_worker_patch_is_required_only_for_live_runs(tmp_path: Path) -> None:
     workplace_refresh_check = _worker_patch_check(tmp_path, required=True)
     assert workplace_refresh_check.status == "error"
     assert "0014-refresh-worker-workplaces.patch" in workplace_refresh_check.detail
+    funcs_source.write_text(complete_funcs_source, encoding="utf-8")
+
+    funcs_source.write_text(
+        complete_funcs_source.replace("_rtscortex_force_runtime_decision\n", ""),
+        encoding="utf-8",
+    )
+    watchdog_check = _worker_patch_check(tmp_path, required=True)
+    assert watchdog_check.status == "error"
+    assert "0015-observation-gap-watchdog.patch" in watchdog_check.detail
     funcs_source.write_text(complete_funcs_source, encoding="utf-8")
 
     complete_main_source = source.read_text(encoding="utf-8")

@@ -61,8 +61,21 @@ class EnvironmentSettings(SettingsModel):
     worker_python: Path = Path("~/fastscratch/envs/rtscortex-llm-pysc2/bin/python")
     pending_plan_step_delay_seconds: float = Field(default=0.0, ge=0.0)
     action_effect_timeout_game_loops: int = Field(default=112, ge=1)
+    observation_gap_watchdog_game_loops: int = Field(default=448, ge=1)
+    observation_gap_hard_limit_game_loops: int = Field(default=1792, ge=2)
     server_ready_timeout_seconds: float = Field(default=15.0, gt=0.0)
     shutdown_timeout_seconds: float = Field(default=10.0, gt=0.0)
+
+    @model_validator(mode="after")
+    def validate_observation_gap_limits(self) -> EnvironmentSettings:
+        if (
+            self.observation_gap_hard_limit_game_loops
+            <= self.observation_gap_watchdog_game_loops
+        ):
+            raise ValueError(
+                "observation_gap_hard_limit_game_loops must exceed the watchdog threshold"
+            )
+        return self
 
 
 class RuntimeSettings(SettingsModel):
@@ -143,7 +156,9 @@ class CortexMacroSettings(SettingsModel):
 
 
 class CortexTacticalSettings(SettingsModel):
-    kind: Literal["deterministic_reflex"] = "deterministic_reflex"
+    kind: Literal["deterministic", "deterministic_reflex"] = "deterministic"
+    retreat_health_threshold: float = Field(default=0.3, ge=0.0, le=1.0)
+    minimum_advance_army_supply: int = Field(default=4, ge=1)
 
 
 class CortexExecutorSettings(SettingsModel):
@@ -152,6 +167,7 @@ class CortexExecutorSettings(SettingsModel):
     fallback: Literal["deterministic"] = "deterministic"
     supply_emergency_free_supply: int = Field(default=2, ge=0)
     resource_fallback_pylon_free_supply: int = Field(default=4, ge=0)
+    pylon_redundancy_free_supply: int = Field(default=16, ge=1)
 
 
 class CortexExplanationSettings(SettingsModel):

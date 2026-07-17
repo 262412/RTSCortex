@@ -127,6 +127,7 @@ const FIELD_LABELS: Record<string, string> = {
   failure_owner: "失败归属",
   consequence: "观察到的后果",
   statement: "战术经验",
+  rule_kind: "规则类型",
   recommended_action: "建议动作",
   avoid_action: "应避免动作",
   support_count: "支持对局数",
@@ -377,6 +378,8 @@ const VALUE_LABELS: Record<string, string> = {
   forming: "正在集结",
   ready: "已准备",
   engaged: "正在交战",
+  strategy: "战略规则",
+  execution_guard: "执行保护规则",
   not_ready: "尚未准备",
   abstain: "主动放弃选择",
   friendly_target: "目标属于己方",
@@ -528,6 +531,7 @@ export function semanticScalar(value: string | number | boolean | null, key?: st
     "reason",
     "effect_kind",
     "confirmation_kind",
+    "rule_kind",
     "role",
     "source_kind",
     "game_phase",
@@ -659,7 +663,9 @@ export function eventSummary(event: StoredEvent): string {
   if (event.event_type === "playbook_lesson_candidate" || event.event_type === "playbook_lesson_promoted") {
     const statement = readString(payload, "statement") ?? "战术经验已更新";
     const support = readNumber(payload, "support_count") ?? 0;
-    return `${event.event_type === "playbook_lesson_promoted" ? "已晋升" : "仍待验证"} · ${support} 局支持 · ${truncate(statement)}`;
+    const ruleKind = readString(payload, "rule_kind");
+    const kindLabel = ruleKind ? `${semanticScalar(ruleKind, "rule_kind")} · ` : "";
+    return `${event.event_type === "playbook_lesson_promoted" ? "已晋升" : "仍待验证"} · ${kindLabel}${support} 局支持 · ${truncate(statement)}`;
   }
   if (event.event_type === "postgame_review_completed") {
     const cases = readNumber(payload, "case_count") ?? 0;

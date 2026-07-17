@@ -273,6 +273,12 @@ def run_experiment(
                 "RTSCORTEX_ACTION_EFFECT_TIMEOUT_GAME_LOOPS": str(
                     config.environment.action_effect_timeout_game_loops
                 ),
+                "RTSCORTEX_OBSERVATION_GAP_WATCHDOG_GAME_LOOPS": str(
+                    config.environment.observation_gap_watchdog_game_loops
+                ),
+                "RTSCORTEX_OBSERVATION_GAP_HARD_LIMIT_GAME_LOOPS": str(
+                    config.environment.observation_gap_hard_limit_game_loops
+                ),
                 "RTSCORTEX_CONSOLE_ENABLED": str(config.console.enabled).lower(),
                 "RTSCORTEX_CONSOLE_FRAME_FPS": str(config.console.frame_fps),
                 "RTSCORTEX_CONSOLE_JPEG_QUALITY": str(config.console.jpeg_quality),

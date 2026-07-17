@@ -81,6 +81,7 @@ from rtscortex.cortex.race_brain import (
     selected_hima_response,
 )
 from rtscortex.cortex.situation import DeterministicSituationAnalyzer
+from rtscortex.cortex.tactical import DeterministicTacticalAgent
 
 __all__ = [
     "ArmyReadiness",
@@ -97,6 +98,7 @@ __all__ = [
     "DeterministicCandidateExecutor",
     "DeterministicSavedCandidatePolicy",
     "DeterministicSituationAnalyzer",
+    "DeterministicTacticalAgent",
     "EconomyStatus",
     "ExecutableCandidate",
     "ExecutorCandidateSample",

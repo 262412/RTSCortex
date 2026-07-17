@@ -44,6 +44,10 @@ from rtscortex.policy.hima import (
     HIMAObservationAdapter,
     HIMAProposalParser,
 )
+from rtscortex.policy.models import (
+    PolicyActionAssessment,
+    PolicyActionClassification,
+)
 from rtscortex.providers import FakeProvider
 from rtscortex.runtime import CortexRuntimeEngine
 
@@ -271,6 +275,48 @@ def test_cortex_runtime_records_three_specialist_race_brain_cycle(tmp_path: Path
     asyncio.run(runtime.close())
 
 
+def test_cortex_runtime_dispatches_proactive_tactical_focus_fire(tmp_path: Path) -> None:
+    runtime = CortexRuntimeEngine(
+        config=_config(tmp_path, macro=False),
+        store=_store(tmp_path),
+        provider=FakeProvider(),
+    )
+    observation = ObservationEnvelope(
+        run_id="cortex-run",
+        episode_id="episode-1",
+        step_id=0,
+        game_loop=0,
+        state=SC2State(
+            economy=EconomyState(army_supply=4, supply_used=16, supply_cap=23),
+            own_units=[
+                UnitState(unit_id="0x10", unit_type="Adept", alliance="self")
+            ],
+            visible_enemies=[
+                UnitState(unit_id="0x20", unit_type="Zergling", alliance="enemy")
+            ],
+        ),
+        available_actions=[
+            AvailableAction(
+                name="Attack_Unit",
+                argument_names=["tag"],
+                argument_types=[ActionArgumentType.TAG],
+                actor_scopes=["CombatGroup/Adept-1"],
+                argument_candidates=[["0x20"]],
+            )
+        ],
+    )
+
+    batch = asyncio.run(runtime.tick(observation))
+
+    assert len(batch.commands) == 1
+    assert batch.commands[0].name == "Attack_Unit"
+    assert batch.commands[0].arguments == ["0x20"]
+    assert batch.commands[0].source is ActionSource.PLANNER
+    lineage = runtime._command_lineages[batch.commands[0].command_id]
+    assert lineage.source_role.value == "tactical"
+    asyncio.run(runtime.close())
+
+
 def test_hima_macro_plan_dispatches_only_through_current_candidate_domain(
     tmp_path: Path,
 ) -> None:
@@ -341,6 +387,41 @@ def test_hima_macro_plan_dispatches_only_through_current_candidate_domain(
     assert metrics.command_lineage_coverage == 1.0
     assert client.closed is True
     recovered.close()
+
+
+def test_slow_hima_plan_ttl_starts_at_acceptance_game_loop(tmp_path: Path) -> None:
+    client = _BlockingFirstMacroClient()
+    store = _store(tmp_path)
+    runtime = CortexRuntimeEngine(
+        config=_config(tmp_path),
+        store=store,
+        provider=FakeProvider(),
+        macro_client=client,
+    )
+
+    async def exercise() -> None:
+        await runtime.start()
+        first = await runtime.tick(_macro_observation(step_id=0, game_loop=0))
+        assert first.planner_pending is True
+        assert runtime._macro_task is not None
+
+        client.release_first.set()
+        await runtime._macro_task
+        accepted = await runtime.tick(_macro_observation(step_id=1, game_loop=500))
+
+        assert [command.name for command in accepted.commands] == ["Build_Pylon_Screen"]
+        assert runtime._macro_plan is not None
+        assert runtime._macro_plan.created_game_loop == 500
+        assert runtime._macro_plan.expires_game_loop == 948
+        event = store.events_of_type(
+            "cortex-run", "episode-1", "macro_plan_accepted"
+        )[-1]
+        assert event.payload["proposal_source_game_loop"] == 0
+        assert event.payload["accepted_game_loop"] == 500
+        assert event.payload["acceptance_delay_game_loops"] == 500
+        await runtime.close()
+
+    asyncio.run(exercise())
 
 
 def test_failed_macro_command_is_not_retried_while_replacement_plan_is_pending(
@@ -532,6 +613,113 @@ def test_supply_emergency_pylon_preempts_blocked_technology_frontier(
     asyncio.run(exercise())
 
 
+def test_macro_skips_redundant_pylon_when_supply_headroom_is_already_large(
+    tmp_path: Path,
+) -> None:
+    runtime = CortexRuntimeEngine(
+        config=_config(tmp_path),
+        store=_store(tmp_path),
+        provider=FakeProvider(),
+        macro_client=_FakeMacroClient("Actions: ['Pylon']"),
+    )
+    observation = _macro_observation(step_id=0, game_loop=0).model_copy(
+        update={
+            "state": _macro_observation(step_id=0, game_loop=0).state.model_copy(
+                update={
+                    "economy": EconomyState(
+                        minerals=500,
+                        supply_used=12,
+                        supply_cap=31,
+                        workers=12,
+                    )
+                }
+            )
+        }
+    )
+
+    async def exercise() -> None:
+        await runtime.start()
+        await runtime.tick(observation)
+        for _ in range(5):
+            await asyncio.sleep(0)
+        batch = await runtime.tick(
+            observation.model_copy(update={"step_id": 1, "game_loop": 1})
+        )
+
+        assert batch.commands == []
+        assert runtime._macro_plan is not None
+        assert runtime._macro_plan.steps[0].status.value == "obsolete"
+        events = runtime.store.events_of_type(
+            "cortex-run", "episode-1", "macro_step_deduplicated"
+        )
+        assert events[-1].payload["free_supply"] == 19
+        await runtime.close()
+
+    asyncio.run(exercise())
+
+
+def test_redundant_pylon_skip_advances_to_next_legal_step_in_same_tick(
+    tmp_path: Path,
+) -> None:
+    runtime = CortexRuntimeEngine(
+        config=_config(tmp_path),
+        store=_store(tmp_path),
+        provider=FakeProvider(),
+        macro_client=_FakeMacroClient("Actions: ['Pylon', 'Gateway']"),
+    )
+    observation = ObservationEnvelope(
+        run_id="cortex-run",
+        episode_id="episode-1",
+        step_id=0,
+        game_loop=0,
+        state=SC2State(
+            economy=EconomyState(
+                minerals=500,
+                supply_used=12,
+                supply_cap=31,
+                workers=12,
+            ),
+            own_structures=[
+                UnitState(unit_id="0x1", unit_type="Pylon", alliance="self")
+            ],
+        ),
+        available_actions=[
+            AvailableAction(
+                name="Build_Pylon_Screen",
+                argument_names=["screen"],
+                argument_types=[ActionArgumentType.POSITION],
+                actor_scopes=["Builder/Probe-1"],
+                argument_candidates=[[[65, 90]]],
+            ),
+            AvailableAction(
+                name="Build_Gateway_Screen",
+                argument_names=["screen"],
+                argument_types=[ActionArgumentType.POSITION],
+                actor_scopes=["Builder/Probe-1"],
+                argument_candidates=[[[70, 90]]],
+            ),
+        ],
+    )
+
+    async def exercise() -> None:
+        await runtime.start()
+        await runtime.tick(observation)
+        for _ in range(5):
+            await asyncio.sleep(0)
+        batch = await runtime.tick(
+            observation.model_copy(update={"step_id": 1, "game_loop": 1})
+        )
+
+        assert [command.name for command in batch.commands] == ["Build_Gateway_Screen"]
+        deduplicated = runtime.store.events_of_type(
+            "cortex-run", "episode-1", "macro_step_deduplicated"
+        )
+        assert deduplicated[-1].payload["semantic_action"] == "BUILD PYLON"
+        await runtime.close()
+
+    asyncio.run(exercise())
+
+
 def test_gas_blocked_stargate_uses_legal_zealot_fallback(tmp_path: Path) -> None:
     client = _FakeMacroClient("Actions: ['Stargate', 'Zealot', 'Nexus']")
     runtime = CortexRuntimeEngine(
@@ -651,6 +839,72 @@ def test_gas_blocked_stargate_uses_supply_or_expansion_fallback(
         await runtime.close()
 
     asyncio.run(exercise())
+
+
+def test_saturated_main_base_gas_frontier_expands_instead_of_stalling(
+    tmp_path: Path,
+) -> None:
+    runtime = CortexRuntimeEngine(
+        config=_config(tmp_path),
+        store=_store(tmp_path),
+        provider=FakeProvider(),
+        macro_client=_FakeMacroClient(
+            "Actions: ['Assimilator', 'Assimilator', 'Assimilator', 'Nexus', 'Zealot']"
+        ),
+    )
+    observation = ObservationEnvelope(
+        run_id="cortex-run",
+        episode_id="episode-1",
+        step_id=0,
+        game_loop=0,
+        state=SC2State(
+            economy=EconomyState(
+                minerals=900,
+                vespene=300,
+                supply_used=20,
+                supply_cap=47,
+                workers=20,
+            ),
+            own_structures=[
+                UnitState(unit_id="0x1", unit_type="Nexus", alliance="self"),
+                UnitState(unit_id="0x2", unit_type="Assimilator", alliance="self"),
+                UnitState(unit_id="0x3", unit_type="Assimilator", alliance="self"),
+                UnitState(unit_id="0x4", unit_type="Gateway", alliance="self"),
+            ],
+        ),
+        available_actions=[
+            AvailableAction(
+                name="Build_Nexus_Near",
+                argument_names=["tag"],
+                argument_types=[ActionArgumentType.TAG],
+                actor_scopes=["Builder/Probe-1"],
+                argument_candidates=[["0x99"]],
+            ),
+            AvailableAction(
+                name="Train_Zealot",
+                actor_scopes=["Developer/Empty"],
+                argument_candidates=None,
+            ),
+        ],
+    )
+
+    proposal = HIMAProposalParser().parse(
+        "Actions: ['Assimilator', 'Assimilator', 'Assimilator', 'Nexus', 'Zealot']"
+    )
+    blocked = PolicyActionAssessment(
+        ordinal=2,
+        source_action="BUILD ASSIMILATOR",
+        runtime_action="Build_Assimilator_Near",
+        classification=PolicyActionClassification.MAPPED_DEFERRED,
+        reason_code="action_unavailable_now",
+        is_runtime_frontier=True,
+    )
+
+    fallback = runtime._fallback_frontier(proposal, observation, blocked)
+
+    assert fallback is not None
+    assert fallback.source_action == "BUILD NEXUS"
+    assert fallback.runtime_action == "Build_Nexus_Near"
 
 
 def test_episode_transition_drains_and_discards_previous_macro_request(

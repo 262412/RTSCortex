@@ -83,11 +83,13 @@ class SharedDecisionBroker:
         self._active_commands: dict[tuple[str, str], _ActiveCommand] = {}
         self._screen_route_provenance: dict[str, ScreenRouteProvenance] = {}
         self._planner_pending = False
+        self._last_decision_game_loop: Optional[int] = None
         self._initial_decision_started = False
         self._initial_decision_complete = False
         self._initial_decision_error: Optional[Exception] = None
         self.unattributed_primitives = 0
         self.candidate_outside_pysc2_dispatches = 0
+        self.observation_gap_watchdog_triggers = 0
         self._metrics_path = None if metrics_path is None else Path(metrics_path)
         with self._condition:
             self._persist_metrics_locked()
@@ -99,7 +101,20 @@ class SharedDecisionBroker:
             return {
                 "unattributed_primitives": self.unattributed_primitives,
                 "candidate_outside_pysc2_dispatches": (self.candidate_outside_pysc2_dispatches),
+                "observation_gap_watchdog_triggers": self.observation_gap_watchdog_triggers,
             }
+
+    @property
+    def last_decision_game_loop(self) -> Optional[int]:
+        """Return the game loop represented by the latest Runtime decision."""
+
+        with self._condition:
+            return self._last_decision_game_loop
+
+    def record_observation_gap_watchdog_trigger(self) -> None:
+        with self._condition:
+            self.observation_gap_watchdog_triggers += 1
+            self._persist_metrics_locked()
 
     def record_unattributed_primitive(self) -> None:
         with self._condition:
@@ -662,6 +677,9 @@ class SharedDecisionBroker:
                 {
                     "unattributed_primitives": self.unattributed_primitives,
                     "candidate_outside_pysc2_dispatches": (self.candidate_outside_pysc2_dispatches),
+                    "observation_gap_watchdog_triggers": (
+                        self.observation_gap_watchdog_triggers
+                    ),
                 }
             ),
             encoding="utf-8",
@@ -696,6 +714,7 @@ class SharedDecisionBroker:
 
         with self._condition:
             state.decision = decision
+            self._last_decision_game_loop = int(snapshot["game_loop"])
             self._initial_decision_complete = True
             self._planner_pending = bool(decision.action_batch.get("planner_pending", False))
             for route in decision.routes.values():

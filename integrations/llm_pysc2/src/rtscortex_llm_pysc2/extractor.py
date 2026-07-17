@@ -99,7 +99,12 @@ def semantic_argument_candidates(
 ) -> Optional[list[list[Any]]]:
     """Return the single semantic candidate domain used at observe and dispatch time."""
 
-    return _argument_candidates(observation, action_name, unit_names=unit_names)
+    return _argument_candidates(
+        observation,
+        action_name,
+        unit_names=unit_names,
+        include_home_minimap=True,
+    )
 
 
 def is_production_action(action_name: str) -> bool:
@@ -529,6 +534,7 @@ def _available_team_actions(
             observation,
             action_name,
             unit_names=unit_names,
+            include_home_minimap=agent.name.startswith("CombatGroup"),
         )
         if (
             agent.name == "Builder"
@@ -625,6 +631,7 @@ def _argument_candidates(
     action_name: str,
     *,
     unit_names: Mapping[int, str],
+    include_home_minimap: bool,
 ) -> Optional[list[list[Any]]]:
     if action_name == "Attack_Unit":
         return [
@@ -643,7 +650,13 @@ def _argument_candidates(
             )
         ]
     if action_name in MINIMAP_POINT_ACTIONS:
-        return [[candidate] for candidate in _movement_minimap_candidates(observation)]
+        return [
+            [candidate]
+            for candidate in _movement_minimap_candidates(
+                observation,
+                include_home=include_home_minimap,
+            )
+        ]
     if action_name == SELECT_BLINK_ACTION:
         positions = _movement_screen_candidates(observation, blink=True)
         stalker_tags = sorted(
@@ -736,7 +749,12 @@ def _movement_screen_candidates(
     return [[x, y] for _, y, x in candidates[:8]]
 
 
-def _movement_minimap_candidates(observation: Any, *, limit: int = 8) -> list[list[int]]:
+def _movement_minimap_candidates(
+    observation: Any,
+    *,
+    limit: int = 8,
+    include_home: bool = False,
+) -> list[list[int]]:
     """Return stable pathable scouting targets across the minimap.
 
     Neutral minimap clusters are preferred because they normally identify melee resource
@@ -755,6 +773,7 @@ def _movement_minimap_candidates(observation: Any, *, limit: int = 8) -> list[li
     visibility_dimensions = _plane_dimensions(visibility)
 
     resource_targets: list[tuple[float, int, int]] = []
+    own_points: list[tuple[int, int]] = []
     if _plane_dimensions(player_relative) == dimensions:
         neutral_points = {
             (x, y) for y in range(height) for x in range(width) if int(player_relative[y][x]) == 3
@@ -800,7 +819,8 @@ def _movement_minimap_candidates(observation: Any, *, limit: int = 8) -> list[li
 
     search_radius = max(4, min(height, width) // 8)
     candidates: list[list[int]] = []
-    for target_x, target_y in desired:
+    offensive_limit = max(0, limit - 1 if include_home else limit)
+    for target_x, target_y in desired if offensive_limit else ():
         candidate = _nearest_pathable_minimap_point(
             pathable,
             target_x,
@@ -819,8 +839,23 @@ def _movement_minimap_candidates(observation: Any, *, limit: int = 8) -> list[li
         ):
             continue
         candidates.append(candidate)
-        if len(candidates) >= limit:
+        if len(candidates) >= offensive_limit:
             break
+    if include_home and own_points:
+        home_x = int(round(sum(point[0] for point in own_points) / len(own_points)))
+        home_y = int(round(sum(point[1] for point in own_points) / len(own_points)))
+        home = _nearest_pathable_minimap_point(
+            pathable,
+            home_x,
+            home_y,
+            width=width,
+            height=height,
+            search_radius=search_radius,
+        )
+        if home is not None and home not in candidates:
+            # The final candidate is the stable home/retreat target. Tactical
+            # compilation excludes it for advances and selects it for retreats.
+            candidates.append(home)
     return candidates
 
 

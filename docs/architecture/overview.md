@@ -54,7 +54,7 @@ flowchart LR
 |---|---|---|---|
 | Situation | `DeterministicSituationAnalyzer` | Full current observation to a typed phase, threat, economy, and army assessment | None |
 | Macro | Persistent HIMA Protoss sidecar | Exact five-field own-state snapshot to a parsed and versioned `MacroPlan` | None |
-| Tactical | Not implemented as a separate policy in v0.3 | `TacticalIntent` is a reserved typed contract only | None |
+| Tactical | `DeterministicTacticalAgent` | Visible enemies, army readiness, health, and legal combat actors to focus-fire, reacquisition, advance, or retreat intents | None |
 | Reflex | `ReflexEngine` | Current alerts, enemies, and unit state to a `ReflexIntent` | None |
 | Fast executor | `DeterministicCandidateExecutor` | Observation-bound candidates to one selection or an explicit abstention | None |
 | Safety and dispatch | Cortex Runtime | Intent selection through ProgressGuard, Validator, Arbiter, and command lifecycle to `ActionBatch` | Sole Runtime dispatch path |
@@ -71,9 +71,11 @@ the currently mapped RTSCortex macro actions. Managed Probe production is transp
 unsupported dependencies and parse errors block the frontier instead of being skipped.
 Only a frontier classified as `mapped_legal_now` can become a `MacroIntent`. Two bounded
 liveness exceptions may select a later `mapped_legal_now` step from the same plan: a Pylon
-can preempt a deferred frontier during a supply emergency, and a gas-blocked Stargate can
-yield to Zealot, low-supply Pylon, or Nexus. The selected fallback still passes through the
-same current candidate domain and safety chain.
+can preempt a deferred frontier during a supply emergency, gas-blocked technology can yield
+to Zealot, low-supply Pylon, or Nexus, and an unavailable third main-base Assimilator can
+yield to the plan's legal expansion. Redundant Pylon steps are consumed and the next frontier
+is evaluated in the same tick. Every fallback still passes through the same current candidate
+domain and safety chain.
 
 ### Candidate-bound motor path
 
@@ -182,14 +184,17 @@ current HIMA observation vocabulary and RTSCortex macro-action mapping are Proto
 A Terran or Zerg ensemble configuration fails before model startup with an explicit missing
 adapter/mapping error; registration is not presented as execution support.
 
-CortexPlaybook is a separate cross-run SQLite database. Post-game review stores every macro
+CortexPlaybook is a separate cross-run SQLite database. Post-game review stores macro and tactical
 decision with source run, command lineage, effect evidence, consequence, failure owner, and
-confidence. Translation, PySC2, placement, or effect-verification failures remain diagnostic
-cases and are never promoted as tactical rules. A positive lesson is promoted only after the
+confidence. Repeated engineering failures can become `execution_guard` rules, while outcome-backed
+recommendations and repeated blocked frontiers become `strategy` rules. Execution guards never
+boost or penalize a HIMA proposal; they preserve an explicit precondition for the executor and
+Bridge. A positive strategy lesson is promoted only after the
 same race, opponent, phase, and semantic action has produced a verified effect in at least
-two winning episodes. Retrieval requires exact race and opponent matches, then ranks phase,
-map, tags, confidence, and support count. This conservative policy makes the notebook
-iterative without allowing one noisy loss or an engineering fault to poison later games.
+two winning episodes. Every rule signature counts distinct episodes, candidate rules stay hidden
+by default, statement length is bounded, and retrieval returns only the configured top-k rules.
+Strategy retrieval requires exact race and opponent; global execution guards require exact race.
+This keeps the notebook iterative without allowing repeated copies from one game to dominate it.
 
 The durable v0.4 observability events are `race_brain_coordinated`, `playbook_retrieved`,
 `playbook_case_recorded`, `playbook_lesson_candidate`, `playbook_lesson_promoted`, and
@@ -206,6 +211,9 @@ semantic boundary needed by a future action-conditioned world model.
 - The legacy Planner and the Cortex macro specialist both run single-flight in the
   background on a fixed start game-loop cadence.
 - The last valid plan remains active while a new plan is pending.
+- A macro plan's TTL starts at its acceptance game loop. Model inference and observation gaps
+  are retained as provenance (`proposal_source_game_loop` and `acceptance_delay_game_loops`)
+  but cannot make a newly accepted plan arrive already expired.
 - `ActionBatch.planner_pending` lets a simulation worker pace game steps for a slower
   local model without blocking the runtime's reflex and fallback path.
 - Reflex commands can preempt only commands for the same actor scope.

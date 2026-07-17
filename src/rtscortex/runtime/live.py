@@ -1004,6 +1004,15 @@ def worker_workplace_refresh_patch_is_applied(project_root: Path) -> bool:
     )
 
 
+def observation_gap_watchdog_patch_is_applied(project_root: Path) -> bool:
+    """Return whether optional upstream gathering honors the Worker watchdog."""
+
+    source = project_root / "third_party/LLM-PySC2/llm_pysc2/agents/main_agent_funcs.py"
+    if not source.is_file():
+        return False
+    return "_rtscortex_force_runtime_decision" in source.read_text(encoding="utf-8")
+
+
 def _signal_process(worker: asyncio.subprocess.Process, sig: signal.Signals) -> None:
     with contextlib.suppress(ProcessLookupError):
         if os.name != "nt":

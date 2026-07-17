@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import subprocess
+import sys
 from pathlib import Path
 
 from rtscortex.contracts import (
@@ -18,8 +20,20 @@ from rtscortex.playbook import (
     LessonStatus,
     PlaybookContext,
     PlaybookQuery,
+    PlaybookRuleKind,
     PlaybookStore,
 )
+
+
+def test_playbook_public_import_succeeds_in_cold_interpreter() -> None:
+    completed = subprocess.run(
+        [sys.executable, "-c", "from rtscortex.playbook import CortexPlaybookReviewer"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
 
 
 def _episode_events(root: Path, run_id: str) -> tuple[EventStore, EpisodeResult]:
@@ -158,6 +172,13 @@ def test_playbook_does_not_promote_bridge_failure_as_strategy(tmp_path: Path) ->
     failed = next(case for case in cases if case.command_id == "failed-command")
     assert failed.quality is DecisionQuality.EXECUTION_ERROR
     assert all(lesson.recommended_action != "BUILD NEXUS" for lesson in lessons)
+    guard = next(
+        lesson
+        for lesson in lessons
+        if lesson.rule_kind is PlaybookRuleKind.EXECUTION_GUARD
+    )
+    assert guard.status is LessonStatus.PROMOTED
+    assert guard.avoid_action is None
 
     store.close()
     playbook.close()
@@ -179,7 +200,7 @@ def test_playbook_records_rejected_macro_proposal_as_cortex_error(tmp_path: Path
         },
     )
 
-    cases, _ = reviewer.review_episode(
+    cases, lessons = reviewer.review_episode(
         store.events_after("run", 0, 100, episode_id="episode"),
         result,
         agent_race="protoss",
@@ -190,6 +211,90 @@ def test_playbook_records_rejected_macro_proposal_as_cortex_error(tmp_path: Path
     assert rejected.quality is DecisionQuality.STRATEGIC_ERROR
     assert rejected.failure_owner.value == "cortex"
     assert rejected.semantic_action == "RESEARCH PSIONIC STORM"
+    warning = next(lesson for lesson in lessons if lesson.avoid_action is not None)
+    assert warning.rule_kind is PlaybookRuleKind.STRATEGY
+    assert warning.avoid_action == "RESEARCH PSIONIC STORM"
 
     store.close()
+    playbook.close()
+
+
+def test_playbook_promotes_repeated_producer_failure_as_compact_execution_rule(
+    tmp_path: Path,
+) -> None:
+    playbook = PlaybookStore(tmp_path / "playbook.sqlite3")
+    reviewer = CortexPlaybookReviewer(playbook, promotion_support=2)
+    updates = []
+    for run_id in ("producer-run-1", "producer-run-2"):
+        store = EventStore(tmp_path / f"{run_id}.sqlite3", tmp_path / f"{run_id}.jsonl")
+        store.append_event(
+            run_id=run_id,
+            episode_id="episode",
+            step_id=0,
+            event_type="situation_assessed",
+            payload={"phase": "production"},
+        )
+        store.append_event(
+            run_id=run_id,
+            episode_id="episode",
+            step_id=1,
+            event_type="command_lineage",
+            payload={
+                "command_id": f"{run_id}:command",
+                "semantic_action": "TRAIN ADEPT",
+                "lineage": {"source_role": "macro"},
+            },
+        )
+        store.append_event(
+            run_id=run_id,
+            episode_id="episode",
+            step_id=2,
+            event_type="execution",
+            payload=ExecutionReport(
+                run_id=run_id,
+                episode_id="episode",
+                step_id=2,
+                command_id=f"{run_id}:command",
+                success=False,
+                action_name="Train_Adept",
+                actor="Developer/Empty",
+                source=ActionSource.PLANNER,
+                status=ExecutionStatus.FAILED,
+                execution_stage=ExecutionStage.TRANSLATION,
+                failure_code="producer_not_observable",
+            ),
+        )
+        result = EpisodeResult(
+            run_id=run_id,
+            episode_id="episode",
+            scenario="Simple64",
+            seed=0,
+            outcome=EpisodeOutcome.DEFEAT,
+            steps=2,
+        )
+        _, lessons = reviewer.review_episode(
+            store.events_after(run_id, 0, 100, episode_id="episode"),
+            result,
+            agent_race="protoss",
+            opponent_race="zerg",
+        )
+        updates.extend(lessons)
+        store.close()
+
+    guard = updates[-1]
+    assert guard.rule_kind is PlaybookRuleKind.EXECUTION_GUARD
+    assert guard.status is LessonStatus.PROMOTED
+    assert guard.support_count == 2
+    assert "fresh feature observation" in guard.statement
+    selection = playbook.retrieve(
+        PlaybookQuery(
+            context=PlaybookContext(
+                agent_race="protoss",
+                opponent_race="terran",
+                phase=GamePhase.COMBAT,
+                map_name="AnotherMap",
+            )
+        )
+    )
+    assert guard.lesson_id in selection.lesson_ids
     playbook.close()

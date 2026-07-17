@@ -235,10 +235,12 @@ Use the report and Console to verify:
 - stopping the Console does not terminate the Runtime, HIMA sidecar, Worker, or SC2;
 - no model download, RGB image file, or replay file appears in the run directory.
 
-### Deliberate v0.3 limitations
+### Deliberate current limitations
 
-The typed `TacticalIntent` contract exists, but no tactical specialist currently emits it.
-Urgent reactions are still owned by deterministic Reflex rules. The fast executor is a
+`DeterministicTacticalAgent` now emits observation-bound intents for proactive advance,
+visible-enemy focus fire, target reacquisition, and low-health retreat. Reflex remains the
+higher-priority emergency layer. Tactical targeting is deterministic and currently omits learned
+micro, air-unit special abilities, terrain reasoning, and opponent strategy prediction. The fast executor is a
 stable deterministic ranker, not a learned small model. A privacy-minimized corpus exporter
 and saved-candidate benchmark are available (see
 [`fast-executor-data.md`](architecture/fast-executor-data.md)), but there is no training
@@ -263,13 +265,16 @@ vespene, supply, and prerequisite requirements are all currently satisfied; this
 the 100-mineral powered Shield Battery after Cybernetics Core, and the full Adept, Void Ray,
 Oracle, and Phoenix production costs.
 
-The live Cortex executor also applies four deterministic liveness rules without bypassing
+The live Cortex executor also applies deterministic liveness rules without bypassing
 the normal candidate and validation chain:
 
 - with at most two free supply, a legal Pylon step later in the current HIMA plan may
   preempt a deferred technology frontier;
 - while Stargate is deferred specifically for insufficient vespene, legal later steps are
   considered in stable order: Zealot, Pylon when at most four supply remains, then Nexus;
+- when all nearby main-base geysers are occupied, an unavailable additional Assimilator can
+  yield to a legal Nexus step; redundant Pylon steps are consumed and the next legal frontier
+  is evaluated in the same observation instead of waiting for another model response;
 - each completed undersaturated Assimilator causes one nearest mineral Probe to be selected
   with tag-based tie-breaking and passed through upstream worker reallocation;
 - a failed screen-build world target and resolved screen position are excluded from the next
@@ -445,6 +450,12 @@ conversion; the final anchor, candidate center, and complete footprint must be v
 RTSCortex repeats the complete-footprint visibility check against the translator's resolved
 screen position before allowing the final Nexus primitive to enter PySC2.
 
+Gateway and Stargate production preserve the exact producer tag selected before translation.
+After the translator-owned camera primitive, the Worker waits for a fresh feature observation in
+which that exact allied producer is visible before consuming `select_point`. The wait is bounded;
+failure becomes `producer_not_observable` rather than a generic translation error, and the Worker
+never substitutes another producer between camera, selection, final primitive, and effect proof.
+
 Build execution now uses two-phase confirmation. First, the next SC2 observation must show
 that PySC2 accepted the primitive. The `ActionEffectVerifier` then defers the final
 `ExecutionReport` while it checks raw observations for a new structure tag of the expected
@@ -496,6 +507,11 @@ confirmed disappearance removes the unit and emits a command-owned
 or duplicate a command. Death confirmation advances on every SC2 observation even while the
 upstream action loop is locked, preventing a permanently missing team head from stalling the
 environment worker.
+The Worker also measures the gap from each SC2 observation to the latest Runtime decision. At
+`environment.observation_gap_watchdog_game_loops` it disables optional worker automation and asks
+the reviewed upstream hook to skip team gathering until a new Runtime decision arrives. If the
+gap reaches `environment.observation_gap_hard_limit_game_loops`, the run fails explicitly instead
+of allowing a seed-1-style multi-thousand-loop blind interval.
 An actor disappearing while its upstream team is executing transport `No_Operation` clears that
 control action without producing an execution report; unattributed semantic actions remain a
 fatal Bridge integrity violation.

@@ -30,6 +30,8 @@ def test_environment_settings_accept_melee_runtime_controls() -> None:
         simulation_speed_multiplier=0.25,
         pause_until_first_plan=True,
         action_effect_timeout_game_loops=96,
+        observation_gap_watchdog_game_loops=448,
+        observation_gap_hard_limit_game_loops=1792,
     )
 
     assert settings.opponent_race == "zerg"
@@ -40,6 +42,8 @@ def test_environment_settings_accept_melee_runtime_controls() -> None:
     assert settings.simulation_speed_multiplier == 0.25
     assert settings.pause_until_first_plan is True
     assert settings.action_effect_timeout_game_loops == 96
+    assert settings.observation_gap_watchdog_game_loops == 448
+    assert settings.observation_gap_hard_limit_game_loops == 1792
 
 
 @pytest.mark.parametrize("multiplier", [0.0, -0.1, 1.01])
@@ -51,6 +55,14 @@ def test_environment_settings_reject_invalid_simulation_speed(multiplier: float)
 def test_environment_settings_reject_invalid_action_effect_timeout() -> None:
     with pytest.raises(ValidationError):
         EnvironmentSettings(action_effect_timeout_game_loops=0)
+
+
+def test_environment_settings_rejects_inverted_observation_gap_limits() -> None:
+    with pytest.raises(ValidationError):
+        EnvironmentSettings(
+            observation_gap_watchdog_game_loops=448,
+            observation_gap_hard_limit_game_loops=448,
+        )
 
 
 def test_runtime_command_ttl_defaults_to_planning_interval() -> None:

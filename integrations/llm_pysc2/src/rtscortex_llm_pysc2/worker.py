@@ -40,6 +40,10 @@ from rtscortex_llm_pysc2.hook import RuntimeQueryMixin
 from rtscortex_llm_pysc2.production import ProductionSpec, production_spec
 from rtscortex_llm_pysc2.protocol import RuntimeClient
 
+PRODUCTION_CAMERA_SETTLE_MAX_OBSERVATIONS = 4
+DEFAULT_OBSERVATION_GAP_WATCHDOG_GAME_LOOPS = 448
+DEFAULT_OBSERVATION_GAP_HARD_LIMIT_GAME_LOOPS = 1792
+
 try:
     _upstream_agents = importlib.import_module("llm_pysc2.agents")
 except ModuleNotFoundError as error:
@@ -65,6 +69,12 @@ class WorkerSettings:
     pause_until_first_plan: bool = False
     runtime_request_timeout_seconds: float = 60.0
     action_effect_timeout_game_loops: int = DEFAULT_ACTION_EFFECT_TIMEOUT_GAME_LOOPS
+    observation_gap_watchdog_game_loops: int = (
+        DEFAULT_OBSERVATION_GAP_WATCHDOG_GAME_LOOPS
+    )
+    observation_gap_hard_limit_game_loops: int = (
+        DEFAULT_OBSERVATION_GAP_HARD_LIMIT_GAME_LOOPS
+    )
     console_enabled: bool = False
     console_frame_fps: float = 2.0
     console_jpeg_quality: int = 75
@@ -94,6 +104,26 @@ class WorkerSettings:
         )
         if action_effect_timeout_game_loops <= 0:
             raise RuntimeError("RTSCORTEX_ACTION_EFFECT_TIMEOUT_GAME_LOOPS must be positive")
+        observation_gap_watchdog_game_loops = int(
+            os.environ.get(
+                "RTSCORTEX_OBSERVATION_GAP_WATCHDOG_GAME_LOOPS",
+                str(DEFAULT_OBSERVATION_GAP_WATCHDOG_GAME_LOOPS),
+            )
+        )
+        observation_gap_hard_limit_game_loops = int(
+            os.environ.get(
+                "RTSCORTEX_OBSERVATION_GAP_HARD_LIMIT_GAME_LOOPS",
+                str(DEFAULT_OBSERVATION_GAP_HARD_LIMIT_GAME_LOOPS),
+            )
+        )
+        if observation_gap_watchdog_game_loops <= 0:
+            raise RuntimeError(
+                "RTSCORTEX_OBSERVATION_GAP_WATCHDOG_GAME_LOOPS must be positive"
+            )
+        if observation_gap_hard_limit_game_loops <= observation_gap_watchdog_game_loops:
+            raise RuntimeError(
+                "RTSCORTEX_OBSERVATION_GAP_HARD_LIMIT_GAME_LOOPS must exceed the watchdog threshold"
+            )
         pause_until_first_plan = _environment_bool("RTSCORTEX_PAUSE_UNTIL_FIRST_PLAN", False)
         console_enabled = _environment_bool("RTSCORTEX_CONSOLE_ENABLED", False)
         console_frame_fps = float(os.environ.get("RTSCORTEX_CONSOLE_FRAME_FPS", "2"))
@@ -117,6 +147,8 @@ class WorkerSettings:
             pause_until_first_plan=pause_until_first_plan,
             runtime_request_timeout_seconds=runtime_request_timeout_seconds,
             action_effect_timeout_game_loops=action_effect_timeout_game_loops,
+            observation_gap_watchdog_game_loops=observation_gap_watchdog_game_loops,
+            observation_gap_hard_limit_game_loops=observation_gap_hard_limit_game_loops,
             console_enabled=console_enabled,
             console_frame_fps=console_frame_fps,
             console_jpeg_quality=console_jpeg_quality,
@@ -148,6 +180,8 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
         self._rtscortex_translation_attempt: Optional[dict[str, Any]] = None
         self._rtscortex_semantic_action: Optional[dict[str, Any]] = None
         self._rtscortex_production_source_tag: Optional[int] = None
+        self._rtscortex_production_camera_waits = 0
+        self._rtscortex_camera_settlement_noop = False
         self._rtscortex_rejected_build_positions: dict[
             str, set[tuple[int, int]]
         ] = {}
@@ -160,8 +194,10 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
         broker.register(self)
 
     def get_func(self, obs: Any) -> Any:
+        self._rtscortex_camera_settlement_noop = False
         if not self.func_list and self.action_list:
             self._rtscortex_semantic_action = _isolate_next_action(self.action_list)
+            self._rtscortex_production_camera_waits = 0
             if production_spec(str(self.action_list[0].get("name", ""))) is None:
                 self._rtscortex_production_source_tag = None
         action: dict[str, Any] = (
@@ -170,6 +206,9 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
             else {"name": getattr(self, "curr_action_name", "")}
         )
         semantic_action_name = str(action.get("name", ""))
+        if self._wait_for_production_camera(semantic_action_name, obs):
+            self._rtscortex_camera_settlement_noop = True
+            return 0, _no_op()
         if not self.func_list and self.action_list:
             action_name = semantic_action_name
             if self._reject_unavailable_production_action(action, obs):
@@ -464,7 +503,39 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
         if dispatch.final_primitive:
             self._rtscortex_semantic_action = None
             self._rtscortex_production_source_tag = None
+            self._rtscortex_production_camera_waits = 0
         return result
+
+    def _wait_for_production_camera(self, action_name: str, obs: Any) -> bool:
+        """Wait for a post-camera feature observation before selecting a producer."""
+
+        if production_spec(action_name) is None or not self.func_list:
+            return False
+        next_function_id = int(self.func_list[0][0])
+        if next_function_id != 2 or int(self._rtscortex_translation_ordinal) != 1:
+            return False
+        producer_tag = self._rtscortex_production_source_tag
+        if producer_tag is None:
+            return False
+        if _producer_is_visible(obs.observation, producer_tag):
+            self._rtscortex_production_camera_waits = 0
+            return False
+        self._rtscortex_production_camera_waits += 1
+        if self._rtscortex_production_camera_waits <= (
+            PRODUCTION_CAMERA_SETTLE_MAX_OBSERVATIONS
+        ):
+            return True
+        self._settle_production_command_failure(
+            action_name,
+            obs,
+            failure_code="producer_not_observable",
+            reason=(
+                f"producer tag {hex(producer_tag)} did not become visible after camera "
+                f"settlement ({PRODUCTION_CAMERA_SETTLE_MAX_OBSERVATIONS} observations)"
+            ),
+        )
+        self._rtscortex_production_camera_waits = 0
+        return True
 
     def _validated_production_source_tag(
         self,
@@ -563,6 +634,7 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
         self.func_list.clear()
         self._rtscortex_semantic_action = None
         self._rtscortex_production_source_tag = None
+        self._rtscortex_production_camera_waits = 0
 
 
 class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
@@ -603,6 +675,9 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
         self._pending_primitive: Optional[PrimitiveDispatch] = None
         self._pending_primitive_agent: Optional[Any] = None
         self.transport_noop_primitives = 0
+        self._observation_watchdog_active = False
+        self._observation_watchdog_baseline_loop: Optional[int] = None
+        self._rtscortex_force_runtime_decision = False
         self._episode_reported = False
         self.initial_planning_barrier = InitialPlanningBarrier()
         self.game_clock = (
@@ -647,8 +722,11 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
         self.decision_broker.observe_effects(obs.observation)
         if _is_terminal(obs):
             return _finish_terminal(self, obs, _base_agent_step, _no_op)
+        observation_loop = _observation_game_loop(obs.observation)
+        watchdog_active = self._update_observation_gap_watchdog(observation_loop)
         worker_management_blocked = (
             self.decision_broker.coordinator.effect_verifier.blocks_auto_worker_management
+            or watchdog_active
         )
         _prime_deterministic_gas_rebalance(
             self,
@@ -789,6 +867,9 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
         if self._pending_primitive is not None or not self.AGENT_NAMES:
             return
         agent = self.agents[self.AGENT_NAMES[self.agent_id]]
+        if bool(getattr(agent, "_rtscortex_camera_settlement_noop", False)):
+            agent._rtscortex_camera_settlement_noop = False
+            return
         attempt = getattr(agent, "_rtscortex_translation_attempt", None)
         function_id = getattr(action, "function", None)
         if isinstance(attempt, Mapping) and function_id is not None:
@@ -857,6 +938,39 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
             return
         self._pending_primitive = dispatch
         self._pending_primitive_agent = agent
+
+    def _update_observation_gap_watchdog(self, game_loop: int) -> bool:
+        """Preempt optional upstream automation when Runtime observations stall."""
+
+        last_decision_loop = self.decision_broker.last_decision_game_loop
+        if last_decision_loop is None:
+            return False
+        if (
+            self._observation_watchdog_active
+            and self._observation_watchdog_baseline_loop is not None
+            and last_decision_loop > self._observation_watchdog_baseline_loop
+        ):
+            self._observation_watchdog_active = False
+            self._observation_watchdog_baseline_loop = None
+            self._rtscortex_force_runtime_decision = False
+        gap = game_loop - last_decision_loop
+        if (
+            not self._observation_watchdog_active
+            and gap > self.worker_settings.observation_gap_watchdog_game_loops
+        ):
+            self._observation_watchdog_active = True
+            self._observation_watchdog_baseline_loop = last_decision_loop
+            self._rtscortex_force_runtime_decision = True
+            self.decision_broker.record_observation_gap_watchdog_trigger()
+        if (
+            self._observation_watchdog_active
+            and gap > self.worker_settings.observation_gap_hard_limit_game_loops
+        ):
+            raise RuntimeError(
+                "observation_gap_watchdog_timeout: no Runtime decision for "
+                f"{gap} game loops (last decision loop {last_decision_loop})"
+            )
+        return self._observation_watchdog_active
 
     def _report_episode(self, obs: Any) -> None:
         reward = float(getattr(obs, "reward", 0.0) or 0.0)
@@ -1314,6 +1428,33 @@ def _production_source_invalid_reason(
     if int(value("active", 0)) != 0 or int(value("order_length", 0)) != 0:
         return f"{spec.action_name} producer {hex(source_tag)} became busy before final dispatch"
     return None
+
+
+def _producer_is_visible(observation: Any, producer_tag: int) -> bool:
+    feature_units = (
+        observation.get("feature_units", ())
+        if isinstance(observation, Mapping)
+        else getattr(observation, "feature_units", ())
+    )
+    for unit in feature_units:
+        tag = unit.get("tag", 0) if isinstance(unit, Mapping) else getattr(unit, "tag", 0)
+        alliance = (
+            unit.get("alliance", 0)
+            if isinstance(unit, Mapping)
+            else getattr(unit, "alliance", 0)
+        )
+        is_on_screen = (
+            unit.get("is_on_screen", True)
+            if isinstance(unit, Mapping)
+            else getattr(unit, "is_on_screen", True)
+        )
+        if (
+            int(tag) == producer_tag
+            and int(alliance) == 1
+            and bool(is_on_screen)
+        ):
+            return True
+    return False
 
 
 def _single_position(arguments: Any) -> Optional[tuple[float, float]]:

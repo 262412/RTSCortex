@@ -12,6 +12,7 @@ from rtscortex.playbook.models import (
     PlaybookHit,
     PlaybookLesson,
     PlaybookQuery,
+    PlaybookRuleKind,
     PlaybookSelection,
 )
 
@@ -106,7 +107,12 @@ class PlaybookStore:
             if lesson.status is not LessonStatus.PROMOTED and not query.include_candidates:
                 continue
             score, reasons = _match_score(query, lesson)
-            if "race" not in reasons or "opponent" not in reasons:
+            required_reasons = (
+                {"race"}
+                if lesson.rule_kind is PlaybookRuleKind.EXECUTION_GUARD
+                else {"race", "opponent"}
+            )
+            if not required_reasons.issubset(reasons):
                 continue
             hits.append(PlaybookHit(lesson=lesson, score=score, match_reasons=tuple(reasons)))
         hits.sort(key=lambda hit: (-hit.score, hit.lesson.lesson_id))

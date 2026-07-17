@@ -24,6 +24,7 @@ from rtscortex.runtime.live import (
     near_placement_patch_is_applied,
     nexus_exact_screen_scale_patch_is_applied,
     nexus_resource_clearance_patch_is_applied,
+    observation_gap_watchdog_patch_is_applied,
     pretranslation_abort_patch_is_applied,
     random_seed_patch_is_applied,
     reserved_builder_worker_patch_is_applied,
@@ -246,6 +247,8 @@ def _worker_patch_check(project_root: Path, *, required: bool) -> Check:
         missing.append("0013-preserve-reserved-builder-worker.patch")
     if not worker_workplace_refresh_patch_is_applied(project_root):
         missing.append("0014-refresh-worker-workplaces.patch")
+    if not observation_gap_watchdog_patch_is_applied(project_root):
+        missing.append("0015-observation-gap-watchdog.patch")
     status = "ok" if not missing else ("error" if required else "optional")
     detail = "all worker patches applied" if not missing else "apply " + ", ".join(missing)
     return Check("worker_patch", status, detail)

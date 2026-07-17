@@ -6,7 +6,7 @@ import hashlib
 from collections.abc import Sequence
 
 from rtscortex.contracts import EpisodeOutcome, EpisodeResult, ExecutionReport
-from rtscortex.cortex.models import GamePhase
+from rtscortex.game_phase import GamePhase
 from rtscortex.memory import StoredEvent
 from rtscortex.playbook.models import (
     DecisionCase,
@@ -15,6 +15,7 @@ from rtscortex.playbook.models import (
     LessonStatus,
     PlaybookContext,
     PlaybookLesson,
+    PlaybookRuleKind,
 )
 from rtscortex.playbook.store import PlaybookStore
 
@@ -25,6 +26,21 @@ class CortexPlaybookReviewer:
     def __init__(self, store: PlaybookStore, *, promotion_support: int = 2) -> None:
         self.store = store
         self.promotion_support = promotion_support
+        self.rebuild_lessons()
+
+    def rebuild_lessons(self) -> list[PlaybookLesson]:
+        """Backfill deduplicated rules from cases written by earlier runtime versions."""
+
+        representatives: dict[str, DecisionCase] = {}
+        for case in self.store.cases():
+            signature = _case_signature(case)
+            if signature is not None:
+                representatives[signature] = case
+        return [
+            lesson
+            for case in representatives.values()
+            if (lesson := self._consolidate(case)) is not None
+        ]
 
     def review_episode(
         self,
@@ -37,7 +53,8 @@ class CortexPlaybookReviewer:
         lineages = {
             str(event.payload.get("command_id")): event
             for event in events
-            if event.event_type == "command_lineage" and _source_role(event.payload) == "macro"
+            if event.event_type == "command_lineage"
+            and _source_role(event.payload) in {"macro", "tactical"}
         }
         phases = _phase_timeline(events)
         cases: list[DecisionCase] = []
@@ -54,6 +71,9 @@ class CortexPlaybookReviewer:
             )
             if self.store.add_case(rejected):
                 cases.append(rejected)
+                lesson = self._consolidate(rejected)
+                if lesson is not None:
+                    lessons.append(lesson)
         for event in events:
             if event.event_type != "execution":
                 continue
@@ -93,6 +113,7 @@ class CortexPlaybookReviewer:
                         None if report.execution_stage is None else report.execution_stage.value
                     ),
                     "failure_code": report.failure_code,
+                    "failure_reason": report.failure_reason,
                     "effect_evidence": (
                         None
                         if report.effect_evidence is None
@@ -111,41 +132,34 @@ class CortexPlaybookReviewer:
         return cases, lessons
 
     def _consolidate(self, case: DecisionCase) -> PlaybookLesson | None:
-        # Execution failures are diagnostic evidence, not tactical truth. A successful
-        # action in a lost game is also insufficient to claim strategic value.
-        if case.quality is not DecisionQuality.ADVANTAGE_GAINED:
+        signature = _case_signature(case)
+        if signature is None:
             return None
-        signature = "|".join(
-            (
-                case.context.agent_race,
-                case.context.opponent_race,
-                case.context.phase.value,
-                case.semantic_action,
-                "positive",
-            )
-        )
-        previous = self.store.lesson_by_signature(signature)
-        source_ids = tuple(
-            dict.fromkeys((*(previous.source_case_ids if previous else ()), case.case_id))
-        )
-        episode_identity = f"{case.run_id}/{case.episode_id}"
+        matching = [
+            candidate
+            for candidate in self.store.cases()
+            if _case_signature(candidate) == signature
+        ]
+        source_ids = tuple(dict.fromkeys(candidate.case_id for candidate in matching))
         source_episode_ids = tuple(
-            dict.fromkeys((*(previous.source_episode_ids if previous else ()), episode_identity))
+            dict.fromkeys(
+                f"{candidate.run_id}/{candidate.episode_id}" for candidate in matching
+            )
         )
         support = len(source_episode_ids)
         status = (
             LessonStatus.PROMOTED if support >= self.promotion_support else LessonStatus.CANDIDATE
         )
         confidence = min(0.95, 0.65 + support * 0.1)
+        rule_kind, statement, recommended_action, avoid_action = _rule_content(case)
         lesson = PlaybookLesson(
             lesson_id=_stable_id("lesson", signature),
             signature=signature,
             context=case.context,
-            statement=(
-                f"In {case.context.opponent_race} {case.context.phase.value}, "
-                f"{case.semantic_action} had a verified effect in a winning episode."
-            ),
-            recommended_action=case.semantic_action,
+            rule_kind=rule_kind,
+            statement=statement,
+            recommended_action=recommended_action,
+            avoid_action=avoid_action,
             status=status,
             confidence=confidence,
             support_count=support,
@@ -155,6 +169,91 @@ class CortexPlaybookReviewer:
         )
         self.store.upsert_lesson(lesson)
         return lesson
+
+
+def _case_signature(case: DecisionCase) -> str | None:
+    if case.quality is DecisionQuality.ADVANTAGE_GAINED:
+        return "|".join(
+            (
+                case.context.agent_race,
+                case.context.opponent_race,
+                case.context.phase.value,
+                case.semantic_action,
+                "positive",
+            )
+        )
+    if case.quality is DecisionQuality.STRATEGIC_ERROR:
+        reason = str(case.evidence.get("reason") or "blocked")
+        return "|".join(
+            (
+                case.context.agent_race,
+                case.context.opponent_race,
+                case.context.phase.value,
+                case.semantic_action,
+                reason,
+                "avoid",
+            )
+        )
+    if case.quality is DecisionQuality.EXECUTION_ERROR:
+        failure_code = str(case.evidence.get("failure_code") or "unknown")
+        return "|".join(
+            (
+                case.context.agent_race,
+                case.semantic_action,
+                failure_code,
+                "execution_guard",
+            )
+        )
+    return None
+
+
+def _rule_content(
+    case: DecisionCase,
+) -> tuple[PlaybookRuleKind, str, str | None, str | None]:
+    if case.quality is DecisionQuality.ADVANTAGE_GAINED:
+        return (
+            PlaybookRuleKind.STRATEGY,
+            f"In {case.context.opponent_race} {case.context.phase.value}, "
+            f"{case.semantic_action} had a verified effect in a winning episode.",
+            case.semantic_action,
+            None,
+        )
+    if case.quality is DecisionQuality.STRATEGIC_ERROR:
+        reason = str(case.evidence.get("reason") or "blocked")
+        return (
+            PlaybookRuleKind.STRATEGY,
+            f"Do not advance {case.semantic_action} while {reason}; "
+            "prefer a currently legal frontier.",
+            None,
+            case.semantic_action,
+        )
+    failure_code = str(case.evidence.get("failure_code") or "unknown")
+    action = case.semantic_action
+    if action.startswith(("TRAIN ", "RESEARCH ")) and failure_code in {
+        "producer_not_observable",
+        "production_provenance_missing",
+        "production_source_invalidated",
+        "translator_rejected",
+    }:
+        statement = (
+            f"Before {action}, bind one completed idle producer, move the camera to its exact tag, "
+            "wait for a fresh feature observation, then select that same tag."
+        )
+    elif failure_code in {"target_not_visible", "friendly_target"}:
+        statement = (
+            f"Before {action}, reacquire a currently visible enemy tag and revalidate alliance."
+        )
+    elif failure_code in {"no_legal_placement", "candidate_invalidated"}:
+        statement = (
+            f"Before retrying {action}, discard the stale placement and resample "
+            "current legal candidates."
+        )
+    else:
+        statement = (
+            f"Before retrying {action}, resolve execution failure {failure_code} "
+            "and revalidate the current candidate."
+        )
+    return PlaybookRuleKind.EXECUTION_GUARD, statement, None, None
 
 
 def _assess(

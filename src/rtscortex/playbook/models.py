@@ -7,7 +7,7 @@ from enum import StrEnum
 from pydantic import Field
 
 from rtscortex.contracts.models import ContractModel
-from rtscortex.cortex.models import GamePhase
+from rtscortex.game_phase import GamePhase
 
 
 class DecisionQuality(StrEnum):
@@ -32,6 +32,13 @@ class LessonStatus(StrEnum):
     PROMOTED = "promoted"
     CONTRADICTED = "contradicted"
     RETIRED = "retired"
+
+
+class PlaybookRuleKind(StrEnum):
+    """Minimal rule split; finer tactical taxonomy is intentionally deferred."""
+
+    STRATEGY = "strategy"
+    EXECUTION_GUARD = "execution_guard"
 
 
 class PlaybookContext(ContractModel):
@@ -66,7 +73,8 @@ class PlaybookLesson(ContractModel):
     lesson_id: str = Field(min_length=1)
     signature: str = Field(min_length=1)
     context: PlaybookContext
-    statement: str = Field(min_length=1)
+    rule_kind: PlaybookRuleKind = PlaybookRuleKind.STRATEGY
+    statement: str = Field(min_length=1, max_length=360)
     recommended_action: str | None = None
     avoid_action: str | None = None
     status: LessonStatus
