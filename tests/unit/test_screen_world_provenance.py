@@ -240,6 +240,7 @@ def test_agent_reprojects_before_current_candidate_domain_check(
     )
     observation.player_common = SimpleNamespace(minerals=500)
     observation.game_loop = [400]
+    observation.available_actions = [35]
     assert build_screen_candidates(observation, "Build_Pylon_Screen") == []
 
     action: dict[str, Any] = {

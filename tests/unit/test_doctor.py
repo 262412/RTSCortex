@@ -108,6 +108,7 @@ def test_worker_patch_is_required_only_for_live_runs(tmp_path: Path) -> None:
         "elif not self._all_agent_executing_finished():\n"
         "    pass\n"
         "return translator settlement no_op\n"
+        "_rtscortex_camera_settlement_noop\n"
         "if tag not in self.unit_uid_disappear:\n"
         "agent.curr_action_name != 'No_Operation'\n"
         "wait for confirmed disappearance\n"
@@ -272,6 +273,15 @@ def test_worker_patch_is_required_only_for_live_runs(tmp_path: Path) -> None:
     assert visible_selection_check.status == "error"
     assert "0016-accept-visible-team-unit.patch" in visible_selection_check.detail
     funcs_source.write_text(complete_funcs_source, encoding="utf-8")
+
+    source.write_text(
+        complete_main_source.replace("_rtscortex_camera_settlement_noop\n", ""),
+        encoding="utf-8",
+    )
+    camera_settlement_check = _worker_patch_check(tmp_path, required=True)
+    assert camera_settlement_check.status == "error"
+    assert "0017-return-camera-settlement-noop.patch" in camera_settlement_check.detail
+    source.write_text(complete_main_source, encoding="utf-8")
 
     complete_main_source = source.read_text(encoding="utf-8")
     source.write_text(

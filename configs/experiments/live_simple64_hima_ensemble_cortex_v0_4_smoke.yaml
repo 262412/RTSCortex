@@ -5,13 +5,13 @@ run:
 environment:
   adapter: llm_pysc2
   scenario: Simple64
-  max_steps: 1000
+  max_steps: 5200
   agent_race: protoss
   opponent_race: zerg
   opponent_difficulty: very_easy
   opponent_build: macro
   step_mul: 1
-  game_steps_per_episode: 800
+  game_steps_per_episode: 5200
   simulation_speed_multiplier: 0.25
   pause_until_first_plan: true
   sc2_path: ~/scratch/StarCraftII

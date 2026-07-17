@@ -106,6 +106,7 @@ jobs:
             ../../integrations/llm_pysc2/patches/0014-refresh-worker-workplaces.patch
             ../../integrations/llm_pysc2/patches/0015-observation-gap-watchdog.patch
             ../../integrations/llm_pysc2/patches/0016-accept-visible-team-unit.patch
+            ../../integrations/llm_pysc2/patches/0017-return-camera-settlement-noop.patch
           )
           applied=()
           cleanup() {

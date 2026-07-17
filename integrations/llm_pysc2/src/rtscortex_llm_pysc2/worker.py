@@ -41,6 +41,7 @@ from rtscortex_llm_pysc2.production import ProductionSpec, production_spec
 from rtscortex_llm_pysc2.protocol import RuntimeClient
 
 PRODUCTION_CAMERA_SETTLE_MAX_OBSERVATIONS = 4
+BUILD_SELECTION_RETRY_MAX_OBSERVATIONS = 2
 DEFAULT_OBSERVATION_GAP_WATCHDOG_GAME_LOOPS = 448
 DEFAULT_OBSERVATION_GAP_HARD_LIMIT_GAME_LOOPS = 1792
 
@@ -175,6 +176,8 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
         self._rtscortex_semantic_action: Optional[dict[str, Any]] = None
         self._rtscortex_production_source_tag: Optional[int] = None
         self._rtscortex_production_camera_waits = 0
+        self._rtscortex_production_camera_wait_loop: Optional[int] = None
+        self._rtscortex_build_selection_retries = 0
         self._rtscortex_camera_settlement_noop = False
         self._rtscortex_rejected_build_positions: dict[str, set[tuple[int, int]]] = {}
         self._rtscortex_rejected_build_targets: dict[str, set[tuple[float, float]]] = {}
@@ -185,14 +188,22 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
 
     def get_func(self, obs: Any) -> Any:
         self._rtscortex_camera_settlement_noop = False
-        if not self.func_list and self.action_list:
+        semantic_action = getattr(self, "_rtscortex_semantic_action", None)
+        if (
+            not self.func_list
+            and self.action_list
+            and semantic_action is None
+        ):
             self._rtscortex_semantic_action = _isolate_next_action(self.action_list)
+            semantic_action = self._rtscortex_semantic_action
             self._rtscortex_production_camera_waits = 0
+            self._rtscortex_production_camera_wait_loop = None
+            self._rtscortex_build_selection_retries = 0
             if production_spec(str(self.action_list[0].get("name", ""))) is None:
                 self._rtscortex_production_source_tag = None
         action: dict[str, Any] = (
-            self._rtscortex_semantic_action
-            if self._rtscortex_semantic_action is not None
+            semantic_action
+            if semantic_action is not None
             else {"name": getattr(self, "curr_action_name", "")}
         )
         semantic_action_name = str(action.get("name", ""))
@@ -324,6 +335,12 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
             if resolved is not None:
                 if command_id is not None:
                     self.broker.resolve_arguments(command_id, [resolved])
+            build_reselection = self._reselect_builder_for_unavailable_build(
+                action,
+                obs,
+            )
+            if build_reselection is not None:
+                return build_reselection
         # Upstream consumes and mutates the semantic action while translating it.
         # Keep the already validated request for the final candidate-domain audit.
         candidate_action = copy.deepcopy(action)
@@ -491,7 +508,36 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
             self._rtscortex_semantic_action = None
             self._rtscortex_production_source_tag = None
             self._rtscortex_production_camera_waits = 0
+            self._rtscortex_production_camera_wait_loop = None
+            self._rtscortex_build_selection_retries = 0
         return result
+
+    def _reselect_builder_for_unavailable_build(
+        self,
+        action: Mapping[str, Any],
+        obs: Any,
+    ) -> Optional[tuple[int, Any]]:
+        """Repair a stale feature selection before translating a screen build."""
+
+        action_name = str(action.get("name", ""))
+        spec = BUILD_SPECS.get(action_name)
+        functions = action.get("func", ())
+        if spec is None or spec.placement_kind != "screen" or not functions:
+            return None
+        requested_function_id = int(functions[0][0])
+        available_actions = set(_observation_value(obs.observation, "available_actions", ()))
+        if requested_function_id in available_actions:
+            self._rtscortex_build_selection_retries = 0
+            return None
+        if self._rtscortex_build_selection_retries >= BUILD_SELECTION_RETRY_MAX_OBSERVATIONS:
+            return None
+        builder_tag = _execution_unit_tag(self)
+        position = _visible_feature_position(obs.observation, builder_tag)
+        if position is None:
+            return None
+        self._rtscortex_build_selection_retries += 1
+        actions = importlib.import_module("pysc2.lib.actions")
+        return 2, actions.FUNCTIONS.select_point("select", position)
 
     def _wait_for_production_camera(self, action_name: str, obs: Any) -> bool:
         """Wait for a post-camera feature observation before selecting a producer."""
@@ -510,7 +556,12 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
             size_screen=int(self.size_screen),
         ):
             self._rtscortex_production_camera_waits = 0
+            self._rtscortex_production_camera_wait_loop = None
             return False
+        observation_loop = _observation_game_loop(obs.observation)
+        if self._rtscortex_production_camera_wait_loop == observation_loop:
+            return True
+        self._rtscortex_production_camera_wait_loop = observation_loop
         self._rtscortex_production_camera_waits += 1
         if self._rtscortex_production_camera_waits <= (PRODUCTION_CAMERA_SETTLE_MAX_OBSERVATIONS):
             return True
@@ -524,6 +575,7 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
             ),
         )
         self._rtscortex_production_camera_waits = 0
+        self._rtscortex_production_camera_wait_loop = None
         return True
 
     def _validated_production_source_tag(
@@ -632,6 +684,7 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
         self._rtscortex_semantic_action = None
         self._rtscortex_production_source_tag = None
         self._rtscortex_production_camera_waits = 0
+        self._rtscortex_production_camera_wait_loop = None
 
 
 class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
@@ -721,9 +774,10 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
         if _is_terminal(obs):
             return _finish_terminal(self, obs, _base_agent_step, _no_op)
         observation_loop = _observation_game_loop(obs.observation)
+        # RTSCortex consumes a global raw snapshot. Do not make every Runtime tick
+        # wait for optional upstream camera/selection-based text gathering.
+        _release_runtime_observation_barrier(self)
         watchdog_active = self._update_observation_gap_watchdog(observation_loop)
-        if watchdog_active:
-            _release_runtime_observation_barrier(self)
         worker_management_blocked = (
             self.decision_broker.coordinator.effect_verifier.blocks_auto_worker_management
             or watchdog_active
@@ -1302,6 +1356,7 @@ def _release_runtime_observation_barrier(main_agent: Any) -> None:
         observed_tags = getattr(agent, "team_unit_tag_list", None)
         if not isinstance(observed_tags, list):
             continue
+        observed_teams = getattr(agent, "team_unit_team_list", None)
         for team in getattr(agent, "teams", ()):
             if not isinstance(team, Mapping):
                 continue
@@ -1309,7 +1364,12 @@ def _release_runtime_observation_barrier(main_agent: Any) -> None:
                 int(tag) for tag in team.get("unit_tags", ()) if int(tag) not in disappeared
             ]
             required_tags = live_tags if team.get("select_type") == "select" else live_tags[:1]
-            observed_tags.extend(tag for tag in required_tags if tag not in observed_tags)
+            for tag in required_tags:
+                if tag in observed_tags:
+                    continue
+                observed_tags.append(tag)
+                if isinstance(observed_teams, list):
+                    observed_teams.append(str(team.get("name", "")))
 
 
 def _translated_build_position(
@@ -1435,6 +1495,29 @@ def _producer_is_visible(
         ):
             return True
     return False
+
+
+def _visible_feature_position(
+    observation: Any,
+    unit_tag: Optional[int],
+) -> Optional[tuple[int, int]]:
+    """Return the current screen point for one visible friendly feature unit."""
+
+    if unit_tag is None:
+        return None
+    feature_units = _observation_value(observation, "feature_units", ())
+    for unit in feature_units:
+        if int(_observation_value(unit, "tag", 0)) != unit_tag:
+            continue
+        if int(_observation_value(unit, "alliance", 0)) != 1:
+            return None
+        if not bool(_observation_value(unit, "is_on_screen", True)):
+            return None
+        return (
+            int(_observation_value(unit, "x", 0)),
+            int(_observation_value(unit, "y", 0)),
+        )
+    return None
 
 
 def _single_position(arguments: Any) -> Optional[tuple[float, float]]:

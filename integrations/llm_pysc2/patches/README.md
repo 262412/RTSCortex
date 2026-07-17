@@ -68,12 +68,20 @@ git -C third_party/LLM-PySC2 apply --check \
   ../../integrations/llm_pysc2/patches/0016-accept-visible-team-unit.patch
 git -C third_party/LLM-PySC2 apply \
   ../../integrations/llm_pysc2/patches/0016-accept-visible-team-unit.patch
+git -C third_party/LLM-PySC2 apply --check \
+  ../../integrations/llm_pysc2/patches/0017-return-camera-settlement-noop.patch
+git -C third_party/LLM-PySC2 apply \
+  ../../integrations/llm_pysc2/patches/0017-return-camera-settlement-noop.patch
 ```
 
 After the live run, restore the clean pinned checkout by reversing exactly these reviewed
 patches in reverse order:
 
 ```bash
+git -C third_party/LLM-PySC2 apply --reverse --check \
+  ../../integrations/llm_pysc2/patches/0017-return-camera-settlement-noop.patch
+git -C third_party/LLM-PySC2 apply --reverse \
+  ../../integrations/llm_pysc2/patches/0017-return-camera-settlement-noop.patch
 git -C third_party/LLM-PySC2 apply --reverse --check \
   ../../integrations/llm_pysc2/patches/0016-accept-visible-team-unit.patch
 git -C third_party/LLM-PySC2 apply --reverse \
@@ -238,7 +246,11 @@ point-to-rectangle selection fallback when a team unit is already visible. RTSCo
 this behavior because its Runtime observation is global; selection remains required later for
 actual feature actions.
 
-CI applies all sixteen patches in order under Python 3.9, compiles and imports both projects, and
+`0017-return-camera-settlement-noop.patch` yields the current SC2 step after a production
+camera move. The producer visibility timeout therefore counts distinct PySC2 observations
+instead of repeated translator calls within one upstream waiting loop.
+
+CI applies all seventeen patches in order under Python 3.9, compiles and imports both projects, and
 runs `integrations/llm_pysc2/tests/python39_contract_smoke.py`. The smoke locks the v1.1
 candidate mapping, multi-argument translator rejection, Nexus camera-settlement primitive,
 exact Nexus anchor, floating-point resource clearance, visible complete-footprint behavior,

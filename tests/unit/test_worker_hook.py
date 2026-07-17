@@ -388,6 +388,7 @@ def test_production_camera_waits_for_exact_producer_feature_observation() -> Non
     agent._rtscortex_translation_ordinal = 1
     agent._rtscortex_production_source_tag = 0xBBB
     agent._rtscortex_production_camera_waits = 0
+    agent._rtscortex_production_camera_wait_loop = None
     agent.size_screen = 128
 
     assert agent._wait_for_production_camera("Train_Zealot", timestep) is True
@@ -459,6 +460,7 @@ def test_production_camera_settlement_timeout_is_structured_failure() -> None:
     agent._rtscortex_translation_ordinal = 1
     agent._rtscortex_production_source_tag = 0xBBB
     agent._rtscortex_production_camera_waits = 0
+    agent._rtscortex_production_camera_wait_loop = None
     agent.size_screen = 128
     agent._rtscortex_semantic_action = {"name": "Train_Adept"}
     agent.team_unit_team_curr = None
@@ -467,7 +469,8 @@ def test_production_camera_settlement_timeout_is_structured_failure() -> None:
     agent.flag_enable_empty_unit_group = True
     timestep = _fake_timestep()
 
-    for _ in range(5):
+    for offset in range(5):
+        timestep.observation.game_loop = [224 + offset]
         assert agent._wait_for_production_camera("Train_Adept", timestep) is True
     broker.end_episode(_episode_result())
 
@@ -476,6 +479,63 @@ def test_production_camera_settlement_timeout_is_structured_failure() -> None:
     assert report["status"] == "failed"
     assert report["failure_code"] == "producer_not_observable"
     assert report["execution_stage"] == "translation"
+
+
+def test_production_camera_counts_unique_observations_only() -> None:
+    timestep = _fake_timestep()
+    agent = cast(Any, object.__new__(RTSCortexLLMAgent))
+    agent.func_list = [(2, object(), ("select", 0xBBB)), (503, object(), ())]
+    agent._rtscortex_translation_ordinal = 1
+    agent._rtscortex_production_source_tag = 0xBBB
+    agent._rtscortex_production_camera_waits = 0
+    agent._rtscortex_production_camera_wait_loop = None
+    agent.size_screen = 128
+
+    for _ in range(5):
+        assert agent._wait_for_production_camera("Train_Zealot", timestep) is True
+
+    assert agent._rtscortex_production_camera_waits == 1
+
+
+def test_unavailable_screen_build_reselects_exact_builder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_actions = SimpleNamespace(
+        FUNCTIONS=SimpleNamespace(
+            select_point=lambda _mode, position: SimpleNamespace(
+                function=2,
+                arguments=[[0], list(position)],
+            )
+        )
+    )
+    original_import = importlib.import_module
+    monkeypatch.setattr(
+        importlib,
+        "import_module",
+        lambda name: fake_actions if name == "pysc2.lib.actions" else original_import(name),
+    )
+    timestep = _fake_timestep()
+    builder = _unit(0xAAA, 84, 1, 45, 52, 20, 255)
+    builder.is_on_screen = True
+    timestep.observation.feature_units.append(builder)
+    timestep.observation.available_actions = [0, 2]
+    agent = cast(Any, object.__new__(RTSCortexLLMAgent))
+    agent.team_unit_tag_curr = 0xAAA
+    agent._rtscortex_build_selection_retries = 0
+    action = {
+        "name": "Build_Gateway_Screen",
+        "func": [(57, object(), ("now", [64, 64]))],
+    }
+
+    function_id, function_call = agent._reselect_builder_for_unavailable_build(action, timestep)
+
+    assert function_id == 2
+    assert function_call.arguments[1] == [45, 52]
+    assert agent._rtscortex_build_selection_retries == 1
+
+    timestep.observation.available_actions.append(57)
+    assert agent._reselect_builder_for_unavailable_build(action, timestep) is None
+    assert agent._rtscortex_build_selection_retries == 0
 
 
 def test_observation_gap_watchdog_preempts_once_and_recovers() -> None:
@@ -536,20 +596,29 @@ def test_observation_gap_watchdog_fails_before_unbounded_stall() -> None:
 def test_observation_gap_watchdog_releases_optional_team_selection_barrier() -> None:
     exact = SimpleNamespace(
         enable=True,
-        teams=[{"select_type": "select", "unit_tags": [0xA, 0xB]}],
+        teams=[{"name": "Probe-1", "select_type": "select", "unit_tags": [0xA, 0xB]}],
         team_unit_tag_list=[],
+        team_unit_team_list=[],
         _is_waiting_query=lambda: True,
     )
     grouped = SimpleNamespace(
         enable=True,
-        teams=[{"select_type": "select_all_type", "unit_tags": [0xC, 0xD]}],
+        teams=[
+            {
+                "name": "Zealot-1",
+                "select_type": "select_all_type",
+                "unit_tags": [0xC, 0xD],
+            }
+        ],
         team_unit_tag_list=[],
+        team_unit_team_list=[],
         _is_waiting_query=lambda: True,
     )
     busy = SimpleNamespace(
         enable=True,
-        teams=[{"select_type": "select", "unit_tags": [0xE]}],
+        teams=[{"name": "Busy-1", "select_type": "select", "unit_tags": [0xE]}],
         team_unit_tag_list=[],
+        team_unit_team_list=[],
         _is_waiting_query=lambda: False,
     )
     main_agent = SimpleNamespace(
@@ -558,9 +627,12 @@ def test_observation_gap_watchdog_releases_optional_team_selection_barrier() -> 
     )
 
     _release_runtime_observation_barrier(main_agent)
+    _release_runtime_observation_barrier(main_agent)
 
     assert exact.team_unit_tag_list == [0xA]
+    assert exact.team_unit_team_list == ["Probe-1"]
     assert grouped.team_unit_tag_list == [0xC]
+    assert grouped.team_unit_team_list == ["Zealot-1"]
     assert busy.team_unit_tag_list == []
 
 

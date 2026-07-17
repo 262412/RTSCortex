@@ -18,6 +18,7 @@ from rtscortex.runtime.live import (
     LiveEnvironmentError,
     atomic_log_directory_patch_is_applied,
     build_feature_plane_patch_is_applied,
+    camera_settlement_noop_patch_is_applied,
     gas_rebalance_worker_management_patch_is_applied,
     live_scenario_spec,
     max_frames_episode_hook_patch_is_applied,
@@ -252,6 +253,8 @@ def _worker_patch_check(project_root: Path, *, required: bool) -> Check:
         missing.append("0015-observation-gap-watchdog.patch")
     if not visible_team_selection_patch_is_applied(project_root):
         missing.append("0016-accept-visible-team-unit.patch")
+    if not camera_settlement_noop_patch_is_applied(project_root):
+        missing.append("0017-return-camera-settlement-noop.patch")
     status = "ok" if not missing else ("error" if required else "optional")
     detail = "all worker patches applied" if not missing else "apply " + ", ".join(missing)
     return Check("worker_patch", status, detail)
