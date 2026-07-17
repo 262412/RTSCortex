@@ -54,6 +54,7 @@ class ScreenCandidateProvenance:
 BUILD_SPECS = {
     "Build_Pylon_Screen": BuildSpec("Pylon", "screen", 2, False, 100),
     "Build_Gateway_Screen": BuildSpec("Gateway", "screen", 3, True, 150),
+    "Build_Forge_Screen": BuildSpec("Forge", "screen", 3, True, 150),
     "Build_CyberneticsCore_Screen": BuildSpec(
         "CyberneticsCore",
         "screen",

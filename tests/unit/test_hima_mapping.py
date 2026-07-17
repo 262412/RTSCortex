@@ -72,7 +72,7 @@ def _macro_ready_state(
 
 
 def test_mapping_registry_exposes_first_expanded_protoss_semantics() -> None:
-    assert len(HIMA_RUNTIME_MAPPINGS) == 14
+    assert len(HIMA_RUNTIME_MAPPINGS) == 15
     assert {item.macro_action for item in HIMA_RUNTIME_MAPPINGS} == {
         "TRAIN ZEALOT",
         "TRAIN STALKER",
@@ -82,6 +82,7 @@ def test_mapping_registry_exposes_first_expanded_protoss_semantics() -> None:
         "TRAIN ORACLE",
         "BUILD PYLON",
         "BUILD GATEWAY",
+        "BUILD FORGE",
         "BUILD CYBERNETICSCORE",
         "BUILD ASSIMILATOR",
         "BUILD NEXUS",
@@ -98,6 +99,7 @@ def test_mapping_registry_exposes_first_expanded_protoss_semantics() -> None:
     assert mappings["TRAIN ORACLE"] == ("Train_Oracle",)
     assert mappings["TRAIN PHOENIX"] == ("Train_Phoenix",)
     assert mappings["BUILD SHIELDBATTERY"] == ("Build_ShieldBattery_Screen",)
+    assert mappings["BUILD FORGE"] == ("Build_Forge_Screen",)
 
 
 def test_mapper_uses_exact_oracle_phoenix_and_shield_battery_runtime_actions() -> None:
@@ -175,11 +177,11 @@ def test_hima_protoss_a_fixed_outputs_have_expanded_mapping_golden() -> None:
 
     assert evaluated_fixture_ids == list(fixtures)
     assert effective_counts == {
-        "parse_error": 2,
-        "unsupported_by_runtime": 961,
-        "mapped_future": 582,
+        "parse_error": 1,
+        "unsupported_by_runtime": 987,
+        "mapped_future": 587,
         "mapped_legal_now": 14,
-        "mapped_deferred": 91,
+        "mapped_deferred": 98,
     }
     assert sum(
         effective_counts[classification]
@@ -190,8 +192,8 @@ def test_hima_protoss_a_fixed_outputs_have_expanded_mapping_golden() -> None:
             "illegal_action",
             "obsolete",
         )
-    ) == 687
-    assert sum(effective_counts.values()) == 1_650
+    ) == 699
+    assert sum(effective_counts.values()) == 1_687
 
 
 def test_mapper_binds_frontier_actor_and_candidate_from_observation() -> None:

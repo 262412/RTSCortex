@@ -273,6 +273,42 @@ def test_tactical_retreat_selects_reserved_home_minimap_candidate() -> None:
     assert [candidate.arguments for candidate in context.candidates] == [[[12, 12]]]
 
 
+def test_tactical_reacquire_move_is_suppressed_until_cooldown_expires() -> None:
+    base = _observation()
+    observation = base.model_copy(
+        update={
+            "state": base.state.model_copy(update={"visible_enemies": []}),
+            "available_actions": [
+                action for action in base.available_actions if action.name == "Move_Minimap"
+            ],
+        }
+    )
+    agent = DeterministicTacticalAgent(
+        retreat_health_threshold=0.3,
+        minimum_advance_army_supply=4,
+        reacquire_cooldown_game_loops=112,
+    )
+
+    first = agent.evaluate(
+        observation,
+        DeterministicSituationAnalyzer().assess(observation),
+    )
+    during_cooldown = observation.model_copy(update={"step_id": 5, "game_loop": 100})
+    second = agent.evaluate(
+        during_cooldown,
+        DeterministicSituationAnalyzer().assess(during_cooldown),
+    )
+    after_cooldown = observation.model_copy(update={"step_id": 6, "game_loop": 176})
+    third = agent.evaluate(
+        after_cooldown,
+        DeterministicSituationAnalyzer().assess(after_cooldown),
+    )
+
+    assert len(first) == 1
+    assert second == []
+    assert len(third) == 1
+
+
 def test_executor_prefers_goal_advancing_candidate_and_materializes_wire_command() -> None:
     observation = _observation()
     intent = TacticalIntent(

@@ -91,6 +91,33 @@ def test_macro_plan_rejects_uncorrelated_response_and_invalid_ttl() -> None:
         )
 
 
+def test_macro_plan_bounds_long_hima_objective_before_goal_projection() -> None:
+    observation = _pylon_observation()
+    response = _response("Actions: ['Pylon']")
+    long_objective = (
+        "Transition into a balanced Protoss force with continuous production, "
+        "air control, map vision, resilient static defense, a secure expansion, "
+        "and enough reserves to replace losses while preserving pressure against "
+        "every enemy counterattack and technology transition. "
+        "Maintain this posture until the enemy economy collapses."
+    )
+    response = response.model_copy(
+        update={
+            "proposal": response.proposal.model_copy(
+                update={"strategic_objective": long_objective}
+            )
+        }
+    )
+
+    plan = macro_plan_from_hima(response, observation, ttl_game_loops=448)
+    goal = macro_goal_spec(plan, observation)
+
+    assert len(plan.strategic_objective) <= 240
+    assert plan.strategic_objective.endswith("...")
+    assert goal is not None
+    assert goal.strategic_goal == plan.strategic_objective
+
+
 def test_runtime_frontier_skips_managed_probe() -> None:
     proposal = _response("Actions: ['Probe', 'Pylon']").proposal
 

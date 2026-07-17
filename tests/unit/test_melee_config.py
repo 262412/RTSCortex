@@ -30,6 +30,7 @@ def melee_config_type(monkeypatch: pytest.MonkeyPatch) -> Iterator[tuple[type[An
                             {"name": "No_Operation", "arg": [], "func": [(0, None, ())]},
                             {"name": "Attack_Unit", "arg": ["tag"], "func": []},
                             {"name": "Build_Pylon_Screen", "arg": ["screen"], "func": []},
+                            {"name": "Build_Forge_Screen", "arg": ["screen"], "func": []},
                             {"name": "Build_Assimilator_Near", "arg": ["tag"], "func": []},
                             {"name": "Build_Assimilator_Screen", "arg": ["screen"], "func": []},
                             {"name": "Build_Nexus_Near", "arg": ["tag"], "func": []},
@@ -238,6 +239,7 @@ def test_melee_config_preserves_build_train_research_and_combat_actions(
     }
 
     assert "Build_Pylon_Screen" in action_names["Builder"]
+    assert "Build_Forge_Screen" in action_names["Builder"]
     assert "Build_Stargate_Screen" in action_names["Builder"]
     assert "Build_ShieldBattery_Screen" in action_names["Builder"]
     assert {

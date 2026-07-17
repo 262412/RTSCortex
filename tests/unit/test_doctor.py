@@ -188,7 +188,8 @@ def test_worker_patch_is_required_only_for_live_runs(tmp_path: Path) -> None:
         "reversed(possible_working_place_nexus_tag_list)\n"
         "Stale worker workplace\n"
         "if len(working_place_unit_list) == 0:\n"
-        "_rtscortex_force_runtime_decision\n",
+        "_rtscortex_force_runtime_decision\n"
+        "_rtscortex_accept_visible_team_unit\n",
         encoding="utf-8",
     )
 
@@ -261,6 +262,15 @@ def test_worker_patch_is_required_only_for_live_runs(tmp_path: Path) -> None:
     watchdog_check = _worker_patch_check(tmp_path, required=True)
     assert watchdog_check.status == "error"
     assert "0015-observation-gap-watchdog.patch" in watchdog_check.detail
+    funcs_source.write_text(complete_funcs_source, encoding="utf-8")
+
+    funcs_source.write_text(
+        complete_funcs_source.replace("_rtscortex_accept_visible_team_unit\n", ""),
+        encoding="utf-8",
+    )
+    visible_selection_check = _worker_patch_check(tmp_path, required=True)
+    assert visible_selection_check.status == "error"
+    assert "0016-accept-visible-team-unit.patch" in visible_selection_check.detail
     funcs_source.write_text(complete_funcs_source, encoding="utf-8")
 
     complete_main_source = source.read_text(encoding="utf-8")

@@ -23,6 +23,7 @@ POST_ORDER_EFFECT_GRACE_GAME_LOOPS = 32
 _BUILD_RAW_FUNCTION_IDS = {
     "Assimilator": 36,
     "CyberneticsCore": 47,
+    "Forge": 38,
     "Gateway": 37,
     "Nexus": 34,
     "Pylon": 35,

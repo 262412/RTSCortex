@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import json
 import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -37,8 +38,8 @@ from rtscortex_llm_pysc2.worker import (
     _prime_deterministic_gas_rebalance,
     _producer_is_visible,
     _production_source_invalid_reason,
-    _production_source_world_position,
     _refresh_build_action_position,
+    _release_runtime_observation_barrier,
     _replace_screen_action_position,
     _resolve_build_action_position,
     _run_with_auto_worker_management_guard,
@@ -207,6 +208,41 @@ def test_broker_times_out_if_an_enabled_agent_never_submits() -> None:
     assert runtime.tick_calls == 0
 
 
+def test_broker_releases_barrier_when_missing_combat_agent_is_disabled() -> None:
+    runtime = FakeRuntime()
+    broker = SharedDecisionBroker(
+        BridgeCoordinator(runtime),
+        TimeStepExtractor("run-worker", "episode-worker"),
+        decision_timeout_seconds=1.0,
+    )
+    timestep = _fake_timestep()
+    first = FakeAgent("AgentA", "A", timestep, broker)
+    second = FakeAgent("AgentB", "B", timestep, broker)
+    departed = FakeAgent("CombatGroup0", "C", timestep, broker)
+    for agent in (first, second, departed):
+        broker.register(agent)
+
+    errors: list[BaseException] = []
+
+    def submit(agent: FakeAgent) -> None:
+        try:
+            broker.submit(agent, timestep, f"observation from {agent.name}")
+        except BaseException as error:  # pragma: no cover - asserted below
+            errors.append(error)
+
+    threads = [threading.Thread(target=submit, args=(agent,)) for agent in (first, second)]
+    for thread in threads:
+        thread.start()
+    time.sleep(0.1)
+    departed.enable = False
+    for thread in threads:
+        thread.join(timeout=2)
+
+    assert errors == []
+    assert all(not thread.is_alive() for thread in threads)
+    assert runtime.tick_calls == 1
+
+
 def test_terminal_seam_skips_main_loop_reports_and_closes() -> None:
     events: list[str] = []
     agent = TerminalAgent(events)
@@ -352,6 +388,7 @@ def test_production_camera_waits_for_exact_producer_feature_observation() -> Non
     agent._rtscortex_translation_ordinal = 1
     agent._rtscortex_production_source_tag = 0xBBB
     agent._rtscortex_production_camera_waits = 0
+    agent.size_screen = 128
 
     assert agent._wait_for_production_camera("Train_Zealot", timestep) is True
     assert agent._rtscortex_production_camera_waits == 1
@@ -360,9 +397,20 @@ def test_production_camera_waits_for_exact_producer_feature_observation() -> Non
     producer.is_on_screen = True
     timestep.observation.feature_units.append(producer)
 
-    assert _producer_is_visible(timestep.observation, 0xBBB) is True
+    assert _producer_is_visible(
+        timestep.observation,
+        0xBBB,
+        size_screen=128,
+    ) is True
     assert agent._wait_for_production_camera("Train_Zealot", timestep) is False
     assert agent._rtscortex_production_camera_waits == 0
+
+    producer.x = 0
+    assert _producer_is_visible(
+        timestep.observation,
+        0xBBB,
+        size_screen=128,
+    ) is False
 
 
 def test_production_camera_settlement_timeout_is_structured_failure() -> None:
@@ -405,6 +453,7 @@ def test_production_camera_settlement_timeout_is_structured_failure() -> None:
     agent._rtscortex_translation_ordinal = 1
     agent._rtscortex_production_source_tag = 0xBBB
     agent._rtscortex_production_camera_waits = 0
+    agent.size_screen = 128
     agent._rtscortex_semantic_action = {"name": "Train_Adept"}
     agent.team_unit_team_curr = None
     agent.team_unit_tag_curr = None
@@ -476,6 +525,37 @@ def test_observation_gap_watchdog_fails_before_unbounded_stall() -> None:
 
     with pytest.raises(RuntimeError, match="observation_gap_watchdog_timeout"):
         agent._update_observation_gap_watchdog(141)
+
+
+def test_observation_gap_watchdog_releases_optional_team_selection_barrier() -> None:
+    exact = SimpleNamespace(
+        enable=True,
+        teams=[{"select_type": "select", "unit_tags": [0xA, 0xB]}],
+        team_unit_tag_list=[],
+        _is_waiting_query=lambda: True,
+    )
+    grouped = SimpleNamespace(
+        enable=True,
+        teams=[{"select_type": "select_all_type", "unit_tags": [0xC, 0xD]}],
+        team_unit_tag_list=[],
+        _is_waiting_query=lambda: True,
+    )
+    busy = SimpleNamespace(
+        enable=True,
+        teams=[{"select_type": "select", "unit_tags": [0xE]}],
+        team_unit_tag_list=[],
+        _is_waiting_query=lambda: False,
+    )
+    main_agent = SimpleNamespace(
+        agents={"Builder": exact, "CombatGroup": grouped, "Busy": busy},
+        unit_uid_disappear={0xB},
+    )
+
+    _release_runtime_observation_barrier(main_agent)
+
+    assert exact.team_unit_tag_list == [0xA]
+    assert grouped.team_unit_tag_list == [0xC]
+    assert busy.team_unit_tag_list == []
 
 
 def test_shared_broker_exposes_pending_planner_state() -> None:
@@ -2439,7 +2519,7 @@ def test_extractor_projects_production_queue_with_exact_producer_tag() -> None:
     ]
 
 
-def test_cached_producer_tag_is_validated_against_primitive_573_world_coordinate() -> None:
+def test_translator_source_tag_replaces_stale_preflight_provenance() -> None:
     timestep = _fake_timestep()
     first = _unit(0xBBB, 62, 1, 36, 35, 500, 255)
     second = _unit(0xAAA, 62, 1, 37, 35, 500, 255)
@@ -2464,27 +2544,23 @@ def test_cached_producer_tag_is_validated_against_primitive_573_world_coordinate
     agent.team_unit_tag_curr = None
     agent.team_unit_tag_list = []
     agent.flag_enable_empty_unit_group = True
-    agent.world_x_offset = 2
-    agent.world_y_offset = 3
-    agent.world_range = 100
     action = {"name": "Train_Zealot", "func": [(503, None, ())]}
 
     assert agent._reject_unavailable_production_action(action, timestep) is False
-    expected_world = _production_source_world_position(agent, timestep.observation, 0xBBB)
-    assert expected_world == (38.0, 68.0)
+    assert agent._rtscortex_production_source_tag == 0xBBB
     producer_tag, failure = agent._validated_production_source_tag(
         "Train_Zealot",
         {
             "ordinal": 0,
             "requested_function_id": 573,
-            "resolved_arguments": [expected_world],
+            "requested_arguments": [0xAAA],
+            "resolved_arguments": [(39.0, 68.0)],
         },
-        timestep,
     )
 
-    assert producer_tag == 0xBBB
+    assert producer_tag == 0xAAA
     assert failure is None
-    assert producer_tag != int(expected_world[0])
+    assert agent._rtscortex_production_source_tag == 0xAAA
 
 
 def test_missing_production_provenance_publishes_one_translation_failure() -> None:
@@ -2520,8 +2596,12 @@ def test_missing_production_provenance_publishes_one_translation_failure() -> No
 
     producer_tag, failure = agent._validated_production_source_tag(
         "Train_Zealot",
-        {"ordinal": 0, "requested_function_id": 573, "resolved_arguments": [(1, 2)]},
-        timestep,
+        {
+            "ordinal": 0,
+            "requested_function_id": 573,
+            "requested_arguments": [],
+            "resolved_arguments": [(1, 2)],
+        },
     )
     assert producer_tag is None
     assert failure is not None

@@ -372,7 +372,6 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
         producer_tag, provenance_failure = self._validated_production_source_tag(
             action_name,
             attempt,
-            obs,
         )
         if provenance_failure is not None:
             failure_code, reason = provenance_failure
@@ -517,7 +516,11 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
         producer_tag = self._rtscortex_production_source_tag
         if producer_tag is None:
             return False
-        if _producer_is_visible(obs.observation, producer_tag):
+        if _producer_is_visible(
+            obs.observation,
+            producer_tag,
+            size_screen=int(self.size_screen),
+        ):
             self._rtscortex_production_camera_waits = 0
             return False
         self._rtscortex_production_camera_waits += 1
@@ -541,30 +544,38 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
         self,
         action_name: str,
         attempt: Mapping[str, Any],
-        obs: Any,
     ) -> tuple[Optional[int], Optional[tuple[str, str]]]:
-        """Bind primitive 573 to the exact raw producer chosen by upstream."""
+        """Bind production to the exact raw producer selected by the translator."""
 
         if production_spec(action_name) is None:
             return None, None
         source_tag = self._rtscortex_production_source_tag
         ordinal = int(attempt.get("ordinal", 0))
         requested_id = int(attempt.get("requested_function_id", 0))
+        if ordinal == 0:
+            requested_arguments = attempt.get("requested_arguments")
+            translator_source_tag = (
+                int(requested_arguments[0])
+                if isinstance(requested_arguments, (list, tuple))
+                and len(requested_arguments) == 1
+                and isinstance(requested_arguments[0], int)
+                and not isinstance(requested_arguments[0], bool)
+                else None
+            )
+            if requested_id != 573 or translator_source_tag is None:
+                return None, (
+                    "production_provenance_missing",
+                    "production primitive 573 did not expose one exact translator "
+                    f"source tag: function {requested_id}, arguments "
+                    f"{requested_arguments!r}",
+                )
+            source_tag = translator_source_tag
+            self._rtscortex_production_source_tag = source_tag
         if source_tag is None:
             return None, (
                 "production_provenance_missing",
                 "production provenance missing before translator dispatch",
             )
-        if ordinal == 0:
-            expected_world = _production_source_world_position(self, obs.observation, source_tag)
-            translated_world = _single_position(attempt.get("resolved_arguments"))
-            if requested_id != 573 or expected_world is None or translated_world != expected_world:
-                return None, (
-                    "production_provenance_missing",
-                    "production primitive 573 does not match the cached producer tag "
-                    f"{hex(source_tag)}: expected {expected_world!r}, received "
-                    f"function {requested_id} arguments {translated_world!r}",
-                )
         return source_tag, None
 
     def _reject_unavailable_production_action(
@@ -693,6 +704,7 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
             unit_names=unit_names,
         )
         super().__init__(config, subagent)
+        self._rtscortex_accept_visible_team_unit = True
         _apply_scenario_bootstrap(self, self.worker_settings.scenario)
         if self.worker_settings.console_enabled:
             self._frame_publisher = RGBFramePublisher(
@@ -724,6 +736,8 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
             return _finish_terminal(self, obs, _base_agent_step, _no_op)
         observation_loop = _observation_game_loop(obs.observation)
         watchdog_active = self._update_observation_gap_watchdog(observation_loop)
+        if watchdog_active:
+            _release_runtime_observation_barrier(self)
         worker_management_blocked = (
             self.decision_broker.coordinator.effect_verifier.blocks_auto_worker_management
             or watchdog_active
@@ -1297,6 +1311,39 @@ def _reserved_builder_worker_tags(main_agent: Any) -> set[int]:
     return tags
 
 
+def _release_runtime_observation_barrier(main_agent: Any) -> None:
+    """Let current raw state reach Runtime when optional team selection stalls."""
+
+    disappeared = {
+        int(tag) for tag in getattr(main_agent, "unit_uid_disappear", ())
+    }
+    agents = getattr(main_agent, "agents", {})
+    if not isinstance(agents, Mapping):
+        return
+    for agent in agents.values():
+        if not getattr(agent, "enable", False) or not agent._is_waiting_query():
+            continue
+        observed_tags = getattr(agent, "team_unit_tag_list", None)
+        if not isinstance(observed_tags, list):
+            continue
+        for team in getattr(agent, "teams", ()):
+            if not isinstance(team, Mapping):
+                continue
+            live_tags = [
+                int(tag)
+                for tag in team.get("unit_tags", ())
+                if int(tag) not in disappeared
+            ]
+            required_tags = (
+                live_tags
+                if team.get("select_type") == "select"
+                else live_tags[:1]
+            )
+            observed_tags.extend(
+                tag for tag in required_tags if tag not in observed_tags
+            )
+
+
 def _translated_build_position(
     action_name: str,
     arguments: Any,
@@ -1334,46 +1381,6 @@ def _execution_team_name(agent: Any) -> Optional[str]:
 def _execution_unit_tag(agent: Any) -> Optional[int]:
     value = getattr(agent, "team_unit_tag_curr", None)
     return None if value is None else int(value)
-
-
-def _production_source_world_position(
-    agent: Any,
-    observation: Any,
-    source_tag: int,
-) -> Optional[tuple[float, float]]:
-    source = next(
-        (
-            unit
-            for unit in getattr(observation, "raw_units", ())
-            if int(getattr(unit, "tag", -1)) == source_tag
-        ),
-        None,
-    )
-    if source is None and isinstance(observation, Mapping):
-        source = next(
-            (
-                unit
-                for unit in observation.get("raw_units", ())
-                if int(
-                    unit.get("tag", -1) if isinstance(unit, Mapping) else getattr(unit, "tag", -1)
-                )
-                == source_tag
-            ),
-            None,
-        )
-    if source is None:
-        return None
-    x = source.get("x", 0.0) if isinstance(source, Mapping) else getattr(source, "x", 0.0)
-    y = source.get("y", 0.0) if isinstance(source, Mapping) else getattr(source, "y", 0.0)
-    return (
-        float(x) + float(getattr(agent, "world_x_offset", 0.0)),
-        max(
-            0.0,
-            float(getattr(agent, "world_range", 0.0))
-            - float(y)
-            + float(getattr(agent, "world_y_offset", 0.0)),
-        ),
-    )
 
 
 def _production_source_invalid_reason(
@@ -1430,7 +1437,12 @@ def _production_source_invalid_reason(
     return None
 
 
-def _producer_is_visible(observation: Any, producer_tag: int) -> bool:
+def _producer_is_visible(
+    observation: Any,
+    producer_tag: int,
+    *,
+    size_screen: int,
+) -> bool:
     feature_units = (
         observation.get("feature_units", ())
         if isinstance(observation, Mapping)
@@ -1448,10 +1460,14 @@ def _producer_is_visible(observation: Any, producer_tag: int) -> bool:
             if isinstance(unit, Mapping)
             else getattr(unit, "is_on_screen", True)
         )
+        x = unit.get("x", 0) if isinstance(unit, Mapping) else getattr(unit, "x", 0)
+        y = unit.get("y", 0) if isinstance(unit, Mapping) else getattr(unit, "y", 0)
         if (
             int(tag) == producer_tag
             and int(alliance) == 1
             and bool(is_on_screen)
+            and 0 < float(x) < size_screen
+            and 0 < float(y) < size_screen
         ):
             return True
     return False

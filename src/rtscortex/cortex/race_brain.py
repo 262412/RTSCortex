@@ -366,6 +366,5 @@ def _member_proposal_is_valid(member: RaceBrainMemberProposal) -> bool:
         return False
     return member.frontier.classification not in {
         PolicyActionClassification.PARSE_ERROR,
-        PolicyActionClassification.UNSUPPORTED_BY_RUNTIME,
         PolicyActionClassification.ILLEGAL_ACTION,
     }

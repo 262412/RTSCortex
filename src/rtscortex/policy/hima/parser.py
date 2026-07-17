@@ -30,6 +30,11 @@ _ACTIONS_LIST_RE = re.compile(
     r"\bactions\s*:\s*(\[[^\]]*\])",
     re.IGNORECASE | re.DOTALL,
 )
+_NONSTANDARD_ACTION_ITEM_RE = re.compile(
+    r"\s*(?P<quote>['\"])(?P<token>[^'\"]+)(?P=quote)\s*:\s*"
+    r"(?P<repeat>[+-]?\d+)\s*|"
+    r"\s*(?P<bare_quote>['\"])(?P<bare_token>[^'\"]+)(?P=bare_quote)\s*"
+)
 _RATIONALE_HEADING = {
     "immediate": r"immediate(?:\s+steps?)?",
     "short_term": r"short[\s-]*term(?:\s+(?:actions?|strategy))?",
@@ -238,6 +243,9 @@ def _extract_action_list(
     try:
         parsed = ast.literal_eval(rendered)
     except (SyntaxError, ValueError):
+        nonstandard_tokens = _extract_nonstandard_action_items(rendered)
+        if nonstandard_tokens is not None:
+            return nonstandard_tokens
         return None, [
             ParseDiagnostic(
                 code="invalid_actions_list",
@@ -279,6 +287,52 @@ def _extract_action_list(
             )
             continue
         tokens.append((ordinal, item.strip(), 1))
+    return tokens, diagnostics
+
+
+def _extract_nonstandard_action_items(
+    rendered: str,
+) -> tuple[list[tuple[int, str, int]], list[ParseDiagnostic]] | None:
+    """Parse HIMA's quoted count entries, including mixed bare entries."""
+
+    inner = rendered[1:-1].strip()
+    if not inner:
+        return [], []
+    items = inner.split(",")
+    tokens: list[tuple[int, str, int]] = []
+    diagnostics: list[ParseDiagnostic] = []
+    for ordinal, item in enumerate(items):
+        if ordinal >= MAX_ACTION_ITEMS:
+            diagnostics.append(
+                ParseDiagnostic(
+                    code="action_limit_exceeded",
+                    message=(
+                        f"HIMA output contains more than {MAX_ACTION_ITEMS} action items."
+                    ),
+                    ordinal=ordinal,
+                )
+            )
+            break
+        match = _NONSTANDARD_ACTION_ITEM_RE.fullmatch(item)
+        if match is None:
+            return None
+        counted_token = match.group("token")
+        raw_token = (counted_token or match.group("bare_token")).strip()
+        repeat = int(match.group("repeat")) if counted_token is not None else 1
+        if not 1 <= repeat <= MAX_ACTION_REPEAT:
+            diagnostics.append(
+                ParseDiagnostic(
+                    code="invalid_repeat",
+                    message=(
+                        f"A HIMA macro-action repeat must be between 1 and "
+                        f"{MAX_ACTION_REPEAT}."
+                    ),
+                    raw_token=raw_token,
+                    ordinal=ordinal,
+                )
+            )
+            continue
+        tokens.append((ordinal, raw_token, repeat))
     return tokens, diagnostics
 
 

@@ -119,6 +119,52 @@ def test_parser_reads_json_actions_list() -> None:
     ]
 
 
+def test_parser_reads_hima_counted_actions_list_without_fuzzy_matching() -> None:
+    proposal = HIMAProposalParser().parse(
+        'Actions: ["Pylon": 1, "VoidRay": 16, "ShieldBattery": 2]'
+    )
+
+    assert [step.canonical_action for step in proposal.steps] == [
+        "BUILD PYLON",
+        "TRAIN VOIDRAY",
+        "BUILD SHIELDBATTERY",
+    ]
+    assert [step.repeat for step in proposal.steps] == [1, 16, 2]
+    assert [step.ordinal for step in proposal.steps] == [0, 1, 2]
+    assert proposal.diagnostics == []
+
+
+def test_parser_reads_hima_mixed_counted_and_bare_actions_list() -> None:
+    proposal = HIMAProposalParser().parse(
+        'Actions: ["Assimilator": 3, "Probe": 14, "CyberneticsCore": 1, '
+        '"Adept", "Pylon", "VoidRay"]'
+    )
+
+    assert [step.canonical_action for step in proposal.steps] == [
+        "BUILD ASSIMILATOR",
+        "TRAIN PROBE",
+        "BUILD CYBERNETICSCORE",
+        "TRAIN ADEPT",
+        "BUILD PYLON",
+        "TRAIN VOIDRAY",
+    ]
+    assert [step.repeat for step in proposal.steps] == [3, 14, 1, 1, 1, 1]
+    assert [step.ordinal for step in proposal.steps] == [0, 1, 2, 3, 4, 5]
+    assert proposal.diagnostics == []
+
+
+def test_parser_reports_invalid_counted_actions_repeat() -> None:
+    proposal = HIMAProposalParser().parse(
+        'Actions: ["Pylon": 0, "VoidRay": 33]'
+    )
+
+    assert proposal.steps == []
+    assert [item.code for item in proposal.diagnostics] == [
+        "invalid_repeat",
+        "invalid_repeat",
+    ]
+
+
 def test_parser_retains_unknown_token_diagnostic_and_source_ordinal() -> None:
     proposal = HIMAProposalParser().parse(
         'Actions: ["Probe", "Orthotomist", "Pylon"]'

@@ -41,6 +41,7 @@ HIMA_RUNTIME_MAPPINGS: tuple[HIMAMacroMapping, ...] = (
     HIMAMacroMapping("TRAIN ORACLE", ("Train_Oracle",)),
     HIMAMacroMapping("BUILD PYLON", ("Build_Pylon_Screen",)),
     HIMAMacroMapping("BUILD GATEWAY", ("Build_Gateway_Screen",)),
+    HIMAMacroMapping("BUILD FORGE", ("Build_Forge_Screen",)),
     HIMAMacroMapping(
         "BUILD CYBERNETICSCORE",
         ("Build_CyberneticsCore_Screen",),

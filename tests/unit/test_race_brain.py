@@ -166,6 +166,28 @@ def test_race_brain_isolates_invalid_member_output() -> None:
     assert invalid.score < 0
 
 
+def test_unsupported_frontier_is_a_runtime_gap_not_a_degraded_member() -> None:
+    clients = {
+        "a": _Client("a", "Actions: ['RoboticsFacility']"),
+        "b": _Client("b", "Actions: ['Pylon']"),
+        "c": _Client("c", "Actions: ['Gateway']"),
+    }
+    client = HIMAEnsemblePolicyClient(clients, race="protoss")
+
+    response = asyncio.run(
+        client.propose(
+            HIMAInputContext(observation=_observation()),
+            request_id="runtime-gap-request",
+        )
+    )
+
+    unsupported = next(member for member in response.members if member.cluster == "a")
+    assert unsupported.frontier is not None
+    assert unsupported.frontier.classification.value == "unsupported_by_runtime"
+    assert response.valid_member_count == 3
+    assert response.degraded_member_ids == ()
+
+
 def test_race_brain_health_contains_all_checkpoint_provenance() -> None:
     clients = {
         cluster: _Client(cluster, "Actions: ['Pylon']")

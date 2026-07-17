@@ -54,6 +54,15 @@ PROTOSS_SIMPLE64_ACTION_SPECS: tuple[ProgressActionSpec, ...] = (
         ),
     ),
     ProgressActionSpec(
+        "Build_Forge_Screen",
+        GoalRequirementKind.STRUCTURE,
+        "Forge",
+        minerals=150,
+        prerequisites=(
+            StatePrerequisite(GoalRequirementKind.STRUCTURE, "Pylon"),
+        ),
+    ),
+    ProgressActionSpec(
         "Build_CyberneticsCore_Screen",
         GoalRequirementKind.STRUCTURE,
         "CyberneticsCore",

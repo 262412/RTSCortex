@@ -31,6 +31,7 @@ from rtscortex.runtime.live import (
     sc2_build,
     transient_unit_grace_patch_is_applied,
     translation_result_patch_is_applied,
+    visible_team_selection_patch_is_applied,
     waiting_response_patch_is_applied,
     worker_workplace_refresh_patch_is_applied,
 )
@@ -249,6 +250,8 @@ def _worker_patch_check(project_root: Path, *, required: bool) -> Check:
         missing.append("0014-refresh-worker-workplaces.patch")
     if not observation_gap_watchdog_patch_is_applied(project_root):
         missing.append("0015-observation-gap-watchdog.patch")
+    if not visible_team_selection_patch_is_applied(project_root):
+        missing.append("0016-accept-visible-team-unit.patch")
     status = "ok" if not missing else ("error" if required else "optional")
     detail = "all worker patches applied" if not missing else "apply " + ", ".join(missing)
     return Check("worker_patch", status, detail)

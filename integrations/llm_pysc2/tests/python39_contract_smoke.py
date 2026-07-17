@@ -9,7 +9,12 @@ from types import SimpleNamespace
 
 from llm_pysc2.agents.llm_pysc2_agent import LLMAgent
 from llm_pysc2.agents.llm_pysc2_agent_main import MainAgent
-from llm_pysc2.agents.main_agent_funcs import main_agent_func1, main_agent_func2, main_agent_func4
+from llm_pysc2.agents.main_agent_funcs import (
+    get_camera_func_smart,
+    main_agent_func1,
+    main_agent_func2,
+    main_agent_func4,
+)
 from llm_pysc2.lib import llm_action
 from pysc2.env import run_loop
 from pysc2.lib import actions, features
@@ -97,10 +102,30 @@ def _assert_observation_gap_watchdog_preempts_optional_gathering() -> None:
     assert "_rtscortex_force_runtime_decision" in inspect.getsource(main_agent_func4)
 
 
+def _assert_visible_team_unit_bypasses_camera_recentering() -> None:
+    assert "_rtscortex_accept_visible_team_unit" in inspect.getsource(
+        get_camera_func_smart
+    )
+    unit = SimpleNamespace(tag=0xA, x=90, y=65)
+    observation = SimpleNamespace(
+        observation=SimpleNamespace(raw_units=[unit], feature_units=[unit])
+    )
+    main_agent = SimpleNamespace(
+        log_id=0,
+        size_screen=128,
+        _rtscortex_accept_visible_team_unit=True,
+    )
+
+    function_id, _ = get_camera_func_smart(main_agent, observation, unit.tag)
+
+    assert function_id == 0
+
+
 def _assert_build_order_ids_use_raw_function_domain() -> None:
     ability_ids = {
         "Assimilator": 882,
         "CyberneticsCore": 894,
+        "Forge": 884,
         "Gateway": 883,
         "Nexus": 880,
         "Pylon": 881,
@@ -322,6 +347,7 @@ def _assert_multi_argument_rejection() -> None:
         "ordinal": 0,
         "total": 1,
         "accepted": False,
+        "requested_arguments": ["invalid-queue", [64, 64]],
         "resolved_arguments": [],
         "reason": "invalid-queue",
     }
@@ -637,6 +663,7 @@ def main() -> None:
     _assert_atomic_log_directory_allocation()
     _assert_gas_rebalance_uses_worker_management_flag()
     _assert_observation_gap_watchdog_preempts_optional_gathering()
+    _assert_visible_team_unit_bypasses_camera_recentering()
     _assert_build_order_ids_use_raw_function_domain()
     _assert_direct_production_contract()
     _assert_raw_unit_presence_controls_team_lifecycle()

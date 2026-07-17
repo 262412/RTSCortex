@@ -427,6 +427,13 @@ def test_goal_graph_rejects_cycles_and_unknown_actions() -> None:
     ("action_name", "structures", "mineral_cost", "vespene_cost", "supply_cost"),
     [
         (
+            "Build_Forge_Screen",
+            ["Nexus", "Pylon"],
+            150,
+            0,
+            0,
+        ),
+        (
             "Build_Stargate_Screen",
             ["Nexus", "Pylon", "Gateway", "CyberneticsCore"],
             150,

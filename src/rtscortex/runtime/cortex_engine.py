@@ -208,6 +208,9 @@ class CortexRuntimeEngine(RuntimeEngine):
             minimum_advance_army_supply=(
                 config.cortex.tactical.minimum_advance_army_supply
             ),
+            reacquire_cooldown_game_loops=(
+                config.cortex.tactical.reacquire_cooldown_game_loops
+            ),
         )
         self._candidate_compiler = CandidateCompiler()
         self._executor = DeterministicCandidateExecutor()

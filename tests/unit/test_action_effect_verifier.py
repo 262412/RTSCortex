@@ -687,6 +687,46 @@ def test_shield_battery_order_48_and_new_tag_confirm_build_effect() -> None:
     assert verdict.evidence["order_seen"] is True
 
 
+def test_forge_order_38_and_new_tag_confirm_build_effect() -> None:
+    verifier = ActionEffectVerifier(timeout_game_loops=10)
+    command = RoutedCommand(
+        command_id="command-forge",
+        actor="Builder/Builder-Probe-1",
+        team_name="Builder-Probe-1",
+        name="Build_Forge_Screen",
+        source="planner",
+        requested_arguments=([65, 65],),
+        resolved_arguments=([65, 65],),
+        rendered_action="<Build_Forge_Screen([65,65])>",
+    )
+    verifier.track(command)
+    verifier.prepare(
+        command.command_id,
+        _observation(game_loop=100, minerals=250, builder_orders=[]),
+        0xABC,
+    )
+    verifier.accept_primitive(command.command_id, game_loop=101)
+
+    assert verifier.observe(_observation(game_loop=105, minerals=100, builder_orders=[38])) == []
+    current = _observation(
+        game_loop=106,
+        minerals=100,
+        structures=["Nexus", "Forge"],
+        builder_orders=[38],
+    )
+    forge = next(unit for unit in current["raw_units"] if unit["unit_type"] == "Forge")
+    forge["x"] = 31.875
+    forge["y"] = 30
+
+    verdict = verifier.observe(current)[0]
+
+    assert verdict.success is True
+    assert verdict.evidence is not None
+    assert verdict.evidence["target_type"] == "Forge"
+    assert verdict.evidence["observed_structure_tag"] == "0x2"
+    assert verdict.evidence["order_seen"] is True
+
+
 def test_all_supported_train_actions_confirm_the_exact_producer_order() -> None:
     for index, spec in enumerate(PRODUCTION_SPECS.values()):
         verifier = ActionEffectVerifier(timeout_game_loops=10)

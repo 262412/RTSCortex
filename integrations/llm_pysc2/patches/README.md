@@ -64,12 +64,20 @@ git -C third_party/LLM-PySC2 apply --check \
   ../../integrations/llm_pysc2/patches/0015-observation-gap-watchdog.patch
 git -C third_party/LLM-PySC2 apply \
   ../../integrations/llm_pysc2/patches/0015-observation-gap-watchdog.patch
+git -C third_party/LLM-PySC2 apply --check \
+  ../../integrations/llm_pysc2/patches/0016-accept-visible-team-unit.patch
+git -C third_party/LLM-PySC2 apply \
+  ../../integrations/llm_pysc2/patches/0016-accept-visible-team-unit.patch
 ```
 
 After the live run, restore the clean pinned checkout by reversing exactly these reviewed
 patches in reverse order:
 
 ```bash
+git -C third_party/LLM-PySC2 apply --reverse --check \
+  ../../integrations/llm_pysc2/patches/0016-accept-visible-team-unit.patch
+git -C third_party/LLM-PySC2 apply --reverse \
+  ../../integrations/llm_pysc2/patches/0016-accept-visible-team-unit.patch
 git -C third_party/LLM-PySC2 apply --reverse --check \
   ../../integrations/llm_pysc2/patches/0015-observation-gap-watchdog.patch
 git -C third_party/LLM-PySC2 apply --reverse \
@@ -225,7 +233,12 @@ instead of indexing an empty list.
 `0015-observation-gap-watchdog.patch` lets the Worker skip optional upstream team gathering
 when the gap since the latest Runtime decision exceeds the configured game-loop threshold.
 
-CI applies all fifteen patches in order under Python 3.9, compiles and imports both projects, and
+`0016-accept-visible-team-unit.patch` stops camera centering from interrupting the existing
+point-to-rectangle selection fallback when a team unit is already visible. RTSCortex enables
+this behavior because its Runtime observation is global; selection remains required later for
+actual feature actions.
+
+CI applies all sixteen patches in order under Python 3.9, compiles and imports both projects, and
 runs `integrations/llm_pysc2/tests/python39_contract_smoke.py`. The smoke locks the v1.1
 candidate mapping, multi-argument translator rejection, Nexus camera-settlement primitive,
 exact Nexus anchor, floating-point resource clearance, visible complete-footprint behavior,

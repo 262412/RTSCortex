@@ -10,6 +10,7 @@ RTSCORTEX_MELEE_NATIVE_ACTIONS = frozenset(
         "Attack_Unit",
         "Build_Assimilator_Near",
         "Build_CyberneticsCore_Screen",
+        "Build_Forge_Screen",
         "Build_Gateway_Screen",
         "Build_Nexus_Near",
         "Build_Pylon_Screen",

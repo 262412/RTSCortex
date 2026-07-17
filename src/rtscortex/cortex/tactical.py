@@ -41,18 +41,21 @@ class DeterministicTacticalAgent:
     """Turn a current situation into exact, candidate-bound combat intents."""
 
     agent_id = "deterministic-tactical-agent"
-    agent_version = "0.1.0"
+    agent_version = "0.2.0"
 
     def __init__(
         self,
         *,
         retreat_health_threshold: float,
         minimum_advance_army_supply: int,
+        reacquire_cooldown_game_loops: int = 112,
     ) -> None:
         self.retreat_health_threshold = retreat_health_threshold
         self.minimum_advance_army_supply = minimum_advance_army_supply
+        self.reacquire_cooldown_game_loops = reacquire_cooldown_game_loops
         self._episode_key: tuple[str, str] | None = None
         self._last_focus_target: str | None = None
+        self._last_reacquire_by_actor: dict[str, int] = {}
 
     def evaluate(
         self,
@@ -93,6 +96,8 @@ class DeterministicTacticalAgent:
             ]
 
         enemies = observation.state.visible_enemies
+        if enemies:
+            self._last_reacquire_by_actor.clear()
         if enemies and attack_actors:
             target, reacquired = self._focus_target(enemies)
             objective = (
@@ -123,7 +128,17 @@ class DeterministicTacticalAgent:
             >= self.minimum_advance_army_supply
         )
         if not enemies and ready_to_advance and move_actors:
-            return [
+            eligible_actors = [
+                actor
+                for actor in move_actors
+                if observation.game_loop
+                - self._last_reacquire_by_actor.get(
+                    actor,
+                    observation.game_loop - self.reacquire_cooldown_game_loops,
+                )
+                >= self.reacquire_cooldown_game_loops
+            ]
+            intents = [
                 self._intent(
                     observation,
                     assessment,
@@ -137,8 +152,12 @@ class DeterministicTacticalAgent:
                     priority=60,
                     ttl_game_loops=16,
                 )
-                for actor in move_actors
+                for actor in eligible_actors
             ]
+            self._last_reacquire_by_actor.update(
+                dict.fromkeys(eligible_actors, observation.game_loop)
+            )
+            return intents
         return []
 
     def _activate_episode(self, observation: ObservationEnvelope) -> None:
@@ -147,6 +166,7 @@ class DeterministicTacticalAgent:
             return
         self._episode_key = episode_key
         self._last_focus_target = None
+        self._last_reacquire_by_actor.clear()
 
     def _focus_target(self, enemies: list[UnitState]) -> tuple[UnitState, bool]:
         by_tag = {_normalize_tag(enemy.unit_id): enemy for enemy in enemies}

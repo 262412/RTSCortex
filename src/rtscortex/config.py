@@ -159,6 +159,7 @@ class CortexTacticalSettings(SettingsModel):
     kind: Literal["deterministic", "deterministic_reflex"] = "deterministic"
     retreat_health_threshold: float = Field(default=0.3, ge=0.0, le=1.0)
     minimum_advance_army_supply: int = Field(default=4, ge=1)
+    reacquire_cooldown_game_loops: int = Field(default=112, ge=1)
 
 
 class CortexExecutorSettings(SettingsModel):

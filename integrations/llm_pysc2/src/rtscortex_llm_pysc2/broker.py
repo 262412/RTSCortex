@@ -7,6 +7,7 @@ from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Condition
+from time import monotonic
 from typing import Any, NoReturn, Optional
 
 from rtscortex_llm_pysc2.coordinator import BridgeCoordinator, BridgeDecision
@@ -229,7 +230,6 @@ class SharedDecisionBroker:
 
     def submit(self, agent: Any, timestep: Any, text_observation: str) -> str:
         step_id = int(agent.main_loop_step)
-        leader = False
         with self._condition:
             state = self._states.setdefault(step_id, _DecisionState())
             if state.error is not None:
@@ -239,30 +239,44 @@ class SharedDecisionBroker:
             if agent.name in state.submissions:
                 raise ValueError(f"agent {agent.name!r} submitted step {step_id} twice")
             state.submissions[agent.name] = _Submission(agent, timestep, text_observation)
-            expected = {name for name, value in self._agents.items() if value.enable}
-            if set(state.submissions) == expected and not state.in_flight:
-                state.in_flight = True
-                leader = True
-                if not self._initial_decision_started:
-                    self._initial_decision_started = True
-                    self._condition.notify_all()
+            self._condition.notify_all()
 
-        if leader:
-            self._decide(step_id)
+        deadline = monotonic() + self.decision_timeout_seconds
+        while state.decision is None and state.error is None:
+            leader = False
+            with self._condition:
+                expected = {
+                    name for name, value in self._agents.items() if value.enable
+                }
+                # Combat agents can be disabled after losing their final unit while
+                # Builder/Developer threads are already waiting at this barrier.
+                # Re-evaluate the live participant set instead of retaining a stale
+                # name until the full decision timeout expires. Submitted agents are
+                # still included in the snapshot even if they become disabled later.
+                if not state.in_flight and expected.issubset(state.submissions):
+                    state.in_flight = True
+                    leader = True
+                    if not self._initial_decision_started:
+                        self._initial_decision_started = True
+                        self._condition.notify_all()
+                else:
+                    remaining = deadline - monotonic()
+                    if remaining <= 0:
+                        missing = sorted(expected.difference(state.submissions))
+                        state.error = TimeoutError(
+                            "not all enabled agents submitted runtime step "
+                            f"{step_id}; missing={missing}"
+                        )
+                        if not self._initial_decision_complete:
+                            self._initial_decision_error = state.error
+                        self._states.pop(step_id, None)
+                        self._condition.notify_all()
+                    else:
+                        self._condition.wait(timeout=min(0.05, remaining))
+            if leader:
+                self._decide(step_id)
 
         with self._condition:
-            ready = self._condition.wait_for(
-                lambda: state.decision is not None or state.error is not None,
-                timeout=self.decision_timeout_seconds,
-            )
-            if not ready:
-                state.error = TimeoutError(
-                    f"not all enabled agents submitted runtime step {step_id}"
-                )
-                if not self._initial_decision_complete:
-                    self._initial_decision_error = state.error
-                self._states.pop(step_id, None)
-                self._condition.notify_all()
             if state.error is not None:
                 raise RuntimeError(
                     f"shared runtime decision failed at step {step_id}"

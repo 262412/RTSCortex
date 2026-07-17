@@ -224,6 +224,16 @@ def prepare_live_worker(
             "the LLM-PySC2 worker-workplace refresh patch is not applied; see "
             "integrations/llm_pysc2/patches/README.md"
         )
+    if not observation_gap_watchdog_patch_is_applied(project_root):
+        errors.append(
+            "the LLM-PySC2 observation-gap watchdog patch is not applied; see "
+            "integrations/llm_pysc2/patches/README.md"
+        )
+    if not visible_team_selection_patch_is_applied(project_root):
+        errors.append(
+            "the LLM-PySC2 visible-team selection patch is not applied; see "
+            "integrations/llm_pysc2/patches/README.md"
+        )
 
     if errors:
         raise LiveEnvironmentError("Live environment validation failed:\n- " + "\n- ".join(errors))
@@ -1011,6 +1021,15 @@ def observation_gap_watchdog_patch_is_applied(project_root: Path) -> bool:
     if not source.is_file():
         return False
     return "_rtscortex_force_runtime_decision" in source.read_text(encoding="utf-8")
+
+
+def visible_team_selection_patch_is_applied(project_root: Path) -> bool:
+    """Return whether visible team units bypass redundant camera centering."""
+
+    source = project_root / "third_party/LLM-PySC2/llm_pysc2/agents/main_agent_funcs.py"
+    if not source.is_file():
+        return False
+    return "_rtscortex_accept_visible_team_unit" in source.read_text(encoding="utf-8")
 
 
 def _signal_process(worker: asyncio.subprocess.Process, sig: signal.Signals) -> None:

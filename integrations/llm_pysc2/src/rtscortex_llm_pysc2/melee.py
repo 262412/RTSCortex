@@ -33,6 +33,7 @@ _ACTION_NAMES = {
         "Move_Screen",
         "Build_Pylon_Screen",
         "Build_Gateway_Screen",
+        "Build_Forge_Screen",
         "Build_Assimilator_Near",
         "Build_CyberneticsCore_Screen",
         "Build_Nexus_Near",

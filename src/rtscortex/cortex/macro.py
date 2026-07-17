@@ -28,6 +28,7 @@ _RUNTIME_TO_HIMA_TOKEN = {
     if (action := resolve_hima_action(mapping.macro_action)) is not None
     for runtime_action in mapping.runtime_actions
 }
+_MAX_STRATEGIC_GOAL_CHARACTERS = 240
 
 
 def macro_plan_from_hima(
@@ -98,8 +99,8 @@ def macro_plan_from_hima(
         source_step_id=projection_observation.step_id,
         created_game_loop=projection_observation.game_loop,
         expires_game_loop=projection_observation.game_loop + ttl_game_loops,
-        strategic_objective=(
-            proposal.strategic_objective.strip() or "Follow HIMA macro proposal"
+        strategic_objective=_bounded_strategic_objective(
+            proposal.strategic_objective
         ),
         steps=steps,
         source_model_id=metadata.model_id if metadata is not None else "hima-live",
@@ -300,3 +301,16 @@ def _validate_plan_episode(
         raise ValueError("macro plan and goal observation must share an episode")
     if observation.game_loop < plan.created_game_loop:
         raise ValueError("goal observation cannot predate the macro plan")
+
+
+def _bounded_strategic_objective(value: str) -> str:
+    """Normalize free-form HIMA prose to the public GoalSpec boundary."""
+
+    objective = " ".join(value.split()) or "Follow HIMA macro proposal"
+    if len(objective) <= _MAX_STRATEGIC_GOAL_CHARACTERS:
+        return objective
+    prefix = objective[: _MAX_STRATEGIC_GOAL_CHARACTERS - 3]
+    boundary = prefix.rsplit(" ", 1)[0].rstrip(" ,.;:-")
+    if not boundary:
+        boundary = prefix.rstrip(" ,.;:-")
+    return f"{boundary}..."
