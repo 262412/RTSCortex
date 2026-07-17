@@ -214,6 +214,16 @@ def prepare_live_worker(
             "the LLM-PySC2 gas-rebalance worker-management patch is not applied; see "
             "integrations/llm_pysc2/patches/README.md"
         )
+    if not reserved_builder_worker_patch_is_applied(project_root):
+        errors.append(
+            "the LLM-PySC2 reserved-builder worker patch is not applied; see "
+            "integrations/llm_pysc2/patches/README.md"
+        )
+    if not worker_workplace_refresh_patch_is_applied(project_root):
+        errors.append(
+            "the LLM-PySC2 worker-workplace refresh patch is not applied; see "
+            "integrations/llm_pysc2/patches/README.md"
+        )
 
     if errors:
         raise LiveEnvironmentError("Live environment validation failed:\n- " + "\n- ".join(errors))
@@ -971,6 +981,25 @@ def reserved_builder_worker_patch_is_applied(project_root: Path) -> bool:
             "_rtscortex_reserved_worker_tags",
             "HoldPosition_quick('now')",
             "Reserved worker",
+        )
+    )
+
+
+def worker_workplace_refresh_patch_is_applied(project_root: Path) -> bool:
+    """Return whether worker assignment rejects depleted or missing targets."""
+
+    source = project_root / "third_party/LLM-PySC2/llm_pysc2/agents/main_agent_funcs.py"
+    if not source.is_file():
+        return False
+    text = source.read_text(encoding="utf-8")
+    return all(
+        marker in text
+        for marker in (
+            "Refresh worker targets from the current raw observation",
+            "if target_nexus is None:",
+            "reversed(possible_working_place_nexus_tag_list)",
+            "Stale worker workplace",
+            "if len(working_place_unit_list) == 0:",
         )
     )
 

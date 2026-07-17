@@ -39,6 +39,15 @@ def _assert_reserved_builder_worker_guard() -> None:
     assert "HoldPosition_quick('now')" in source
 
 
+def _assert_worker_assignment_revalidates_workplaces() -> None:
+    source = inspect.getsource(main_agent_func2)
+    assert "Refresh worker targets from the current raw observation" in source
+    assert "if target_nexus is None:" in source
+    assert "reversed(possible_working_place_nexus_tag_list)" in source
+    assert "Stale worker workplace" in source
+    assert "if len(working_place_unit_list) == 0:" in source
+
+
 def _assert_max_frame_hook() -> None:
     calls = []
 
@@ -619,6 +628,7 @@ def _assert_exact_anchor_and_footprint() -> None:
 def main() -> None:
     _assert_candidate_mapping()
     _assert_reserved_builder_worker_guard()
+    _assert_worker_assignment_revalidates_workplaces()
     _assert_max_frame_hook()
     _assert_atomic_log_directory_allocation()
     _assert_gas_rebalance_uses_worker_management_flag()

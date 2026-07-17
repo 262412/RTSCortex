@@ -72,7 +72,12 @@ def test_prepare_live_worker_builds_fixed_pysc2_command(tmp_path: Path) -> None:
         "self.config.ENABLE_AUTO_WORKER_MANAGE and self.is_all_nexus_full is False\n"
         "_rtscortex_reserved_worker_tags\n"
         "HoldPosition_quick('now')\n"
-        "Reserved worker\n",
+        "Reserved worker\n"
+        "Refresh worker targets from the current raw observation\n"
+        "if target_nexus is None:\n"
+        "reversed(possible_working_place_nexus_tag_list)\n"
+        "Stale worker workplace\n"
+        "if len(working_place_unit_list) == 0:\n",
         encoding="utf-8",
     )
 
@@ -155,6 +160,8 @@ def test_prepare_live_worker_reports_all_missing_prerequisites(tmp_path: Path) -
     assert "Nexus resource-clearance patch is not applied" in message
     assert "Nexus exact-screen-scale patch is not applied" in message
     assert "gas-rebalance worker-management patch is not applied" in message
+    assert "reserved-builder worker patch is not applied" in message
+    assert "worker-workplace refresh patch is not applied" in message
 
 
 def test_prepare_live_worker_accepts_2s3z_on_sc2_410(tmp_path: Path) -> None:
@@ -372,7 +379,12 @@ def _write_worker_patch_sources(project_root: Path) -> None:
         "self.config.ENABLE_AUTO_WORKER_MANAGE and self.is_all_nexus_full is False\n"
         "_rtscortex_reserved_worker_tags\n"
         "HoldPosition_quick('now')\n"
-        "Reserved worker\n",
+        "Reserved worker\n"
+        "Refresh worker targets from the current raw observation\n"
+        "if target_nexus is None:\n"
+        "reversed(possible_working_place_nexus_tag_list)\n"
+        "Stale worker workplace\n"
+        "if len(working_place_unit_list) == 0:\n",
         encoding="utf-8",
     )
 

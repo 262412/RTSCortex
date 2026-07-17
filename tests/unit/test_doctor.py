@@ -182,7 +182,12 @@ def test_worker_patch_is_required_only_for_live_runs(tmp_path: Path) -> None:
         "self.config.ENABLE_AUTO_WORKER_MANAGE and self.is_all_nexus_full is False\n"
         "_rtscortex_reserved_worker_tags\n"
         "HoldPosition_quick('now')\n"
-        "Reserved worker\n",
+        "Reserved worker\n"
+        "Refresh worker targets from the current raw observation\n"
+        "if target_nexus is None:\n"
+        "reversed(possible_working_place_nexus_tag_list)\n"
+        "Stale worker workplace\n"
+        "if len(working_place_unit_list) == 0:\n",
         encoding="utf-8",
     )
 
@@ -235,6 +240,17 @@ def test_worker_patch_is_required_only_for_live_runs(tmp_path: Path) -> None:
     reserved_worker_check = _worker_patch_check(tmp_path, required=True)
     assert reserved_worker_check.status == "error"
     assert "0013-preserve-reserved-builder-worker.patch" in reserved_worker_check.detail
+    funcs_source.write_text(complete_funcs_source, encoding="utf-8")
+
+    funcs_source.write_text(
+        complete_funcs_source.replace(
+            "Refresh worker targets from the current raw observation\n", ""
+        ),
+        encoding="utf-8",
+    )
+    workplace_refresh_check = _worker_patch_check(tmp_path, required=True)
+    assert workplace_refresh_check.status == "error"
+    assert "0014-refresh-worker-workplaces.patch" in workplace_refresh_check.detail
     funcs_source.write_text(complete_funcs_source, encoding="utf-8")
 
     complete_main_source = source.read_text(encoding="utf-8")

@@ -1,0 +1,54 @@
+diff --git a/llm_pysc2/agents/main_agent_funcs.py b/llm_pysc2/agents/main_agent_funcs.py
+--- a/llm_pysc2/agents/main_agent_funcs.py
++++ b/llm_pysc2/agents/main_agent_funcs.py
+@@ -606,6 +606,16 @@ def main_agent_func2(self, obs):
+           'num_worker_m': 0,  # mineral
+           'num_worker_g': 0,  # gas
+         }
++      # Refresh worker targets from the current raw observation. Mineral fields
++      # can deplete and gas buildings can disappear during a long episode.
++      nexus_info = self.nexus_info_dict[str(nexus.tag)]
++      nexus_info['nexus'] = nexus
++      nexus_info['x'] = nexus.x
++      nexus_info['y'] = nexus.y
++      nexus_info['gas_building_1'] = None
++      nexus_info['gas_building_2'] = None
++      nexus_info['nearby_gas_building_tag_list'] = []
++      nexus_info['nearby_mineral_tag_list'] = []
+       # 查找附近的水晶矿、建成的气站、工人
+       for unit in get_nearby_unit_list(nexus, obs.observation.raw_units, dist=10):
+         if unit.alliance == features.PlayerRelative.SELF and unit.unit_type in GAS_BUILDING_TYPE and unit.build_progress == 100:
+@@ -820,7 +830,15 @@ def main_agent_func2(self, obs):
+               min_dist = dist
+               target_nexus = unit
+ 
+-        idx = possible_working_place_nexus_tag_list.index(target_nexus.tag)
++        if target_nexus is None:
++          logger.warning(f"[ID {self.log_id}] Stale worker workplace: nexus disappeared")
++          self.possible_working_place_nexus = []
++          self.possible_working_place_tag_list = []
++          self.func_id_history.append(0)
++          return actions.FUNCTIONS.no_op()
++
++        reverse_idx = list(reversed(possible_working_place_nexus_tag_list)).index(target_nexus.tag)
++        idx = len(possible_working_place_nexus_tag_list) - reverse_idx - 1
+         working_place_unit_tag_list = self.possible_working_place_tag_list[idx]
+ 
+         # # 相机移动到主矿
+@@ -841,9 +860,13 @@ def main_agent_func2(self, obs):
+ 
+         # 相机移动
+         working_place_unit_list = get_raw_unit_list_of_tags(obs, working_place_unit_tag_list)
+-        if len(working_place_unit_tag_list) == 0 or len(working_place_unit_list) == 0:
+-          print(working_place_unit_tag_list)
+-          print(working_place_unit_list)
++        if len(working_place_unit_list) == 0:
++          logger.warning(
++            f"[ID {self.log_id}] Stale worker workplace: no current mineral or gas target")
++          self.possible_working_place_nexus = []
++          self.possible_working_place_tag_list = []
++          self.func_id_history.append(0)
++          return actions.FUNCTIONS.no_op()
+         target_working_position = working_place_unit_list[0]
+         func_id, func_call = get_camera_func_smart(self, obs, target_working_position.tag)
+         if func_id == 573:

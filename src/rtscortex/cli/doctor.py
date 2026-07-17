@@ -31,6 +31,7 @@ from rtscortex.runtime.live import (
     transient_unit_grace_patch_is_applied,
     translation_result_patch_is_applied,
     waiting_response_patch_is_applied,
+    worker_workplace_refresh_patch_is_applied,
 )
 
 EXPECTED_LLM_PYSC2_COMMIT = "551c863475c0c4a96a181080974d24b59589e9f3"
@@ -243,6 +244,8 @@ def _worker_patch_check(project_root: Path, *, required: bool) -> Check:
         missing.append("0012-bind-gas-rebalance-to-worker-management.patch")
     if not reserved_builder_worker_patch_is_applied(project_root):
         missing.append("0013-preserve-reserved-builder-worker.patch")
+    if not worker_workplace_refresh_patch_is_applied(project_root):
+        missing.append("0014-refresh-worker-workplaces.patch")
     status = "ok" if not missing else ("error" if required else "optional")
     detail = "all worker patches applied" if not missing else "apply " + ", ".join(missing)
     return Check("worker_patch", status, detail)

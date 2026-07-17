@@ -56,12 +56,20 @@ git -C third_party/LLM-PySC2 apply --check \
   ../../integrations/llm_pysc2/patches/0013-preserve-reserved-builder-worker.patch
 git -C third_party/LLM-PySC2 apply \
   ../../integrations/llm_pysc2/patches/0013-preserve-reserved-builder-worker.patch
+git -C third_party/LLM-PySC2 apply --check \
+  ../../integrations/llm_pysc2/patches/0014-refresh-worker-workplaces.patch
+git -C third_party/LLM-PySC2 apply \
+  ../../integrations/llm_pysc2/patches/0014-refresh-worker-workplaces.patch
 ```
 
 After the live run, restore the clean pinned checkout by reversing exactly these reviewed
 patches in reverse order:
 
 ```bash
+git -C third_party/LLM-PySC2 apply --reverse --check \
+  ../../integrations/llm_pysc2/patches/0014-refresh-worker-workplaces.patch
+git -C third_party/LLM-PySC2 apply --reverse \
+  ../../integrations/llm_pysc2/patches/0014-refresh-worker-workplaces.patch
 git -C third_party/LLM-PySC2 apply --reverse --check \
   ../../integrations/llm_pysc2/patches/0013-preserve-reserved-builder-worker.patch
 git -C third_party/LLM-PySC2 apply --reverse \
@@ -200,7 +208,13 @@ keeps worker management enabled so the deterministic gas rebalance can run; if t
 already present in a gas slot, the Bridge evicts that exact tag before filling the slot with an
 ordinary worker.
 
-CI applies all thirteen patches in order under Python 3.9, compiles and imports both projects, and
+`0014-refresh-worker-workplaces.patch` rebuilds each Nexus resource list from the current raw
+observation so depleted mineral fields and destroyed gas buildings cannot remain valid worker
+targets. Before assignment, it revalidates the selected Nexus and workplace, prefers the newest
+observation-bound entry, and returns a transport no-op when no current resource target remains
+instead of indexing an empty list.
+
+CI applies all fourteen patches in order under Python 3.9, compiles and imports both projects, and
 runs `integrations/llm_pysc2/tests/python39_contract_smoke.py`. The smoke locks the v1.1
 candidate mapping, multi-argument translator rejection, Nexus camera-settlement primitive,
 exact Nexus anchor, floating-point resource clearance, visible complete-footprint behavior,
