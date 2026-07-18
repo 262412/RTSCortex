@@ -94,6 +94,7 @@ from rtscortex.runtime.engine import (
 )
 
 _HIMA_PREVIOUS_ACTION_WINDOW_GAME_LOOPS = int(60 * 22.4)
+_MACRO_REJECTION_RETRY_GAME_LOOPS = 16
 
 
 def _deferred_frontier_requires_replan(frontier: PolicyActionAssessment) -> bool:
@@ -1002,9 +1003,13 @@ class CortexRuntimeEngine(RuntimeEngine):
         metadata = response.proposal.generation_metadata
         self._last_planner_failure = IdleReason.NO_LEGAL_ACTION
         self._next_macro_retry_game_loop = (
-            observation.game_loop + self.config.cortex.macro.interval_game_loops
+            observation.game_loop
+            + min(
+                self.config.cortex.macro.interval_game_loops,
+                _MACRO_REJECTION_RETRY_GAME_LOOPS,
+            )
         )
-        self._urgent_replan_requested = True
+        self._urgent_replan_requested = False
         self._record_cortex_event(
             observation,
             "macro_plan_rejected",

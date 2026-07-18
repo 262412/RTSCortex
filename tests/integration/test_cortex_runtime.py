@@ -597,6 +597,10 @@ def test_missing_prerequisite_plan_is_rejected_without_hot_loop(
         assert runtime._macro_plan is None
         await runtime.tick(blocked.model_copy(update={"step_id": 2, "game_loop": 2}))
         assert len(client.contexts) == 1
+        await runtime.tick(blocked.model_copy(update={"step_id": 3, "game_loop": 17}))
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert len(client.contexts) == 2
         failures = store.events_of_type("cortex-run", "episode-1", "macro_plan_rejected")
         assert failures[-1].payload["reason"] == "missing_prerequisite_pylon"
         assert not store.events_of_type("cortex-run", "episode-1", "specialist_failed")
