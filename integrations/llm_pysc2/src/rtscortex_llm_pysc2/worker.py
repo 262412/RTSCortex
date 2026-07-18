@@ -176,6 +176,7 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
         *args: Any,
         broker: SharedDecisionBroker,
         unit_names: Mapping[int, str],
+        player_race: str,
         **kwargs: Any,
     ) -> None:
         _require_upstream()
@@ -186,6 +187,7 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
             )
         self.broker = broker
         self.unit_names = dict(unit_names)
+        self.rtscortex_player_race = str(player_race).casefold()
         self._rtscortex_translation_attempt: Optional[dict[str, Any]] = None
         self._rtscortex_semantic_action: Optional[dict[str, Any]] = None
         self._rtscortex_production_source_tag: Optional[int] = None
@@ -879,6 +881,7 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
             RTSCortexLLMAgent,
             broker=self.decision_broker,
             unit_names=unit_names,
+            player_race=self.worker_settings.agent_race,
         )
         super().__init__(config, subagent)
         self._rtscortex_accept_visible_team_unit = True
@@ -1577,6 +1580,9 @@ def _execution_unit_tag(agent: Any) -> Optional[int]:
 
 
 def _worker_player_race(agent: Any) -> str:
+    explicit_race = getattr(agent, "rtscortex_player_race", None)
+    if explicit_race is not None:
+        return str(explicit_race).casefold()
     config = getattr(agent, "config", None)
     return str(
         getattr(config, "rtscortex_player_race", getattr(agent, "race", "protoss"))

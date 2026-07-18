@@ -49,6 +49,7 @@ from rtscortex_llm_pysc2.worker import (
     _translated_build_position,
     _translation_failure_code,
     _upstream_replaced_production_with_noop,
+    _worker_player_race,
 )
 
 from rtscortex.contracts import ObservationEnvelope
@@ -1170,6 +1171,19 @@ def test_timestep_extractor_does_not_apply_scv_construction_lock_to_probe() -> N
     assert "Build_Pylon_Screen" in {
         action["name"] for action in snapshot["teams"][0]["available_actions"]
     }
+
+
+def test_worker_player_race_prefers_explicit_bridge_race_over_upstream_compatibility() -> None:
+    agent = SimpleNamespace(
+        rtscortex_player_race="terran",
+        config=SimpleNamespace(rtscortex_player_race="protoss"),
+        race="protoss",
+    )
+
+    assert _worker_player_race(agent) == "terran"
+    assert "player_race=self.worker_settings.agent_race" in inspect.getsource(
+        RTSCortexMainAgent.__init__
+    )
 
 
 def test_timestep_extractor_enumerates_stable_pathable_move_and_blink_candidates() -> None:
