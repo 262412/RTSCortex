@@ -12,7 +12,7 @@ environment:
   opponent_build: macro
   step_mul: 1
   game_steps_per_episode: 2500
-  simulation_speed_multiplier: 0.125
+  simulation_speed_multiplier: 0.25
   pause_until_first_plan: true
   sc2_path: ~/scratch/StarCraftII
   action_effect_timeout_game_loops: 112
