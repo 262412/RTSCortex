@@ -87,7 +87,12 @@ export function App() {
           staleAfterSeconds={state.session?.stale_after_seconds ?? 2}
         />
         <DecisionRail
+          raceProfile={projection.raceProfile}
           situation={projection.situation}
+          tacticalShadow={projection.tacticalShadow}
+          roleIntent={projection.roleIntent}
+          arbitration={projection.arbitration}
+          playbookRule={projection.playbookRule}
           reflection={projection.reflection}
           goalProgress={projection.goalProgress}
           plan={projection.plan}

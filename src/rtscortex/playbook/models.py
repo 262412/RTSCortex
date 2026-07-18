@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from enum import StrEnum
+from typing import Literal, TypeAlias
 
 from pydantic import Field
 
@@ -39,6 +41,111 @@ class PlaybookRuleKind(StrEnum):
 
     STRATEGY = "strategy"
     EXECUTION_GUARD = "execution_guard"
+
+
+class PlaybookRuleCategory(StrEnum):
+    ENGINE_INVARIANT = "engine_invariant"
+    EXECUTION_GUARD = "execution_guard"
+    RACE_MACRO = "race_macro"
+    MATCHUP_STRATEGY = "matchup_strategy"
+    TACTICAL_RESPONSE = "tactical_response"
+    MAP_SPECIFIC = "map_specific"
+
+
+class PlaybookRuleEffect(StrEnum):
+    REQUIRE = "require"
+    FORBID = "forbid"
+    PREFER = "prefer"
+    AVOID = "avoid"
+
+
+class PlaybookRuleStrength(StrEnum):
+    ADVISORY = "advisory"
+    SOFT = "soft"
+    HARD = "hard"
+
+
+class PlaybookRuleStatus(StrEnum):
+    LEGACY = "legacy"
+    CANDIDATE = "candidate"
+    ACTIVE = "active"
+    SUSPENDED = "suspended"
+    RETIRED = "retired"
+
+
+class PlaybookConditionOperator(StrEnum):
+    EQ = "eq"
+    IN = "in"
+    CONTAINS = "contains"
+    GTE = "gte"
+    LTE = "lte"
+
+
+PlaybookConditionValue: TypeAlias = str | int | float | bool | tuple[str, ...]
+
+
+class PlaybookCondition(ContractModel):
+    field: Literal[
+        "agent_race",
+        "opponent_race",
+        "phase",
+        "map_name",
+        "action_name",
+        "role",
+        "threat_level",
+        "economy_status",
+        "army_readiness",
+        "alert",
+    ]
+    operator: PlaybookConditionOperator = PlaybookConditionOperator.EQ
+    value: PlaybookConditionValue
+
+
+class PlaybookRule(ContractModel):
+    schema_version: str = "2.0"
+    rule_id: str = Field(min_length=1)
+    canonical_key: str = Field(min_length=1)
+    category: PlaybookRuleCategory
+    conditions: tuple[PlaybookCondition, ...]
+    effect: PlaybookRuleEffect
+    strength: PlaybookRuleStrength
+    status: PlaybookRuleStatus
+    action_names: tuple[str, ...] = ()
+    role_ids: tuple[str, ...] = ()
+    confidence: float = Field(ge=0.0, le=1.0)
+    support_count: int = Field(default=0, ge=0)
+    contradiction_count: int = Field(default=0, ge=0)
+    source_case_ids: tuple[str, ...] = ()
+    source_run_ids: tuple[str, ...] = ()
+    source_seeds: tuple[int, ...] = ()
+    contradiction_seeds: tuple[int, ...] = ()
+    code_revision: str | None = None
+    sc2_patch: str | None = None
+    expires_at: datetime | None = None
+    shadow_state_count: int = Field(default=0, ge=0)
+    false_block_count: int = Field(default=0, ge=0)
+    evidence: dict[str, object] = Field(default_factory=dict)
+
+    @property
+    def false_block_rate(self) -> float:
+        if self.shadow_state_count == 0:
+            return 0.0
+        return self.false_block_count / self.shadow_state_count
+
+
+class PlaybookRuleApplication(ContractModel):
+    application_id: str = Field(min_length=1)
+    rule_id: str = Field(min_length=1)
+    run_id: str = Field(min_length=1)
+    episode_id: str = Field(min_length=1)
+    step_id: int = Field(ge=0)
+    game_loop: int = Field(ge=0)
+    target_kind: Literal["intent", "candidate"]
+    target_id: str = Field(min_length=1)
+    matched: bool
+    blocked: bool = False
+    score_delta: float = 0.0
+    reason: str = Field(min_length=1)
 
 
 class PlaybookContext(ContractModel):

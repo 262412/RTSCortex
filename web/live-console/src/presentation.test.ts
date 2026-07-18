@@ -232,6 +232,51 @@ describe("Chinese event presentation", () => {
     expect(semanticScalar("missing_prerequisite", "kind")).toBe("缺少科技前置条件");
   });
 
+  it("explains race capability, role intent, arbitration, and executable rules", () => {
+    const profile = event("race_profile_activated", {
+      race: "terran",
+      macro_contract_ready: true,
+      runtime_mapping_ready: false,
+      live_worker_ready: false,
+      effect_verification_kinds: [],
+      limitations: ["llm_pysc2_worker_not_implemented"],
+    });
+    const roleIntent = event("role_intent_emitted", {
+      intent: {
+        role: "economy",
+        objective: "prevent supply block",
+        action_names: ["Build_SupplyDepot_Screen"],
+      },
+    });
+    const arbitration = event("intent_arbitrated", {
+      mode: "shadow",
+      arbitration: {
+        decisions: [{ intent_id: "intent-1", status: "selected" }],
+        selected_intent_ids: ["intent-1"],
+        conflicts: [],
+        agenda: { reserved_resources: { minerals: 100, vespene: 0, supply: 0 } },
+      },
+    });
+    const playbook = event("playbook_rule_applied", {
+      rule_id: "rule:no-idle-with-progress",
+      reason: "shadow_would_block",
+      score_delta: -4,
+    });
+
+    expect(eventSummary(profile)).toContain("仅离线契约");
+    expect(eventSummary(roleIntent)).toContain("经济管理");
+    expect(eventSummary(roleIntent)).toContain("建造补给站");
+    expect(eventSummary(arbitration)).toBe(
+      "影子模式 · 选择 1/1 个意图 · 冲突 0 个 · 预约 100 矿 / 0 气 / 0 人口",
+    );
+    expect(eventSummary(playbook)).toContain("rule:no-idle-with-progress");
+    expect(eventSemanticPayload(profile)).toMatchObject({
+      race: "terran",
+      live_worker_ready: false,
+      limitations: ["llm_pysc2_worker_not_implemented"],
+    });
+  });
+
   it("presents the Cortex specialist-to-executor pipeline without raw JSON", () => {
     const situation = event("situation_assessed", {
       source_kind: "deterministic",

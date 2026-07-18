@@ -9,7 +9,13 @@ from hashlib import sha256
 from rtscortex.contracts import ObservationEnvelope
 from rtscortex.cortex.models import MacroPlan, MacroStep, MacroStepStatus
 from rtscortex.policy.hima.live import HIMALiveProposalResponse
-from rtscortex.policy.hima.mapping import HIMA_RUNTIME_MAPPINGS, HIMAMacroActionMapper
+from rtscortex.policy.hima.mapping import (
+    HIMA_RUNTIME_MAPPINGS,
+    HIMAMacroActionMapper,
+    HIMAMacroMapping,
+    hima_runtime_mappings,
+)
+from rtscortex.policy.hima.race_vocabulary import resolve_race_hima_action
 from rtscortex.policy.hima.vocabulary import resolve_hima_action
 from rtscortex.policy.models import (
     MacroPolicyProposal,
@@ -18,6 +24,7 @@ from rtscortex.policy.models import (
     PolicyObservationFixture,
 )
 from rtscortex.progress import GoalProgressVerifier, GoalSpec
+from rtscortex.races import PROTOSS_PROFILE_DATA, RaceProfileData
 
 _MAPPINGS_BY_MACRO = {mapping.macro_action: mapping for mapping in HIMA_RUNTIME_MAPPINGS}
 _RUNTIME_TO_HIMA_TOKEN = {
@@ -35,6 +42,7 @@ def macro_plan_from_hima(
     ttl_game_loops: int,
     *,
     current_observation: ObservationEnvelope | None = None,
+    profile: RaceProfileData = PROTOSS_PROFILE_DATA,
 ) -> MacroPlan:
     """Project one correlated HIMA response into a typed, immutable macro plan."""
 
@@ -61,19 +69,22 @@ def macro_plan_from_hima(
         raise ValueError("current observation does not match the source episode")
 
     proposal = response.proposal
-    assessments = HIMAMacroActionMapper().assess(
+    assessments = HIMAMacroActionMapper(profile).assess(
         proposal,
         _live_fixture(projection_observation),
     )
     assessment_by_step = {
         (assessment.ordinal, assessment.source_action): assessment for assessment in assessments
     }
+    mappings_by_macro = _mappings_by_macro(profile)
     steps = [
         _macro_step(
             step.ordinal,
             step.canonical_action,
             step.repeat,
             assessment_by_step.get((step.ordinal, step.canonical_action)),
+            mappings_by_macro=mappings_by_macro,
+            managed_worker_action=f"TRAIN {profile.worker_type.upper()}",
         )
         for step in sorted(proposal.steps, key=lambda item: item.ordinal)
     ]
@@ -111,6 +122,7 @@ def macro_goal_spec(
     plan: MacroPlan,
     observation: ObservationEnvelope,
     verifier: GoalProgressVerifier | None = None,
+    profile: RaceProfileData = PROTOSS_PROFILE_DATA,
 ) -> GoalSpec | None:
     """Build the measurable prefix of a plan without crossing a hard blocker.
 
@@ -119,7 +131,7 @@ def macro_goal_spec(
     """
 
     _validate_plan_episode(plan, observation)
-    parse_blocker_ordinal = _hard_parse_blocker_ordinal(plan, observation)
+    parse_blocker_ordinal = _hard_parse_blocker_ordinal(plan, observation, profile)
     action_names: list[str] = []
     for step in sorted(plan.steps, key=lambda item: item.ordinal):
         if parse_blocker_ordinal is not None and step.ordinal >= parse_blocker_ordinal:
@@ -133,7 +145,7 @@ def macro_goal_spec(
         action_names.extend([step.runtime_actions[0]] * step.repeat)
     if not action_names:
         return None
-    progress_verifier = verifier or GoalProgressVerifier()
+    progress_verifier = verifier or GoalProgressVerifier(profile.progress_action_specs)
     return progress_verifier.goal_from_action_names(
         goal_id=f"{plan.plan_id}:goal",
         strategic_goal=plan.strategic_objective,
@@ -145,6 +157,7 @@ def macro_goal_spec(
 def _hard_parse_blocker_ordinal(
     plan: MacroPlan,
     observation: ObservationEnvelope,
+    profile: RaceProfileData,
 ) -> int | None:
     """Return the first parser failure encoded in the source HIMA response."""
 
@@ -156,7 +169,7 @@ def _hard_parse_blocker_ordinal(
     if not isinstance(proposal_payload, dict):
         return None
     proposal = MacroPolicyProposal.model_validate(proposal_payload)
-    assessments = HIMAMacroActionMapper().assess(
+    assessments = HIMAMacroActionMapper(profile).assess(
         proposal,
         _live_fixture(observation),
     )
@@ -174,6 +187,7 @@ def runtime_frontier(
     proposal: MacroPolicyProposal,
     observation: ObservationEnvelope,
     previous_actions: Iterable[str] = (),
+    profile: RaceProfileData = PROTOSS_PROFILE_DATA,
 ) -> PolicyActionAssessment | None:
     """Return the current dependency-safe Runtime frontier for a HIMA proposal.
 
@@ -183,7 +197,7 @@ def runtime_frontier(
     """
 
     fixture = _live_fixture(observation, previous_actions=previous_actions)
-    assessments = HIMAMacroActionMapper().assess(proposal, fixture)
+    assessments = HIMAMacroActionMapper(profile).assess(proposal, fixture)
     mapped_frontier = next(
         (assessment for assessment in assessments if assessment.is_runtime_frontier),
         None,
@@ -211,21 +225,36 @@ def runtime_frontier(
     return mapped_frontier
 
 
-def hima_previous_action_for_runtime_action(runtime_action: str) -> str | None:
+def hima_previous_action_for_runtime_action(
+    runtime_action: str,
+    profile: RaceProfileData = PROTOSS_PROFILE_DATA,
+) -> str | None:
     """Return the exact official HIMA token for one confirmed Runtime action."""
 
-    return _RUNTIME_TO_HIMA_TOKEN.get(runtime_action)
+    if profile is PROTOSS_PROFILE_DATA:
+        return _RUNTIME_TO_HIMA_TOKEN.get(runtime_action)
+    race = profile.race.value
+    return next(
+        (
+            action.upstream_name
+            for mapping in hima_runtime_mappings(race)
+            if runtime_action in mapping.runtime_actions
+            if (action := resolve_race_hima_action(mapping.macro_action, race=race)) is not None
+        ),
+        None,
+    )
 
 
 def hima_previous_actions_for_runtime_actions(
     runtime_actions: Iterable[str],
+    profile: RaceProfileData = PROTOSS_PROFILE_DATA,
 ) -> list[str]:
     """Project supported Runtime actions to official HIMA tokens in input order."""
 
     return [
         token
         for runtime_action in runtime_actions
-        if (token := hima_previous_action_for_runtime_action(runtime_action)) is not None
+        if (token := hima_previous_action_for_runtime_action(runtime_action, profile)) is not None
     ]
 
 
@@ -234,10 +263,13 @@ def _macro_step(
     semantic_action: str,
     repeat: int,
     assessment: PolicyActionAssessment | None,
+    *,
+    mappings_by_macro: dict[str, HIMAMacroMapping],
+    managed_worker_action: str,
 ) -> MacroStep:
-    mapping = _MAPPINGS_BY_MACRO.get(semantic_action)
+    mapping = mappings_by_macro.get(semantic_action)
     if mapping is None:
-        managed = semantic_action == "TRAIN PROBE"
+        managed = semantic_action == managed_worker_action
         return MacroStep(
             ordinal=ordinal,
             semantic_action=semantic_action,
@@ -262,6 +294,12 @@ def _macro_step(
         status=status,
         reason=assessment.reason_code if assessment is not None else None,
     )
+
+
+def _mappings_by_macro(profile: RaceProfileData) -> dict[str, HIMAMacroMapping]:
+    if profile is PROTOSS_PROFILE_DATA:
+        return _MAPPINGS_BY_MACRO
+    return {mapping.macro_action: mapping for mapping in hima_runtime_mappings(profile.race.value)}
 
 
 def _live_fixture(

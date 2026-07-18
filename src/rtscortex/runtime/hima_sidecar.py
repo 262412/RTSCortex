@@ -18,8 +18,11 @@ from rtscortex.policy.hima.live import (
 )
 from rtscortex.policy.hima.models import (
     HIMA_ADAPTER_VERSION,
-    HIMA_PARSER_VERSION,
-    HIMA_VOCABULARY_VERSION,
+)
+from rtscortex.policy.hima.race_vocabulary import (
+    HIMA_PARSER_VERSIONS,
+    HIMA_VOCABULARY_VERSIONS,
+    hima_race_for_model,
 )
 from rtscortex.policy.hima.subagent import HIMA_PINNED_REVISIONS
 
@@ -292,10 +295,11 @@ class HIMASidecarProcess:
                 "HIMA sidecar revision mismatch: "
                 f"{health.model_revision!r} != {self.expected_model_revision!r}"
             )
+        race = hima_race_for_model(self.expected_model_id)
         versions = {
             "adapter": (health.adapter_version, HIMA_ADAPTER_VERSION),
-            "parser": (health.parser_version, HIMA_PARSER_VERSION),
-            "vocabulary": (health.vocabulary_version, HIMA_VOCABULARY_VERSION),
+            "parser": (health.parser_version, HIMA_PARSER_VERSIONS[race]),
+            "vocabulary": (health.vocabulary_version, HIMA_VOCABULARY_VERSIONS[race]),
         }
         for component, (actual, expected) in versions.items():
             if actual != expected:

@@ -24,11 +24,17 @@ const EVENT_TITLES: Record<string, string> = {
   execution: "动作执行结果",
   validation_failed: "动作验证失败",
   goal_progress: "目标进度检查",
+  race_profile_activated: "当前种族能力已激活",
   situation_assessed: "战况分析完成",
+  situation_shadow_assessed: "影子战况模型已完成分析",
+  tactical_policy_shadow: "影子战术策略已完成评估",
   macro_plan_accepted: "专用宏观计划已采用",
   macro_plan_rejected: "专用宏观计划被拒绝",
   macro_step_updated: "宏观计划步骤已更新",
   intent_emitted: "决策意图已生成",
+  role_intent_emitted: "职责 Agent 已提交意图",
+  intent_arbitrated: "战略意图已仲裁",
+  intent_arbiter_shadow_diff: "影子仲裁差异已记录",
   candidate_set_built: "合法执行候选已生成",
   executor_selection: "快速执行器已选择",
   command_lineage: "动作决策链已关联",
@@ -38,6 +44,8 @@ const EVENT_TITLES: Record<string, string> = {
   race_brain_coordinated: "种族大脑已汇总三位专家",
   macro_proposal_revalidated: "宏观提案已按最新战况复核",
   playbook_retrieved: "战术笔记已检索",
+  playbook_rule_applied: "可执行战术规则已应用",
+  playbook_rule_updated: "可执行战术规则已更新",
   playbook_case_recorded: "关键决策案例已记录",
   playbook_lesson_candidate: "候选战术经验已更新",
   playbook_lesson_promoted: "战术经验已晋升",
@@ -288,6 +296,30 @@ const ACTION_LABELS: Record<string, string> = {
   Build_Nexus_Near: "在扩张点建造星灵枢纽",
   Build_Stargate_Screen: "建造星门",
   Build_ShieldBattery_Screen: "建造护盾充能站",
+  Build_SupplyDepot_Screen: "建造补给站",
+  Build_Barracks_Screen: "建造兵营",
+  Build_Refinery_Near: "在气矿建造精炼厂",
+  Build_CommandCenter_Near: "建造指挥中心",
+  Build_Factory_Screen: "建造重工厂",
+  Build_Starport_Screen: "建造星港",
+  Build_EngineeringBay_Screen: "建造工程站",
+  Build_BarracksTechLab: "为兵营建造科技实验室",
+  Build_BarracksReactor: "为兵营建造反应堆",
+  Build_FactoryTechLab: "为重工厂建造科技实验室",
+  Build_FactoryReactor: "为重工厂建造反应堆",
+  Build_StarportTechLab: "为星港建造科技实验室",
+  Build_StarportReactor: "为星港建造反应堆",
+  Build_Bunker_Screen: "建造地堡",
+  Build_MissileTurret_Screen: "建造导弹塔",
+  Build_Hatchery_Near: "建造孵化场",
+  Build_Extractor_Near: "在气矿建造萃取房",
+  Build_SpawningPool_Screen: "建造孵化池",
+  Build_RoachWarren_Screen: "建造蟑螂繁殖场",
+  Morph_Lair: "将孵化场变形为虫穴",
+  Build_EvolutionChamber_Screen: "建造进化腔",
+  Build_HydraliskDen_Screen: "建造刺蛇巢",
+  Build_SpineCrawler_Screen: "建造脊针爬虫",
+  Build_SporeCrawler_Screen: "建造孢子爬虫",
   Train_Probe: "训练探机",
   Train_Zealot: "训练狂热者",
   Train_Stalker: "训练追猎者",
@@ -295,6 +327,18 @@ const ACTION_LABELS: Record<string, string> = {
   Train_VoidRay: "训练虚空辉光舰",
   Train_Oracle: "训练先知",
   Train_Phoenix: "训练凤凰战机",
+  Train_Marine: "训练陆战队员",
+  Train_Marauder: "训练劫掠者",
+  Train_Hellion: "训练恶火",
+  Train_SiegeTank: "训练攻城坦克",
+  Train_Medivac: "训练医疗运输机",
+  Train_VikingFighter: "训练维京战机",
+  Train_Overlord: "变异王虫",
+  Train_Queen: "训练虫后",
+  Train_Zergling: "变异跳虫",
+  Train_Roach: "变异蟑螂",
+  Train_Hydralisk: "变异刺蛇",
+  Research_Stimpack: "研究兴奋剂",
   Research_Warp_Gate: "研究折跃门",
   Research_WarpGate: "研究折跃门",
   Retreat: "撤退",
@@ -310,6 +354,12 @@ const VALUE_LABELS: Record<string, string> = {
   situation: "战况分析",
   macro: "宏观决策",
   tactical: "战术决策",
+  protoss: "神族",
+  terran: "人族",
+  zerg: "虫族",
+  shadow: "影子模式",
+  active: "生效模式",
+  disabled: "已关闭",
   motor: "快速执行",
   deterministic: "确定性规则",
   deterministic_reflex: "确定性战术与快速反应",
@@ -414,6 +464,16 @@ const VALUE_LABELS: Record<string, string> = {
   "action is not available": "当前观察中该动作不可用",
 };
 
+const ROLE_LABELS: Record<string, string> = {
+  economy: "经济管理",
+  technology: "科技发展",
+  production: "生产调度",
+  defense: "防守",
+  offense: "进攻",
+  focus_fire: "集火",
+  retreat: "撤退",
+};
+
 const CATEGORY_LABELS: Record<Exclude<EventCategory, "all"> | "system", string> = {
   planner: "规划",
   reflex: "快速反应",
@@ -516,6 +576,9 @@ export function semanticScalar(value: string | number | boolean | null, key?: st
     key === "advancing_actions"
   ) return actionLabel(value);
   if (key === "actor") return actorLabel(value);
+  if (key === "role" && ROLE_LABELS[value.toLowerCase()]) {
+    return `${ROLE_LABELS[value.toLowerCase()]}（${value}）`;
+  }
   if (key === "status" && GOAL_PROGRESS_STATUS_LABELS[value.toLowerCase()]) {
     return `${GOAL_PROGRESS_STATUS_LABELS[value.toLowerCase()]}（${value}）`;
   }
@@ -695,6 +758,51 @@ export function eventSummary(event: StoredEvent): string {
       intentId,
     ].filter(Boolean).join(" · ");
   }
+  if (event.event_type === "role_intent_emitted") {
+    const intent = asObject(payload.intent) ?? payload;
+    const role = readString(intent, "role") ?? "unknown";
+    const action = asArray(intent.action_names).find(
+      (value): value is string => typeof value === "string",
+    );
+    const objective = readString(intent, "objective");
+    return `${semanticScalar(role, "role")} · ${action ? actionLabel(action, false) : "未指定动作"}${objective ? ` · ${truncate(objective)}` : ""}`;
+  }
+  if (event.event_type === "tactical_policy_shadow") {
+    const provider = readString(payload, "provider_id") ?? "unknown";
+    const intents = asArray(payload.shadow_intents);
+    return `${provider} · ${intents.length} 个影子 Intent · ${formatDuration(readNumber(payload, "latency_ms") ?? 0)}`;
+  }
+  if (event.event_type === "race_profile_activated") {
+    const race = semanticScalar(readString(payload, "race") ?? "unknown");
+    const live = payload.live_worker_ready === true ? "真实 Worker 就绪" : "仅离线契约";
+    const effects = asArray(payload.effect_verification_kinds)
+      .filter((value): value is string => typeof value === "string")
+      .map((value) => semanticScalar(value));
+    return `${race} · ${live}${effects.length ? ` · 效果验证：${effects.join("、")}` : ""}`;
+  }
+  if (event.event_type === "intent_arbitrated") {
+    const arbitration = asObject(payload.arbitration) ?? payload;
+    const decisions = asArray(arbitration.decisions);
+    const selected = asArray(arbitration.selected_intent_ids).length;
+    const conflicts = asArray(arbitration.conflicts).length;
+    const agenda = asObject(arbitration.agenda);
+    const resources = asObject(agenda?.reserved_resources);
+    return `${semanticScalar(readString(payload, "mode") ?? "unknown")} · 选择 ${selected}/${decisions.length} 个意图 · 冲突 ${conflicts} 个 · 预约 ${readNumber(resources ?? {}, "minerals") ?? 0} 矿 / ${readNumber(resources ?? {}, "vespene") ?? 0} 气 / ${readNumber(resources ?? {}, "supply") ?? 0} 人口`;
+  }
+  if (event.event_type === "playbook_rule_applied") {
+    const rule = readString(payload, "rule_id") ?? "unknown";
+    const reason = readString(payload, "reason") ?? "matched";
+    const delta = readNumber(payload, "score_delta") ?? 0;
+    return `${rule} · ${semanticScalar(reason)}${delta ? ` · 仲裁分 ${delta > 0 ? "+" : ""}${delta}` : ""}`;
+  }
+  if (event.event_type === "playbook_rule_updated") {
+    const rule = readString(payload, "rule_id") ?? "unknown";
+    const strength = semanticScalar(readString(payload, "strength") ?? "unknown");
+    const status = semanticScalar(readString(payload, "status") ?? "unknown");
+    const support = readNumber(payload, "support_count") ?? 0;
+    const contradictions = readNumber(payload, "contradiction_count") ?? 0;
+    return `${rule} · ${strength} / ${status} · 支持 ${support} · 矛盾 ${contradictions}`;
+  }
   if (event.event_type === "candidate_set_built") {
     const candidates = asArray(payload.candidates);
     const count = readNumber(payload, "candidate_count") ?? candidates.length;
@@ -837,8 +945,14 @@ export function eventSemanticPayload(event: StoredEvent): JsonValue {
       ["assessment", payload.assessment],
     ]);
   }
-  if (["macro_plan_accepted", "macro_plan_rejected", "macro_step_updated", "intent_emitted", "candidate_set_built", "executor_selection", "command_lineage", "specialist_failed", "specialist_ready", "specialist_recovered"].includes(event.event_type)) {
+  if (["race_profile_activated", "tactical_policy_shadow", "playbook_rule_updated", "macro_plan_accepted", "macro_plan_rejected", "macro_step_updated", "intent_emitted", "role_intent_emitted", "intent_arbitrated", "intent_arbiter_shadow_diff", "candidate_set_built", "executor_selection", "command_lineage", "specialist_failed", "specialist_ready", "specialist_recovered", "playbook_rule_applied"].includes(event.event_type)) {
     return compactObject([
+      ["race", payload.race],
+      ["macro_contract_ready", payload.macro_contract_ready],
+      ["runtime_mapping_ready", payload.runtime_mapping_ready],
+      ["live_worker_ready", payload.live_worker_ready],
+      ["effect_verification_kinds", payload.effect_verification_kinds],
+      ["limitations", payload.limitations],
       ["role", payload.role ?? payload.source_role ?? payload.intent_kind ?? payload.specialist],
       ["model_id", payload.model_id ?? payload.source_model_id ?? payload.model],
       ["plan_id", payload.plan_id ?? payload.macro_plan_id],
@@ -855,6 +969,10 @@ export function eventSemanticPayload(event: StoredEvent): JsonValue {
       ["intent", payload.intent],
       ["candidates", payload.candidates],
       ["lineage", payload.lineage],
+      ["arbitration", payload.arbitration],
+      ["rule_id", payload.rule_id],
+      ["target_id", payload.target_id],
+      ["score_delta", payload.score_delta],
     ]);
   }
   if (event.event_type === "decision") {

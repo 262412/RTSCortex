@@ -1,4 +1,4 @@
-import { BrainCircuit, Braces, CheckCircle2, Clock3, Crosshair, Database, ShieldCheck, Target, Workflow, XCircle } from "lucide-react";
+import { BookOpenCheck, BrainCircuit, Braces, CheckCircle2, Clock3, Crosshair, Database, Scale, ShieldCheck, Target, UsersRound, Workflow, XCircle } from "lucide-react";
 
 import { moduleOutput } from "../data";
 import { eventSemanticPayload, moduleSemanticOutput, semanticScalar } from "../presentation";
@@ -6,7 +6,12 @@ import type { JsonValue, StoredEvent } from "../types";
 import { SemanticValue } from "./SemanticValue";
 
 interface DecisionRailProps {
+  raceProfile?: StoredEvent;
   situation?: StoredEvent;
+  tacticalShadow?: StoredEvent;
+  roleIntent?: StoredEvent;
+  arbitration?: StoredEvent;
+  playbookRule?: StoredEvent;
   reflection?: StoredEvent;
   goalProgress?: StoredEvent;
   plan?: StoredEvent;
@@ -42,7 +47,12 @@ function InsightCard({ title, icon, value, tone = "default", empty = "Waiting fo
 }
 
 export function DecisionRail({
+  raceProfile,
   situation,
+  tacticalShadow,
+  roleIntent,
+  arbitration,
+  playbookRule,
   reflection,
   goalProgress,
   plan,
@@ -80,10 +90,40 @@ export function DecisionRail({
       <div className="insight-stack">
         <InsightCard title="模型调用" icon={<Clock3 size={15} />} value={modelTelemetry} />
         <InsightCard
+          title="当前种族与能力"
+          icon={<ShieldCheck size={15} />}
+          value={raceProfile ? eventSemanticPayload(raceProfile) : undefined}
+          empty="等待 RaceProfile 激活"
+        />
+        <InsightCard
           title="当前战况分析"
           icon={<BrainCircuit size={15} />}
           value={situation ? eventSemanticPayload(situation) : undefined}
           empty="等待战况分析"
+        />
+        <InsightCard
+          title="影子战术策略"
+          icon={<Crosshair size={15} />}
+          value={tacticalShadow ? eventSemanticPayload(tacticalShadow) : undefined}
+          empty="未启用战术模型 shadow"
+        />
+        <InsightCard
+          title="职责 Agent"
+          icon={<UsersRound size={15} />}
+          value={roleIntent ? eventSemanticPayload(roleIntent) : undefined}
+          empty="等待职责 Agent 提交 Intent"
+        />
+        <InsightCard
+          title="战略意图仲裁"
+          icon={<Scale size={15} />}
+          value={arbitration ? eventSemanticPayload(arbitration) : undefined}
+          empty="等待 Intent Arbiter"
+        />
+        <InsightCard
+          title="CortexPlaybook 约束"
+          icon={<BookOpenCheck size={15} />}
+          value={playbookRule ? eventSemanticPayload(playbookRule) : undefined}
+          empty="当前没有适用的可执行规则"
         />
         <InsightCard title="上下文压缩" icon={<Database size={15} />} value={context?.payload} />
         <InsightCard title="复盘反思" icon={<BrainCircuit size={15} />} value={moduleSemanticOutput(reflection)} />

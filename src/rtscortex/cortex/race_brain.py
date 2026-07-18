@@ -12,9 +12,10 @@ from pydantic import Field
 from rtscortex.contracts.models import ContractModel
 from rtscortex.cortex.macro import runtime_frontier
 from rtscortex.cortex.models import SituationAssessment, ThreatLevel
-from rtscortex.playbook import PlaybookRuleKind, PlaybookSelection
+from rtscortex.playbook.models import PlaybookRuleKind, PlaybookSelection
 from rtscortex.policy.hima import HIMAInputContext, HIMALiveHealth, HIMALiveProposalResponse
 from rtscortex.policy.models import PolicyActionAssessment, PolicyActionClassification
+from rtscortex.races import race_profile
 
 RACE_BRAIN_COORDINATOR_VERSION = "deterministic-race-brain-v1"
 HIMACluster = Literal["a", "b", "c"]
@@ -121,6 +122,12 @@ class HIMAEnsemblePolicyClient:
         for cluster in _HIMA_CLUSTERS:
             client = self._clients[cluster]
             health = await client.health()
+            expected_model_id = f"SNUMPR/{self.race.title()}-{cluster}"
+            if health.model_id != expected_model_id:
+                raise ValueError(
+                    "race brain member identity mismatch: "
+                    f"{health.model_id!r} != {expected_model_id!r}"
+                )
             members.append(
                 RaceBrainMemberHealth(
                     member_id=f"hima-{self.race}-{cluster}",
@@ -269,6 +276,7 @@ def _coordinate(
             response.proposal,
             context.observation,
             context.previous_actions,
+            race_profile(race).data,
         )
         score, reasons = _proposal_score(
             response,

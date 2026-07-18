@@ -32,13 +32,22 @@ from rtscortex.cortex import (
     DeterministicCandidateExecutor,
     DeterministicSituationAnalyzer,
     DeterministicTacticalAgent,
+    FastExecutorContext,
+    IntentArbiter,
     MacroIntent,
     MacroPlan,
     MacroStep,
     MacroStepStatus,
     ReflexIntent,
+    RoleAgentContext,
+    RoleAgentCoordinator,
     SituationAssessment,
+    SituationProvider,
+    StrategicAgenda,
+    StrategicIntent,
+    StrategicIntentAdapter,
     TacticalIntent,
+    TacticalPolicyProvider,
     hima_previous_action_for_runtime_action,
     macro_goal_spec,
     macro_plan_from_hima,
@@ -57,8 +66,12 @@ from rtscortex.memory import EventStore
 from rtscortex.playbook import (
     CortexPlaybookReviewer,
     LessonStatus,
+    PlaybookCandidateGuard,
     PlaybookContext,
+    PlaybookIntentGuard,
     PlaybookQuery,
+    PlaybookRule,
+    PlaybookRuleApplication,
     PlaybookSelection,
     PlaybookStore,
 )
@@ -71,7 +84,8 @@ from rtscortex.policy.models import (
     PolicyActionAssessment,
     PolicyActionClassification,
 )
-from rtscortex.progress import GoalProgressReport, GoalSpec
+from rtscortex.progress import GoalProgressReport, GoalProgressVerifier, GoalSpec
+from rtscortex.races import RaceProfile, race_profile
 from rtscortex.reflex import ReflexEngine
 from rtscortex.runtime.engine import (
     _ACTIONABLE_COMMAND_STATUSES,
@@ -152,6 +166,10 @@ class CortexRuntimeEngine(RuntimeEngine):
         macro_startup_failure: Exception | None = None,
         playbook_store: PlaybookStore | None = None,
         playbook_reviewer: CortexPlaybookReviewer | None = None,
+        situation_provider: SituationProvider | None = None,
+        shadow_situation_provider: SituationProvider | None = None,
+        tactical_provider: TacticalPolicyProvider | None = None,
+        shadow_tactical_provider: TacticalPolicyProvider | None = None,
     ) -> None:
         if config.agent.variant != "cortex":
             raise ValueError("CortexRuntimeEngine requires agent.variant=cortex")
@@ -168,6 +186,10 @@ class CortexRuntimeEngine(RuntimeEngine):
         if config.cortex.macro.kind == "disabled" and macro_client is not None:
             raise ValueError("a macro client cannot be attached when the specialist is disabled")
         super().__init__(config=config, store=store, provider=provider)
+        self._race_profile: RaceProfile = race_profile(config.environment.agent_race)
+        self.goal_progress_verifier = GoalProgressVerifier(
+            self._race_profile.data.progress_action_specs
+        )
         self.reflex = ReflexEngine(
             enabled=config.reflex.enabled,
             low_health_threshold=config.reflex.low_health_threshold,
@@ -192,20 +214,51 @@ class CortexRuntimeEngine(RuntimeEngine):
         self._playbook_reviewer = playbook_reviewer
         self._playbook_selection: PlaybookSelection | None = None
         self._playbook_selection_fingerprint: tuple[str, ...] | None = None
+        self._playbook_rules: tuple[PlaybookRule, ...] = ()
+        self._playbook_intent_guard = PlaybookIntentGuard()
+        self._playbook_candidate_guard = PlaybookCandidateGuard()
+        self._current_situation: SituationAssessment | None = None
         self._macro_goal: GoalSpec | None = None
         self._macro_plan_frozen = False
         self._macro_inflight_command_id: str | None = None
         self._macro_command_steps: dict[str, tuple[str, str, int]] = {}
         self._command_lineages: dict[str, CommandLineage] = {}
         self._previous_hima_actions: list[tuple[int, str]] = []
-        self._situation = DeterministicSituationAnalyzer(valid_for_game_loops=1)
-        self._tactical = DeterministicTacticalAgent(
+        if config.cortex.situation.kind == "model_active" and situation_provider is None:
+            raise ValueError("model_active Situation requires a SituationProvider")
+        if config.cortex.situation.kind == "model_shadow" and shadow_situation_provider is None:
+            raise ValueError("model_shadow Situation requires a shadow SituationProvider")
+        if config.cortex.tactical.kind == "model_active" and tactical_provider is None:
+            raise ValueError("model_active tactical policy requires a TacticalPolicyProvider")
+        if (
+            config.cortex.tactical.kind == "model_shadow"
+            and shadow_tactical_provider is None
+        ):
+            raise ValueError("model_shadow tactical policy requires a shadow provider")
+        self._situation = situation_provider or DeterministicSituationAnalyzer(
+            valid_for_game_loops=1
+        )
+        self._shadow_situation = shadow_situation_provider
+        deterministic_tactical = DeterministicTacticalAgent(
             retreat_health_threshold=(config.cortex.tactical.retreat_health_threshold),
             minimum_advance_army_supply=(config.cortex.tactical.minimum_advance_army_supply),
             reacquire_cooldown_game_loops=(config.cortex.tactical.reacquire_cooldown_game_loops),
         )
+        self._tactical: TacticalPolicyProvider = tactical_provider or deterministic_tactical
+        self._shadow_tactical = shadow_tactical_provider
         self._candidate_compiler = CandidateCompiler()
         self._executor = DeterministicCandidateExecutor()
+        self._strategic_adapter = StrategicIntentAdapter(self._race_profile)
+        self._role_agents = RoleAgentCoordinator(
+            self._race_profile,
+            self._strategic_adapter,
+        )
+        self._strategic_arbiter = IntentArbiter(
+            switch_margin=config.cortex.arbiter.switch_margin,
+            max_intents=config.cortex.arbiter.max_intents,
+        )
+        self._strategic_agenda: StrategicAgenda | None = None
+        self._strategic_by_legacy_intent: dict[str, StrategicIntent] = {}
 
     async def start(self) -> None:
         """Load and validate the configured specialist before SC2 starts."""
@@ -231,6 +284,7 @@ class CortexRuntimeEngine(RuntimeEngine):
     async def tick(self, observation: ObservationEnvelope) -> ActionBatch:
         tick_started = time.perf_counter()
         await self._activate_episode(observation)
+        self._strategic_by_legacy_intent = {}
         self.store.append_event(
             run_id=observation.run_id,
             episode_id=observation.episode_id,
@@ -243,7 +297,18 @@ class CortexRuntimeEngine(RuntimeEngine):
         self._note_alerts(observation)
 
         assessment = self._situation.assess(observation)
+        self._current_situation = assessment
         self._record_cortex_event(observation, "situation_assessed", assessment)
+        if self._shadow_situation is not None:
+            shadow_assessment = self._shadow_situation.assess(observation)
+            self._record_cortex_event(
+                observation,
+                "situation_shadow_assessed",
+                {
+                    "active_assessment_id": assessment.assessment_id,
+                    "assessment": shadow_assessment.model_dump(mode="json"),
+                },
+            )
         self._refresh_playbook(observation, assessment)
 
         goal_progress = self._macro_goal_progress(observation)
@@ -269,9 +334,26 @@ class CortexRuntimeEngine(RuntimeEngine):
         if macro_prepared is not None:
             prepared.append(macro_prepared)
 
+        tactical_intents = self._tactical.evaluate(observation, assessment)
+        if self._shadow_tactical is not None:
+            shadow_started = time.perf_counter()
+            shadow_intents = self._shadow_tactical.evaluate(observation, assessment)
+            self._record_cortex_event(
+                observation,
+                "tactical_policy_shadow",
+                {
+                    "provider_id": self._shadow_tactical.provider_id,
+                    "provider_version": self._shadow_tactical.provider_version,
+                    "latency_ms": (time.perf_counter() - shadow_started) * 1_000,
+                    "active_intent_ids": [intent.intent_id for intent in tactical_intents],
+                    "shadow_intents": [
+                        intent.model_dump(mode="json") for intent in shadow_intents
+                    ],
+                },
+            )
         tactical_prepared = [
             item
-            for intent in self._tactical.evaluate(observation, assessment)
+            for intent in tactical_intents
             if (item := self._compile_intent(observation, intent)) is not None
         ]
         prepared.extend(tactical_prepared)
@@ -289,6 +371,8 @@ class CortexRuntimeEngine(RuntimeEngine):
         ]
         prepared.extend(reflex_prepared)
         reflex_latency_ms = (time.perf_counter() - reflex_started) * 1_000
+
+        prepared = self._apply_strategic_arbitration(observation, prepared)
 
         prepared_by_id = {item.command.command_id: item for item in prepared}
         macro_candidates = [
@@ -476,18 +560,35 @@ class CortexRuntimeEngine(RuntimeEngine):
         self._macro_proposal = None
         self._playbook_selection = None
         self._playbook_selection_fingerprint = None
+        self._playbook_rules = ()
+        self._current_situation = None
         self._macro_goal = None
         self._macro_plan_frozen = False
         self._macro_inflight_command_id = None
         self._macro_command_steps = {}
         self._command_lineages = {}
         self._previous_hima_actions = []
+        self._strategic_agenda = None
+        self._strategic_by_legacy_intent = {}
         self._macro_source_observation = None
         self._macro_task_started_at = None
         self._macro_task_outcome_revision = None
         self._macro_outcome_revision = 0
         self._next_macro_retry_game_loop = None
         self._recover_cortex_episode(observation)
+        if (
+            self.store.last_event(
+                observation.run_id,
+                observation.episode_id,
+                "race_profile_activated",
+            )
+            is None
+        ):
+            self._record_cortex_event(
+                observation,
+                "race_profile_activated",
+                self._race_profile.data.capability_snapshot(),
+            )
 
     def _recover_cortex_episode(self, observation: ObservationEnvelope) -> None:
         plan_event = self.store.last_event(
@@ -515,6 +616,23 @@ class CortexRuntimeEngine(RuntimeEngine):
                     self._macro_plan.created_game_loop,
                 )
             )
+
+        arbitration_event = self.store.last_event(
+            observation.run_id,
+            observation.episode_id,
+            "intent_arbitrated",
+        )
+        if arbitration_event is not None:
+            arbitration_payload = arbitration_event.payload.get("arbitration")
+            agenda_payload = (
+                arbitration_payload.get("agenda")
+                if isinstance(arbitration_payload, dict)
+                else None
+            )
+            if isinstance(agenda_payload, dict):
+                agenda = StrategicAgenda.model_validate(agenda_payload)
+                if agenda.commitment_until_game_loop > observation.game_loop:
+                    self._strategic_agenda = agenda
 
         for event in self.store.events_of_type(
             observation.run_id,
@@ -549,7 +667,10 @@ class CortexRuntimeEngine(RuntimeEngine):
                 continue
             if report.status is ExecutionStatus.SUCCEEDED and report.action_name is not None:
                 loop = self._execution_game_loop(report)
-                token = hima_previous_action_for_runtime_action(report.action_name)
+                token = hima_previous_action_for_runtime_action(
+                    report.action_name,
+                    self._race_profile.data,
+                )
                 if token is not None:
                     self._previous_hima_actions.append((loop, token))
             recovered_macro_outcomes.append(
@@ -761,6 +882,7 @@ class CortexRuntimeEngine(RuntimeEngine):
                 source_observation,
                 self.config.cortex.macro.plan_ttl_game_loops,
                 current_observation=(observation if revalidate_after_outcome else None),
+                profile=self._race_profile.data,
             )
             if isinstance(policy_response, RaceBrainProposalResponse):
                 raw = policy_response.model_dump(mode="json")
@@ -788,6 +910,7 @@ class CortexRuntimeEngine(RuntimeEngine):
                 response.proposal,
                 observation,
                 self._recent_hima_actions(observation.game_loop),
+                self._race_profile.data,
             )
             fallback = self._fallback_frontier(
                 response.proposal,
@@ -817,7 +940,12 @@ class CortexRuntimeEngine(RuntimeEngine):
                     reason=reason,
                 )
                 return
-            goal = macro_goal_spec(plan, observation, self.goal_progress_verifier)
+            goal = macro_goal_spec(
+                plan,
+                observation,
+                self.goal_progress_verifier,
+                self._race_profile.data,
+            )
             self._accept_macro_plan(
                 plan,
                 response.proposal,
@@ -923,6 +1051,7 @@ class CortexRuntimeEngine(RuntimeEngine):
             proposal,
             observation,
             self._recent_hima_actions(observation.game_loop),
+            self._race_profile.data,
         )
         is_revision = self._macro_plan is not None
         self._macro_plan = plan
@@ -1003,6 +1132,7 @@ class CortexRuntimeEngine(RuntimeEngine):
             remaining_proposal,
             observation,
             self._recent_hima_actions(observation.game_loop),
+            self._race_profile.data,
         )
         if frontier is None:
             return None
@@ -1020,7 +1150,7 @@ class CortexRuntimeEngine(RuntimeEngine):
             )
             reason = (
                 "supply_emergency"
-                if fallback.source_action == "BUILD PYLON"
+                if fallback.source_action == self._supply_macro_action()
                 and self._free_supply(observation)
                 <= self.config.cortex.executor.supply_emergency_free_supply
                 else "resource_fallback"
@@ -1082,7 +1212,7 @@ class CortexRuntimeEngine(RuntimeEngine):
             )
             return None
         if (
-            frontier.source_action == "BUILD PYLON"
+            frontier.source_action == self._supply_macro_action()
             and self._free_supply(observation)
             >= self.config.cortex.executor.pylon_redundancy_free_supply
         ):
@@ -1155,24 +1285,31 @@ class CortexRuntimeEngine(RuntimeEngine):
         ):
             return None
         free_supply = self._free_supply(observation)
+        supply_action = self._supply_macro_action()
+        gas_action = self._semantic_action_for_target(self._race_profile.data.gas_structure)
+        townhall_action = self._semantic_action_for_target(
+            self._race_profile.data.townhall_types[0]
+        )
+        fallback_unit_action = self._fallback_unit_macro_action()
         if (
-            blocked_frontier.source_action != "BUILD PYLON"
+            blocked_frontier.source_action != supply_action
             and free_supply <= self.config.cortex.executor.supply_emergency_free_supply
         ):
             emergency = self._legal_proposal_step(
                 proposal,
                 observation,
-                "BUILD PYLON",
+                supply_action,
             )
             if emergency is not None:
                 return emergency
-        nexus_count = sum(
-            structure.unit_type == "Nexus" for structure in observation.state.own_structures
+        townhall_count = sum(
+            structure.unit_type in self._race_profile.data.townhall_types
+            for structure in observation.state.own_structures
         )
         gas_saturated_before_expansion = (
-            blocked_frontier.source_action == "BUILD ASSIMILATOR"
+            blocked_frontier.source_action == gas_action
             and blocked_frontier.reason_code == "action_unavailable_now"
-            and nexus_count < 2
+            and townhall_count < 2
             and observation.state.economy.minerals >= 400
         )
         if (
@@ -1182,14 +1319,14 @@ class CortexRuntimeEngine(RuntimeEngine):
             return None
         fallback_actions = []
         if gas_saturated_before_expansion or (
-            observation.state.economy.minerals >= 800 and nexus_count < 2
+            observation.state.economy.minerals >= 800 and townhall_count < 2
         ):
-            fallback_actions.append("BUILD NEXUS")
-        fallback_actions.append("TRAIN ZEALOT")
+            fallback_actions.append(townhall_action)
+        fallback_actions.append(fallback_unit_action)
         if free_supply <= self.config.cortex.executor.resource_fallback_pylon_free_supply:
-            fallback_actions.append("BUILD PYLON")
-        if "BUILD NEXUS" not in fallback_actions:
-            fallback_actions.append("BUILD NEXUS")
+            fallback_actions.append(supply_action)
+        if townhall_action not in fallback_actions:
+            fallback_actions.append(townhall_action)
         for action_name in fallback_actions:
             fallback = self._legal_proposal_step(
                 proposal,
@@ -1199,6 +1336,43 @@ class CortexRuntimeEngine(RuntimeEngine):
             if fallback is not None:
                 return fallback
         return None
+
+    def _supply_macro_action(self) -> str:
+        return self._semantic_action_for_target(self._race_profile.data.supply_provider)
+
+    def _fallback_unit_macro_action(self) -> str:
+        worker = self._race_profile.data.worker_type.casefold()
+        candidates = [
+            spec
+            for spec in self._race_profile.data.progress_action_specs
+            if spec.effect_kind.value == "unit"
+            and spec.effect_target.casefold() != worker
+            and spec.vespene == 0
+        ]
+        if not candidates:
+            raise RuntimeError(f"{self._race_profile.race.value} profile has no fallback unit")
+        selected = min(candidates, key=lambda spec: (spec.minerals, spec.name))
+        return self._semantic_action_for_runtime(selected.name)
+
+    def _semantic_action_for_target(self, effect_target: str) -> str:
+        matching = [
+            spec.name
+            for spec in self._race_profile.data.progress_action_specs
+            if spec.effect_target.casefold() == effect_target.casefold()
+        ]
+        if not matching:
+            raise RuntimeError(
+                f"{self._race_profile.race.value} profile has no action for {effect_target}"
+            )
+        return self._semantic_action_for_runtime(matching[0])
+
+    def _semantic_action_for_runtime(self, runtime_action: str) -> str:
+        for mapping in self._race_profile.data.macro_action_mappings:
+            if runtime_action in mapping.runtime_actions:
+                return mapping.semantic_action
+        raise RuntimeError(
+            f"{self._race_profile.race.value} profile has no HIMA mapping for {runtime_action}"
+        )
 
     def _legal_proposal_step(
         self,
@@ -1215,6 +1389,7 @@ class CortexRuntimeEngine(RuntimeEngine):
                 isolated,
                 observation,
                 previous_actions,
+                self._race_profile.data,
             )
             if (
                 assessment is not None
@@ -1323,6 +1498,25 @@ class CortexRuntimeEngine(RuntimeEngine):
         semantic_action: str | None = None,
         macro_step_ordinal: int | None = None,
     ) -> _PreparedCommand | None:
+        assessment = self._current_situation
+        if assessment is None:
+            raise RuntimeError("role agents require a current Situation assessment")
+        strategic_intent = self._role_agents.evaluate(
+            RoleAgentContext(
+                observation=observation,
+                situation=assessment,
+                source_intents=(intent,),
+            )
+        )[intent.intent_id]
+        self._strategic_by_legacy_intent[intent.intent_id] = strategic_intent
+        self._record_cortex_event(
+            observation,
+            "role_intent_emitted",
+            {
+                "legacy_intent_id": intent.intent_id,
+                "intent": strategic_intent.model_dump(mode="json"),
+            },
+        )
         busy_actors = tuple(
             lifecycle.command.actor
             for lifecycle in self._command_states.values()
@@ -1345,6 +1539,11 @@ class CortexRuntimeEngine(RuntimeEngine):
             goal_progress=goal_progress,
             busy_actors=busy_actors,
             recent_commands=() if active_snapshot is None else active_snapshot.commands,
+        )
+        context = self._guard_candidate_context(
+            observation,
+            strategic_intent,
+            context,
         )
         self._record_cortex_event(
             observation,
@@ -1370,6 +1569,9 @@ class CortexRuntimeEngine(RuntimeEngine):
             },
         )
         if selection.status is CandidateSelectionStatus.ABSTAINED:
+            self._strategic_by_legacy_intent[intent.intent_id] = strategic_intent.model_copy(
+                update={"hard_blockers": ("no_executable_candidate",)}
+            )
             return None
         resolved_command_id = command_id or self._command_id(
             observation,
@@ -1394,6 +1596,9 @@ class CortexRuntimeEngine(RuntimeEngine):
             executor_version=selection.executor_version,
             situation_assessment_id=intent.situation_assessment_id,
             macro_plan_id=(intent.macro_plan_id if isinstance(intent, MacroIntent) else None),
+            strategic_intent_id=strategic_intent.intent_id,
+            responsibility=strategic_intent.role.value,
+            playbook_rule_ids=strategic_intent.playbook_rule_ids,
             selected_game_loop=observation.game_loop,
         )
         return _PreparedCommand(
@@ -1402,6 +1607,172 @@ class CortexRuntimeEngine(RuntimeEngine):
             semantic_action=semantic_action,
             macro_step_ordinal=macro_step_ordinal,
         )
+
+    def _apply_strategic_arbitration(
+        self,
+        observation: ObservationEnvelope,
+        prepared: list[_PreparedCommand],
+    ) -> list[_PreparedCommand]:
+        mode = self.config.cortex.arbiter.mode
+        if mode == "disabled" or not self._strategic_by_legacy_intent:
+            return prepared
+        intents, playbook_deltas, playbook_rule_ids = self._guard_strategic_intents(
+            observation
+        )
+        result = self._strategic_arbiter.arbitrate(
+            intents,
+            observation,
+            previous_agenda=self._strategic_agenda,
+            playbook_deltas=playbook_deltas,
+            playbook_rule_ids=playbook_rule_ids,
+        )
+        self._strategic_agenda = result.agenda
+        selected = set(result.selected_intent_ids)
+        actual = tuple(
+            sorted(
+                self._strategic_by_legacy_intent[item.lineage.intent_id].intent_id
+                for item in prepared
+            )
+        )
+        self._record_cortex_event(
+            observation,
+            "intent_arbitrated",
+            {
+                "mode": mode,
+                "arbitration": result.model_dump(mode="json"),
+                "actual_prepared_intent_ids": list(actual),
+            },
+        )
+        decisions = {decision.intent_id: decision for decision in result.decisions}
+        annotated = [
+            _PreparedCommand(
+                command=item.command,
+                lineage=item.lineage.model_copy(
+                    update={
+                        "arbiter_mode": mode,
+                        "intent_decision": decisions[
+                            self._strategic_by_legacy_intent[item.lineage.intent_id].intent_id
+                        ].status.value,
+                        "playbook_rule_ids": self._strategic_by_legacy_intent[
+                            item.lineage.intent_id
+                        ].playbook_rule_ids,
+                    }
+                ),
+                semantic_action=item.semantic_action,
+                macro_step_ordinal=item.macro_step_ordinal,
+            )
+            for item in prepared
+        ]
+        if mode == "shadow":
+            self._record_cortex_event(
+                observation,
+                "intent_arbiter_shadow_diff",
+                {
+                    "actual_intent_ids": list(actual),
+                    "shadow_selected_intent_ids": list(result.selected_intent_ids),
+                    "only_actual": sorted(set(actual) - selected),
+                    "only_shadow": sorted(selected - set(actual)),
+                },
+            )
+            return annotated
+        return [
+            item
+            for item in annotated
+            if self._strategic_by_legacy_intent[item.lineage.intent_id].intent_id in selected
+        ]
+
+    def _guard_strategic_intents(
+        self,
+        observation: ObservationEnvelope,
+    ) -> tuple[tuple[StrategicIntent, ...], dict[str, float], dict[str, tuple[str, ...]]]:
+        mode = self.config.cortex.playbook.rule_mode
+        assessment = self._current_situation
+        if mode == "disabled" or assessment is None or not self._playbook_rules:
+            return tuple(self._strategic_by_legacy_intent.values()), {}, {}
+        context = self._playbook_context(assessment)
+        guarded: list[StrategicIntent] = []
+        deltas: dict[str, float] = {}
+        rule_ids: dict[str, tuple[str, ...]] = {}
+        for legacy_id, intent in tuple(self._strategic_by_legacy_intent.items()):
+            result = self._playbook_intent_guard.evaluate(
+                intent,
+                context=context,
+                situation=assessment,
+                rules=self._playbook_rules,
+                game_loop=observation.game_loop,
+                mode=mode,
+            )
+            updated = intent
+            if result.blocked:
+                updated = intent.model_copy(
+                    update={
+                        "hard_blockers": tuple(
+                            dict.fromkeys((*intent.hard_blockers, "playbook_hard_rule"))
+                        ),
+                        "playbook_rule_ids": result.rule_ids,
+                    }
+                )
+            elif result.rule_ids:
+                updated = intent.model_copy(update={"playbook_rule_ids": result.rule_ids})
+            self._strategic_by_legacy_intent[legacy_id] = updated
+            guarded.append(updated)
+            deltas[updated.intent_id] = result.score_delta
+            rule_ids[updated.intent_id] = result.rule_ids
+            self._record_playbook_applications(observation, result.applications)
+        return tuple(guarded), deltas, rule_ids
+
+    def _guard_candidate_context(
+        self,
+        observation: ObservationEnvelope,
+        intent: StrategicIntent,
+        context: FastExecutorContext,
+    ) -> FastExecutorContext:
+        mode = self.config.cortex.playbook.rule_mode
+        assessment = self._current_situation
+        if mode == "disabled" or assessment is None or not self._playbook_rules:
+            return context
+        playbook_context = self._playbook_context(assessment)
+        candidates = []
+        for candidate in context.candidates:
+            result = self._playbook_candidate_guard.evaluate(
+                candidate,
+                role=intent.role.value,
+                context=playbook_context,
+                situation=assessment,
+                rules=self._playbook_rules,
+                run_id=observation.run_id,
+                episode_id=observation.episode_id,
+                step_id=observation.step_id,
+                game_loop=observation.game_loop,
+                mode=mode,
+            )
+            self._record_playbook_applications(observation, result.applications)
+            if result.blocked:
+                continue
+            if mode == "active" and result.score_delta:
+                candidate = candidate.model_copy(
+                    update={
+                        "features": candidate.features.model_copy(
+                            update={"playbook_score": result.score_delta}
+                        )
+                    }
+                )
+            candidates.append(candidate)
+        return context.model_copy(update={"candidates": candidates})
+
+    def _record_playbook_applications(
+        self,
+        observation: ObservationEnvelope,
+        applications: tuple[PlaybookRuleApplication, ...],
+    ) -> None:
+        for application in applications:
+            if self._playbook_store is not None:
+                self._playbook_store.record_rule_application(application)
+            self._record_cortex_event(
+                observation,
+                "playbook_rule_applied",
+                application,
+            )
 
     def _record_command_lineage(
         self,
@@ -1444,7 +1815,10 @@ class CortexRuntimeEngine(RuntimeEngine):
                 report=report,
             )
         if succeeded and report.action_name is not None:
-            token = hima_previous_action_for_runtime_action(report.action_name)
+            token = hima_previous_action_for_runtime_action(
+                report.action_name,
+                self._race_profile.data,
+            )
             if token is not None:
                 self._previous_hima_actions.append((self._execution_game_loop(report), token))
         else:
@@ -1618,15 +1992,14 @@ class CortexRuntimeEngine(RuntimeEngine):
     ) -> None:
         if self._playbook_store is None:
             self._playbook_selection = None
+            self._playbook_rules = ()
             return
+        self._playbook_rules = self._playbook_store.rules_for_guard(
+            max_hard=self.config.cortex.playbook.max_hard_rules,
+            max_soft=self.config.cortex.playbook.max_soft_rules,
+        )
         query = PlaybookQuery(
-            context=PlaybookContext(
-                agent_race=self.config.environment.agent_race,
-                opponent_race=self.config.environment.opponent_race,
-                phase=assessment.phase,
-                map_name=self.config.environment.scenario,
-                tags=tuple(assessment.threats),
-            ),
+            context=self._playbook_context(assessment),
             top_k=self.config.cortex.playbook.top_k,
             min_confidence=self.config.cortex.playbook.min_confidence,
             include_candidates=self.config.cortex.playbook.include_candidates,
@@ -1645,7 +2018,17 @@ class CortexRuntimeEngine(RuntimeEngine):
                 "lesson_ids": list(selection.lesson_ids),
                 "hit_count": len(selection.hits),
                 "hits": [hit.model_dump(mode="json") for hit in selection.hits],
+                "executable_rule_count": len(self._playbook_rules),
             },
+        )
+
+    def _playbook_context(self, assessment: SituationAssessment) -> PlaybookContext:
+        return PlaybookContext(
+            agent_race=self.config.environment.agent_race,
+            opponent_race=self.config.environment.opponent_race,
+            phase=assessment.phase,
+            map_name=self.config.environment.scenario,
+            tags=tuple(assessment.threats),
         )
 
     def end_episode(self, result: EpisodeResult) -> None:
@@ -1685,6 +2068,14 @@ class CortexRuntimeEngine(RuntimeEngine):
                 step_id=result.steps,
                 event_type=event_type,
                 payload=lesson,
+            )
+        for rule in self._playbook_reviewer.last_rule_updates:
+            self.store.append_event(
+                run_id=result.run_id,
+                episode_id=result.episode_id,
+                step_id=result.steps,
+                event_type="playbook_rule_updated",
+                payload=rule,
             )
         self.store.append_event(
             run_id=result.run_id,

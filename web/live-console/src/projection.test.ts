@@ -62,4 +62,22 @@ describe("Cortex decision-rail projection", () => {
     expect(plannerProjection(events).running).toBe(false);
     expect(modelTelemetryProjection(events).retained_request_count).toBe(1);
   });
+
+  it("projects the latest race, role, arbiter, tactical shadow, and playbook state", () => {
+    const events = [
+      event(1, "race_profile_activated", { race: "protoss" }),
+      event(2, "role_intent_emitted", { role: "economy", intent_id: "intent-1" }),
+      event(3, "intent_arbitrated", { mode: "shadow", arbitration: {} }),
+      event(4, "tactical_policy_shadow", { provider_id: "shadow-policy" }),
+      event(5, "playbook_rule_applied", { rule_id: "rule-1" }),
+      event(6, "role_intent_emitted", { role: "defense", intent_id: "intent-2" }),
+    ];
+
+    const projection = decisionRailProjection(events);
+    expect(projection.raceProfile?.event_id).toBe(1);
+    expect(projection.arbitration?.event_id).toBe(3);
+    expect(projection.tacticalShadow?.event_id).toBe(4);
+    expect(projection.playbookRule?.event_id).toBe(5);
+    expect(projection.roleIntent?.event_id).toBe(6);
+  });
 });

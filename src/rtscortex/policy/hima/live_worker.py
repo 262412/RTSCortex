@@ -11,7 +11,7 @@ import uvicorn
 
 from rtscortex.policy.hima.live import HIMALivePolicyService, create_hima_live_app
 from rtscortex.policy.hima.subagent import HIMA_PINNED_REVISIONS, TransformersHIMAGenerator
-from rtscortex.policy.subagents import HIMA_PROTOSS_SPECS
+from rtscortex.policy.subagents import HIMA_ALL_SPECS
 
 
 def run_worker(
@@ -30,7 +30,7 @@ def run_worker(
     if not socket_path.parent.is_dir():
         raise FileNotFoundError(f"HIMA socket parent does not exist: {socket_path.parent}")
     spec = next(
-        (candidate for candidate in HIMA_PROTOSS_SPECS if candidate.model_id == model_id),
+        (candidate for candidate in HIMA_ALL_SPECS if candidate.model_id == model_id),
         None,
     )
     if spec is None:

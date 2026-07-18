@@ -43,6 +43,56 @@ class ArmyReadiness(StrEnum):
     ENGAGED = "engaged"
 
 
+class KnowledgeStatus(StrEnum):
+    """How strongly one Situation v2 fact is supported by observations."""
+
+    CONFIRMED = "confirmed"
+    INFERRED = "inferred"
+    UNKNOWN = "unknown"
+
+
+class SituationFact(ContractModel):
+    """One auditable fact or inference used by the Cortex decision hierarchy."""
+
+    name: str = Field(min_length=1)
+    status: KnowledgeStatus
+    confidence: float = Field(ge=0.0, le=1.0)
+    source: str = Field(min_length=1)
+    evidence: tuple[str, ...] = ()
+
+
+class ForceComposition(ContractModel):
+    counts: dict[str, int] = Field(default_factory=dict)
+    total_units: int = Field(default=0, ge=0)
+    ground_units: int = Field(default=0, ge=0)
+    air_units: int = Field(default=0, ge=0)
+    estimated_resource_value: int = Field(default=0, ge=0)
+    unknown_unit_types: tuple[str, ...] = ()
+
+
+class BaseAssessment(ContractModel):
+    own_base_count: int = Field(default=0, ge=0)
+    visible_enemy_base_count: int = Field(default=0, ge=0)
+    own_production_capacity: int = Field(default=0, ge=0)
+    visible_enemy_production_capacity: int = Field(default=0, ge=0)
+
+
+class SpatialAssessment(ContractModel):
+    nearest_threat_distance: float | None = Field(default=None, ge=0.0)
+    threat_eta_seconds: float | None = Field(default=None, ge=0.0)
+    visible_enemy_regions: tuple[str, ...] = ()
+    map_control_fraction: float | None = Field(default=None, ge=0.0, le=1.0)
+
+
+class ScoutingAssessment(ContractModel):
+    enemy_visible: bool = False
+    last_enemy_seen_game_loop: int | None = Field(default=None, ge=0)
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    confirmed_enemy_tech: tuple[str, ...] = ()
+    inferred_enemy_tech: tuple[str, ...] = ()
+    possible_transitions: tuple[str, ...] = ()
+
+
 class SituationAssessment(ContractModel):
     """Compact game-state interpretation with explicit source provenance."""
 
@@ -58,6 +108,12 @@ class SituationAssessment(ContractModel):
     army_readiness: ArmyReadiness
     threats: list[str] = Field(default_factory=list)
     information_gaps: list[str] = Field(default_factory=list)
+    own_force: ForceComposition = Field(default_factory=ForceComposition)
+    visible_enemy_force: ForceComposition = Field(default_factory=ForceComposition)
+    bases: BaseAssessment = Field(default_factory=BaseAssessment)
+    spatial: SpatialAssessment = Field(default_factory=SpatialAssessment)
+    scouting: ScoutingAssessment = Field(default_factory=ScoutingAssessment)
+    facts: list[SituationFact] = Field(default_factory=list)
     source_kind: Literal["deterministic", "model"]
     source_id: str = Field(min_length=1)
     source_version: str = Field(min_length=1)
@@ -200,6 +256,7 @@ class CandidateFeatures(ContractModel):
     argument_rank: int = Field(ge=0)
     compile_ordinal: int = Field(ge=0)
     advances_goal: bool = False
+    playbook_score: float = 0.0
 
 
 class ExecutableCandidate(ContractModel):
@@ -300,4 +357,17 @@ class CommandLineage(ContractModel):
     executor_version: str = Field(min_length=1)
     situation_assessment_id: str | None = None
     macro_plan_id: str | None = None
+    strategic_intent_id: str | None = None
+    responsibility: Literal[
+        "economy",
+        "technology",
+        "production",
+        "defense",
+        "offense",
+        "focus_fire",
+        "retreat",
+    ] | None = None
+    arbiter_mode: Literal["disabled", "shadow", "active"] = "disabled"
+    intent_decision: Literal["selected", "deferred", "rejected", "preempted"] | None = None
+    playbook_rule_ids: tuple[str, ...] = ()
     selected_game_loop: int = Field(ge=0)

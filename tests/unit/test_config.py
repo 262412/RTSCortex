@@ -155,7 +155,7 @@ def test_hima_ensemble_requires_one_race_and_all_three_clusters() -> None:
     ]
 
 
-def test_hima_ensemble_rejects_mixed_races_and_agent_mismatch() -> None:
+def test_hima_ensemble_rejects_mixed_races() -> None:
     with pytest.raises(ValidationError, match="a/b/c checkpoints for one race"):
         CortexMacroSettings.model_validate(
             {
@@ -167,6 +167,27 @@ def test_hima_ensemble_rejects_mixed_races_and_agent_mismatch() -> None:
                 ],
             }
         )
+
+
+def test_non_protoss_cortex_is_offline_until_live_worker_exists() -> None:
+    offline = ExperimentConfig.model_validate(
+        {
+            "environment": {"adapter": "mock", "agent_race": "terran"},
+            "agent": {"variant": "cortex"},
+        }
+    )
+    assert offline.environment.agent_race == "terran"
+
+    with pytest.raises(ValidationError, match="Worker is not implemented"):
+        ExperimentConfig.model_validate(
+            {
+                "environment": {"adapter": "llm_pysc2", "agent_race": "zerg"},
+                "agent": {"variant": "cortex"},
+            }
+        )
+
+
+def test_hima_ensemble_race_must_match_agent() -> None:
 
     with pytest.raises(ValidationError, match="race must match"):
         ExperimentConfig.model_validate(

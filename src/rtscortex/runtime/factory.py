@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 
 from rtscortex.config import ExperimentConfig
 from rtscortex.contracts import LLMProvider
@@ -161,11 +161,6 @@ def _build_hima_ensemble(
     macro = config.cortex.macro
     candidates = [member.candidate for member in macro.ensemble_members]
     race = candidates[0].rsplit("-", 1)[0]
-    if race != "protoss":
-        raise HIMASidecarError(
-            f"HIMA {race} checkpoints are registered but live {race} observation, "
-            "vocabulary and Runtime action mappings are not implemented yet"
-        )
     clients: dict[str, HIMALivePolicyClient] = {}
     sidecars: list[HIMASidecarProcess] = []
     clusters_by_device: dict[str, list[HIMACluster]] = {}
@@ -210,7 +205,7 @@ def _build_hima_ensemble(
         clusters_by_device.setdefault(member.device, []).append(cluster)
     ensemble_client = HIMAEnsemblePolicyClient(
         clients,
-        race="protoss",
+        race=cast(Literal["protoss", "terran", "zerg"], race),
         execution_groups=tuple(tuple(group) for group in clusters_by_device.values()),
     )
     return ensemble_client, HIMAEnsembleSidecar(sidecars, ensemble_client)

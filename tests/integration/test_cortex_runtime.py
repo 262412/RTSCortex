@@ -10,6 +10,7 @@ from rtscortex.config import (
     CortexHIMAEnsembleMemberSettings,
     CortexMacroSettings,
     CortexSettings,
+    CortexTacticalSettings,
     ExperimentConfig,
     ReflexSettings,
     RunSettings,
@@ -30,7 +31,7 @@ from rtscortex.contracts import (
     SC2State,
     UnitState,
 )
-from rtscortex.cortex import HIMAEnsemblePolicyClient
+from rtscortex.cortex import HIMAEnsemblePolicyClient, SituationAssessment, TacticalIntent
 from rtscortex.evaluation import compute_cortex_observability
 from rtscortex.memory import EventStore
 from rtscortex.policy.hima import (
@@ -53,17 +54,23 @@ from rtscortex.runtime import CortexRuntimeEngine
 
 
 class _FakeMacroClient:
-    def __init__(self, output: str | list[str] = "Actions: ['Pylon']") -> None:
+    def __init__(
+        self,
+        output: str | list[str] = "Actions: ['Pylon']",
+        *,
+        model_id: str = "SNUMPR/Protoss-a",
+    ) -> None:
         self.outputs = [output] if isinstance(output, str) else output
         if not self.outputs:
             raise ValueError("fake macro client requires at least one output")
         self.contexts: list[HIMAInputContext] = []
         self.closed = False
+        self.model_id = model_id
 
     async def health(self) -> HIMALiveHealth:
         return HIMALiveHealth(
-            model_id="SNUMPR/Protoss-a",
-            model_revision=HIMA_PINNED_REVISIONS["SNUMPR/Protoss-a"],
+            model_id=self.model_id,
+            model_revision=HIMA_PINNED_REVISIONS[self.model_id],
             adapter_version=HIMA_ADAPTER_VERSION,
             parser_version=HIMA_PARSER_VERSION,
             vocabulary_version=HIMA_VOCABULARY_VERSION,
@@ -150,6 +157,19 @@ class _RecoveringMacroSidecar:
 
     async def close(self) -> None:
         self.closed = True
+
+
+class _EmptyShadowTacticalProvider:
+    provider_id = "empty-shadow-tactical"
+    provider_version = "1.0"
+
+    def evaluate(
+        self,
+        observation: ObservationEnvelope,
+        situation: SituationAssessment,
+    ) -> list[TacticalIntent]:
+        del observation, situation
+        return []
 
 
 def _config(
@@ -245,9 +265,18 @@ def test_cortex_runtime_records_three_specialist_race_brain_cycle(tmp_path: Path
     )
     client = HIMAEnsemblePolicyClient(
         {
-            "a": _FakeMacroClient("Actions: ['Pylon']"),
-            "b": _FakeMacroClient("Actions: ['Gateway']"),
-            "c": _FakeMacroClient("Actions: ['Stargate']"),
+            "a": _FakeMacroClient(
+                "Actions: ['Pylon']",
+                model_id="SNUMPR/Protoss-a",
+            ),
+            "b": _FakeMacroClient(
+                "Actions: ['Gateway']",
+                model_id="SNUMPR/Protoss-b",
+            ),
+            "c": _FakeMacroClient(
+                "Actions: ['Stargate']",
+                model_id="SNUMPR/Protoss-c",
+            ),
         },
         race="protoss",
     )
@@ -310,6 +339,58 @@ def test_cortex_runtime_dispatches_proactive_tactical_focus_fire(tmp_path: Path)
     assert batch.commands[0].source is ActionSource.PLANNER
     lineage = runtime._command_lineages[batch.commands[0].command_id]
     assert lineage.source_role.value == "tactical"
+    assert lineage.responsibility == "focus_fire"
+    assert lineage.strategic_intent_id is not None
+    assert lineage.arbiter_mode == "shadow"
+    assert lineage.intent_decision == "selected"
+    asyncio.run(runtime.close())
+
+
+def test_tactical_shadow_records_without_changing_active_action(tmp_path: Path) -> None:
+    config = _config(tmp_path, macro=False)
+    config = config.model_copy(
+        update={
+            "cortex": config.cortex.model_copy(
+                update={"tactical": CortexTacticalSettings(kind="model_shadow")}
+            )
+        }
+    )
+    store = _store(tmp_path)
+    runtime = CortexRuntimeEngine(
+        config=config,
+        store=store,
+        provider=FakeProvider(),
+        shadow_tactical_provider=_EmptyShadowTacticalProvider(),
+    )
+    observation = ObservationEnvelope(
+        run_id="cortex-run",
+        episode_id="episode-1",
+        step_id=0,
+        game_loop=0,
+        state=SC2State(
+            economy=EconomyState(army_supply=4, supply_used=16, supply_cap=23),
+            own_units=[UnitState(unit_id="0x10", unit_type="Adept", alliance="self")],
+            visible_enemies=[
+                UnitState(unit_id="0x20", unit_type="Zergling", alliance="enemy")
+            ],
+        ),
+        available_actions=[
+            AvailableAction(
+                name="Attack_Unit",
+                argument_names=["tag"],
+                argument_types=[ActionArgumentType.TAG],
+                actor_scopes=["CombatGroup/Adept-1"],
+                argument_candidates=[["0x20"]],
+            )
+        ],
+    )
+
+    batch = asyncio.run(runtime.tick(observation))
+
+    assert [command.name for command in batch.commands] == ["Attack_Unit"]
+    shadows = store.events_of_type("cortex-run", "episode-1", "tactical_policy_shadow")
+    assert len(shadows) == 1
+    assert shadows[0].payload["shadow_intents"] == []
     asyncio.run(runtime.close())
 
 

@@ -15,6 +15,10 @@ from rtscortex.policy.hima import (
     HIMALiveHealth,
     HIMALivePolicyClient,
 )
+from rtscortex.policy.hima.race_vocabulary import (
+    HIMA_PARSER_VERSIONS,
+    HIMA_VOCABULARY_VERSIONS,
+)
 from rtscortex.runtime.hima_sidecar import (
     HIMA_CANDIDATE_MODEL_IDS,
     HIMASidecarError,
@@ -466,3 +470,31 @@ def test_hima_sidecar_process_rejects_stale_protocol_component(
 
     assert client.closed is True
     assert not socket_path.exists()
+
+
+@pytest.mark.parametrize("race", ["terran", "zerg"])
+def test_hima_sidecar_accepts_race_specific_protocol_versions(
+    tmp_path: Path,
+    race: str,
+) -> None:
+    model_id = f"SNUMPR/{race.title()}-a"
+    health = HIMALiveHealth(
+        model_id=model_id,
+        model_revision=HIMA_PINNED_REVISIONS[model_id],
+        adapter_version=HIMA_ADAPTER_VERSION,
+        parser_version=HIMA_PARSER_VERSIONS[race],
+        vocabulary_version=HIMA_VOCABULARY_VERSIONS[race],
+    )
+    process = HIMASidecarProcess(
+        HIMASidecarSpec(
+            command=(sys.executable, "-c", "pass"),
+            socket_path=tmp_path / f"{race}.sock",
+            stdout_path=tmp_path / f"{race}.stdout.log",
+            stderr_path=tmp_path / f"{race}.stderr.log",
+        ),
+        cast(HIMALivePolicyClient, object()),
+        expected_model_id=model_id,
+        expected_model_revision=HIMA_PINNED_REVISIONS[model_id],
+    )
+
+    process._validate_health(health)

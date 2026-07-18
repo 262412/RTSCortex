@@ -59,4 +59,39 @@ describe("DecisionRail", () => {
     expect(markup).toContain("晶体矿不足");
     expect(markup).not.toContain("等待确定性目标进度检查");
   });
+
+  it("shows strategic cortex cards without requiring raw JSON", () => {
+    const markup = renderToStaticMarkup(
+      <DecisionRail
+        raceProfile={{
+          event_id: 1,
+          event_type: "race_profile_activated",
+          payload: { race: "protoss", live_worker_ready: true },
+        }}
+        roleIntent={{
+          event_id: 2,
+          event_type: "role_intent_emitted",
+          payload: { intent: { role: "defense", action_names: ["Move_Minimap"] } },
+        }}
+        arbitration={{
+          event_id: 3,
+          event_type: "intent_arbitrated",
+          payload: { mode: "shadow", arbitration: { decisions: [] } },
+        }}
+        playbookRule={{
+          event_id: 4,
+          event_type: "playbook_rule_applied",
+          payload: { rule_id: "rule-1", reason: "matched" },
+        }}
+        plannerRunning={false}
+        modelTelemetry={{ retained_request_count: 0 }}
+      />,
+    );
+
+    expect(markup).toContain("当前种族与能力");
+    expect(markup).toContain("职责 Agent");
+    expect(markup).toContain("战略意图仲裁");
+    expect(markup).toContain("CortexPlaybook 约束");
+    expect(markup).toContain("rule-1");
+  });
 });

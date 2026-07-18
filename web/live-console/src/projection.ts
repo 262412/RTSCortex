@@ -54,7 +54,15 @@ export function decisionRailProjection(events: StoredEvent[]) {
     (event) => event.event_type === "candidate_set_built",
   );
   return {
+    raceProfile: findLatest(events, (event) => event.event_type === "race_profile_activated"),
     situation: findLatest(events, (event) => event.event_type === "situation_assessed"),
+    tacticalShadow: findLatest(events, (event) => event.event_type === "tactical_policy_shadow"),
+    roleIntent: findLatest(events, (event) => event.event_type === "role_intent_emitted"),
+    arbitration: findLatest(events, (event) => event.event_type === "intent_arbitrated"),
+    playbookRule: findLatest(
+      events,
+      (event) => ["playbook_rule_applied", "playbook_rule_updated"].includes(event.event_type),
+    ),
     reflection: latestModule(cycleEvents, "reflection"),
     goalProgress: findLatest(events, (event) => event.event_type === "goal_progress"),
     plan:

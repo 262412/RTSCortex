@@ -948,6 +948,34 @@ def _render_cortex_event(event: StoredEvent) -> list[str]:
             f"- Event {event_id} · {_inline(role or 'unknown')} intent "
             f"{_code(intent_id or 'unknown')}: {_code(intent_action or 'no action')}."
         ]
+    if event.event_type == "role_intent_emitted":
+        intent = _nested_payload(payload, "intent")
+        role = _payload_text(intent, "role") or "unknown"
+        source_id = _payload_text(payload, "legacy_intent_id") or "unknown"
+        actions = intent.get("action_names", [])
+        action = actions[0] if isinstance(actions, list) and actions else "no action"
+        return [
+            f"- Event {event_id} · Responsibility {_code(role)} owns "
+            f"{_code(str(action))} from {_code(source_id)}."
+        ]
+    if event.event_type == "intent_arbitrated":
+        arbitration = _nested_payload(payload, "arbitration")
+        selected = arbitration.get("selected_intent_ids", [])
+        conflicts = arbitration.get("conflicts", [])
+        return [
+            f"- Event {event_id} · Strategic arbitration "
+            f"{_code(str(payload.get('mode', 'unknown')))} "
+            f"selected `{len(selected) if isinstance(selected, list) else 0}` intents with "
+            f"`{len(conflicts) if isinstance(conflicts, list) else 0}` conflicts."
+        ]
+    if event.event_type == "playbook_rule_applied":
+        rule_id = _payload_text(payload, "rule_id") or "unknown"
+        reason = _payload_text(payload, "reason") or "matched"
+        target = _payload_text(payload, "target_id") or "unknown"
+        return [
+            f"- Event {event_id} · Playbook rule {_code(rule_id)} applied to "
+            f"{_code(target)}: {_code(reason)}."
+        ]
     if event.event_type == "candidate_set_built":
         candidates = payload.get("candidates", [])
         candidate_count = len(candidates) if isinstance(candidates, list) else 0
@@ -1280,9 +1308,32 @@ def _render_cortex_metrics(metrics: CortexObservabilityMetrics) -> list[str]:
         (
             "- Race Brain / Playbook: "
             f"`{event_counts.get('race_brain_coordinated', 0)}` coordinated cycles, "
+            f"proposal diversity `{metrics.race_brain_proposal_diversity:.1%}`, "
+            f"degraded member results `{metrics.race_brain_degraded_members}`; "
             f"`{event_counts.get('playbook_retrieved', 0)}` retrievals, "
             f"`{event_counts.get('playbook_case_recorded', 0)}` cases, "
             f"`{event_counts.get('playbook_lesson_promoted', 0)}` promoted lessons."
+        ),
+        (
+            "- Active RaceProfile: "
+            f"`{metrics.active_race or 'not_recorded'}`; HIMA contract "
+            f"`{metrics.race_macro_contract_ready}`, Runtime mapping "
+            f"`{metrics.race_runtime_mapping_ready}`, live Worker "
+            f"`{metrics.race_live_worker_ready}`; limitations "
+            f"`{', '.join(metrics.race_limitations) or 'none_recorded'}`."
+        ),
+        (
+            "- Strategic Intent Arbiter: "
+            f"`{event_counts.get('intent_arbitrated', 0)}` cycles, "
+            f"`{metrics.intent_shadow_diff_count}` shadow diffs; role lineage coverage "
+            f"`{metrics.role_lineage_coverage:.1%}`."
+        ),
+        (
+            "- Executable Playbook: "
+            f"`{metrics.playbook_rule_update_count}` rule updates, "
+            f"`{metrics.playbook_application_count}` applications, "
+            f"`{metrics.playbook_block_count}` active blocks, "
+            f"`{metrics.playbook_shadow_block_count}` shadow blocks."
         ),
         (
             f"- Command lineage coverage: {coverage}; missing "
@@ -1291,6 +1342,21 @@ def _render_cortex_metrics(metrics: CortexObservabilityMetrics) -> list[str]:
             f"`{metrics.lineage_integrity_violations}`."
         ),
         *_render_count_table("Cortex intents by role", metrics.intent_counts),
+        *_render_count_table(
+            "Race Brain selected members",
+            metrics.race_brain_selected_members,
+        ),
+        *_render_count_table(
+            "Race Brain selected member by phase",
+            metrics.race_brain_selected_by_phase,
+        ),
+        *_render_count_table(
+            "Race Brain unique frontier contributions",
+            metrics.race_brain_unique_frontier_contributions,
+        ),
+        *_render_count_table("Strategic intents by responsibility", metrics.role_intent_counts),
+        *_render_count_table("Strategic intent decisions", metrics.intent_decision_counts),
+        *_render_count_table("Strategic intent conflicts", metrics.intent_conflict_counts),
         *_render_count_table("Cortex selections by executor", metrics.executor_counts),
         *_render_count_table("Specialist failures", metrics.specialist_failure_counts),
         *_render_count_table("Specialists ready", metrics.specialist_ready_counts),

@@ -89,9 +89,9 @@ class HIMALiveHealth(HIMAModel):
 
 
 class HIMAMacroAction(HIMAModel):
-    """One member of the pinned Protoss macro-action vocabulary."""
+    """One member of a pinned race-specific HIMA macro-action vocabulary."""
 
-    upstream_action_id: int = Field(ge=100, le=325)
+    upstream_action_id: int = Field(ge=100, le=330)
     upstream_name: str = Field(min_length=1)
     canonical_action: str
     category: Literal["train", "build", "research"]

@@ -28,6 +28,10 @@ agent:
 cortex:
   situation:
     kind: deterministic
+  arbiter:
+    mode: shadow
+    switch_margin: 1.0
+    max_intents: 7
   macro:
     kind: hima_ensemble
     python_executable: ~/fastscratch/envs/rtscortex-hima/bin/python
@@ -64,6 +68,9 @@ cortex:
     min_confidence: 0.6
     promotion_support: 2
     include_candidates: false
+    rule_mode: shadow
+    max_hard_rules: 8
+    max_soft_rules: 8
 reflex:
   enabled: true
   low_health_threshold: 0.25

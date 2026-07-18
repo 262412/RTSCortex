@@ -46,10 +46,11 @@ class DeterministicCandidateExecutor:
         )
 
     @staticmethod
-    def _rank(candidate: ExecutableCandidate) -> tuple[int, int, int, int, int]:
+    def _rank(candidate: ExecutableCandidate) -> tuple[int, float, int, int, int, int]:
         features = candidate.features
         return (
             0 if features.advances_goal else 1,
+            -features.playbook_score,
             features.action_rank,
             features.actor_rank,
             features.argument_rank,

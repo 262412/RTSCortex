@@ -16,8 +16,6 @@ from pydantic import Field, ValidationError
 from rtscortex.policy.hima.models import (
     HIMA_ADAPTER_VERSION,
     HIMA_LIVE_PROTOCOL_VERSION,
-    HIMA_PARSER_VERSION,
-    HIMA_VOCABULARY_VERSION,
     HIMAInputContext,
     HIMALiveHealth,
     HIMALiveProposalRequest,
@@ -25,6 +23,11 @@ from rtscortex.policy.hima.models import (
 )
 from rtscortex.policy.hima.observation import HIMAObservationAdapter
 from rtscortex.policy.hima.parser import HIMAProposalParser
+from rtscortex.policy.hima.race_vocabulary import (
+    HIMA_PARSER_VERSIONS,
+    HIMA_VOCABULARY_VERSIONS,
+    hima_race_for_model,
+)
 from rtscortex.policy.hima.subagent import (
     HIMA_PINNED_REVISIONS,
     HIMAPersistentTextGenerator,
@@ -82,12 +85,13 @@ class HIMALivePolicyService:
         parser: HIMAProposalParser | None = None,
     ) -> None:
         self._generator = generator
-        self._adapter = adapter or HIMAObservationAdapter()
+        self._race = hima_race_for_model(spec.model_id)
+        self._adapter = adapter or HIMAObservationAdapter(race=self._race)
         self._subagent = HIMAPolicySubagent(
             spec,
             generator,
             self._adapter,
-            parser or HIMAProposalParser(),
+            parser or HIMAProposalParser(race=self._race),
         )
         self._started = False
         self._start_lock = asyncio.Lock()
@@ -120,8 +124,8 @@ class HIMALivePolicyService:
             model_id=self.model_id,
             model_revision=self.model_revision,
             adapter_version=HIMA_ADAPTER_VERSION,
-            parser_version=HIMA_PARSER_VERSION,
-            vocabulary_version=HIMA_VOCABULARY_VERSION,
+            parser_version=HIMA_PARSER_VERSIONS[self._race],
+            vocabulary_version=HIMA_VOCABULARY_VERSIONS[self._race],
         )
 
     async def propose(
@@ -224,7 +228,10 @@ class HIMALivePolicyClient:
         self._client = client
         self._expected_model_id = expected_model_id
         self._owns_client = owns_client
-        self._adapter = HIMAObservationAdapter()
+        self._race = (
+            "protoss" if expected_model_id is None else hima_race_for_model(expected_model_id)
+        )
+        self._adapter = HIMAObservationAdapter(race=self._race)
 
     @classmethod
     def for_unix_socket(
@@ -267,8 +274,8 @@ class HIMALivePolicyClient:
             ) from error
         if (
             health.adapter_version != HIMA_ADAPTER_VERSION
-            or health.parser_version != HIMA_PARSER_VERSION
-            or health.vocabulary_version != HIMA_VOCABULARY_VERSION
+            or health.parser_version != HIMA_PARSER_VERSIONS[self._race]
+            or health.vocabulary_version != HIMA_VOCABULARY_VERSIONS[self._race]
         ):
             raise HIMALiveProtocolError(
                 "HIMA health adapter/parser/vocabulary versions do not match this Runtime"

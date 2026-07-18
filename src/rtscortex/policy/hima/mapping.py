@@ -20,7 +20,8 @@ from rtscortex.policy.models import (
     PolicyObservationFixture,
 )
 from rtscortex.progress.models import GoalRequirementKind
-from rtscortex.progress.verifier import PROTOSS_SIMPLE64_ACTION_SPECS
+from rtscortex.progress.verifier import ProgressActionSpec
+from rtscortex.races import PROTOSS_PROFILE_DATA, RaceProfileData, race_profile
 from rtscortex.runtime.validation import ActionValidator, ValidationDisposition
 
 
@@ -32,29 +33,17 @@ class HIMAMacroMapping:
     runtime_actions: tuple[str, ...]
 
 
-HIMA_RUNTIME_MAPPINGS: tuple[HIMAMacroMapping, ...] = (
-    HIMAMacroMapping("TRAIN ZEALOT", ("Train_Zealot", "Warp_Zealot_Near")),
-    HIMAMacroMapping("TRAIN STALKER", ("Train_Stalker", "Warp_Stalker_Near")),
-    HIMAMacroMapping("TRAIN ADEPT", ("Train_Adept",)),
-    HIMAMacroMapping("TRAIN PHOENIX", ("Train_Phoenix",)),
-    HIMAMacroMapping("TRAIN VOIDRAY", ("Train_VoidRay",)),
-    HIMAMacroMapping("TRAIN ORACLE", ("Train_Oracle",)),
-    HIMAMacroMapping("BUILD PYLON", ("Build_Pylon_Screen",)),
-    HIMAMacroMapping("BUILD GATEWAY", ("Build_Gateway_Screen",)),
-    HIMAMacroMapping("BUILD FORGE", ("Build_Forge_Screen",)),
-    HIMAMacroMapping(
-        "BUILD CYBERNETICSCORE",
-        ("Build_CyberneticsCore_Screen",),
-    ),
-    HIMAMacroMapping("BUILD ASSIMILATOR", ("Build_Assimilator_Near",)),
-    HIMAMacroMapping("BUILD NEXUS", ("Build_Nexus_Near",)),
-    HIMAMacroMapping("BUILD STARGATE", ("Build_Stargate_Screen",)),
-    HIMAMacroMapping("BUILD SHIELDBATTERY", ("Build_ShieldBattery_Screen",)),
-    HIMAMacroMapping("RESEARCH WARPGATERESEARCH", ("Research_WarpGate",)),
+HIMA_RUNTIME_MAPPINGS: tuple[HIMAMacroMapping, ...] = tuple(
+    HIMAMacroMapping(mapping.semantic_action, mapping.runtime_actions)
+    for mapping in PROTOSS_PROFILE_DATA.macro_action_mappings
 )
 
-_MAPPINGS_BY_MACRO = {mapping.macro_action: mapping for mapping in HIMA_RUNTIME_MAPPINGS}
-_PROGRESS_SPECS_BY_ACTION = {spec.name: spec for spec in PROTOSS_SIMPLE64_ACTION_SPECS}
+
+def hima_runtime_mappings(race: str) -> tuple[HIMAMacroMapping, ...]:
+    return tuple(
+        HIMAMacroMapping(mapping.semantic_action, mapping.runtime_actions)
+        for mapping in race_profile(race).data.macro_action_mappings
+    )
 _STEP_PARSE_ERROR_CODES = frozenset(
     {
         "action_limit_exceeded",
@@ -83,6 +72,20 @@ class _FrontierProbe:
 class HIMAMacroActionMapper:
     """Assess logical and Runtime-actionable frontiers without dispatching."""
 
+    def __init__(self, profile: RaceProfileData = PROTOSS_PROFILE_DATA) -> None:
+        self.profile = profile
+        self._mappings_by_macro = {
+            mapping.macro_action: mapping
+            for mapping in (
+                HIMAMacroMapping(item.semantic_action, item.runtime_actions)
+                for item in profile.macro_action_mappings
+            )
+        }
+        self._progress_specs_by_action = {
+            spec.name: spec for spec in profile.progress_action_specs
+        }
+        self._managed_worker_action = f"TRAIN {profile.worker_type.upper()}"
+
     def assess(
         self,
         proposal: MacroPolicyProposal,
@@ -102,7 +105,7 @@ class HIMAMacroActionMapper:
         runtime_frontier_ordinal: int | None = None
         first_soft_deferred_ordinal: int | None = None
         for step in sorted(proposal.steps, key=lambda item: item.ordinal):
-            mapping = _MAPPINGS_BY_MACRO.get(step.canonical_action)
+            mapping = self._mappings_by_macro.get(step.canonical_action)
             if mapping is None:
                 continue
             probe = self._probe_step(step, mapping, fixture)
@@ -156,11 +159,11 @@ class HIMAMacroActionMapper:
         is_logical_frontier: bool,
         is_runtime_frontier: bool,
     ) -> PolicyActionAssessment:
-        mapping = _MAPPINGS_BY_MACRO.get(step.canonical_action)
+        mapping = self._mappings_by_macro.get(step.canonical_action)
         if mapping is None:
             reason = (
                 "managed_automatically"
-                if step.canonical_action == "TRAIN PROBE"
+                if step.canonical_action == self._managed_worker_action
                 else "not_implemented"
             )
             return PolicyActionAssessment(
@@ -239,7 +242,11 @@ class HIMAMacroActionMapper:
 
         runtime_action = mapping.runtime_actions[0]
         if not saw_available_action:
-            hard_blocker = _hard_state_blocker(mapping, fixture)
+            hard_blocker = _hard_state_blocker(
+                mapping,
+                fixture,
+                self._progress_specs_by_action,
+            )
             return _FrontierProbe(
                 runtime_action,
                 PolicyActionClassification.MAPPED_DEFERRED,
@@ -268,12 +275,13 @@ class HIMAMacroActionMapper:
 def _hard_state_blocker(
     mapping: HIMAMacroMapping,
     fixture: PolicyObservationFixture,
+    progress_specs_by_action: dict[str, ProgressActionSpec],
 ) -> str | None:
     spec = next(
         (
-            _PROGRESS_SPECS_BY_ACTION[action_name]
+            progress_specs_by_action[action_name]
             for action_name in mapping.runtime_actions
-            if action_name in _PROGRESS_SPECS_BY_ACTION
+            if action_name in progress_specs_by_action
         ),
         None,
     )
