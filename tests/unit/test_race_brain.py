@@ -14,6 +14,7 @@ from rtscortex.cortex import (
     HIMAEnsemblePolicyClient,
     RaceBrainProposalResponse,
     RaceBrainStrategicContext,
+    macro_plan_from_hima,
 )
 from rtscortex.policy.hima import (
     HIMA_ADAPTER_VERSION,
@@ -257,4 +258,21 @@ def test_race_brain_staggered_schedule_refreshes_one_current_member_per_cycle() 
     assert [member.source_age_game_loops for member in second.members] == [0, 112, 112]
     assert third.refreshed_member_ids == ("hima-protoss-b",)
     assert [member.source_age_game_loops for member in third.members] == [112, 0, 224]
+    assert third.selected_member_id == "hima-protoss-a"
+    assert third.selected_source_age_game_loops == 112
+    assert third.selected.step_id == third_observation.step_id
+    assert third.selected.game_loop == third_observation.game_loop
+    assert third.selected.projection_hash == HIMAObservationAdapter().adapt_context(
+        HIMAInputContext(observation=third_observation)
+    ).projection_hash
+    selected_source = next(
+        member for member in third.members if member.member_id == third.selected_member_id
+    )
+    assert selected_source.response.game_loop == second_observation.game_loop
+    plan = macro_plan_from_hima(
+        third.selected,
+        third_observation,
+        ttl_game_loops=112,
+    )
+    assert plan.source_step_id == third_observation.step_id
     assert [clients[cluster].calls for cluster in ("a", "b", "c")] == [2, 2, 1]

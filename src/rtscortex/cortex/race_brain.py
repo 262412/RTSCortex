@@ -13,7 +13,12 @@ from rtscortex.contracts.models import ContractModel
 from rtscortex.cortex.macro import runtime_frontier
 from rtscortex.cortex.models import SituationAssessment, ThreatLevel
 from rtscortex.playbook.models import PlaybookRuleKind, PlaybookSelection
-from rtscortex.policy.hima import HIMAInputContext, HIMALiveHealth, HIMALiveProposalResponse
+from rtscortex.policy.hima import (
+    HIMAInputContext,
+    HIMALiveHealth,
+    HIMALiveProposalResponse,
+    HIMAObservationAdapter,
+)
 from rtscortex.policy.models import PolicyActionAssessment, PolicyActionClassification
 from rtscortex.races import race_profile
 
@@ -69,6 +74,7 @@ class RaceBrainProposalResponse(ContractModel):
     refreshed_member_ids: tuple[str, ...] = ()
     max_member_age_game_loops: int = Field(default=0, ge=0)
     selected_member_id: str = Field(min_length=1)
+    selected_source_age_game_loops: int = Field(default=0, ge=0)
     selected: HIMALiveProposalResponse
     members: tuple[RaceBrainMemberProposal, ...] = Field(min_length=3, max_length=3)
     valid_member_count: int = Field(default=3, ge=0, le=3)
@@ -221,7 +227,13 @@ class HIMAEnsemblePolicyClient:
                 member.source_age_game_loops for member in members
             ),
             selected_member_id=selected.member_id,
-            selected=selected.response,
+            selected_source_age_game_loops=selected.source_age_game_loops,
+            selected=_rebind_selected_response(
+                selected.response,
+                context,
+                request_id=f"{outer_request_id}:selected:{selected.cluster}",
+                race=self.race,
+            ),
             members=tuple(members),
             valid_member_count=len(members) - len(degraded_member_ids),
             degraded_member_ids=degraded_member_ids,
@@ -304,6 +316,34 @@ class HIMAEnsembleSidecar:
 
 def selected_hima_response(response: MacroPolicyResponse) -> HIMALiveProposalResponse:
     return response.selected if isinstance(response, RaceBrainProposalResponse) else response
+
+
+def _rebind_selected_response(
+    response: HIMALiveProposalResponse,
+    context: HIMAInputContext,
+    *,
+    request_id: str,
+    race: str,
+) -> HIMALiveProposalResponse:
+    """Bind a cached proposal, revalidated by the coordinator, to the current tick.
+
+    The original model response remains unchanged in ``members`` so its source age
+    and request provenance stay observable. The selected wrapper is the executable
+    projection for the current observation and must therefore carry its identity.
+    """
+
+    observation = context.observation
+    snapshot = HIMAObservationAdapter(race=race).adapt_context(context)
+    return response.model_copy(
+        update={
+            "request_id": request_id,
+            "run_id": observation.run_id,
+            "episode_id": observation.episode_id,
+            "step_id": observation.step_id,
+            "game_loop": observation.game_loop,
+            "projection_hash": snapshot.projection_hash,
+        }
+    )
 
 
 def _coordinate(
