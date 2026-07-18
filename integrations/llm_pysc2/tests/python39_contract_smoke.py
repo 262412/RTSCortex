@@ -21,6 +21,7 @@ from pysc2.lib import actions, features
 from rtscortex_llm_pysc2.effect_verifier import _BUILD_RAW_FUNCTION_IDS
 from rtscortex_llm_pysc2.observation import _map_argument_candidates
 from rtscortex_llm_pysc2.production import PRODUCTION_SPECS
+from rtscortex_llm_pysc2.terran_melee import RTSCortexTerranMeleeConfig
 
 
 def _assert_candidate_mapping() -> None:
@@ -139,6 +140,15 @@ def _assert_build_order_ids_use_raw_function_domain() -> None:
         "Pylon": 881,
         "ShieldBattery": 895,
         "Stargate": 889,
+        "Barracks": 321,
+        "Bunker": 324,
+        "CommandCenter": 318,
+        "EngineeringBay": 322,
+        "Factory": 328,
+        "MissileTurret": 323,
+        "Refinery": 320,
+        "Starport": 329,
+        "SupplyDepot": 319,
     }
     assert _BUILD_RAW_FUNCTION_IDS == {
         structure: int(actions.RAW_ABILITY_ID_TO_FUNC_ID[ability_id])
@@ -172,6 +182,39 @@ def _assert_direct_production_contract() -> None:
         "Train_Phoenix": (484, 55, "Stargate", "Phoenix", 150, 100, 2, ("Stargate",)),
         "Train_VoidRay": (500, 57, "Stargate", "VoidRay", 250, 150, 4, ("Stargate",)),
         "Train_Oracle": (482, 58, "Stargate", "Oracle", 150, 150, 3, ("Stargate",)),
+        "Train_Marine": (477, 511, "Barracks", "Marine", 50, 0, 1, ("Barracks",)),
+        "Train_Marauder": (
+            476,
+            510,
+            "Barracks",
+            "Marauder",
+            100,
+            25,
+            2,
+            ("Barracks", "BarracksTechLab"),
+        ),
+        "Train_Hellion": (470, 506, "Factory", "Hellion", 100, 0, 2, ("Factory",)),
+        "Train_SiegeTank": (
+            492,
+            521,
+            "Factory",
+            "SiegeTank",
+            150,
+            125,
+            3,
+            ("Factory", "FactoryTechLab"),
+        ),
+        "Train_Medivac": (478, 512, "Starport", "Medivac", 100, 100, 2, ("Starport",)),
+        "Train_VikingFighter": (
+            498,
+            525,
+            "Starport",
+            "VikingFighter",
+            150,
+            75,
+            2,
+            ("Starport",),
+        ),
     }
     assert {
         action_name: (
@@ -186,6 +229,49 @@ def _assert_direct_production_contract() -> None:
         )
         for action_name, spec in PRODUCTION_SPECS.items()
     } == expected
+
+
+def _assert_terran_worker_contract() -> None:
+    config = RTSCortexTerranMeleeConfig()
+    assert config.rtscortex_player_race == "terran"
+    assert config.ENABLE_AUTO_WORKER_MANAGE is False
+    assert config.ENABLE_AUTO_WORKER_TRAINING is False
+    assert list(config.AGENTS) == [
+        "Builder",
+        "Developer",
+        "CombatGroup0",
+        "CombatGroup1",
+        "CombatGroup2",
+        "CombatGroup3",
+        "CombatGroup4",
+        "CombatGroup5",
+    ]
+    builder_actions = {
+        action["name"]
+        for actions_for_type in config.AGENTS["Builder"]["action"].values()
+        for action in actions_for_type
+    }
+    assert {
+        "Build_SupplyDepot_Screen",
+        "Build_Barracks_Screen",
+        "Build_Refinery_Near",
+        "Build_CommandCenter_Near",
+        "Build_Factory_Screen",
+        "Build_Starport_Screen",
+    }.issubset(builder_actions)
+    developer_actions = {
+        action["name"]
+        for actions_for_type in config.AGENTS["Developer"]["action"].values()
+        for action in actions_for_type
+    }
+    assert {
+        "Train_Marine",
+        "Train_Marauder",
+        "Train_Hellion",
+        "Train_SiegeTank",
+        "Train_Medivac",
+        "Train_VikingFighter",
+    }.issubset(developer_actions)
 
 
 def _agent_with_tracked_team() -> LLMAgent:
@@ -675,6 +761,7 @@ def main() -> None:
     _assert_visible_team_unit_bypasses_camera_recentering()
     _assert_build_order_ids_use_raw_function_domain()
     _assert_direct_production_contract()
+    _assert_terran_worker_contract()
     _assert_raw_unit_presence_controls_team_lifecycle()
     _assert_transient_disappearance_grace()
     _assert_confirmed_disappearance_removes_actor()

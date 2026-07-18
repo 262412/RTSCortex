@@ -360,6 +360,7 @@ def test_worker_settings_prefer_canonical_runtime_environment(
     monkeypatch.setenv("RTSCORTEX_SOCKET", "/tmp/legacy.sock")
     monkeypatch.setenv("RTSCORTEX_SCENARIO", "pvz_task1_level1")
     monkeypatch.setenv("RTSCORTEX_SEED", "17")
+    monkeypatch.setenv("RTSCORTEX_AGENT_RACE", "terran")
     monkeypatch.setenv("RTSCORTEX_PENDING_PLAN_STEP_DELAY_SECONDS", "0.75")
     monkeypatch.setenv("RTSCORTEX_SIMULATION_SPEED_MULTIPLIER", "0.25")
     monkeypatch.setenv("RTSCORTEX_PAUSE_UNTIL_FIRST_PLAN", "true")
@@ -373,6 +374,7 @@ def test_worker_settings_prefer_canonical_runtime_environment(
     assert settings.socket_path == "/tmp/canonical.sock"
     assert settings.scenario == "pvz_task1_level1"
     assert settings.seed == 17
+    assert settings.agent_race == "terran"
     assert settings.pending_plan_step_delay_seconds == 0.75
     assert settings.simulation_speed_multiplier == 0.25
     assert settings.pause_until_first_plan is True
@@ -2548,7 +2550,7 @@ def test_production_source_follows_upstream_raw_order_instead_of_tag_order() -> 
     assert resolved == 0xBBB
 
 
-def test_train_registry_pins_six_worker_actions_and_raw_orders() -> None:
+def test_train_registry_pins_multirace_worker_actions_and_raw_orders() -> None:
     assert {action: spec.raw_order_id for action, spec in PRODUCTION_SPECS.items()} == {
         "Train_Zealot": 49,
         "Train_Stalker": 50,
@@ -2556,6 +2558,12 @@ def test_train_registry_pins_six_worker_actions_and_raw_orders() -> None:
         "Train_Phoenix": 55,
         "Train_VoidRay": 57,
         "Train_Oracle": 58,
+        "Train_Marine": 511,
+        "Train_Marauder": 510,
+        "Train_Hellion": 506,
+        "Train_SiegeTank": 521,
+        "Train_Medivac": 512,
+        "Train_VikingFighter": 525,
     }
 
 
@@ -3852,6 +3860,39 @@ def test_worker_selects_rtscortex_melee_config(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setattr(importlib, "import_module", fake_import)
 
     selected = _scenario_config("Simple64")
+
+    assert selected is config
+    assert config.reset_args == {
+        "model_name": "gpt-3.5-turbo",
+        "api_base": "http://127.0.0.1",
+        "api_key": "rtscortex-unused",
+    }
+
+
+def test_worker_selects_rtscortex_terran_melee_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeTerranMeleeConfig:
+        def __init__(self) -> None:
+            self.AGENTS: dict[str, Any] = {}
+            self.reset_args: dict[str, Any] | None = None
+
+        def reset_llm(self, **kwargs: Any) -> None:
+            self.reset_args = kwargs
+
+    config = FakeTerranMeleeConfig()
+    no_op_function = object()
+
+    def fake_import(name: str) -> Any:
+        if name == "rtscortex_llm_pysc2.terran_melee":
+            return SimpleNamespace(RTSCortexTerranMeleeConfig=lambda: config)
+        if name == "pysc2.lib.actions":
+            return SimpleNamespace(FUNCTIONS=SimpleNamespace(no_op=no_op_function))
+        raise AssertionError(f"unexpected import: {name}")
+
+    monkeypatch.setattr(importlib, "import_module", fake_import)
+
+    selected = _scenario_config("Simple64", agent_race="terran")
 
     assert selected is config
     assert config.reset_args == {

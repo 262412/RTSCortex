@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 from pydantic import ValidationError
-from rtscortex_llm_pysc2.production import PRODUCTION_SPECS
+from rtscortex_llm_pysc2.production import PRODUCTION_SPECS_BY_RACE
 
 from rtscortex.contracts import (
     ActionArgumentType,
@@ -622,11 +622,13 @@ def test_worker_and_runtime_production_specs_remain_contract_equivalent() -> Non
     """Keep the Python 3.9 Worker registry aligned with the Python 3.11 Runtime."""
 
     runtime_specs = {
-        spec.name: spec for spec in PROTOSS_SIMPLE64_ACTION_SPECS if spec.name in PRODUCTION_SPECS
+        spec.name: spec
+        for spec in PROTOSS_SIMPLE64_ACTION_SPECS
+        if spec.name in PRODUCTION_SPECS_BY_RACE["protoss"]
     }
 
-    assert set(runtime_specs) == set(PRODUCTION_SPECS)
-    for action_name, worker_spec in PRODUCTION_SPECS.items():
+    assert set(runtime_specs) == set(PRODUCTION_SPECS_BY_RACE["protoss"])
+    for action_name, worker_spec in PRODUCTION_SPECS_BY_RACE["protoss"].items():
         runtime_spec = runtime_specs[action_name]
         assert runtime_spec.effect_target == worker_spec.unit_type
         assert (runtime_spec.minerals, runtime_spec.vespene, runtime_spec.supply) == (

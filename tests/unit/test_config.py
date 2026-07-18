@@ -169,7 +169,7 @@ def test_hima_ensemble_rejects_mixed_races() -> None:
         )
 
 
-def test_non_protoss_cortex_is_offline_until_live_worker_exists() -> None:
+def test_terran_cortex_is_live_but_zerg_remains_offline() -> None:
     offline = ExperimentConfig.model_validate(
         {
             "environment": {"adapter": "mock", "agent_race": "terran"},
@@ -178,7 +178,15 @@ def test_non_protoss_cortex_is_offline_until_live_worker_exists() -> None:
     )
     assert offline.environment.agent_race == "terran"
 
-    with pytest.raises(ValidationError, match="Worker is not implemented"):
+    live = ExperimentConfig.model_validate(
+        {
+            "environment": {"adapter": "llm_pysc2", "agent_race": "terran"},
+            "agent": {"variant": "cortex"},
+        }
+    )
+    assert live.environment.agent_race == "terran"
+
+    with pytest.raises(ValidationError, match="does not yet implement Zerg"):
         ExperimentConfig.model_validate(
             {
                 "environment": {"adapter": "llm_pysc2", "agent_race": "zerg"},

@@ -268,11 +268,10 @@ class ExperimentConfig(SettingsModel):
         if (
             self.agent.variant == "cortex"
             and self.environment.adapter == "llm_pysc2"
-            and self.environment.agent_race in {"terran", "zerg"}
+            and self.environment.agent_race == "zerg"
         ):
             raise ValueError(
-                "the pinned LLM-PySC2 Worker is Protoss-only; Terran/Zerg Race Brain "
-                "contracts can run offline, but their live Worker is not implemented"
+                "the RTSCortex LLM-PySC2 Worker does not yet implement Zerg live actions"
             )
         if self.cortex.macro.kind == "hima":
             race = self.cortex.macro.candidate.rsplit("-", 1)[0]

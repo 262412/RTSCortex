@@ -30,6 +30,15 @@ _BUILD_RAW_FUNCTION_IDS = {
     "Pylon": 35,
     "ShieldBattery": 48,
     "Stargate": 42,
+    "Barracks": 185,
+    "Bunker": 186,
+    "CommandCenter": 187,
+    "EngineeringBay": 191,
+    "Factory": 194,
+    "MissileTurret": 202,
+    "Refinery": 214,
+    "Starport": 221,
+    "SupplyDepot": 222,
 }
 
 
@@ -491,7 +500,12 @@ class ActionEffectVerifier:
         raw_units = list(_value(observation, "raw_units", ()))
         if pending.command.name.endswith("_Near") and pending.command.requested_arguments:
             pending.target_tag = _parse_tag(pending.command.requested_arguments[0])
-            if pending.target_structure == "Assimilator" and pending.target_tag is not None:
+            spec = BUILD_SPECS.get(pending.command.name)
+            if (
+                spec is not None
+                and spec.placement_kind == "geyser"
+                and pending.target_tag is not None
+            ):
                 for unit in raw_units:
                     if int(_value(unit, "tag", -1)) == pending.target_tag:
                         pending.target_position = (
@@ -524,7 +538,7 @@ class ActionEffectVerifier:
                     float(_value(unit, "y", 0.0)),
                 )
                 pending.coordinate_space = "world"
-                if pending.target_structure == "Nexus":
+                if spec is not None and spec.placement_kind == "expansion":
                     resources = [
                         candidate
                         for candidate in raw_units
@@ -595,7 +609,8 @@ class ActionEffectVerifier:
                 else max(2.0, spec.footprint / 2.0 + 1.0)
             )
         else:
-            tolerance = 1.5 if pending.target_structure == "Assimilator" else 4.0
+            spec = BUILD_SPECS.get(pending.command.name)
+            tolerance = 1.5 if spec is not None and spec.placement_kind == "geyser" else 4.0
         return distance if distance <= tolerance else None
 
     def _timeout_reason(self, pending: _PendingBuild, current: _Evidence) -> str:
@@ -692,7 +707,10 @@ class ActionEffectVerifier:
     def _active_order_timeout(self, pending: _PendingBuild) -> int:
         multiplier = (
             NEXUS_ACTIVE_BUILD_ORDER_TIMEOUT_MULTIPLIER
-            if pending.target_structure == "Nexus"
+            if (
+                (spec := BUILD_SPECS.get(pending.command.name)) is not None
+                and spec.placement_kind == "expansion"
+            )
             else ACTIVE_BUILD_ORDER_TIMEOUT_MULTIPLIER
         )
         return self.timeout_game_loops * multiplier

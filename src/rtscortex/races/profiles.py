@@ -370,12 +370,12 @@ TERRAN_PROFILE_DATA = RaceProfileData(
         "Research_Stimpack": ("BarracksTechLab",),
     },
     hima_vocabulary_version="hima-terran-69-v1",
-    effect_verification_kinds=(),
+    effect_verification_kinds=("build", "production", "move"),
     controller_capabilities=(),
     limitations=(
-        "runtime_mapping_partial",
-        "llm_pysc2_worker_not_implemented",
         "addon_and_morph_effect_verification_pending",
+        "research_effect_verification_pending",
+        "automatic_scv_management_pending",
     ),
 )
 

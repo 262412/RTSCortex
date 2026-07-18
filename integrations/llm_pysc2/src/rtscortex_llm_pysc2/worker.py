@@ -37,7 +37,11 @@ from rtscortex_llm_pysc2.extractor import (
 )
 from rtscortex_llm_pysc2.frame_stream import RGBFramePublisher, RuntimeFrameUploader
 from rtscortex_llm_pysc2.hook import RuntimeQueryMixin
-from rtscortex_llm_pysc2.production import ProductionSpec, production_spec
+from rtscortex_llm_pysc2.production import (
+    PRODUCTION_SPECS_BY_RACE,
+    ProductionSpec,
+    production_spec,
+)
 from rtscortex_llm_pysc2.protocol import RuntimeClient
 
 PRODUCTION_CAMERA_SETTLE_MAX_OBSERVATIONS = 4
@@ -67,6 +71,7 @@ class WorkerSettings:
     socket_path: Optional[str]
     runtime_url: str
     seed: int
+    agent_race: str = "protoss"
     scenario: str = "pvz_task1_level1"
     pending_plan_step_delay_seconds: float = 0.0
     simulation_speed_multiplier: Optional[float] = None
@@ -130,6 +135,9 @@ class WorkerSettings:
         console_jpeg_quality = int(os.environ.get("RTSCORTEX_CONSOLE_JPEG_QUALITY", "75"))
         if not 1 <= console_jpeg_quality <= 95:
             raise RuntimeError("RTSCORTEX_CONSOLE_JPEG_QUALITY must be between 1 and 95")
+        agent_race = os.environ.get("RTSCORTEX_AGENT_RACE", "protoss").strip().casefold()
+        if agent_race not in {"protoss", "terran", "zerg"}:
+            raise RuntimeError(f"unsupported RTSCORTEX_AGENT_RACE {agent_race!r}")
         return cls(
             run_id=run_id,
             episode_id=episode_id,
@@ -137,6 +145,7 @@ class WorkerSettings:
             or os.environ.get("RTSCORTEX_SOCKET"),
             runtime_url=os.environ.get("RTSCORTEX_RUNTIME_URL", "http://127.0.0.1:8765"),
             seed=int(os.environ.get("RTSCORTEX_SEED", "0")),
+            agent_race=agent_race,
             scenario=os.environ.get("RTSCORTEX_SCENARIO", "pvz_task1_level1"),
             pending_plan_step_delay_seconds=pending_plan_step_delay_seconds,
             simulation_speed_multiplier=(
@@ -159,6 +168,8 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
     broker: SharedDecisionBroker
     func_list: list[Any]
     action_list: list[dict[str, Any]]
+    curr_action_name: str
+    curr_action_args: list[Any]
 
     def __init__(
         self,
@@ -346,6 +357,11 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
             )
             if build_reselection is not None:
                 return build_reselection
+            if (
+                production_spec(action_name) is not None
+                and _worker_player_race(self) == "terran"
+            ):
+                self._prime_terran_production_chain(action)
         if _next_primitive_is_screen_build(semantic_action_name, self.func_list):
             command_id = self.broker.command_id_for(
                 self.name,
@@ -417,7 +433,10 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
         # Keep the already validated request for the final candidate-domain audit.
         candidate_action = copy.deepcopy(action)
         self._rtscortex_translation_attempt = None
-        result = super().get_func(obs)
+        if _is_terran_near_build_final_primitive(self, semantic_action_name):
+            result = _translate_terran_near_build_primitive(self, obs)
+        else:
+            result = super().get_func(obs)
         metadata = getattr(self, "last_translation_result", None)
         if not isinstance(metadata, Mapping):
             self.broker.fail_command_integrity(
@@ -503,7 +522,8 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
             self._rtscortex_translation_ordinal = ordinal
             return result
         if (
-            action_name == "Build_Nexus_Near"
+            (expansion_spec := BUILD_SPECS.get(action_name)) is not None
+            and expansion_spec.placement_kind == "expansion"
             and accepted
             and final_primitive
             and (
@@ -529,14 +549,14 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
             )
             if dispatch is None:
                 self.broker.raise_unattributed_integrity(
-                    "unscouted Nexus primitive has no active command"
+                    "unscouted expansion primitive has no active command"
                 )
             if translated_position is not None:
                 self.broker.resolve_arguments(dispatch.command_id, [translated_position])
             self.broker.settle_primitive(
                 dispatch,
                 success=False,
-                failure_reason="translated Nexus footprint is not fully visible",
+                failure_reason="translated expansion footprint is not fully visible",
                 game_loop=_observation_game_loop(obs.observation),
             )
             self.func_list.clear()
@@ -634,6 +654,24 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
         self._rtscortex_build_selection_retries += 1
         actions = importlib.import_module("pysc2.lib.actions")
         return 2, actions.FUNCTIONS.select_point("select", position)
+
+    def _prime_terran_production_chain(self, action: Mapping[str, Any]) -> None:
+        """Bind a Terran train action to the exact producer selected by RTSCortex."""
+
+        producer_tag = self._rtscortex_production_source_tag
+        if producer_tag is None:
+            raise RuntimeError("Terran production chain lacks producer provenance")
+        actions = importlib.import_module("pysc2.lib.actions")
+        semantic_action = self.action_list.pop(0)
+        self.func_list = [
+            (573, actions.FUNCTIONS.llm_pysc2_move_camera, (int(producer_tag),)),
+            (2, actions.FUNCTIONS.select_point, ("select", int(producer_tag))),
+            *list(action.get("func", semantic_action.get("func", ()))),
+        ]
+        self._rtscortex_translation_ordinal = 0
+        self._rtscortex_translation_total = len(self.func_list)
+        self.curr_action_name = str(action.get("name", ""))
+        self.curr_action_args = list(action.get("arg", ()))
 
     def _wait_for_production_camera(self, action_name: str, obs: Any) -> bool:
         """Wait for a post-camera feature observation before selecting a producer."""
@@ -811,7 +849,7 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
             unit_names=unit_names,
             upgrade_names=upgrade_names,
             building_types=building_types,
-            action_source_types=_production_action_source_types(),
+            action_source_types=_production_action_source_types(self.worker_settings.agent_race),
         )
         self.decision_broker = SharedDecisionBroker(
             coordinator,
@@ -833,7 +871,10 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
             else None
         )
 
-        config = _scenario_config(self.worker_settings.scenario)
+        config = _scenario_config(
+            self.worker_settings.scenario,
+            agent_race=self.worker_settings.agent_race,
+        )
         subagent = partial(
             RTSCortexLLMAgent,
             broker=self.decision_broker,
@@ -1210,22 +1251,38 @@ def _require_upstream() -> None:
         ) from _UPSTREAM_IMPORT_ERROR
 
 
-def _scenario_config(scenario: str) -> Any:
+def _scenario_config(scenario: str, *, agent_race: str = "protoss") -> Any:
+    normalized_race = agent_race.strip().casefold()
+    if normalized_race not in {"protoss", "terran", "zerg"}:
+        raise ValueError(f"unsupported worker race {agent_race!r}")
+    if scenario != "Simple64" and normalized_race != "protoss":
+        raise ValueError(f"worker scenario {scenario!r} does not support race {normalized_race!r}")
     definitions = {
         "pvz_task1_level1": (
             "llm_pysc2.agents.configs.llm_pysc2",
             "ConfigPysc2_Harass",
         ),
         "2s3z": ("llm_pysc2.agents.configs.llm_smac", "ConfigSmac_2s3z"),
-        "Simple64": ("rtscortex_llm_pysc2.melee", "RTSCortexMeleeConfig"),
+        "Simple64": {
+            "protoss": ("rtscortex_llm_pysc2.melee", "RTSCortexMeleeConfig"),
+            "terran": (
+                "rtscortex_llm_pysc2.terran_melee",
+                "RTSCortexTerranMeleeConfig",
+            ),
+        }.get(normalized_race),
     }
     try:
-        module_name, class_name = definitions[scenario]
+        definition = definitions[scenario]
     except KeyError as error:
         supported = ", ".join(sorted(definitions))
         raise ValueError(
             f"unsupported worker scenario {scenario!r}; supported scenarios: {supported}"
         ) from error
+    if definition is None:
+        raise ValueError(
+            f"worker scenario {scenario!r} does not yet support race {normalized_race!r}"
+        )
+    module_name, class_name = definition
     module = importlib.import_module(module_name)
     config = getattr(module, class_name)()
     config.reset_llm(
@@ -1292,14 +1349,19 @@ def _upgrade_metadata() -> dict[int, str]:
     return {int(value): value.name for value in upgrades.Upgrades}
 
 
-def _production_action_source_types() -> dict[int, int]:
+def _production_action_source_types(agent_race: str = "protoss") -> dict[int, int]:
     actions = importlib.import_module("pysc2.lib.actions")
     llm_action = importlib.import_module("llm_pysc2.lib.llm_action")
+    units = importlib.import_module("pysc2.lib.units")
     result: dict[int, int] = {}
     for function_id in range(len(actions.FUNCTIONS)):
-        source_type = llm_action.find_unit_type_the_func_belongs_to(function_id, "protoss")
+        source_type = llm_action.find_unit_type_the_func_belongs_to(function_id, agent_race)
         if source_type is not None:
             result[function_id] = int(source_type)
+    for spec in PRODUCTION_SPECS_BY_RACE.get(agent_race, {}).values():
+        producer = getattr(getattr(units, agent_race.capitalize()), spec.producer_type, None)
+        if producer is not None:
+            result[spec.feature_function_id] = int(producer)
     return result
 
 
@@ -1512,6 +1574,88 @@ def _execution_team_name(agent: Any) -> Optional[str]:
 def _execution_unit_tag(agent: Any) -> Optional[int]:
     value = getattr(agent, "team_unit_tag_curr", None)
     return None if value is None else int(value)
+
+
+def _worker_player_race(agent: Any) -> str:
+    config = getattr(agent, "config", None)
+    return str(
+        getattr(config, "rtscortex_player_race", getattr(agent, "race", "protoss"))
+    ).casefold()
+
+
+def _is_terran_near_build_final_primitive(agent: Any, action_name: str) -> bool:
+    if (
+        _worker_player_race(agent) != "terran"
+        or action_name not in {"Build_Refinery_Near", "Build_CommandCenter_Near"}
+        or not agent.func_list
+    ):
+        return False
+    function_id = int(agent.func_list[0][0])
+    return function_id in {44, 79}
+
+
+def _translate_terran_near_build_primitive(agent: Any, obs: Any) -> tuple[int, Any]:
+    """Resolve Terran gas and expansion anchors without upstream Terran factories."""
+
+    requested_id, function, arguments = agent.func_list.pop(0)
+    requested_arguments = list(arguments)
+    ordinal = int(agent._rtscortex_translation_ordinal)
+    agent._rtscortex_translation_ordinal += 1
+    total = int(agent._rtscortex_translation_total)
+    available = set(_observation_value(obs.observation, "available_actions", ()))
+    reason: Optional[str] = None
+    resolved_arguments: list[Any] = []
+    emitted_id = int(requested_id)
+    function_call: Any
+    if emitted_id not in available:
+        reason = f"function {getattr(function, 'name', emitted_id)} is not available"
+    elif len(requested_arguments) != 2 or not isinstance(requested_arguments[1], int):
+        reason = (
+            "Terran Near build expected queue flag and anchor tag, got "
+            f"{requested_arguments!r}"
+        )
+    else:
+        queue = requested_arguments[0]
+        queue = "now" if agent.first_action and queue in {"now", "queued"} else queue
+        llm_action = importlib.import_module("llm_pysc2.lib.llm_action")
+        resolver = (
+            llm_action.get_arg_screen_tag_gas_building
+            if agent.curr_action_name == "Build_Refinery_Near"
+            else llm_action.get_arg_screen_tag_base_building
+        )
+        position, valid = resolver(
+            obs,
+            int(requested_arguments[1]),
+            int(agent.size_screen),
+            str(agent.curr_action_name),
+        )
+        if not valid:
+            reason = str(position)
+        else:
+            resolved_arguments = [queue, position]
+    if reason is None:
+        function_call = function(*resolved_arguments)
+        if agent.first_action and resolved_arguments[0] == "now":
+            agent.first_action = False
+    else:
+        emitted_id = 0
+        function_call = _no_op()
+    if not agent.action_list and not agent.func_list:
+        agent.first_action = True
+    agent.last_translation_result = {
+        "action_name": agent.curr_action_name,
+        "requested_function_id": int(requested_id),
+        "requested_function_name": str(getattr(function, "name", requested_id)),
+        "emitted_function_id": emitted_id,
+        "emitted_function_name": _function_name(emitted_id),
+        "ordinal": ordinal,
+        "total": total,
+        "accepted": emitted_id == int(requested_id),
+        "requested_arguments": requested_arguments,
+        "resolved_arguments": resolved_arguments if emitted_id == int(requested_id) else [],
+        "reason": reason,
+    }
+    return emitted_id, function_call
 
 
 def _production_source_invalid_reason(
@@ -2003,9 +2147,10 @@ def _semantic_target_failure(
             return "friendly_target", f"target {hex(target_tag)} is not an enemy"
         return "target_not_visible", f"enemy target {hex(target_tag)} is not targetable"
 
+    spec = BUILD_SPECS.get(action_name)
     failure_code = (
         "invalid_geyser_tag"
-        if action_name == "Build_Assimilator_Near"
+        if spec is not None and spec.placement_kind == "geyser"
         else "invalid_expansion_anchor"
     )
     return failure_code, f"semantic target {hex(target_tag)} is no longer legal"

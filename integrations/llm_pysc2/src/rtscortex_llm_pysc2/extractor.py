@@ -82,6 +82,59 @@ BUILD_SPECS = {
         100,
         prerequisites=("CyberneticsCore",),
     ),
+    "Build_SupplyDepot_Screen": BuildSpec("SupplyDepot", "screen", 2, False, 100),
+    "Build_Barracks_Screen": BuildSpec(
+        "Barracks",
+        "screen",
+        3,
+        False,
+        150,
+        prerequisites=("SupplyDepot",),
+    ),
+    "Build_Refinery_Near": BuildSpec("Refinery", "geyser", 3, False, 75),
+    "Build_CommandCenter_Near": BuildSpec("CommandCenter", "expansion", 5, False, 400),
+    "Build_Factory_Screen": BuildSpec(
+        "Factory",
+        "screen",
+        3,
+        False,
+        150,
+        vespene_cost=100,
+        prerequisites=("Barracks",),
+    ),
+    "Build_Starport_Screen": BuildSpec(
+        "Starport",
+        "screen",
+        3,
+        False,
+        150,
+        vespene_cost=100,
+        prerequisites=("Factory",),
+    ),
+    "Build_EngineeringBay_Screen": BuildSpec(
+        "EngineeringBay",
+        "screen",
+        3,
+        False,
+        125,
+        prerequisites=("CommandCenter",),
+    ),
+    "Build_Bunker_Screen": BuildSpec(
+        "Bunker",
+        "screen",
+        3,
+        False,
+        100,
+        prerequisites=("Barracks",),
+    ),
+    "Build_MissileTurret_Screen": BuildSpec(
+        "MissileTurret",
+        "screen",
+        2,
+        False,
+        100,
+        prerequisites=("EngineeringBay",),
+    ),
 }
 
 SCREEN_POINT_ACTIONS = frozenset({"Move_Screen", "Ability_Blink_Screen"})
@@ -681,7 +734,14 @@ def _argument_candidates(
     if spec.placement_kind == "screen":
         return [[candidate] for candidate in build_screen_candidates(observation, action_name)]
     if spec.placement_kind == "geyser":
-        return [[tag] for tag in _assimilator_candidates(observation, unit_names)]
+        return [
+            [tag]
+            for tag in _gas_structure_candidates(
+                observation,
+                unit_names,
+                target_structure=spec.target_structure,
+            )
+        ]
     return [[tag] for tag in _expansion_anchor_candidates(observation, unit_names)]
 
 
@@ -948,23 +1008,26 @@ def _build_prerequisites_satisfied(
     return all(prerequisite in completed for prerequisite in spec.prerequisites)
 
 
-def _assimilator_candidates(
+def _gas_structure_candidates(
     observation: Any,
     unit_names: Mapping[int, str],
+    *,
+    target_structure: str,
 ) -> list[int]:
     raw_units = list(_value(observation, "raw_units", ()))
     raw_by_tag = {int(_value(unit, "tag", 0)): unit for unit in raw_units}
-    nexuses = [
+    townhalls = [
         unit
         for unit in raw_units
         if int(_value(unit, "alliance", 0)) == 1
-        and _unit_name(unit, unit_names) == "Nexus"
+        and _unit_name(unit, unit_names).casefold() in TOWNHALL_NAMES
         and _build_progress(unit) >= 1.0
     ]
-    assimilators = [
+    gas_structures = [
         unit
         for unit in raw_units
-        if int(_value(unit, "alliance", 0)) == 1 and _unit_name(unit, unit_names) == "Assimilator"
+        if int(_value(unit, "alliance", 0)) == 1
+        and _unit_name(unit, unit_names) == target_structure
     ]
     candidates = []
     for unit in _value(observation, "feature_units", ()):
@@ -977,9 +1040,9 @@ def _assimilator_candidates(
             or not _is_gas(_unit_name(raw, unit_names))
         ):
             continue
-        if not any(_distance(raw, nexus) < 10.0 for nexus in nexuses):
+        if not any(_distance(raw, townhall) < 10.0 for townhall in townhalls):
             continue
-        if any(_distance(raw, assimilator) < 2.0 for assimilator in assimilators):
+        if any(_distance(raw, gas_structure) < 2.0 for gas_structure in gas_structures):
             continue
         candidates.append(tag)
     return sorted(set(candidates))
@@ -1033,10 +1096,10 @@ def _expansion_anchor_candidates(
         if _unit_name(unit, unit_names).casefold() in TOWNHALL_NAMES
         and int(_value(unit, "alliance", 0)) in {1, 2, 4}
     ]
-    own_nexuses = [
+    own_townhalls = [
         unit
         for unit in townhalls
-        if _unit_name(unit, unit_names) == "Nexus" and int(_value(unit, "alliance", 0)) == 1
+        if int(_value(unit, "alliance", 0)) == 1
     ]
     ranked: list[tuple[float, int]] = []
     for cluster in clusters.values():
@@ -1072,7 +1135,7 @@ def _expansion_anchor_candidates(
         ):
             continue
         base_distance = min(
-            (_distance(anchor, nexus) for nexus in own_nexuses),
+            (_distance(anchor, townhall) for townhall in own_townhalls),
             default=math.inf,
         )
         ranked.append((base_distance, anchor_tag))
