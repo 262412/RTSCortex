@@ -538,7 +538,7 @@ def test_unavailable_screen_build_reselects_exact_builder(
     assert agent._rtscortex_build_selection_retries == 0
 
 
-def test_observation_gap_watchdog_preempts_once_and_recovers() -> None:
+def test_observation_gap_watchdog_latches_lightweight_observations_after_recovery() -> None:
     broker = SimpleNamespace(last_decision_game_loop=100, triggers=0)
     broker.record_observation_gap_watchdog_trigger = lambda: setattr(
         broker, "triggers", broker.triggers + 1
@@ -555,6 +555,7 @@ def test_observation_gap_watchdog_preempts_once_and_recovers() -> None:
         observation_gap_hard_limit_game_loops=40,
     )
     agent._observation_watchdog_active = False
+    agent._observation_watchdog_preempted = False
     agent._observation_watchdog_baseline_loop = None
     agent._rtscortex_force_runtime_decision = False
 
@@ -566,7 +567,12 @@ def test_observation_gap_watchdog_preempts_once_and_recovers() -> None:
 
     broker.last_decision_game_loop = 120
     assert agent._update_observation_gap_watchdog(121) is False
-    assert agent._rtscortex_force_runtime_decision is False
+    assert agent._rtscortex_force_runtime_decision is True
+    assert broker.triggers == 1
+
+    broker.last_decision_game_loop = 130
+    assert agent._update_observation_gap_watchdog(131) is False
+    assert broker.triggers == 1
 
 
 def test_observation_gap_watchdog_fails_before_unbounded_stall() -> None:
@@ -586,6 +592,7 @@ def test_observation_gap_watchdog_fails_before_unbounded_stall() -> None:
         observation_gap_hard_limit_game_loops=40,
     )
     agent._observation_watchdog_active = False
+    agent._observation_watchdog_preempted = False
     agent._observation_watchdog_baseline_loop = None
     agent._rtscortex_force_runtime_decision = False
 

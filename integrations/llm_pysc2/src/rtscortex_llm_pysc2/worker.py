@@ -821,6 +821,7 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
         self._pending_primitive_agent: Optional[Any] = None
         self.transport_noop_primitives = 0
         self._observation_watchdog_active = False
+        self._observation_watchdog_preempted = False
         self._observation_watchdog_baseline_loop: Optional[int] = None
         self._rtscortex_force_runtime_decision = False
         self._episode_reported = False
@@ -1101,18 +1102,18 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
         ):
             self._observation_watchdog_active = False
             self._observation_watchdog_baseline_loop = None
-            self._rtscortex_force_runtime_decision = False
         gap = game_loop - last_decision_loop
         if (
-            not self._observation_watchdog_active
+            not self._observation_watchdog_preempted
             and gap > self.worker_settings.observation_gap_watchdog_game_loops
         ):
+            self._observation_watchdog_preempted = True
             self._observation_watchdog_active = True
             self._observation_watchdog_baseline_loop = last_decision_loop
             self._rtscortex_force_runtime_decision = True
             self.decision_broker.record_observation_gap_watchdog_trigger()
         if (
-            self._observation_watchdog_active
+            self._observation_watchdog_preempted
             and gap > self.worker_settings.observation_gap_hard_limit_game_loops
         ):
             raise RuntimeError(
