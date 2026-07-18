@@ -102,6 +102,16 @@ def _assert_observation_gap_watchdog_preempts_optional_gathering() -> None:
     assert "_rtscortex_force_runtime_decision" in inspect.getsource(main_agent_func4)
 
 
+def _assert_single_unit_selection_uses_exact_point() -> None:
+    from llm_pysc2.agents import llm_pysc2_agent_main
+
+    source = inspect.getsource(llm_pysc2_agent_main.MainAgent.step)
+    assert "_rtscortex_exact_single_unit_selection" in source
+    exact_branch = source.index("_rtscortex_exact_single_unit_selection")
+    rectangle_fallback = source.index("elif self.func_id_history[-1] in [2, 3]", exact_branch)
+    assert exact_branch < rectangle_fallback
+
+
 def _assert_visible_team_unit_bypasses_camera_recentering() -> None:
     assert "_rtscortex_accept_visible_team_unit" in inspect.getsource(get_camera_func_smart)
     unit = SimpleNamespace(tag=0xA, x=90, y=65)
@@ -661,6 +671,7 @@ def main() -> None:
     _assert_atomic_log_directory_allocation()
     _assert_gas_rebalance_uses_worker_management_flag()
     _assert_observation_gap_watchdog_preempts_optional_gathering()
+    _assert_single_unit_selection_uses_exact_point()
     _assert_visible_team_unit_bypasses_camera_recentering()
     _assert_build_order_ids_use_raw_function_domain()
     _assert_direct_production_contract()

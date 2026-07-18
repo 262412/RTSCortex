@@ -841,6 +841,7 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
         )
         super().__init__(config, subagent)
         self._rtscortex_accept_visible_team_unit = True
+        self._rtscortex_exact_single_unit_selection = True
         _apply_scenario_bootstrap(self, self.worker_settings.scenario)
         if self.worker_settings.console_enabled:
             self._frame_publisher = RGBFramePublisher(
