@@ -12,10 +12,12 @@ environment:
   opponent_build: macro
   step_mul: 1
   game_steps_per_episode: 5200
-  simulation_speed_multiplier: 0.25
+  simulation_speed_multiplier: 0.125
   pause_until_first_plan: true
   sc2_path: ~/scratch/StarCraftII
   action_effect_timeout_game_loops: 112
+  observation_gap_watchdog_game_loops: 112
+  observation_gap_hard_limit_game_loops: 448
   worker_python: ~/fastscratch/envs/rtscortex-llm-pysc2/bin/python
 runtime:
   deterministic: false
