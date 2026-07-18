@@ -42,6 +42,9 @@ from rtscortex_llm_pysc2.protocol import RuntimeClient
 
 PRODUCTION_CAMERA_SETTLE_MAX_OBSERVATIONS = 4
 BUILD_SELECTION_RETRY_MAX_OBSERVATIONS = 2
+BUILD_TRANSLATOR_RETRY_FAILURE_CODES = frozenset(
+    {"blocked", "need_power", "not_pathable", "no_legal_placement"}
+)
 DEFAULT_OBSERVATION_GAP_WATCHDOG_GAME_LOOPS = 448
 DEFAULT_OBSERVATION_GAP_HARD_LIMIT_GAME_LOOPS = 1792
 
@@ -474,6 +477,30 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
             action_name,
             attempt.get("resolved_arguments"),
         )
+        translated_build_spec = BUILD_SPECS.get(action_name)
+        if (
+            not accepted
+            and translated_build_spec is not None
+            and translated_build_spec.placement_kind == "screen"
+            and failure_code in BUILD_TRANSLATOR_RETRY_FAILURE_CODES
+        ):
+            rejected_position = _screen_argument(candidate_action)
+            if rejected_position is not None:
+                self._rtscortex_rejected_build_positions.setdefault(
+                    action_name,
+                    set(),
+                ).add(_screen_position_key(rejected_position))
+            if provenance is not None:
+                self._rtscortex_rejected_build_targets.setdefault(
+                    action_name,
+                    set(),
+                ).add(_build_world_target_key(provenance.world_target))
+            # Nothing reached PySC2. Keep the command and primitive ordinal alive
+            # so the next observation can use another semantic placement candidate.
+            self.func_list = list(candidate_action.get("func", ()))
+            self._rtscortex_semantic_action = candidate_action
+            self._rtscortex_translation_ordinal = ordinal
+            return result
         if (
             action_name == "Build_Nexus_Near"
             and accepted

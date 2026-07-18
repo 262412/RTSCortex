@@ -438,6 +438,110 @@ def test_agent_reprojects_screen_build_again_after_selection_chain(
     assert agent._rtscortex_translation_attempt is not None
 
 
+def test_agent_resamples_screen_build_after_translator_rejects_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observation = _observation(anchor_screen=(32, 32))
+    observation.game_loop = [500]
+    observation.available_actions = [70]
+    action: dict[str, Any] = {
+        "name": "Build_Pylon_Screen",
+        "arg": [[64, 64]],
+        "func": [],
+    }
+    pending_function = SimpleNamespace(name="Build_Pylon_screen")
+
+    class Broker:
+        unattributed_primitives = 0
+
+        def __init__(self) -> None:
+            self.resolutions: list[list[Any]] = []
+            self.claims = 0
+
+        def command_id_for(self, *_args: Any) -> str:
+            return "pylon-command"
+
+        def screen_route_provenance(self, _command_id: str) -> SimpleNamespace:
+            return SimpleNamespace(world_target=(106.0, 56.0), anchor_tag=1)
+
+        def resolve_arguments(self, _command_id: str, arguments: list[Any]) -> None:
+            self.resolutions.append(arguments)
+
+        def claim_primitive(self, *_args: Any, **_kwargs: Any) -> PrimitiveDispatch:
+            self.claims += 1
+            return PrimitiveDispatch(
+                "pylon-command",
+                "Build_Pylon_screen",
+                True,
+                ordinal=0,
+                total=1,
+                requested_function_id=70,
+                emitted_function_id=70,
+            )
+
+    attempted_positions: list[list[int]] = []
+
+    def upstream_get_func(agent: Any, _obs: Any) -> tuple[int, str]:
+        function_id, _function, arguments = agent.func_list.pop(0)
+        resolved = [int(value) for value in arguments[1]]
+        attempted_positions.append(resolved)
+        ordinal = agent._rtscortex_translation_ordinal
+        agent._rtscortex_translation_ordinal += 1
+        accepted = len(attempted_positions) > 1
+        agent.last_translation_result = {
+            "action_name": "Build_Pylon_Screen",
+            "requested_function_id": function_id,
+            "requested_function_name": "Build_Pylon_screen",
+            "emitted_function_id": function_id if accepted else 0,
+            "accepted": accepted,
+            "ordinal": ordinal,
+            "total": 1,
+            "resolved_arguments": [resolved] if accepted else [],
+            "reason": None if accepted else f"area near {tuple(resolved)} not pathable",
+        }
+        return (function_id if accepted else 0), "translated"
+
+    monkeypatch.setattr(RuntimeQueryMixin, "get_func", upstream_get_func, raising=False)
+    broker = Broker()
+    agent = object.__new__(RTSCortexLLMAgent)
+    agent.name = "Builder"
+    agent.team_unit_team_curr = "Builder-Probe-1"
+    agent.team_unit_tag_curr = 1
+    agent.team_unit_tag_list = [1]
+    agent.flag_enable_empty_unit_group = False
+    agent.func_list = [(70, pending_function, ("now", [64, 64]))]
+    agent.action_list = []
+    agent.unit_names = {}
+    agent.curr_action_name = "Build_Pylon_Screen"
+    agent.broker = cast(Any, broker)
+    agent._rtscortex_semantic_action = action
+    agent._rtscortex_translation_attempt = None
+    agent._rtscortex_translation_ordinal = 0
+    agent._rtscortex_rejected_build_positions = {}
+    agent._rtscortex_rejected_build_targets = {}
+    agent._rtscortex_active_build_route = None
+    agent._rtscortex_camera_settlement_noop = False
+    agent._rtscortex_build_selection_retries = 0
+    agent.size_screen = 128
+
+    first = agent.get_func(SimpleNamespace(observation=observation))
+
+    assert first == (0, "translated")
+    assert broker.claims == 0
+    assert agent._rtscortex_translation_ordinal == 0
+    assert agent.func_list
+    assert tuple(attempted_positions[0]) in agent._rtscortex_rejected_build_positions[
+        "Build_Pylon_Screen"
+    ]
+
+    second = agent.get_func(SimpleNamespace(observation=observation))
+
+    assert second == (70, "translated")
+    assert attempted_positions[1] != attempted_positions[0]
+    assert broker.claims == 1
+    assert agent._rtscortex_translation_attempt is not None
+
+
 def test_agent_reprojects_move_screen_and_records_resolved_arguments(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
