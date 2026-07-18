@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+from rtscortex_llm_pysc2.addon import ADDON_SPECS
 from rtscortex_llm_pysc2.broker import PrimitiveDispatch, SharedDecisionBroker
 from rtscortex_llm_pysc2.coordinator import BridgeCoordinator
 from rtscortex_llm_pysc2.extractor import (
@@ -1132,12 +1133,12 @@ def test_timestep_extractor_defers_terran_builds_while_reserved_scv_is_construct
         step_id=2,
     )
 
-    assert [action["name"] for action in busy["teams"][0]["available_actions"]] == [
-        "No_Operation"
-    ]
-    assert {
-        action["name"] for action in idle["teams"][0]["available_actions"]
-    } == {"No_Operation", "Build_SupplyDepot_Screen", "Build_Barracks_Screen"}
+    assert [action["name"] for action in busy["teams"][0]["available_actions"]] == ["No_Operation"]
+    assert {action["name"] for action in idle["teams"][0]["available_actions"]} == {
+        "No_Operation",
+        "Build_SupplyDepot_Screen",
+        "Build_Barracks_Screen",
+    }
 
 
 def test_timestep_extractor_does_not_apply_scv_construction_lock_to_probe() -> None:
@@ -1228,6 +1229,30 @@ def test_untracked_transport_noop_clears_semantic_cache_before_next_action() -> 
     assert untracked_branch.index("self._rtscortex_semantic_action = None") < (
         untracked_branch.index("return result")
     )
+
+
+def test_terran_addon_uses_exact_producer_chain(monkeypatch: pytest.MonkeyPatch) -> None:
+    action = {
+        "name": "Build_BarracksReactor",
+        "arg": [],
+        "func": [(73, object(), ("queued",))],
+    }
+    agent = cast(Any, object.__new__(RTSCortexLLMAgent))
+    agent._rtscortex_production_source_tag = 0xABC
+    agent.action_list = [action.copy()]
+    agent.func_list = []
+    functions = SimpleNamespace(
+        llm_pysc2_move_camera=object(),
+        select_point=object(),
+    )
+    monkeypatch.setattr(
+        "rtscortex_llm_pysc2.worker.importlib.import_module",
+        lambda _name: SimpleNamespace(FUNCTIONS=functions),
+    )
+    agent._prime_terran_production_chain(action)
+
+    assert [int(item[0]) for item in agent.func_list] == [573, 2, 73]
+    assert _requires_terran_production_chain("Build_BarracksReactor") is True
 
 
 def test_timestep_extractor_enumerates_stable_pathable_move_and_blink_candidates() -> None:
@@ -2720,6 +2745,34 @@ def test_train_registry_pins_multirace_worker_actions_and_raw_orders() -> None:
         "Train_Medivac": 512,
         "Train_VikingFighter": 525,
     }
+
+
+def test_addon_source_resolver_requires_idle_unattached_exact_producer() -> None:
+    spec = ADDON_SPECS["Build_BarracksReactor"]
+    timestep = _fake_timestep()
+    timestep.observation.player.minerals = spec.minerals
+    timestep.observation.player.vespene = spec.vespene
+    attached = _unit(0xAAA, 21, 1, 35, 35, 500, 255)
+    attached.build_progress = 100
+    attached.active = 0
+    attached.add_on_tag = 0xBAD
+    available = _unit(0xBBB, 21, 1, 36, 35, 500, 255)
+    available.build_progress = 100
+    available.active = 0
+    available.add_on_tag = 0
+    timestep.observation.raw_units.extend([attached, available])
+
+    resolved = production_source_tag(
+        timestep.observation,
+        {
+            "name": spec.action_name,
+            "func": [(spec.feature_function_id, None, ("queued",))],
+        },
+        unit_names={21: "Barracks"},
+        action_source_types={spec.feature_function_id: 21},
+    )
+
+    assert resolved == 0xBBB
 
 
 @pytest.mark.parametrize("action_name", ["Train_Phoenix", "Train_Oracle"])

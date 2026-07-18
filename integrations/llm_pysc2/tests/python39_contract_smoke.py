@@ -18,6 +18,7 @@ from llm_pysc2.agents.main_agent_funcs import (
 from llm_pysc2.lib import llm_action
 from pysc2.env import run_loop
 from pysc2.lib import actions, features
+from rtscortex_llm_pysc2.addon import ADDON_SPECS
 from rtscortex_llm_pysc2.extractor import BUILD_RAW_FUNCTION_IDS
 from rtscortex_llm_pysc2.observation import _map_argument_candidates
 from rtscortex_llm_pysc2.production import PRODUCTION_SPECS
@@ -231,10 +232,45 @@ def _assert_direct_production_contract() -> None:
     } == expected
 
 
+def _assert_terran_addon_contract() -> None:
+    expected = {
+        "Build_BarracksTechLab": (94, 225, 421, "Barracks", "BarracksTechLab"),
+        "Build_BarracksReactor": (73, 208, 422, "Barracks", "BarracksReactor"),
+        "Build_FactoryTechLab": (96, 227, 454, "Factory", "FactoryTechLab"),
+        "Build_FactoryReactor": (75, 210, 455, "Factory", "FactoryReactor"),
+        "Build_StarportTechLab": (98, 229, 487, "Starport", "StarportTechLab"),
+        "Build_StarportReactor": (77, 212, 488, "Starport", "StarportReactor"),
+    }
+    assert {
+        name: (
+            spec.feature_function_id,
+            spec.raw_order_id,
+            spec.ability_id,
+            spec.producer_type,
+            spec.addon_type,
+        )
+        for name, spec in ADDON_SPECS.items()
+    } == expected
+    feature_names = {
+        "Build_BarracksTechLab": "Build_TechLab_Barracks_quick",
+        "Build_BarracksReactor": "Build_Reactor_Barracks_quick",
+        "Build_FactoryTechLab": "Build_TechLab_Factory_quick",
+        "Build_FactoryReactor": "Build_Reactor_Factory_quick",
+        "Build_StarportTechLab": "Build_TechLab_Starport_quick",
+        "Build_StarportReactor": "Build_Reactor_Starport_quick",
+    }
+    for action_name, function_name in feature_names.items():
+        spec = ADDON_SPECS[action_name]
+        assert int(getattr(actions.FUNCTIONS, function_name).id) == spec.feature_function_id
+        raw_function = getattr(actions.RAW_FUNCTIONS, function_name)
+        assert int(raw_function.id) == spec.raw_order_id
+        assert int(raw_function.ability_id) == spec.ability_id
+
+
 def _assert_terran_worker_contract() -> None:
     config = RTSCortexTerranMeleeConfig()
     assert config.rtscortex_player_race == "terran"
-    assert config.ENABLE_AUTO_WORKER_MANAGE is False
+    assert config.ENABLE_AUTO_WORKER_MANAGE is True
     assert config.ENABLE_AUTO_WORKER_TRAINING is False
     assert list(config.AGENTS) == [
         "Builder",
@@ -264,6 +300,7 @@ def _assert_terran_worker_contract() -> None:
         for actions_for_type in config.AGENTS["Developer"]["action"].values()
         for action in actions_for_type
     }
+    assert set(ADDON_SPECS).issubset(developer_actions)
     assert {
         "Train_Marine",
         "Train_Marauder",
@@ -761,6 +798,7 @@ def main() -> None:
     _assert_visible_team_unit_bypasses_camera_recentering()
     _assert_build_order_ids_use_raw_function_domain()
     _assert_direct_production_contract()
+    _assert_terran_addon_contract()
     _assert_terran_worker_contract()
     _assert_raw_unit_presence_controls_team_lifecycle()
     _assert_transient_disappearance_grace()

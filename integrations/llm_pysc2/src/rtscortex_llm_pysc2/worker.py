@@ -10,8 +10,9 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from functools import partial
 from numbers import Integral
-from typing import Any, Optional
+from typing import Any, Optional, Protocol
 
+from rtscortex_llm_pysc2.addon import ADDON_SPECS, addon_spec
 from rtscortex_llm_pysc2.broker import PrimitiveDispatch, SharedDecisionBroker
 from rtscortex_llm_pysc2.clock import FixedRateGameClock, InitialPlanningBarrier
 from rtscortex_llm_pysc2.coordinator import BridgeCoordinator
@@ -27,7 +28,7 @@ from rtscortex_llm_pysc2.extractor import (
     TimeStepExtractor,
     build_screen_candidates,
     builder_move_requires_power,
-    is_production_action,
+    is_source_bound_action,
     nexus_placement_footprint_is_visible,
     production_source_tag,
     resolve_screen_build_world_target,
@@ -39,7 +40,6 @@ from rtscortex_llm_pysc2.frame_stream import RGBFramePublisher, RuntimeFrameUplo
 from rtscortex_llm_pysc2.hook import RuntimeQueryMixin
 from rtscortex_llm_pysc2.production import (
     PRODUCTION_SPECS_BY_RACE,
-    ProductionSpec,
     production_spec,
 )
 from rtscortex_llm_pysc2.protocol import RuntimeClient
@@ -51,6 +51,15 @@ BUILD_TRANSLATOR_RETRY_FAILURE_CODES = frozenset(
 )
 DEFAULT_OBSERVATION_GAP_WATCHDOG_GAME_LOOPS = 448
 DEFAULT_OBSERVATION_GAP_HARD_LIMIT_GAME_LOOPS = 1792
+
+
+class _SourceActionSpec(Protocol):
+    @property
+    def action_name(self) -> str: ...
+
+    @property
+    def producer_type(self) -> str: ...
+
 
 try:
     _upstream_agents = importlib.import_module("llm_pysc2.agents")
@@ -205,17 +214,14 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
     def get_func(self, obs: Any) -> Any:
         self._rtscortex_camera_settlement_noop = False
         semantic_action = getattr(self, "_rtscortex_semantic_action", None)
-        if (
-            not self.func_list
-            and self.action_list
-            and semantic_action is None
-        ):
+        if not self.func_list and self.action_list and semantic_action is None:
             self._rtscortex_semantic_action = _isolate_next_action(self.action_list)
             semantic_action = self._rtscortex_semantic_action
             self._rtscortex_production_camera_waits = 0
             self._rtscortex_production_camera_wait_loop = None
             self._rtscortex_build_selection_retries = 0
-            if production_spec(str(self.action_list[0].get("name", ""))) is None:
+            next_action_name = str(self.action_list[0].get("name", ""))
+            if production_spec(next_action_name) is None and addon_spec(next_action_name) is None:
                 self._rtscortex_production_source_tag = None
         action: dict[str, Any] = (
             semantic_action
@@ -463,7 +469,7 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
         ordinal = int(attempt.get("ordinal", 0))
         total = int(attempt.get("total", 1))
         final_primitive = not accepted or ordinal + 1 >= total
-        train_spec = production_spec(action_name)
+        source_spec = production_spec(action_name) or addon_spec(action_name)
         producer_tag, provenance_failure = self._validated_production_source_tag(
             action_name,
             attempt,
@@ -477,18 +483,22 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
                 reason=reason,
             )
             return 0, _no_op()
-        if train_spec is not None and final_primitive:
+        if source_spec is not None and final_primitive:
             invalid_reason = _production_source_invalid_reason(
                 obs.observation,
                 producer_tag,
-                train_spec,
+                source_spec,
                 self.unit_names,
             )
             if invalid_reason is not None:
                 self._settle_production_command_failure(
                     action_name,
                     obs,
-                    failure_code="production_source_invalidated",
+                    failure_code=(
+                        "addon_source_invalidated"
+                        if addon_spec(action_name) is not None
+                        else "production_source_invalidated"
+                    ),
                     reason=invalid_reason,
                 )
                 return 0, _no_op()
@@ -676,7 +686,9 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
     def _wait_for_production_camera(self, action_name: str, obs: Any) -> bool:
         """Wait for a post-camera feature observation before selecting a producer."""
 
-        if production_spec(action_name) is None or not self.func_list:
+        if (
+            production_spec(action_name) is None and addon_spec(action_name) is None
+        ) or not self.func_list:
             return False
         next_function_id = int(self.func_list[0][0])
         if next_function_id != 2 or int(self._rtscortex_translation_ordinal) != 1:
@@ -719,8 +731,9 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
     ) -> tuple[Optional[int], Optional[tuple[str, str]]]:
         """Bind production to the exact raw producer selected by the translator."""
 
-        if production_spec(action_name) is None:
+        if production_spec(action_name) is None and addon_spec(action_name) is None:
             return None, None
+        source_kind = "addon" if addon_spec(action_name) is not None else "production"
         source_tag = self._rtscortex_production_source_tag
         ordinal = int(attempt.get("ordinal", 0))
         requested_id = int(attempt.get("requested_function_id", 0))
@@ -736,8 +749,8 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
             )
             if requested_id != 573 or translator_source_tag is None:
                 return None, (
-                    "production_provenance_missing",
-                    "production primitive 573 did not expose one exact translator "
+                    f"{source_kind}_provenance_missing",
+                    f"{source_kind} primitive 573 did not expose one exact translator "
                     f"source tag: function {requested_id}, arguments "
                     f"{requested_arguments!r}",
                 )
@@ -745,8 +758,8 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
             self._rtscortex_production_source_tag = source_tag
         if source_tag is None:
             return None, (
-                "production_provenance_missing",
-                "production provenance missing before translator dispatch",
+                f"{source_kind}_provenance_missing",
+                f"{source_kind} provenance missing before translator dispatch",
             )
         return source_tag, None
 
@@ -756,7 +769,7 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
         obs: Any,
     ) -> bool:
         action_name = str(action.get("name", ""))
-        if not is_production_action(action_name):
+        if not is_source_bound_action(action_name):
             return False
         source_tag = production_source_tag(
             obs.observation,
@@ -765,7 +778,7 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
             action_source_types=self.broker.extractor.action_source_types,
         )
         if source_tag is not None:
-            if production_spec(action_name) is not None:
+            if is_source_bound_action(action_name):
                 self._rtscortex_production_source_tag = source_tag
             return False
         self._settle_production_source_failure(
@@ -786,7 +799,11 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
         self._settle_production_command_failure(
             action_name,
             obs,
-            failure_code="production_source_unavailable",
+            failure_code=(
+                "addon_source_unavailable"
+                if addon_spec(action_name) is not None
+                else "production_source_unavailable"
+            ),
             reason=reason,
         )
 
@@ -1363,6 +1380,16 @@ def _production_action_source_types(agent_race: str = "protoss") -> dict[int, in
         producer = getattr(getattr(units, agent_race.capitalize()), spec.producer_type, None)
         if producer is not None:
             result[spec.feature_function_id] = int(producer)
+    for addon in ADDON_SPECS.values():
+        if addon.race != agent_race:
+            continue
+        producer = getattr(
+            getattr(units, agent_race.capitalize()),
+            addon.producer_type,
+            None,
+        )
+        if producer is not None:
+            result[addon.feature_function_id] = int(producer)
     return result
 
 
@@ -1588,7 +1615,7 @@ def _worker_player_race(agent: Any) -> str:
 
 
 def _requires_terran_production_chain(action_name: str) -> bool:
-    spec = production_spec(action_name)
+    spec = production_spec(action_name) or addon_spec(action_name)
     return spec is not None and spec.race == "terran"
 
 
@@ -1619,8 +1646,7 @@ def _translate_terran_near_build_primitive(agent: Any, obs: Any) -> tuple[int, A
         reason = f"function {getattr(function, 'name', emitted_id)} is not available"
     elif len(requested_arguments) != 2 or not isinstance(requested_arguments[1], int):
         reason = (
-            "Terran Near build expected queue flag and anchor tag, got "
-            f"{requested_arguments!r}"
+            f"Terran Near build expected queue flag and anchor tag, got {requested_arguments!r}"
         )
     else:
         queue = requested_arguments[0]
@@ -1669,7 +1695,7 @@ def _translate_terran_near_build_primitive(agent: Any, obs: Any) -> tuple[int, A
 def _production_source_invalid_reason(
     observation: Any,
     source_tag: Optional[int],
-    spec: ProductionSpec,
+    spec: _SourceActionSpec,
     unit_names: Mapping[int, str],
 ) -> Optional[str]:
     if source_tag is None:
@@ -1715,6 +1741,8 @@ def _production_source_invalid_reason(
         return f"{spec.action_name} producer {hex(source_tag)} is no longer complete"
     if int(value("active", 0)) != 0 or int(value("order_length", 0)) != 0:
         return f"{spec.action_name} producer {hex(source_tag)} became busy before final dispatch"
+    if addon_spec(spec.action_name) is not None and int(value("add_on_tag", 0)) != 0:
+        return f"{spec.action_name} producer {hex(source_tag)} already has an add-on"
     return None
 
 
@@ -2289,7 +2317,7 @@ def _upstream_replaced_production_with_noop(
     translation_result: Mapping[str, Any],
 ) -> bool:
     return (
-        is_production_action(semantic_action_name)
+        is_source_bound_action(semantic_action_name)
         and str(translation_result.get("action_name", "")) == "No_Operation"
         and int(translation_result.get("requested_function_id", -1)) == 0
         and bool(translation_result.get("accepted", False))

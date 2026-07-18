@@ -239,7 +239,7 @@ class PrimitiveTraceEntry(ContractModel):
 
 
 class EffectEvidence(ContractModel):
-    effect_kind: Literal["build", "move", "production"] | None = None
+    effect_kind: Literal["build", "move", "production", "addon"] | None = None
     target_type: str | None = None
     target_position: tuple[float, float] | None = None
     target_tag: str | None = None
@@ -276,7 +276,7 @@ class EffectEvidence(ContractModel):
     resource_delta: dict[str, int] = Field(default_factory=dict)
     order_seen: bool = False
     production_order_seen: bool = False
-    confirmation_kind: Literal["producer_order", "new_unit"] | None = None
+    confirmation_kind: Literal["producer_order", "new_unit", "new_structure"] | None = None
     order_last_seen_game_loop: int | None = Field(default=None, ge=0)
     post_order_grace_game_loops: int | None = Field(default=None, ge=1)
     mineral_delta: int | None = None

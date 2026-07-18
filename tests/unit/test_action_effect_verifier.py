@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from rtscortex_llm_pysc2.addon import ADDON_SPECS, AddonSpec
 from rtscortex_llm_pysc2.effect_verifier import ActionEffectVerifier
 from rtscortex_llm_pysc2.production import PRODUCTION_SPECS, ProductionSpec
 from rtscortex_llm_pysc2.routing import RoutedCommand
@@ -1010,6 +1011,98 @@ def test_pending_production_does_not_block_auto_worker_management() -> None:
     assert verifier.blocks_auto_worker_management is False
 
 
+def test_addon_effect_is_confirmed_by_exact_producer_order() -> None:
+    spec = ADDON_SPECS["Build_BarracksReactor"]
+    verifier = ActionEffectVerifier(timeout_game_loops=10)
+    command = _addon_command(spec)
+    baseline = _addon_observation(spec, game_loop=100)
+    verifier.track(command)
+    verifier.prepare(command.command_id, baseline, None, producer_tag=0xA00)
+    verifier.accept_primitive(command.command_id, game_loop=101)
+
+    verdicts = verifier.observe(
+        _addon_observation(spec, game_loop=102, producer_orders=[spec.raw_order_id])
+    )
+
+    assert [verdict.success for verdict in verdicts] == [True]
+    evidence = verdicts[0].evidence
+    assert evidence is not None
+    assert evidence["effect_kind"] == "addon"
+    assert evidence["producer_tag"] == "0xa00"
+    assert evidence["target_type"] == "BarracksReactor"
+    assert evidence["expected_order_id"] == spec.raw_order_id
+    assert evidence["confirmation_kind"] == "producer_order"
+
+
+def test_addon_effect_ignores_order_on_another_producer() -> None:
+    spec = ADDON_SPECS["Build_BarracksTechLab"]
+    verifier = ActionEffectVerifier(timeout_game_loops=10)
+    command = _addon_command(spec)
+    verifier.track(command)
+    verifier.prepare(
+        command.command_id,
+        _addon_observation(spec, game_loop=100),
+        None,
+        producer_tag=0xA00,
+    )
+    verifier.accept_primitive(command.command_id, game_loop=101)
+
+    current = _addon_observation(
+        spec,
+        game_loop=102,
+        producers=[(0xA00, []), (0xA01, [spec.raw_order_id])],
+    )
+
+    assert verifier.observe(current) == []
+
+
+def test_addon_effect_is_confirmed_by_attached_new_structure() -> None:
+    spec = ADDON_SPECS["Build_StarportTechLab"]
+    verifier = ActionEffectVerifier(timeout_game_loops=10)
+    command = _addon_command(spec)
+    verifier.track(command)
+    verifier.prepare(
+        command.command_id,
+        _addon_observation(spec, game_loop=100),
+        None,
+        producer_tag=0xA00,
+    )
+    verifier.accept_primitive(command.command_id, game_loop=101)
+
+    verdict = verifier.observe(
+        _addon_observation(
+            spec,
+            game_loop=102,
+            producer_addon_tag=0xB00,
+            addon_tag=0xB00,
+        )
+    )[0]
+
+    assert verdict.success is True
+    assert verdict.evidence is not None
+    assert verdict.evidence["observed_structure_tag"] == "0xb00"
+    assert verdict.evidence["confirmation_kind"] == "new_structure"
+
+
+def test_addon_timeout_is_not_misreported_as_success() -> None:
+    spec = ADDON_SPECS["Build_FactoryReactor"]
+    verifier = ActionEffectVerifier(timeout_game_loops=10)
+    command = _addon_command(spec)
+    verifier.track(command)
+    verifier.prepare(
+        command.command_id,
+        _addon_observation(spec, game_loop=100),
+        None,
+        producer_tag=0xA00,
+    )
+    verifier.accept_primitive(command.command_id, game_loop=101)
+
+    verdict = verifier.observe(_addon_observation(spec, game_loop=111))[0]
+
+    assert verdict.success is False
+    assert verdict.failure_code == "no_addon_order_observed"
+
+
 def _production_command(
     spec: ProductionSpec,
     *,
@@ -1025,6 +1118,62 @@ def _production_command(
         resolved_arguments=(),
         rendered_action=f"<{spec.action_name}()>",
     )
+
+
+def _addon_command(spec: AddonSpec) -> RoutedCommand:
+    return RoutedCommand(
+        command_id="command-addon",
+        actor="Developer/Empty",
+        team_name="Empty",
+        name=spec.action_name,
+        source="planner",
+        requested_arguments=(),
+        resolved_arguments=(),
+        rendered_action=f"<{spec.action_name}()>",
+    )
+
+
+def _addon_observation(
+    spec: AddonSpec,
+    *,
+    game_loop: int,
+    producer_orders: list[int] | None = None,
+    producers: list[tuple[int, list[int]]] | None = None,
+    producer_addon_tag: int = 0,
+    addon_tag: int | None = None,
+) -> dict[str, Any]:
+    producer_definitions = producers or [(0xA00, producer_orders or [])]
+    raw_units: list[dict[str, Any]] = [
+        {
+            "tag": tag,
+            "unit_type": spec.producer_type,
+            "alliance": 1,
+            "order_length": len(orders),
+            **{f"order_id_{index}": order for index, order in enumerate(orders)},
+            "add_on_tag": producer_addon_tag if tag == 0xA00 else 0,
+            "build_progress": 100,
+            "x": 20 + index * 10,
+            "y": 20,
+        }
+        for index, (tag, orders) in enumerate(producer_definitions)
+    ]
+    if addon_tag is not None:
+        raw_units.append(
+            {
+                "tag": addon_tag,
+                "unit_type": spec.addon_type,
+                "alliance": 1,
+                "order_length": 0,
+                "build_progress": 10,
+                "x": 23,
+                "y": 18,
+            }
+        )
+    return {
+        "game_loop": game_loop,
+        "player_common": {"minerals": 500, "vespene": 500},
+        "raw_units": raw_units,
+    }
 
 
 def _production_observation(

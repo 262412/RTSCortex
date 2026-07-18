@@ -251,9 +251,7 @@ TERRAN_PROGRESS_ACTION_SPECS: tuple[ProgressActionSpec, ...] = (
         minerals=100,
         vespene=25,
         supply=2,
-        prerequisites=(
-            StatePrerequisite(GoalRequirementKind.STRUCTURE, "BarracksTechLab"),
-        ),
+        prerequisites=(StatePrerequisite(GoalRequirementKind.STRUCTURE, "BarracksTechLab"),),
     ),
     ProgressActionSpec(
         "Train_Hellion",
@@ -287,9 +285,7 @@ TERRAN_PROGRESS_ACTION_SPECS: tuple[ProgressActionSpec, ...] = (
         "Stimpack",
         minerals=100,
         vespene=100,
-        prerequisites=(
-            StatePrerequisite(GoalRequirementKind.STRUCTURE, "BarracksTechLab"),
-        ),
+        prerequisites=(StatePrerequisite(GoalRequirementKind.STRUCTURE, "BarracksTechLab"),),
     ),
 )
 
@@ -370,12 +366,17 @@ TERRAN_PROFILE_DATA = RaceProfileData(
         "Research_Stimpack": ("BarracksTechLab",),
     },
     hima_vocabulary_version="hima-terran-69-v1",
-    effect_verification_kinds=("build", "production", "move"),
-    controller_capabilities=(),
+    effect_verification_kinds=("build", "production", "addon", "move"),
+    controller_capabilities=(
+        "gas_workers",
+        "supply_emergency",
+        "resource_fallback",
+        "prerequisite_closure",
+    ),
     limitations=(
-        "addon_and_morph_effect_verification_pending",
+        "morph_effect_verification_pending",
         "research_effect_verification_pending",
-        "automatic_scv_management_pending",
+        "automatic_scv_training_pending",
     ),
 )
 

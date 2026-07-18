@@ -945,6 +945,70 @@ def test_gas_blocked_stargate_uses_legal_zealot_fallback(tmp_path: Path) -> None
     asyncio.run(exercise())
 
 
+def test_terran_gas_blocked_addon_builds_first_refinery(tmp_path: Path) -> None:
+    base = _config(tmp_path)
+    config = base.model_copy(
+        update={
+            "environment": base.environment.model_copy(update={"agent_race": "terran"})
+        }
+    )
+    runtime = CortexRuntimeEngine(
+        config=config,
+        store=_store(tmp_path),
+        provider=FakeProvider(),
+        macro_client=_FakeMacroClient(
+            "Actions: ['BarracksReactor']",
+            model_id="SNUMPR/Terran-a",
+        ),
+    )
+    observation = ObservationEnvelope(
+        run_id="cortex-run",
+        episode_id="episode-1",
+        step_id=0,
+        game_loop=0,
+        state=SC2State(
+            economy=EconomyState(
+                minerals=200,
+                vespene=0,
+                supply_used=15,
+                supply_cap=23,
+                workers=12,
+            ),
+            own_structures=[
+                UnitState(unit_id="0x1", unit_type="CommandCenter", alliance="self"),
+                UnitState(unit_id="0x2", unit_type="Barracks", alliance="self"),
+            ],
+        ),
+        available_actions=[
+            AvailableAction(
+                name="Build_Refinery_Near",
+                argument_names=["tag"],
+                argument_types=[ActionArgumentType.TAG],
+                actor_scopes=["Builder/SCV-1"],
+                argument_candidates=[["0x99"]],
+            )
+        ],
+    )
+    proposal = HIMAProposalParser(race="terran").parse(
+        "Actions: ['BarracksReactor']"
+    )
+    blocked = PolicyActionAssessment(
+        ordinal=0,
+        source_action="BUILD BARRACKSREACTOR",
+        runtime_action="Build_BarracksReactor",
+        classification=PolicyActionClassification.MAPPED_DEFERRED,
+        reason_code="insufficient_vespene",
+        is_runtime_frontier=True,
+    )
+
+    fallback = runtime._fallback_frontier(proposal, observation, blocked)
+
+    assert fallback is not None
+    assert fallback.source_action == "BUILD REFINERY"
+    assert fallback.runtime_action == "Build_Refinery_Near"
+    assert runtime._fallback_reason(blocked, fallback, observation) == "prerequisite_closure"
+
+
 @pytest.mark.parametrize(
     ("supply_used", "expected_action"),
     [(28, "Build_Pylon_Screen"), (20, "Build_Nexus_Near")],

@@ -339,6 +339,20 @@ def test_effect_evidence_round_trips_production_provenance_without_breaking_lega
         EffectEvidence(confirmation_kind="acceptance_only")  # type: ignore[arg-type]
 
 
+def test_effect_evidence_accepts_terran_addon_confirmation() -> None:
+    evidence = EffectEvidence(
+        effect_kind="addon",
+        target_type="BarracksReactor",
+        producer_tag="0xabc",
+        producer_type="Barracks",
+        expected_order_id=208,
+        new_structure_tag="0xdef",
+        confirmation_kind="new_structure",
+    )
+
+    assert EffectEvidence.model_validate_json(evidence.model_dump_json()) == evidence
+
+
 def test_episode_result_contract_round_trip_and_invalid_samples() -> None:
     result = EpisodeResult(
         run_id="run-1",

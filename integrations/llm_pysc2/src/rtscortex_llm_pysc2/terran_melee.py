@@ -109,6 +109,14 @@ PRODUCTION_ACTIONS = [
     _action("Train_Medivac", [], F.Train_Medivac_quick, "queued"),
     _action("Train_VikingFighter", [], F.Train_VikingFighter_quick, "queued"),
 ]
+ADDON_ACTIONS = [
+    _action("Build_BarracksTechLab", [], F.Build_TechLab_Barracks_quick, "queued"),
+    _action("Build_BarracksReactor", [], F.Build_Reactor_Barracks_quick, "queued"),
+    _action("Build_FactoryTechLab", [], F.Build_TechLab_Factory_quick, "queued"),
+    _action("Build_FactoryReactor", [], F.Build_Reactor_Factory_quick, "queued"),
+    _action("Build_StarportTechLab", [], F.Build_TechLab_Starport_quick, "queued"),
+    _action("Build_StarportReactor", [], F.Build_Reactor_Starport_quick, "queued"),
+]
 
 
 def _llm_settings(config: AgentConfig, *, translator_o: str = "default") -> dict[str, Any]:
@@ -140,7 +148,10 @@ class RTSCortexTerranMeleeConfig(AgentConfig):  # type: ignore[misc]
         self.rtscortex_player_race = "terran"
         self.AGENTS_ALWAYS_DISABLE = []
         self.ENABLE_INIT_STEPS = True
-        self.ENABLE_AUTO_WORKER_MANAGE = False
+        # Upstream's worker workplace tracker is race-neutral (all townhall,
+        # worker, mineral, and gas types). RTSCortex adds exact gas saturation
+        # and reserved-Builder guards around it.
+        self.ENABLE_AUTO_WORKER_MANAGE = True
         self.ENABLE_AUTO_WORKER_TRAINING = False
         self.AGENTS = {
             "Builder": {
@@ -167,7 +178,7 @@ class RTSCortexTerranMeleeConfig(AgentConfig):  # type: ignore[misc]
                         "select_type": "select",
                     }
                 ],
-                "action": {"EmptyGroup": [NO_OPERATION, *PRODUCTION_ACTIONS]},
+                "action": {"EmptyGroup": [NO_OPERATION, *PRODUCTION_ACTIONS, *ADDON_ACTIONS]},
             },
             "CombatGroup0": _combat_agent(self, "Marine-1", units.Terran.Marine),
             "CombatGroup1": _combat_agent(self, "Marauder-1", units.Terran.Marauder),

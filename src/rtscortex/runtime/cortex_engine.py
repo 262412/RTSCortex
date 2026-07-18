@@ -1322,7 +1322,10 @@ class CortexRuntimeEngine(RuntimeEngine):
             return None
         free_supply = self._free_supply(observation)
         supply_action = self._supply_macro_action()
-        gas_action = self._semantic_action_for_target(self._race_profile.data.gas_structure)
+        gas_runtime_action = self._runtime_action_for_target(
+            self._race_profile.data.gas_structure
+        )
+        gas_action = self._semantic_action_for_runtime(gas_runtime_action)
         townhall_action = self._semantic_action_for_target(
             self._race_profile.data.townhall_types[0]
         )
@@ -1338,6 +1341,18 @@ class CortexRuntimeEngine(RuntimeEngine):
             )
             if emergency is not None:
                 return emergency
+        if (
+            blocked_frontier.reason_code == "insufficient_vespene"
+            and not self._has_gas_infrastructure(observation)
+        ):
+            gas_closure = self._legal_synthetic_action(
+                proposal,
+                observation,
+                gas_runtime_action,
+                ordinal=blocked_frontier.ordinal,
+            )
+            if gas_closure is not None:
+                return gas_closure
         prerequisite = self._prerequisite_resolution(blocked_frontier, observation)
         if prerequisite is not None and prerequisite.unique_next_action is not None:
             closure = self._legal_synthetic_action(
@@ -1451,12 +1466,19 @@ class CortexRuntimeEngine(RuntimeEngine):
             raw_token=semantic_action,
         )
         isolated = proposal.model_copy(update={"steps": [step], "diagnostics": []})
-        return runtime_frontier(
+        assessment = runtime_frontier(
             isolated,
             observation,
             self._recent_hima_actions(observation.game_loop),
             self._race_profile.data,
         )
+        if (
+            assessment is None
+            or assessment.classification
+            is not PolicyActionClassification.MAPPED_LEGAL_NOW
+        ):
+            return None
+        return assessment
 
     def _fallback_reason(
         self,
@@ -1472,7 +1494,20 @@ class CortexRuntimeEngine(RuntimeEngine):
             return "supply_emergency"
         if (blocked.reason_code or "").startswith("missing_prerequisite_"):
             return "prerequisite_closure"
+        if (
+            blocked.reason_code == "insufficient_vespene"
+            and fallback.source_action
+            == self._semantic_action_for_target(self._race_profile.data.gas_structure)
+        ):
+            return "prerequisite_closure"
         return "resource_fallback"
+
+    def _has_gas_infrastructure(self, observation: ObservationEnvelope) -> bool:
+        gas_structure = self._race_profile.data.gas_structure.casefold()
+        return any(
+            structure.unit_type.casefold() == gas_structure
+            for structure in observation.state.own_structures
+        )
 
     def _supply_macro_action(self) -> str:
         return self._semantic_action_for_target(self._race_profile.data.supply_provider)
@@ -1492,6 +1527,11 @@ class CortexRuntimeEngine(RuntimeEngine):
         return self._semantic_action_for_runtime(selected.name)
 
     def _semantic_action_for_target(self, effect_target: str) -> str:
+        return self._semantic_action_for_runtime(
+            self._runtime_action_for_target(effect_target)
+        )
+
+    def _runtime_action_for_target(self, effect_target: str) -> str:
         matching = [
             spec.name
             for spec in self._race_profile.data.progress_action_specs
@@ -1501,7 +1541,7 @@ class CortexRuntimeEngine(RuntimeEngine):
             raise RuntimeError(
                 f"{self._race_profile.race.value} profile has no action for {effect_target}"
             )
-        return self._semantic_action_for_runtime(matching[0])
+        return matching[0]
 
     def _semantic_action_for_runtime(self, runtime_action: str) -> str:
         for mapping in self._race_profile.data.macro_action_mappings:

@@ -7,6 +7,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Optional
 
+from rtscortex_llm_pysc2.addon_effect_verifier import AddonEffectVerifier
 from rtscortex_llm_pysc2.effect_types import EffectVerdict
 from rtscortex_llm_pysc2.extractor import BUILD_RAW_FUNCTION_IDS, BUILD_SPECS
 from rtscortex_llm_pysc2.production_effect_verifier import ProductionEffectVerifier
@@ -18,6 +19,7 @@ NEXUS_ACTIVE_BUILD_ORDER_TIMEOUT_MULTIPLIER = 12
 MOVE_RAW_FUNCTION_ID = 13
 MOVE_MINIMAP_DISPLACEMENT_TOLERANCE_WORLD = 1.0
 POST_ORDER_EFFECT_GRACE_GAME_LOOPS = 32
+
 
 @dataclass(frozen=True)
 class _BuilderEvidence:
@@ -95,6 +97,10 @@ class ActionEffectVerifier:
             timeout_game_loops=timeout_game_loops,
             unit_names=self.unit_names,
         )
+        self.addons = AddonEffectVerifier(
+            timeout_game_loops=timeout_game_loops,
+            unit_names=self.unit_names,
+        )
 
     def track(self, command: RoutedCommand) -> bool:
         """Register an effectful command, returning false for immediate actions."""
@@ -102,6 +108,8 @@ class ActionEffectVerifier:
         if self.is_tracked(command.command_id):
             raise ValueError(f"command {command.command_id!r} is already tracked")
         if self.production.track(command):
+            return True
+        if self.addons.track(command):
             return True
         target = _target_structure(command.name)
         if target is None and command.name != "Move_Minimap":
@@ -130,6 +138,7 @@ class ActionEffectVerifier:
             command_id in self._pending
             or command_id in self._pending_moves
             or self.production.is_tracked(command_id)
+            or self.addons.is_tracked(command_id)
         )
 
     @property
@@ -140,6 +149,8 @@ class ActionEffectVerifier:
 
     def resolve_arguments(self, command_id: str, arguments: list[Any]) -> None:
         if self.production.is_tracked(command_id):
+            return
+        if self.addons.is_tracked(command_id):
             return
         pending_move = self._pending_moves.get(command_id)
         if pending_move is not None:
@@ -164,6 +175,9 @@ class ActionEffectVerifier:
         if self.production.is_tracked(command_id):
             self.production.prepare(command_id, observation, producer_tag)
             return
+        if self.addons.is_tracked(command_id):
+            self.addons.prepare(command_id, observation, producer_tag)
+            return
         pending_move = self._pending_moves.get(command_id)
         if pending_move is not None:
             pending_move.builder_tag = None if builder_tag is None else int(builder_tag)
@@ -187,6 +201,9 @@ class ActionEffectVerifier:
         if self.production.is_tracked(command_id):
             self.production.accept_primitive(command_id, game_loop=game_loop)
             return
+        if self.addons.is_tracked(command_id):
+            self.addons.accept_primitive(command_id, game_loop=game_loop)
+            return
         pending_move = self._pending_moves.get(command_id)
         if pending_move is not None:
             if pending_move.dispatched_game_loop is None:
@@ -203,11 +220,13 @@ class ActionEffectVerifier:
         self._pending.pop(command_id, None)
         self._pending_moves.pop(command_id, None)
         self.production.cancel(command_id)
+        self.addons.cancel(command_id)
 
     def observe(self, observation: Any) -> list[EffectVerdict]:
         """Evaluate all accepted effectful commands against one observation."""
 
         verdicts = self.production.observe(observation)
+        verdicts.extend(self.addons.observe(observation))
         verdicts.extend(self._observe_moves(observation))
         accepted = [
             pending
@@ -337,6 +356,7 @@ class ActionEffectVerifier:
         """Mark accepted commands unconfirmed when no later observation can arrive."""
 
         verdicts = self.production.fail_pending(reason)
+        verdicts.extend(self.addons.fail_pending(reason))
         for command_id, pending in list(self._pending.items()):
             if pending.accepted_game_loop is None:
                 continue
@@ -580,11 +600,7 @@ class ActionEffectVerifier:
         distance = _position_distance(target, structure.position)
         if pending.command.name.endswith("_Screen"):
             spec = BUILD_SPECS.get(pending.command.name)
-            tolerance = (
-                2.0
-                if spec is None
-                else max(2.0, spec.footprint / 2.0 + 1.0)
-            )
+            tolerance = 2.0 if spec is None else max(2.0, spec.footprint / 2.0 + 1.0)
         else:
             spec = BUILD_SPECS.get(pending.command.name)
             tolerance = 1.5 if spec is not None and spec.placement_kind == "geyser" else 4.0

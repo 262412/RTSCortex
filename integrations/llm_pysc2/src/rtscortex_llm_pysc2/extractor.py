@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+from rtscortex_llm_pysc2.addon import addon_spec
 from rtscortex_llm_pysc2.production import (
     production_spec,
     production_spec_for_order,
@@ -204,6 +205,12 @@ def is_production_action(action_name: str) -> bool:
     return action_name.startswith(PRODUCTION_ACTION_PREFIXES)
 
 
+def is_source_bound_action(action_name: str) -> bool:
+    """Return whether an action must bind one exact production structure."""
+
+    return is_production_action(action_name) or addon_spec(action_name) is not None
+
+
 def production_source_tag(
     observation: Any,
     action: Mapping[str, Any],
@@ -214,9 +221,9 @@ def production_source_tag(
     """Resolve the completed idle structure that can execute a production action."""
 
     action_name = str(action.get("name", ""))
-    if not is_production_action(action_name):
+    if not is_source_bound_action(action_name):
         return None
-    spec = production_spec(action_name)
+    spec = production_spec(action_name) or addon_spec(action_name)
     cost = (
         None if spec is None else (spec.minerals, spec.vespene, spec.supply)
     ) or RESEARCH_COSTS.get(action_name)
@@ -249,6 +256,7 @@ def production_source_tag(
         and _build_progress(unit) >= 1.0
         and int(_value(unit, "active", 0)) == 0
         and int(_value(unit, "tag", 0)) > 0
+        and (addon_spec(action_name) is None or int(_value(unit, "add_on_tag", 0)) == 0)
     ]
     if not candidates:
         return None
@@ -619,7 +627,7 @@ def _available_team_actions(
             for function_id in function_ids
             if function_id in action_source_types
         }
-        if is_production_action(action_name):
+        if is_source_bound_action(action_name):
             if (
                 production_source_tag(
                     observation,
@@ -718,11 +726,7 @@ def _terran_builder_is_constructing(
 ) -> bool:
     """Keep an SCV on its current structure until the build order is gone."""
 
-    builder_tags = {
-        int(tag)
-        for tag in team.get("unit_tags", ())
-        if int(tag) > 0
-    }
+    builder_tags = {int(tag) for tag in team.get("unit_tags", ()) if int(tag) > 0}
     if not builder_tags:
         return False
     for unit in _value(observation, "raw_units", ()):
@@ -731,8 +735,7 @@ def _terran_builder_is_constructing(
         if _unit_name(unit, unit_names).casefold() != "scv":
             continue
         return any(
-            order_id in TERRAN_BUILD_RAW_FUNCTION_IDS
-            for order_id, _ in _unit_order_entries(unit)
+            order_id in TERRAN_BUILD_RAW_FUNCTION_IDS for order_id, _ in _unit_order_entries(unit)
         )
     return False
 
@@ -1168,11 +1171,7 @@ def _expansion_anchor_candidates(
         if _unit_name(unit, unit_names).casefold() in TOWNHALL_NAMES
         and int(_value(unit, "alliance", 0)) in {1, 2, 4}
     ]
-    own_townhalls = [
-        unit
-        for unit in townhalls
-        if int(_value(unit, "alliance", 0)) == 1
-    ]
+    own_townhalls = [unit for unit in townhalls if int(_value(unit, "alliance", 0)) == 1]
     ranked: list[tuple[float, int]] = []
     for cluster in clusters.values():
         if sum(_is_mineral(_unit_name(unit, unit_names)) for unit in cluster) < 5:
