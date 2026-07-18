@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 from rtscortex_llm_pysc2.effect_types import EffectVerdict
+from rtscortex_llm_pysc2.extractor import BUILD_SPECS
 from rtscortex_llm_pysc2.production_effect_verifier import ProductionEffectVerifier
 from rtscortex_llm_pysc2.routing import RoutedCommand
 
@@ -399,6 +400,7 @@ class ActionEffectVerifier:
             else max(0, current_loop - pending.accepted_game_loop)
         )
         return {
+            "effect_kind": "move",
             "target_type": "Move_Minimap",
             "target_position": pending.target_position,
             "target_tag": None,
@@ -586,7 +588,12 @@ class ActionEffectVerifier:
             return None
         distance = _position_distance(target, structure.position)
         if pending.command.name.endswith("_Screen"):
-            tolerance = 2.0
+            spec = BUILD_SPECS.get(pending.command.name)
+            tolerance = (
+                2.0
+                if spec is None
+                else max(2.0, spec.footprint / 2.0 + 1.0)
+            )
         else:
             tolerance = 1.5 if pending.target_structure == "Assimilator" else 4.0
         return distance if distance <= tolerance else None
@@ -646,6 +653,7 @@ class ActionEffectVerifier:
     ) -> dict[str, Any]:
         baseline = pending.baseline
         return {
+            "effect_kind": "build",
             "target_type": pending.target_structure,
             "target_position": pending.target_position,
             "target_tag": None if pending.target_tag is None else hex(pending.target_tag),

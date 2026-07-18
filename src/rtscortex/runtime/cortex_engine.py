@@ -763,8 +763,6 @@ class CortexRuntimeEngine(RuntimeEngine):
             and observation.game_loop < self._next_macro_retry_game_loop
         ):
             return False
-        if self._macro_inflight_command_id is not None:
-            return False
         if self._urgent_replan_requested or self._macro_plan is None:
             return True
         if self._last_planner_started_game_loop is None:
@@ -842,10 +840,6 @@ class CortexRuntimeEngine(RuntimeEngine):
         task = self._macro_task
         if task is None or not task.done():
             return
-        if self._macro_inflight_command_id is not None:
-            # Keep the completed proposal correlated with its source, but do not let
-            # it replace the plan that still owns an in-flight command.
-            return
         source_observation = self._macro_source_observation
         started_at = self._macro_task_started_at
         source_outcome_revision = self._macro_task_outcome_revision
@@ -917,7 +911,21 @@ class CortexRuntimeEngine(RuntimeEngine):
                 observation,
                 frontier,
             )
-            if not plan.steps or not (_macro_frontier_is_usable(frontier) or fallback is not None):
+            speculative_after_inflight = (
+                self._macro_inflight_command_id is not None
+                and frontier is not None
+                and frontier.classification
+                in {
+                    PolicyActionClassification.MAPPED_FUTURE,
+                    PolicyActionClassification.MAPPED_LEGAL_NOW,
+                    PolicyActionClassification.MAPPED_DEFERRED,
+                }
+            )
+            if not plan.steps or not (
+                _macro_frontier_is_usable(frontier)
+                or fallback is not None
+                or speculative_after_inflight
+            ):
                 classification = (
                     "empty_plan"
                     if not plan.steps
@@ -1076,6 +1084,10 @@ class CortexRuntimeEngine(RuntimeEngine):
                 "acceptance_delay_game_loops": max(
                     0, observation.game_loop - proposal_source_game_loop
                 ),
+                "accepted_while_command_inflight": (
+                    self._macro_inflight_command_id is not None
+                ),
+                "inflight_command_id": self._macro_inflight_command_id,
                 "is_revision": is_revision,
                 "latency_ms": latency_ms,
                 "generation_metadata": (

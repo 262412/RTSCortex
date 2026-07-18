@@ -28,6 +28,7 @@ def test_build_effect_is_confirmed_when_target_structure_appears() -> None:
     assert verdicts[0].success is True
     assert verdicts[0].failure_reason is None
     assert verdicts[0].evidence is not None
+    assert verdicts[0].evidence["effect_kind"] == "build"
     assert verdicts[0].evidence["worker_orders"] == ["35"]
     assert verdicts[0].evidence["resource_delta"] == {"minerals": -75}
     assert verdicts[0].evidence["order_seen"] is True
@@ -75,6 +76,48 @@ def test_build_effect_uses_world_target_after_camera_moves() -> None:
     )
 
     assert [verdict.success for verdict in verdicts] == [True]
+
+
+def test_three_by_three_build_effect_allows_sc2_placement_snap() -> None:
+    verifier = ActionEffectVerifier(timeout_game_loops=112)
+    command = RoutedCommand(
+        command_id="command-core",
+        actor="Builder/Builder-Probe-1",
+        team_name="Builder-Probe-1",
+        name="Build_CyberneticsCore_Screen",
+        source="planner",
+        requested_arguments=([10, 110],),
+        resolved_arguments=([10, 110],),
+        rendered_action="<Build_CyberneticsCore_Screen([10, 110])>",
+    )
+    baseline = _observation(game_loop=2417, minerals=175)
+    baseline["raw_units"][0]["x"] = 48.75
+    baseline["raw_units"][0]["y"] = 65.0
+    baseline["feature_units"][0]["x"] = 20
+    baseline["feature_units"][0]["y"] = 63
+    verifier.track(command)
+    verifier.prepare(command.command_id, baseline, 0xABC)
+    verifier.accept_primitive(command.command_id, game_loop=2418)
+
+    current = _observation(game_loop=2529, minerals=95)
+    current["raw_units"].append(
+        {
+            "tag": 0x1017C0002,
+            "unit_type": "CyberneticsCore",
+            "alliance": 1,
+            "x": 49.0,
+            "y": 74.0,
+            "build_progress": 0.1,
+            "order_length": 0,
+            "orders": [],
+        }
+    )
+
+    verdicts = verifier.observe(current)
+
+    assert [verdict.success for verdict in verdicts] == [True]
+    assert verdicts[0].evidence is not None
+    assert verdicts[0].evidence["observed_structure_tag"] == "0x1017c0002"
 
 
 def test_build_effect_preserves_live_feature_screen_y_direction() -> None:
@@ -481,6 +524,7 @@ def test_move_minimap_uses_builder_motion_instead_of_global_camera_position() ->
     assert verdict.success is True
     assert verdict.status == "succeeded"
     assert verdict.evidence is not None
+    assert verdict.evidence["effect_kind"] == "move"
     assert verdict.evidence["target_type"] == "Move_Minimap"
     assert verdict.evidence["target_position"] == (48.0, 48.0)
     assert verdict.evidence["builder_tag"] == "0xabc"

@@ -234,7 +234,7 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
                             action_name, set()
                         )
                         target_key = _build_world_target_key(provenance.world_target)
-                        resolved = _resolve_build_action_position(
+                        resolved = _resolve_translator_compatible_build_position(
                             action,
                             obs.observation,
                             world_target=provenance.world_target,
@@ -244,6 +244,7 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
                                 target_key
                                 in self._rtscortex_rejected_build_targets.get(action_name, set())
                             ),
+                            screen_size=int(self.size_screen),
                         )
                     else:
                         resolved = _resolve_screen_point_action_position(
@@ -341,6 +342,73 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
             )
             if build_reselection is not None:
                 return build_reselection
+        if _next_primitive_is_screen_build(semantic_action_name, self.func_list):
+            command_id = self.broker.command_id_for(
+                self.name,
+                _execution_team_name(self),
+                semantic_action_name,
+            )
+            provenance = (
+                None if command_id is None else self.broker.screen_route_provenance(command_id)
+            )
+            if provenance is not None:
+                action["func"] = list(self.func_list)
+                rejected_positions = self._rtscortex_rejected_build_positions.get(
+                    semantic_action_name,
+                    set(),
+                )
+                target_key = _build_world_target_key(provenance.world_target)
+                resolved = _resolve_translator_compatible_build_position(
+                    action,
+                    obs.observation,
+                    world_target=provenance.world_target,
+                    preferred_anchor_tag=provenance.anchor_tag,
+                    excluded_positions=rejected_positions,
+                    force_resample=(
+                        target_key
+                        in self._rtscortex_rejected_build_targets.get(
+                            semantic_action_name,
+                            set(),
+                        )
+                    ),
+                    screen_size=int(self.size_screen),
+                )
+                if resolved is None:
+                    requested = _screen_argument(action)
+                    if requested is not None:
+                        self._rtscortex_rejected_build_positions.setdefault(
+                            semantic_action_name,
+                            set(),
+                        ).add(_screen_position_key(requested))
+                    self._rtscortex_rejected_build_targets.setdefault(
+                        semantic_action_name,
+                        set(),
+                    ).add(target_key)
+                    dispatch = self.broker.reject_command(
+                        self.name,
+                        _execution_team_name(self),
+                        semantic_action_name,
+                        failure_code="no_legal_placement",
+                    )
+                    if dispatch is None:
+                        self.broker.raise_unattributed_integrity(
+                            f"no command owns {semantic_action_name!r}"
+                        )
+                    self.broker.settle_primitive(
+                        dispatch,
+                        success=False,
+                        failure_reason=(
+                            "no legal placement remained after camera or builder selection"
+                        ),
+                        game_loop=_observation_game_loop(obs.observation),
+                    )
+                    self.func_list.clear()
+                    self._rtscortex_semantic_action = None
+                    self._rtscortex_build_selection_retries = 0
+                    return 0, _no_op()
+                self.func_list = list(action["func"])
+                assert command_id is not None
+                self.broker.resolve_arguments(command_id, [resolved])
         # Upstream consumes and mutates the semantic action while translating it.
         # Keep the already validated request for the final candidate-domain audit.
         candidate_action = copy.deepcopy(action)
@@ -1604,6 +1672,90 @@ def _resolve_build_action_position(
     return _replace_screen_action_position(action, position)
 
 
+def _resolve_translator_compatible_build_position(
+    action: dict[str, Any],
+    observation: Any,
+    *,
+    world_target: tuple[float, float],
+    preferred_anchor_tag: Optional[int],
+    excluded_positions: set[tuple[int, int]],
+    force_resample: bool,
+    screen_size: int,
+) -> Optional[list[int]]:
+    """Resample until the pinned translator accepts the same screen position."""
+
+    action_name = str(action.get("name", ""))
+    excluded = set(excluded_positions)
+    attempts = len(build_screen_candidates(observation, action_name)) + 1
+    for _ in range(attempts):
+        position = _resolve_build_action_position(
+            action,
+            observation,
+            world_target=world_target,
+            preferred_anchor_tag=preferred_anchor_tag,
+            excluded_positions=excluded,
+            force_resample=force_resample,
+        )
+        if position is None:
+            excluded_positions.update(excluded)
+            return None
+        if _translator_screen_build_is_legal(
+            observation,
+            position,
+            screen_size,
+            action_name,
+        ):
+            excluded_positions.update(excluded)
+            return position
+        excluded.add(_screen_position_key(position))
+        force_resample = True
+    excluded_positions.update(excluded)
+    return None
+
+
+def _translator_screen_build_is_legal(
+    observation: Any,
+    position: list[int],
+    screen_size: int,
+    action_name: str,
+) -> bool:
+    """Mirror the pinned upstream sampled-grid build argument contract."""
+
+    spec = BUILD_SPECS.get(action_name)
+    feature_screen = _observation_value(observation, "feature_screen", None)
+    buildable = _observation_value(feature_screen, "buildable", None)
+    pathable = _observation_value(feature_screen, "pathable", None)
+    player_relative = _observation_value(feature_screen, "player_relative", None)
+    power = _observation_value(feature_screen, "power", None)
+    if (
+        spec is None
+        or spec.placement_kind != "screen"
+        or screen_size <= 0
+        or buildable is None
+        or pathable is None
+        or player_relative is None
+    ):
+        return False
+    ratio = int(screen_size / 24)
+    x0 = int(min(max(0, position[0]), screen_size))
+    y0 = int(min(max(0, position[1]), screen_size))
+    if spec.requires_power and (power is None or power[y0][x0] == 0):
+        return False
+    first_x = int(x0 - ratio * (spec.footprint - 1) / 2)
+    first_y = int(y0 - ratio * (spec.footprint - 1) / 2)
+    for x_index in range(spec.footprint):
+        for y_index in range(spec.footprint):
+            x = int(first_x + x_index * ratio)
+            y = int(first_y + y_index * ratio)
+            if not (0 < x < screen_size and 0 < y < screen_size):
+                return False
+            if buildable[y][x] != 1 or pathable[y][x] != 1:
+                return False
+            if player_relative[y][x] not in (0, 1):
+                return False
+    return True
+
+
 def _build_world_target_key(world_target: tuple[float, float]) -> tuple[float, float]:
     return (round(world_target[0], 3), round(world_target[1], 3))
 
@@ -1652,6 +1804,19 @@ def _replace_screen_action_position(
         refreshed_functions.append((function_id, function, refreshed_arguments))
     action["func"] = refreshed_functions
     return position
+
+
+def _next_primitive_is_screen_build(
+    action_name: str,
+    functions: list[Any],
+) -> bool:
+    spec = BUILD_SPECS.get(action_name)
+    if spec is None or spec.placement_kind != "screen" or not functions:
+        return False
+    function = functions[0]
+    if not isinstance(function, (list, tuple)) or len(function) != 3:
+        return False
+    return str(getattr(function[1], "name", "")).startswith("Build_")
 
 
 def _isolate_next_action(action_list: list[dict[str, Any]]) -> dict[str, Any]:

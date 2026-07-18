@@ -1315,7 +1315,7 @@ def test_duplicate_terminal_report_advances_repeated_step_once(tmp_path: Path) -
     recovered.close()
 
 
-def test_refresh_started_before_old_plan_outcome_is_revalidated(
+def test_completed_refresh_is_accepted_while_old_plan_command_is_inflight(
     tmp_path: Path,
 ) -> None:
     client = _FakeMacroClient(["Actions: ['Pylon', 'Pylon']", "Actions: ['Gateway']"])
@@ -1355,12 +1355,14 @@ def test_refresh_started_before_old_plan_outcome_is_revalidated(
 
         old_plan_batch = await runtime.tick(_macro_observation(step_id=2, game_loop=112))
         assert len(old_plan_batch.commands) == 1
-        for _ in range(5):
-            await asyncio.sleep(0)
+        assert runtime._macro_task is not None
+        await runtime._macro_task
         await runtime.tick(_macro_observation(step_id=3, game_loop=113))
         assert runtime._macro_plan is not None
-        assert runtime._macro_plan.plan_id == first_plan_id
-        assert len(store.events_of_type("cortex-run", "episode-1", "macro_plan_accepted")) == 1
+        assert runtime._macro_plan.plan_id != first_plan_id
+        replacement_plan_id = runtime._macro_plan.plan_id
+        assert runtime._macro_inflight_command_id == old_plan_batch.commands[0].command_id
+        assert len(store.events_of_type("cortex-run", "episode-1", "macro_plan_accepted")) == 2
 
         runtime.record_execution(successful_report(old_plan_batch))
         current = _macro_observation(step_id=4, game_loop=114, pylon=True)
@@ -1375,15 +1377,26 @@ def test_refresh_started_before_old_plan_outcome_is_revalidated(
         )
         await runtime.tick(current)
         assert runtime._macro_plan is not None
-        assert runtime._macro_plan.plan_id != first_plan_id
+        assert runtime._macro_plan.plan_id == replacement_plan_id
         assert len(store.events_of_type("cortex-run", "episode-1", "macro_plan_accepted")) == 2
         revalidated = store.events_of_type("cortex-run", "episode-1", "macro_proposal_revalidated")
-        assert len(revalidated) == 1
-        assert revalidated[0].payload["source_outcome_revision"] == 1
-        assert revalidated[0].payload["current_outcome_revision"] == 2
+        assert revalidated == []
         await runtime.close()
 
     asyncio.run(exercise())
+
+
+def test_fixed_macro_start_cadence_is_not_blocked_by_inflight_effect(tmp_path: Path) -> None:
+    runtime = CortexRuntimeEngine(
+        config=_config(tmp_path),
+        store=_store(tmp_path),
+        provider=FakeProvider(),
+        macro_client=_FakeMacroClient(),
+    )
+    runtime._last_planner_started_game_loop = 0
+    runtime._macro_inflight_command_id = "old-plan-command"
+
+    assert runtime._should_start_macro(_macro_observation(step_id=2, game_loop=112)) is True
 
 
 def test_restart_does_not_apply_old_plan_execution_to_latest_plan(tmp_path: Path) -> None:

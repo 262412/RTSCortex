@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+import rtscortex_llm_pysc2.worker as worker_module
 from rtscortex_llm_pysc2.broker import PrimitiveDispatch
 from rtscortex_llm_pysc2.extractor import (
     build_screen_candidates,
@@ -313,12 +314,127 @@ def test_agent_reprojects_before_current_candidate_domain_check(
     agent._rtscortex_rejected_build_positions = {}
     agent._rtscortex_rejected_build_targets = {}
     agent._rtscortex_active_build_route = None
+    agent.size_screen = 128
 
     result = agent.get_func(SimpleNamespace(observation=observation))
 
     assert result == (35, "translated")
     assert translated_positions == [[64, 64]]
     assert broker.resolutions == [[[64, 64]], [[64, 64]]]
+    assert agent._rtscortex_translation_attempt is not None
+
+
+def test_agent_reprojects_screen_build_again_after_selection_chain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    buildable = [[0 for _ in range(128)] for _ in range(128)]
+    pathable = [[0 for _ in range(128)] for _ in range(128)]
+    for y in range(54, 75):
+        for x in range(54, 75):
+            buildable[y][x] = 1
+            pathable[y][x] = 1
+    observation = _observation(
+        anchor_screen=(32, 32),
+        buildable=buildable,
+        pathable=pathable,
+    )
+    observation.game_loop = [500]
+    observation.available_actions = [57]
+    action: dict[str, Any] = {
+        "name": "Build_Gateway_Screen",
+        "arg": [[60, 85]],
+        "func": [],
+    }
+    pending_function = SimpleNamespace(name="Build_Gateway_screen")
+    upstream_validation_calls: list[list[int]] = []
+
+    def validate_like_pinned_translator(
+        _obs: Any,
+        position: list[int],
+        _screen_size: int,
+        _action_name: str,
+    ) -> bool:
+        upstream_validation_calls.append(list(position))
+        return position != [64, 64]
+
+    monkeypatch.setattr(
+        worker_module,
+        "_translator_screen_build_is_legal",
+        validate_like_pinned_translator,
+    )
+
+    class Broker:
+        unattributed_primitives = 0
+
+        def __init__(self) -> None:
+            self.resolutions: list[list[Any]] = []
+
+        def command_id_for(self, *_args: Any) -> str:
+            return "gateway-command"
+
+        def screen_route_provenance(self, _command_id: str) -> SimpleNamespace:
+            return SimpleNamespace(world_target=(106.0, 56.0), anchor_tag=1)
+
+        def resolve_arguments(self, _command_id: str, arguments: list[Any]) -> None:
+            self.resolutions.append(arguments)
+
+        def claim_primitive(self, *_args: Any, **_kwargs: Any) -> PrimitiveDispatch:
+            return PrimitiveDispatch(
+                "gateway-command",
+                "Build_Gateway_screen",
+                True,
+                ordinal=3,
+                total=4,
+                requested_function_id=57,
+                emitted_function_id=57,
+            )
+
+    translated_positions: list[list[int]] = []
+
+    def upstream_get_func(agent: Any, _obs: Any) -> tuple[int, str]:
+        function_id, _function, arguments = agent.func_list.pop(0)
+        resolved = next(value for value in arguments if isinstance(value, list))
+        translated_positions.append(list(resolved))
+        agent.last_translation_result = {
+            "action_name": "Build_Gateway_Screen",
+            "requested_function_id": function_id,
+            "requested_function_name": "Build_Gateway_screen",
+            "emitted_function_id": function_id,
+            "accepted": True,
+            "ordinal": 3,
+            "total": 4,
+            "resolved_arguments": [resolved],
+        }
+        return function_id, "translated"
+
+    monkeypatch.setattr(RuntimeQueryMixin, "get_func", upstream_get_func, raising=False)
+    broker = Broker()
+    agent = object.__new__(RTSCortexLLMAgent)
+    agent.name = "Builder"
+    agent.team_unit_team_curr = "Builder-Probe-1"
+    agent.team_unit_tag_curr = 1
+    agent.team_unit_tag_list = [1]
+    agent.flag_enable_empty_unit_group = False
+    agent.func_list = [(57, pending_function, ("now", [60, 85]))]
+    agent.action_list = []
+    agent.unit_names = {}
+    agent.curr_action_name = "Build_Gateway_Screen"
+    agent.broker = cast(Any, broker)
+    agent._rtscortex_semantic_action = action
+    agent._rtscortex_translation_attempt = None
+    agent._rtscortex_rejected_build_positions = {}
+    agent._rtscortex_rejected_build_targets = {}
+    agent._rtscortex_active_build_route = None
+    agent._rtscortex_camera_settlement_noop = False
+    agent._rtscortex_build_selection_retries = 0
+    agent.size_screen = 128
+
+    result = agent.get_func(SimpleNamespace(observation=observation))
+
+    assert result == (57, "translated")
+    assert upstream_validation_calls == [[64, 64], [65, 65]]
+    assert translated_positions == [[65, 65]]
+    assert broker.resolutions == [[[65, 65]], [[65, 65]]]
     assert agent._rtscortex_translation_attempt is not None
 
 
