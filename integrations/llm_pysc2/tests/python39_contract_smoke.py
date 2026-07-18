@@ -18,7 +18,7 @@ from llm_pysc2.agents.main_agent_funcs import (
 from llm_pysc2.lib import llm_action
 from pysc2.env import run_loop
 from pysc2.lib import actions, features
-from rtscortex_llm_pysc2.effect_verifier import _BUILD_RAW_FUNCTION_IDS
+from rtscortex_llm_pysc2.extractor import BUILD_RAW_FUNCTION_IDS
 from rtscortex_llm_pysc2.observation import _map_argument_candidates
 from rtscortex_llm_pysc2.production import PRODUCTION_SPECS
 from rtscortex_llm_pysc2.terran_melee import RTSCortexTerranMeleeConfig
@@ -150,7 +150,7 @@ def _assert_build_order_ids_use_raw_function_domain() -> None:
         "Starport": 329,
         "SupplyDepot": 319,
     }
-    assert _BUILD_RAW_FUNCTION_IDS == {
+    assert BUILD_RAW_FUNCTION_IDS == {
         structure: int(actions.RAW_ABILITY_ID_TO_FUNC_ID[ability_id])
         for structure, ability_id in ability_ids.items()
     }

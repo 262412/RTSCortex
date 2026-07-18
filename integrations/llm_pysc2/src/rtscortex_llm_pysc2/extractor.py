@@ -137,6 +137,45 @@ BUILD_SPECS = {
     ),
 }
 
+# PySC2's ``FeatureUnit.order_id_*`` fields expose the pinned RAW action IDs
+# for active construction orders.  Keep this table next to BuildSpec so both
+# observation-time availability and effect verification use one contract.
+BUILD_RAW_FUNCTION_IDS = {
+    "Assimilator": 36,
+    "CyberneticsCore": 47,
+    "Forge": 38,
+    "Gateway": 37,
+    "Nexus": 34,
+    "Pylon": 35,
+    "ShieldBattery": 48,
+    "Stargate": 42,
+    "Barracks": 185,
+    "Bunker": 186,
+    "CommandCenter": 187,
+    "EngineeringBay": 191,
+    "Factory": 194,
+    "MissileTurret": 202,
+    "Refinery": 214,
+    "Starport": 221,
+    "SupplyDepot": 222,
+}
+TERRAN_BUILD_RAW_FUNCTION_IDS = frozenset(
+    BUILD_RAW_FUNCTION_IDS[spec.target_structure]
+    for spec in BUILD_SPECS.values()
+    if spec.target_structure
+    in {
+        "Barracks",
+        "Bunker",
+        "CommandCenter",
+        "EngineeringBay",
+        "Factory",
+        "MissileTurret",
+        "Refinery",
+        "Starport",
+        "SupplyDepot",
+    }
+)
+
 SCREEN_POINT_ACTIONS = frozenset({"Move_Screen", "Ability_Blink_Screen"})
 MINIMAP_POINT_ACTIONS = frozenset({"Move_Minimap"})
 SELECT_BLINK_ACTION = "Select_Unit_Blink_Screen"
@@ -549,8 +588,15 @@ def _available_team_actions(
     completed_builder_structures = (
         _completed_own_structures(observation, unit_names) if agent.name == "Builder" else set()
     )
+    terran_builder_committed = agent.name == "Builder" and _terran_builder_is_constructing(
+        observation,
+        team,
+        unit_names,
+    )
     for action in candidates:
         action_name = str(action["name"])
+        if terran_builder_committed and action_name.startswith("Build_"):
+            continue
         if agent.name == "Builder" and _builder_movement_is_locked(
             action_name,
             completed_builder_structures,
@@ -663,6 +709,32 @@ def _completed_own_structures(observation: Any, unit_names: Mapping[int, str]) -
         for unit in _value(observation, "raw_units", ())
         if int(_value(unit, "alliance", 0)) == 1 and _build_progress(unit) >= 1.0
     }
+
+
+def _terran_builder_is_constructing(
+    observation: Any,
+    team: Mapping[str, Any],
+    unit_names: Mapping[int, str],
+) -> bool:
+    """Keep an SCV on its current structure until the build order is gone."""
+
+    builder_tags = {
+        int(tag)
+        for tag in team.get("unit_tags", ())
+        if int(tag) > 0
+    }
+    if not builder_tags:
+        return False
+    for unit in _value(observation, "raw_units", ()):
+        if int(_value(unit, "tag", 0)) not in builder_tags:
+            continue
+        if _unit_name(unit, unit_names).casefold() != "scv":
+            continue
+        return any(
+            order_id in TERRAN_BUILD_RAW_FUNCTION_IDS
+            for order_id, _ in _unit_order_entries(unit)
+        )
+    return False
 
 
 def _builder_movement_is_locked(action_name: str, completed_structures: set[str]) -> bool:

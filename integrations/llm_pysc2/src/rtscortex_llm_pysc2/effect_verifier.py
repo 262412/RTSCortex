@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 from rtscortex_llm_pysc2.effect_types import EffectVerdict
-from rtscortex_llm_pysc2.extractor import BUILD_SPECS
+from rtscortex_llm_pysc2.extractor import BUILD_RAW_FUNCTION_IDS, BUILD_SPECS
 from rtscortex_llm_pysc2.production_effect_verifier import ProductionEffectVerifier
 from rtscortex_llm_pysc2.routing import RoutedCommand
 
@@ -18,29 +18,6 @@ NEXUS_ACTIVE_BUILD_ORDER_TIMEOUT_MULTIPLIER = 12
 MOVE_RAW_FUNCTION_ID = 13
 MOVE_MINIMAP_DISPLACEMENT_TOLERANCE_WORLD = 1.0
 POST_ORDER_EFFECT_GRACE_GAME_LOOPS = 32
-
-# PySC2's ``FeatureUnit.order_id_*`` fields contain RAW function IDs, not
-# SC2 ability IDs. These values are pinned by the vendored PySC2 revision.
-_BUILD_RAW_FUNCTION_IDS = {
-    "Assimilator": 36,
-    "CyberneticsCore": 47,
-    "Forge": 38,
-    "Gateway": 37,
-    "Nexus": 34,
-    "Pylon": 35,
-    "ShieldBattery": 48,
-    "Stargate": 42,
-    "Barracks": 185,
-    "Bunker": 186,
-    "CommandCenter": 187,
-    "EngineeringBay": 191,
-    "Factory": 194,
-    "MissileTurret": 202,
-    "Refinery": 214,
-    "Starport": 221,
-    "SupplyDepot": 222,
-}
-
 
 @dataclass(frozen=True)
 class _BuilderEvidence:
@@ -243,7 +220,7 @@ class ActionEffectVerifier:
         for pending in accepted:
             current = current_by_command[pending.command.command_id]
             pending.latest = current
-            expected_order = _BUILD_RAW_FUNCTION_IDS.get(pending.target_structure)
+            expected_order = BUILD_RAW_FUNCTION_IDS.get(pending.target_structure)
             if (
                 expected_order is not None
                 and current.builder is not None
@@ -273,7 +250,7 @@ class ActionEffectVerifier:
             elapsed = current.game_loop - pending.accepted_game_loop
             if elapsed < self.timeout_game_loops:
                 continue
-            expected_order = _BUILD_RAW_FUNCTION_IDS.get(pending.target_structure)
+            expected_order = BUILD_RAW_FUNCTION_IDS.get(pending.target_structure)
             order_is_active = (
                 expected_order is not None
                 and current.builder is not None
@@ -635,7 +612,7 @@ class ActionEffectVerifier:
             return "builder_not_observable"
         if not pending.order_seen:
             return "no_build_order_observed"
-        expected_order = _BUILD_RAW_FUNCTION_IDS.get(pending.target_structure)
+        expected_order = BUILD_RAW_FUNCTION_IDS.get(pending.target_structure)
         if current.builder.orders and expected_order not in current.builder.orders:
             return "worker_order_replaced"
         return "target_not_created"
@@ -880,7 +857,7 @@ def _diagnosis(
     if current.builder is None:
         return "selected builder disappeared before construction became visible"
 
-    expected_order = _BUILD_RAW_FUNCTION_IDS.get(target_structure)
+    expected_order = BUILD_RAW_FUNCTION_IDS.get(target_structure)
     if expected_order is not None and expected_order in current.builder.orders:
         return "expected build order remains active but the target structure is not visible"
     if order_seen and current.builder.orders:

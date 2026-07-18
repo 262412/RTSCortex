@@ -1075,6 +1075,103 @@ def test_timestep_extractor_keeps_build_when_primitive_is_temporarily_unavailabl
     }
 
 
+def test_timestep_extractor_defers_terran_builds_while_reserved_scv_is_constructing() -> None:
+    timestep = _fake_timestep()
+    scv = timestep.observation.raw_units[0]
+    scv.unit_type = 45
+    scv.order_length = 1
+    scv.order_id_0 = 222
+    supply_depot = _unit(0xDEAD, 19, 1, 50, 50, 400, 255)
+    supply_depot.build_progress = 100
+    timestep.observation.raw_units.append(supply_depot)
+    timestep.observation.feature_screen = SimpleNamespace(
+        buildable=UniformGrid(1),
+        pathable=UniformGrid(1),
+        player_relative=UniformGrid(0),
+        power=UniformGrid(0),
+    )
+    agent = FakeAgent("Builder", "Builder-SCV-1", timestep, StubBroker())
+    team = agent.config.AGENTS["Builder"]["team"][0]
+    team["unit_type"] = [45]
+    team["unit_tags"] = [scv.tag]
+    agent.config.AGENTS["Builder"]["action"] = {
+        45: [
+            {"name": "No_Operation", "arg": [], "func": [(0, None, ())]},
+            {
+                "name": "Build_SupplyDepot_Screen",
+                "arg": ["screen"],
+                "func": [(91, None, ())],
+            },
+            {
+                "name": "Build_Barracks_Screen",
+                "arg": ["screen"],
+                "func": [(42, None, ())],
+            },
+        ]
+    }
+    extractor = TimeStepExtractor(
+        "run-worker",
+        "episode-worker",
+        unit_names={45: "SCV", 19: "SupplyDepot"},
+        action_source_types={42: 45, 91: 45},
+    )
+
+    busy = extractor.extract(
+        timestep,
+        {"Builder": agent},
+        {"Builder": "building supply"},
+        step_id=1,
+    )
+    scv.order_length = 0
+    idle = extractor.extract(
+        timestep,
+        {"Builder": agent},
+        {"Builder": "ready"},
+        step_id=2,
+    )
+
+    assert [action["name"] for action in busy["teams"][0]["available_actions"]] == [
+        "No_Operation"
+    ]
+    assert {
+        action["name"] for action in idle["teams"][0]["available_actions"]
+    } == {"No_Operation", "Build_SupplyDepot_Screen", "Build_Barracks_Screen"}
+
+
+def test_timestep_extractor_does_not_apply_scv_construction_lock_to_probe() -> None:
+    timestep = _fake_timestep()
+    probe = timestep.observation.raw_units[0]
+    probe.order_length = 1
+    probe.order_id_0 = 35
+    timestep.observation.feature_screen = SimpleNamespace(
+        buildable=UniformGrid(1),
+        pathable=UniformGrid(1),
+        player_relative=UniformGrid(0),
+        power=UniformGrid(0),
+    )
+    agent = FakeAgent("Builder", "Builder-Probe-1", timestep, StubBroker())
+    agent.config.AGENTS["Builder"]["team"][0]["unit_tags"] = [probe.tag]
+    agent.config.AGENTS["Builder"]["action"][311].append(
+        {"name": "Build_Pylon_Screen", "arg": ["screen"], "func": [(70, None, ())]}
+    )
+
+    snapshot = TimeStepExtractor(
+        "run-worker",
+        "episode-worker",
+        unit_names={311: "Probe"},
+        action_source_types={70: 311},
+    ).extract(
+        timestep,
+        {"Builder": agent},
+        {"Builder": "probe may leave the pylon"},
+        step_id=1,
+    )
+
+    assert "Build_Pylon_Screen" in {
+        action["name"] for action in snapshot["teams"][0]["available_actions"]
+    }
+
+
 def test_timestep_extractor_enumerates_stable_pathable_move_and_blink_candidates() -> None:
     timestep = _fake_timestep()
     timestep.observation.feature_screen = SimpleNamespace(pathable=UniformGrid(1))
