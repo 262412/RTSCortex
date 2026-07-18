@@ -566,12 +566,14 @@ def test_observation_gap_watchdog_latches_lightweight_observations_after_recover
     assert broker.triggers == 1
 
     broker.last_decision_game_loop = 120
-    assert agent._update_observation_gap_watchdog(121) is False
+    assert agent._update_observation_gap_watchdog(121) is True
     assert agent._rtscortex_force_runtime_decision is True
+    assert agent._observation_watchdog_active is False
+    assert agent._observation_watchdog_preempted is True
     assert broker.triggers == 1
 
     broker.last_decision_game_loop = 130
-    assert agent._update_observation_gap_watchdog(131) is False
+    assert agent._update_observation_gap_watchdog(131) is True
     assert broker.triggers == 1
 
 

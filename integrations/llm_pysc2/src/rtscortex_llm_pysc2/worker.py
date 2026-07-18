@@ -1120,7 +1120,12 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
                 "observation_gap_watchdog_timeout: no Runtime decision for "
                 f"{gap} game loops (last decision loop {last_decision_loop})"
             )
-        return self._observation_watchdog_active
+        # Once the watchdog has observed starvation, keep optional upstream
+        # automation disabled for the rest of the episode.  A recovered
+        # Runtime decision only clears the hard-limit recovery window; letting
+        # worker management resume here can consume every subsequent SC2 step
+        # and starve the next Runtime decision again.
+        return self._observation_watchdog_preempted
 
     def _report_episode(self, obs: Any) -> None:
         reward = float(getattr(obs, "reward", 0.0) or 0.0)
