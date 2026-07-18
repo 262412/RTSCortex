@@ -42,6 +42,7 @@ from rtscortex_llm_pysc2.worker import (
     _refresh_build_action_position,
     _release_runtime_observation_barrier,
     _replace_screen_action_position,
+    _requires_terran_production_chain,
     _resolve_build_action_position,
     _run_with_auto_worker_management_guard,
     _scenario_config,
@@ -1184,6 +1185,39 @@ def test_worker_player_race_prefers_explicit_bridge_race_over_upstream_compatibi
     assert "player_race=self.worker_settings.agent_race" in inspect.getsource(
         RTSCortexMainAgent.__init__
     )
+    source = inspect.getsource(RTSCortexLLMAgent.get_func)
+    assert "_requires_terran_production_chain(action_name)" in source
+    assert _requires_terran_production_chain("Train_Marine") is True
+    assert _requires_terran_production_chain("Train_Zealot") is False
+
+
+def test_terran_production_chain_bypasses_upstream_source_lookup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    action = {
+        "name": "Train_Marine",
+        "arg": [],
+        "func": [(477, object(), ("queued",))],
+    }
+    agent = cast(Any, object.__new__(RTSCortexLLMAgent))
+    agent._rtscortex_production_source_tag = 0xABC
+    agent.action_list = [action.copy()]
+    agent.func_list = []
+    functions = SimpleNamespace(
+        llm_pysc2_move_camera=object(),
+        select_point=object(),
+    )
+    monkeypatch.setattr(
+        "rtscortex_llm_pysc2.worker.importlib.import_module",
+        lambda _name: SimpleNamespace(FUNCTIONS=functions),
+    )
+
+    agent._prime_terran_production_chain(action)
+
+    assert [int(item[0]) for item in agent.func_list] == [573, 2, 477]
+    assert agent.action_list == []
+    assert agent.curr_action_name == "Train_Marine"
+    assert agent._rtscortex_translation_total == 3
 
 
 def test_timestep_extractor_enumerates_stable_pathable_move_and_blink_candidates() -> None:

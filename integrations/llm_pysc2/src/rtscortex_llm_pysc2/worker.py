@@ -359,10 +359,7 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
             )
             if build_reselection is not None:
                 return build_reselection
-            if (
-                production_spec(action_name) is not None
-                and _worker_player_race(self) == "terran"
-            ):
+            if _requires_terran_production_chain(action_name):
                 self._prime_terran_production_chain(action)
         if _next_primitive_is_screen_build(semantic_action_name, self.func_list):
             command_id = self.broker.command_id_for(
@@ -1589,10 +1586,14 @@ def _worker_player_race(agent: Any) -> str:
     ).casefold()
 
 
+def _requires_terran_production_chain(action_name: str) -> bool:
+    spec = production_spec(action_name)
+    return spec is not None and spec.race == "terran"
+
+
 def _is_terran_near_build_final_primitive(agent: Any, action_name: str) -> bool:
     if (
-        _worker_player_race(agent) != "terran"
-        or action_name not in {"Build_Refinery_Near", "Build_CommandCenter_Near"}
+        action_name not in {"Build_Refinery_Near", "Build_CommandCenter_Near"}
         or not agent.func_list
     ):
         return False
