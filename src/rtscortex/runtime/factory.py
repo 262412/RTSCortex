@@ -207,6 +207,7 @@ def _build_hima_ensemble(
         clients,
         race=cast(Literal["protoss", "terran", "zerg"], race),
         execution_groups=tuple(tuple(group) for group in clusters_by_device.values()),
+        schedule_mode=macro.ensemble_schedule,
     )
     return ensemble_client, HIMAEnsembleSidecar(sidecars, ensemble_client)
 

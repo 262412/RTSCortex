@@ -81,6 +81,7 @@ from rtscortex.cortex.models import (
     ThreatLevel,
 )
 from rtscortex.cortex.race_brain import (
+    EnsembleSchedule,
     HIMAEnsemblePolicyClient,
     HIMAEnsembleSidecar,
     MacroPolicyHealth,
@@ -141,6 +142,7 @@ __all__ = [
     "DefenseAgent",
     "EconomyStatus",
     "EconomyAgent",
+    "EnsembleSchedule",
     "ExecutableCandidate",
     "ExecutorCandidateSample",
     "ExecutorCorpusArtifact",

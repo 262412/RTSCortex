@@ -12,7 +12,7 @@ environment:
   opponent_build: macro
   step_mul: 1
   game_steps_per_episode: 5200
-  simulation_speed_multiplier: 0.09375
+  simulation_speed_multiplier: 0.125
   pause_until_first_plan: true
   sc2_path: ~/scratch/StarCraftII
   action_effect_timeout_game_loops: 112
@@ -48,6 +48,7 @@ cortex:
         model_path: ~/fastscratch/cache/huggingface/hub/models--SNUMPR--Protoss-c/snapshots/09ae752994bcd458d3b91f5b97dcdacd626edccb
         device: cuda:1
     coordinator: deterministic_v1
+    ensemble_schedule: staggered
     allow_unlicensed_weights: true
     required: true
     interval_game_loops: 112

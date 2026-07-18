@@ -19,6 +19,7 @@ from rtscortex.races import race_profile
 
 RACE_BRAIN_COORDINATOR_VERSION = "deterministic-race-brain-v1"
 HIMACluster = Literal["a", "b", "c"]
+EnsembleSchedule = Literal["barrier", "staggered"]
 _HIMA_CLUSTERS: tuple[HIMACluster, ...] = ("a", "b", "c")
 
 
@@ -35,6 +36,7 @@ class RaceBrainHealth(ContractModel):
     race: Literal["protoss", "terran", "zerg"]
     coordinator_version: str = RACE_BRAIN_COORDINATOR_VERSION
     execution_groups: tuple[tuple[HIMACluster, ...], ...] = ((_HIMA_CLUSTERS),)
+    schedule_mode: EnsembleSchedule = "barrier"
     members: tuple[RaceBrainMemberHealth, ...] = Field(min_length=3, max_length=3)
 
 
@@ -47,6 +49,7 @@ class RaceBrainMemberProposal(ContractModel):
     member_id: str = Field(min_length=1)
     cluster: HIMACluster
     response: HIMALiveProposalResponse
+    source_age_game_loops: int = Field(default=0, ge=0)
     frontier: PolicyActionAssessment | None = None
     score: float
     score_reasons: tuple[str, ...]
@@ -62,6 +65,9 @@ class RaceBrainProposalResponse(ContractModel):
     race: Literal["protoss", "terran", "zerg"]
     coordinator_version: str = RACE_BRAIN_COORDINATOR_VERSION
     execution_groups: tuple[tuple[HIMACluster, ...], ...] = ((_HIMA_CLUSTERS),)
+    schedule_mode: EnsembleSchedule = "barrier"
+    refreshed_member_ids: tuple[str, ...] = ()
+    max_member_age_game_loops: int = Field(default=0, ge=0)
     selected_member_id: str = Field(min_length=1)
     selected: HIMALiveProposalResponse
     members: tuple[RaceBrainMemberProposal, ...] = Field(min_length=3, max_length=3)
@@ -105,6 +111,7 @@ class HIMAEnsemblePolicyClient:
         *,
         race: Literal["protoss", "terran", "zerg"],
         execution_groups: Sequence[Sequence[HIMACluster]] | None = None,
+        schedule_mode: EnsembleSchedule = "barrier",
     ) -> None:
         if tuple(sorted(clients)) != ("a", "b", "c"):
             raise ValueError("race brain requires exactly the a/b/c specialist clients")
@@ -116,6 +123,10 @@ class HIMAEnsemblePolicyClient:
         if tuple(sorted(flattened)) != _HIMA_CLUSTERS or len(flattened) != 3:
             raise ValueError("execution groups must contain each a/b/c specialist once")
         self.execution_groups = normalized
+        self.schedule_mode = schedule_mode
+        self._proposal_cache: dict[HIMACluster, HIMALiveProposalResponse] = {}
+        self._cache_scope: tuple[str, str] | None = None
+        self._staggered_refresh_index = 0
 
     async def health(self) -> RaceBrainHealth:
         members: list[RaceBrainMemberHealth] = []
@@ -143,6 +154,7 @@ class HIMAEnsemblePolicyClient:
             model_revision=revision,
             race=self.race,
             execution_groups=self.execution_groups,
+            schedule_mode=self.schedule_mode,
             members=tuple(members),
         )
 
@@ -163,24 +175,25 @@ class HIMAEnsemblePolicyClient:
             ).hexdigest()
         )
 
-        async def propose_group(
-            group: Sequence[HIMACluster],
-        ) -> list[tuple[HIMACluster, HIMALiveProposalResponse]]:
-            group_responses: list[tuple[HIMACluster, HIMALiveProposalResponse]] = []
-            for cluster in group:
-                response = await self._clients[cluster].propose(
-                    context,
-                    request_id=f"{outer_request_id}:{cluster}",
-                )
-                group_responses.append((cluster, response))
-            return group_responses
-
-        grouped_responses = await asyncio.gather(
-            *(propose_group(group) for group in self.execution_groups)
-        )
-        response_by_cluster = {
-            cluster: response for group in grouped_responses for cluster, response in group
-        }
+        scope = (context.observation.run_id, context.observation.episode_id)
+        if scope != self._cache_scope:
+            self._proposal_cache.clear()
+            self._cache_scope = scope
+            self._staggered_refresh_index = 0
+        refreshed_clusters: tuple[HIMACluster, ...]
+        if self.schedule_mode == "barrier" or len(self._proposal_cache) != 3:
+            response_by_cluster = await self._propose_all(context, outer_request_id)
+            self._proposal_cache = dict(response_by_cluster)
+            refreshed_clusters = _HIMA_CLUSTERS
+        else:
+            cluster = _HIMA_CLUSTERS[self._staggered_refresh_index % len(_HIMA_CLUSTERS)]
+            self._staggered_refresh_index += 1
+            self._proposal_cache[cluster] = await self._clients[cluster].propose(
+                context,
+                request_id=f"{outer_request_id}:{cluster}",
+            )
+            response_by_cluster = dict(self._proposal_cache)
+            refreshed_clusters = (cluster,)
         responses = [(cluster, response_by_cluster[cluster]) for cluster in _HIMA_CLUSTERS]
         members = _coordinate(responses, context, strategic_context, self.race)
         selected = max(members, key=lambda item: item.score)
@@ -200,6 +213,13 @@ class HIMAEnsemblePolicyClient:
             game_loop=context.observation.game_loop,
             race=self.race,
             execution_groups=self.execution_groups,
+            schedule_mode=self.schedule_mode,
+            refreshed_member_ids=tuple(
+                f"hima-{self.race}-{cluster}" for cluster in refreshed_clusters
+            ),
+            max_member_age_game_loops=max(
+                member.source_age_game_loops for member in members
+            ),
             selected_member_id=selected.member_id,
             selected=selected.response,
             members=tuple(members),
@@ -211,6 +231,30 @@ class HIMAEnsemblePolicyClient:
                 + ", ".join(selected.score_reasons)
             ),
         )
+
+    async def _propose_all(
+        self,
+        context: HIMAInputContext,
+        outer_request_id: str,
+    ) -> dict[HIMACluster, HIMALiveProposalResponse]:
+        async def propose_group(
+            group: Sequence[HIMACluster],
+        ) -> list[tuple[HIMACluster, HIMALiveProposalResponse]]:
+            group_responses: list[tuple[HIMACluster, HIMALiveProposalResponse]] = []
+            for cluster in group:
+                response = await self._clients[cluster].propose(
+                    context,
+                    request_id=f"{outer_request_id}:{cluster}",
+                )
+                group_responses.append((cluster, response))
+            return group_responses
+
+        grouped_responses = await asyncio.gather(
+            *(propose_group(group) for group in self.execution_groups)
+        )
+        return {
+            cluster: response for group in grouped_responses for cluster, response in group
+        }
 
     async def close(self) -> None:
         await asyncio.gather(
@@ -290,6 +334,10 @@ def _coordinate(
                 member_id=f"hima-{race}-{cluster}",
                 cluster=cluster,
                 response=response,
+                source_age_game_loops=max(
+                    0,
+                    context.observation.game_loop - response.game_loop,
+                ),
                 frontier=frontier,
                 score=score,
                 score_reasons=tuple(reasons),

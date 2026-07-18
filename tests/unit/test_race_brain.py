@@ -217,3 +217,44 @@ def test_race_brain_runs_device_groups_in_parallel_and_members_in_order() -> Non
     assert events.index("start:a") < events.index("end:b")
     assert events.index("start:b") < events.index("end:a")
     assert events.index("end:b") < events.index("start:c")
+
+
+def test_race_brain_staggered_schedule_refreshes_one_current_member_per_cycle() -> None:
+    clients = {
+        cluster: _Client(cluster, "Actions: ['Pylon']") for cluster in ("a", "b", "c")
+    }
+    client = HIMAEnsemblePolicyClient(
+        clients,
+        race="protoss",
+        execution_groups=(("a",), ("b", "c")),
+        schedule_mode="staggered",
+    )
+
+    initial_observation = _observation()
+    initial = asyncio.run(
+        client.propose(HIMAInputContext(observation=initial_observation))
+    )
+    second_observation = initial_observation.model_copy(
+        update={"step_id": 1, "game_loop": 112}
+    )
+    second = asyncio.run(
+        client.propose(HIMAInputContext(observation=second_observation))
+    )
+    third_observation = initial_observation.model_copy(
+        update={"step_id": 2, "game_loop": 224}
+    )
+    third = asyncio.run(
+        client.propose(HIMAInputContext(observation=third_observation))
+    )
+
+    assert initial.refreshed_member_ids == (
+        "hima-protoss-a",
+        "hima-protoss-b",
+        "hima-protoss-c",
+    )
+    assert initial.max_member_age_game_loops == 0
+    assert second.refreshed_member_ids == ("hima-protoss-a",)
+    assert [member.source_age_game_loops for member in second.members] == [0, 112, 112]
+    assert third.refreshed_member_ids == ("hima-protoss-b",)
+    assert [member.source_age_game_loops for member in third.members] == [112, 0, 224]
+    assert [clients[cluster].calls for cluster in ("a", "b", "c")] == [2, 2, 1]

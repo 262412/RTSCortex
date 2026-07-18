@@ -132,6 +132,7 @@ class CortexMacroSettings(SettingsModel):
     restart_limit: int = Field(default=1, ge=0)
     ensemble_members: list[CortexHIMAEnsembleMemberSettings] = Field(default_factory=list)
     coordinator: Literal["deterministic_v1"] = "deterministic_v1"
+    ensemble_schedule: Literal["barrier", "staggered"] = "barrier"
 
     @model_validator(mode="after")
     def require_hima_model_path(self) -> CortexMacroSettings:
