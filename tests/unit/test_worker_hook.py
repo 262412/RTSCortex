@@ -3583,19 +3583,36 @@ def test_broker_requires_a_contiguous_translator_sequence() -> None:
     assert len(runtime.execution_reports) == 1
 
 
-def test_broker_treats_nexus_camera_settlement_noop_as_non_final() -> None:
+@pytest.mark.parametrize(
+    ("action_name", "function_name", "function_id", "command_id"),
+    [
+        ("Build_Nexus_Near", "Build_Nexus_screen", 65, "command-nexus"),
+        (
+            "Build_Assimilator_Near",
+            "Build_Assimilator_screen",
+            40,
+            "command-assimilator",
+        ),
+    ],
+)
+def test_broker_treats_near_build_camera_settlement_noop_as_non_final(
+    action_name: str,
+    function_name: str,
+    function_id: int,
+    command_id: str,
+) -> None:
     broker = SharedDecisionBroker(
         BridgeCoordinator(FakeRuntime()),
         TimeStepExtractor("run-worker", "episode-worker"),
     )
-    broker._command_queues[("Builder", "Builder-Probe-1", "Build_Nexus_Near")].append(  # noqa: SLF001
-        "command-nexus"
+    broker._command_queues[("Builder", "Builder-Probe-1", action_name)].append(  # noqa: SLF001
+        command_id
     )
 
     camera = broker.claim_primitive(
         "Builder",
         "Builder-Probe-1",
-        "Build_Nexus_Near",
+        action_name,
         "llm_pysc2_move_camera",
         final_primitive=False,
         ordinal=0,
@@ -3606,7 +3623,7 @@ def test_broker_treats_nexus_camera_settlement_noop_as_non_final() -> None:
     settlement = broker.claim_primitive(
         "Builder",
         "Builder-Probe-1",
-        "Build_Nexus_Near",
+        action_name,
         "no_op",
         final_primitive=False,
         ordinal=1,
@@ -3617,19 +3634,19 @@ def test_broker_treats_nexus_camera_settlement_noop_as_non_final() -> None:
     final = broker.claim_primitive(
         "Builder",
         "Builder-Probe-1",
-        "Build_Nexus_Near",
-        "Build_Nexus_screen",
+        action_name,
+        function_name,
         final_primitive=True,
         ordinal=2,
         total=3,
-        requested_function_id=65,
-        emitted_function_id=65,
+        requested_function_id=function_id,
+        emitted_function_id=function_id,
     )
 
     assert camera is not None and camera.final_primitive is False
     assert settlement is not None and settlement.final_primitive is False
     assert final is not None and final.final_primitive is True
-    assert {camera.command_id, settlement.command_id, final.command_id} == {"command-nexus"}
+    assert {camera.command_id, settlement.command_id, final.command_id} == {command_id}
 
 
 def test_broker_attributes_pretranslator_orchestration_without_claiming_command() -> None:

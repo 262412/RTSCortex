@@ -31,9 +31,21 @@ def melee_config_type(monkeypatch: pytest.MonkeyPatch) -> Iterator[tuple[type[An
                             {"name": "Attack_Unit", "arg": ["tag"], "func": []},
                             {"name": "Build_Pylon_Screen", "arg": ["screen"], "func": []},
                             {"name": "Build_Forge_Screen", "arg": ["screen"], "func": []},
-                            {"name": "Build_Assimilator_Near", "arg": ["tag"], "func": []},
+                            {
+                                "name": "Build_Assimilator_Near",
+                                "arg": ["tag"],
+                                "func": [(40, "build-assimilator", ("queued", "screen_tag"))],
+                            },
                             {"name": "Build_Assimilator_Screen", "arg": ["screen"], "func": []},
-                            {"name": "Build_Nexus_Near", "arg": ["tag"], "func": []},
+                            {
+                                "name": "Build_Nexus_Near",
+                                "arg": ["tag"],
+                                "func": [
+                                    (573, "move-camera", ("world_tag",)),
+                                    (0, "settlement-noop", ()),
+                                    (65, "build-nexus", ("queued", "screen_tag")),
+                                ],
+                            },
                             {"name": "Build_Nexus_Screen", "arg": ["screen"], "func": []},
                             {"name": "Build_Stargate_Screen", "arg": ["screen"], "func": []},
                             {
@@ -208,6 +220,21 @@ def test_melee_config_enables_gas_management_with_reserved_builder(
     assert config.ENABLE_INIT_STEPS is True
     assert config.ENABLE_AUTO_WORKER_MANAGE is True
     assert config.ENABLE_AUTO_WORKER_TRAINING is True
+
+
+def test_melee_config_moves_camera_before_assimilator_screen_translation(
+    melee_config_type: tuple[type[Any], list[Any]],
+) -> None:
+    config_type, _ = melee_config_type
+    config = config_type()
+    builder_actions = config.AGENTS["Builder"]["action"]["Probe"]
+    assimilator = next(
+        action for action in builder_actions if action["name"] == "Build_Assimilator_Near"
+    )
+
+    assert [function_id for function_id, _, _ in assimilator["func"]] == [573, 0, 40]
+    assert assimilator["func"][0][2] == ("world_tag",)
+    assert assimilator["func"][2][2] == ("queued", "screen_tag")
     assert config.AGENTS_ALWAYS_DISABLE == []
 
 
