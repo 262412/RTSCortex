@@ -579,6 +579,7 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
                 self.broker.raise_unattributed_integrity(
                     f"translator primitive for {action_name!r} has no unique active command"
                 )
+            self._rtscortex_semantic_action = None
             return result
         if accepted:
             candidate_failure = _candidate_dispatch_failure(

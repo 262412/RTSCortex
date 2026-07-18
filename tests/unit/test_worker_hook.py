@@ -1220,6 +1220,16 @@ def test_terran_production_chain_bypasses_upstream_source_lookup(
     assert agent._rtscortex_translation_total == 3
 
 
+def test_untracked_transport_noop_clears_semantic_cache_before_next_action() -> None:
+    source = inspect.getsource(RTSCortexLLMAgent.get_func)
+    marker = 'f"translator primitive for {action_name!r} has no unique active command"'
+    untracked_branch = source[source.rindex("if dispatch is None:", 0, source.index(marker)) :]
+
+    assert untracked_branch.index("self._rtscortex_semantic_action = None") < (
+        untracked_branch.index("return result")
+    )
+
+
 def test_timestep_extractor_enumerates_stable_pathable_move_and_blink_candidates() -> None:
     timestep = _fake_timestep()
     timestep.observation.feature_screen = SimpleNamespace(pathable=UniformGrid(1))
