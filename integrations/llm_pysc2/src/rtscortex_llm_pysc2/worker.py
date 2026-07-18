@@ -209,6 +209,7 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
             if semantic_action is not None
             else {"name": getattr(self, "curr_action_name", "")}
         )
+        provenance = None
         semantic_action_name = str(action.get("name", ""))
         if self._wait_for_production_camera(semantic_action_name, obs):
             self._rtscortex_camera_settlement_noop = True

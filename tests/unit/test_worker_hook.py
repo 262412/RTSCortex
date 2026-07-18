@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import inspect
 import json
 import threading
 import time
@@ -974,6 +975,12 @@ def test_build_position_resampling_excludes_previously_failed_candidate() -> Non
     assert resolved != requested
     assert resolved in candidates
     assert action["arg"] == [resolved]
+
+
+def test_build_translation_retry_initializes_optional_screen_provenance() -> None:
+    source = inspect.getsource(RTSCortexLLMAgent.get_func)
+
+    assert source.index("provenance = None") < source.index("semantic_action_name =")
 
 
 def test_timestep_extractor_maps_sc2_attack_alerts() -> None:
