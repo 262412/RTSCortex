@@ -609,6 +609,100 @@ def test_missing_prerequisite_plan_is_rejected_without_hot_loop(
     asyncio.run(exercise())
 
 
+def test_missing_technology_prerequisite_is_closed_by_technology_agent(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    runtime = CortexRuntimeEngine(
+        config=_config(tmp_path),
+        store=store,
+        provider=FakeProvider(),
+        macro_client=_FakeMacroClient("Actions: ['Stargate']"),
+    )
+    initial = ObservationEnvelope(
+        run_id="cortex-run",
+        episode_id="episode-1",
+        step_id=0,
+        game_loop=0,
+        state=SC2State(
+            economy=EconomyState(
+                minerals=200,
+                vespene=200,
+                supply_used=12,
+                supply_cap=23,
+                workers=12,
+            ),
+            own_structures=[
+                UnitState(unit_id="0x1", unit_type="Pylon", alliance="self"),
+                UnitState(
+                    unit_id="0x2",
+                    unit_type="Gateway",
+                    alliance="self",
+                    status="constructing",
+                ),
+            ],
+        ),
+        available_actions=[],
+    )
+    gateway_complete = initial.model_copy(
+        update={
+            "step_id": 2,
+            "game_loop": 2,
+            "state": initial.state.model_copy(
+                update={
+                    "own_structures": [
+                        UnitState(unit_id="0x1", unit_type="Pylon", alliance="self"),
+                        UnitState(unit_id="0x2", unit_type="Gateway", alliance="self"),
+                    ]
+                }
+            ),
+            "available_actions": [
+                AvailableAction(
+                    name="Build_CyberneticsCore_Screen",
+                    argument_names=["screen"],
+                    argument_types=[ActionArgumentType.POSITION],
+                    actor_scopes=["Builder/Probe-1"],
+                    argument_candidates=[[[70, 90]]],
+                )
+            ],
+        }
+    )
+
+    async def exercise() -> None:
+        await runtime.start()
+        await runtime.tick(initial)
+        for _ in range(5):
+            await asyncio.sleep(0)
+        waiting = await runtime.tick(
+            initial.model_copy(update={"step_id": 1, "game_loop": 1})
+        )
+        assert waiting.commands == []
+        assert runtime._macro_plan is not None
+        assert runtime._macro_plan_frozen is False
+        assert not store.events_of_type("cortex-run", "episode-1", "macro_plan_rejected")
+
+        batch = await runtime.tick(gateway_complete)
+
+        assert [command.name for command in batch.commands] == [
+            "Build_CyberneticsCore_Screen"
+        ]
+        assert runtime._macro_plan.steps[0].semantic_action == "BUILD STARGATE"
+        assert runtime._macro_plan.steps[0].status.value == "deferred"
+        preemptions = store.events_of_type(
+            "cortex-run", "episode-1", "macro_frontier_preempted"
+        )
+        assert preemptions[-1].payload["reason"] == "prerequisite_closure"
+        role_events = store.events_of_type(
+            "cortex-run", "episode-1", "role_intent_emitted"
+        )
+        assert role_events[-1].payload["intent"]["role"] == "technology"
+        lineage = store.events_of_type("cortex-run", "episode-1", "command_lineage")
+        assert lineage[-1].payload["macro_step_ordinal"] is None
+        await runtime.close()
+
+    asyncio.run(exercise())
+
+
 def test_resource_deferred_frontier_satisfies_required_startup_barrier(
     tmp_path: Path,
 ) -> None:

@@ -8,7 +8,7 @@ import hashlib
 import json
 import time
 from dataclasses import asdict, dataclass
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from pydantic import BaseModel
 
@@ -80,11 +80,17 @@ from rtscortex.policy.hima import (
     HIMALiveProposalResponse,
 )
 from rtscortex.policy.models import (
+    MacroActionStep,
     MacroPolicyProposal,
     PolicyActionAssessment,
     PolicyActionClassification,
 )
-from rtscortex.progress import GoalProgressReport, GoalProgressVerifier, GoalSpec
+from rtscortex.progress import (
+    GoalBlockerKind,
+    GoalProgressReport,
+    GoalProgressVerifier,
+    GoalSpec,
+)
 from rtscortex.races import RaceProfile, race_profile
 from rtscortex.reflex import ReflexEngine
 from rtscortex.runtime.engine import (
@@ -222,7 +228,7 @@ class CortexRuntimeEngine(RuntimeEngine):
         self._macro_goal: GoalSpec | None = None
         self._macro_plan_frozen = False
         self._macro_inflight_command_id: str | None = None
-        self._macro_command_steps: dict[str, tuple[str, str, int]] = {}
+        self._macro_command_steps: dict[str, tuple[str, str, int | None]] = {}
         self._command_lineages: dict[str, CommandLineage] = {}
         self._previous_hima_actions: list[tuple[int, str]] = []
         if config.cortex.situation.kind == "model_active" and situation_provider is None:
@@ -456,17 +462,17 @@ class CortexRuntimeEngine(RuntimeEngine):
                     raise RuntimeError("macro command lineage is missing its plan ID")
                 self._macro_inflight_command_id = command.command_id
                 assert prepared_command.semantic_action is not None
-                assert prepared_command.macro_step_ordinal is not None
                 self._macro_command_steps[command.command_id] = (
                     plan_id,
                     prepared_command.semantic_action,
                     prepared_command.macro_step_ordinal,
                 )
-                self._set_macro_step_status(
-                    prepared_command.macro_step_ordinal,
-                    MacroStepStatus.DISPATCHED,
-                    None,
-                )
+                if prepared_command.macro_step_ordinal is not None:
+                    self._set_macro_step_status(
+                        prepared_command.macro_step_ordinal,
+                        MacroStepStatus.DISPATCHED,
+                        None,
+                    )
 
         idle_reason = None if accepted_commands else self._cortex_idle_reason()
         batch = ActionBatch(
@@ -645,15 +651,11 @@ class CortexRuntimeEngine(RuntimeEngine):
             self._command_lineages[lineage.command_id] = lineage
             ordinal = payload.get("macro_step_ordinal")
             semantic = payload.get("semantic_action")
-            if (
-                lineage.macro_plan_id is not None
-                and isinstance(ordinal, int)
-                and isinstance(semantic, str)
-            ):
+            if lineage.macro_plan_id is not None and isinstance(semantic, str):
                 self._macro_command_steps[lineage.command_id] = (
                     lineage.macro_plan_id,
                     semantic,
-                    ordinal,
+                    ordinal if isinstance(ordinal, int) else None,
                 )
 
         recovered_macro_outcomes: list[tuple[str, bool]] = []
@@ -681,7 +683,11 @@ class CortexRuntimeEngine(RuntimeEngine):
         if self._macro_plan is not None:
             for command_id, succeeded in recovered_macro_outcomes:
                 metadata = self._macro_command_steps.get(command_id)
-                if metadata is not None and metadata[0] == self._macro_plan.plan_id:
+                if (
+                    metadata is not None
+                    and metadata[0] == self._macro_plan.plan_id
+                    and metadata[2] is not None
+                ):
                     self._advance_macro_step(
                         metadata[2],
                         succeeded=succeeded,
@@ -707,6 +713,7 @@ class CortexRuntimeEngine(RuntimeEngine):
                 metadata is not None
                 and self._macro_plan is not None
                 and metadata[0] == self._macro_plan.plan_id
+                and metadata[2] is not None
             ):
                 self._set_macro_step_status(
                     metadata[2],
@@ -925,6 +932,7 @@ class CortexRuntimeEngine(RuntimeEngine):
             if not plan.steps or not (
                 _macro_frontier_is_usable(frontier)
                 or fallback is not None
+                or self._prerequisite_resolution_is_active(frontier, observation)
                 or speculative_after_inflight
             ):
                 classification = (
@@ -1165,13 +1173,7 @@ class CortexRuntimeEngine(RuntimeEngine):
                 MacroStepStatus.DEFERRED,
                 blocked_frontier.reason_code,
             )
-            reason = (
-                "supply_emergency"
-                if fallback.source_action == self._supply_macro_action()
-                and self._free_supply(observation)
-                <= self.config.cortex.executor.supply_emergency_free_supply
-                else "resource_fallback"
-            )
+            reason = self._fallback_reason(blocked_frontier, fallback, observation)
             self._record_cortex_event(
                 observation,
                 "macro_frontier_preempted",
@@ -1188,6 +1190,13 @@ class CortexRuntimeEngine(RuntimeEngine):
             frontier = fallback
         if frontier.classification is PolicyActionClassification.MAPPED_DEFERRED:
             if _deferred_frontier_requires_replan(frontier):
+                if self._prerequisite_resolution(frontier, observation) is not None:
+                    self._set_macro_step_status(
+                        frontier.ordinal,
+                        MacroStepStatus.DEFERRED,
+                        frontier.reason_code,
+                    )
+                    return None
                 self._set_macro_step_status(
                     frontier.ordinal,
                     MacroStepStatus.BLOCKED,
@@ -1258,14 +1267,24 @@ class CortexRuntimeEngine(RuntimeEngine):
             or frontier.runtime_action is None
         ):
             return None
-        step = self._macro_step(frontier.ordinal)
-        if step is None:
+        advances_plan_step = any(
+            step.ordinal == frontier.ordinal
+            and step.canonical_action == frontier.source_action
+            for step in remaining_proposal.steps
+        )
+        step = self._macro_step(frontier.ordinal) if advances_plan_step else None
+        if advances_plan_step and step is None:
             raise RuntimeError("macro frontier has no matching typed plan step")
+        step_identity = (
+            f"{frontier.ordinal}:{step.completed_repeats}"
+            if step is not None
+            else f"prerequisite:{frontier.source_action}"
+        )
         intent = MacroIntent(
             intent_id=self._intent_id(
                 observation,
                 CortexRole.MACRO,
-                f"{self._macro_plan.plan_id}:{frontier.ordinal}:{step.completed_repeats}",
+                f"{self._macro_plan.plan_id}:{step_identity}",
             ),
             run_id=observation.run_id,
             episode_id=observation.episode_id,
@@ -1285,7 +1304,7 @@ class CortexRuntimeEngine(RuntimeEngine):
             intent,
             goal_progress=goal_progress,
             semantic_action=frontier.source_action,
-            macro_step_ordinal=frontier.ordinal,
+            macro_step_ordinal=(frontier.ordinal if advances_plan_step else None),
         )
 
     def _fallback_frontier(
@@ -1319,6 +1338,16 @@ class CortexRuntimeEngine(RuntimeEngine):
             )
             if emergency is not None:
                 return emergency
+        prerequisite = self._prerequisite_resolution(blocked_frontier, observation)
+        if prerequisite is not None and prerequisite.unique_next_action is not None:
+            closure = self._legal_synthetic_action(
+                proposal,
+                observation,
+                prerequisite.unique_next_action,
+                ordinal=blocked_frontier.ordinal,
+            )
+            if closure is not None:
+                return closure
         townhall_count = sum(
             structure.unit_type in self._race_profile.data.townhall_types
             for structure in observation.state.own_structures
@@ -1353,6 +1382,97 @@ class CortexRuntimeEngine(RuntimeEngine):
             if fallback is not None:
                 return fallback
         return None
+
+    def _prerequisite_resolution(
+        self,
+        frontier: PolicyActionAssessment | None,
+        observation: ObservationEnvelope,
+    ) -> GoalProgressReport | None:
+        if (
+            frontier is None
+            or frontier.runtime_action is None
+            or not (frontier.reason_code or "").startswith("missing_prerequisite_")
+        ):
+            return None
+        try:
+            goal = self.goal_progress_verifier.goal_from_action_names(
+                strategic_goal=f"Resolve prerequisites for {frontier.runtime_action}",
+                action_names=[frontier.runtime_action],
+                observation=observation,
+                goal_id=f"prerequisite:{frontier.runtime_action}",
+            )
+        except ValueError:
+            return None
+        report = self.goal_progress_verifier.verify(observation, goal)
+        prerequisite_blockers = {
+            GoalBlockerKind.MISSING_PREREQUISITE,
+            GoalBlockerKind.PREREQUISITE_IN_PROGRESS,
+        }
+        if not any(blocker.kind in prerequisite_blockers for blocker in report.blockers):
+            return None
+        return report
+
+    def _prerequisite_resolution_is_active(
+        self,
+        frontier: PolicyActionAssessment | None,
+        observation: ObservationEnvelope,
+    ) -> bool:
+        report = self._prerequisite_resolution(frontier, observation)
+        if report is None:
+            return False
+        return report.unique_next_action is not None or any(
+            blocker.kind is GoalBlockerKind.PREREQUISITE_IN_PROGRESS
+            for blocker in report.blockers
+        )
+
+    def _legal_synthetic_action(
+        self,
+        proposal: MacroPolicyProposal,
+        observation: ObservationEnvelope,
+        runtime_action: str,
+        *,
+        ordinal: int,
+    ) -> PolicyActionAssessment | None:
+        semantic_action = self._semantic_action_for_runtime(runtime_action)
+        prefix = runtime_action.partition("_")[0]
+        category: Literal["build", "train", "research"]
+        if prefix == "Build":
+            category = "build"
+        elif prefix == "Train":
+            category = "train"
+        elif prefix == "Research":
+            category = "research"
+        else:
+            return None
+        step = MacroActionStep(
+            ordinal=ordinal,
+            canonical_action=semantic_action,
+            category=category,
+            raw_token=semantic_action,
+        )
+        isolated = proposal.model_copy(update={"steps": [step], "diagnostics": []})
+        return runtime_frontier(
+            isolated,
+            observation,
+            self._recent_hima_actions(observation.game_loop),
+            self._race_profile.data,
+        )
+
+    def _fallback_reason(
+        self,
+        blocked: PolicyActionAssessment,
+        fallback: PolicyActionAssessment,
+        observation: ObservationEnvelope,
+    ) -> str:
+        if (
+            fallback.source_action == self._supply_macro_action()
+            and self._free_supply(observation)
+            <= self.config.cortex.executor.supply_emergency_free_supply
+        ):
+            return "supply_emergency"
+        if (blocked.reason_code or "").startswith("missing_prerequisite_"):
+            return "prerequisite_closure"
+        return "resource_fallback"
 
     def _supply_macro_action(self) -> str:
         return self._semantic_action_for_target(self._race_profile.data.supply_provider)
@@ -1824,7 +1944,11 @@ class CortexRuntimeEngine(RuntimeEngine):
         if self._macro_inflight_command_id == report.command_id:
             self._macro_inflight_command_id = None
         succeeded = report.status is ExecutionStatus.SUCCEEDED
-        if self._macro_plan is not None and metadata[0] == self._macro_plan.plan_id:
+        if (
+            self._macro_plan is not None
+            and metadata[0] == self._macro_plan.plan_id
+            and metadata[2] is not None
+        ):
             self._advance_macro_step(
                 metadata[2],
                 succeeded=succeeded,

@@ -461,9 +461,14 @@ def _extract_team_actions(
 
 
 def current_team_order(agent: Any) -> tuple[str, ...]:
-    """Return the positional team order, including upstream's implicit Empty team."""
+    """Return stable logical teams, including upstream's implicit Empty team.
 
-    team_names = [str(value) for value in agent.team_unit_team_list]
+    Upstream stores one entry per selected unit, so a ``select_all_type`` team can
+    appear more than once when a second unit joins it. RTSCortex actors are logical
+    teams and must be routed exactly once.
+    """
+
+    team_names = list(dict.fromkeys(str(value) for value in agent.team_unit_team_list))
     if getattr(agent, "flag_enable_empty_unit_group", False):
         configured_teams = agent.config.AGENTS[agent.name]["team"]
         for team in configured_teams:

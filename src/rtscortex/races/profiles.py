@@ -105,7 +105,12 @@ PROTOSS_PROFILE_DATA = RaceProfileData(
     runtime_mapping_ready=True,
     live_worker_ready=True,
     effect_verification_kinds=("build", "production", "move"),
-    controller_capabilities=("gas_workers", "supply_emergency", "resource_fallback"),
+    controller_capabilities=(
+        "gas_workers",
+        "supply_emergency",
+        "resource_fallback",
+        "prerequisite_closure",
+    ),
     limitations=("research_effect_verification_pending",),
 )
 

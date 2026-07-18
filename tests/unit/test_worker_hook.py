@@ -2330,6 +2330,15 @@ def test_timestep_extractor_exposes_developer_empty_team_actions() -> None:
     ]
 
 
+def test_current_team_order_deduplicates_logical_select_all_team() -> None:
+    agent = SimpleNamespace(
+        flag_enable_empty_unit_group=False,
+        team_unit_team_list=["Zealot-1", "Zealot-1", "Stalker-1"],
+    )
+
+    assert current_team_order(agent) == ("Zealot-1", "Stalker-1")
+
+
 def test_timestep_extractor_hides_production_action_without_source_structure() -> None:
     timestep = _fake_timestep()
     train = {"name": "Train_Zealot", "arg": [], "func": [(100, None, ())]}
