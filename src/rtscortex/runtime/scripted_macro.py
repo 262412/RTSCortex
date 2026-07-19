@@ -85,11 +85,20 @@ class ScriptedMacroPolicyClient:
     ) -> HIMALiveProposalResponse:
         if self._closed:
             raise RuntimeError("scripted macro client is closed")
-        for action in context.previous_actions:
-            if self._completed_prefix >= len(self._actions):
+        observed = {
+            _canonical_evidence(value)
+            for value in (
+                *context.previous_actions,
+                *(unit.unit_type for unit in context.observation.state.own_units),
+                *(unit.unit_type for unit in context.observation.state.own_structures),
+                *context.observation.state.upgrades,
+            )
+        }
+        while self._completed_prefix < len(self._actions):
+            expected = _canonical_evidence(self._actions[self._completed_prefix])
+            if expected not in observed:
                 break
-            if action == self._actions[self._completed_prefix]:
-                self._completed_prefix += 1
+            self._completed_prefix += 1
         remaining = self._actions[self._completed_prefix :]
         proposal = (
             self._parse_actions(remaining, self._objective)
@@ -110,3 +119,7 @@ class ScriptedMacroPolicyClient:
 
     async def close(self) -> None:
         self._closed = True
+
+
+def _canonical_evidence(value: str) -> str:
+    return "".join(character for character in value.casefold() if character.isalnum())

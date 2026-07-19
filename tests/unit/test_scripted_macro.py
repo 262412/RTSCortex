@@ -5,7 +5,7 @@ import asyncio
 import pytest
 
 from rtscortex.config import CortexMacroSettings
-from rtscortex.contracts import EconomyState, ObservationEnvelope, SC2State
+from rtscortex.contracts import EconomyState, ObservationEnvelope, SC2State, UnitState
 from rtscortex.policy.hima import HIMAInputContext
 from rtscortex.runtime.scripted_macro import (
     SCRIPTED_MACRO_REVISION,
@@ -74,6 +74,54 @@ async def _assert_scripted_macro_client_uses_pinned_race_parser_and_projection()
     assert [step.canonical_action for step in suffix.proposal.steps] == [
         "BUILD BARRACKSTECHLAB"
     ]
+
+    completed_state = observation.model_copy(
+        update={
+            "game_loop": 336,
+            "state": observation.state.model_copy(
+                update={
+                    "own_units": [
+                        UnitState(
+                            unit_id="0x1",
+                            unit_type="Marine",
+                            alliance="self",
+                        )
+                    ],
+                    "own_structures": [
+                        UnitState(
+                            unit_id=f"0x{index + 2:x}",
+                            unit_type=unit_type,
+                            alliance="self",
+                        )
+                        for index, unit_type in enumerate(
+                            ("SupplyDepot", "Barracks", "Refinery", "BarracksTechLab")
+                        )
+                    ],
+                }
+            ),
+        }
+    )
+    completed = await client.propose(
+        HIMAInputContext(
+            observation=completed_state,
+            previous_actions=("BarracksTechLab",),
+        ),
+        request_id="request-scripted-completed",
+    )
+    assert completed.proposal.steps == []
+
+    fresh_client = ScriptedMacroPolicyClient(
+        race="terran",
+        actions=["SupplyDepot", "Barracks", "Refinery", "Marine", "BarracksTechLab"],
+        objective="Verify restart-safe observed progress.",
+    )
+    recovered = await fresh_client.propose(
+        HIMAInputContext(
+            observation=completed_state,
+            previous_actions=("BarracksTechLab",),
+        )
+    )
+    assert recovered.proposal.steps == []
 
 
 def test_scripted_macro_client_rejects_unknown_race_action() -> None:
