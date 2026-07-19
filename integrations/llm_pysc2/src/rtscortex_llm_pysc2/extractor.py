@@ -181,6 +181,7 @@ SCREEN_POINT_ACTIONS = frozenset({"Move_Screen", "Ability_Blink_Screen"})
 MINIMAP_POINT_ACTIONS = frozenset({"Move_Minimap"})
 SELECT_BLINK_ACTION = "Select_Unit_Blink_Screen"
 PRODUCTION_ACTION_PREFIXES = ("Train_", "Research_")
+MIN_PRODUCTION_SOURCE_HEALTH_FRACTION = 0.2
 RESEARCH_PREREQUISITES = {"Research_WarpGate": ("CyberneticsCore",)}
 RESEARCH_COSTS = {"Research_WarpGate": (50, 50, 0)}
 
@@ -256,6 +257,7 @@ def production_source_tag(
         if int(_value(unit, "alliance", 0)) == 1
         and int(_value(unit, "unit_type", 0)) == source_type
         and _build_progress(unit) >= 1.0
+        and _health_fraction(unit) >= MIN_PRODUCTION_SOURCE_HEALTH_FRACTION
         and int(_value(unit, "active", 0)) == 0
         and int(_value(unit, "tag", 0)) > 0
         and int(_value(unit, "tag", 0)) not in excluded
@@ -1401,6 +1403,15 @@ def _is_mineral(name: str) -> bool:
 def _build_progress(unit: Any) -> float:
     progress = float(_value(unit, "build_progress", 0.0))
     return progress / 100.0 if progress > 1.0 else progress
+
+
+def _health_fraction(unit: Any) -> float:
+    health = float(_value(unit, "health", 0.0))
+    health_max = float(_value(unit, "health_max", 0.0))
+    if health_max > 0.0:
+        return health / health_max
+    health_ratio = float(_value(unit, "health_ratio", 255.0))
+    return health_ratio / 255.0
 
 
 def _distance(left: Any, right: Any) -> float:

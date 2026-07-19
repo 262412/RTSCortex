@@ -2862,6 +2862,28 @@ def test_addon_source_resolver_requires_idle_unattached_exact_producer() -> None
     )
 
 
+def test_production_source_rejects_new_structure_false_completion_frame() -> None:
+    spec = PRODUCTION_SPECS["Train_Marine"]
+    timestep = _fake_timestep()
+    timestep.observation.player.minerals = spec.minerals
+    incomplete = _unit(0xBBB, 21, 1, 36, 35, 55, 28)
+    incomplete.health_max = 1000
+    incomplete.build_progress = 100
+    incomplete.active = 0
+    incomplete.order_length = 0
+    timestep.observation.raw_units.append(incomplete)
+
+    assert (
+        production_source_tag(
+            timestep.observation,
+            {"name": spec.action_name, "func": [(spec.feature_function_id, None, ())]},
+            unit_names={21: "Barracks"},
+            action_source_types={spec.feature_function_id: 21},
+        )
+        is None
+    )
+
+
 def test_addon_unavailable_function_has_placement_failure_code() -> None:
     assert (
         _translation_failure_code(
