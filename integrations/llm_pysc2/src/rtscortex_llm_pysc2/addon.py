@@ -16,6 +16,7 @@ class AddonSpec:
     producer_type: str
     addon_type: str
     feature_function_id: int
+    generic_feature_function_id: int
     raw_order_id: int
     ability_id: int
     minerals: int
@@ -27,22 +28,58 @@ class AddonSpec:
 
 _ADDON_SPECS = (
     AddonSpec(
-        "Build_BarracksTechLab", "Barracks", "BarracksTechLab", 94, 225, 421, 50, 25, ("Barracks",)
+        "Build_BarracksTechLab",
+        "Barracks",
+        "BarracksTechLab",
+        94,
+        92,
+        225,
+        421,
+        50,
+        25,
+        ("Barracks",),
     ),
     AddonSpec(
-        "Build_BarracksReactor", "Barracks", "BarracksReactor", 73, 208, 422, 50, 50, ("Barracks",)
+        "Build_BarracksReactor",
+        "Barracks",
+        "BarracksReactor",
+        73,
+        71,
+        208,
+        422,
+        50,
+        50,
+        ("Barracks",),
     ),
     AddonSpec(
-        "Build_FactoryTechLab", "Factory", "FactoryTechLab", 96, 227, 454, 50, 25, ("Factory",)
+        "Build_FactoryTechLab", "Factory", "FactoryTechLab", 96, 92, 227, 454, 50, 25, ("Factory",)
     ),
     AddonSpec(
-        "Build_FactoryReactor", "Factory", "FactoryReactor", 75, 210, 455, 50, 50, ("Factory",)
+        "Build_FactoryReactor", "Factory", "FactoryReactor", 75, 71, 210, 455, 50, 50, ("Factory",)
     ),
     AddonSpec(
-        "Build_StarportTechLab", "Starport", "StarportTechLab", 98, 229, 487, 50, 25, ("Starport",)
+        "Build_StarportTechLab",
+        "Starport",
+        "StarportTechLab",
+        98,
+        92,
+        229,
+        487,
+        50,
+        25,
+        ("Starport",),
     ),
     AddonSpec(
-        "Build_StarportReactor", "Starport", "StarportReactor", 77, 212, 488, 50, 50, ("Starport",)
+        "Build_StarportReactor",
+        "Starport",
+        "StarportReactor",
+        77,
+        71,
+        212,
+        488,
+        50,
+        50,
+        ("Starport",),
     ),
 )
 

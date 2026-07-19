@@ -31,6 +31,7 @@ from rtscortex_llm_pysc2.worker import (
     RTSCortexMainAgent,
     WorkerSettings,
     _apply_scenario_bootstrap,
+    _available_addon_function_id,
     _candidate_dispatch_failure,
     _canonical_pysc2_arguments,
     _execution_team_name,
@@ -3159,6 +3160,14 @@ def test_addon_unavailable_function_has_placement_failure_code() -> None:
         )
         == "no_legal_addon_placement"
     )
+
+
+def test_addon_function_prefers_live_specific_then_generic_capability() -> None:
+    spec = ADDON_SPECS["Build_BarracksTechLab"]
+
+    assert _available_addon_function_id(spec.action_name, {94, 92}) == 94
+    assert _available_addon_function_id(spec.action_name, {92}) == 92
+    assert _available_addon_function_id(spec.action_name, set()) == 94
 
 
 @pytest.mark.parametrize("action_name", ["Train_Phoenix", "Train_Oracle"])

@@ -6,7 +6,7 @@ import copy
 import importlib
 import os
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass, replace
 from functools import partial
 from numbers import Integral
@@ -453,6 +453,7 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
                 self.broker.resolve_arguments(command_id, [resolved])
         # Upstream consumes and mutates the semantic action while translating it.
         # Keep the already validated request for the final candidate-domain audit.
+        self._prefer_available_generic_addon_function(semantic_action_name, obs)
         candidate_action = copy.deepcopy(action)
         self._rtscortex_translation_attempt = None
         if _is_terran_near_build_final_primitive(self, semantic_action_name):
@@ -720,6 +721,26 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
         self._rtscortex_translation_total = len(self.func_list)
         self.curr_action_name = str(action.get("name", ""))
         self.curr_action_args = list(action.get("arg", ()))
+
+    def _prefer_available_generic_addon_function(self, action_name: str, obs: Any) -> None:
+        """Use SC2's generic add-on ability only when the live action set exposes it."""
+
+        spec = addon_spec(action_name)
+        if spec is None or not self.func_list:
+            return
+        if int(self._rtscortex_translation_ordinal) != 2:
+            return
+        available_actions = set(_observation_value(obs.observation, "available_actions", ()))
+        function_id = _available_addon_function_id(action_name, available_actions)
+        current_id, _, arguments = self.func_list[0]
+        if function_id == int(current_id):
+            return
+        actions = importlib.import_module("pysc2.lib.actions")
+        self.func_list[0] = (
+            function_id,
+            actions.FUNCTIONS[function_id],
+            arguments,
+        )
 
     def _wait_for_production_camera(self, action_name: str, obs: Any) -> bool:
         """Wait for a post-camera feature observation before selecting a producer."""
@@ -1535,6 +1556,23 @@ def _production_action_source_types(agent_race: str = "protoss") -> dict[int, in
 def _function_name(function_id: int) -> str:
     actions = importlib.import_module("pysc2.lib.actions")
     return str(actions.FUNCTIONS[function_id].name)
+
+
+def _available_addon_function_id(
+    action_name: str,
+    available_actions: Collection[int],
+) -> int:
+    """Resolve producer-specific versus generic PySC2 add-on functions."""
+
+    spec = addon_spec(action_name)
+    if spec is None:
+        raise ValueError(f"unknown add-on action {action_name!r}")
+    available = {int(value) for value in available_actions}
+    if spec.feature_function_id in available:
+        return spec.feature_function_id
+    if spec.generic_feature_function_id in available:
+        return spec.generic_feature_function_id
+    return spec.feature_function_id
 
 
 def _pending_plan_idle_delay(
