@@ -217,6 +217,7 @@ def production_source_tag(
     *,
     unit_names: Mapping[int, str],
     action_source_types: Mapping[int, int],
+    excluded_source_tags: Collection[int] = (),
 ) -> Optional[int]:
     """Resolve the completed idle structure that can execute a production action."""
 
@@ -248,6 +249,7 @@ def production_source_tag(
     if not set(prerequisites).issubset(completed_structures):
         return None
     source_type = next(iter(source_types))
+    excluded = {int(tag) for tag in excluded_source_tags}
     candidates = [
         unit
         for unit in raw_units
@@ -256,6 +258,7 @@ def production_source_tag(
         and _build_progress(unit) >= 1.0
         and int(_value(unit, "active", 0)) == 0
         and int(_value(unit, "tag", 0)) > 0
+        and int(_value(unit, "tag", 0)) not in excluded
         and (addon_spec(action_name) is None or int(_value(unit, "add_on_tag", 0)) == 0)
     ]
     if not candidates:
@@ -634,6 +637,11 @@ def _available_team_actions(
                     action,
                     unit_names=unit_names,
                     action_source_types=action_source_types,
+                    excluded_source_tags=getattr(
+                        agent,
+                        "_rtscortex_rejected_addon_sources",
+                        {},
+                    ).get(action_name, ()),
                 )
                 is None
             ):

@@ -206,6 +206,7 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
         self._rtscortex_camera_settlement_noop = False
         self._rtscortex_rejected_build_positions: dict[str, set[tuple[int, int]]] = {}
         self._rtscortex_rejected_build_targets: dict[str, set[tuple[float, float]]] = {}
+        self._rtscortex_rejected_addon_sources: dict[str, set[int]] = {}
         self._rtscortex_active_build_route: Optional[
             tuple[str, tuple[int, int], Optional[tuple[float, float]]]
         ] = None
@@ -483,6 +484,16 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
                 reason=reason,
             )
             return 0, _no_op()
+        if (
+            not accepted
+            and failure_code == "no_legal_addon_placement"
+            and producer_tag is not None
+        ):
+            rejected_sources = getattr(self, "_rtscortex_rejected_addon_sources", None)
+            if rejected_sources is None:
+                rejected_sources = {}
+                self._rtscortex_rejected_addon_sources = rejected_sources
+            rejected_sources.setdefault(action_name, set()).add(producer_tag)
         if source_spec is not None and final_primitive:
             invalid_reason = _production_source_invalid_reason(
                 obs.observation,
@@ -776,6 +787,11 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
             action,
             unit_names=self.unit_names,
             action_source_types=self.broker.extractor.action_source_types,
+            excluded_source_tags=getattr(
+                self,
+                "_rtscortex_rejected_addon_sources",
+                {},
+            ).get(action_name, ()),
         )
         if source_tag is not None:
             if is_source_bound_action(action_name):
@@ -2387,6 +2403,10 @@ def _translation_failure_code(reason: Optional[str], action_name: str) -> Option
             return "invalid_geyser_tag"
         if "Nexus" in action_name:
             return "invalid_expansion_anchor"
+    if addon_spec(action_name) is not None and (
+        "not available" in normalized or "function" in normalized
+    ):
+        return "no_legal_addon_placement"
     if "not available" in normalized or "function" in normalized:
         return "translator_rejected"
     return "translator_rejected"

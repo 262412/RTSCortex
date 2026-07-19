@@ -2847,6 +2847,30 @@ def test_addon_source_resolver_requires_idle_unattached_exact_producer() -> None
 
     assert resolved == 0xBBB
 
+    assert (
+        production_source_tag(
+            timestep.observation,
+            {
+                "name": spec.action_name,
+                "func": [(spec.feature_function_id, None, ("queued",))],
+            },
+            unit_names={21: "Barracks"},
+            action_source_types={spec.feature_function_id: 21},
+            excluded_source_tags={0xBBB},
+        )
+        is None
+    )
+
+
+def test_addon_unavailable_function_has_placement_failure_code() -> None:
+    assert (
+        _translation_failure_code(
+            "function Build_Reactor_Barracks_quick is not available",
+            "Build_BarracksReactor",
+        )
+        == "no_legal_addon_placement"
+    )
+
 
 @pytest.mark.parametrize("action_name", ["Train_Phoenix", "Train_Oracle"])
 def test_stargate_train_availability_uses_registry_costs(action_name: str) -> None:
