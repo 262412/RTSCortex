@@ -937,20 +937,22 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
         # RTSCortex consumes a global raw snapshot. Do not make every Runtime tick
         # wait for optional upstream camera/selection-based text gathering.
         _release_runtime_observation_barrier(self)
-        watchdog_active = self._update_observation_gap_watchdog(observation_loop)
-        worker_management_blocked = (
+        watchdog_preempted = self._update_observation_gap_watchdog(observation_loop)
+        effect_verification_blocked = (
             self.decision_broker.coordinator.effect_verifier.blocks_auto_worker_management
-            or watchdog_active
         )
         _prime_deterministic_gas_rebalance(
             self,
             obs.observation,
-            blocked=worker_management_blocked,
+            blocked=_should_block_gas_rebalance(
+                effect_verification_blocked=effect_verification_blocked,
+                observation_watchdog_active=self._observation_watchdog_active,
+            ),
         )
         upstream_step = super().step
         action = _run_with_auto_worker_management_guard(
             self.config,
-            blocked=worker_management_blocked,
+            blocked=effect_verification_blocked or watchdog_preempted,
             upstream_step=lambda: upstream_step(obs),
         )
         self._consume_execution_aborts(obs)
@@ -1432,6 +1434,16 @@ def _run_with_auto_worker_management_guard(
     finally:
         config.ENABLE_AUTO_WORKER_MANAGE = worker_management_enabled
         config.ENABLE_AUTO_WORKER_TRAINING = worker_training_enabled
+
+
+def _should_block_gas_rebalance(
+    *,
+    effect_verification_blocked: bool,
+    observation_watchdog_active: bool,
+) -> bool:
+    """Keep deterministic gas management enabled after Runtime recovers."""
+
+    return effect_verification_blocked or observation_watchdog_active
 
 
 def _prime_deterministic_gas_rebalance(

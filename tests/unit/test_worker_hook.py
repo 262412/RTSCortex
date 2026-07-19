@@ -49,6 +49,7 @@ from rtscortex_llm_pysc2.worker import (
     _run_with_auto_worker_management_guard,
     _scenario_config,
     _semantic_target_failure,
+    _should_block_gas_rebalance,
     _translated_build_position,
     _translation_failure_code,
     _upstream_replaced_production_with_noop,
@@ -578,10 +579,21 @@ def test_observation_gap_watchdog_latches_lightweight_observations_after_recover
     assert agent._observation_watchdog_active is False
     assert agent._observation_watchdog_preempted is True
     assert broker.triggers == 1
+    assert not _should_block_gas_rebalance(
+        effect_verification_blocked=False,
+        observation_watchdog_active=agent._observation_watchdog_active,
+    )
 
     broker.last_decision_game_loop = 130
     assert agent._update_observation_gap_watchdog(131) is True
     assert broker.triggers == 1
+
+
+def test_effect_verification_still_blocks_deterministic_gas_rebalance() -> None:
+    assert _should_block_gas_rebalance(
+        effect_verification_blocked=True,
+        observation_watchdog_active=False,
+    )
 
 
 def test_observation_gap_watchdog_fails_before_unbounded_stall() -> None:
