@@ -16,6 +16,7 @@ from rtscortex.policy.hima.race_vocabulary import (
     HIMA_PARSER_VERSIONS,
     HIMA_VOCABULARY_VERSIONS,
 )
+from rtscortex.policy.models import MacroPolicyProposal
 
 SCRIPTED_MACRO_REVISION = "scripted-macro-v1"
 
@@ -33,16 +34,37 @@ class ScriptedMacroPolicyClient:
         self.race = race.casefold()
         self._adapter = HIMAObservationAdapter(race=self.race)
         self._parser = HIMAProposalParser(race=self.race)
-        raw_output = f"Reason: {objective} Actions: {json.dumps(actions)}"
-        proposal = self._parser.parse(raw_output)
+        normalized_actions = tuple(action.strip() for action in actions)
+        if len(set(normalized_actions)) != len(normalized_actions):
+            raise ValueError("scripted macro actions must be unique")
+        proposal = self._parse_actions(normalized_actions, objective)
         if proposal.diagnostics or len(proposal.steps) != len(actions):
             diagnostics = ", ".join(item.code for item in proposal.diagnostics)
             raise ValueError(
                 "scripted macro actions must use the pinned race vocabulary"
                 + (f": {diagnostics}" if diagnostics else "")
             )
-        self._proposal = proposal.model_copy(update={"strategic_objective": objective})
+        self._actions = normalized_actions
+        self._objective = objective
+        self._empty_proposal = proposal.model_copy(
+            update={
+                "strategic_objective": objective,
+                "steps": [],
+                "raw_output": "Actions: []",
+            }
+        )
+        self._completed_prefix = 0
         self._closed = False
+
+    def _parse_actions(
+        self,
+        actions: tuple[str, ...],
+        objective: str,
+    ) -> MacroPolicyProposal:
+        raw_output = f"Reason: {objective} Actions: {json.dumps(actions)}"
+        return self._parser.parse(raw_output).model_copy(
+            update={"strategic_objective": objective}
+        )
 
     async def health(self) -> HIMALiveHealth:
         if self._closed:
@@ -63,6 +85,17 @@ class ScriptedMacroPolicyClient:
     ) -> HIMALiveProposalResponse:
         if self._closed:
             raise RuntimeError("scripted macro client is closed")
+        for action in context.previous_actions:
+            if self._completed_prefix >= len(self._actions):
+                break
+            if action == self._actions[self._completed_prefix]:
+                self._completed_prefix += 1
+        remaining = self._actions[self._completed_prefix :]
+        proposal = (
+            self._parse_actions(remaining, self._objective)
+            if remaining
+            else self._empty_proposal
+        )
         snapshot = self._adapter.adapt_context(context)
         observation = context.observation
         return HIMALiveProposalResponse(
@@ -72,7 +105,7 @@ class ScriptedMacroPolicyClient:
             step_id=observation.step_id,
             game_loop=observation.game_loop,
             projection_hash=snapshot.projection_hash,
-            proposal=self._proposal,
+            proposal=proposal,
         )
 
     async def close(self) -> None:

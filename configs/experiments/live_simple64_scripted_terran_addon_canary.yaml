@@ -42,7 +42,6 @@ cortex:
       - Barracks
       - Refinery
       - Marine
-      - Marine
       - BarracksTechLab
     required: true
     interval_game_loops: 10000

@@ -64,6 +64,17 @@ async def _assert_scripted_macro_client_uses_pinned_race_parser_and_projection()
     ]
     assert response.proposal.strategic_objective == "Verify the Terran add-on path."
 
+    suffix = await client.propose(
+        HIMAInputContext(
+            observation=observation.model_copy(update={"game_loop": 224}),
+            previous_actions=("SupplyDepot", "Barracks", "Refinery"),
+        ),
+        request_id="request-scripted-suffix",
+    )
+    assert [step.canonical_action for step in suffix.proposal.steps] == [
+        "BUILD BARRACKSTECHLAB"
+    ]
+
 
 def test_scripted_macro_client_rejects_unknown_race_action() -> None:
     with pytest.raises(ValueError, match="pinned race vocabulary"):
@@ -71,4 +82,13 @@ def test_scripted_macro_client_rejects_unknown_race_action() -> None:
             race="terran",
             actions=["Pylon"],
             objective="Reject cross-race actions.",
+        )
+
+
+def test_scripted_macro_client_rejects_ambiguous_duplicate_actions() -> None:
+    with pytest.raises(ValueError, match="must be unique"):
+        ScriptedMacroPolicyClient(
+            race="terran",
+            actions=["Marine", "Marine"],
+            objective="Reject ambiguous confirmation cursors.",
         )
