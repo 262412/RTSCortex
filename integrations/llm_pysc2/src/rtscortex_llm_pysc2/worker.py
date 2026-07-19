@@ -1527,8 +1527,10 @@ def _reserved_builder_worker_tags(main_agent: Any) -> set[int]:
     current = getattr(builder, "team_unit_tag_curr", None)
     if current is not None and int(current) > 0:
         tags.add(int(current))
-    for attribute in ("unit_tag_list", "team_unit_tag_list"):
-        tags.update(int(tag) for tag in getattr(builder, attribute, ()) if int(tag) > 0)
+    # ``unit_tag_list`` and ``team_unit_tag_list`` are upstream observation/history
+    # caches.  For Terran they can contain every SCV seen by Builder, so treating
+    # them as reservations prevents all ordinary workers from mining gas.  Only
+    # the SCVs actually owned by a configured Builder team are reserved.
     for team in getattr(builder, "teams", ()):
         if not isinstance(team, Mapping):
             continue

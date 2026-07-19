@@ -809,8 +809,8 @@ def test_deterministic_gas_rebalance_excludes_reserved_builder_worker() -> None:
         SimpleNamespace(tag=20, x=18.0, y=18.0),
     ]
     builder = SimpleNamespace(
-        unit_tag_list=[10],
-        team_unit_tag_list=[],
+        unit_tag_list=[10, 20],
+        team_unit_tag_list=[10, 20],
         team_unit_tag_curr=None,
         teams=[{"unit_tags": [10]}],
     )
