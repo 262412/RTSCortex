@@ -1783,6 +1783,69 @@ def test_terran_production_build_requires_buildable_addon_footprint() -> None:
     )
 
 
+def test_terran_production_build_keeps_future_addon_clear_of_geyser() -> None:
+    anchor = SimpleNamespace(
+        tag=0xAAA,
+        alliance=1,
+        unit_type=18,
+        x=20,
+        y=20,
+        radius=0.5,
+        is_on_screen=True,
+    )
+    geyser = SimpleNamespace(
+        tag=0xBBB,
+        alliance=3,
+        unit_type=342,
+        x=63.5,
+        y=59.5,
+    )
+    observation = SimpleNamespace(
+        feature_units=[anchor],
+        feature_screen=SimpleNamespace(
+            buildable=UniformGrid(1),
+            pathable=UniformGrid(1),
+            player_relative=UniformGrid(0),
+            power=UniformGrid(0),
+        ),
+        raw_units=[
+            SimpleNamespace(
+                tag=0xAAA,
+                alliance=1,
+                unit_type=18,
+                x=50.0,
+                y=50.0,
+                build_progress=100,
+            ),
+            SimpleNamespace(
+                tag=0xAAC,
+                alliance=1,
+                unit_type=19,
+                x=50.0,
+                y=52.0,
+                build_progress=100,
+            ),
+            geyser,
+        ],
+    )
+    unit_names = {18: "CommandCenter", 19: "SupplyDepot", 342: "VespeneGeyser"}
+
+    assert not screen_build_position_is_legal(
+        observation,
+        "Build_Barracks_Screen",
+        [65, 65],
+        unit_names=unit_names,
+    )
+    geyser.x = 70.0
+    geyser.y = 70.0
+    assert screen_build_position_is_legal(
+        observation,
+        "Build_Barracks_Screen",
+        [65, 65],
+        unit_names=unit_names,
+    )
+
+
 def test_new_build_avoids_existing_terran_producer_addon_reservation() -> None:
     observation = SimpleNamespace(
         feature_units=[

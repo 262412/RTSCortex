@@ -17,6 +17,7 @@ from rtscortex_llm_pysc2.production import (
 
 SUPPORTED_ARGUMENTS = frozenset({"minimap", "screen", "tag"})
 SCREEN_WORLD_GRID = 24.0
+TERRAN_ADDON_GAS_CLEARANCE_WORLD = 7.0
 ALLIANCES = {1: "self", 2: "ally", 3: "neutral", 4: "enemy"}
 SC2_ALERT_NAMES = {6: "building_under_attack", 19: "unit_under_attack"}
 TOWNHALL_NAMES = frozenset(
@@ -1698,6 +1699,16 @@ def _build_screen_candidates(
         require_power=spec.requires_power,
         semantic_anchor=semantic_anchor,
     )
+    if spec.reserves_addon_space:
+        candidates = [
+            candidate
+            for candidate in candidates
+            if _terran_addon_gas_clearance_is_legal(
+                observation,
+                candidate,
+                unit_names,
+            )
+        ]
     return candidates if limit is None else candidates[:limit]
 
 
@@ -1790,22 +1801,57 @@ def _build_screen_position_is_legal(
         screen_size,
         require_power=spec.requires_power,
     )
-    return _build_footprint_is_clear(
-        prefix,
-        _occupied_positions(observation),
-        _build_footprint_bounds_for_spec(
-            int(position[0]),
-            int(position[1]),
-            ratio,
-            spec,
-        ),
-        screen_size,
-        reserved_bounds=_terran_addon_reservation_bounds(
-            observation,
-            unit_names,
+    return (
+        _build_footprint_is_clear(
+            prefix,
+            _occupied_positions(observation),
+            _build_footprint_bounds_for_spec(
+                int(position[0]),
+                int(position[1]),
+                ratio,
+                spec,
+            ),
             screen_size,
-        ),
+            reserved_bounds=_terran_addon_reservation_bounds(
+                observation,
+                unit_names,
+                screen_size,
+            ),
+        )
+        and (
+            not spec.reserves_addon_space
+            or _terran_addon_gas_clearance_is_legal(
+                observation,
+                position,
+                unit_names,
+            )
+        )
     )
+
+
+def _terran_addon_gas_clearance_is_legal(
+    observation: Any,
+    screen_position: Sequence[int],
+    unit_names: Mapping[int, str],
+) -> bool:
+    """Keep Terran producer plus future add-on clear of fixed geysers."""
+
+    provenance = screen_to_world_target(observation, screen_position)
+    if provenance is None:
+        return True
+    target_x, target_y = provenance.world_target
+    for unit in _value(observation, "raw_units", ()):
+        if int(_value(unit, "alliance", 0)) != 3:
+            continue
+        if not _is_gas(_unit_name(unit, unit_names)):
+            continue
+        distance = math.hypot(
+            target_x - float(_value(unit, "x", 0.0)),
+            target_y - float(_value(unit, "y", 0.0)),
+        )
+        if distance < TERRAN_ADDON_GAS_CLEARANCE_WORLD:
+            return False
+    return True
 
 
 def _occupied_positions(observation: Any) -> tuple[tuple[int, int, float], ...]:
