@@ -67,7 +67,7 @@ def run_doctor(
     checks.append(_core_venv_check(project_root / ".venv"))
     if config is not None and config.provider.kind == "openai_compatible":
         checks.append(_provider_check(config))
-    if config is not None and config.cortex.macro.kind != "disabled":
+    if config is not None and config.cortex.macro.kind in {"hima", "hima_ensemble"}:
         checks.extend(_hima_checks(config))
     submodule = project_root / "third_party" / "LLM-PySC2"
     commit = _git_commit(submodule)

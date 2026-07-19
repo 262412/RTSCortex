@@ -183,7 +183,7 @@ class CortexRuntimeEngine(RuntimeEngine):
         if macro_sidecar is not None and macro_client is None:
             raise ValueError("a macro sidecar requires its matching client")
         if (
-            config.cortex.macro.kind in {"hima", "hima_ensemble"}
+            config.cortex.macro.kind in {"hima", "hima_ensemble", "scripted"}
             and macro_client is None
             and macro_startup_failure is None
         ):

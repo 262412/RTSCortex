@@ -118,7 +118,7 @@ class CortexHIMAEnsembleMemberSettings(SettingsModel):
 
 
 class CortexMacroSettings(SettingsModel):
-    kind: Literal["disabled", "hima", "hima_ensemble"] = "disabled"
+    kind: Literal["disabled", "hima", "hima_ensemble", "scripted"] = "disabled"
     candidate: HIMACandidate = "protoss-a"
     python_executable: Path = Path("~/fastscratch/envs/rtscortex-hima/bin/python")
     model_path: Path | None = None
@@ -133,6 +133,12 @@ class CortexMacroSettings(SettingsModel):
     ensemble_members: list[CortexHIMAEnsembleMemberSettings] = Field(default_factory=list)
     coordinator: Literal["deterministic_v1"] = "deterministic_v1"
     ensemble_schedule: Literal["barrier", "staggered"] = "barrier"
+    scripted_actions: list[str] = Field(default_factory=list, max_length=128)
+    scripted_objective: str = Field(
+        default="Execute the deterministic engineering canary.",
+        min_length=1,
+        max_length=500,
+    )
 
     @model_validator(mode="after")
     def require_hima_model_path(self) -> CortexMacroSettings:
@@ -148,6 +154,10 @@ class CortexMacroSettings(SettingsModel):
                 raise ValueError("HIMA ensemble members must be the a/b/c checkpoints for one race")
         elif self.ensemble_members:
             raise ValueError("ensemble_members are only valid for kind=hima_ensemble")
+        if self.kind == "scripted" and not self.scripted_actions:
+            raise ValueError("scripted macro policy requires scripted_actions")
+        if self.kind != "scripted" and self.scripted_actions:
+            raise ValueError("scripted_actions are only valid for kind=scripted")
         return self
 
 

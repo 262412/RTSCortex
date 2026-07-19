@@ -1,0 +1,71 @@
+run:
+  output_root: ~/scratch/outputs/RTSCortex
+  runtime_root: ~/fastscratch/rtscortex_runtime
+  seed: 2
+environment:
+  adapter: llm_pysc2
+  scenario: Simple64
+  max_steps: 6000
+  agent_race: terran
+  opponent_race: zerg
+  opponent_difficulty: very_easy
+  opponent_build: macro
+  step_mul: 1
+  game_steps_per_episode: 6000
+  simulation_speed_multiplier: 0.5
+  pause_until_first_plan: true
+  sc2_path: ~/scratch/StarCraftII
+  action_effect_timeout_game_loops: 112
+  observation_gap_watchdog_game_loops: 112
+  observation_gap_hard_limit_game_loops: 448
+  worker_python: ~/fastscratch/envs/rtscortex-llm-pysc2/bin/python
+runtime:
+  deterministic: true
+  planning_interval_game_loops: 112
+  planner_command_ttl_game_loops: 112
+  planner_timeout_seconds: 15.0
+  max_actions: 5
+agent:
+  variant: cortex
+cortex:
+  situation:
+    kind: deterministic
+  arbiter:
+    mode: shadow
+    switch_margin: 1.0
+    max_intents: 7
+  macro:
+    kind: scripted
+    scripted_objective: Verify Terran Barracks add-on placement and effect provenance.
+    scripted_actions:
+      - SupplyDepot
+      - Barracks
+      - Refinery
+      - Marine
+      - Marine
+      - BarracksTechLab
+    required: true
+    interval_game_loops: 112
+    plan_ttl_game_loops: 448
+    timeout_seconds: 15.0
+  tactical:
+    kind: deterministic
+  executor:
+    kind: deterministic
+    timeout_ms: 10.0
+    fallback: deterministic
+    supply_emergency_free_supply: 2
+    resource_fallback_pylon_free_supply: 4
+  playbook:
+    enabled: false
+reflex:
+  enabled: true
+  low_health_threshold: 0.25
+  target_latency_ms: 50.0
+provider:
+  kind: fake
+  model: scripted-terran-addon-canary
+evaluation:
+  seeds: [2]
+console:
+  enabled: false

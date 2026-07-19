@@ -146,6 +146,8 @@ def _active_model_label(config: ExperimentConfig) -> str:
     if config.agent.variant == "cortex" and config.cortex.macro.kind == "hima_ensemble":
         race = config.cortex.macro.ensemble_members[0].candidate.rsplit("-", 1)[0]
         return f"HIMA {race.title()} a/b/c Ensemble"
+    if config.agent.variant == "cortex" and config.cortex.macro.kind == "scripted":
+        return f"Scripted {config.environment.agent_race.title()} canary"
     return config.provider.model
 
 

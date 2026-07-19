@@ -26,6 +26,7 @@ from rtscortex.runtime.hima_sidecar import (
     validate_local_hima_checkpoint,
     validate_sidecar_executable,
 )
+from rtscortex.runtime.scripted_macro import ScriptedMacroPolicyClient
 
 _UDS_PATH_LIMIT = 100
 
@@ -66,7 +67,9 @@ def _build_cortex_runtime(
 ) -> RuntimeEngine:
     from rtscortex.runtime.cortex_engine import CortexRuntimeEngine
 
-    macro_client: HIMALivePolicyClient | HIMAEnsemblePolicyClient | None = None
+    macro_client: (
+        HIMALivePolicyClient | HIMAEnsemblePolicyClient | ScriptedMacroPolicyClient | None
+    ) = None
     macro_sidecar: HIMASidecarProcess | HIMAEnsembleSidecar | None = None
     macro_startup_failure: Exception | None = None
     if config.cortex.macro.kind == "hima":
@@ -83,6 +86,12 @@ def _build_cortex_runtime(
             if config.cortex.macro.required:
                 raise
             macro_startup_failure = error
+    elif config.cortex.macro.kind == "scripted":
+        macro_client = ScriptedMacroPolicyClient(
+            race=config.environment.agent_race,
+            actions=config.cortex.macro.scripted_actions,
+            objective=config.cortex.macro.scripted_objective,
+        )
     playbook_store = (
         PlaybookStore(config.cortex.playbook.database_path)
         if config.cortex.playbook.enabled
