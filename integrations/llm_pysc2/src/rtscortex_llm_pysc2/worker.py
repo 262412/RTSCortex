@@ -38,6 +38,7 @@ from rtscortex_llm_pysc2.extractor import (
 )
 from rtscortex_llm_pysc2.frame_stream import RGBFramePublisher, RuntimeFrameUploader
 from rtscortex_llm_pysc2.hook import RuntimeQueryMixin
+from rtscortex_llm_pysc2.morph import MORPH_SPECS, morph_spec
 from rtscortex_llm_pysc2.production import (
     PRODUCTION_SPECS_BY_RACE,
     production_spec,
@@ -60,6 +61,9 @@ class _SourceActionSpec(Protocol):
 
     @property
     def producer_type(self) -> str: ...
+
+    @property
+    def race(self) -> str: ...
 
 
 try:
@@ -227,7 +231,7 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
             self._rtscortex_production_selection_attempts = 0
             self._rtscortex_build_selection_retries = 0
             next_action_name = str(self.action_list[0].get("name", ""))
-            if production_spec(next_action_name) is None and addon_spec(next_action_name) is None:
+            if _source_action_spec(next_action_name) is None:
                 self._rtscortex_production_source_tag = None
         action: dict[str, Any] = (
             semantic_action
@@ -487,7 +491,7 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
         ordinal = int(attempt.get("ordinal", 0))
         total = int(attempt.get("total", 1))
         final_primitive = not accepted or ordinal + 1 >= total
-        source_spec = production_spec(action_name) or addon_spec(action_name)
+        source_spec = _source_action_spec(action_name)
         producer_tag, provenance_failure = self._validated_production_source_tag(
             action_name,
             attempt,
@@ -534,7 +538,11 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
                     failure_code=(
                         "addon_source_invalidated"
                         if addon_spec(action_name) is not None
-                        else "production_source_invalidated"
+                        else (
+                            "morph_source_invalidated"
+                            if morph_spec(action_name) is not None
+                            else "production_source_invalidated"
+                        )
                     ),
                     reason=invalid_reason,
                 )
@@ -745,9 +753,7 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
     def _wait_for_production_camera(self, action_name: str, obs: Any) -> bool:
         """Wait for a post-camera feature observation before selecting a producer."""
 
-        if (
-            production_spec(action_name) is None and addon_spec(action_name) is None
-        ) or not self.func_list:
+        if _source_action_spec(action_name) is None or not self.func_list:
             return False
         next_function_id = int(self.func_list[0][0])
         if next_function_id != 2 or int(self._rtscortex_translation_ordinal) != 1:
@@ -786,9 +792,7 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
     def _wait_for_production_selection(self, action_name: str, obs: Any) -> bool:
         """Wait for selection acceptance, then verify the exact producer tag."""
 
-        if (
-            production_spec(action_name) is None and addon_spec(action_name) is None
-        ) or not self.func_list:
+        if _source_action_spec(action_name) is None or not self.func_list:
             return False
         if int(self._rtscortex_translation_ordinal) != 2:
             return False
@@ -813,9 +817,7 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
     ) -> Optional[tuple[int, Any]]:
         """Retry a point selection when another unit obscured the producer."""
 
-        if (
-            production_spec(action_name) is None and addon_spec(action_name) is None
-        ) or not self.func_list:
+        if _source_action_spec(action_name) is None or not self.func_list:
             return None
         if int(self._rtscortex_translation_ordinal) != 2:
             return None
@@ -838,7 +840,11 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
                 failure_code=(
                     "addon_source_not_selected"
                     if addon_spec(action_name) is not None
-                    else "production_source_not_selected"
+                    else (
+                        "morph_source_not_selected"
+                        if morph_spec(action_name) is not None
+                        else "production_source_not_selected"
+                    )
                 ),
                 reason=(
                     f"producer tag {hex(producer_tag or 0)} was not selected after "
@@ -861,9 +867,13 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
     ) -> tuple[Optional[int], Optional[tuple[str, str]]]:
         """Bind production to the exact raw producer selected by the translator."""
 
-        if production_spec(action_name) is None and addon_spec(action_name) is None:
+        if _source_action_spec(action_name) is None:
             return None, None
-        source_kind = "addon" if addon_spec(action_name) is not None else "production"
+        source_kind = (
+            "addon"
+            if addon_spec(action_name) is not None
+            else "morph" if morph_spec(action_name) is not None else "production"
+        )
         source_tag = self._rtscortex_production_source_tag
         ordinal = int(attempt.get("ordinal", 0))
         requested_id = int(attempt.get("requested_function_id", 0))
@@ -937,7 +947,11 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
             failure_code=(
                 "addon_source_unavailable"
                 if addon_spec(action_name) is not None
-                else "production_source_unavailable"
+                else (
+                    "morph_source_unavailable"
+                    if morph_spec(action_name) is not None
+                    else "production_source_unavailable"
+                )
             ),
             reason=reason,
         )
@@ -1554,6 +1568,16 @@ def _production_action_source_types(agent_race: str = "protoss") -> dict[int, in
         )
         if producer is not None:
             result[addon.feature_function_id] = int(producer)
+    for morph in MORPH_SPECS.values():
+        if morph.race != agent_race:
+            continue
+        producer = getattr(
+            getattr(units, agent_race.capitalize()),
+            morph.producer_type,
+            None,
+        )
+        if producer is not None:
+            result[morph.feature_function_id] = int(producer)
     return result
 
 
@@ -1871,8 +1895,12 @@ def _worker_player_race(agent: Any) -> str:
 
 
 def _requires_explicit_production_chain(action_name: str) -> bool:
-    spec = production_spec(action_name) or addon_spec(action_name)
+    spec = _source_action_spec(action_name)
     return spec is not None and spec.race != "protoss"
+
+
+def _source_action_spec(action_name: str) -> Optional[_SourceActionSpec]:
+    return production_spec(action_name) or addon_spec(action_name) or morph_spec(action_name)
 
 
 def _is_worker_owned_near_build_final_primitive(agent: Any, action_name: str) -> bool:

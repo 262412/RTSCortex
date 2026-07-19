@@ -239,7 +239,7 @@ class PrimitiveTraceEntry(ContractModel):
 
 
 class EffectEvidence(ContractModel):
-    effect_kind: Literal["build", "move", "production", "addon"] | None = None
+    effect_kind: Literal["build", "move", "production", "addon", "morph"] | None = None
     target_type: str | None = None
     target_position: tuple[float, float] | None = None
     target_tag: str | None = None
@@ -281,6 +281,7 @@ class EffectEvidence(ContractModel):
     confirmation_kind: Literal[
         "producer_order",
         "producer_morph",
+        "source_morph",
         "new_unit",
         "new_structure",
     ] | None = None
@@ -291,6 +292,7 @@ class EffectEvidence(ContractModel):
     base_timeout_game_loops: int | None = Field(default=None, ge=1)
     effective_timeout_game_loops: int | None = Field(default=None, ge=1)
     active_order_extension: bool = False
+    source_build_progress: float | None = Field(default=None, ge=0.0, le=1.0)
     baseline_builder_position: tuple[float, float] | None = None
     observed_builder_position: tuple[float, float] | None = None
     builder_displacement: float | None = Field(default=None, ge=0)

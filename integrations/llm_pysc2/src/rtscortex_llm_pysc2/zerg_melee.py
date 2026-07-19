@@ -105,6 +105,7 @@ PRODUCTION_ACTIONS = [
     _action("Train_Zergling", [], F.Train_Zergling_quick, "queued"),
     _action("Train_Roach", [], F.Train_Roach_quick, "queued"),
     _action("Train_Hydralisk", [], F.Train_Hydralisk_quick, "queued"),
+    _action("Morph_Lair", [], F.Morph_Lair_quick, "queued"),
 ]
 
 

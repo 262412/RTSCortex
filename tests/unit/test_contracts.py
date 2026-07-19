@@ -367,6 +367,22 @@ def test_effect_evidence_accepts_terran_addon_confirmation() -> None:
     assert EffectEvidence.model_validate_json(evidence.model_dump_json()) == evidence
 
 
+def test_effect_evidence_accepts_zerg_structure_morph_confirmation() -> None:
+    evidence = EffectEvidence(
+        effect_kind="morph",
+        target_type="Lair",
+        target_tag="0xabc",
+        producer_tag="0xabc",
+        producer_type="Hatchery",
+        producer_observed_type="Lair",
+        expected_order_id=388,
+        confirmation_kind="source_morph",
+        source_build_progress=0.1,
+    )
+
+    assert EffectEvidence.model_validate_json(evidence.model_dump_json()) == evidence
+
+
 def test_episode_result_contract_round_trip_and_invalid_samples() -> None:
     result = EpisodeResult(
         run_id="run-1",

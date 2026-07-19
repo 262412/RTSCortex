@@ -23,6 +23,7 @@ from rtscortex_llm_pysc2.extractor import (
     semantic_argument_candidates,
 )
 from rtscortex_llm_pysc2.hook import RuntimeDecisionBroker, RuntimeQueryMixin
+from rtscortex_llm_pysc2.morph import MORPH_SPECS
 from rtscortex_llm_pysc2.observation import ObservationMapper
 from rtscortex_llm_pysc2.production import PRODUCTION_SPECS
 from rtscortex_llm_pysc2.routing import RoutedActionBatch, RoutedCommand
@@ -1340,6 +1341,7 @@ def test_worker_player_race_prefers_explicit_bridge_race_over_upstream_compatibi
     assert "_requires_explicit_production_chain(action_name)" in source
     assert _requires_explicit_production_chain("Train_Marine") is True
     assert _requires_explicit_production_chain("Train_Zergling") is True
+    assert _requires_explicit_production_chain("Morph_Lair") is True
     assert _requires_explicit_production_chain("Train_Zealot") is False
 
 
@@ -3136,6 +3138,46 @@ def test_train_registry_pins_multirace_worker_actions_and_raw_orders() -> None:
         "Train_Roach": 519,
         "Train_Hydralisk": 507,
     }
+
+
+def test_zerg_morph_registry_and_source_resolver_require_exact_idle_hatchery() -> None:
+    spec = MORPH_SPECS["Morph_Lair"]
+    assert (spec.feature_function_id, spec.raw_order_id, spec.ability_id) == (303, 388, 1216)
+
+    timestep = _fake_timestep()
+    timestep.observation.player.minerals = spec.minerals
+    timestep.observation.player.vespene = spec.vespene
+    hatchery = _unit(0xA00, 86, 1, 35, 35, 1500, 1500)
+    hatchery.build_progress = 100
+    hatchery.active = 0
+    pool = _unit(0xB00, 89, 1, 40, 35, 1000, 1000)
+    pool.build_progress = 100
+    timestep.observation.raw_units.extend([hatchery, pool])
+
+    resolved = production_source_tag(
+        timestep.observation,
+        {
+            "name": spec.action_name,
+            "func": [(spec.feature_function_id, None, ("queued",))],
+        },
+        unit_names={86: "Hatchery", 89: "SpawningPool"},
+        action_source_types={spec.feature_function_id: 86},
+    )
+
+    assert resolved == 0xA00
+    hatchery.active = 1
+    assert (
+        production_source_tag(
+            timestep.observation,
+            {
+                "name": spec.action_name,
+                "func": [(spec.feature_function_id, None, ("queued",))],
+            },
+            unit_names={86: "Hatchery", 89: "SpawningPool"},
+            action_source_types={spec.feature_function_id: 86},
+        )
+        is None
+    )
 
 
 def test_addon_source_resolver_requires_idle_unattached_exact_producer() -> None:

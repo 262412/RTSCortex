@@ -4,6 +4,7 @@ from typing import Any
 
 from rtscortex_llm_pysc2.addon import ADDON_SPECS, AddonSpec
 from rtscortex_llm_pysc2.effect_verifier import ActionEffectVerifier
+from rtscortex_llm_pysc2.morph import MORPH_SPECS, MorphSpec
 from rtscortex_llm_pysc2.production import PRODUCTION_SPECS, ProductionSpec
 from rtscortex_llm_pysc2.routing import RoutedCommand
 
@@ -834,6 +835,66 @@ def test_consumed_zerg_larva_confirms_when_the_same_tag_becomes_an_egg() -> None
     assert verdict.evidence["production_order_seen"] is False
 
 
+def test_zerg_lair_morph_confirms_the_exact_hatchery_order() -> None:
+    spec = MORPH_SPECS["Morph_Lair"]
+    verifier = ActionEffectVerifier(timeout_game_loops=10)
+    command = _morph_command(spec)
+    verifier.track(command)
+    verifier.prepare(
+        command.command_id,
+        _morph_observation(spec, game_loop=100),
+        None,
+        producer_tag=0xA00,
+    )
+    verifier.accept_primitive(command.command_id, game_loop=101)
+
+    verdict = verifier.observe(
+        _morph_observation(
+            spec,
+            game_loop=102,
+            source_orders=[spec.raw_order_id],
+        )
+    )[0]
+
+    assert verdict.success is True
+    assert verdict.evidence is not None
+    assert verdict.evidence["effect_kind"] == "morph"
+    assert verdict.evidence["producer_tag"] == "0xa00"
+    assert verdict.evidence["producer_type"] == "Hatchery"
+    assert verdict.evidence["target_type"] == "Lair"
+    assert verdict.evidence["expected_order_id"] == 388
+    assert verdict.evidence["confirmation_kind"] == "producer_order"
+
+
+def test_zerg_lair_morph_fallback_confirms_same_tag_type_change() -> None:
+    spec = MORPH_SPECS["Morph_Lair"]
+    verifier = ActionEffectVerifier(timeout_game_loops=10)
+    command = _morph_command(spec)
+    verifier.track(command)
+    verifier.prepare(
+        command.command_id,
+        _morph_observation(spec, game_loop=100),
+        None,
+        producer_tag=0xA00,
+    )
+    verifier.accept_primitive(command.command_id, game_loop=101)
+
+    verdict = verifier.observe(
+        _morph_observation(
+            spec,
+            game_loop=102,
+            source_type="Lair",
+            source_progress=0.1,
+        )
+    )[0]
+
+    assert verdict.success is True
+    assert verdict.evidence is not None
+    assert verdict.evidence["producer_observed_type"] == "Lair"
+    assert verdict.evidence["source_build_progress"] == 0.1
+    assert verdict.evidence["confirmation_kind"] == "source_morph"
+
+
 def test_new_unit_near_the_exact_producer_can_confirm_missed_short_order() -> None:
     spec = PRODUCTION_SPECS["Train_Adept"]
     verifier = ActionEffectVerifier(timeout_game_loops=10)
@@ -1149,6 +1210,47 @@ def _production_command(
         resolved_arguments=(),
         rendered_action=f"<{spec.action_name}()>",
     )
+
+
+def _morph_command(spec: MorphSpec) -> RoutedCommand:
+    return RoutedCommand(
+        command_id="command-morph",
+        actor="Developer/Empty",
+        team_name="Empty",
+        name=spec.action_name,
+        source="planner",
+        requested_arguments=(),
+        resolved_arguments=(),
+        rendered_action=f"<{spec.action_name}()>",
+    )
+
+
+def _morph_observation(
+    spec: MorphSpec,
+    *,
+    game_loop: int,
+    source_tag: int = 0xA00,
+    source_type: str | None = None,
+    source_orders: list[int] | None = None,
+    source_progress: float = 1.0,
+) -> dict[str, Any]:
+    orders = source_orders or []
+    return {
+        "game_loop": game_loop,
+        "player_common": {"minerals": 500, "vespene": 500},
+        "raw_units": [
+            {
+                "tag": source_tag,
+                "unit_type": source_type or spec.producer_type,
+                "alliance": 1,
+                "order_length": len(orders),
+                **{f"order_id_{index}": order for index, order in enumerate(orders)},
+                "build_progress": source_progress,
+                "x": 20,
+                "y": 20,
+            }
+        ],
+    }
 
 
 def _addon_command(spec: AddonSpec) -> RoutedCommand:

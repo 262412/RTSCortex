@@ -560,7 +560,7 @@ ZERG_PROFILE_DATA = RaceProfileData(
     hima_vocabulary_version="hima-zerg-63-v1",
     runtime_mapping_ready=True,
     live_worker_ready=True,
-    effect_verification_kinds=("build", "production", "move"),
+    effect_verification_kinds=("build", "production", "morph", "move"),
     controller_capabilities=(
         "gas_workers",
         "supply_emergency",
@@ -568,7 +568,6 @@ ZERG_PROFILE_DATA = RaceProfileData(
         "prerequisite_closure",
     ),
     limitations=(
-        "morph_effect_verification_pending",
         "inject_and_active_creep_controllers_pending",
     ),
 )

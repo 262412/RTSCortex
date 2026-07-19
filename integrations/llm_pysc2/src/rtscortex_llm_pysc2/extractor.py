@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from rtscortex_llm_pysc2.addon import addon_spec
+from rtscortex_llm_pysc2.morph import morph_spec
 from rtscortex_llm_pysc2.production import (
     production_spec,
     production_spec_for_order,
@@ -287,7 +288,11 @@ def is_production_action(action_name: str) -> bool:
 def is_source_bound_action(action_name: str) -> bool:
     """Return whether an action must bind one exact production structure."""
 
-    return is_production_action(action_name) or addon_spec(action_name) is not None
+    return (
+        is_production_action(action_name)
+        or addon_spec(action_name) is not None
+        or morph_spec(action_name) is not None
+    )
 
 
 def production_source_tag(
@@ -303,7 +308,7 @@ def production_source_tag(
     action_name = str(action.get("name", ""))
     if not is_source_bound_action(action_name):
         return None
-    spec = production_spec(action_name) or addon_spec(action_name)
+    spec = production_spec(action_name) or addon_spec(action_name) or morph_spec(action_name)
     cost = (
         None if spec is None else (spec.minerals, spec.vespene, spec.supply)
     ) or RESEARCH_COSTS.get(action_name)
