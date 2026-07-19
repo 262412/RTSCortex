@@ -29,6 +29,7 @@ from rtscortex.progress import (
     GoalRequirementKind,
     GoalSpec,
 )
+from rtscortex.races import ActionDomain, RaceId, RaceProfileData, race_profile
 
 CORPUS_FORMAT_VERSION: Literal["0.2"] = "0.2"
 CORPUS_PROTOCOL_VERSION: Literal["1.1"] = "1.1"
@@ -50,59 +51,132 @@ _CONDITION_PHASES: tuple[PolicyFixtureStratum, ...] = (
     PolicyFixtureStratum.PRODUCTION,
     PolicyFixtureStratum.COMBAT,
 )
-_PRODUCTION_STRUCTURES = frozenset({"gateway", "warpgate", "roboticsfacility", "stargate"})
-_TECHNOLOGY_STRUCTURES = frozenset(
-    {
-        "cyberneticscore",
-        "forge",
-        "twilightcouncil",
-        "templararchive",
-        "darkshrine",
-        "roboticsbay",
-        "fleetbeacon",
-    }
-)
 _PREVIOUS_ACTION_WINDOW_GAME_LOOPS = int(60 * 22.4)
-_RUNTIME_TO_HIMA_SHORT_ACTION = {
-    "Build_Pylon_Screen": "Pylon",
-    "Build_Assimilator_Near": "Assimilator",
-    "Build_Nexus_Near": "Nexus",
-    "Build_Gateway_Screen": "Gateway",
-    "Build_CyberneticsCore_Screen": "CyberneticsCore",
-    "Build_Stargate_Screen": "Stargate",
-    "Build_ShieldBattery_Screen": "ShieldBattery",
-    "Train_Probe": "Probe",
-    "Train_Zealot": "Zealot",
-    "Train_Stalker": "Stalker",
-    "Train_Adept": "Adept",
-    "Train_Oracle": "Oracle",
-    "Train_Phoenix": "Phoenix",
-    "Train_VoidRay": "VoidRay",
-    "Research_WarpGate": "WarpGateResearch",
-}
-_IN_PROGRESS_ACTIONS: tuple[tuple[GoalRequirementKind, str, str], ...] = (
-    (GoalRequirementKind.STRUCTURE, "Pylon", "Build_Pylon_Screen"),
-    (GoalRequirementKind.STRUCTURE, "Gateway", "Build_Gateway_Screen"),
-    (
-        GoalRequirementKind.STRUCTURE,
-        "CyberneticsCore",
-        "Build_CyberneticsCore_Screen",
-    ),
-    (GoalRequirementKind.STRUCTURE, "Assimilator", "Build_Assimilator_Near"),
-    (GoalRequirementKind.STRUCTURE, "Nexus", "Build_Nexus_Near"),
-    (GoalRequirementKind.STRUCTURE, "Stargate", "Build_Stargate_Screen"),
-    (
-        GoalRequirementKind.STRUCTURE,
-        "ShieldBattery",
-        "Build_ShieldBattery_Screen",
-    ),
-    (GoalRequirementKind.UNIT, "Zealot", "Train_Zealot"),
-    (GoalRequirementKind.UNIT, "Stalker", "Train_Stalker"),
-    (GoalRequirementKind.UNIT, "Adept", "Train_Adept"),
-    (GoalRequirementKind.UNIT, "Oracle", "Train_Oracle"),
-    (GoalRequirementKind.UNIT, "Phoenix", "Train_Phoenix"),
-    (GoalRequirementKind.UNIT, "VoidRay", "Train_VoidRay"),
+_DEFENSIVE_ALERT_NAMES = frozenset(
+    {"underattack", "buildingunderattack", "unitunderattack"}
 )
+
+
+def _canonical_static(value: str) -> str:
+    return "".join(character for character in value.casefold() if character.isalnum())
+
+
+def _is_defensive_alert(value: str) -> bool:
+    return _canonical_static(value) in _DEFENSIVE_ALERT_NAMES
+
+
+@dataclass(frozen=True)
+class _CorpusRaceSemantics:
+    race: RaceId
+    profile: RaceProfileData
+    runtime_to_hima_short_action: Mapping[str, str]
+    in_progress_actions: tuple[tuple[GoalRequirementKind, str, str], ...]
+    production_structures: frozenset[str]
+    technology_structures: frozenset[str]
+    technology_actions: frozenset[str]
+    production_actions: frozenset[str]
+    production_readiness_structures: frozenset[str]
+
+
+_TECHNOLOGY_TARGET_OVERRIDES: Mapping[RaceId, frozenset[str]] = {
+    RaceId.PROTOSS: frozenset(
+        {
+            "cyberneticscore",
+            "forge",
+            "twilightcouncil",
+            "templararchive",
+            "darkshrine",
+            "roboticsbay",
+            "fleetbeacon",
+        }
+    ),
+    RaceId.TERRAN: frozenset(
+        {
+            "factory",
+            "starport",
+            "engineeringbay",
+            "barrackstechlab",
+            "factorytechlab",
+            "starporttechlab",
+        }
+    ),
+    RaceId.ZERG: frozenset(
+        {"lair", "hive", "evolutionchamber", "hydraliskden"}
+    ),
+}
+
+
+def _corpus_race_semantics(race: RaceId | str) -> _CorpusRaceSemantics:
+    profile = race_profile(race).data
+    technology_structures = _TECHNOLOGY_TARGET_OVERRIDES[profile.race]
+    specs_by_name = {spec.name: spec for spec in profile.progress_action_specs}
+    runtime_to_hima_short_action: dict[str, str] = {}
+    for mapping in profile.macro_action_mappings:
+        for runtime_action in mapping.runtime_actions:
+            spec = specs_by_name.get(runtime_action)
+            if spec is not None:
+                short_action = spec.effect_target
+                if runtime_action.startswith("Research_"):
+                    short_action = f"{short_action}Research"
+            else:
+                parts = runtime_action.split("_")
+                short_action = next(
+                    (
+                        part
+                        for part in parts[1:]
+                        if part not in {"Screen", "Near", "Minimap"}
+                    ),
+                    mapping.semantic_action.split(maxsplit=1)[-1],
+                )
+            runtime_to_hima_short_action[runtime_action] = short_action
+    in_progress_actions = tuple(
+        (spec.effect_kind, spec.effect_target, spec.name)
+        for spec in profile.progress_action_specs
+        if spec.effect_kind in {GoalRequirementKind.STRUCTURE, GoalRequirementKind.UNIT}
+    )
+    technology_actions = frozenset(
+        spec.name
+        for spec in profile.progress_action_specs
+        if profile.action_domains.get(spec.name) is ActionDomain.TECHNOLOGY
+        or _canonical_static(spec.effect_target) in technology_structures
+    )
+    production_actions = frozenset(
+        spec.name
+        for spec in profile.progress_action_specs
+        if profile.action_domains.get(spec.name) is ActionDomain.PRODUCTION
+        and spec.name not in technology_actions
+        and spec.name.startswith(("Train_", "Warp_"))
+    )
+    production_readiness_structures = frozenset(
+        _canonical_static(prerequisite.target)
+        for spec in profile.progress_action_specs
+        if spec.name in production_actions
+        for prerequisite in spec.prerequisites
+        if prerequisite.kind is GoalRequirementKind.STRUCTURE
+    )
+    return _CorpusRaceSemantics(
+        race=profile.race,
+        profile=profile,
+        runtime_to_hima_short_action=runtime_to_hima_short_action,
+        in_progress_actions=in_progress_actions,
+        production_structures=frozenset(
+            _canonical_static(structure) for structure in profile.production_structures
+        ),
+        technology_structures=technology_structures,
+        technology_actions=technology_actions,
+        production_actions=production_actions,
+        production_readiness_structures=production_readiness_structures,
+    )
+
+
+_PROTOSS_CORPUS_SEMANTICS = _corpus_race_semantics(RaceId.PROTOSS)
+# Compatibility aliases for the v0.2 Protoss corpus and existing callers.
+_PRODUCTION_STRUCTURES = _PROTOSS_CORPUS_SEMANTICS.production_structures
+_TECHNOLOGY_STRUCTURES = _PROTOSS_CORPUS_SEMANTICS.technology_structures
+_RUNTIME_TO_HIMA_SHORT_ACTION = dict(
+    _PROTOSS_CORPUS_SEMANTICS.runtime_to_hima_short_action
+)
+_IN_PROGRESS_ACTIONS = _PROTOSS_CORPUS_SEMANTICS.in_progress_actions
 
 
 class PolicyCorpusError(ValueError):
@@ -127,6 +201,7 @@ class PolicyCorpusSourceConfig(CorpusModel):
 class PolicyCorpusBuildConfig(CorpusModel):
     format_version: Literal["0.2"] = CORPUS_FORMAT_VERSION
     corpus_id: str = Field(default="protoss-v0.2", min_length=1, max_length=120)
+    race: RaceId = RaceId.PROTOSS
     protocol_version: Literal["1.1"] = CORPUS_PROTOCOL_VERSION
     fixtures_per_stratum: int = Field(default=8, ge=1)
     minimum_game_loop_gap: int = Field(default=224, ge=0)
@@ -172,6 +247,7 @@ class PolicyCorpusManifestSource(CorpusModel):
 class PolicyCorpusManifest(CorpusModel):
     format_version: Literal["0.2"] = CORPUS_FORMAT_VERSION
     corpus_id: str
+    race: RaceId = RaceId.PROTOSS
     protocol_version: Literal["1.1"] = CORPUS_PROTOCOL_VERSION
     fixtures_file: str = "fixtures.jsonl"
     fixture_count: int = Field(ge=0)
@@ -259,8 +335,17 @@ def build_policy_corpus(
 ) -> PolicyCorpusBuildResult:
     """Select balanced real observations and persist a deterministic corpus."""
 
-    sources = tuple(_load_source(source, base_dir=base_dir) for source in config.sources)
-    candidates = _collect_candidates(sources, protocol_version=config.protocol_version)
+    semantics = _corpus_race_semantics(config.race)
+    sources = tuple(
+        _load_source(source, semantics=semantics, base_dir=base_dir)
+        for source in config.sources
+    )
+    candidates = _collect_candidates(
+        sources,
+        protocol_version=config.protocol_version,
+        corpus_id=config.corpus_id,
+        semantics=semantics,
+    )
     selected = _select_balanced(candidates, config)
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -286,6 +371,7 @@ def build_policy_corpus(
     )
     manifest = PolicyCorpusManifest(
         corpus_id=config.corpus_id,
+        race=config.race,
         fixture_count=len(selected),
         fixtures_sha256=_sha256_bytes(fixture_bytes),
         fixtures_per_stratum=config.fixtures_per_stratum,
@@ -424,8 +510,10 @@ def _collect_candidates(
     sources: Sequence[_LoadedSource],
     *,
     protocol_version: str,
+    corpus_id: str,
+    semantics: _CorpusRaceSemantics,
 ) -> dict[PolicyFixtureStratum, list[_FixtureCandidate]]:
-    verifier = GoalProgressVerifier()
+    verifier = GoalProgressVerifier(action_specs=semantics.profile.progress_action_specs)
     candidates: dict[PolicyFixtureStratum, list[_FixtureCandidate]] = {
         stratum: [] for stratum in CORPUS_STRATA
     }
@@ -434,13 +522,14 @@ def _collect_candidates(
             observation = ObservationEnvelope.model_validate(event.payload)
             if observation.protocol_version != protocol_version:
                 continue
-            phase = _observation_phase(observation)
-            phase_goal = _phase_goal(verifier, observation, phase)
+            phase = _observation_phase(observation, semantics.race)
+            phase_goal = _phase_goal(verifier, observation, phase, semantics.race)
             phase_report = verifier.verify(observation, phase_goal)
             previous_actions = _previous_actions_for_observation(
                 source,
                 event,
                 observation,
+                semantics,
             )
             phase_classification = _classify_observation(
                 observation,
@@ -457,10 +546,11 @@ def _collect_candidates(
                     report=phase_report,
                     classification=phase_classification,
                     previous_actions=previous_actions,
+                    corpus_id=corpus_id,
                 )
             )
 
-            progress_goal = _in_progress_goal(observation, phase)
+            progress_goal = _in_progress_goal(observation, phase, semantics.race)
             if progress_goal is not None:
                 progress_report = verifier.verify(observation, progress_goal)
                 if progress_report.status is not GoalProgressStatus.IN_PROGRESS:
@@ -483,6 +573,7 @@ def _collect_candidates(
                         report=progress_report,
                         classification=progress_classification,
                         previous_actions=previous_actions,
+                        corpus_id=corpus_id,
                     )
                 )
             elif phase_report.status is GoalProgressStatus.BLOCKED:
@@ -501,6 +592,7 @@ def _collect_candidates(
                         report=phase_report,
                         classification=blocked_classification,
                         previous_actions=previous_actions,
+                        corpus_id=corpus_id,
                     )
                 )
     return candidates
@@ -515,6 +607,7 @@ def _make_candidate(
     report: GoalProgressReport,
     classification: _Classification,
     previous_actions: list[str],
+    corpus_id: str,
 ) -> _FixtureCandidate:
     observation_sha256 = _sha256_bytes(_canonical_json(observation.model_dump(mode="json")))
     fixture_source = PolicyFixtureSource(
@@ -530,7 +623,7 @@ def _make_candidate(
     )
     fixture = PolicyObservationFixture(
         fixture_id=(
-            f"protoss-v0.2:{classification.primary.value}:{source.config.source_id}:"
+            f"{corpus_id}:{classification.primary.value}:{source.config.source_id}:"
             f"event-{event.event_id}"
         ),
         observation=observation,
@@ -731,7 +824,7 @@ def _classify_observation(
         if _canonical(unit.status or "") in _IN_PROGRESS_STATUSES
     ]
     defensive_alerts = [
-        alert for alert in observation.alerts if "under_attack" in _canonical(alert)
+        alert for alert in observation.alerts if _is_defensive_alert(alert)
     ]
     condition_tags = [report.status.value]
     if report.defensive_hold_required:
@@ -772,33 +865,46 @@ def _classify_observation(
     )
 
 
-def _observation_phase(observation: ObservationEnvelope) -> PolicyFixtureStratum:
+def _observation_phase(
+    observation: ObservationEnvelope,
+    race: RaceId = RaceId.PROTOSS,
+) -> PolicyFixtureStratum:
     """Assign one deterministic strategic phase without using combat-unit presence."""
 
+    semantics = _corpus_race_semantics(race)
     action_names = {action.name for action in observation.available_actions}
     structure_names = {
         _canonical(structure.unit_type) for structure in observation.state.own_structures
     }
-    defensive_alert = any("under_attack" in _canonical(alert) for alert in observation.alerts)
+    completed_structure_names = {
+        _canonical(structure.unit_type)
+        for structure in observation.state.own_structures
+        if _canonical(structure.status or "") not in _IN_PROGRESS_STATUSES
+    }
+    defensive_alert = any(_is_defensive_alert(alert) for alert in observation.alerts)
     if observation.state.visible_enemies or "Attack_Unit" in action_names or defensive_alert:
         return PolicyFixtureStratum.COMBAT
-    if (
-        observation.state.upgrades
-        or structure_names & _TECHNOLOGY_STRUCTURES
-        or any(name.startswith("Research_") or "CyberneticsCore" in name for name in action_names)
-    ):
+    has_incomplete_technology_structure = any(
+        _canonical(structure.unit_type) in semantics.technology_structures
+        and _canonical(structure.status or "") in _IN_PROGRESS_STATUSES
+        for structure in observation.state.own_structures
+    )
+    if action_names & semantics.technology_actions or has_incomplete_technology_structure:
         return PolicyFixtureStratum.TECHNOLOGY
     has_incomplete_production_structure = any(
-        _canonical(structure.unit_type) in _PRODUCTION_STRUCTURES
+        _canonical(structure.unit_type) in semantics.production_structures
         and _canonical(structure.status or "") in _IN_PROGRESS_STATUSES
         for structure in observation.state.own_structures
     )
     if (
         observation.state.production_queue
-        or any(name.startswith(("Train_", "Warp_")) for name in action_names)
+        or action_names & semantics.production_actions
         or has_incomplete_production_structure
+        or completed_structure_names & semantics.production_readiness_structures
     ):
         return PolicyFixtureStratum.PRODUCTION
+    if observation.state.upgrades or structure_names & semantics.technology_structures:
+        return PolicyFixtureStratum.TECHNOLOGY
     return PolicyFixtureStratum.EARLY
 
 
@@ -806,6 +912,7 @@ def _phase_goal(
     verifier: GoalProgressVerifier,
     observation: ObservationEnvelope,
     phase: PolicyFixtureStratum,
+    race: RaceId = RaceId.PROTOSS,
 ) -> GoalSpec:
     """Choose one measurable next-state goal appropriate to the assigned phase."""
 
@@ -815,53 +922,107 @@ def _phase_goal(
         if _canonical(structure.status or "") not in _IN_PROGRESS_STATUSES
     }
     upgrades = {_canonical(upgrade) for upgrade in observation.state.upgrades}
-    if phase is PolicyFixtureStratum.EARLY:
-        if "pylon" not in completed_structures:
-            action = "Build_Pylon_Screen"
-            use_baseline = False
-        elif "gateway" not in completed_structures:
-            action = "Build_Gateway_Screen"
-            use_baseline = False
-        else:
-            action = "Train_Zealot"
-            use_baseline = True
-    elif phase is PolicyFixtureStratum.TECHNOLOGY:
-        if "cyberneticscore" not in completed_structures:
-            action = "Build_CyberneticsCore_Screen"
-            use_baseline = False
-        elif "warpgate" not in upgrades and "warpgateresearch" not in upgrades:
-            action = "Research_WarpGate"
-            use_baseline = False
-        else:
-            action = "Train_Stalker"
-            use_baseline = True
-    elif phase is PolicyFixtureStratum.PRODUCTION:
-        action = "Train_Stalker"
-        use_baseline = True
-    elif phase is PolicyFixtureStratum.COMBAT:
-        action = "Train_Stalker" if "cyberneticscore" in completed_structures else "Train_Zealot"
-        use_baseline = True
-    else:
-        raise ValueError(f"unsupported policy corpus phase: {phase.value}")
+    action, use_baseline = _phase_action(
+        race,
+        phase,
+        completed_structures=completed_structures,
+        upgrades=upgrades,
+        defensive_hold=any(_is_defensive_alert(alert) for alert in observation.alerts),
+    )
     return verifier.goal_from_action_names(
-        goal_id=f"protoss-{phase.value}-next-v1",
+        goal_id=f"{race.value}-{phase.value}-next-v1",
         strategic_goal=f"Advance the {phase.value} phase with {action}",
         action_names=[action],
         observation=observation if use_baseline else None,
     )
 
 
+def _phase_action(
+    race: RaceId,
+    phase: PolicyFixtureStratum,
+    *,
+    completed_structures: set[str],
+    upgrades: set[str],
+    defensive_hold: bool,
+) -> tuple[str, bool]:
+    if phase not in _CONDITION_PHASES:
+        raise ValueError(f"unsupported policy corpus phase: {phase.value}")
+    if race is RaceId.PROTOSS:
+        if phase is PolicyFixtureStratum.EARLY:
+            if "pylon" not in completed_structures:
+                return "Build_Pylon_Screen", False
+            if "gateway" not in completed_structures:
+                return "Build_Gateway_Screen", False
+            return "Train_Zealot", True
+        if phase is PolicyFixtureStratum.TECHNOLOGY:
+            if "cyberneticscore" not in completed_structures:
+                return "Build_CyberneticsCore_Screen", False
+            if "warpgate" not in upgrades and "warpgateresearch" not in upgrades:
+                return "Research_WarpGate", False
+            return "Train_Stalker", True
+        if phase is PolicyFixtureStratum.PRODUCTION:
+            return "Train_Stalker", True
+        if defensive_hold:
+            return "Build_ShieldBattery_Screen", False
+        action = (
+            "Train_Stalker" if "cyberneticscore" in completed_structures else "Train_Zealot"
+        )
+        return action, True
+    if race is RaceId.TERRAN:
+        if phase is PolicyFixtureStratum.EARLY:
+            if "supplydepot" not in completed_structures:
+                return "Build_SupplyDepot_Screen", False
+            if "barracks" not in completed_structures:
+                return "Build_Barracks_Screen", False
+            return "Train_Marine", True
+        if phase is PolicyFixtureStratum.TECHNOLOGY:
+            if "factory" not in completed_structures:
+                return "Build_Factory_Screen", False
+            if "starport" not in completed_structures:
+                return "Build_Starport_Screen", False
+            return "Train_SiegeTank", True
+        if phase is PolicyFixtureStratum.PRODUCTION:
+            return "Train_SiegeTank" if "factory" in completed_structures else "Train_Marine", True
+        return ("Build_Bunker_Screen", False) if defensive_hold else ("Train_Marine", True)
+    if phase is PolicyFixtureStratum.EARLY:
+        if "spawningpool" not in completed_structures:
+            return "Build_SpawningPool_Screen", False
+        return "Train_Zergling", True
+    if phase is PolicyFixtureStratum.TECHNOLOGY:
+        if "lair" not in completed_structures and "hive" not in completed_structures:
+            return "Morph_Lair", False
+        if "hydraliskden" not in completed_structures:
+            return "Build_HydraliskDen_Screen", False
+        return "Train_Hydralisk", True
+    if phase is PolicyFixtureStratum.PRODUCTION:
+        return (
+            ("Train_Roach", True)
+            if "roachwarren" in completed_structures
+            else ("Train_Zergling", True)
+        )
+    if defensive_hold:
+        return "Build_SpineCrawler_Screen", False
+    return (
+        ("Train_Roach", True)
+        if "roachwarren" in completed_structures
+        else ("Train_Zergling", True)
+    )
+
+
 def _in_progress_goal(
     observation: ObservationEnvelope,
     phase: PolicyFixtureStratum,
+    race: RaceId = RaceId.PROTOSS,
 ) -> GoalSpec | None:
     """Describe a real observed construction, unit, or queue item as a goal."""
 
-    for kind, target, action_name in _IN_PROGRESS_ACTIONS:
+    semantics = _corpus_race_semantics(race)
+    for kind, target, action_name in semantics.in_progress_actions:
         completed, incomplete = _effect_counts(observation, kind, target)
         if incomplete:
             return _single_requirement_goal(
                 phase=phase,
+                race=race,
                 kind=kind,
                 target=target,
                 required_count=completed + 1,
@@ -875,6 +1036,7 @@ def _in_progress_goal(
     )[0]
     return _single_requirement_goal(
         phase=phase,
+        race=race,
         kind=GoalRequirementKind.UNIT,
         target=item.name,
         required_count=1,
@@ -885,6 +1047,7 @@ def _in_progress_goal(
 def _single_requirement_goal(
     *,
     phase: PolicyFixtureStratum,
+    race: RaceId,
     kind: GoalRequirementKind,
     target: str,
     required_count: int,
@@ -892,7 +1055,7 @@ def _single_requirement_goal(
 ) -> GoalSpec:
     canonical_target = _canonical(target)
     return GoalSpec(
-        goal_id=f"protoss-{phase.value}-in-progress-{canonical_target}-v1",
+        goal_id=f"{race.value}-{phase.value}-in-progress-{canonical_target}-v1",
         strategic_goal=f"Complete the in-progress {target}",
         requirements=[
             GoalRequirement(
@@ -930,6 +1093,7 @@ def _verify_fixtures(
     manifest: PolicyCorpusManifest,
     errors: list[str],
 ) -> None:
+    semantics = _corpus_race_semantics(manifest.race)
     if len(fixtures) != manifest.fixture_count:
         errors.append(
             f"fixture count {len(fixtures)} does not match manifest {manifest.fixture_count}"
@@ -948,7 +1112,7 @@ def _verify_fixtures(
     episode_counts: Counter[tuple[PolicyFixtureStratum, str, str]] = Counter()
     loops: dict[tuple[PolicyFixtureStratum, str, str], list[int]] = defaultdict(list)
     stratum_episodes: dict[PolicyFixtureStratum, set[tuple[str, str]]] = defaultdict(set)
-    verifier = GoalProgressVerifier()
+    verifier = GoalProgressVerifier(action_specs=semantics.profile.progress_action_specs)
     for fixture in fixtures:
         observation = fixture.observation
         stratum = fixture.primary_stratum
@@ -966,7 +1130,7 @@ def _verify_fixtures(
         if fixture.state_fingerprint != state_fingerprint(observation):
             errors.append(f"{fixture.fixture_id}: state fingerprint mismatch")
         unknown_previous_actions = set(fixture.previous_actions) - set(
-            _RUNTIME_TO_HIMA_SHORT_ACTION.values()
+            semantics.runtime_to_hima_short_action.values()
         )
         if unknown_previous_actions:
             errors.append(
@@ -999,12 +1163,12 @@ def _verify_fixtures(
             errors.append(f"{fixture.fixture_id}: condition tag is not a strategic phase")
             continue
         if stratum is PolicyFixtureStratum.IN_PROGRESS:
-            expected_goal = _in_progress_goal(observation, phase)
+            expected_goal = _in_progress_goal(observation, phase, manifest.race)
             if expected_goal is None:
                 errors.append(f"{fixture.fixture_id}: no in-progress state evidence remains")
                 continue
         else:
-            expected_goal = _phase_goal(verifier, observation, phase)
+            expected_goal = _phase_goal(verifier, observation, phase, manifest.race)
         expected_report = verifier.verify(observation, expected_goal)
         if fixture.goal_spec != expected_goal or fixture.goal_progress != expected_report:
             errors.append(f"{fixture.fixture_id}: goal progress is not deterministic")
@@ -1100,6 +1264,7 @@ def _verify_source_journals(
     fixtures: Sequence[PolicyObservationFixture],
     errors: list[str],
 ) -> None:
+    semantics = _corpus_race_semantics(manifest.race)
     fixtures_by_journal: dict[str, list[PolicyObservationFixture]] = defaultdict(list)
     for fixture in fixtures:
         if fixture.source is not None:
@@ -1132,7 +1297,8 @@ def _verify_source_journals(
             successful_executions=tuple(
                 event
                 for event in source_events
-                if event.event_type == "execution" and _successful_hima_action(event) is not None
+                if event.event_type == "execution"
+                and _successful_hima_action(event, semantics) is not None
             ),
         )
         if len(observations) != source.observation_count:
@@ -1156,6 +1322,7 @@ def _verify_source_journals(
                 loaded_source,
                 event,
                 observation,
+                semantics,
             )
             if fixture.previous_actions != expected_previous_actions:
                 errors.append(f"{fixture.fixture_id}: previous action history changed")
@@ -1166,6 +1333,7 @@ def _verify_source_journals(
 def _load_source(
     config: PolicyCorpusSourceConfig,
     *,
+    semantics: _CorpusRaceSemantics,
     base_dir: Path | None,
 ) -> _LoadedSource:
     path = _expand_path(config.journal_path, base_dir=base_dir)
@@ -1184,7 +1352,8 @@ def _load_source(
         successful_executions=tuple(
             event
             for event in events
-            if event.event_type == "execution" and _successful_hima_action(event) is not None
+            if event.event_type == "execution"
+            and _successful_hima_action(event, semantics) is not None
         ),
     )
 
@@ -1193,6 +1362,7 @@ def _previous_actions_for_observation(
     source: _LoadedSource,
     observation_event: StoredEvent,
     observation: ObservationEnvelope,
+    semantics: _CorpusRaceSemantics,
 ) -> list[str]:
     earliest_loop = max(
         0,
@@ -1205,7 +1375,7 @@ def _previous_actions_for_observation(
             or execution_event.episode_id != observation.episode_id
         ):
             continue
-        normalized = _successful_hima_action(execution_event)
+        normalized = _successful_hima_action(execution_event, semantics)
         if normalized is None:
             continue
         game_loop, action = normalized
@@ -1220,14 +1390,17 @@ def _previous_actions_for_observation(
     return [action for _, _, action in sorted(actions)]
 
 
-def _successful_hima_action(event: StoredEvent) -> tuple[int, str] | None:
+def _successful_hima_action(
+    event: StoredEvent,
+    semantics: _CorpusRaceSemantics,
+) -> tuple[int, str] | None:
     try:
         report = ExecutionReport.model_validate(event.payload)
     except ValueError:
         return None
     if not report.success or report.action_name is None:
         return None
-    action = _RUNTIME_TO_HIMA_SHORT_ACTION.get(report.action_name)
+    action = semantics.runtime_to_hima_short_action.get(report.action_name)
     if action is None:
         return None
     game_loops = [

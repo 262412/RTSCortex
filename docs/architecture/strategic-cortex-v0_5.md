@@ -47,16 +47,17 @@ not perform strategic reasoning.
 | Fixed HIMA a/b/c vocabulary, parser and adapter | Ready | Ready | Ready |
 | Local-only a/b/c checkpoint validation | Ready | Ready | Ready |
 | Offline three-member inference smoke | Ready | Ready | Ready |
-| RaceProfile macro contract | Ready | Partial | Partial |
-| Runtime action mapping | Ready for current Simple64 frontier | Partial, offline only | Partial, offline only |
-| Live LLM-PySC2 Worker | Ready | Not implemented | Not implemented |
-| Effect verification | Build, production and move | Add-on, research and morph missing | Larva, inject, creep and morph missing |
-| Live 48-state corpus and seed regression | Existing Protoss path | Not built | Not built |
+| RaceProfile macro contract | Ready | Ready | Ready |
+| Runtime action mapping | Ready | Ready for current Simple64 frontier | Ready for current Simple64 frontier |
+| Live LLM-PySC2 Worker | Ready | Ready | Ready |
+| Effect verification | Build, production and move | Build, production, add-on and move | Build, production, morph, inject and move |
+| Live 48-state corpus | Protoss v0.2 | Source coverage incomplete | Zerg v0.3 |
+| Seeds 0/1/2 engineering regression | Ready | Ready | Ready |
 
-The pinned LLM-PySC2 Worker is Protoss-specific. RTSCortex therefore rejects Terran or Zerg
-with `environment.adapter: llm_pysc2` instead of pretending that an offline HIMA proposal is a
-playable race. Terran and Zerg live support must be added race-by-race without changing the
-shared Cortex runtime.
+The pinned LLM-PySC2 environment remains unchanged, while reviewed Bridge adapters provide
+race-specific observation, actor routing and action/effect semantics. All three races use the
+same Cortex runtime. Current explicit gaps are Terran research/morph verification, chained
+Zerg creep spread, a complete Terran corpus, and the 27-match tactical-quality suite.
 
 The installed specialist checkpoints are pinned and loaded with `local_files_only=True`:
 
@@ -135,11 +136,11 @@ intent, arbitration decision, Playbook rules, candidate and terminal execution r
    2; verify deterministic replay, reservations, ownership and no command-success regression.
 2. Promote the Arbiter to active only after the shadow engineering gates pass.
 3. Run paired Playbook on/off seeds; promote only the rules that satisfy the published gates.
-4. Implement and verify the Terran Worker, add-on/research effects and a 48-state corpus.
-5. Run Terran smoke and seed regression before starting Zerg Worker work.
-6. Implement Zerg larva, inject, creep and morph provenance/effects, then build its corpus and
-   run the same gates.
-7. Only after all three races pass engineering gates, run the 27-match tactical-quality suite.
+4. Completed: Terran Worker, add-on effects, smoke and seed regression.
+5. Completed: Zerg larva, inject, creep/morph provenance, seed regression, and 48-state corpus.
+6. Capture the missing real Terran blocked-production and blocked-combat states, then
+   materialize and verify its 48-state corpus.
+7. Complete the remaining race-effect gaps, then run the 27-match tactical-quality suite.
 
 This order intentionally keeps “model can produce a proposal” separate from “the race is safe
 to execute in PySC2.”

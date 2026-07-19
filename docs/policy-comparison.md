@@ -6,7 +6,8 @@ sent to Runtime, Bridge, PySC2, or StarCraft II.
 
 ## Corpus
 
-The checked-in Protoss corpus contains 48 real protocol v1.1 observations: eight each for
+The checked-in Protoss and Zerg corpora each contain 48 real protocol v1.1 observations:
+eight each for
 `early`, `technology`, `production`, `combat`, `blocked`, and `in_progress`. Blocked and
 in-progress fixtures retain their underlying phase tag, deterministic goal evidence,
 source journal hash, state fingerprint, and successful HIMA-compatible actions from the
@@ -17,6 +18,8 @@ Verify the materialized corpus without requiring its original journals:
 ```bash
 uv run rtscortex policy-corpus verify \
   benchmarks/policy/protoss_v0_2/manifest.yaml
+uv run rtscortex policy-corpus verify \
+  benchmarks/policy/zerg_v0_3/manifest.yaml
 ```
 
 On the compute-center host, also verify every source journal:
@@ -37,6 +40,18 @@ uv run rtscortex policy-corpus build \
 
 The builder fails rather than using synthetic states when any stratum, seed, episode,
 game-loop spacing, fingerprint, or blocked/in-progress phase quota cannot be met.
+Corpus configs and manifests carry an explicit `race`; manifests created before that field
+default to Protoss. Phase detection, goal progress, in-progress effects, and HIMA
+`previous_action` projection all come from the active `RaceProfile`. Economy-only actions such
+as `Train_Drone` do not by themselves turn a Zerg opening into a production fixture, while a
+completed army prerequisite such as `SpawningPool` makes resource-blocked production
+representable.
+
+The Terran source pool is recorded in
+`configs/policy/corpus_sources_terran_v0_3.yaml`, but it intentionally has no checked-in
+manifest yet: the available real journals do not satisfy the two-fixture blocked-production
+and blocked-combat phase quotas. The strict builder reports this gap instead of fabricating
+states or reducing the quota.
 
 ## Offline workflow smoke
 

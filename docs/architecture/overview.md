@@ -179,10 +179,9 @@ cannot outrank another member with a valid Runtime frontier. RTSCortex does not 
 mapping for model-specific placeholders such as `supply:12` or skip an invalid earlier step.
 
 The public race-brain catalog covers the nine released HIMA checkpoints: Protoss, Terran,
-and Zerg `a/b/c`. Live v0.4 dispatch is intentionally restricted to Protoss because the
-current HIMA observation vocabulary and RTSCortex macro-action mapping are Protoss-specific.
-A Terran or Zerg ensemble configuration fails before model startup with an explicit missing
-adapter/mapping error; registration is not presented as execution support.
+and Zerg `a/b/c`. The active `RaceProfile` now supplies each race's HIMA observation contract,
+macro mapping, actor routing, prerequisites, and effect semantics, so all three ensembles can
+dispatch through the shared Cortex runtime. Only the configured player race is loaded.
 
 CortexPlaybook is a separate cross-run SQLite database. Post-game review stores macro and tactical
 decision with source run, command lineage, effect evidence, consequence, failure owner, and
