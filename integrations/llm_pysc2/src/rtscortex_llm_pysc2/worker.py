@@ -205,6 +205,7 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
         self._rtscortex_translation_attempt: Optional[dict[str, Any]] = None
         self._rtscortex_semantic_action: Optional[dict[str, Any]] = None
         self._rtscortex_production_source_tag: Optional[int] = None
+        self._rtscortex_production_navigation_tag: Optional[int] = None
         self._rtscortex_production_camera_waits = 0
         self._rtscortex_production_camera_wait_loop: Optional[int] = None
         self._rtscortex_production_selection_loop: Optional[int] = None
@@ -233,6 +234,7 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
             next_action_name = str(self.action_list[0].get("name", ""))
             if _source_action_spec(next_action_name) is None:
                 self._rtscortex_production_source_tag = None
+                self._rtscortex_production_navigation_tag = None
         action: dict[str, Any] = (
             semantic_action
             if semantic_action is not None
@@ -460,7 +462,9 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
         self._prefer_available_generic_addon_function(semantic_action_name, obs)
         candidate_action = copy.deepcopy(action)
         self._rtscortex_translation_attempt = None
-        if _is_worker_owned_near_build_final_primitive(self, semantic_action_name):
+        if _is_worker_owned_larva_selection(self, semantic_action_name):
+            result = _translate_worker_owned_zero_argument_primitive(self, obs)
+        elif _is_worker_owned_near_build_final_primitive(self, semantic_action_name):
             result = _translate_worker_owned_near_build_primitive(self, obs)
         else:
             result = super().get_func(obs)
@@ -508,7 +512,10 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
         if (
             source_spec is not None
             and accepted
-            and requested_id == 2
+            and _selection_primitive_starts_production_barrier(
+                action_name,
+                requested_id,
+            )
             and not final_primitive
         ):
             self._rtscortex_production_selection_loop = _observation_game_loop(
@@ -678,6 +685,7 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
         if dispatch.final_primitive:
             self._rtscortex_semantic_action = None
             self._rtscortex_production_source_tag = None
+            self._rtscortex_production_navigation_tag = None
             self._rtscortex_production_camera_waits = 0
             self._rtscortex_production_camera_wait_loop = None
             self._rtscortex_production_selection_loop = None
@@ -720,11 +728,24 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
             raise RuntimeError("production chain lacks producer provenance")
         actions = importlib.import_module("pysc2.lib.actions")
         semantic_action = self.action_list.pop(0)
-        self.func_list = [
-            (573, actions.FUNCTIONS.llm_pysc2_move_camera, (int(producer_tag),)),
-            (2, actions.FUNCTIONS.select_point, ("select", int(producer_tag))),
-            *list(action.get("func", semantic_action.get("func", ()))),
-        ]
+        direct_production_spec = production_spec(str(action.get("name", "")))
+        action_functions = list(action.get("func", semantic_action.get("func", ())))
+        if direct_production_spec is not None and direct_production_spec.producer_consumed:
+            navigation_tag = self._rtscortex_production_navigation_tag
+            if navigation_tag is None:
+                raise RuntimeError("larva production chain lacks a townhall navigation tag")
+            self.func_list = [
+                (573, actions.FUNCTIONS.llm_pysc2_move_camera, (int(navigation_tag),)),
+                (2, actions.FUNCTIONS.select_point, ("select", int(navigation_tag))),
+                (9, actions.FUNCTIONS.select_larva, ()),
+                *action_functions,
+            ]
+        else:
+            self.func_list = [
+                (573, actions.FUNCTIONS.llm_pysc2_move_camera, (int(producer_tag),)),
+                (2, actions.FUNCTIONS.select_point, ("select", int(producer_tag))),
+                *action_functions,
+            ]
         self._rtscortex_translation_ordinal = 0
         self._rtscortex_translation_total = len(self.func_list)
         self.curr_action_name = str(action.get("name", ""))
@@ -758,7 +779,10 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
         next_function_id = int(self.func_list[0][0])
         if next_function_id != 2 or int(self._rtscortex_translation_ordinal) != 1:
             return False
-        producer_tag = self._rtscortex_production_source_tag
+        producer_tag = (
+            self._rtscortex_production_navigation_tag
+            or self._rtscortex_production_source_tag
+        )
         if producer_tag is None:
             return False
         if _producer_is_visible(
@@ -794,18 +818,54 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
 
         if _source_action_spec(action_name) is None or not self.func_list:
             return False
-        if int(self._rtscortex_translation_ordinal) != 2:
-            return False
         selected_loop = self._rtscortex_production_selection_loop
         if selected_loop is None:
             return False
         if _observation_game_loop(obs.observation) <= selected_loop:
             return True
         producer_tag = self._rtscortex_production_source_tag
-        if producer_tag is not None and _producer_is_selected(
-            obs.observation,
-            producer_tag,
+        source_spec = _source_action_spec(action_name)
+        selected_tags = (
+            ()
+            if source_spec is None
+            else _selected_production_source_tags(
+                obs.observation,
+                producer_type=source_spec.producer_type,
+                unit_names=self.unit_names,
+            )
+        )
+        selected_tag: Optional[int] = None
+        direct_production_spec = production_spec(action_name)
+        available_function_ids = {
+            int(value)
+            for value in _observation_value(obs.observation, "available_actions", ())
+        }
+        final_function_id = int(self.func_list[0][0])
+        consumed_production_is_available = (
+            direct_production_spec is not None
+            and direct_production_spec.producer_consumed
+            and final_function_id in available_function_ids
+        )
+        if (
+            direct_production_spec is not None
+            and direct_production_spec.producer_consumed
+            and (selected_tags or consumed_production_is_available)
         ):
+            if producer_tag is not None and (
+                producer_tag in selected_tags or consumed_production_is_available
+            ):
+                selected_tag = producer_tag
+            elif selected_tags:
+                selected_tag = selected_tags[0]
+        elif len(selected_tags) == 1:
+            selected_tag = selected_tags[0]
+        if selected_tag is not None:
+            if producer_tag is not None and selected_tag != producer_tag:
+                self._rtscortex_last_production_source_rebind = (
+                    producer_tag,
+                    selected_tag,
+                )
+            self._rtscortex_production_source_tag = selected_tag
             self._rtscortex_production_selection_loop = None
             self._rtscortex_production_selection_attempts = 0
         return False
@@ -819,10 +879,28 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
 
         if _source_action_spec(action_name) is None or not self.func_list:
             return None
-        if int(self._rtscortex_translation_ordinal) != 2:
-            return None
         if self._rtscortex_production_selection_loop is None:
             return None
+        direct_production_spec = production_spec(action_name)
+        if direct_production_spec is not None and direct_production_spec.producer_consumed:
+            if self._rtscortex_production_selection_attempts >= PRODUCTION_SELECTION_MAX_ATTEMPTS:
+                self._settle_production_command_failure(
+                    action_name,
+                    obs,
+                    failure_code="production_source_not_selected",
+                    reason=(
+                        "select_larva did not expose the requested train capability after "
+                        f"{self._rtscortex_production_selection_attempts + 1} attempts"
+                    ),
+                )
+                self._rtscortex_camera_settlement_noop = True
+                return 0, _no_op()
+            self._rtscortex_production_selection_attempts += 1
+            self._rtscortex_production_selection_loop = _observation_game_loop(
+                obs.observation
+            )
+            actions = importlib.import_module("pysc2.lib.actions")
+            return 9, actions.FUNCTIONS.select_larva()
         producer_tag = self._rtscortex_production_source_tag
         position = _production_reselection_position(
             obs.observation,
@@ -877,7 +955,30 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
         source_tag = self._rtscortex_production_source_tag
         ordinal = int(attempt.get("ordinal", 0))
         requested_id = int(attempt.get("requested_function_id", 0))
+        direct_production_spec = production_spec(action_name)
+        if (
+            direct_production_spec is not None
+            and direct_production_spec.producer_consumed
+            and requested_id == 9
+        ):
+            if source_tag is None:
+                return None, (
+                    f"{source_kind}_provenance_missing",
+                    f"{source_kind} select_larva primitive has no preflight source anchor",
+                )
+            return source_tag, None
         if ordinal == 0:
+            if (
+                direct_production_spec is not None
+                and direct_production_spec.producer_consumed
+                and requested_id == 573
+            ):
+                if source_tag is None:
+                    return None, (
+                        f"{source_kind}_provenance_missing",
+                        f"{source_kind} camera primitive has no preflight source anchor",
+                    )
+                return source_tag, None
             requested_arguments = attempt.get("requested_arguments")
             translator_source_tag = (
                 int(requested_arguments[0])
@@ -922,6 +1023,21 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
                 {},
             ).get(action_name, ()),
         )
+        direct_production_spec = production_spec(action_name)
+        if (
+            source_tag is not None
+            and direct_production_spec is not None
+            and direct_production_spec.producer_consumed
+        ):
+            navigation_tag = _zerg_larva_townhall_tag(
+                obs.observation,
+                larva_tag=source_tag,
+                unit_names=self.unit_names,
+            )
+            if navigation_tag is None:
+                source_tag = None
+            else:
+                self._rtscortex_production_navigation_tag = navigation_tag
         if source_tag is not None:
             if is_source_bound_action(action_name):
                 self._rtscortex_production_source_tag = source_tag
@@ -983,6 +1099,7 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
         self.func_list.clear()
         self._rtscortex_semantic_action = None
         self._rtscortex_production_source_tag = None
+        self._rtscortex_production_navigation_tag = None
         self._rtscortex_production_camera_waits = 0
         self._rtscortex_production_camera_wait_loop = None
         self._rtscortex_production_selection_loop = None
@@ -1084,6 +1201,7 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
         if _is_terminal(obs):
             return _finish_terminal(self, obs, _base_agent_step, _no_op)
         _rebind_builder_to_selected_worker(self, obs.observation)
+        _refresh_consumed_zerg_builder(self, obs.observation)
         observation_loop = _observation_game_loop(obs.observation)
         # RTSCortex consumes a global raw snapshot. Do not make every Runtime tick
         # wait for optional upstream camera/selection-based text gathering.
@@ -1222,9 +1340,12 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
                             ).add(world_target)
         elif (
             dispatch.origin in {"translator", "orchestration"}
-            and dispatch.requested_function_id == 2
             and not dispatch.final_primitive
             and self._pending_primitive_agent is not None
+            and _selection_primitive_starts_production_barrier(
+                self._pending_primitive_agent.curr_action_name,
+                int(dispatch.requested_function_id or 0),
+            )
             and (
                 production_spec(self._pending_primitive_agent.curr_action_name) is not None
                 or addon_spec(self._pending_primitive_agent.curr_action_name) is not None
@@ -1824,6 +1945,83 @@ def _rebind_builder_to_selected_worker(main_agent: Any, observation: Any) -> boo
     return True
 
 
+def _refresh_consumed_zerg_builder(main_agent: Any, observation: Any) -> bool:
+    """Replace a Drone that morphed into a Zerg structure without a long actor gap."""
+
+    settings = getattr(main_agent, "worker_settings", None)
+    if str(getattr(settings, "agent_race", "")).casefold() != "zerg":
+        return False
+    agents = getattr(main_agent, "agents", {})
+    if not isinstance(agents, Mapping):
+        return False
+    builder = agents.get("Builder")
+    if builder is None:
+        return False
+    teams = [team for team in getattr(builder, "teams", ()) if isinstance(team, dict)]
+    if len(teams) != 1:
+        return False
+    team = teams[0]
+    unit_names = getattr(
+        getattr(getattr(main_agent, "decision_broker", None), "extractor", None),
+        "unit_names",
+        {},
+    )
+    raw_units = list(_observation_value(observation, "raw_units", ()))
+    live_drones = {
+        int(_observation_value(unit, "tag", 0)): unit
+        for unit in raw_units
+        if int(_observation_value(unit, "alliance", 0)) == 1
+        and _worker_unit_name(unit, unit_names) == "Drone"
+        and int(_observation_value(unit, "tag", 0)) > 0
+    }
+    configured_tags = [int(tag) for tag in team.get("unit_tags", ()) if int(tag) > 0]
+    if any(tag in live_drones for tag in configured_tags):
+        return False
+
+    gas_worker_tags = {
+        int(tag)
+        for info in getattr(main_agent, "nexus_info_dict", {}).values()
+        for key in ("worker_g_tag_list", "worker_g1_tag_list", "worker_g2_tag_list")
+        for tag in info.get(key, ())
+    }
+    mineral_worker_tags = {
+        int(tag)
+        for info in getattr(main_agent, "nexus_info_dict", {}).values()
+        for tag in info.get("worker_m_tag_list", ())
+    }
+    eligible_tags = sorted(set(live_drones) - gas_worker_tags)
+    mineral_candidates = sorted(set(eligible_tags) & mineral_worker_tags)
+    replacement_tag = next(iter(mineral_candidates or eligible_tags), None)
+    if replacement_tag is None:
+        return False
+
+    team_name = str(team.get("name", ""))
+    old_tags = set(configured_tags)
+    team["unit_tags"] = [replacement_tag]
+    team["unit_tags_selected"] = []
+    team["obs"] = []
+    team["pos"] = []
+    team["minimap_pos"] = []
+    builder.unit_tag_list = [
+        tag
+        for tag in getattr(builder, "unit_tag_list", ())
+        if int(tag) not in old_tags and int(tag) != replacement_tag
+    ]
+    builder.unit_tag_list.append(replacement_tag)
+    builder.unit_raw_list = [live_drones[replacement_tag]]
+    builder.team_unit_obs_list = []
+    builder.team_unit_tag_list = [replacement_tag]
+    builder.team_unit_team_list = [team_name]
+    builder.team_unit_tag_curr = None
+    builder.team_unit_team_curr = None
+    builder.enable = True
+    builder._rtscortex_last_consumed_builder_refresh = (
+        tuple(sorted(old_tags)),
+        replacement_tag,
+    )
+    return True
+
+
 def _release_runtime_observation_barrier(main_agent: Any) -> None:
     """Let current raw state reach Runtime when optional team selection stalls."""
 
@@ -1892,6 +2090,11 @@ def _execution_unit_tag(agent: Any) -> Optional[int]:
     return None if value is None else int(value)
 
 
+def _worker_unit_name(unit: Any, unit_names: Mapping[int, str]) -> str:
+    value = _observation_value(unit, "unit_type", "")
+    return str(value) if isinstance(value, str) else unit_names.get(int(value), f"unit:{value}")
+
+
 def _worker_player_race(agent: Any) -> str:
     explicit_race = getattr(agent, "rtscortex_player_race", None)
     if explicit_race is not None:
@@ -1907,6 +2110,16 @@ def _requires_explicit_production_chain(action_name: str) -> bool:
     return spec is not None and spec.race != "protoss"
 
 
+def _selection_primitive_starts_production_barrier(
+    action_name: str,
+    function_id: int,
+) -> bool:
+    spec = production_spec(action_name)
+    if spec is not None and spec.producer_consumed:
+        return function_id == 9
+    return function_id == 2
+
+
 def _source_action_spec(action_name: str) -> Optional[_SourceActionSpec]:
     return production_spec(action_name) or addon_spec(action_name) or morph_spec(action_name)
 
@@ -1919,6 +2132,53 @@ def _is_worker_owned_near_build_final_primitive(agent: Any, action_name: str) ->
         return False
     function_id = int(agent.func_list[0][0])
     return function_id not in {0, 573}
+
+
+def _is_worker_owned_larva_selection(agent: Any, action_name: str) -> bool:
+    spec = production_spec(action_name)
+    return bool(
+        spec is not None
+        and spec.producer_consumed
+        and agent.func_list
+        and int(agent.func_list[0][0]) == 9
+    )
+
+
+def _translate_worker_owned_zero_argument_primitive(agent: Any, obs: Any) -> tuple[int, Any]:
+    """Dispatch a reviewed zero-argument feature primitive with full provenance."""
+
+    requested_id, function, arguments = agent.func_list.pop(0)
+    requested_arguments = list(arguments)
+    ordinal = int(agent._rtscortex_translation_ordinal)
+    agent._rtscortex_translation_ordinal += 1
+    total = int(agent._rtscortex_translation_total)
+    available = set(_observation_value(obs.observation, "available_actions", ()))
+    reason: Optional[str] = None
+    emitted_id = int(requested_id)
+    requested_name = str(
+        getattr(function, "name", getattr(function, "__name__", requested_id))
+    )
+    if emitted_id not in available:
+        reason = f"function {requested_name} is not available"
+    elif requested_arguments:
+        reason = f"zero-argument primitive received {requested_arguments!r}"
+    function_call = function() if reason is None else _no_op()
+    if reason is not None:
+        emitted_id = 0
+    agent.last_translation_result = {
+        "action_name": agent.curr_action_name,
+        "requested_function_id": int(requested_id),
+        "requested_function_name": requested_name,
+        "emitted_function_id": emitted_id,
+        "emitted_function_name": _function_name(emitted_id),
+        "ordinal": ordinal,
+        "total": total,
+        "accepted": emitted_id == int(requested_id),
+        "requested_arguments": requested_arguments,
+        "resolved_arguments": [],
+        "reason": reason,
+    }
+    return emitted_id, function_call
 
 
 def _translate_worker_owned_near_build_primitive(agent: Any, obs: Any) -> tuple[int, Any]:
@@ -2084,6 +2344,68 @@ def _producer_is_selected(observation: Any, producer_tag: int) -> bool:
                 return False
             return bool(_observation_value(unit, "is_selected", False))
     return False
+
+
+def _selected_production_source_tags(
+    observation: Any,
+    *,
+    producer_type: str,
+    unit_names: Mapping[int, str],
+) -> tuple[int, ...]:
+    """Return selected producer tags, preferring the feature-action view."""
+
+    for collection_name in ("feature_units", "raw_units"):
+        selected_tags = {
+            int(_observation_value(unit, "tag", 0))
+            for unit in _observation_value(observation, collection_name, ())
+            if int(_observation_value(unit, "alliance", 0)) == 1
+            and bool(_observation_value(unit, "is_selected", False))
+            and _worker_unit_name(unit, unit_names) == producer_type
+            and int(_observation_value(unit, "tag", 0)) > 0
+        }
+        if selected_tags:
+            return tuple(sorted(selected_tags))
+    return ()
+
+
+def _zerg_larva_townhall_tag(
+    observation: Any,
+    *,
+    larva_tag: int,
+    unit_names: Mapping[int, str],
+) -> Optional[int]:
+    """Choose the completed Zerg townhall nearest to a preflight Larva."""
+
+    raw_units = list(_observation_value(observation, "raw_units", ()))
+    larva = next(
+        (
+            unit
+            for unit in raw_units
+            if int(_observation_value(unit, "tag", 0)) == int(larva_tag)
+            and int(_observation_value(unit, "alliance", 0)) == 1
+            and _worker_unit_name(unit, unit_names) == "Larva"
+        ),
+        None,
+    )
+    if larva is None:
+        return None
+    larva_x = float(_observation_value(larva, "x", 0.0))
+    larva_y = float(_observation_value(larva, "y", 0.0))
+    candidates: list[tuple[float, int]] = []
+    for unit in raw_units:
+        if int(_observation_value(unit, "alliance", 0)) != 1:
+            continue
+        if _worker_unit_name(unit, unit_names) not in {"Hatchery", "Lair", "Hive"}:
+            continue
+        progress = float(_observation_value(unit, "build_progress", 0.0))
+        progress = progress / 100.0 if progress > 1.0 else progress
+        if progress < 1.0:
+            continue
+        tag = int(_observation_value(unit, "tag", 0))
+        x = float(_observation_value(unit, "x", 0.0))
+        y = float(_observation_value(unit, "y", 0.0))
+        candidates.append(((x - larva_x) ** 2 + (y - larva_y) ** 2, tag))
+    return None if not candidates else min(candidates)[1]
 
 
 def _production_reselection_position(

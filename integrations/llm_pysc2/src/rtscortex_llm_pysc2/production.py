@@ -196,7 +196,7 @@ _PRODUCTION_SPECS = (
         (),
         race="zerg",
         producer_consumed=True,
-        intermediate_types=("Egg",),
+        intermediate_types=("Cocoon",),
     ),
     ProductionSpec(
         "Train_Overlord",
@@ -211,7 +211,7 @@ _PRODUCTION_SPECS = (
         (),
         race="zerg",
         producer_consumed=True,
-        intermediate_types=("Egg",),
+        intermediate_types=("Cocoon",),
     ),
     ProductionSpec(
         "Train_Queen",
@@ -239,7 +239,7 @@ _PRODUCTION_SPECS = (
         ("SpawningPool",),
         race="zerg",
         producer_consumed=True,
-        intermediate_types=("Egg",),
+        intermediate_types=("Cocoon",),
     ),
     ProductionSpec(
         "Train_Roach",
@@ -254,7 +254,7 @@ _PRODUCTION_SPECS = (
         ("RoachWarren",),
         race="zerg",
         producer_consumed=True,
-        intermediate_types=("Egg",),
+        intermediate_types=("Cocoon",),
     ),
     ProductionSpec(
         "Train_Hydralisk",
@@ -269,7 +269,7 @@ _PRODUCTION_SPECS = (
         ("HydraliskDen",),
         race="zerg",
         producer_consumed=True,
-        intermediate_types=("Egg",),
+        intermediate_types=("Cocoon",),
     ),
 )
 

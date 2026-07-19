@@ -251,6 +251,7 @@ class EffectEvidence(ContractModel):
     target_position: tuple[float, float] | None = None
     target_tag: str | None = None
     builder_tag: str | None = None
+    requested_producer_tag: str | None = None
     producer_tag: str | None = None
     producer_type: str | None = None
     producer_observed_type: str | None = None

@@ -342,9 +342,10 @@ def test_effect_evidence_round_trips_production_provenance_without_breaking_lega
 
     zerg = EffectEvidence(
         effect_kind="production",
+        requested_producer_tag="0x200",
         producer_tag="0x100",
         producer_type="Larva",
-        producer_observed_type="Egg",
+        producer_observed_type="Cocoon",
         producer_consumed=True,
         expected_unit_type="Zergling",
         expected_order_id=528,

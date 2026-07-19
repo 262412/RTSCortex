@@ -45,6 +45,7 @@ from rtscortex_llm_pysc2.worker import (
     _production_source_invalid_reason,
     _rebind_builder_to_selected_worker,
     _refresh_build_action_position,
+    _refresh_consumed_zerg_builder,
     _release_runtime_observation_barrier,
     _replace_screen_action_position,
     _requires_explicit_production_chain,
@@ -53,11 +54,13 @@ from rtscortex_llm_pysc2.worker import (
     _scenario_config,
     _semantic_target_failure,
     _should_block_gas_rebalance,
+    _translate_worker_owned_zero_argument_primitive,
     _translated_build_position,
     _translation_failure_code,
     _unit_metadata,
     _upstream_replaced_production_with_noop,
     _worker_player_race,
+    _zerg_larva_townhall_tag,
 )
 
 from rtscortex.contracts import ObservationEnvelope
@@ -399,6 +402,7 @@ def test_production_camera_waits_for_exact_producer_feature_observation() -> Non
     agent.func_list = [(2, object(), ("select", 0xBBB)), (503, object(), ())]
     agent._rtscortex_translation_ordinal = 1
     agent._rtscortex_production_source_tag = 0xBBB
+    agent._rtscortex_production_navigation_tag = None
     agent._rtscortex_production_camera_waits = 0
     agent._rtscortex_production_camera_wait_loop = None
     agent.size_screen = 128
@@ -471,6 +475,7 @@ def test_production_camera_settlement_timeout_is_structured_failure() -> None:
     agent.action_list = []
     agent._rtscortex_translation_ordinal = 1
     agent._rtscortex_production_source_tag = 0xBBB
+    agent._rtscortex_production_navigation_tag = None
     agent._rtscortex_production_camera_waits = 0
     agent._rtscortex_production_camera_wait_loop = None
     agent.size_screen = 128
@@ -499,6 +504,7 @@ def test_production_camera_counts_unique_observations_only() -> None:
     agent.func_list = [(2, object(), ("select", 0xBBB)), (503, object(), ())]
     agent._rtscortex_translation_ordinal = 1
     agent._rtscortex_production_source_tag = 0xBBB
+    agent._rtscortex_production_navigation_tag = None
     agent._rtscortex_production_camera_waits = 0
     agent._rtscortex_production_camera_wait_loop = None
     agent.size_screen = 128
@@ -512,7 +518,7 @@ def test_production_camera_counts_unique_observations_only() -> None:
 def test_production_selection_waits_for_a_new_game_loop() -> None:
     timestep = _fake_timestep()
     timestep.observation.game_loop = [3127]
-    producer = SimpleNamespace(tag=0xBBB, alliance=1, is_selected=True)
+    producer = SimpleNamespace(tag=0xBBB, alliance=1, is_selected=True, unit_type="Barracks")
     timestep.observation.raw_units.append(producer)
     timestep.observation.feature_units.append(producer)
     agent = cast(Any, object.__new__(RTSCortexLLMAgent))
@@ -521,6 +527,7 @@ def test_production_selection_waits_for_a_new_game_loop() -> None:
     agent._rtscortex_production_selection_loop = 3127
     agent._rtscortex_production_selection_attempts = 0
     agent._rtscortex_production_source_tag = 0xBBB
+    agent.unit_names = {}
 
     assert agent._wait_for_production_selection("Build_BarracksTechLab", timestep) is True
     assert agent._rtscortex_production_selection_loop == 3127
@@ -528,6 +535,85 @@ def test_production_selection_waits_for_a_new_game_loop() -> None:
     timestep.observation.game_loop = [3128]
     assert agent._wait_for_production_selection("Build_BarracksTechLab", timestep) is False
     assert agent._rtscortex_production_selection_loop is None
+
+
+def test_production_selection_rebinds_to_the_unique_feature_selected_larva() -> None:
+    timestep = _fake_timestep()
+    timestep.observation.game_loop = [3128]
+    timestep.observation.feature_units = list(timestep.observation.feature_units)
+    requested = SimpleNamespace(
+        tag=0xAAA,
+        alliance=1,
+        is_selected=True,
+        unit_type=151,
+    )
+    selected = SimpleNamespace(
+        tag=0xBBB,
+        alliance=1,
+        is_selected=True,
+        unit_type=151,
+    )
+    timestep.observation.raw_units.append(requested)
+    timestep.observation.feature_units.append(selected)
+    agent = cast(Any, object.__new__(RTSCortexLLMAgent))
+    agent.func_list = [(467, object(), ("queued",))]
+    agent._rtscortex_translation_ordinal = 2
+    agent._rtscortex_production_selection_loop = 3127
+    agent._rtscortex_production_selection_attempts = 0
+    agent._rtscortex_production_source_tag = 0xAAA
+    agent.unit_names = {151: "Larva"}
+
+    assert agent._wait_for_production_selection("Train_Drone", timestep) is False
+    assert agent._rtscortex_production_selection_loop is None
+    assert agent._rtscortex_production_source_tag == 0xBBB
+    assert agent._rtscortex_last_production_source_rebind == (0xAAA, 0xBBB)
+
+
+def test_larva_selection_accepts_an_ambiguous_selected_set_for_effect_rebinding() -> None:
+    timestep = _fake_timestep()
+    timestep.observation.game_loop = [3128]
+    timestep.observation.feature_units = list(timestep.observation.feature_units)
+    selected_larvae = [
+        SimpleNamespace(tag=tag, alliance=1, is_selected=True, unit_type=151)
+        for tag in (0xAAA, 0xBBB)
+    ]
+    timestep.observation.feature_units.extend(selected_larvae)
+    agent = cast(Any, object.__new__(RTSCortexLLMAgent))
+    agent.func_list = [(467, object(), ("queued",))]
+    agent._rtscortex_translation_ordinal = 2
+    agent._rtscortex_production_selection_loop = 3127
+    agent._rtscortex_production_selection_attempts = 0
+    agent._rtscortex_production_source_tag = 0xAAA
+    agent.unit_names = {151: "Larva"}
+
+    assert agent._wait_for_production_selection("Train_Drone", timestep) is False
+    assert agent._rtscortex_production_selection_loop is None
+    assert agent._rtscortex_production_source_tag == 0xAAA
+
+
+def test_larva_selection_accepts_the_observed_train_capability_without_selection_flags() -> None:
+    timestep = _fake_timestep()
+    timestep.observation.game_loop = [3128]
+    timestep.observation.available_actions.append(467)
+    timestep.observation.raw_units.append(
+        SimpleNamespace(
+            tag=0xAAA,
+            alliance=1,
+            is_selected=False,
+            unit_type=151,
+        )
+    )
+    agent = cast(Any, object.__new__(RTSCortexLLMAgent))
+    agent.func_list = [(467, object(), ("queued",))]
+    agent._rtscortex_translation_ordinal = 2
+    agent._rtscortex_production_selection_loop = 3127
+    agent._rtscortex_production_selection_attempts = 0
+    agent._rtscortex_production_source_tag = 0xAAA
+    agent.unit_names = {151: "Larva"}
+
+    assert agent._wait_for_production_selection("Train_Drone", timestep) is False
+    assert agent._rtscortex_production_selection_loop is None
+    assert agent._rtscortex_production_source_tag == 0xAAA
 
 
 def test_production_selection_retries_inside_exact_producer_footprint(
@@ -557,6 +643,7 @@ def test_production_selection_retries_inside_exact_producer_footprint(
         x=66,
         y=66,
         radius=8,
+        unit_type="Barracks",
     )
     timestep.observation.raw_units.append(producer)
     timestep.observation.feature_units.append(producer)
@@ -566,6 +653,7 @@ def test_production_selection_retries_inside_exact_producer_footprint(
     agent._rtscortex_production_selection_loop = 3127
     agent._rtscortex_production_selection_attempts = 0
     agent._rtscortex_production_source_tag = 0xBBB
+    agent.unit_names = {}
     agent.size_screen = 128
 
     assert agent._wait_for_production_selection("Build_BarracksTechLab", timestep) is False
@@ -1038,6 +1126,76 @@ def test_builder_never_rebinds_to_selected_gas_worker() -> None:
     assert team["unit_tags"] == [10]
 
 
+def test_zerg_builder_refreshes_a_consumed_drone_from_mineral_workers() -> None:
+    stale_tag = 10
+    mineral_tag = 20
+    gas_tag = 30
+    team = {
+        "name": "Builder-Drone-1",
+        "unit_tags": [stale_tag],
+        "unit_tags_selected": [stale_tag],
+        "obs": [object()],
+        "pos": [(1, 1)],
+        "minimap_pos": [(1, 1)],
+    }
+    builder = SimpleNamespace(
+        teams=[team],
+        unit_tag_list=[stale_tag],
+        unit_raw_list=[],
+        team_unit_obs_list=[object()],
+        team_unit_tag_list=[stale_tag],
+        team_unit_team_list=["Builder-Drone-1"],
+        team_unit_tag_curr=stale_tag,
+        team_unit_team_curr="Builder-Drone-1",
+        enable=True,
+    )
+    main_agent = SimpleNamespace(
+        worker_settings=SimpleNamespace(agent_race="zerg"),
+        agents={"Builder": builder},
+        decision_broker=SimpleNamespace(extractor=SimpleNamespace(unit_names={104: "Drone"})),
+        nexus_info_dict={
+            "hatchery": {
+                "worker_m_tag_list": [mineral_tag, gas_tag],
+                "worker_g_tag_list": [gas_tag],
+                "worker_g1_tag_list": [],
+                "worker_g2_tag_list": [],
+            }
+        },
+    )
+    observation = SimpleNamespace(
+        raw_units=[
+            SimpleNamespace(tag=mineral_tag, alliance=1, unit_type=104),
+            SimpleNamespace(tag=gas_tag, alliance=1, unit_type=104),
+        ]
+    )
+
+    assert _refresh_consumed_zerg_builder(main_agent, observation) is True
+    assert team["unit_tags"] == [mineral_tag]
+    assert team["unit_tags_selected"] == []
+    assert builder.unit_tag_list == [mineral_tag]
+    assert builder.team_unit_tag_list == [mineral_tag]
+    assert builder.team_unit_team_list == ["Builder-Drone-1"]
+    assert builder.team_unit_tag_curr is None
+    assert builder._rtscortex_last_consumed_builder_refresh == ((stale_tag,), mineral_tag)
+
+
+def test_zerg_builder_refresh_keeps_a_live_builder() -> None:
+    team = {"name": "Builder-Drone-1", "unit_tags": [10]}
+    builder = SimpleNamespace(teams=[team])
+    main_agent = SimpleNamespace(
+        worker_settings=SimpleNamespace(agent_race="zerg"),
+        agents={"Builder": builder},
+        decision_broker=SimpleNamespace(extractor=SimpleNamespace(unit_names={104: "Drone"})),
+        nexus_info_dict={},
+    )
+    observation = SimpleNamespace(
+        raw_units=[SimpleNamespace(tag=10, alliance=1, unit_type=104)]
+    )
+
+    assert _refresh_consumed_zerg_builder(main_agent, observation) is False
+    assert team["unit_tags"] == [10]
+
+
 def test_deterministic_gas_rebalance_respects_effect_and_main_loop_guards() -> None:
     builder = SimpleNamespace(
         unit_tag_list=[10],
@@ -1374,6 +1532,146 @@ def test_terran_production_chain_bypasses_upstream_source_lookup(
     assert agent.action_list == []
     assert agent.curr_action_name == "Train_Marine"
     assert agent._rtscortex_translation_total == 3
+
+
+def test_zerg_consumed_production_uses_select_larva_without_camera_point_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    action = {
+        "name": "Train_Drone",
+        "arg": [],
+        "func": [(467, object(), ("queued",))],
+    }
+    agent = cast(Any, object.__new__(RTSCortexLLMAgent))
+    agent._rtscortex_production_source_tag = 0xABC
+    agent._rtscortex_production_navigation_tag = 0xDEF
+    agent.action_list = [action.copy()]
+    agent.func_list = []
+    functions = SimpleNamespace(
+        llm_pysc2_move_camera=object(),
+        select_point=object(),
+        select_larva=object(),
+    )
+    monkeypatch.setattr(
+        "rtscortex_llm_pysc2.worker.importlib.import_module",
+        lambda _name: SimpleNamespace(FUNCTIONS=functions),
+    )
+
+    agent._prime_production_chain(action)
+
+    assert [int(item[0]) for item in agent.func_list] == [573, 2, 9, 467]
+    assert agent.action_list == []
+    assert agent.curr_action_name == "Train_Drone"
+    assert agent._rtscortex_translation_total == 4
+
+
+def test_zerg_select_larva_keeps_the_preflight_producer_anchor() -> None:
+    agent = cast(Any, object.__new__(RTSCortexLLMAgent))
+    agent._rtscortex_production_source_tag = 0xABC
+
+    producer_tag, failure = agent._validated_production_source_tag(
+        "Train_Drone",
+        {
+            "ordinal": 0,
+            "requested_function_id": 9,
+            "requested_arguments": [],
+        },
+    )
+
+    assert producer_tag == 0xABC
+    assert failure is None
+
+
+def test_zerg_larva_navigation_uses_the_nearest_completed_townhall() -> None:
+    observation = SimpleNamespace(
+        raw_units=[
+            SimpleNamespace(
+                tag=0xAAA,
+                alliance=1,
+                unit_type=151,
+                build_progress=100,
+                x=20,
+                y=20,
+            ),
+            SimpleNamespace(
+                tag=0xB00,
+                alliance=1,
+                unit_type=86,
+                build_progress=100,
+                x=22,
+                y=20,
+            ),
+            SimpleNamespace(
+                tag=0xC00,
+                alliance=1,
+                unit_type=100,
+                build_progress=50,
+                x=20,
+                y=20,
+            ),
+            SimpleNamespace(
+                tag=0xD00,
+                alliance=1,
+                unit_type=101,
+                build_progress=100,
+                x=80,
+                y=80,
+            ),
+        ]
+    )
+
+    assert (
+        _zerg_larva_townhall_tag(
+            observation,
+            larva_tag=0xAAA,
+            unit_names={151: "Larva", 86: "Hatchery", 100: "Lair", 101: "Hive"},
+        )
+        == 0xB00
+    )
+
+
+def test_worker_dispatches_select_larva_without_the_upstream_translator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    function_call = object()
+
+    def select_larva() -> object:
+        return function_call
+
+    agent = SimpleNamespace(
+        func_list=[(9, select_larva, ())],
+        _rtscortex_translation_ordinal=0,
+        _rtscortex_translation_total=2,
+        curr_action_name="Train_Drone",
+        last_translation_result=None,
+    )
+    observation = SimpleNamespace(available_actions=[9])
+    monkeypatch.setattr(
+        "rtscortex_llm_pysc2.worker._function_name",
+        lambda function_id: "select_larva" if function_id == 9 else str(function_id),
+    )
+
+    function_id, translated = _translate_worker_owned_zero_argument_primitive(
+        agent,
+        SimpleNamespace(observation=observation),
+    )
+
+    assert function_id == 9
+    assert translated is function_call
+    assert agent.func_list == []
+    assert agent.last_translation_result == {
+        "action_name": "Train_Drone",
+        "requested_function_id": 9,
+        "requested_function_name": "select_larva",
+        "emitted_function_id": 9,
+        "emitted_function_name": "select_larva",
+        "ordinal": 0,
+        "total": 2,
+        "accepted": True,
+        "requested_arguments": [],
+        "resolved_arguments": [],
+        "reason": None,
+    }
 
 
 def test_untracked_transport_noop_clears_semantic_cache_before_next_action() -> None:

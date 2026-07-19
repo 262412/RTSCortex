@@ -154,7 +154,8 @@ describe("Chinese event presentation", () => {
     expect(actionLabel("Build_CreepTumor_Queen_Screen")).toBe(
       "虫后放置菌毯肿瘤（Build_CreepTumor_Queen_Screen）",
     );
-    expect(fieldLabel("producer_tag")).toBe("生产建筑 Tag");
+    expect(fieldLabel("requested_producer_tag")).toBe("请求生产来源 Tag");
+    expect(fieldLabel("producer_tag")).toBe("实际生产来源 Tag");
     expect(fieldLabel("confirmation_kind")).toBe("生产确认方式");
     expect(semanticScalar("production", "effect_kind")).toBe("生产（production）");
     expect(semanticScalar("producer_order", "confirmation_kind")).toBe(

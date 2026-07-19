@@ -23,9 +23,17 @@ class _UnitEvidence:
 
 
 @dataclass(frozen=True)
+class _ProducerEvidence:
+    tag: int
+    unit_type: str
+    position: tuple[float, float]
+
+
+@dataclass(frozen=True)
 class _ProductionEvidence:
     game_loop: int
     units: tuple[_UnitEvidence, ...]
+    producer_sources: tuple[_ProducerEvidence, ...]
     producer_orders: Optional[tuple[int, ...]]
     producer_position: Optional[tuple[float, float]]
     producer_observed_type: Optional[str]
@@ -38,6 +46,7 @@ class _ProductionEvidence:
 class _PendingProduction:
     command: RoutedCommand
     spec: ProductionSpec
+    requested_producer_tag: Optional[int] = None
     producer_tag: Optional[int] = None
     baseline: Optional[_ProductionEvidence] = None
     latest: Optional[_ProductionEvidence] = None
@@ -80,6 +89,7 @@ class ProductionEffectVerifier:
             raise RuntimeError(
                 f"production command {command_id!r} has no translator producer provenance"
             )
+        pending.requested_producer_tag = int(producer_tag)
         pending.producer_tag = int(producer_tag)
         pending.baseline = self._evidence(pending, observation)
         pending.latest = pending.baseline
@@ -107,7 +117,7 @@ class ProductionEffectVerifier:
         current_by_command = {
             pending.command.command_id: self._evidence(pending, observation) for pending in accepted
         }
-        assignments: dict[str, tuple[str, Optional[int]]] = {}
+        assignments: dict[str, tuple[str, Optional[int], Optional[int]]] = {}
 
         claimed_orders: set[tuple[int, int]] = set()
         for pending in sorted(
@@ -132,7 +142,7 @@ class ProductionEffectVerifier:
                 and order_key not in self._claimed_order_keys
                 and order_key not in claimed_orders
             ):
-                assignments[command_id] = ("producer_order", None)
+                assignments[command_id] = ("producer_order", None, None)
                 claimed_orders.add(order_key)
 
         for pending in accepted:
@@ -141,7 +151,43 @@ class ProductionEffectVerifier:
                 continue
             current = current_by_command[command_id]
             if current.producer_observed_type in pending.spec.intermediate_types:
-                assignments[command_id] = ("producer_morph", None)
+                assignments[command_id] = ("producer_morph", None, None)
+
+        rebound_pairs: list[tuple[int, str, int]] = []
+        for pending in accepted:
+            command_id = pending.command.command_id
+            if command_id in assignments or not pending.spec.producer_consumed:
+                continue
+            baseline = pending.baseline
+            assert baseline is not None
+            baseline_tags = {
+                source.tag
+                for source in baseline.producer_sources
+                if source.unit_type == pending.spec.producer_type
+            }
+            current = current_by_command[command_id]
+            for source in current.producer_sources:
+                if (
+                    source.tag in baseline_tags
+                    and source.unit_type in pending.spec.intermediate_types
+                    and source.tag not in self._claimed_unit_tags
+                ):
+                    rebound_pairs.append(
+                        (
+                            int(pending.accepted_game_loop or 0),
+                            command_id,
+                            source.tag,
+                        )
+                    )
+        rebound_pairs.sort()
+        rebound_commands = set(assignments)
+        rebound_tags: set[int] = set()
+        for _, command_id, source_tag in rebound_pairs:
+            if command_id in rebound_commands or source_tag in rebound_tags:
+                continue
+            assignments[command_id] = ("producer_morph", None, source_tag)
+            rebound_commands.add(command_id)
+            rebound_tags.add(source_tag)
 
         unit_pairs: list[tuple[float, int, str, int]] = []
         for pending in accepted:
@@ -173,16 +219,25 @@ class ProductionEffectVerifier:
         for _, _, command_id, unit_tag in unit_pairs:
             if command_id in assigned_commands or unit_tag in claimed_units:
                 continue
-            assignments[command_id] = ("new_unit", unit_tag)
+            assignments[command_id] = ("new_unit", unit_tag, None)
             assigned_commands.add(command_id)
             claimed_units.add(unit_tag)
 
         self._claimed_order_keys.update(claimed_orders)
         self._claimed_unit_tags.update(claimed_units)
         verdicts: list[EffectVerdict] = []
-        for command_id, (confirmation_kind, confirmed_unit_tag) in assignments.items():
+        self._claimed_unit_tags.update(rebound_tags)
+        for command_id, (
+            confirmation_kind,
+            confirmed_unit_tag,
+            rebound_producer_tag,
+        ) in assignments.items():
             pending = self._pending.pop(command_id)
-            current = current_by_command[command_id]
+            if rebound_producer_tag is not None:
+                pending.producer_tag = rebound_producer_tag
+                current = self._evidence(pending, observation)
+            else:
+                current = current_by_command[command_id]
             pending.latest = current
             pending.production_order_seen = confirmation_kind == "producer_order"
             verdicts.append(
@@ -271,6 +326,29 @@ class ProductionEffectVerifier:
 
     def _evidence(self, pending: _PendingProduction, observation: Any) -> _ProductionEvidence:
         raw_units = list(_value(observation, "raw_units", ()))
+        producer_source_types = {
+            pending.spec.producer_type,
+            *pending.spec.intermediate_types,
+        }
+        producer_sources = tuple(
+            sorted(
+                (
+                    _ProducerEvidence(
+                        int(_value(unit, "tag", 0)),
+                        self._unit_name(unit),
+                        (
+                            float(_value(unit, "x", 0.0)),
+                            float(_value(unit, "y", 0.0)),
+                        ),
+                    )
+                    for unit in raw_units
+                    if int(_value(unit, "alliance", 0)) == 1
+                    and self._unit_name(unit) in producer_source_types
+                    and int(_value(unit, "tag", 0)) > 0
+                ),
+                key=lambda item: item.tag,
+            )
+        )
         units = tuple(
             sorted(
                 (
@@ -311,6 +389,7 @@ class ProductionEffectVerifier:
         return _ProductionEvidence(
             game_loop=_game_loop(observation),
             units=units,
+            producer_sources=producer_sources,
             producer_orders=None if producer is None else _unit_orders(producer),
             producer_position=(
                 None
@@ -344,6 +423,11 @@ class ProductionEffectVerifier:
             "target_position": None,
             "target_tag": None,
             "builder_tag": None,
+            "requested_producer_tag": (
+                None
+                if pending.requested_producer_tag is None
+                else hex(pending.requested_producer_tag)
+            ),
             "producer_tag": None if pending.producer_tag is None else hex(pending.producer_tag),
             "producer_type": pending.spec.producer_type,
             "producer_observed_type": current.producer_observed_type,

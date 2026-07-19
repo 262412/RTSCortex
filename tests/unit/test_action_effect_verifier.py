@@ -853,7 +853,7 @@ def test_all_supported_train_actions_confirm_the_exact_producer_order() -> None:
         assert verdict.evidence["confirmation_kind"] == "producer_order"
 
 
-def test_consumed_zerg_larva_confirms_when_the_same_tag_becomes_an_egg() -> None:
+def test_consumed_zerg_larva_confirms_when_the_same_tag_becomes_a_cocoon() -> None:
     spec = PRODUCTION_SPECS["Train_Zergling"]
     verifier = ActionEffectVerifier(timeout_game_loops=10)
     command = _production_command(spec)
@@ -870,7 +870,7 @@ def test_consumed_zerg_larva_confirms_when_the_same_tag_becomes_an_egg() -> None
         _production_observation(
             spec,
             game_loop=102,
-            producer_type="Egg",
+            producer_type="Cocoon",
         )
     )[0]
 
@@ -878,10 +878,59 @@ def test_consumed_zerg_larva_confirms_when_the_same_tag_becomes_an_egg() -> None
     assert verdict.evidence is not None
     assert verdict.evidence["producer_tag"] == "0xa00"
     assert verdict.evidence["producer_type"] == "Larva"
-    assert verdict.evidence["producer_observed_type"] == "Egg"
+    assert verdict.evidence["producer_observed_type"] == "Cocoon"
     assert verdict.evidence["producer_consumed"] is True
     assert verdict.evidence["confirmation_kind"] == "producer_morph"
     assert verdict.evidence["production_order_seen"] is False
+
+
+def test_consumed_zerg_larva_rebinds_to_the_unique_cocoon_tag() -> None:
+    spec = PRODUCTION_SPECS["Train_Overlord"]
+    verifier = ActionEffectVerifier(timeout_game_loops=10)
+    command = _production_command(spec)
+    verifier.track(command)
+    verifier.prepare(
+        command.command_id,
+        _production_observation(
+            spec,
+            game_loop=100,
+            producers=[
+                (0xA00, (20, 20), []),
+                (0xB00, (21, 20), []),
+            ],
+        ),
+        None,
+        producer_tag=0xA00,
+    )
+    verifier.accept_primitive(command.command_id, game_loop=101)
+
+    verdict = verifier.observe(
+        _production_observation(
+            spec,
+            game_loop=102,
+            producers=[
+                (0xA00, (20, 20), []),
+                (0xB00, (21, 20), []),
+            ],
+            producer_types={0xB00: "Cocoon"},
+        )
+    )[0]
+
+    assert verdict.success is True
+    assert verdict.evidence is not None
+    assert verdict.evidence["requested_producer_tag"] == "0xa00"
+    assert verdict.evidence["producer_tag"] == "0xb00"
+    assert verdict.evidence["producer_observed_type"] == "Cocoon"
+    assert verdict.evidence["confirmation_kind"] == "producer_morph"
+
+
+def test_all_larva_production_uses_the_pinned_pysc2_cocoon_name() -> None:
+    larva_specs = [
+        spec for spec in PRODUCTION_SPECS.values() if spec.producer_type == "Larva"
+    ]
+
+    assert len(larva_specs) == 5
+    assert {spec.intermediate_types for spec in larva_specs} == {("Cocoon",)}
 
 
 def test_zerg_lair_morph_confirms_the_exact_hatchery_order() -> None:
@@ -1459,6 +1508,7 @@ def _production_observation(
     producer_position: tuple[float, float] = (20, 20),
     producer_orders: list[int] | None = None,
     producers: list[tuple[int, tuple[float, float], list[int]]] | None = None,
+    producer_types: dict[int, str] | None = None,
     trained_units: list[tuple[int, tuple[float, float]]] | None = None,
     include_default_producer: bool = True,
 ) -> dict[str, Any]:
@@ -1474,7 +1524,10 @@ def _production_observation(
         raw_units.append(
             {
                 "tag": tag,
-                "unit_type": producer_type or spec.producer_type,
+                "unit_type": (producer_types or {}).get(
+                    tag,
+                    producer_type or spec.producer_type,
+                ),
                 "alliance": 1,
                 "is_structure": True,
                 "order_length": len(orders),
