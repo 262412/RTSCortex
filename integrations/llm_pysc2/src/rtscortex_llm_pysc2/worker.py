@@ -45,6 +45,7 @@ from rtscortex_llm_pysc2.production import (
 from rtscortex_llm_pysc2.protocol import RuntimeClient
 
 PRODUCTION_CAMERA_SETTLE_MAX_OBSERVATIONS = 4
+PRODUCTION_SELECTION_MAX_ATTEMPTS = 4
 BUILD_SELECTION_RETRY_MAX_OBSERVATIONS = 2
 BUILD_TRANSLATOR_RETRY_FAILURE_CODES = frozenset(
     {"blocked", "need_power", "not_pathable", "no_legal_placement"}
@@ -203,6 +204,7 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
         self._rtscortex_production_camera_waits = 0
         self._rtscortex_production_camera_wait_loop: Optional[int] = None
         self._rtscortex_production_selection_loop: Optional[int] = None
+        self._rtscortex_production_selection_attempts = 0
         self._rtscortex_build_selection_retries = 0
         self._rtscortex_camera_settlement_noop = False
         self._rtscortex_rejected_build_positions: dict[str, set[tuple[int, int]]] = {}
@@ -222,6 +224,7 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
             self._rtscortex_production_camera_waits = 0
             self._rtscortex_production_camera_wait_loop = None
             self._rtscortex_production_selection_loop = None
+            self._rtscortex_production_selection_attempts = 0
             self._rtscortex_build_selection_retries = 0
             next_action_name = str(self.action_list[0].get("name", ""))
             if production_spec(next_action_name) is None and addon_spec(next_action_name) is None:
@@ -239,6 +242,12 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
         if self._wait_for_production_selection(semantic_action_name, obs):
             self._rtscortex_camera_settlement_noop = True
             return 0, _no_op()
+        production_reselection = self._reselect_unconfirmed_production_source(
+            semantic_action_name,
+            obs,
+        )
+        if production_reselection is not None:
+            return production_reselection
         if not self.func_list and self.action_list:
             action_name = semantic_action_name
             if self._reject_unavailable_production_action(action, obs):
@@ -663,6 +672,7 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
             self._rtscortex_production_camera_waits = 0
             self._rtscortex_production_camera_wait_loop = None
             self._rtscortex_production_selection_loop = None
+            self._rtscortex_production_selection_attempts = 0
             self._rtscortex_build_selection_retries = 0
         return result
 
@@ -753,7 +763,7 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
         return True
 
     def _wait_for_production_selection(self, action_name: str, obs: Any) -> bool:
-        """Require a newer SC2 observation after selecting an exact producer."""
+        """Wait for selection acceptance, then verify the exact producer tag."""
 
         if (
             production_spec(action_name) is None and addon_spec(action_name) is None
@@ -766,8 +776,62 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
             return False
         if _observation_game_loop(obs.observation) <= selected_loop:
             return True
-        self._rtscortex_production_selection_loop = None
+        producer_tag = self._rtscortex_production_source_tag
+        if producer_tag is not None and _producer_is_selected(
+            obs.observation,
+            producer_tag,
+        ):
+            self._rtscortex_production_selection_loop = None
+            self._rtscortex_production_selection_attempts = 0
         return False
+
+    def _reselect_unconfirmed_production_source(
+        self,
+        action_name: str,
+        obs: Any,
+    ) -> Optional[tuple[int, Any]]:
+        """Retry a point selection when another unit obscured the producer."""
+
+        if (
+            production_spec(action_name) is None and addon_spec(action_name) is None
+        ) or not self.func_list:
+            return None
+        if int(self._rtscortex_translation_ordinal) != 2:
+            return None
+        if self._rtscortex_production_selection_loop is None:
+            return None
+        producer_tag = self._rtscortex_production_source_tag
+        position = _production_reselection_position(
+            obs.observation,
+            producer_tag,
+            attempt=self._rtscortex_production_selection_attempts,
+            size_screen=int(self.size_screen),
+        )
+        if position is None or (
+            self._rtscortex_production_selection_attempts
+            >= PRODUCTION_SELECTION_MAX_ATTEMPTS
+        ):
+            self._settle_production_command_failure(
+                action_name,
+                obs,
+                failure_code=(
+                    "addon_source_not_selected"
+                    if addon_spec(action_name) is not None
+                    else "production_source_not_selected"
+                ),
+                reason=(
+                    f"producer tag {hex(producer_tag or 0)} was not selected after "
+                    f"{self._rtscortex_production_selection_attempts + 1} attempts"
+                ),
+            )
+            self._rtscortex_camera_settlement_noop = True
+            return 0, _no_op()
+        self._rtscortex_production_selection_attempts += 1
+        self._rtscortex_production_selection_loop = _observation_game_loop(
+            obs.observation
+        )
+        actions = importlib.import_module("pysc2.lib.actions")
+        return 2, actions.FUNCTIONS.select_point("select", position)
 
     def _validated_production_source_tag(
         self,
@@ -887,6 +951,7 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
         self._rtscortex_production_camera_waits = 0
         self._rtscortex_production_camera_wait_loop = None
         self._rtscortex_production_selection_loop = None
+        self._rtscortex_production_selection_attempts = 0
 
 
 class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
@@ -1121,7 +1186,7 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
                                 action_name, set()
                             ).add(world_target)
         elif (
-            dispatch.origin == "translator"
+            dispatch.origin in {"translator", "orchestration"}
             and dispatch.requested_function_id == 2
             and not dispatch.final_primitive
             and self._pending_primitive_agent is not None
@@ -1927,6 +1992,51 @@ def _producer_is_visible(
         ):
             return True
     return False
+
+
+def _producer_is_selected(observation: Any, producer_tag: int) -> bool:
+    """Return whether the exact producer, rather than an overlapping unit, is selected."""
+
+    for collection_name in ("raw_units", "feature_units"):
+        units = _observation_value(observation, collection_name, ())
+        for unit in units:
+            if int(_observation_value(unit, "tag", 0)) != producer_tag:
+                continue
+            if int(_observation_value(unit, "alliance", 0)) != 1:
+                return False
+            return bool(_observation_value(unit, "is_selected", False))
+    return False
+
+
+def _production_reselection_position(
+    observation: Any,
+    producer_tag: Optional[int],
+    *,
+    attempt: int,
+    size_screen: int,
+) -> Optional[tuple[int, int]]:
+    """Choose stable interior points away from units at a producer's center."""
+
+    if producer_tag is None:
+        return None
+    for unit in _observation_value(observation, "feature_units", ()):
+        if int(_observation_value(unit, "tag", 0)) != producer_tag:
+            continue
+        if int(_observation_value(unit, "alliance", 0)) != 1:
+            return None
+        if not bool(_observation_value(unit, "is_on_screen", True)):
+            return None
+        x = int(_observation_value(unit, "x", 0))
+        y = int(_observation_value(unit, "y", 0))
+        radius = float(_observation_value(unit, "radius", 1.0))
+        offset = max(1, int(round(radius * 0.5)))
+        offsets = ((-offset, -offset), (offset, -offset), (-offset, offset), (offset, offset))
+        dx, dy = offsets[attempt % len(offsets)]
+        return (
+            min(max(1, x + dx), size_screen - 2),
+            min(max(1, y + dy), size_screen - 2),
+        )
+    return None
 
 
 def _visible_feature_position(

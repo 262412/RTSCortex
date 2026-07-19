@@ -508,10 +508,15 @@ def test_production_camera_counts_unique_observations_only() -> None:
 def test_production_selection_waits_for_a_new_game_loop() -> None:
     timestep = _fake_timestep()
     timestep.observation.game_loop = [3127]
+    producer = SimpleNamespace(tag=0xBBB, alliance=1, is_selected=True)
+    timestep.observation.raw_units.append(producer)
+    timestep.observation.feature_units.append(producer)
     agent = cast(Any, object.__new__(RTSCortexLLMAgent))
     agent.func_list = [(94, object(), ("queued",))]
     agent._rtscortex_translation_ordinal = 2
     agent._rtscortex_production_selection_loop = 3127
+    agent._rtscortex_production_selection_attempts = 0
+    agent._rtscortex_production_source_tag = 0xBBB
 
     assert agent._wait_for_production_selection("Build_BarracksTechLab", timestep) is True
     assert agent._rtscortex_production_selection_loop == 3127
@@ -519,6 +524,58 @@ def test_production_selection_waits_for_a_new_game_loop() -> None:
     timestep.observation.game_loop = [3128]
     assert agent._wait_for_production_selection("Build_BarracksTechLab", timestep) is False
     assert agent._rtscortex_production_selection_loop is None
+
+
+def test_production_selection_retries_inside_exact_producer_footprint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_actions = SimpleNamespace(
+        FUNCTIONS=SimpleNamespace(
+            select_point=lambda mode, position: SimpleNamespace(
+                function=2,
+                arguments=[[mode], list(position)],
+            )
+        )
+    )
+    original_import = importlib.import_module
+    monkeypatch.setattr(
+        importlib,
+        "import_module",
+        lambda name: fake_actions if name == "pysc2.lib.actions" else original_import(name),
+    )
+    timestep = _fake_timestep()
+    timestep.observation.game_loop = [3128]
+    producer = SimpleNamespace(
+        tag=0xBBB,
+        alliance=1,
+        is_selected=False,
+        is_on_screen=True,
+        x=66,
+        y=66,
+        radius=8,
+    )
+    timestep.observation.raw_units.append(producer)
+    timestep.observation.feature_units.append(producer)
+    agent = cast(Any, object.__new__(RTSCortexLLMAgent))
+    agent.func_list = [(94, object(), ("queued",))]
+    agent._rtscortex_translation_ordinal = 2
+    agent._rtscortex_production_selection_loop = 3127
+    agent._rtscortex_production_selection_attempts = 0
+    agent._rtscortex_production_source_tag = 0xBBB
+    agent.size_screen = 128
+
+    assert agent._wait_for_production_selection("Build_BarracksTechLab", timestep) is False
+    result = agent._reselect_unconfirmed_production_source(
+        "Build_BarracksTechLab",
+        timestep,
+    )
+
+    assert result is not None
+    function_id, function_call = result
+    assert function_id == 2
+    assert function_call.arguments[1] == [62, 62]
+    assert agent._rtscortex_production_selection_attempts == 1
+    assert agent._rtscortex_production_selection_loop == 3128
 
 
 def test_non_production_action_never_uses_producer_selection_barrier() -> None:
