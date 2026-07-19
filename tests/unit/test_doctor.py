@@ -192,7 +192,8 @@ def test_worker_patch_is_required_only_for_live_runs(tmp_path: Path) -> None:
         "Stale worker workplace\n"
         "if len(working_place_unit_list) == 0:\n"
         "_rtscortex_force_runtime_decision\n"
-        "_rtscortex_accept_visible_team_unit\n",
+        "_rtscortex_accept_visible_team_unit\n"
+        "_rtscortex_validate_gather_target\n",
         encoding="utf-8",
     )
 
@@ -274,6 +275,15 @@ def test_worker_patch_is_required_only_for_live_runs(tmp_path: Path) -> None:
     visible_selection_check = _worker_patch_check(tmp_path, required=True)
     assert visible_selection_check.status == "error"
     assert "0016-accept-visible-team-unit.patch" in visible_selection_check.detail
+    funcs_source.write_text(complete_funcs_source, encoding="utf-8")
+
+    funcs_source.write_text(
+        complete_funcs_source.replace("_rtscortex_validate_gather_target\n", ""),
+        encoding="utf-8",
+    )
+    gather_target_check = _worker_patch_check(tmp_path, required=True)
+    assert gather_target_check.status == "error"
+    assert "0020-validate-gather-screen-target.patch" in gather_target_check.detail
     funcs_source.write_text(complete_funcs_source, encoding="utf-8")
 
     source.write_text(

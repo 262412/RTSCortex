@@ -1,0 +1,14 @@
+diff --git a/llm_pysc2/agents/main_agent_funcs.py b/llm_pysc2/agents/main_agent_funcs.py
+--- a/llm_pysc2/agents/main_agent_funcs.py
++++ b/llm_pysc2/agents/main_agent_funcs.py
+@@ -528,6 +528,10 @@ def main_agent_func1(self, obs):
+         unit_f = None
+         for unit in obs.observation.feature_units:
+           if unit.tag == head_unit_tag and unit.unit_type not in UNIT_DONOT_NEED_GATHER:
++            if getattr(self, '_rtscortex_validate_gather_target', False) and (
++                not unit.is_on_screen or not (0 <= unit.x < self.size_screen) or
++                not (0 <= unit.y < self.size_screen)):
++              continue
+             unit_f = unit
+         if unit_f is not None:
+           func_id, func_call = (331, actions.FUNCTIONS.Move_screen('now', (unit_f.x, unit_f.y)))

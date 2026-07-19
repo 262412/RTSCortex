@@ -902,6 +902,7 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
         self._rtscortex_accept_visible_team_unit = True
         self._rtscortex_exact_single_unit_selection = True
         self._rtscortex_transport_noop_without_actor_selection = True
+        self._rtscortex_validate_gather_target = True
         _apply_scenario_bootstrap(self, self.worker_settings.scenario)
         if self.worker_settings.console_enabled:
             self._frame_publisher = RGBFramePublisher(

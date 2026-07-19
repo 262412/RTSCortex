@@ -106,6 +106,13 @@ def _assert_observation_gap_watchdog_preempts_optional_gathering() -> None:
     assert "_rtscortex_force_runtime_decision" in inspect.getsource(main_agent_func4)
 
 
+def _assert_gather_target_is_visible_and_in_bounds() -> None:
+    source = inspect.getsource(main_agent_func1)
+    assert "_rtscortex_validate_gather_target" in source
+    assert "0 <= unit.x < self.size_screen" in source
+    assert "0 <= unit.y < self.size_screen" in source
+
+
 def _assert_single_unit_selection_uses_exact_point() -> None:
     from llm_pysc2.agents import llm_pysc2_agent_main
 
@@ -796,6 +803,7 @@ def main() -> None:
     _assert_atomic_log_directory_allocation()
     _assert_gas_rebalance_uses_worker_management_flag()
     _assert_observation_gap_watchdog_preempts_optional_gathering()
+    _assert_gather_target_is_visible_and_in_bounds()
     _assert_single_unit_selection_uses_exact_point()
     _assert_visible_team_unit_bypasses_camera_recentering()
     _assert_build_order_ids_use_raw_function_domain()

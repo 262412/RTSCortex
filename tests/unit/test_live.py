@@ -82,7 +82,8 @@ def test_prepare_live_worker_builds_fixed_pysc2_command(tmp_path: Path) -> None:
         "Stale worker workplace\n"
         "if len(working_place_unit_list) == 0:\n"
         "_rtscortex_force_runtime_decision\n"
-        "_rtscortex_accept_visible_team_unit\n",
+        "_rtscortex_accept_visible_team_unit\n"
+        "_rtscortex_validate_gather_target\n",
         encoding="utf-8",
     )
 
@@ -394,7 +395,8 @@ def _write_worker_patch_sources(project_root: Path) -> None:
         "Stale worker workplace\n"
         "if len(working_place_unit_list) == 0:\n"
         "_rtscortex_force_runtime_decision\n"
-        "_rtscortex_accept_visible_team_unit\n",
+        "_rtscortex_accept_visible_team_unit\n"
+        "_rtscortex_validate_gather_target\n",
         encoding="utf-8",
     )
 
