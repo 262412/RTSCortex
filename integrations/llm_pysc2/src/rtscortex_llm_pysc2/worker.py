@@ -202,6 +202,7 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
         self._rtscortex_production_source_tag: Optional[int] = None
         self._rtscortex_production_camera_waits = 0
         self._rtscortex_production_camera_wait_loop: Optional[int] = None
+        self._rtscortex_production_selection_loop: Optional[int] = None
         self._rtscortex_build_selection_retries = 0
         self._rtscortex_camera_settlement_noop = False
         self._rtscortex_rejected_build_positions: dict[str, set[tuple[int, int]]] = {}
@@ -220,6 +221,7 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
             semantic_action = self._rtscortex_semantic_action
             self._rtscortex_production_camera_waits = 0
             self._rtscortex_production_camera_wait_loop = None
+            self._rtscortex_production_selection_loop = None
             self._rtscortex_build_selection_retries = 0
             next_action_name = str(self.action_list[0].get("name", ""))
             if production_spec(next_action_name) is None and addon_spec(next_action_name) is None:
@@ -232,6 +234,9 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
         provenance = None
         semantic_action_name = str(action.get("name", ""))
         if self._wait_for_production_camera(semantic_action_name, obs):
+            self._rtscortex_camera_settlement_noop = True
+            return 0, _no_op()
+        if self._wait_for_production_selection(semantic_action_name, obs):
             self._rtscortex_camera_settlement_noop = True
             return 0, _no_op()
         if not self.func_list and self.action_list:
@@ -487,6 +492,15 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
             )
             return 0, _no_op()
         if (
+            source_spec is not None
+            and accepted
+            and requested_id == 2
+            and not final_primitive
+        ):
+            self._rtscortex_production_selection_loop = _observation_game_loop(
+                obs.observation
+            )
+        if (
             not accepted
             and failure_code == "no_legal_addon_placement"
             and producer_tag is not None
@@ -648,6 +662,7 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
             self._rtscortex_production_source_tag = None
             self._rtscortex_production_camera_waits = 0
             self._rtscortex_production_camera_wait_loop = None
+            self._rtscortex_production_selection_loop = None
             self._rtscortex_build_selection_retries = 0
         return result
 
@@ -736,6 +751,23 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
         self._rtscortex_production_camera_waits = 0
         self._rtscortex_production_camera_wait_loop = None
         return True
+
+    def _wait_for_production_selection(self, action_name: str, obs: Any) -> bool:
+        """Require a newer SC2 observation after selecting an exact producer."""
+
+        if (
+            production_spec(action_name) is None and addon_spec(action_name) is None
+        ) or not self.func_list:
+            return False
+        if int(self._rtscortex_translation_ordinal) != 2:
+            return False
+        selected_loop = self._rtscortex_production_selection_loop
+        if selected_loop is None:
+            return False
+        if _observation_game_loop(obs.observation) <= selected_loop:
+            return True
+        self._rtscortex_production_selection_loop = None
+        return False
 
     def _validated_production_source_tag(
         self,
@@ -854,6 +886,7 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
         self._rtscortex_production_source_tag = None
         self._rtscortex_production_camera_waits = 0
         self._rtscortex_production_camera_wait_loop = None
+        self._rtscortex_production_selection_loop = None
 
 
 class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]

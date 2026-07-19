@@ -505,6 +505,32 @@ def test_production_camera_counts_unique_observations_only() -> None:
     assert agent._rtscortex_production_camera_waits == 1
 
 
+def test_production_selection_waits_for_a_new_game_loop() -> None:
+    timestep = _fake_timestep()
+    timestep.observation.game_loop = [3127]
+    agent = cast(Any, object.__new__(RTSCortexLLMAgent))
+    agent.func_list = [(94, object(), ("queued",))]
+    agent._rtscortex_translation_ordinal = 2
+    agent._rtscortex_production_selection_loop = 3127
+
+    assert agent._wait_for_production_selection("Build_BarracksTechLab", timestep) is True
+    assert agent._rtscortex_production_selection_loop == 3127
+
+    timestep.observation.game_loop = [3128]
+    assert agent._wait_for_production_selection("Build_BarracksTechLab", timestep) is False
+    assert agent._rtscortex_production_selection_loop is None
+
+
+def test_non_production_action_never_uses_producer_selection_barrier() -> None:
+    timestep = _fake_timestep()
+    agent = cast(Any, object.__new__(RTSCortexLLMAgent))
+    agent.func_list = [(331, object(), ("queued", "screen"))]
+    agent._rtscortex_translation_ordinal = 2
+    agent._rtscortex_production_selection_loop = 3127
+
+    assert agent._wait_for_production_selection("Move_Screen", timestep) is False
+
+
 def test_unavailable_screen_build_reselects_exact_builder(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
