@@ -26,6 +26,7 @@ from rtscortex.policy.models import (
 )
 from rtscortex.policy.subagents import PolicySubagentRegistration
 from rtscortex.progress import GoalProgressStatus, GoalProgressVerifier, GoalSpec
+from rtscortex.races import race_profile
 from rtscortex.runtime.progress_guard import CONTROL_ACTIONS
 from rtscortex.runtime.validation import (
     ActionValidator,
@@ -180,7 +181,7 @@ def _record(
     latency_ms: float = 0.0,
     error: str | None = None,
 ) -> PolicyShadowRecord:
-    scores = _score_proposal(fixture, proposal)
+    scores = _score_proposal(fixture, proposal, race=registration.spec.race)
     return PolicyShadowRecord(
         fixture_id=fixture.fixture_id,
         run_id=fixture.observation.run_id,
@@ -252,11 +253,14 @@ class _ProposalScores:
 def _score_proposal(
     fixture: PolicyObservationFixture,
     proposal: PolicyProposal | MacroPolicyProposal | None,
+    *,
+    race: str,
 ) -> _ProposalScores:
     if proposal is None:
         return _ProposalScores()
     if isinstance(proposal, MacroPolicyProposal):
-        assessments = HIMAMacroActionMapper().assess(proposal, fixture)
+        profile = race_profile("protoss" if race == "any" else race).data
+        assessments = HIMAMacroActionMapper(profile).assess(proposal, fixture)
         scores = _scores_from_assessments(
             assessments,
             discovered_macro_step_count=len(assessments),

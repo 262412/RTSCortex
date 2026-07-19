@@ -106,6 +106,10 @@ jobs:
             ../../integrations/llm_pysc2/patches/0014-refresh-worker-workplaces.patch
             ../../integrations/llm_pysc2/patches/0015-observation-gap-watchdog.patch
             ../../integrations/llm_pysc2/patches/0016-accept-visible-team-unit.patch
+            ../../integrations/llm_pysc2/patches/0017-return-camera-settlement-noop.patch
+            ../../integrations/llm_pysc2/patches/0018-use-exact-single-unit-selection.patch
+            ../../integrations/llm_pysc2/patches/0019-bypass-actor-selection-for-transport-noop.patch
+            ../../integrations/llm_pysc2/patches/0020-validate-gather-screen-target.patch
           )
           applied=()
           cleanup() {

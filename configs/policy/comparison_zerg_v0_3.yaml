@@ -1,0 +1,17 @@
+format_version: "0.2"
+corpus_manifest: benchmarks/policy/zerg_v0_3/manifest.yaml
+output_root: ~/scratch/outputs/RTSCortex
+qwen:
+  enabled: false
+hima:
+  enabled: [a, b, c]
+  python_executable: ~/fastscratch/envs/rtscortex-hima/bin/python
+  device: cuda:0
+  allow_unlicensed_weights: true
+  timeout_seconds: 1800
+  model_paths:
+    a: ~/fastscratch/cache/huggingface/hub/models--SNUMPR--Zerg-a/snapshots/c2bb6b08f531cd96d46c83e004c1312066855a46
+    b: ~/fastscratch/cache/huggingface/hub/models--SNUMPR--Zerg-b/snapshots/8b74c24921ee921445b27b1e7ce13523cbde9c0a
+    c: ~/fastscratch/cache/huggingface/hub/models--SNUMPR--Zerg-c/snapshots/79322205ba70ccd56a72645164178aa027d2fbf6
+hiernet:
+  enabled: false

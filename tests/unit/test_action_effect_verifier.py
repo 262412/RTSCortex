@@ -2,7 +2,13 @@ from __future__ import annotations
 
 from typing import Any
 
+from rtscortex_llm_pysc2.addon import ADDON_SPECS, AddonSpec
 from rtscortex_llm_pysc2.effect_verifier import ActionEffectVerifier
+from rtscortex_llm_pysc2.inject_effect_verifier import (
+    INJECT_RAW_FUNCTION_ID,
+    INJECT_TARGET_BUFF_ID,
+)
+from rtscortex_llm_pysc2.morph import MORPH_SPECS, MorphSpec
 from rtscortex_llm_pysc2.production import PRODUCTION_SPECS, ProductionSpec
 from rtscortex_llm_pysc2.routing import RoutedCommand
 
@@ -28,6 +34,7 @@ def test_build_effect_is_confirmed_when_target_structure_appears() -> None:
     assert verdicts[0].success is True
     assert verdicts[0].failure_reason is None
     assert verdicts[0].evidence is not None
+    assert verdicts[0].evidence["effect_kind"] == "build"
     assert verdicts[0].evidence["worker_orders"] == ["35"]
     assert verdicts[0].evidence["resource_delta"] == {"minerals": -75}
     assert verdicts[0].evidence["order_seen"] is True
@@ -75,6 +82,48 @@ def test_build_effect_uses_world_target_after_camera_moves() -> None:
     )
 
     assert [verdict.success for verdict in verdicts] == [True]
+
+
+def test_three_by_three_build_effect_allows_sc2_placement_snap() -> None:
+    verifier = ActionEffectVerifier(timeout_game_loops=112)
+    command = RoutedCommand(
+        command_id="command-core",
+        actor="Builder/Builder-Probe-1",
+        team_name="Builder-Probe-1",
+        name="Build_CyberneticsCore_Screen",
+        source="planner",
+        requested_arguments=([10, 110],),
+        resolved_arguments=([10, 110],),
+        rendered_action="<Build_CyberneticsCore_Screen([10, 110])>",
+    )
+    baseline = _observation(game_loop=2417, minerals=175)
+    baseline["raw_units"][0]["x"] = 48.75
+    baseline["raw_units"][0]["y"] = 65.0
+    baseline["feature_units"][0]["x"] = 20
+    baseline["feature_units"][0]["y"] = 63
+    verifier.track(command)
+    verifier.prepare(command.command_id, baseline, 0xABC)
+    verifier.accept_primitive(command.command_id, game_loop=2418)
+
+    current = _observation(game_loop=2529, minerals=95)
+    current["raw_units"].append(
+        {
+            "tag": 0x1017C0002,
+            "unit_type": "CyberneticsCore",
+            "alliance": 1,
+            "x": 49.0,
+            "y": 74.0,
+            "build_progress": 0.1,
+            "order_length": 0,
+            "orders": [],
+        }
+    )
+
+    verdicts = verifier.observe(current)
+
+    assert [verdict.success for verdict in verdicts] == [True]
+    assert verdicts[0].evidence is not None
+    assert verdicts[0].evidence["observed_structure_tag"] == "0x1017c0002"
 
 
 def test_build_effect_preserves_live_feature_screen_y_direction() -> None:
@@ -481,6 +530,7 @@ def test_move_minimap_uses_builder_motion_instead_of_global_camera_position() ->
     assert verdict.success is True
     assert verdict.status == "succeeded"
     assert verdict.evidence is not None
+    assert verdict.evidence["effect_kind"] == "move"
     assert verdict.evidence["target_type"] == "Move_Minimap"
     assert verdict.evidence["target_position"] == (48.0, 48.0)
     assert verdict.evidence["builder_tag"] == "0xabc"
@@ -725,6 +775,47 @@ def test_forge_order_38_and_new_tag_confirm_build_effect() -> None:
     assert verdict.evidence["order_seen"] is True
 
 
+def test_queen_creep_tumor_confirms_a_new_structure_at_the_selected_position() -> None:
+    verifier = ActionEffectVerifier(timeout_game_loops=10)
+    command = RoutedCommand(
+        command_id="command-creep",
+        actor="CombatGroup1/Queen-1",
+        team_name="Queen-1",
+        name="Build_CreepTumor_Queen_Screen",
+        source="reflex",
+        requested_arguments=([65, 65],),
+        resolved_arguments=([65, 65],),
+        rendered_action="<Build_CreepTumor_Queen_Screen([65,65])>",
+    )
+    verifier.track(command)
+    verifier.prepare(
+        command.command_id,
+        _observation(game_loop=100, minerals=250, builder_orders=[]),
+        0xABC,
+    )
+    verifier.accept_primitive(command.command_id, game_loop=101)
+    current = _observation(
+        game_loop=102,
+        minerals=250,
+        structures=["Nexus", "CreepTumorQueen"],
+        builder_orders=[189],
+    )
+    tumor = next(unit for unit in current["raw_units"] if unit["unit_type"] == "CreepTumorQueen")
+    tumor["x"] = 31.875
+    tumor["y"] = 30
+    feature_tumor = next(unit for unit in current["feature_units"] if unit["tag"] == tumor["tag"])
+    feature_tumor["x"] = 65
+    feature_tumor["y"] = 65
+
+    verdict = verifier.observe(current)[0]
+
+    assert verdict.success is True
+    assert verdict.evidence is not None
+    assert verdict.evidence["effect_kind"] == "build"
+    assert verdict.evidence["target_type"] == "CreepTumorQueen"
+    assert verdict.evidence["order_seen"] is True
+
+
 def test_all_supported_train_actions_confirm_the_exact_producer_order() -> None:
     for index, spec in enumerate(PRODUCTION_SPECS.values()):
         verifier = ActionEffectVerifier(timeout_game_loops=10)
@@ -756,6 +847,195 @@ def test_all_supported_train_actions_confirm_the_exact_producer_order() -> None:
         assert verdict.evidence["expected_order_id"] == spec.raw_order_id
         assert verdict.evidence["production_order_seen"] is True
         assert verdict.evidence["confirmation_kind"] == "producer_order"
+
+
+def test_consumed_zerg_larva_confirms_when_the_same_tag_becomes_a_cocoon() -> None:
+    spec = PRODUCTION_SPECS["Train_Zergling"]
+    verifier = ActionEffectVerifier(timeout_game_loops=10)
+    command = _production_command(spec)
+    verifier.track(command)
+    verifier.prepare(
+        command.command_id,
+        _production_observation(spec, game_loop=100),
+        None,
+        producer_tag=0xA00,
+    )
+    verifier.accept_primitive(command.command_id, game_loop=101)
+
+    verdict = verifier.observe(
+        _production_observation(
+            spec,
+            game_loop=102,
+            producer_type="Cocoon",
+        )
+    )[0]
+
+    assert verdict.success is True
+    assert verdict.evidence is not None
+    assert verdict.evidence["producer_tag"] == "0xa00"
+    assert verdict.evidence["producer_type"] == "Larva"
+    assert verdict.evidence["producer_observed_type"] == "Cocoon"
+    assert verdict.evidence["producer_consumed"] is True
+    assert verdict.evidence["confirmation_kind"] == "producer_morph"
+    assert verdict.evidence["production_order_seen"] is False
+
+
+def test_consumed_zerg_larva_rebinds_to_the_unique_cocoon_tag() -> None:
+    spec = PRODUCTION_SPECS["Train_Overlord"]
+    verifier = ActionEffectVerifier(timeout_game_loops=10)
+    command = _production_command(spec)
+    verifier.track(command)
+    verifier.prepare(
+        command.command_id,
+        _production_observation(
+            spec,
+            game_loop=100,
+            producers=[
+                (0xA00, (20, 20), []),
+                (0xB00, (21, 20), []),
+            ],
+        ),
+        None,
+        producer_tag=0xA00,
+    )
+    verifier.accept_primitive(command.command_id, game_loop=101)
+
+    verdict = verifier.observe(
+        _production_observation(
+            spec,
+            game_loop=102,
+            producers=[
+                (0xA00, (20, 20), []),
+                (0xB00, (21, 20), []),
+            ],
+            producer_types={0xB00: "Cocoon"},
+        )
+    )[0]
+
+    assert verdict.success is True
+    assert verdict.evidence is not None
+    assert verdict.evidence["requested_producer_tag"] == "0xa00"
+    assert verdict.evidence["producer_tag"] == "0xb00"
+    assert verdict.evidence["producer_observed_type"] == "Cocoon"
+    assert verdict.evidence["confirmation_kind"] == "producer_morph"
+
+
+def test_all_larva_production_uses_the_pinned_pysc2_cocoon_name() -> None:
+    larva_specs = [spec for spec in PRODUCTION_SPECS.values() if spec.producer_type == "Larva"]
+
+    assert len(larva_specs) == 5
+    assert {spec.intermediate_types for spec in larva_specs} == {("Cocoon",)}
+
+
+def test_zerg_lair_morph_confirms_the_exact_hatchery_order() -> None:
+    spec = MORPH_SPECS["Morph_Lair"]
+    verifier = ActionEffectVerifier(timeout_game_loops=10)
+    command = _morph_command(spec)
+    verifier.track(command)
+    verifier.prepare(
+        command.command_id,
+        _morph_observation(spec, game_loop=100),
+        None,
+        producer_tag=0xA00,
+    )
+    verifier.accept_primitive(command.command_id, game_loop=101)
+
+    verdict = verifier.observe(
+        _morph_observation(
+            spec,
+            game_loop=102,
+            source_orders=[spec.raw_order_id],
+        )
+    )[0]
+
+    assert verdict.success is True
+    assert verdict.evidence is not None
+    assert verdict.evidence["effect_kind"] == "morph"
+    assert verdict.evidence["producer_tag"] == "0xa00"
+    assert verdict.evidence["producer_type"] == "Hatchery"
+    assert verdict.evidence["target_type"] == "Lair"
+    assert verdict.evidence["expected_order_id"] == 388
+    assert verdict.evidence["confirmation_kind"] == "producer_order"
+
+
+def test_zerg_lair_morph_fallback_confirms_same_tag_type_change() -> None:
+    spec = MORPH_SPECS["Morph_Lair"]
+    verifier = ActionEffectVerifier(timeout_game_loops=10)
+    command = _morph_command(spec)
+    verifier.track(command)
+    verifier.prepare(
+        command.command_id,
+        _morph_observation(spec, game_loop=100),
+        None,
+        producer_tag=0xA00,
+    )
+    verifier.accept_primitive(command.command_id, game_loop=101)
+
+    verdict = verifier.observe(
+        _morph_observation(
+            spec,
+            game_loop=102,
+            source_type="Lair",
+            source_progress=0.1,
+        )
+    )[0]
+
+    assert verdict.success is True
+    assert verdict.evidence is not None
+    assert verdict.evidence["producer_observed_type"] == "Lair"
+    assert verdict.evidence["source_build_progress"] == 0.1
+    assert verdict.evidence["confirmation_kind"] == "source_morph"
+
+
+def test_zerg_larva_inject_confirms_the_exact_townhall_buff() -> None:
+    verifier = ActionEffectVerifier(timeout_game_loops=10)
+    command = _inject_command()
+    verifier.track(command)
+    verifier.prepare(
+        command.command_id,
+        _inject_observation(game_loop=100),
+        0xA00,
+    )
+    verifier.accept_primitive(command.command_id, game_loop=101)
+
+    verdict = verifier.observe(
+        _inject_observation(
+            game_loop=102,
+            target_buffs=[INJECT_TARGET_BUFF_ID],
+        )
+    )[0]
+
+    assert verdict.success is True
+    assert verdict.evidence is not None
+    assert verdict.evidence["effect_kind"] == "inject"
+    assert verdict.evidence["builder_tag"] == "0xa00"
+    assert verdict.evidence["target_tag"] == "0xb00"
+    assert verdict.evidence["target_buff_ids"] == [INJECT_TARGET_BUFF_ID]
+    assert verdict.evidence["confirmation_kind"] == "target_buff"
+
+
+def test_zerg_larva_inject_can_confirm_the_exact_queen_order() -> None:
+    verifier = ActionEffectVerifier(timeout_game_loops=10)
+    command = _inject_command()
+    verifier.track(command)
+    verifier.prepare(
+        command.command_id,
+        _inject_observation(game_loop=100),
+        0xA00,
+    )
+    verifier.accept_primitive(command.command_id, game_loop=101)
+
+    verdict = verifier.observe(
+        _inject_observation(
+            game_loop=102,
+            queen_orders=[INJECT_RAW_FUNCTION_ID],
+        )
+    )[0]
+
+    assert verdict.success is True
+    assert verdict.evidence is not None
+    assert verdict.evidence["producer_orders"] == [INJECT_RAW_FUNCTION_ID]
+    assert verdict.evidence["confirmation_kind"] == "producer_order"
 
 
 def test_new_unit_near_the_exact_producer_can_confirm_missed_short_order() -> None:
@@ -966,6 +1246,98 @@ def test_pending_production_does_not_block_auto_worker_management() -> None:
     assert verifier.blocks_auto_worker_management is False
 
 
+def test_addon_effect_is_confirmed_by_exact_producer_order() -> None:
+    spec = ADDON_SPECS["Build_BarracksReactor"]
+    verifier = ActionEffectVerifier(timeout_game_loops=10)
+    command = _addon_command(spec)
+    baseline = _addon_observation(spec, game_loop=100)
+    verifier.track(command)
+    verifier.prepare(command.command_id, baseline, None, producer_tag=0xA00)
+    verifier.accept_primitive(command.command_id, game_loop=101)
+
+    verdicts = verifier.observe(
+        _addon_observation(spec, game_loop=102, producer_orders=[spec.raw_order_id])
+    )
+
+    assert [verdict.success for verdict in verdicts] == [True]
+    evidence = verdicts[0].evidence
+    assert evidence is not None
+    assert evidence["effect_kind"] == "addon"
+    assert evidence["producer_tag"] == "0xa00"
+    assert evidence["target_type"] == "BarracksReactor"
+    assert evidence["expected_order_id"] == spec.raw_order_id
+    assert evidence["confirmation_kind"] == "producer_order"
+
+
+def test_addon_effect_ignores_order_on_another_producer() -> None:
+    spec = ADDON_SPECS["Build_BarracksTechLab"]
+    verifier = ActionEffectVerifier(timeout_game_loops=10)
+    command = _addon_command(spec)
+    verifier.track(command)
+    verifier.prepare(
+        command.command_id,
+        _addon_observation(spec, game_loop=100),
+        None,
+        producer_tag=0xA00,
+    )
+    verifier.accept_primitive(command.command_id, game_loop=101)
+
+    current = _addon_observation(
+        spec,
+        game_loop=102,
+        producers=[(0xA00, []), (0xA01, [spec.raw_order_id])],
+    )
+
+    assert verifier.observe(current) == []
+
+
+def test_addon_effect_is_confirmed_by_attached_new_structure() -> None:
+    spec = ADDON_SPECS["Build_StarportTechLab"]
+    verifier = ActionEffectVerifier(timeout_game_loops=10)
+    command = _addon_command(spec)
+    verifier.track(command)
+    verifier.prepare(
+        command.command_id,
+        _addon_observation(spec, game_loop=100),
+        None,
+        producer_tag=0xA00,
+    )
+    verifier.accept_primitive(command.command_id, game_loop=101)
+
+    verdict = verifier.observe(
+        _addon_observation(
+            spec,
+            game_loop=102,
+            producer_addon_tag=0xB00,
+            addon_tag=0xB00,
+        )
+    )[0]
+
+    assert verdict.success is True
+    assert verdict.evidence is not None
+    assert verdict.evidence["observed_structure_tag"] == "0xb00"
+    assert verdict.evidence["confirmation_kind"] == "new_structure"
+
+
+def test_addon_timeout_is_not_misreported_as_success() -> None:
+    spec = ADDON_SPECS["Build_FactoryReactor"]
+    verifier = ActionEffectVerifier(timeout_game_loops=10)
+    command = _addon_command(spec)
+    verifier.track(command)
+    verifier.prepare(
+        command.command_id,
+        _addon_observation(spec, game_loop=100),
+        None,
+        producer_tag=0xA00,
+    )
+    verifier.accept_primitive(command.command_id, game_loop=101)
+
+    verdict = verifier.observe(_addon_observation(spec, game_loop=111))[0]
+
+    assert verdict.success is False
+    assert verdict.failure_code == "no_addon_order_observed"
+
+
 def _production_command(
     spec: ProductionSpec,
     *,
@@ -983,14 +1355,154 @@ def _production_command(
     )
 
 
+def _morph_command(spec: MorphSpec) -> RoutedCommand:
+    return RoutedCommand(
+        command_id="command-morph",
+        actor="Developer/Empty",
+        team_name="Empty",
+        name=spec.action_name,
+        source="planner",
+        requested_arguments=(),
+        resolved_arguments=(),
+        rendered_action=f"<{spec.action_name}()>",
+    )
+
+
+def _inject_command() -> RoutedCommand:
+    return RoutedCommand(
+        command_id="command-inject",
+        actor="CombatGroup1/Queen-1",
+        team_name="Queen-1",
+        name="Effect_InjectLarva",
+        source="reflex",
+        requested_arguments=(0xB00,),
+        resolved_arguments=(0xB00,),
+        rendered_action="<Effect_InjectLarva(0xb00)>",
+    )
+
+
+def _inject_observation(
+    *,
+    game_loop: int,
+    queen_orders: list[int] | None = None,
+    target_buffs: list[int] | None = None,
+) -> dict[str, Any]:
+    orders = queen_orders or []
+    return {
+        "game_loop": game_loop,
+        "raw_units": [
+            {
+                "tag": 0xA00,
+                "unit_type": "Queen",
+                "alliance": 1,
+                "energy": 50,
+                "order_length": len(orders),
+                **{f"order_id_{index}": order for index, order in enumerate(orders)},
+            },
+            {
+                "tag": 0xB00,
+                "unit_type": "Hatchery",
+                "alliance": 1,
+                "buff_ids": target_buffs or [],
+            },
+        ],
+    }
+
+
+def _morph_observation(
+    spec: MorphSpec,
+    *,
+    game_loop: int,
+    source_tag: int = 0xA00,
+    source_type: str | None = None,
+    source_orders: list[int] | None = None,
+    source_progress: float = 1.0,
+) -> dict[str, Any]:
+    orders = source_orders or []
+    return {
+        "game_loop": game_loop,
+        "player_common": {"minerals": 500, "vespene": 500},
+        "raw_units": [
+            {
+                "tag": source_tag,
+                "unit_type": source_type or spec.producer_type,
+                "alliance": 1,
+                "order_length": len(orders),
+                **{f"order_id_{index}": order for index, order in enumerate(orders)},
+                "build_progress": source_progress,
+                "x": 20,
+                "y": 20,
+            }
+        ],
+    }
+
+
+def _addon_command(spec: AddonSpec) -> RoutedCommand:
+    return RoutedCommand(
+        command_id="command-addon",
+        actor="Developer/Empty",
+        team_name="Empty",
+        name=spec.action_name,
+        source="planner",
+        requested_arguments=(),
+        resolved_arguments=(),
+        rendered_action=f"<{spec.action_name}()>",
+    )
+
+
+def _addon_observation(
+    spec: AddonSpec,
+    *,
+    game_loop: int,
+    producer_orders: list[int] | None = None,
+    producers: list[tuple[int, list[int]]] | None = None,
+    producer_addon_tag: int = 0,
+    addon_tag: int | None = None,
+) -> dict[str, Any]:
+    producer_definitions = producers or [(0xA00, producer_orders or [])]
+    raw_units: list[dict[str, Any]] = [
+        {
+            "tag": tag,
+            "unit_type": spec.producer_type,
+            "alliance": 1,
+            "order_length": len(orders),
+            **{f"order_id_{index}": order for index, order in enumerate(orders)},
+            "add_on_tag": producer_addon_tag if tag == 0xA00 else 0,
+            "build_progress": 100,
+            "x": 20 + index * 10,
+            "y": 20,
+        }
+        for index, (tag, orders) in enumerate(producer_definitions)
+    ]
+    if addon_tag is not None:
+        raw_units.append(
+            {
+                "tag": addon_tag,
+                "unit_type": spec.addon_type,
+                "alliance": 1,
+                "order_length": 0,
+                "build_progress": 10,
+                "x": 23,
+                "y": 18,
+            }
+        )
+    return {
+        "game_loop": game_loop,
+        "player_common": {"minerals": 500, "vespene": 500},
+        "raw_units": raw_units,
+    }
+
+
 def _production_observation(
     spec: ProductionSpec,
     *,
     game_loop: int,
     producer_tag: int = 0xA00,
+    producer_type: str | None = None,
     producer_position: tuple[float, float] = (20, 20),
     producer_orders: list[int] | None = None,
     producers: list[tuple[int, tuple[float, float], list[int]]] | None = None,
+    producer_types: dict[int, str] | None = None,
     trained_units: list[tuple[int, tuple[float, float]]] | None = None,
     include_default_producer: bool = True,
 ) -> dict[str, Any]:
@@ -1006,7 +1518,10 @@ def _production_observation(
         raw_units.append(
             {
                 "tag": tag,
-                "unit_type": spec.producer_type,
+                "unit_type": (producer_types or {}).get(
+                    tag,
+                    producer_type or spec.producer_type,
+                ),
                 "alliance": 1,
                 "is_structure": True,
                 "order_length": len(orders),

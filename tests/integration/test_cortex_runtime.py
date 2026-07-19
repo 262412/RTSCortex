@@ -10,6 +10,7 @@ from rtscortex.config import (
     CortexHIMAEnsembleMemberSettings,
     CortexMacroSettings,
     CortexSettings,
+    CortexTacticalSettings,
     ExperimentConfig,
     ReflexSettings,
     RunSettings,
@@ -30,7 +31,7 @@ from rtscortex.contracts import (
     SC2State,
     UnitState,
 )
-from rtscortex.cortex import HIMAEnsemblePolicyClient
+from rtscortex.cortex import HIMAEnsemblePolicyClient, SituationAssessment, TacticalIntent
 from rtscortex.evaluation import compute_cortex_observability
 from rtscortex.memory import EventStore
 from rtscortex.policy.hima import (
@@ -53,17 +54,23 @@ from rtscortex.runtime import CortexRuntimeEngine
 
 
 class _FakeMacroClient:
-    def __init__(self, output: str | list[str] = "Actions: ['Pylon']") -> None:
+    def __init__(
+        self,
+        output: str | list[str] = "Actions: ['Pylon']",
+        *,
+        model_id: str = "SNUMPR/Protoss-a",
+    ) -> None:
         self.outputs = [output] if isinstance(output, str) else output
         if not self.outputs:
             raise ValueError("fake macro client requires at least one output")
         self.contexts: list[HIMAInputContext] = []
         self.closed = False
+        self.model_id = model_id
 
     async def health(self) -> HIMALiveHealth:
         return HIMALiveHealth(
-            model_id="SNUMPR/Protoss-a",
-            model_revision=HIMA_PINNED_REVISIONS["SNUMPR/Protoss-a"],
+            model_id=self.model_id,
+            model_revision=HIMA_PINNED_REVISIONS[self.model_id],
             adapter_version=HIMA_ADAPTER_VERSION,
             parser_version=HIMA_PARSER_VERSION,
             vocabulary_version=HIMA_VOCABULARY_VERSION,
@@ -150,6 +157,19 @@ class _RecoveringMacroSidecar:
 
     async def close(self) -> None:
         self.closed = True
+
+
+class _EmptyShadowTacticalProvider:
+    provider_id = "empty-shadow-tactical"
+    provider_version = "1.0"
+
+    def evaluate(
+        self,
+        observation: ObservationEnvelope,
+        situation: SituationAssessment,
+    ) -> list[TacticalIntent]:
+        del observation, situation
+        return []
 
 
 def _config(
@@ -245,9 +265,18 @@ def test_cortex_runtime_records_three_specialist_race_brain_cycle(tmp_path: Path
     )
     client = HIMAEnsemblePolicyClient(
         {
-            "a": _FakeMacroClient("Actions: ['Pylon']"),
-            "b": _FakeMacroClient("Actions: ['Gateway']"),
-            "c": _FakeMacroClient("Actions: ['Stargate']"),
+            "a": _FakeMacroClient(
+                "Actions: ['Pylon']",
+                model_id="SNUMPR/Protoss-a",
+            ),
+            "b": _FakeMacroClient(
+                "Actions: ['Gateway']",
+                model_id="SNUMPR/Protoss-b",
+            ),
+            "c": _FakeMacroClient(
+                "Actions: ['Stargate']",
+                model_id="SNUMPR/Protoss-c",
+            ),
         },
         race="protoss",
     )
@@ -310,6 +339,56 @@ def test_cortex_runtime_dispatches_proactive_tactical_focus_fire(tmp_path: Path)
     assert batch.commands[0].source is ActionSource.PLANNER
     lineage = runtime._command_lineages[batch.commands[0].command_id]
     assert lineage.source_role.value == "tactical"
+    assert lineage.responsibility == "focus_fire"
+    assert lineage.strategic_intent_id is not None
+    assert lineage.arbiter_mode == "shadow"
+    assert lineage.intent_decision == "selected"
+    asyncio.run(runtime.close())
+
+
+def test_tactical_shadow_records_without_changing_active_action(tmp_path: Path) -> None:
+    config = _config(tmp_path, macro=False)
+    config = config.model_copy(
+        update={
+            "cortex": config.cortex.model_copy(
+                update={"tactical": CortexTacticalSettings(kind="model_shadow")}
+            )
+        }
+    )
+    store = _store(tmp_path)
+    runtime = CortexRuntimeEngine(
+        config=config,
+        store=store,
+        provider=FakeProvider(),
+        shadow_tactical_provider=_EmptyShadowTacticalProvider(),
+    )
+    observation = ObservationEnvelope(
+        run_id="cortex-run",
+        episode_id="episode-1",
+        step_id=0,
+        game_loop=0,
+        state=SC2State(
+            economy=EconomyState(army_supply=4, supply_used=16, supply_cap=23),
+            own_units=[UnitState(unit_id="0x10", unit_type="Adept", alliance="self")],
+            visible_enemies=[UnitState(unit_id="0x20", unit_type="Zergling", alliance="enemy")],
+        ),
+        available_actions=[
+            AvailableAction(
+                name="Attack_Unit",
+                argument_names=["tag"],
+                argument_types=[ActionArgumentType.TAG],
+                actor_scopes=["CombatGroup/Adept-1"],
+                argument_candidates=[["0x20"]],
+            )
+        ],
+    )
+
+    batch = asyncio.run(runtime.tick(observation))
+
+    assert [command.name for command in batch.commands] == ["Attack_Unit"]
+    shadows = store.events_of_type("cortex-run", "episode-1", "tactical_policy_shadow")
+    assert len(shadows) == 1
+    assert shadows[0].payload["shadow_intents"] == []
     asyncio.run(runtime.close())
 
 
@@ -516,9 +595,99 @@ def test_missing_prerequisite_plan_is_rejected_without_hot_loop(
         assert runtime._macro_plan is None
         await runtime.tick(blocked.model_copy(update={"step_id": 2, "game_loop": 2}))
         assert len(client.contexts) == 1
+        await runtime.tick(blocked.model_copy(update={"step_id": 3, "game_loop": 17}))
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert len(client.contexts) == 2
         failures = store.events_of_type("cortex-run", "episode-1", "macro_plan_rejected")
         assert failures[-1].payload["reason"] == "missing_prerequisite_pylon"
         assert not store.events_of_type("cortex-run", "episode-1", "specialist_failed")
+        await runtime.close()
+
+    asyncio.run(exercise())
+
+
+def test_missing_technology_prerequisite_is_closed_by_technology_agent(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    runtime = CortexRuntimeEngine(
+        config=_config(tmp_path),
+        store=store,
+        provider=FakeProvider(),
+        macro_client=_FakeMacroClient("Actions: ['Stargate']"),
+    )
+    initial = ObservationEnvelope(
+        run_id="cortex-run",
+        episode_id="episode-1",
+        step_id=0,
+        game_loop=0,
+        state=SC2State(
+            economy=EconomyState(
+                minerals=200,
+                vespene=200,
+                supply_used=12,
+                supply_cap=23,
+                workers=12,
+            ),
+            own_structures=[
+                UnitState(unit_id="0x1", unit_type="Pylon", alliance="self"),
+                UnitState(
+                    unit_id="0x2",
+                    unit_type="Gateway",
+                    alliance="self",
+                    status="constructing",
+                ),
+            ],
+        ),
+        available_actions=[],
+    )
+    gateway_complete = initial.model_copy(
+        update={
+            "step_id": 2,
+            "game_loop": 2,
+            "state": initial.state.model_copy(
+                update={
+                    "own_structures": [
+                        UnitState(unit_id="0x1", unit_type="Pylon", alliance="self"),
+                        UnitState(unit_id="0x2", unit_type="Gateway", alliance="self"),
+                    ]
+                }
+            ),
+            "available_actions": [
+                AvailableAction(
+                    name="Build_CyberneticsCore_Screen",
+                    argument_names=["screen"],
+                    argument_types=[ActionArgumentType.POSITION],
+                    actor_scopes=["Builder/Probe-1"],
+                    argument_candidates=[[[70, 90]]],
+                )
+            ],
+        }
+    )
+
+    async def exercise() -> None:
+        await runtime.start()
+        await runtime.tick(initial)
+        for _ in range(5):
+            await asyncio.sleep(0)
+        waiting = await runtime.tick(initial.model_copy(update={"step_id": 1, "game_loop": 1}))
+        assert waiting.commands == []
+        assert runtime._macro_plan is not None
+        assert runtime._macro_plan_frozen is False
+        assert not store.events_of_type("cortex-run", "episode-1", "macro_plan_rejected")
+
+        batch = await runtime.tick(gateway_complete)
+
+        assert [command.name for command in batch.commands] == ["Build_CyberneticsCore_Screen"]
+        assert runtime._macro_plan.steps[0].semantic_action == "BUILD STARGATE"
+        assert runtime._macro_plan.steps[0].status.value == "deferred"
+        preemptions = store.events_of_type("cortex-run", "episode-1", "macro_frontier_preempted")
+        assert preemptions[-1].payload["reason"] == "prerequisite_closure"
+        role_events = store.events_of_type("cortex-run", "episode-1", "role_intent_emitted")
+        assert role_events[-1].payload["intent"]["role"] == "technology"
+        lineage = store.events_of_type("cortex-run", "episode-1", "command_lineage")
+        assert lineage[-1].payload["macro_step_ordinal"] is None
         await runtime.close()
 
     asyncio.run(exercise())
@@ -764,6 +933,66 @@ def test_gas_blocked_stargate_uses_legal_zealot_fallback(tmp_path: Path) -> None
         await runtime.close()
 
     asyncio.run(exercise())
+
+
+def test_terran_gas_blocked_addon_builds_first_refinery(tmp_path: Path) -> None:
+    base = _config(tmp_path)
+    config = base.model_copy(
+        update={"environment": base.environment.model_copy(update={"agent_race": "terran"})}
+    )
+    runtime = CortexRuntimeEngine(
+        config=config,
+        store=_store(tmp_path),
+        provider=FakeProvider(),
+        macro_client=_FakeMacroClient(
+            "Actions: ['BarracksReactor']",
+            model_id="SNUMPR/Terran-a",
+        ),
+    )
+    observation = ObservationEnvelope(
+        run_id="cortex-run",
+        episode_id="episode-1",
+        step_id=0,
+        game_loop=0,
+        state=SC2State(
+            economy=EconomyState(
+                minerals=200,
+                vespene=0,
+                supply_used=15,
+                supply_cap=23,
+                workers=12,
+            ),
+            own_structures=[
+                UnitState(unit_id="0x1", unit_type="CommandCenter", alliance="self"),
+                UnitState(unit_id="0x2", unit_type="Barracks", alliance="self"),
+            ],
+        ),
+        available_actions=[
+            AvailableAction(
+                name="Build_Refinery_Near",
+                argument_names=["tag"],
+                argument_types=[ActionArgumentType.TAG],
+                actor_scopes=["Builder/SCV-1"],
+                argument_candidates=[["0x99"]],
+            )
+        ],
+    )
+    proposal = HIMAProposalParser(race="terran").parse("Actions: ['BarracksReactor']")
+    blocked = PolicyActionAssessment(
+        ordinal=0,
+        source_action="BUILD BARRACKSREACTOR",
+        runtime_action="Build_BarracksReactor",
+        classification=PolicyActionClassification.MAPPED_DEFERRED,
+        reason_code="insufficient_vespene",
+        is_runtime_frontier=True,
+    )
+
+    fallback = runtime._fallback_frontier(proposal, observation, blocked)
+
+    assert fallback is not None
+    assert fallback.source_action == "BUILD REFINERY"
+    assert fallback.runtime_action == "Build_Refinery_Near"
+    assert runtime._fallback_reason(blocked, fallback, observation) == "prerequisite_closure"
 
 
 @pytest.mark.parametrize(
@@ -1234,7 +1463,7 @@ def test_duplicate_terminal_report_advances_repeated_step_once(tmp_path: Path) -
     recovered.close()
 
 
-def test_refresh_started_before_old_plan_outcome_is_revalidated(
+def test_completed_refresh_is_accepted_while_old_plan_command_is_inflight(
     tmp_path: Path,
 ) -> None:
     client = _FakeMacroClient(["Actions: ['Pylon', 'Pylon']", "Actions: ['Gateway']"])
@@ -1274,12 +1503,14 @@ def test_refresh_started_before_old_plan_outcome_is_revalidated(
 
         old_plan_batch = await runtime.tick(_macro_observation(step_id=2, game_loop=112))
         assert len(old_plan_batch.commands) == 1
-        for _ in range(5):
-            await asyncio.sleep(0)
+        assert runtime._macro_task is not None
+        await runtime._macro_task
         await runtime.tick(_macro_observation(step_id=3, game_loop=113))
         assert runtime._macro_plan is not None
-        assert runtime._macro_plan.plan_id == first_plan_id
-        assert len(store.events_of_type("cortex-run", "episode-1", "macro_plan_accepted")) == 1
+        assert runtime._macro_plan.plan_id != first_plan_id
+        replacement_plan_id = runtime._macro_plan.plan_id
+        assert runtime._macro_inflight_command_id == old_plan_batch.commands[0].command_id
+        assert len(store.events_of_type("cortex-run", "episode-1", "macro_plan_accepted")) == 2
 
         runtime.record_execution(successful_report(old_plan_batch))
         current = _macro_observation(step_id=4, game_loop=114, pylon=True)
@@ -1294,15 +1525,26 @@ def test_refresh_started_before_old_plan_outcome_is_revalidated(
         )
         await runtime.tick(current)
         assert runtime._macro_plan is not None
-        assert runtime._macro_plan.plan_id != first_plan_id
+        assert runtime._macro_plan.plan_id == replacement_plan_id
         assert len(store.events_of_type("cortex-run", "episode-1", "macro_plan_accepted")) == 2
         revalidated = store.events_of_type("cortex-run", "episode-1", "macro_proposal_revalidated")
-        assert len(revalidated) == 1
-        assert revalidated[0].payload["source_outcome_revision"] == 1
-        assert revalidated[0].payload["current_outcome_revision"] == 2
+        assert revalidated == []
         await runtime.close()
 
     asyncio.run(exercise())
+
+
+def test_fixed_macro_start_cadence_is_not_blocked_by_inflight_effect(tmp_path: Path) -> None:
+    runtime = CortexRuntimeEngine(
+        config=_config(tmp_path),
+        store=_store(tmp_path),
+        provider=FakeProvider(),
+        macro_client=_FakeMacroClient(),
+    )
+    runtime._last_planner_started_game_loop = 0
+    runtime._macro_inflight_command_id = "old-plan-command"
+
+    assert runtime._should_start_macro(_macro_observation(step_id=2, game_loop=112)) is True
 
 
 def test_restart_does_not_apply_old_plan_execution_to_latest_plan(tmp_path: Path) -> None:

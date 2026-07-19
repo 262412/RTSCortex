@@ -30,6 +30,7 @@ from rtscortex.policy.corpus import (
     verify_policy_corpus,
 )
 from rtscortex.policy.models import PolicyFixtureStratum
+from rtscortex.races import RaceId
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 PINNED_CORPUS_MANIFEST = PROJECT_ROOT / "benchmarks/policy/protoss_v0_2/manifest.yaml"
@@ -61,6 +62,8 @@ def test_build_load_and_verify_balanced_corpus(tmp_path: Path) -> None:
     assert all("in_progress" in fixture.condition_tags for fixture in in_progress)
     assert first_result.fixtures_path.read_bytes() == second_result.fixtures_path.read_bytes()
     assert first_result.manifest.fixtures_sha256 == second_result.manifest.fixtures_sha256
+    assert first_result.manifest.race is RaceId.PROTOSS
+    assert all(fixture.fixture_id.startswith("test-protoss-v0.2:") for fixture in fixtures)
 
 
 def test_verifier_detects_tampered_fixture_file(tmp_path: Path) -> None:

@@ -14,6 +14,7 @@ from rtscortex.cortex import (
     HIMAEnsemblePolicyClient,
     RaceBrainProposalResponse,
     RaceBrainStrategicContext,
+    macro_plan_from_hima,
 )
 from rtscortex.policy.hima import (
     HIMA_ADAPTER_VERSION,
@@ -29,9 +30,10 @@ from rtscortex.policy.hima import (
 
 
 class _Client:
-    def __init__(self, cluster: str, output: str) -> None:
+    def __init__(self, cluster: str, output: str, *, truncated: bool = False) -> None:
         self.cluster = cluster
         self.output = output
+        self.truncated = truncated
         self.calls = 0
 
     async def health(self) -> HIMALiveHealth:
@@ -59,7 +61,10 @@ class _Client:
             step_id=context.observation.step_id,
             game_loop=context.observation.game_loop,
             projection_hash=snapshot.projection_hash,
-            proposal=HIMAProposalParser().parse(self.output),
+            proposal=HIMAProposalParser().parse(
+                self.output,
+                truncated=self.truncated,
+            ),
         )
 
     async def close(self) -> None:
@@ -166,6 +171,33 @@ def test_race_brain_isolates_invalid_member_output() -> None:
     assert invalid.score < 0
 
 
+def test_race_brain_keeps_recovered_truncated_prefix_usable() -> None:
+    clients = {
+        "a": _Client("a", "Actions: ['Pylon']"),
+        "b": _Client(
+            "b",
+            'Actions: ["Pylon", "Gateway", "Pyl',
+            truncated=True,
+        ),
+        "c": _Client("c", "Actions: ['Gateway']"),
+    }
+    client = HIMAEnsemblePolicyClient(clients, race="protoss")
+
+    response = asyncio.run(
+        client.propose(
+            HIMAInputContext(observation=_observation()),
+            request_id="recovered-truncated-prefix",
+        )
+    )
+
+    recovered = next(member for member in response.members if member.cluster == "b")
+    assert recovered.frontier is not None
+    assert recovered.frontier.classification.value == "mapped_legal_now"
+    assert "recovered truncated prefix penalty" in recovered.score_reasons
+    assert response.valid_member_count == 3
+    assert response.degraded_member_ids == ()
+
+
 def test_unsupported_frontier_is_a_runtime_gap_not_a_degraded_member() -> None:
     clients = {
         "a": _Client("a", "Actions: ['RoboticsFacility']"),
@@ -217,3 +249,52 @@ def test_race_brain_runs_device_groups_in_parallel_and_members_in_order() -> Non
     assert events.index("start:a") < events.index("end:b")
     assert events.index("start:b") < events.index("end:a")
     assert events.index("end:b") < events.index("start:c")
+
+
+def test_race_brain_staggered_schedule_refreshes_one_current_member_per_cycle() -> None:
+    clients = {cluster: _Client(cluster, "Actions: ['Pylon']") for cluster in ("a", "b", "c")}
+    client = HIMAEnsemblePolicyClient(
+        clients,
+        race="protoss",
+        execution_groups=(("a",), ("b", "c")),
+        schedule_mode="staggered",
+    )
+
+    initial_observation = _observation()
+    initial = asyncio.run(client.propose(HIMAInputContext(observation=initial_observation)))
+    second_observation = initial_observation.model_copy(update={"step_id": 1, "game_loop": 112})
+    second = asyncio.run(client.propose(HIMAInputContext(observation=second_observation)))
+    third_observation = initial_observation.model_copy(update={"step_id": 2, "game_loop": 224})
+    third = asyncio.run(client.propose(HIMAInputContext(observation=third_observation)))
+
+    assert initial.refreshed_member_ids == (
+        "hima-protoss-a",
+        "hima-protoss-b",
+        "hima-protoss-c",
+    )
+    assert initial.max_member_age_game_loops == 0
+    assert second.refreshed_member_ids == ("hima-protoss-a",)
+    assert [member.source_age_game_loops for member in second.members] == [0, 112, 112]
+    assert third.refreshed_member_ids == ("hima-protoss-b",)
+    assert [member.source_age_game_loops for member in third.members] == [112, 0, 224]
+    assert third.selected_member_id == "hima-protoss-a"
+    assert third.selected_source_age_game_loops == 112
+    assert third.selected.step_id == third_observation.step_id
+    assert third.selected.game_loop == third_observation.game_loop
+    assert (
+        third.selected.projection_hash
+        == HIMAObservationAdapter()
+        .adapt_context(HIMAInputContext(observation=third_observation))
+        .projection_hash
+    )
+    selected_source = next(
+        member for member in third.members if member.member_id == third.selected_member_id
+    )
+    assert selected_source.response.game_loop == second_observation.game_loop
+    plan = macro_plan_from_hima(
+        third.selected,
+        third_observation,
+        ttl_game_loops=112,
+    )
+    assert plan.source_step_id == third_observation.step_id
+    assert [clients[cluster].calls for cluster in ("a", "b", "c")] == [2, 2, 1]

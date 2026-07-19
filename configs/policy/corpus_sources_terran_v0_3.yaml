@@ -1,0 +1,99 @@
+format_version: "0.2"
+corpus_id: terran-v0.3
+race: terran
+protocol_version: "1.1"
+fixtures_per_stratum: 8
+minimum_game_loop_gap: 224
+max_per_episode_per_stratum: 4
+minimum_episodes_per_stratum: 2
+minimum_seeds: 3
+minimum_condition_fixtures_per_phase: 2
+sources:
+  - source_id: seed-0-bootstrap
+    journal_path: ~/scratch/outputs/RTSCortex/cortex-20260718T222336311105Z-966b7e0b/events.jsonl
+    seed: 0
+    map_name: Simple64
+  - source_id: seed-0-depot
+    journal_path: ~/scratch/outputs/RTSCortex/cortex-20260718T222746639079Z-4977fb2b/events.jsonl
+    seed: 0
+    map_name: Simple64
+  - source_id: seed-0-opening-a
+    journal_path: ~/scratch/outputs/RTSCortex/cortex-20260718T224010465461Z-faa93f6f/events.jsonl
+    seed: 0
+    map_name: Simple64
+  - source_id: seed-0-opening-b
+    journal_path: ~/scratch/outputs/RTSCortex/cortex-20260718T231522644770Z-3cae0ae9/events.jsonl
+    seed: 0
+    map_name: Simple64
+  - source_id: seed-0-opening-c
+    journal_path: ~/scratch/outputs/RTSCortex/cortex-20260718T225630329063Z-970f43d0/events.jsonl
+    seed: 0
+    map_name: Simple64
+  - source_id: seed-0-opening-d
+    journal_path: ~/scratch/outputs/RTSCortex/cortex-20260718T230635223671Z-30d1e346/events.jsonl
+    seed: 0
+    map_name: Simple64
+  - source_id: seed-0-watchdog-characterization
+    journal_path: ~/scratch/outputs/RTSCortex/cortex-20260718T234115822045Z-d27fcc68/events.jsonl
+    seed: 0
+    map_name: Simple64
+  - source_id: seed-0-melee-a
+    journal_path: ~/scratch/outputs/RTSCortex/cortex-20260718T234358494948Z-1d5675d6/events.jsonl
+    seed: 0
+    map_name: Simple64
+  - source_id: seed-0-regression-a
+    journal_path: ~/scratch/outputs/RTSCortex/cortex-20260718T235731509216Z-061515e1/events.jsonl
+    seed: 0
+    map_name: Simple64
+  - source_id: seed-0-regression-b
+    journal_path: ~/scratch/outputs/RTSCortex/cortex-20260719T002408540000Z-3f8ab6ff/events.jsonl
+    seed: 0
+    map_name: Simple64
+  - source_id: seed-0-melee-b
+    journal_path: ~/scratch/outputs/RTSCortex/cortex-20260719T001408815747Z-dec48093/events.jsonl
+    seed: 0
+    map_name: Simple64
+  - source_id: seed-0-melee-c
+    journal_path: ~/scratch/outputs/RTSCortex/cortex-20260719T004505628038Z-edb6302b/events.jsonl
+    seed: 0
+    map_name: Simple64
+  - source_id: seed-0-combat
+    journal_path: ~/scratch/outputs/RTSCortex/cortex-20260719T005419006119Z-bd959392/events.jsonl
+    seed: 0
+    map_name: Simple64
+  - source_id: seed-1-regression-a
+    journal_path: ~/scratch/outputs/RTSCortex/cortex-20260719T010841267211Z-e7bf6a57/events.jsonl
+    seed: 1
+    map_name: Simple64
+  - source_id: seed-1-opening
+    journal_path: ~/scratch/outputs/RTSCortex/cortex-20260719T010610961859Z-6a15637e/events.jsonl
+    seed: 1
+    map_name: Simple64
+  - source_id: seed-1-addon
+    journal_path: ~/scratch/outputs/RTSCortex/cortex-20260719T012132155822Z-4dcefb5e/events.jsonl
+    seed: 1
+    map_name: Simple64
+  - source_id: seed-1-regression-b
+    journal_path: ~/scratch/outputs/RTSCortex/cortex-20260719T014717311861Z-4d5d9d7d/events.jsonl
+    seed: 1
+    map_name: Simple64
+  - source_id: seed-1-combat
+    journal_path: ~/scratch/outputs/RTSCortex/cortex-20260719T013422512543Z-589dcc5c/events.jsonl
+    seed: 1
+    map_name: Simple64
+  - source_id: seed-2-tech
+    journal_path: ~/scratch/outputs/RTSCortex/cortex-20260719T015816827396Z-94cc07e5/events.jsonl
+    seed: 2
+    map_name: Simple64
+  - source_id: seed-2-long-a
+    journal_path: ~/scratch/outputs/RTSCortex/cortex-20260719T020745892034Z-ff6d7f14/events.jsonl
+    seed: 2
+    map_name: Simple64
+  - source_id: seed-2-long-b
+    journal_path: ~/scratch/outputs/RTSCortex/cortex-20260719T022315239381Z-b1f4454d/events.jsonl
+    seed: 2
+    map_name: Simple64
+  - source_id: seed-2-combat
+    journal_path: ~/scratch/outputs/RTSCortex/cortex-20260719T023618898910Z-fff37260/events.jsonl
+    seed: 2
+    map_name: Simple64

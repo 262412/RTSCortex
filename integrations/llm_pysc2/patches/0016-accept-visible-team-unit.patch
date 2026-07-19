@@ -1,11 +1,13 @@
 diff --git a/llm_pysc2/agents/main_agent_funcs.py b/llm_pysc2/agents/main_agent_funcs.py
 --- a/llm_pysc2/agents/main_agent_funcs.py
 +++ b/llm_pysc2/agents/main_agent_funcs.py
-@@ -78,6 +78,7 @@ def get_camera_func_smart(self, obs, tag, threshold=0.15, team=None):
+@@ -78,6 +78,9 @@ def get_camera_func_smart(self, obs, tag, threshold=0.15, team=None):
      self.last_two_camera_pos.append([x, y])
      return (573, actions.FUNCTIONS.llm_pysc2_move_camera((x, y)))  # 有这个单位，但是屏幕上没找到
    elif (unit_r is not None) and (unit_f is not None) and \
-+      not getattr(self, '_rtscortex_accept_visible_team_unit', False) and \
++      (not getattr(self, '_rtscortex_accept_visible_team_unit', False) or
++       not (max(2, int(self.size_screen * 0.02)) <= unit_f.x < self.size_screen - max(2, int(self.size_screen * 0.02)) and
++            max(2, int(self.size_screen * 0.02)) <= unit_f.y < self.size_screen - max(2, int(self.size_screen * 0.02)))) and \
        not (abs(unit_f.x - self.size_screen / 2) < threshold * self.size_screen and
             abs(unit_f.y - self.size_screen / 2) < threshold * self.size_screen):
      # not (threshold * self.size_screen < unit_f.x < (1 - threshold) * self.size_screen and

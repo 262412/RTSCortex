@@ -6,7 +6,8 @@ sent to Runtime, Bridge, PySC2, or StarCraft II.
 
 ## Corpus
 
-The checked-in Protoss corpus contains 48 real protocol v1.1 observations: eight each for
+The checked-in Protoss and Zerg corpora each contain 48 real protocol v1.1 observations:
+eight each for
 `early`, `technology`, `production`, `combat`, `blocked`, and `in_progress`. Blocked and
 in-progress fixtures retain their underlying phase tag, deterministic goal evidence,
 source journal hash, state fingerprint, and successful HIMA-compatible actions from the
@@ -17,6 +18,8 @@ Verify the materialized corpus without requiring its original journals:
 ```bash
 uv run rtscortex policy-corpus verify \
   benchmarks/policy/protoss_v0_2/manifest.yaml
+uv run rtscortex policy-corpus verify \
+  benchmarks/policy/zerg_v0_3/manifest.yaml
 ```
 
 On the compute-center host, also verify every source journal:
@@ -37,6 +40,18 @@ uv run rtscortex policy-corpus build \
 
 The builder fails rather than using synthetic states when any stratum, seed, episode,
 game-loop spacing, fingerprint, or blocked/in-progress phase quota cannot be met.
+Corpus configs and manifests carry an explicit `race`; manifests created before that field
+default to Protoss. Phase detection, goal progress, in-progress effects, and HIMA
+`previous_action` projection all come from the active `RaceProfile`. Economy-only actions such
+as `Train_Drone` do not by themselves turn a Zerg opening into a production fixture, while a
+completed army prerequisite such as `SpawningPool` makes resource-blocked production
+representable.
+
+The Terran source pool is recorded in
+`configs/policy/corpus_sources_terran_v0_3.yaml`, but it intentionally has no checked-in
+manifest yet: the available real journals do not satisfy the two-fixture blocked-production
+and blocked-combat phase quotas. The strict builder reports this gap instead of fabricating
+states or reducing the quota.
 
 ## Offline workflow smoke
 
@@ -58,6 +73,29 @@ Its expected candidate states are:
 
 Use `configs/policy/comparison_v0_2.yaml` to evaluate the current OpenAI-compatible Qwen
 endpoint. This still does not download or load HIMA weights.
+
+The installed Zerg a/b/c checkpoints can be evaluated, one process at a time, with:
+
+```bash
+uv run rtscortex policy-compare \
+  --config configs/policy/comparison_zerg_v0_3.yaml
+```
+
+The first Zerg v0.3 baseline completed all `144/144` specialist-fixture evaluations with
+no candidate failure and no illegal Runtime frontier. Classification conservation was 100%.
+
+| Candidate | Parse validity | Mapping coverage | Legal frontiers | Deferred frontiers | Goal advancing |
+|---|---:|---:|---:|---:|---:|
+| Zerg-a | 100.0% | 94.8% | 11/48 | 37/48 | 0/5 |
+| Zerg-b | 99.9% | 96.0% | 8/48 | 40/48 | 0/5 |
+| Zerg-c | 100.0% | 96.9% | 8/48 | 40/48 | 1/5 |
+
+This proves integration viability, not strong strategic quality. The largest unsupported
+families were Zergling speed, Mutalisk/Spire, Roach speed, Ravager, Overseer, and level-one
+combat upgrades. Those gaps should be closed before treating the 27-match suite as a useful
+Race Brain quality measurement. Zerg-a currently exposes the most immediately legal
+frontiers; Zerg-c provides the broadest mapping coverage and the only goal-advancing frontier
+in this corpus.
 
 ## Local HIMA boundary
 

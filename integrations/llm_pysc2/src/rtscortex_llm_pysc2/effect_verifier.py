@@ -7,7 +7,11 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Optional
 
+from rtscortex_llm_pysc2.addon_effect_verifier import AddonEffectVerifier
 from rtscortex_llm_pysc2.effect_types import EffectVerdict
+from rtscortex_llm_pysc2.extractor import BUILD_RAW_FUNCTION_IDS, BUILD_SPECS
+from rtscortex_llm_pysc2.inject_effect_verifier import InjectEffectVerifier
+from rtscortex_llm_pysc2.morph_effect_verifier import MorphEffectVerifier
 from rtscortex_llm_pysc2.production_effect_verifier import ProductionEffectVerifier
 from rtscortex_llm_pysc2.routing import RoutedCommand
 
@@ -17,19 +21,6 @@ NEXUS_ACTIVE_BUILD_ORDER_TIMEOUT_MULTIPLIER = 12
 MOVE_RAW_FUNCTION_ID = 13
 MOVE_MINIMAP_DISPLACEMENT_TOLERANCE_WORLD = 1.0
 POST_ORDER_EFFECT_GRACE_GAME_LOOPS = 32
-
-# PySC2's ``FeatureUnit.order_id_*`` fields contain RAW function IDs, not
-# SC2 ability IDs. These values are pinned by the vendored PySC2 revision.
-_BUILD_RAW_FUNCTION_IDS = {
-    "Assimilator": 36,
-    "CyberneticsCore": 47,
-    "Forge": 38,
-    "Gateway": 37,
-    "Nexus": 34,
-    "Pylon": 35,
-    "ShieldBattery": 48,
-    "Stargate": 42,
-}
 
 
 @dataclass(frozen=True)
@@ -108,6 +99,18 @@ class ActionEffectVerifier:
             timeout_game_loops=timeout_game_loops,
             unit_names=self.unit_names,
         )
+        self.addons = AddonEffectVerifier(
+            timeout_game_loops=timeout_game_loops,
+            unit_names=self.unit_names,
+        )
+        self.morphs = MorphEffectVerifier(
+            timeout_game_loops=timeout_game_loops,
+            unit_names=self.unit_names,
+        )
+        self.injects = InjectEffectVerifier(
+            timeout_game_loops=timeout_game_loops,
+            unit_names=self.unit_names,
+        )
 
     def track(self, command: RoutedCommand) -> bool:
         """Register an effectful command, returning false for immediate actions."""
@@ -115,6 +118,12 @@ class ActionEffectVerifier:
         if self.is_tracked(command.command_id):
             raise ValueError(f"command {command.command_id!r} is already tracked")
         if self.production.track(command):
+            return True
+        if self.addons.track(command):
+            return True
+        if self.morphs.track(command):
+            return True
+        if self.injects.track(command):
             return True
         target = _target_structure(command.name)
         if target is None and command.name != "Move_Minimap":
@@ -143,6 +152,9 @@ class ActionEffectVerifier:
             command_id in self._pending
             or command_id in self._pending_moves
             or self.production.is_tracked(command_id)
+            or self.addons.is_tracked(command_id)
+            or self.morphs.is_tracked(command_id)
+            or self.injects.is_tracked(command_id)
         )
 
     @property
@@ -153,6 +165,12 @@ class ActionEffectVerifier:
 
     def resolve_arguments(self, command_id: str, arguments: list[Any]) -> None:
         if self.production.is_tracked(command_id):
+            return
+        if self.addons.is_tracked(command_id):
+            return
+        if self.morphs.is_tracked(command_id):
+            return
+        if self.injects.is_tracked(command_id):
             return
         pending_move = self._pending_moves.get(command_id)
         if pending_move is not None:
@@ -177,6 +195,15 @@ class ActionEffectVerifier:
         if self.production.is_tracked(command_id):
             self.production.prepare(command_id, observation, producer_tag)
             return
+        if self.addons.is_tracked(command_id):
+            self.addons.prepare(command_id, observation, producer_tag)
+            return
+        if self.morphs.is_tracked(command_id):
+            self.morphs.prepare(command_id, observation, producer_tag)
+            return
+        if self.injects.is_tracked(command_id):
+            self.injects.prepare(command_id, observation, builder_tag)
+            return
         pending_move = self._pending_moves.get(command_id)
         if pending_move is not None:
             pending_move.builder_tag = None if builder_tag is None else int(builder_tag)
@@ -200,6 +227,15 @@ class ActionEffectVerifier:
         if self.production.is_tracked(command_id):
             self.production.accept_primitive(command_id, game_loop=game_loop)
             return
+        if self.addons.is_tracked(command_id):
+            self.addons.accept_primitive(command_id, game_loop=game_loop)
+            return
+        if self.morphs.is_tracked(command_id):
+            self.morphs.accept_primitive(command_id, game_loop=game_loop)
+            return
+        if self.injects.is_tracked(command_id):
+            self.injects.accept_primitive(command_id, game_loop=game_loop)
+            return
         pending_move = self._pending_moves.get(command_id)
         if pending_move is not None:
             if pending_move.dispatched_game_loop is None:
@@ -216,11 +252,17 @@ class ActionEffectVerifier:
         self._pending.pop(command_id, None)
         self._pending_moves.pop(command_id, None)
         self.production.cancel(command_id)
+        self.addons.cancel(command_id)
+        self.morphs.cancel(command_id)
+        self.injects.cancel(command_id)
 
     def observe(self, observation: Any) -> list[EffectVerdict]:
         """Evaluate all accepted effectful commands against one observation."""
 
         verdicts = self.production.observe(observation)
+        verdicts.extend(self.addons.observe(observation))
+        verdicts.extend(self.morphs.observe(observation))
+        verdicts.extend(self.injects.observe(observation))
         verdicts.extend(self._observe_moves(observation))
         accepted = [
             pending
@@ -233,7 +275,7 @@ class ActionEffectVerifier:
         for pending in accepted:
             current = current_by_command[pending.command.command_id]
             pending.latest = current
-            expected_order = _BUILD_RAW_FUNCTION_IDS.get(pending.target_structure)
+            expected_order = BUILD_RAW_FUNCTION_IDS.get(pending.target_structure)
             if (
                 expected_order is not None
                 and current.builder is not None
@@ -263,7 +305,7 @@ class ActionEffectVerifier:
             elapsed = current.game_loop - pending.accepted_game_loop
             if elapsed < self.timeout_game_loops:
                 continue
-            expected_order = _BUILD_RAW_FUNCTION_IDS.get(pending.target_structure)
+            expected_order = BUILD_RAW_FUNCTION_IDS.get(pending.target_structure)
             order_is_active = (
                 expected_order is not None
                 and current.builder is not None
@@ -350,6 +392,9 @@ class ActionEffectVerifier:
         """Mark accepted commands unconfirmed when no later observation can arrive."""
 
         verdicts = self.production.fail_pending(reason)
+        verdicts.extend(self.addons.fail_pending(reason))
+        verdicts.extend(self.morphs.fail_pending(reason))
+        verdicts.extend(self.injects.fail_pending(reason))
         for command_id, pending in list(self._pending.items()):
             if pending.accepted_game_loop is None:
                 continue
@@ -399,6 +444,7 @@ class ActionEffectVerifier:
             else max(0, current_loop - pending.accepted_game_loop)
         )
         return {
+            "effect_kind": "move",
             "target_type": "Move_Minimap",
             "target_position": pending.target_position,
             "target_tag": None,
@@ -489,7 +535,12 @@ class ActionEffectVerifier:
         raw_units = list(_value(observation, "raw_units", ()))
         if pending.command.name.endswith("_Near") and pending.command.requested_arguments:
             pending.target_tag = _parse_tag(pending.command.requested_arguments[0])
-            if pending.target_structure == "Assimilator" and pending.target_tag is not None:
+            spec = BUILD_SPECS.get(pending.command.name)
+            if (
+                spec is not None
+                and spec.placement_kind == "geyser"
+                and pending.target_tag is not None
+            ):
                 for unit in raw_units:
                     if int(_value(unit, "tag", -1)) == pending.target_tag:
                         pending.target_position = (
@@ -522,7 +573,7 @@ class ActionEffectVerifier:
                     float(_value(unit, "y", 0.0)),
                 )
                 pending.coordinate_space = "world"
-                if pending.target_structure == "Nexus":
+                if spec is not None and spec.placement_kind == "expansion":
                     resources = [
                         candidate
                         for candidate in raw_units
@@ -586,9 +637,11 @@ class ActionEffectVerifier:
             return None
         distance = _position_distance(target, structure.position)
         if pending.command.name.endswith("_Screen"):
-            tolerance = 2.0
+            spec = BUILD_SPECS.get(pending.command.name)
+            tolerance = 2.0 if spec is None else max(2.0, spec.footprint / 2.0 + 1.0)
         else:
-            tolerance = 1.5 if pending.target_structure == "Assimilator" else 4.0
+            spec = BUILD_SPECS.get(pending.command.name)
+            tolerance = 1.5 if spec is not None and spec.placement_kind == "geyser" else 4.0
         return distance if distance <= tolerance else None
 
     def _timeout_reason(self, pending: _PendingBuild, current: _Evidence) -> str:
@@ -613,7 +666,7 @@ class ActionEffectVerifier:
             return "builder_not_observable"
         if not pending.order_seen:
             return "no_build_order_observed"
-        expected_order = _BUILD_RAW_FUNCTION_IDS.get(pending.target_structure)
+        expected_order = BUILD_RAW_FUNCTION_IDS.get(pending.target_structure)
         if current.builder.orders and expected_order not in current.builder.orders:
             return "worker_order_replaced"
         return "target_not_created"
@@ -646,6 +699,7 @@ class ActionEffectVerifier:
     ) -> dict[str, Any]:
         baseline = pending.baseline
         return {
+            "effect_kind": "build",
             "target_type": pending.target_structure,
             "target_position": pending.target_position,
             "target_tag": None if pending.target_tag is None else hex(pending.target_tag),
@@ -684,7 +738,10 @@ class ActionEffectVerifier:
     def _active_order_timeout(self, pending: _PendingBuild) -> int:
         multiplier = (
             NEXUS_ACTIVE_BUILD_ORDER_TIMEOUT_MULTIPLIER
-            if pending.target_structure == "Nexus"
+            if (
+                (spec := BUILD_SPECS.get(pending.command.name)) is not None
+                and spec.placement_kind == "expansion"
+            )
             else ACTIVE_BUILD_ORDER_TIMEOUT_MULTIPLIER
         )
         return self.timeout_game_loops * multiplier
@@ -697,6 +754,9 @@ class ActionEffectVerifier:
 
 
 def _target_structure(action_name: str) -> Optional[str]:
+    spec = BUILD_SPECS.get(action_name)
+    if spec is not None:
+        return spec.target_structure
     if not action_name.startswith("Build_"):
         return None
     stem = action_name.removeprefix("Build_")
@@ -854,7 +914,7 @@ def _diagnosis(
     if current.builder is None:
         return "selected builder disappeared before construction became visible"
 
-    expected_order = _BUILD_RAW_FUNCTION_IDS.get(target_structure)
+    expected_order = BUILD_RAW_FUNCTION_IDS.get(target_structure)
     if expected_order is not None and expected_order in current.builder.orders:
         return "expected build order remains active but the target structure is not visible"
     if order_seen and current.builder.orders:

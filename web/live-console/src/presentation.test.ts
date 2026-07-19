@@ -148,7 +148,14 @@ describe("Chinese event presentation", () => {
     );
     expect(actionLabel("Train_Adept")).toBe("训练使徒（Train_Adept）");
     expect(actionLabel("Train_VoidRay")).toBe("训练虚空辉光舰（Train_VoidRay）");
-    expect(fieldLabel("producer_tag")).toBe("生产建筑 Tag");
+    expect(actionLabel("Effect_InjectLarva")).toBe(
+      "虫后向基地注入幼虫（Effect_InjectLarva）",
+    );
+    expect(actionLabel("Build_CreepTumor_Queen_Screen")).toBe(
+      "虫后放置菌毯肿瘤（Build_CreepTumor_Queen_Screen）",
+    );
+    expect(fieldLabel("requested_producer_tag")).toBe("请求生产来源 Tag");
+    expect(fieldLabel("producer_tag")).toBe("实际生产来源 Tag");
     expect(fieldLabel("confirmation_kind")).toBe("生产确认方式");
     expect(semanticScalar("production", "effect_kind")).toBe("生产（production）");
     expect(semanticScalar("producer_order", "confirmation_kind")).toBe(
@@ -159,6 +166,12 @@ describe("Chinese event presentation", () => {
     );
     expect(semanticScalar("production_source_invalidated", "failure_code")).toBe(
       "生产建筑在执行前已失效（production_source_invalidated）",
+    );
+    expect(semanticScalar("target_buff", "confirmation_kind")).toBe(
+      "目标获得状态效果（target_buff）",
+    );
+    expect(semanticScalar("no_inject_effect_observed", "failure_code")).toBe(
+      "未观察到幼虫注入订单或状态效果（no_inject_effect_observed）",
     );
     expect(eventSummary(confirmed)).toBe("训练使徒 · 成功 · 效果验证");
     expect(eventSummary(acceptanceOnly)).toBe(
@@ -230,6 +243,51 @@ describe("Chinese event presentation", () => {
       "建造传送门（Build_Gateway_Screen）",
     );
     expect(semanticScalar("missing_prerequisite", "kind")).toBe("缺少科技前置条件");
+  });
+
+  it("explains race capability, role intent, arbitration, and executable rules", () => {
+    const profile = event("race_profile_activated", {
+      race: "terran",
+      macro_contract_ready: true,
+      runtime_mapping_ready: false,
+      live_worker_ready: false,
+      effect_verification_kinds: [],
+      limitations: ["llm_pysc2_worker_not_implemented"],
+    });
+    const roleIntent = event("role_intent_emitted", {
+      intent: {
+        role: "economy",
+        objective: "prevent supply block",
+        action_names: ["Build_SupplyDepot_Screen"],
+      },
+    });
+    const arbitration = event("intent_arbitrated", {
+      mode: "shadow",
+      arbitration: {
+        decisions: [{ intent_id: "intent-1", status: "selected" }],
+        selected_intent_ids: ["intent-1"],
+        conflicts: [],
+        agenda: { reserved_resources: { minerals: 100, vespene: 0, supply: 0 } },
+      },
+    });
+    const playbook = event("playbook_rule_applied", {
+      rule_id: "rule:no-idle-with-progress",
+      reason: "shadow_would_block",
+      score_delta: -4,
+    });
+
+    expect(eventSummary(profile)).toContain("仅离线契约");
+    expect(eventSummary(roleIntent)).toContain("经济管理");
+    expect(eventSummary(roleIntent)).toContain("建造补给站");
+    expect(eventSummary(arbitration)).toBe(
+      "影子模式 · 选择 1/1 个意图 · 冲突 0 个 · 预约 100 矿 / 0 气 / 0 人口",
+    );
+    expect(eventSummary(playbook)).toContain("rule:no-idle-with-progress");
+    expect(eventSemanticPayload(profile)).toMatchObject({
+      race: "terran",
+      live_worker_ready: false,
+      limitations: ["llm_pysc2_worker_not_implemented"],
+    });
   });
 
   it("presents the Cortex specialist-to-executor pipeline without raw JSON", () => {

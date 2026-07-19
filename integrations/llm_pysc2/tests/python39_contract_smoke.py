@@ -18,9 +18,15 @@ from llm_pysc2.agents.main_agent_funcs import (
 from llm_pysc2.lib import llm_action
 from pysc2.env import run_loop
 from pysc2.lib import actions, features
-from rtscortex_llm_pysc2.effect_verifier import _BUILD_RAW_FUNCTION_IDS
+from rtscortex_llm_pysc2.addon import ADDON_SPECS
+from rtscortex_llm_pysc2.extractor import BUILD_RAW_FUNCTION_IDS
 from rtscortex_llm_pysc2.observation import _map_argument_candidates
 from rtscortex_llm_pysc2.production import PRODUCTION_SPECS
+from rtscortex_llm_pysc2.terran_melee import RTSCortexTerranMeleeConfig
+from rtscortex_llm_pysc2.zerg_melee import (
+    QUEEN_CONTROLLER_ACTIONS,
+    RTSCortexZergMeleeConfig,
+)
 
 
 def _assert_candidate_mapping() -> None:
@@ -34,7 +40,9 @@ def _assert_candidate_mapping() -> None:
         action for action in llm_action.PROTOSS_ACTION_BUILD if action["name"] == "Build_Nexus_Near"
     )
     assert [function_id for function_id, _, _ in nexus["func"]] == [573, 0, 65]
-    assert "return translator settlement no_op" in inspect.getsource(MainAgent.step)
+    main_step_source = inspect.getsource(MainAgent.step)
+    assert "return translator settlement no_op" in main_step_source
+    assert "_rtscortex_transport_noop_without_actor_selection" in main_step_source
 
 
 def _assert_reserved_builder_worker_guard() -> None:
@@ -102,6 +110,23 @@ def _assert_observation_gap_watchdog_preempts_optional_gathering() -> None:
     assert "_rtscortex_force_runtime_decision" in inspect.getsource(main_agent_func4)
 
 
+def _assert_gather_target_is_visible_and_in_bounds() -> None:
+    source = inspect.getsource(main_agent_func1)
+    assert "_rtscortex_validate_gather_target" in source
+    assert "0 <= unit.x < self.size_screen" in source
+    assert "0 <= unit.y < self.size_screen" in source
+
+
+def _assert_single_unit_selection_uses_exact_point() -> None:
+    from llm_pysc2.agents import llm_pysc2_agent_main
+
+    source = inspect.getsource(llm_pysc2_agent_main.MainAgent.step)
+    assert "_rtscortex_exact_single_unit_selection" in source
+    exact_branch = source.index("_rtscortex_exact_single_unit_selection")
+    rectangle_fallback = source.index("elif self.func_id_history[-1] in [2, 3]", exact_branch)
+    assert exact_branch < rectangle_fallback
+
+
 def _assert_visible_team_unit_bypasses_camera_recentering() -> None:
     assert "_rtscortex_accept_visible_team_unit" in inspect.getsource(get_camera_func_smart)
     unit = SimpleNamespace(tag=0xA, x=90, y=65)
@@ -118,6 +143,33 @@ def _assert_visible_team_unit_bypasses_camera_recentering() -> None:
 
     assert function_id == 0
 
+    edge_unit = SimpleNamespace(tag=0xB, unit_type=126, x=0, y=65)
+    edge_observation = SimpleNamespace(
+        observation=SimpleNamespace(raw_units=[edge_unit], feature_units=[edge_unit])
+    )
+    main_agent.world_x_offset = 0
+    main_agent.world_y_offset = 0
+    main_agent.world_range = 128
+    main_agent.last_two_camera_pos = []
+
+    edge_function_id, _ = get_camera_func_smart(
+        main_agent,
+        edge_observation,
+        edge_unit.tag,
+    )
+
+    assert edge_function_id == 573
+
+
+def _assert_zerg_queen_uses_exact_single_actor_selection() -> None:
+    config = RTSCortexZergMeleeConfig()
+    queen_team = config.AGENTS["CombatGroup1"]["team"][0]
+    roach_team = config.AGENTS["CombatGroup2"]["team"][0]
+
+    assert queen_team["name"] == "Queen-1"
+    assert queen_team["select_type"] == "select"
+    assert roach_team["select_type"] == "select_all_type"
+
 
 def _assert_build_order_ids_use_raw_function_domain() -> None:
     ability_ids = {
@@ -129,8 +181,26 @@ def _assert_build_order_ids_use_raw_function_domain() -> None:
         "Pylon": 881,
         "ShieldBattery": 895,
         "Stargate": 889,
+        "Barracks": 321,
+        "Bunker": 324,
+        "CommandCenter": 318,
+        "EngineeringBay": 322,
+        "Factory": 328,
+        "MissileTurret": 323,
+        "Refinery": 320,
+        "Starport": 329,
+        "SupplyDepot": 319,
+        "EvolutionChamber": 1156,
+        "Extractor": 1154,
+        "Hatchery": 1152,
+        "HydraliskDen": 1157,
+        "RoachWarren": 1165,
+        "SpawningPool": 1155,
+        "SpineCrawler": 1166,
+        "SporeCrawler": 1167,
+        "CreepTumorQueen": 1694,
     }
-    assert _BUILD_RAW_FUNCTION_IDS == {
+    assert BUILD_RAW_FUNCTION_IDS == {
         structure: int(actions.RAW_ABILITY_ID_TO_FUNC_ID[ability_id])
         for structure, ability_id in ability_ids.items()
     }
@@ -162,6 +232,81 @@ def _assert_direct_production_contract() -> None:
         "Train_Phoenix": (484, 55, "Stargate", "Phoenix", 150, 100, 2, ("Stargate",)),
         "Train_VoidRay": (500, 57, "Stargate", "VoidRay", 250, 150, 4, ("Stargate",)),
         "Train_Oracle": (482, 58, "Stargate", "Oracle", 150, 150, 3, ("Stargate",)),
+        "Train_Marine": (477, 511, "Barracks", "Marine", 50, 0, 1, ("Barracks",)),
+        "Train_Marauder": (
+            476,
+            510,
+            "Barracks",
+            "Marauder",
+            100,
+            25,
+            2,
+            ("Barracks", "BarracksTechLab"),
+        ),
+        "Train_Hellion": (470, 506, "Factory", "Hellion", 100, 0, 2, ("Factory",)),
+        "Train_SiegeTank": (
+            492,
+            521,
+            "Factory",
+            "SiegeTank",
+            150,
+            125,
+            3,
+            ("Factory", "FactoryTechLab"),
+        ),
+        "Train_Medivac": (478, 512, "Starport", "Medivac", 100, 100, 2, ("Starport",)),
+        "Train_VikingFighter": (
+            498,
+            525,
+            "Starport",
+            "VikingFighter",
+            150,
+            75,
+            2,
+            ("Starport",),
+        ),
+        "Train_Drone": (467, 503, "Larva", "Drone", 50, 0, 1, ()),
+        "Train_Overlord": (483, 515, "Larva", "Overlord", 100, 0, 0, ()),
+        "Train_Queen": (
+            486,
+            516,
+            "Hatchery",
+            "Queen",
+            150,
+            0,
+            2,
+            ("SpawningPool",),
+        ),
+        "Train_Zergling": (
+            504,
+            528,
+            "Larva",
+            "Zergling",
+            50,
+            0,
+            1,
+            ("SpawningPool",),
+        ),
+        "Train_Roach": (
+            489,
+            519,
+            "Larva",
+            "Roach",
+            75,
+            25,
+            2,
+            ("RoachWarren",),
+        ),
+        "Train_Hydralisk": (
+            472,
+            507,
+            "Larva",
+            "Hydralisk",
+            100,
+            50,
+            2,
+            ("HydraliskDen",),
+        ),
     }
     assert {
         action_name: (
@@ -176,6 +321,94 @@ def _assert_direct_production_contract() -> None:
         )
         for action_name, spec in PRODUCTION_SPECS.items()
     } == expected
+
+
+def _assert_terran_addon_contract() -> None:
+    expected = {
+        "Build_BarracksTechLab": (94, 225, 421, "Barracks", "BarracksTechLab"),
+        "Build_BarracksReactor": (73, 208, 422, "Barracks", "BarracksReactor"),
+        "Build_FactoryTechLab": (96, 227, 454, "Factory", "FactoryTechLab"),
+        "Build_FactoryReactor": (75, 210, 455, "Factory", "FactoryReactor"),
+        "Build_StarportTechLab": (98, 229, 487, "Starport", "StarportTechLab"),
+        "Build_StarportReactor": (77, 212, 488, "Starport", "StarportReactor"),
+    }
+    assert {
+        name: (
+            spec.feature_function_id,
+            spec.raw_order_id,
+            spec.ability_id,
+            spec.producer_type,
+            spec.addon_type,
+        )
+        for name, spec in ADDON_SPECS.items()
+    } == expected
+    feature_names = {
+        "Build_BarracksTechLab": "Build_TechLab_Barracks_quick",
+        "Build_BarracksReactor": "Build_Reactor_Barracks_quick",
+        "Build_FactoryTechLab": "Build_TechLab_Factory_quick",
+        "Build_FactoryReactor": "Build_Reactor_Factory_quick",
+        "Build_StarportTechLab": "Build_TechLab_Starport_quick",
+        "Build_StarportReactor": "Build_Reactor_Starport_quick",
+    }
+    for action_name, function_name in feature_names.items():
+        spec = ADDON_SPECS[action_name]
+        assert int(getattr(actions.FUNCTIONS, function_name).id) == spec.feature_function_id
+        raw_function = getattr(actions.RAW_FUNCTIONS, function_name)
+        assert int(raw_function.id) == spec.raw_order_id
+        assert int(raw_function.ability_id) == spec.ability_id
+
+
+def _assert_terran_worker_contract() -> None:
+    config = RTSCortexTerranMeleeConfig()
+    assert config.rtscortex_player_race == "terran"
+    assert config.ENABLE_AUTO_WORKER_MANAGE is True
+    assert config.ENABLE_AUTO_WORKER_TRAINING is False
+    assert list(config.AGENTS) == [
+        "Builder",
+        "Developer",
+        "CombatGroup0",
+        "CombatGroup1",
+        "CombatGroup2",
+        "CombatGroup3",
+        "CombatGroup4",
+        "CombatGroup5",
+    ]
+    builder_actions = {
+        action["name"]
+        for actions_for_type in config.AGENTS["Builder"]["action"].values()
+        for action in actions_for_type
+    }
+    assert {
+        "Build_SupplyDepot_Screen",
+        "Build_Barracks_Screen",
+        "Build_Refinery_Near",
+        "Build_CommandCenter_Near",
+        "Build_Factory_Screen",
+        "Build_Starport_Screen",
+    }.issubset(builder_actions)
+    developer_actions = {
+        action["name"]
+        for actions_for_type in config.AGENTS["Developer"]["action"].values()
+        for action in actions_for_type
+    }
+    assert set(ADDON_SPECS).issubset(developer_actions)
+    assert {
+        "Train_Marine",
+        "Train_Marauder",
+        "Train_Hellion",
+        "Train_SiegeTank",
+        "Train_Medivac",
+        "Train_VikingFighter",
+    }.issubset(developer_actions)
+
+
+def _assert_zerg_queen_controller_settlement_contract() -> None:
+    functions_by_action = {
+        action["name"]: [int(function[0]) for function in action["func"]]
+        for action in QUEEN_CONTROLLER_ACTIONS
+    }
+    assert functions_by_action["Effect_InjectLarva"] == [573, 0, 204]
+    assert functions_by_action["Build_CreepTumor_Queen_Screen"] == [0, 46]
 
 
 def _agent_with_tracked_team() -> LLMAgent:
@@ -661,9 +894,15 @@ def main() -> None:
     _assert_atomic_log_directory_allocation()
     _assert_gas_rebalance_uses_worker_management_flag()
     _assert_observation_gap_watchdog_preempts_optional_gathering()
+    _assert_gather_target_is_visible_and_in_bounds()
+    _assert_single_unit_selection_uses_exact_point()
     _assert_visible_team_unit_bypasses_camera_recentering()
+    _assert_zerg_queen_uses_exact_single_actor_selection()
     _assert_build_order_ids_use_raw_function_domain()
     _assert_direct_production_contract()
+    _assert_terran_addon_contract()
+    _assert_terran_worker_contract()
+    _assert_zerg_queen_controller_settlement_contract()
     _assert_raw_unit_presence_controls_team_lifecycle()
     _assert_transient_disappearance_grace()
     _assert_confirmed_disappearance_removes_actor()

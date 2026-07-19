@@ -2,17 +2,26 @@
 
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 import threading
+from datetime import UTC, datetime
 from pathlib import Path
 
 from rtscortex.playbook.models import (
     DecisionCase,
     LessonStatus,
+    PlaybookCondition,
     PlaybookHit,
     PlaybookLesson,
     PlaybookQuery,
+    PlaybookRule,
+    PlaybookRuleApplication,
+    PlaybookRuleCategory,
+    PlaybookRuleEffect,
     PlaybookRuleKind,
+    PlaybookRuleStatus,
+    PlaybookRuleStrength,
     PlaybookSelection,
 )
 
@@ -41,9 +50,28 @@ class PlaybookStore:
                 signature TEXT NOT NULL UNIQUE,
                 payload_json TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS playbook_rules_v2 (
+                rule_id TEXT PRIMARY KEY,
+                canonical_key TEXT NOT NULL UNIQUE,
+                payload_json TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS playbook_rule_applications_v2 (
+                application_id TEXT PRIMARY KEY,
+                rule_id TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                episode_id TEXT NOT NULL,
+                payload_json TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_playbook_rule_applications_episode
+                ON playbook_rule_applications_v2 (run_id, episode_id);
+            CREATE TABLE IF NOT EXISTS playbook_migrations (
+                migration_id TEXT PRIMARY KEY,
+                applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
             """
         )
         self._connection.commit()
+        self.migrate_legacy_lessons()
 
     def add_case(self, case: DecisionCase) -> bool:
         with self._lock:
@@ -99,6 +127,155 @@ class PlaybookStore:
         ).fetchall()
         return [PlaybookLesson.model_validate_json(str(row["payload_json"])) for row in rows]
 
+    def upsert_rule(self, rule: PlaybookRule) -> PlaybookRule:
+        with self._lock:
+            existing_row = self._connection.execute(
+                "SELECT payload_json FROM playbook_rules_v2 WHERE canonical_key = ?",
+                (rule.canonical_key,),
+            ).fetchone()
+            if existing_row is not None:
+                existing = PlaybookRule.model_validate_json(str(existing_row["payload_json"]))
+                rule = _merge_rule_evidence(existing, rule)
+            self._connection.execute(
+                """
+                INSERT INTO playbook_rules_v2 (rule_id, canonical_key, payload_json)
+                VALUES (?, ?, ?)
+                ON CONFLICT(canonical_key) DO UPDATE SET
+                    rule_id = excluded.rule_id,
+                    payload_json = excluded.payload_json
+                """,
+                (rule.rule_id, rule.canonical_key, rule.model_dump_json()),
+            )
+            self._connection.commit()
+        return rule
+
+    def upsert_legacy_lesson_rule(self, lesson: PlaybookLesson) -> PlaybookRule:
+        rule = _legacy_rule(lesson)
+        return self.upsert_rule(rule)
+
+    def upsert_lesson_rule_candidate(
+        self,
+        lesson: PlaybookLesson,
+        source_case: DecisionCase,
+    ) -> PlaybookRule:
+        return self.upsert_rule(_candidate_rule(lesson, source_case))
+
+    def rules(self) -> list[PlaybookRule]:
+        rows = self._connection.execute(
+            "SELECT payload_json FROM playbook_rules_v2 ORDER BY rowid"
+        ).fetchall()
+        return [PlaybookRule.model_validate_json(str(row["payload_json"])) for row in rows]
+
+    def rules_for_guard(
+        self,
+        *,
+        max_hard: int = 8,
+        max_soft: int = 8,
+    ) -> tuple[PlaybookRule, ...]:
+        active = [rule for rule in self.rules() if rule.status is PlaybookRuleStatus.ACTIVE]
+        now = datetime.now(UTC)
+        active = [rule for rule in active if _rule_is_unexpired(rule, now)]
+        hard = sorted(
+            (rule for rule in active if rule.strength is PlaybookRuleStrength.HARD),
+            key=lambda rule: (-rule.confidence, rule.rule_id),
+        )[:max_hard]
+        soft = sorted(
+            (rule for rule in active if rule.strength is PlaybookRuleStrength.SOFT),
+            key=lambda rule: (-rule.confidence, rule.rule_id),
+        )[:max_soft]
+        advisory = sorted(
+            (
+                rule
+                for rule in self.rules()
+                if rule.status is PlaybookRuleStatus.LEGACY
+                and rule.strength is PlaybookRuleStrength.ADVISORY
+            ),
+            key=lambda rule: (-rule.confidence, rule.rule_id),
+        )[:8]
+        return tuple([*hard, *soft, *advisory])
+
+    def record_rule_application(self, application: PlaybookRuleApplication) -> bool:
+        with self._lock:
+            cursor = self._connection.execute(
+                """
+                INSERT OR IGNORE INTO playbook_rule_applications_v2 (
+                    application_id, rule_id, run_id, episode_id, payload_json
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    application.application_id,
+                    application.rule_id,
+                    application.run_id,
+                    application.episode_id,
+                    application.model_dump_json(),
+                ),
+            )
+            self._connection.commit()
+        return cursor.rowcount == 1
+
+    def rule_applications(
+        self,
+        *,
+        run_id: str | None = None,
+    ) -> list[PlaybookRuleApplication]:
+        if run_id is None:
+            rows = self._connection.execute(
+                "SELECT payload_json FROM playbook_rule_applications_v2 ORDER BY rowid"
+            ).fetchall()
+        else:
+            rows = self._connection.execute(
+                """
+                SELECT payload_json FROM playbook_rule_applications_v2
+                WHERE run_id = ? ORDER BY rowid
+                """,
+                (run_id,),
+            ).fetchall()
+        return [
+            PlaybookRuleApplication.model_validate_json(str(row["payload_json"])) for row in rows
+        ]
+
+    def migrate_legacy_lessons(self) -> int:
+        migration_id = "legacy-lessons-to-v2-advisory"
+        applied = self._connection.execute(
+            "SELECT 1 FROM playbook_migrations WHERE migration_id = ?",
+            (migration_id,),
+        ).fetchone()
+        if applied is not None:
+            return 0
+        lessons = self.lessons()
+        if lessons:
+            backup_path = self.database_path.with_name(
+                f"{self.database_path.stem}.pre-v2{self.database_path.suffix}"
+            )
+            if not backup_path.exists():
+                backup = sqlite3.connect(backup_path)
+                try:
+                    self._connection.backup(backup)
+                finally:
+                    backup.close()
+        with self._lock:
+            self._connection.execute("BEGIN IMMEDIATE")
+            try:
+                for lesson in lessons:
+                    rule = _legacy_rule(lesson)
+                    self._connection.execute(
+                        """
+                        INSERT OR IGNORE INTO playbook_rules_v2 (
+                            rule_id, canonical_key, payload_json
+                        ) VALUES (?, ?, ?)
+                        """,
+                        (rule.rule_id, rule.canonical_key, rule.model_dump_json()),
+                    )
+                self._connection.execute(
+                    "INSERT INTO playbook_migrations (migration_id) VALUES (?)",
+                    (migration_id,),
+                )
+                self._connection.commit()
+            except BaseException:
+                self._connection.rollback()
+                raise
+        return len(lessons)
+
     def retrieve(self, query: PlaybookQuery) -> PlaybookSelection:
         hits: list[PlaybookHit] = []
         for lesson in self.lessons():
@@ -144,3 +321,143 @@ def _match_score(query: PlaybookQuery, lesson: PlaybookLesson) -> tuple[float, l
         score += min(len(overlap), 3) * 0.25
         reasons.append("tags")
     return score, reasons
+
+
+def _legacy_rule(lesson: PlaybookLesson) -> PlaybookRule:
+    conditions = (
+        PlaybookCondition(field="agent_race", value=lesson.context.agent_race),
+        PlaybookCondition(field="opponent_race", value=lesson.context.opponent_race),
+        PlaybookCondition(field="phase", value=lesson.context.phase.value),
+        PlaybookCondition(field="map_name", value=lesson.context.map_name),
+    )
+    effect = (
+        PlaybookRuleEffect.PREFER
+        if lesson.recommended_action is not None
+        else PlaybookRuleEffect.AVOID
+    )
+    actions = tuple(
+        action for action in (lesson.recommended_action, lesson.avoid_action) if action is not None
+    )
+    canonical = hashlib.sha256(
+        f"legacy|{lesson.signature}|{effect.value}|{'|'.join(actions)}".encode()
+    ).hexdigest()
+    return PlaybookRule(
+        rule_id=f"playbook-rule:{canonical}",
+        canonical_key=canonical,
+        category=(
+            PlaybookRuleCategory.EXECUTION_GUARD
+            if lesson.rule_kind is PlaybookRuleKind.EXECUTION_GUARD
+            else PlaybookRuleCategory.MATCHUP_STRATEGY
+        ),
+        conditions=conditions,
+        effect=effect,
+        strength=PlaybookRuleStrength.ADVISORY,
+        status=PlaybookRuleStatus.LEGACY,
+        action_names=actions,
+        confidence=lesson.confidence,
+        support_count=lesson.support_count,
+        contradiction_count=lesson.contradiction_count,
+        source_case_ids=lesson.source_case_ids,
+        source_run_ids=tuple(
+            dict.fromkeys(source.split("/", 1)[0] for source in lesson.source_episode_ids)
+        ),
+        evidence={"legacy_lesson_id": lesson.lesson_id, "statement": lesson.statement},
+    )
+
+
+def _candidate_rule(lesson: PlaybookLesson, source_case: DecisionCase) -> PlaybookRule:
+    conditions = (
+        PlaybookCondition(field="agent_race", value=lesson.context.agent_race),
+        PlaybookCondition(field="opponent_race", value=lesson.context.opponent_race),
+        PlaybookCondition(field="phase", value=lesson.context.phase.value),
+        PlaybookCondition(field="map_name", value=lesson.context.map_name),
+    )
+    effect = (
+        PlaybookRuleEffect.PREFER
+        if lesson.recommended_action is not None
+        else PlaybookRuleEffect.AVOID
+    )
+    actions = tuple(
+        action for action in (lesson.recommended_action, lesson.avoid_action) if action is not None
+    )
+    canonical_payload = "|".join(
+        (
+            lesson.rule_kind.value,
+            *(
+                f"{condition.field}:{condition.operator.value}:{condition.value}"
+                for condition in conditions
+            ),
+            effect.value,
+            *actions,
+        )
+    )
+    canonical = hashlib.sha256(canonical_payload.encode()).hexdigest()
+    seed = source_case.evidence.get("seed")
+    return PlaybookRule(
+        rule_id=f"playbook-rule:{canonical}",
+        canonical_key=canonical,
+        category=(
+            PlaybookRuleCategory.EXECUTION_GUARD
+            if lesson.rule_kind is PlaybookRuleKind.EXECUTION_GUARD
+            else PlaybookRuleCategory.MATCHUP_STRATEGY
+        ),
+        conditions=conditions,
+        effect=effect,
+        strength=PlaybookRuleStrength.ADVISORY,
+        status=PlaybookRuleStatus.CANDIDATE,
+        action_names=actions,
+        confidence=lesson.confidence,
+        support_count=1,
+        source_case_ids=(source_case.case_id,),
+        source_run_ids=(source_case.run_id,),
+        source_seeds=((int(seed),) if isinstance(seed, int) else ()),
+        evidence={"lesson_id": lesson.lesson_id, "statement": lesson.statement},
+    )
+
+
+def _merge_rule_evidence(existing: PlaybookRule, incoming: PlaybookRule) -> PlaybookRule:
+    """Keep one canonical rule while preserving independent evidence lineage."""
+
+    contradiction_seeds = tuple(
+        dict.fromkeys((*existing.contradiction_seeds, *incoming.contradiction_seeds))
+    )
+    source_run_ids = tuple(dict.fromkeys((*existing.source_run_ids, *incoming.source_run_ids)))
+    preserve_active = (
+        incoming.status is PlaybookRuleStatus.CANDIDATE
+        and existing.status is PlaybookRuleStatus.ACTIVE
+    )
+    return incoming.model_copy(
+        update={
+            "status": existing.status if preserve_active else incoming.status,
+            "strength": existing.strength if preserve_active else incoming.strength,
+            "confidence": (
+                max(existing.confidence, incoming.confidence)
+                if preserve_active
+                else incoming.confidence
+            ),
+            "support_count": max(
+                existing.support_count,
+                incoming.support_count,
+                len(source_run_ids),
+            ),
+            "contradiction_count": len(contradiction_seeds),
+            "source_case_ids": tuple(
+                dict.fromkeys((*existing.source_case_ids, *incoming.source_case_ids))
+            ),
+            "source_run_ids": source_run_ids,
+            "source_seeds": tuple(dict.fromkeys((*existing.source_seeds, *incoming.source_seeds))),
+            "contradiction_seeds": contradiction_seeds,
+            "shadow_state_count": max(existing.shadow_state_count, incoming.shadow_state_count),
+            "false_block_count": max(existing.false_block_count, incoming.false_block_count),
+            "evidence": {**existing.evidence, **incoming.evidence},
+        }
+    )
+
+
+def _rule_is_unexpired(rule: PlaybookRule, now: datetime) -> bool:
+    expires_at = rule.expires_at
+    if expires_at is None:
+        return True
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=UTC)
+    return expires_at.astimezone(UTC) > now

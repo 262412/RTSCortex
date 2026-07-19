@@ -16,6 +16,7 @@ from rtscortex.policy.hima.models import (
 )
 from rtscortex.policy.hima.observation import HIMAObservationAdapter
 from rtscortex.policy.hima.parser import HIMAProposalParser
+from rtscortex.policy.hima.race_vocabulary import hima_race_for_model
 from rtscortex.policy.models import (
     MacroPolicyProposal,
     PolicyGenerationMetadata,
@@ -65,8 +66,11 @@ class HIMAPolicySubagent:
             raise ValueError("HIMA subagents require the Hugging Face Transformers provider")
         if spec.model_id not in HIMA_PINNED_REVISIONS:
             raise ValueError(f"unrecognized pinned HIMA model: {spec.model_id}")
-        if spec.race != "Protoss":
-            raise ValueError("HIMA Protoss subagents require race='Protoss'")
+        model_race = hima_race_for_model(spec.model_id)
+        if spec.race.casefold() != model_race:
+            raise ValueError("HIMA subagent race must match its checkpoint")
+        if adapter.race != model_race or parser.race != model_race:
+            raise ValueError("HIMA adapter and parser race must match the checkpoint")
         self.spec = spec
         self.generator = generator
         self.adapter = adapter

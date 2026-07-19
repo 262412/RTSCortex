@@ -6,12 +6,13 @@ import copy
 import importlib
 import os
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass, replace
 from functools import partial
 from numbers import Integral
-from typing import Any, Optional
+from typing import Any, Optional, Protocol
 
+from rtscortex_llm_pysc2.addon import ADDON_SPECS, addon_spec
 from rtscortex_llm_pysc2.broker import PrimitiveDispatch, SharedDecisionBroker
 from rtscortex_llm_pysc2.clock import FixedRateGameClock, InitialPlanningBarrier
 from rtscortex_llm_pysc2.coordinator import BridgeCoordinator
@@ -27,7 +28,7 @@ from rtscortex_llm_pysc2.extractor import (
     TimeStepExtractor,
     build_screen_candidates,
     builder_move_requires_power,
-    is_production_action,
+    is_source_bound_action,
     nexus_placement_footprint_is_visible,
     production_source_tag,
     resolve_screen_build_world_target,
@@ -37,12 +38,34 @@ from rtscortex_llm_pysc2.extractor import (
 )
 from rtscortex_llm_pysc2.frame_stream import RGBFramePublisher, RuntimeFrameUploader
 from rtscortex_llm_pysc2.hook import RuntimeQueryMixin
-from rtscortex_llm_pysc2.production import ProductionSpec, production_spec
+from rtscortex_llm_pysc2.morph import MORPH_SPECS, morph_spec
+from rtscortex_llm_pysc2.production import (
+    PRODUCTION_SPECS_BY_RACE,
+    production_spec,
+)
 from rtscortex_llm_pysc2.protocol import RuntimeClient
 
 PRODUCTION_CAMERA_SETTLE_MAX_OBSERVATIONS = 4
+PRODUCTION_SELECTION_MAX_ATTEMPTS = 4
+BUILD_SELECTION_RETRY_MAX_OBSERVATIONS = 2
+ACTOR_SELECTION_MAX_ATTEMPTS = 8
+BUILD_TRANSLATOR_RETRY_FAILURE_CODES = frozenset(
+    {"blocked", "need_power", "not_pathable", "no_legal_placement"}
+)
 DEFAULT_OBSERVATION_GAP_WATCHDOG_GAME_LOOPS = 448
 DEFAULT_OBSERVATION_GAP_HARD_LIMIT_GAME_LOOPS = 1792
+
+
+class _SourceActionSpec(Protocol):
+    @property
+    def action_name(self) -> str: ...
+
+    @property
+    def producer_type(self) -> str: ...
+
+    @property
+    def race(self) -> str: ...
+
 
 try:
     _upstream_agents = importlib.import_module("llm_pysc2.agents")
@@ -63,6 +86,7 @@ class WorkerSettings:
     socket_path: Optional[str]
     runtime_url: str
     seed: int
+    agent_race: str = "protoss"
     scenario: str = "pvz_task1_level1"
     pending_plan_step_delay_seconds: float = 0.0
     simulation_speed_multiplier: Optional[float] = None
@@ -126,6 +150,9 @@ class WorkerSettings:
         console_jpeg_quality = int(os.environ.get("RTSCORTEX_CONSOLE_JPEG_QUALITY", "75"))
         if not 1 <= console_jpeg_quality <= 95:
             raise RuntimeError("RTSCORTEX_CONSOLE_JPEG_QUALITY must be between 1 and 95")
+        agent_race = os.environ.get("RTSCORTEX_AGENT_RACE", "protoss").strip().casefold()
+        if agent_race not in {"protoss", "terran", "zerg"}:
+            raise RuntimeError(f"unsupported RTSCORTEX_AGENT_RACE {agent_race!r}")
         return cls(
             run_id=run_id,
             episode_id=episode_id,
@@ -133,6 +160,7 @@ class WorkerSettings:
             or os.environ.get("RTSCORTEX_SOCKET"),
             runtime_url=os.environ.get("RTSCORTEX_RUNTIME_URL", "http://127.0.0.1:8765"),
             seed=int(os.environ.get("RTSCORTEX_SEED", "0")),
+            agent_race=agent_race,
             scenario=os.environ.get("RTSCORTEX_SCENARIO", "pvz_task1_level1"),
             pending_plan_step_delay_seconds=pending_plan_step_delay_seconds,
             simulation_speed_multiplier=(
@@ -155,12 +183,15 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
     broker: SharedDecisionBroker
     func_list: list[Any]
     action_list: list[dict[str, Any]]
+    curr_action_name: str
+    curr_action_args: list[Any]
 
     def __init__(
         self,
         *args: Any,
         broker: SharedDecisionBroker,
         unit_names: Mapping[int, str],
+        player_race: str,
         **kwargs: Any,
     ) -> None:
         _require_upstream()
@@ -171,13 +202,20 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
             )
         self.broker = broker
         self.unit_names = dict(unit_names)
+        self.rtscortex_player_race = str(player_race).casefold()
         self._rtscortex_translation_attempt: Optional[dict[str, Any]] = None
         self._rtscortex_semantic_action: Optional[dict[str, Any]] = None
         self._rtscortex_production_source_tag: Optional[int] = None
+        self._rtscortex_production_navigation_tag: Optional[int] = None
         self._rtscortex_production_camera_waits = 0
+        self._rtscortex_production_camera_wait_loop: Optional[int] = None
+        self._rtscortex_production_selection_loop: Optional[int] = None
+        self._rtscortex_production_selection_attempts = 0
+        self._rtscortex_build_selection_retries = 0
         self._rtscortex_camera_settlement_noop = False
         self._rtscortex_rejected_build_positions: dict[str, set[tuple[int, int]]] = {}
         self._rtscortex_rejected_build_targets: dict[str, set[tuple[float, float]]] = {}
+        self._rtscortex_rejected_addon_sources: dict[str, set[int]] = {}
         self._rtscortex_active_build_route: Optional[
             tuple[str, tuple[int, int], Optional[tuple[float, float]]]
         ] = None
@@ -185,20 +223,38 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
 
     def get_func(self, obs: Any) -> Any:
         self._rtscortex_camera_settlement_noop = False
-        if not self.func_list and self.action_list:
+        semantic_action = getattr(self, "_rtscortex_semantic_action", None)
+        if not self.func_list and self.action_list and semantic_action is None:
             self._rtscortex_semantic_action = _isolate_next_action(self.action_list)
+            semantic_action = self._rtscortex_semantic_action
             self._rtscortex_production_camera_waits = 0
-            if production_spec(str(self.action_list[0].get("name", ""))) is None:
+            self._rtscortex_production_camera_wait_loop = None
+            self._rtscortex_production_selection_loop = None
+            self._rtscortex_production_selection_attempts = 0
+            self._rtscortex_build_selection_retries = 0
+            next_action_name = str(self.action_list[0].get("name", ""))
+            if _source_action_spec(next_action_name) is None:
                 self._rtscortex_production_source_tag = None
+                self._rtscortex_production_navigation_tag = None
         action: dict[str, Any] = (
-            self._rtscortex_semantic_action
-            if self._rtscortex_semantic_action is not None
+            semantic_action
+            if semantic_action is not None
             else {"name": getattr(self, "curr_action_name", "")}
         )
+        provenance = None
         semantic_action_name = str(action.get("name", ""))
         if self._wait_for_production_camera(semantic_action_name, obs):
             self._rtscortex_camera_settlement_noop = True
             return 0, _no_op()
+        if self._wait_for_production_selection(semantic_action_name, obs):
+            self._rtscortex_camera_settlement_noop = True
+            return 0, _no_op()
+        production_reselection = self._reselect_unconfirmed_production_source(
+            semantic_action_name,
+            obs,
+        )
+        if production_reselection is not None:
+            return production_reselection
         if not self.func_list and self.action_list:
             action_name = semantic_action_name
             if self._reject_unavailable_production_action(action, obs):
@@ -223,7 +279,7 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
                             action_name, set()
                         )
                         target_key = _build_world_target_key(provenance.world_target)
-                        resolved = _resolve_build_action_position(
+                        resolved = _resolve_translator_compatible_build_position(
                             action,
                             obs.observation,
                             world_target=provenance.world_target,
@@ -233,6 +289,8 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
                                 target_key
                                 in self._rtscortex_rejected_build_targets.get(action_name, set())
                             ),
+                            screen_size=int(self.size_screen),
+                            unit_names=self.unit_names,
                         )
                     else:
                         resolved = _resolve_screen_point_action_position(
@@ -324,11 +382,98 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
             if resolved is not None:
                 if command_id is not None:
                     self.broker.resolve_arguments(command_id, [resolved])
+            build_reselection = self._reselect_builder_for_unavailable_build(
+                action,
+                obs,
+            )
+            if build_reselection is not None:
+                return build_reselection
+            if _requires_explicit_production_chain(action_name):
+                self._prime_production_chain(action)
+        if _next_primitive_is_screen_build(semantic_action_name, self.func_list):
+            command_id = self.broker.command_id_for(
+                self.name,
+                _execution_team_name(self),
+                semantic_action_name,
+            )
+            provenance = (
+                None if command_id is None else self.broker.screen_route_provenance(command_id)
+            )
+            if provenance is not None:
+                action["func"] = list(self.func_list)
+                rejected_positions = self._rtscortex_rejected_build_positions.get(
+                    semantic_action_name,
+                    set(),
+                )
+                target_key = _build_world_target_key(provenance.world_target)
+                resolved = _resolve_translator_compatible_build_position(
+                    action,
+                    obs.observation,
+                    world_target=provenance.world_target,
+                    preferred_anchor_tag=provenance.anchor_tag,
+                    excluded_positions=rejected_positions,
+                    force_resample=(
+                        target_key
+                        in self._rtscortex_rejected_build_targets.get(
+                            semantic_action_name,
+                            set(),
+                        )
+                    ),
+                    screen_size=int(self.size_screen),
+                    unit_names=self.unit_names,
+                    builder_tags=(
+                        [builder_tag]
+                        if (builder_tag := _execution_unit_tag(self)) is not None
+                        else []
+                    ),
+                )
+                if resolved is None:
+                    requested = _screen_argument(action)
+                    if requested is not None:
+                        self._rtscortex_rejected_build_positions.setdefault(
+                            semantic_action_name,
+                            set(),
+                        ).add(_screen_position_key(requested))
+                    self._rtscortex_rejected_build_targets.setdefault(
+                        semantic_action_name,
+                        set(),
+                    ).add(target_key)
+                    dispatch = self.broker.reject_command(
+                        self.name,
+                        _execution_team_name(self),
+                        semantic_action_name,
+                        failure_code="no_legal_placement",
+                    )
+                    if dispatch is None:
+                        self.broker.raise_unattributed_integrity(
+                            f"no command owns {semantic_action_name!r}"
+                        )
+                    self.broker.settle_primitive(
+                        dispatch,
+                        success=False,
+                        failure_reason=(
+                            "no legal placement remained after camera or builder selection"
+                        ),
+                        game_loop=_observation_game_loop(obs.observation),
+                    )
+                    self.func_list.clear()
+                    self._rtscortex_semantic_action = None
+                    self._rtscortex_build_selection_retries = 0
+                    return 0, _no_op()
+                self.func_list = list(action["func"])
+                assert command_id is not None
+                self.broker.resolve_arguments(command_id, [resolved])
         # Upstream consumes and mutates the semantic action while translating it.
         # Keep the already validated request for the final candidate-domain audit.
+        self._prefer_available_generic_addon_function(semantic_action_name, obs)
         candidate_action = copy.deepcopy(action)
         self._rtscortex_translation_attempt = None
-        result = super().get_func(obs)
+        if _is_worker_owned_larva_selection(self, semantic_action_name):
+            result = _translate_worker_owned_zero_argument_primitive(self, obs)
+        elif _is_worker_owned_near_build_final_primitive(self, semantic_action_name):
+            result = _translate_worker_owned_near_build_primitive(self, obs)
+        else:
+            result = super().get_func(obs)
         metadata = getattr(self, "last_translation_result", None)
         if not isinstance(metadata, Mapping):
             self.broker.fail_command_integrity(
@@ -356,7 +501,7 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
         ordinal = int(attempt.get("ordinal", 0))
         total = int(attempt.get("total", 1))
         final_primitive = not accepted or ordinal + 1 >= total
-        train_spec = production_spec(action_name)
+        source_spec = _source_action_spec(action_name)
         producer_tag, provenance_failure = self._validated_production_source_tag(
             action_name,
             attempt,
@@ -370,18 +515,42 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
                 reason=reason,
             )
             return 0, _no_op()
-        if train_spec is not None and final_primitive:
+        if (
+            source_spec is not None
+            and accepted
+            and _selection_primitive_starts_production_barrier(
+                action_name,
+                requested_id,
+            )
+            and not final_primitive
+        ):
+            self._rtscortex_production_selection_loop = _observation_game_loop(obs.observation)
+        if not accepted and failure_code == "no_legal_addon_placement" and producer_tag is not None:
+            rejected_sources = getattr(self, "_rtscortex_rejected_addon_sources", None)
+            if rejected_sources is None:
+                rejected_sources = {}
+                self._rtscortex_rejected_addon_sources = rejected_sources
+            rejected_sources.setdefault(action_name, set()).add(producer_tag)
+        if source_spec is not None and final_primitive:
             invalid_reason = _production_source_invalid_reason(
                 obs.observation,
                 producer_tag,
-                train_spec,
+                source_spec,
                 self.unit_names,
             )
             if invalid_reason is not None:
                 self._settle_production_command_failure(
                     action_name,
                     obs,
-                    failure_code="production_source_invalidated",
+                    failure_code=(
+                        "addon_source_invalidated"
+                        if addon_spec(action_name) is not None
+                        else (
+                            "morph_source_invalidated"
+                            if morph_spec(action_name) is not None
+                            else "production_source_invalidated"
+                        )
+                    ),
                     reason=invalid_reason,
                 )
                 return 0, _no_op()
@@ -389,8 +558,33 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
             action_name,
             attempt.get("resolved_arguments"),
         )
+        translated_build_spec = BUILD_SPECS.get(action_name)
         if (
-            action_name == "Build_Nexus_Near"
+            not accepted
+            and translated_build_spec is not None
+            and translated_build_spec.placement_kind == "screen"
+            and failure_code in BUILD_TRANSLATOR_RETRY_FAILURE_CODES
+        ):
+            rejected_position = _screen_argument(candidate_action)
+            if rejected_position is not None:
+                self._rtscortex_rejected_build_positions.setdefault(
+                    action_name,
+                    set(),
+                ).add(_screen_position_key(rejected_position))
+            if provenance is not None:
+                self._rtscortex_rejected_build_targets.setdefault(
+                    action_name,
+                    set(),
+                ).add(_build_world_target_key(provenance.world_target))
+            # Nothing reached PySC2. Keep the command and primitive ordinal alive
+            # so the next observation can use another semantic placement candidate.
+            self.func_list = list(candidate_action.get("func", ()))
+            self._rtscortex_semantic_action = candidate_action
+            self._rtscortex_translation_ordinal = ordinal
+            return result
+        if (
+            (expansion_spec := BUILD_SPECS.get(action_name)) is not None
+            and expansion_spec.placement_kind == "expansion"
             and accepted
             and final_primitive
             and (
@@ -416,14 +610,14 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
             )
             if dispatch is None:
                 self.broker.raise_unattributed_integrity(
-                    "unscouted Nexus primitive has no active command"
+                    "unscouted expansion primitive has no active command"
                 )
             if translated_position is not None:
                 self.broker.resolve_arguments(dispatch.command_id, [translated_position])
             self.broker.settle_primitive(
                 dispatch,
                 success=False,
-                failure_reason="translated Nexus footprint is not fully visible",
+                failure_reason="translated expansion footprint is not fully visible",
                 game_loop=_observation_game_loop(obs.observation),
             )
             self.func_list.clear()
@@ -447,6 +641,7 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
                 self.broker.raise_unattributed_integrity(
                     f"translator primitive for {action_name!r} has no unique active command"
                 )
+            self._rtscortex_semantic_action = None
             return result
         if accepted:
             candidate_failure = _candidate_dispatch_failure(
@@ -490,18 +685,103 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
         if dispatch.final_primitive:
             self._rtscortex_semantic_action = None
             self._rtscortex_production_source_tag = None
+            self._rtscortex_production_navigation_tag = None
             self._rtscortex_production_camera_waits = 0
+            self._rtscortex_production_camera_wait_loop = None
+            self._rtscortex_production_selection_loop = None
+            self._rtscortex_production_selection_attempts = 0
+            self._rtscortex_build_selection_retries = 0
         return result
+
+    def _reselect_builder_for_unavailable_build(
+        self,
+        action: Mapping[str, Any],
+        obs: Any,
+    ) -> Optional[tuple[int, Any]]:
+        """Repair a stale feature selection before translating a screen build."""
+
+        action_name = str(action.get("name", ""))
+        spec = BUILD_SPECS.get(action_name)
+        functions = action.get("func", ())
+        if spec is None or spec.placement_kind != "screen" or not functions:
+            return None
+        requested_function_id = int(functions[0][0])
+        available_actions = set(_observation_value(obs.observation, "available_actions", ()))
+        if requested_function_id in available_actions:
+            self._rtscortex_build_selection_retries = 0
+            return None
+        if self._rtscortex_build_selection_retries >= BUILD_SELECTION_RETRY_MAX_OBSERVATIONS:
+            return None
+        builder_tag = _execution_unit_tag(self)
+        position = _visible_feature_position(obs.observation, builder_tag)
+        if position is None:
+            return None
+        self._rtscortex_build_selection_retries += 1
+        actions = importlib.import_module("pysc2.lib.actions")
+        return 2, actions.FUNCTIONS.select_point("select", position)
+
+    def _prime_production_chain(self, action: Mapping[str, Any]) -> None:
+        """Bind a non-Protoss action to the exact producer selected by RTSCortex."""
+
+        producer_tag = self._rtscortex_production_source_tag
+        if producer_tag is None:
+            raise RuntimeError("production chain lacks producer provenance")
+        actions = importlib.import_module("pysc2.lib.actions")
+        semantic_action = self.action_list.pop(0)
+        direct_production_spec = production_spec(str(action.get("name", "")))
+        action_functions = list(action.get("func", semantic_action.get("func", ())))
+        if direct_production_spec is not None and direct_production_spec.producer_consumed:
+            navigation_tag = self._rtscortex_production_navigation_tag
+            if navigation_tag is None:
+                raise RuntimeError("larva production chain lacks a townhall navigation tag")
+            self.func_list = [
+                (573, actions.FUNCTIONS.llm_pysc2_move_camera, (int(navigation_tag),)),
+                (2, actions.FUNCTIONS.select_point, ("select", int(navigation_tag))),
+                (9, actions.FUNCTIONS.select_larva, ()),
+                *action_functions,
+            ]
+        else:
+            self.func_list = [
+                (573, actions.FUNCTIONS.llm_pysc2_move_camera, (int(producer_tag),)),
+                (2, actions.FUNCTIONS.select_point, ("select", int(producer_tag))),
+                *action_functions,
+            ]
+        self._rtscortex_translation_ordinal = 0
+        self._rtscortex_translation_total = len(self.func_list)
+        self.curr_action_name = str(action.get("name", ""))
+        self.curr_action_args = list(action.get("arg", ()))
+
+    def _prefer_available_generic_addon_function(self, action_name: str, obs: Any) -> None:
+        """Use SC2's generic add-on ability only when the live action set exposes it."""
+
+        spec = addon_spec(action_name)
+        if spec is None or not self.func_list:
+            return
+        if int(self._rtscortex_translation_ordinal) != 2:
+            return
+        available_actions = set(_observation_value(obs.observation, "available_actions", ()))
+        function_id = _available_addon_function_id(action_name, available_actions)
+        current_id, _, arguments = self.func_list[0]
+        if function_id == int(current_id):
+            return
+        actions = importlib.import_module("pysc2.lib.actions")
+        self.func_list[0] = (
+            function_id,
+            actions.FUNCTIONS[function_id],
+            arguments,
+        )
 
     def _wait_for_production_camera(self, action_name: str, obs: Any) -> bool:
         """Wait for a post-camera feature observation before selecting a producer."""
 
-        if production_spec(action_name) is None or not self.func_list:
+        if _source_action_spec(action_name) is None or not self.func_list:
             return False
         next_function_id = int(self.func_list[0][0])
         if next_function_id != 2 or int(self._rtscortex_translation_ordinal) != 1:
             return False
-        producer_tag = self._rtscortex_production_source_tag
+        producer_tag = (
+            self._rtscortex_production_navigation_tag or self._rtscortex_production_source_tag
+        )
         if producer_tag is None:
             return False
         if _producer_is_visible(
@@ -510,7 +790,12 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
             size_screen=int(self.size_screen),
         ):
             self._rtscortex_production_camera_waits = 0
+            self._rtscortex_production_camera_wait_loop = None
             return False
+        observation_loop = _observation_game_loop(obs.observation)
+        if self._rtscortex_production_camera_wait_loop == observation_loop:
+            return True
+        self._rtscortex_production_camera_wait_loop = observation_loop
         self._rtscortex_production_camera_waits += 1
         if self._rtscortex_production_camera_waits <= (PRODUCTION_CAMERA_SETTLE_MAX_OBSERVATIONS):
             return True
@@ -524,7 +809,127 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
             ),
         )
         self._rtscortex_production_camera_waits = 0
+        self._rtscortex_production_camera_wait_loop = None
         return True
+
+    def _wait_for_production_selection(self, action_name: str, obs: Any) -> bool:
+        """Wait for selection acceptance, then verify the exact producer tag."""
+
+        if _source_action_spec(action_name) is None or not self.func_list:
+            return False
+        selected_loop = self._rtscortex_production_selection_loop
+        if selected_loop is None:
+            return False
+        if _observation_game_loop(obs.observation) <= selected_loop:
+            return True
+        producer_tag = self._rtscortex_production_source_tag
+        source_spec = _source_action_spec(action_name)
+        selected_tags = (
+            ()
+            if source_spec is None
+            else _selected_production_source_tags(
+                obs.observation,
+                producer_type=source_spec.producer_type,
+                unit_names=self.unit_names,
+            )
+        )
+        selected_tag: Optional[int] = None
+        direct_production_spec = production_spec(action_name)
+        available_function_ids = {
+            int(value) for value in _observation_value(obs.observation, "available_actions", ())
+        }
+        final_function_id = int(self.func_list[0][0])
+        consumed_production_is_available = (
+            direct_production_spec is not None
+            and direct_production_spec.producer_consumed
+            and final_function_id in available_function_ids
+        )
+        if (
+            direct_production_spec is not None
+            and direct_production_spec.producer_consumed
+            and (selected_tags or consumed_production_is_available)
+        ):
+            if producer_tag is not None and (
+                producer_tag in selected_tags or consumed_production_is_available
+            ):
+                selected_tag = producer_tag
+            elif selected_tags:
+                selected_tag = selected_tags[0]
+        elif len(selected_tags) == 1:
+            selected_tag = selected_tags[0]
+        if selected_tag is not None:
+            if producer_tag is not None and selected_tag != producer_tag:
+                self._rtscortex_last_production_source_rebind = (
+                    producer_tag,
+                    selected_tag,
+                )
+            self._rtscortex_production_source_tag = selected_tag
+            self._rtscortex_production_selection_loop = None
+            self._rtscortex_production_selection_attempts = 0
+        return False
+
+    def _reselect_unconfirmed_production_source(
+        self,
+        action_name: str,
+        obs: Any,
+    ) -> Optional[tuple[int, Any]]:
+        """Retry a point selection when another unit obscured the producer."""
+
+        if _source_action_spec(action_name) is None or not self.func_list:
+            return None
+        if self._rtscortex_production_selection_loop is None:
+            return None
+        direct_production_spec = production_spec(action_name)
+        if direct_production_spec is not None and direct_production_spec.producer_consumed:
+            if self._rtscortex_production_selection_attempts >= PRODUCTION_SELECTION_MAX_ATTEMPTS:
+                self._settle_production_command_failure(
+                    action_name,
+                    obs,
+                    failure_code="production_source_not_selected",
+                    reason=(
+                        "select_larva did not expose the requested train capability after "
+                        f"{self._rtscortex_production_selection_attempts + 1} attempts"
+                    ),
+                )
+                self._rtscortex_camera_settlement_noop = True
+                return 0, _no_op()
+            self._rtscortex_production_selection_attempts += 1
+            self._rtscortex_production_selection_loop = _observation_game_loop(obs.observation)
+            actions = importlib.import_module("pysc2.lib.actions")
+            return 9, actions.FUNCTIONS.select_larva()
+        producer_tag = self._rtscortex_production_source_tag
+        position = _production_reselection_position(
+            obs.observation,
+            producer_tag,
+            attempt=self._rtscortex_production_selection_attempts,
+            size_screen=int(self.size_screen),
+        )
+        if position is None or (
+            self._rtscortex_production_selection_attempts >= PRODUCTION_SELECTION_MAX_ATTEMPTS
+        ):
+            self._settle_production_command_failure(
+                action_name,
+                obs,
+                failure_code=(
+                    "addon_source_not_selected"
+                    if addon_spec(action_name) is not None
+                    else (
+                        "morph_source_not_selected"
+                        if morph_spec(action_name) is not None
+                        else "production_source_not_selected"
+                    )
+                ),
+                reason=(
+                    f"producer tag {hex(producer_tag or 0)} was not selected after "
+                    f"{self._rtscortex_production_selection_attempts + 1} attempts"
+                ),
+            )
+            self._rtscortex_camera_settlement_noop = True
+            return 0, _no_op()
+        self._rtscortex_production_selection_attempts += 1
+        self._rtscortex_production_selection_loop = _observation_game_loop(obs.observation)
+        actions = importlib.import_module("pysc2.lib.actions")
+        return 2, actions.FUNCTIONS.select_point("select", position)
 
     def _validated_production_source_tag(
         self,
@@ -533,12 +938,42 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
     ) -> tuple[Optional[int], Optional[tuple[str, str]]]:
         """Bind production to the exact raw producer selected by the translator."""
 
-        if production_spec(action_name) is None:
+        if _source_action_spec(action_name) is None:
             return None, None
+        source_kind = (
+            "addon"
+            if addon_spec(action_name) is not None
+            else "morph"
+            if morph_spec(action_name) is not None
+            else "production"
+        )
         source_tag = self._rtscortex_production_source_tag
         ordinal = int(attempt.get("ordinal", 0))
         requested_id = int(attempt.get("requested_function_id", 0))
+        direct_production_spec = production_spec(action_name)
+        if (
+            direct_production_spec is not None
+            and direct_production_spec.producer_consumed
+            and requested_id == 9
+        ):
+            if source_tag is None:
+                return None, (
+                    f"{source_kind}_provenance_missing",
+                    f"{source_kind} select_larva primitive has no preflight source anchor",
+                )
+            return source_tag, None
         if ordinal == 0:
+            if (
+                direct_production_spec is not None
+                and direct_production_spec.producer_consumed
+                and requested_id == 573
+            ):
+                if source_tag is None:
+                    return None, (
+                        f"{source_kind}_provenance_missing",
+                        f"{source_kind} camera primitive has no preflight source anchor",
+                    )
+                return source_tag, None
             requested_arguments = attempt.get("requested_arguments")
             translator_source_tag = (
                 int(requested_arguments[0])
@@ -550,8 +985,8 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
             )
             if requested_id != 573 or translator_source_tag is None:
                 return None, (
-                    "production_provenance_missing",
-                    "production primitive 573 did not expose one exact translator "
+                    f"{source_kind}_provenance_missing",
+                    f"{source_kind} primitive 573 did not expose one exact translator "
                     f"source tag: function {requested_id}, arguments "
                     f"{requested_arguments!r}",
                 )
@@ -559,8 +994,8 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
             self._rtscortex_production_source_tag = source_tag
         if source_tag is None:
             return None, (
-                "production_provenance_missing",
-                "production provenance missing before translator dispatch",
+                f"{source_kind}_provenance_missing",
+                f"{source_kind} provenance missing before translator dispatch",
             )
         return source_tag, None
 
@@ -570,16 +1005,36 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
         obs: Any,
     ) -> bool:
         action_name = str(action.get("name", ""))
-        if not is_production_action(action_name):
+        if not is_source_bound_action(action_name):
             return False
         source_tag = production_source_tag(
             obs.observation,
             action,
             unit_names=self.unit_names,
             action_source_types=self.broker.extractor.action_source_types,
+            excluded_source_tags=getattr(
+                self,
+                "_rtscortex_rejected_addon_sources",
+                {},
+            ).get(action_name, ()),
         )
+        direct_production_spec = production_spec(action_name)
+        if (
+            source_tag is not None
+            and direct_production_spec is not None
+            and direct_production_spec.producer_consumed
+        ):
+            navigation_tag = _zerg_larva_townhall_tag(
+                obs.observation,
+                larva_tag=source_tag,
+                unit_names=self.unit_names,
+            )
+            if navigation_tag is None:
+                source_tag = None
+            else:
+                self._rtscortex_production_navigation_tag = navigation_tag
         if source_tag is not None:
-            if production_spec(action_name) is not None:
+            if is_source_bound_action(action_name):
                 self._rtscortex_production_source_tag = source_tag
             return False
         self._settle_production_source_failure(
@@ -600,7 +1055,15 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
         self._settle_production_command_failure(
             action_name,
             obs,
-            failure_code="production_source_unavailable",
+            failure_code=(
+                "addon_source_unavailable"
+                if addon_spec(action_name) is not None
+                else (
+                    "morph_source_unavailable"
+                    if morph_spec(action_name) is not None
+                    else "production_source_unavailable"
+                )
+            ),
             reason=reason,
         )
 
@@ -631,11 +1094,17 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
         self.func_list.clear()
         self._rtscortex_semantic_action = None
         self._rtscortex_production_source_tag = None
+        self._rtscortex_production_navigation_tag = None
         self._rtscortex_production_camera_waits = 0
+        self._rtscortex_production_camera_wait_loop = None
+        self._rtscortex_production_selection_loop = None
+        self._rtscortex_production_selection_attempts = 0
 
 
 class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
     """Keep the upstream environment loop and attach RTSCortex at its query seam."""
+
+    select_rect_threshold: int
 
     def __init__(self) -> None:
         _require_upstream()
@@ -662,7 +1131,7 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
             unit_names=unit_names,
             upgrade_names=upgrade_names,
             building_types=building_types,
-            action_source_types=_production_action_source_types(),
+            action_source_types=_production_action_source_types(self.worker_settings.agent_race),
         )
         self.decision_broker = SharedDecisionBroker(
             coordinator,
@@ -671,8 +1140,11 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
         )
         self._pending_primitive: Optional[PrimitiveDispatch] = None
         self._pending_primitive_agent: Optional[Any] = None
+        self._actor_selection_retry_key: Optional[tuple[str, str]] = None
+        self._actor_selection_attempts = 0
         self.transport_noop_primitives = 0
         self._observation_watchdog_active = False
+        self._observation_watchdog_preempted = False
         self._observation_watchdog_baseline_loop: Optional[int] = None
         self._rtscortex_force_runtime_decision = False
         self._episode_reported = False
@@ -683,14 +1155,21 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
             else None
         )
 
-        config = _scenario_config(self.worker_settings.scenario)
+        config = _scenario_config(
+            self.worker_settings.scenario,
+            agent_race=self.worker_settings.agent_race,
+        )
         subagent = partial(
             RTSCortexLLMAgent,
             broker=self.decision_broker,
             unit_names=unit_names,
+            player_race=self.worker_settings.agent_race,
         )
         super().__init__(config, subagent)
         self._rtscortex_accept_visible_team_unit = True
+        self._rtscortex_exact_single_unit_selection = True
+        self._rtscortex_transport_noop_without_actor_selection = True
+        self._rtscortex_validate_gather_target = True
         _apply_scenario_bootstrap(self, self.worker_settings.scenario)
         if self.worker_settings.console_enabled:
             self._frame_publisher = RGBFramePublisher(
@@ -716,27 +1195,44 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
 
     def _step(self, obs: Any) -> Any:
         self._submit_console_frame(obs)
+        _abort_stalled_actor_selection(self)
         self._settle_previous_primitive(obs)
         self.decision_broker.observe_effects(obs.observation)
         if _is_terminal(obs):
             return _finish_terminal(self, obs, _base_agent_step, _no_op)
+        _rebind_builder_to_selected_worker(self, obs.observation)
+        _refresh_consumed_zerg_builder(self, obs.observation)
+        _refresh_zerg_morphed_combat_teams(self, obs.observation)
         observation_loop = _observation_game_loop(obs.observation)
-        watchdog_active = self._update_observation_gap_watchdog(observation_loop)
-        if watchdog_active:
-            _release_runtime_observation_barrier(self)
-        worker_management_blocked = (
+        # RTSCortex consumes a global raw snapshot. Do not make every Runtime tick
+        # wait for optional upstream camera/selection-based text gathering.
+        _release_runtime_observation_barrier(self)
+        watchdog_preempted = self._update_observation_gap_watchdog(observation_loop)
+        runtime_observation_due = _runtime_observation_is_due(
+            observation_loop,
+            last_decision_game_loop=self.decision_broker.last_decision_game_loop,
+            watchdog_game_loops=self.worker_settings.observation_gap_watchdog_game_loops,
+        )
+        effect_verification_blocked = (
             self.decision_broker.coordinator.effect_verifier.blocks_auto_worker_management
-            or watchdog_active
         )
         _prime_deterministic_gas_rebalance(
             self,
             obs.observation,
-            blocked=worker_management_blocked,
+            blocked=_should_block_gas_rebalance(
+                effect_verification_blocked=effect_verification_blocked,
+                observation_watchdog_active=self._observation_watchdog_active,
+                runtime_observation_due=runtime_observation_due,
+            ),
+        )
+        self.select_rect_threshold = min(
+            int(self.select_rect_threshold),
+            max(1, int(self.size_screen)),
         )
         upstream_step = super().step
         action = _run_with_auto_worker_management_guard(
             self.config,
-            blocked=worker_management_blocked,
+            blocked=(effect_verification_blocked or watchdog_preempted or runtime_observation_due),
             upstream_step=lambda: upstream_step(obs),
         )
         self._consume_execution_aborts(obs)
@@ -824,6 +1320,7 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
         dispatch = self._pending_primitive
         if dispatch is None:
             return
+        settlement_loop = _observation_game_loop(obs.observation)
         action_results = list(getattr(obs.observation, "action_result", ()))
         failure_reason = None
         if action_results:
@@ -852,11 +1349,29 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
                             self._pending_primitive_agent._rtscortex_rejected_build_targets.setdefault(
                                 action_name, set()
                             ).add(world_target)
+        elif (
+            dispatch.origin in {"translator", "orchestration"}
+            and not dispatch.final_primitive
+            and self._pending_primitive_agent is not None
+            and _selection_primitive_starts_production_barrier(
+                self._pending_primitive_agent.curr_action_name,
+                int(dispatch.requested_function_id or 0),
+            )
+            and (
+                production_spec(self._pending_primitive_agent.curr_action_name) is not None
+                or addon_spec(self._pending_primitive_agent.curr_action_name) is not None
+            )
+        ):
+            # The select primitive was created from the previous observation.
+            # Anchor the barrier to the observation that confirms PySC2 accepted
+            # it, so the final train/add-on primitive cannot run in this same
+            # handler invocation with stale feature-action availability.
+            self._pending_primitive_agent._rtscortex_production_selection_loop = settlement_loop
         self.decision_broker.settle_primitive(
             dispatch,
             success=not action_results,
             failure_reason=failure_reason,
-            game_loop=_observation_game_loop(obs.observation),
+            game_loop=settlement_loop,
         )
         self._pending_primitive = None
         if self._pending_primitive_agent is not None:
@@ -952,25 +1467,30 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
         ):
             self._observation_watchdog_active = False
             self._observation_watchdog_baseline_loop = None
-            self._rtscortex_force_runtime_decision = False
         gap = game_loop - last_decision_loop
         if (
-            not self._observation_watchdog_active
+            not self._observation_watchdog_preempted
             and gap > self.worker_settings.observation_gap_watchdog_game_loops
         ):
+            self._observation_watchdog_preempted = True
             self._observation_watchdog_active = True
             self._observation_watchdog_baseline_loop = last_decision_loop
             self._rtscortex_force_runtime_decision = True
             self.decision_broker.record_observation_gap_watchdog_trigger()
         if (
-            self._observation_watchdog_active
+            self._observation_watchdog_preempted
             and gap > self.worker_settings.observation_gap_hard_limit_game_loops
         ):
             raise RuntimeError(
                 "observation_gap_watchdog_timeout: no Runtime decision for "
                 f"{gap} game loops (last decision loop {last_decision_loop})"
             )
-        return self._observation_watchdog_active
+        # Once the watchdog has observed starvation, keep optional upstream
+        # automation disabled for the rest of the episode.  A recovered
+        # Runtime decision only clears the hard-limit recovery window; letting
+        # worker management resume here can consume every subsequent SC2 step
+        # and starve the next Runtime decision again.
+        return self._observation_watchdog_preempted
 
     def _report_episode(self, obs: Any) -> None:
         reward = float(getattr(obs, "reward", 0.0) or 0.0)
@@ -1053,22 +1573,42 @@ def _require_upstream() -> None:
         ) from _UPSTREAM_IMPORT_ERROR
 
 
-def _scenario_config(scenario: str) -> Any:
+def _scenario_config(scenario: str, *, agent_race: str = "protoss") -> Any:
+    normalized_race = agent_race.strip().casefold()
+    if normalized_race not in {"protoss", "terran", "zerg"}:
+        raise ValueError(f"unsupported worker race {agent_race!r}")
+    if scenario != "Simple64" and normalized_race != "protoss":
+        raise ValueError(f"worker scenario {scenario!r} does not support race {normalized_race!r}")
     definitions = {
         "pvz_task1_level1": (
             "llm_pysc2.agents.configs.llm_pysc2",
             "ConfigPysc2_Harass",
         ),
         "2s3z": ("llm_pysc2.agents.configs.llm_smac", "ConfigSmac_2s3z"),
-        "Simple64": ("rtscortex_llm_pysc2.melee", "RTSCortexMeleeConfig"),
+        "Simple64": {
+            "protoss": ("rtscortex_llm_pysc2.melee", "RTSCortexMeleeConfig"),
+            "terran": (
+                "rtscortex_llm_pysc2.terran_melee",
+                "RTSCortexTerranMeleeConfig",
+            ),
+            "zerg": (
+                "rtscortex_llm_pysc2.zerg_melee",
+                "RTSCortexZergMeleeConfig",
+            ),
+        }.get(normalized_race),
     }
     try:
-        module_name, class_name = definitions[scenario]
+        definition = definitions[scenario]
     except KeyError as error:
         supported = ", ".join(sorted(definitions))
         raise ValueError(
             f"unsupported worker scenario {scenario!r}; supported scenarios: {supported}"
         ) from error
+    if definition is None:
+        raise ValueError(
+            f"worker scenario {scenario!r} does not yet support race {normalized_race!r}"
+        )
+    module_name, class_name = definition
     module = importlib.import_module(module_name)
     config = getattr(module, class_name)()
     config.reset_llm(
@@ -1127,7 +1667,15 @@ def _unit_metadata() -> tuple[dict[int, str], tuple[int, ...]]:
     for race in (units.Neutral, units.Protoss, units.Terran, units.Zerg):
         names.update({int(value): value.name for value in race})
     utils = importlib.import_module("llm_pysc2.lib.utils")
-    return names, tuple(int(value) for value in utils.BUILDING_TYPE)
+    building_types = {int(value) for value in utils.BUILDING_TYPE}
+    building_types.update(
+        {
+            int(units.Zerg.CreepTumor),
+            int(units.Zerg.CreepTumorBurrowed),
+            int(units.Zerg.CreepTumorQueen),
+        }
+    )
+    return names, tuple(sorted(building_types))
 
 
 def _upgrade_metadata() -> dict[int, str]:
@@ -1135,20 +1683,62 @@ def _upgrade_metadata() -> dict[int, str]:
     return {int(value): value.name for value in upgrades.Upgrades}
 
 
-def _production_action_source_types() -> dict[int, int]:
+def _production_action_source_types(agent_race: str = "protoss") -> dict[int, int]:
     actions = importlib.import_module("pysc2.lib.actions")
     llm_action = importlib.import_module("llm_pysc2.lib.llm_action")
+    units = importlib.import_module("pysc2.lib.units")
     result: dict[int, int] = {}
     for function_id in range(len(actions.FUNCTIONS)):
-        source_type = llm_action.find_unit_type_the_func_belongs_to(function_id, "protoss")
+        source_type = llm_action.find_unit_type_the_func_belongs_to(function_id, agent_race)
         if source_type is not None:
             result[function_id] = int(source_type)
+    for spec in PRODUCTION_SPECS_BY_RACE.get(agent_race, {}).values():
+        producer = getattr(getattr(units, agent_race.capitalize()), spec.producer_type, None)
+        if producer is not None:
+            result[spec.feature_function_id] = int(producer)
+    for addon in ADDON_SPECS.values():
+        if addon.race != agent_race:
+            continue
+        producer = getattr(
+            getattr(units, agent_race.capitalize()),
+            addon.producer_type,
+            None,
+        )
+        if producer is not None:
+            result[addon.feature_function_id] = int(producer)
+    for morph in MORPH_SPECS.values():
+        if morph.race != agent_race:
+            continue
+        producer = getattr(
+            getattr(units, agent_race.capitalize()),
+            morph.producer_type,
+            None,
+        )
+        if producer is not None:
+            result[morph.feature_function_id] = int(producer)
     return result
 
 
 def _function_name(function_id: int) -> str:
     actions = importlib.import_module("pysc2.lib.actions")
     return str(actions.FUNCTIONS[function_id].name)
+
+
+def _available_addon_function_id(
+    action_name: str,
+    available_actions: Collection[int],
+) -> int:
+    """Resolve producer-specific versus generic PySC2 add-on functions."""
+
+    spec = addon_spec(action_name)
+    if spec is None:
+        raise ValueError(f"unknown add-on action {action_name!r}")
+    available = {int(value) for value in available_actions}
+    if spec.feature_function_id in available:
+        return spec.feature_function_id
+    if spec.generic_feature_function_id in available:
+        return spec.generic_feature_function_id
+    return spec.feature_function_id
 
 
 def _pending_plan_idle_delay(
@@ -1182,6 +1772,31 @@ def _run_with_auto_worker_management_guard(
     finally:
         config.ENABLE_AUTO_WORKER_MANAGE = worker_management_enabled
         config.ENABLE_AUTO_WORKER_TRAINING = worker_training_enabled
+
+
+def _should_block_gas_rebalance(
+    *,
+    effect_verification_blocked: bool,
+    observation_watchdog_active: bool,
+    runtime_observation_due: bool,
+) -> bool:
+    """Keep deterministic gas management enabled after Runtime recovers."""
+
+    return effect_verification_blocked or observation_watchdog_active or runtime_observation_due
+
+
+def _runtime_observation_is_due(
+    game_loop: int,
+    *,
+    last_decision_game_loop: Optional[int],
+    watchdog_game_loops: int,
+) -> bool:
+    """Yield optional worker automation before it reaches the watchdog boundary."""
+
+    if last_decision_game_loop is None:
+        return False
+    observation_budget = max(1, watchdog_game_loops // 2)
+    return game_loop - last_decision_game_loop >= observation_budget
 
 
 def _prime_deterministic_gas_rebalance(
@@ -1280,13 +1895,334 @@ def _reserved_builder_worker_tags(main_agent: Any) -> set[int]:
     current = getattr(builder, "team_unit_tag_curr", None)
     if current is not None and int(current) > 0:
         tags.add(int(current))
-    for attribute in ("unit_tag_list", "team_unit_tag_list"):
-        tags.update(int(tag) for tag in getattr(builder, attribute, ()) if int(tag) > 0)
+    # ``unit_tag_list`` and ``team_unit_tag_list`` are upstream observation/history
+    # caches.  For Terran they can contain every SCV seen by Builder, so treating
+    # them as reservations prevents all ordinary workers from mining gas.  Only
+    # the SCVs actually owned by a configured Builder team are reserved.
     for team in getattr(builder, "teams", ()):
         if not isinstance(team, Mapping):
             continue
         tags.update(int(tag) for tag in team.get("unit_tags", ()) if int(tag) > 0)
     return tags
+
+
+def _rebind_builder_to_selected_worker(main_agent: Any, observation: Any) -> bool:
+    """Adopt the exact same-type worker selected by a crowded feature click."""
+
+    agents = getattr(main_agent, "agents", {})
+    if not isinstance(agents, Mapping):
+        return False
+    builder = agents.get("Builder")
+    if (
+        builder is None
+        or not bool(builder._is_executing_actions())
+        or not str(getattr(builder, "curr_action_name", "")).startswith("Build_")
+    ):
+        return False
+    original_tag = int(getattr(builder, "team_unit_tag_curr", 0) or 0)
+    team_name = str(getattr(builder, "team_unit_team_curr", ""))
+    if original_tag <= 0 or not team_name:
+        return False
+    raw_units = list(getattr(observation, "raw_units", ()))
+    original = next(
+        (unit for unit in raw_units if int(getattr(unit, "tag", 0)) == original_tag),
+        None,
+    )
+    if original is None:
+        return False
+    gas_worker_tags = {
+        int(tag)
+        for info in getattr(main_agent, "nexus_info_dict", {}).values()
+        for key in ("worker_g_tag_list", "worker_g1_tag_list", "worker_g2_tag_list")
+        for tag in info.get(key, ())
+    }
+    selected = [
+        unit
+        for unit in raw_units
+        if bool(getattr(unit, "is_selected", False))
+        and int(getattr(unit, "alliance", 0)) == 1
+        and int(getattr(unit, "unit_type", 0)) == int(getattr(original, "unit_type", -1))
+        and int(getattr(unit, "tag", 0)) not in gas_worker_tags
+    ]
+    if len(selected) != 1:
+        return False
+    selected_tag = int(selected[0].tag)
+    if selected_tag == original_tag:
+        return False
+    team = next(
+        (
+            item
+            for item in getattr(builder, "teams", ())
+            if isinstance(item, Mapping) and str(item.get("name", "")) == team_name
+        ),
+        None,
+    )
+    unit_tags = None if team is None else team.get("unit_tags")
+    if not isinstance(unit_tags, list) or original_tag not in unit_tags:
+        return False
+    unit_tags[:] = [selected_tag if int(tag) == original_tag else int(tag) for tag in unit_tags]
+    builder.team_unit_tag_curr = selected_tag
+    builder._rtscortex_last_builder_rebind = (original_tag, selected_tag)
+    return True
+
+
+def _refresh_consumed_zerg_builder(main_agent: Any, observation: Any) -> bool:
+    """Replace a Drone that morphed into a Zerg structure without a long actor gap."""
+
+    settings = getattr(main_agent, "worker_settings", None)
+    if str(getattr(settings, "agent_race", "")).casefold() != "zerg":
+        return False
+    agents = getattr(main_agent, "agents", {})
+    if not isinstance(agents, Mapping):
+        return False
+    builder = agents.get("Builder")
+    if builder is None:
+        return False
+    teams = [team for team in getattr(builder, "teams", ()) if isinstance(team, dict)]
+    if len(teams) != 1:
+        return False
+    team = teams[0]
+    unit_names = getattr(
+        getattr(getattr(main_agent, "decision_broker", None), "extractor", None),
+        "unit_names",
+        {},
+    )
+    raw_units = list(_observation_value(observation, "raw_units", ()))
+    live_drones = {
+        int(_observation_value(unit, "tag", 0)): unit
+        for unit in raw_units
+        if int(_observation_value(unit, "alliance", 0)) == 1
+        and _worker_unit_name(unit, unit_names) == "Drone"
+        and int(_observation_value(unit, "tag", 0)) > 0
+    }
+    configured_tags = [int(tag) for tag in team.get("unit_tags", ()) if int(tag) > 0]
+    if any(tag in live_drones for tag in configured_tags):
+        return False
+
+    gas_worker_tags = {
+        int(tag)
+        for info in getattr(main_agent, "nexus_info_dict", {}).values()
+        for key in ("worker_g_tag_list", "worker_g1_tag_list", "worker_g2_tag_list")
+        for tag in info.get(key, ())
+    }
+    mineral_worker_tags = {
+        int(tag)
+        for info in getattr(main_agent, "nexus_info_dict", {}).values()
+        for tag in info.get("worker_m_tag_list", ())
+    }
+    eligible_tags = sorted(set(live_drones) - gas_worker_tags)
+    mineral_candidates = sorted(set(eligible_tags) & mineral_worker_tags)
+    replacement_tag = next(iter(mineral_candidates or eligible_tags), None)
+    if replacement_tag is None:
+        return False
+
+    team_name = str(team.get("name", ""))
+    old_tags = set(configured_tags)
+    team["unit_tags"] = [replacement_tag]
+    team["unit_tags_selected"] = []
+    team["obs"] = []
+    team["pos"] = []
+    team["minimap_pos"] = []
+    builder.unit_tag_list = [
+        tag
+        for tag in getattr(builder, "unit_tag_list", ())
+        if int(tag) not in old_tags and int(tag) != replacement_tag
+    ]
+    builder.unit_tag_list.append(replacement_tag)
+    builder.unit_raw_list = [live_drones[replacement_tag]]
+    builder.team_unit_obs_list = []
+    builder.team_unit_tag_list = [replacement_tag]
+    builder.team_unit_team_list = [team_name]
+    builder.team_unit_tag_curr = None
+    builder.team_unit_team_curr = None
+    builder.enable = True
+    builder._rtscortex_last_consumed_builder_refresh = (
+        tuple(sorted(old_tags)),
+        replacement_tag,
+    )
+    return True
+
+
+def _refresh_zerg_morphed_combat_teams(main_agent: Any, observation: Any) -> int:
+    """Recover Zerg combat teams whose cocoon tag was mistaken for a reappearance."""
+
+    settings = getattr(main_agent, "worker_settings", None)
+    if str(getattr(settings, "agent_race", "")).casefold() != "zerg":
+        return 0
+    agents = getattr(main_agent, "agents", {})
+    if not isinstance(agents, Mapping):
+        return 0
+    raw_units = list(_observation_value(observation, "raw_units", ()))
+    refreshed = 0
+    for agent_name, agent in sorted(agents.items()):
+        if not str(agent_name).startswith("CombatGroup"):
+            continue
+        teams = [team for team in getattr(agent, "teams", ()) if isinstance(team, dict)]
+        if len(teams) != 1:
+            continue
+        team = teams[0]
+        allowed_types = {int(unit_type) for unit_type in team.get("unit_type", ())}
+        if not allowed_types:
+            continue
+        live_units = {
+            int(_observation_value(unit, "tag", 0)): unit
+            for unit in raw_units
+            if int(_observation_value(unit, "tag", 0)) > 0
+            and int(_observation_value(unit, "alliance", 0)) == 1
+            and int(_observation_value(unit, "unit_type", -1)) in allowed_types
+            and float(_observation_value(unit, "build_progress", 0.0)) in {1.0, 100.0}
+        }
+        configured_tags = [int(tag) for tag in team.get("unit_tags", ()) if int(tag) > 0]
+        selected_tags = sorted(
+            tag
+            for tag, unit in live_units.items()
+            if bool(_observation_value(unit, "is_selected", False))
+        )
+        team_name = str(team.get("name", ""))
+        current_tag = int(getattr(agent, "team_unit_tag_curr", 0) or 0)
+        if (
+            selected_tags
+            and current_tag > 0
+            and current_tag not in selected_tags
+            and str(getattr(agent, "team_unit_team_curr", "")) == team_name
+            and agent._is_executing_actions()
+        ):
+            replacement_tag = selected_tags[0]
+            team["unit_tags"] = [replacement_tag]
+            agent.unit_tag_list = [
+                replacement_tag if int(tag) == current_tag else int(tag)
+                for tag in getattr(agent, "unit_tag_list", ())
+            ]
+            if replacement_tag not in agent.unit_tag_list:
+                agent.unit_tag_list.append(replacement_tag)
+            agent.unit_raw_list = [live_units[replacement_tag]]
+            agent.team_unit_tag_curr = replacement_tag
+            agent._rtscortex_last_zerg_combat_rebind = (
+                current_tag,
+                replacement_tag,
+            )
+            refreshed += 1
+            continue
+        if any(tag in live_units for tag in configured_tags):
+            continue
+        if not live_units:
+            if configured_tags:
+                action_name = str(getattr(agent, "curr_action_name", ""))
+                if action_name and action_name != "No_Operation" and agent._is_executing_actions():
+                    agent.last_execution_abort = {
+                        "team_name": str(team.get("name", "")),
+                        "action_name": action_name,
+                        "failure_code": "actor_not_available",
+                        "failure_reason": "Zerg combat actor disappeared from the raw observation",
+                        "actor_tag": configured_tags[0],
+                    }
+                agent.func_list.clear()
+                agent.action_list.clear()
+                with agent.lock:
+                    agent.action_lists.clear()
+                team["unit_tags"] = []
+                team["unit_tags_selected"] = []
+                team["obs"] = []
+                team["pos"] = []
+                team["minimap_pos"] = []
+                agent.unit_tag_list = []
+                agent.unit_raw_list = []
+                agent.team_unit_obs_list = []
+                agent.team_unit_tag_list = []
+                agent.team_unit_team_list = []
+                agent.team_unit_tag_curr = None
+                agent.team_unit_team_curr = None
+                agent.enable = False
+                agent._rtscortex_last_zerg_combat_disable = tuple(configured_tags)
+            continue
+        # The upstream MainAgent assumes its enabled-agent roster remains stable
+        # from the first query in a main-loop round until every response has been
+        # consumed. Activating a newly morphed combat unit while that lock is held
+        # can make an already completed Builder query run twice and strand another
+        # participant at the shared Broker barrier. Defer only new activations;
+        # an already enabled agent may still rebind its same-type actor above.
+        if not getattr(agent, "enable", False) and bool(
+            getattr(main_agent, "main_loop_lock", False)
+        ):
+            agent._rtscortex_pending_zerg_combat_tag = min(live_units)
+            continue
+        replacement_tag = min(live_units)
+        old_tags = set(configured_tags)
+        team["unit_tags"] = [replacement_tag]
+        team["unit_tags_selected"] = []
+        team["obs"] = []
+        team["pos"] = []
+        team["minimap_pos"] = []
+        agent.unit_tag_list = [
+            int(tag)
+            for tag in getattr(agent, "unit_tag_list", ())
+            if int(tag) not in old_tags and int(tag) != replacement_tag
+        ]
+        agent.unit_tag_list.append(replacement_tag)
+        agent.unit_raw_list = [live_units[replacement_tag]]
+        agent.team_unit_obs_list = []
+        agent.team_unit_tag_list = [replacement_tag]
+        agent.team_unit_team_list = [team_name]
+        agent.team_unit_tag_curr = None
+        agent.team_unit_team_curr = None
+        current_loop = int(getattr(main_agent, "main_loop_step", 0))
+        agent.main_loop_step = current_loop
+        agent.query_llm_times = current_loop
+        agent.executing_times = current_loop
+        agent.enable = True
+        agent._rtscortex_last_zerg_combat_refresh = (
+            tuple(sorted(old_tags)),
+            replacement_tag,
+        )
+        agent._rtscortex_pending_zerg_combat_tag = None
+        refreshed += 1
+    return refreshed
+
+
+def _abort_stalled_actor_selection(main_agent: Any) -> bool:
+    """Bound orchestration retries so one unselectable actor cannot stall every agent."""
+
+    dispatch = getattr(main_agent, "_pending_primitive", None)
+    agent = getattr(main_agent, "_pending_primitive_agent", None)
+    if (
+        dispatch is None
+        or agent is None
+        or str(getattr(dispatch, "origin", "")) != "orchestration"
+        or int(getattr(dispatch, "requested_function_id", 0) or 0) not in {2, 3, 4}
+    ):
+        if dispatch is not None and str(getattr(dispatch, "origin", "")) == "translator":
+            main_agent._actor_selection_retry_key = None
+            main_agent._actor_selection_attempts = 0
+        return False
+
+    command_id = str(getattr(dispatch, "command_id", ""))
+    team_name = str(getattr(agent, "team_unit_team_curr", "") or "")
+    key = (command_id, team_name)
+    if key != getattr(main_agent, "_actor_selection_retry_key", None):
+        main_agent._actor_selection_retry_key = key
+        main_agent._actor_selection_attempts = 0
+    main_agent._actor_selection_attempts += 1
+    if main_agent._actor_selection_attempts < ACTOR_SELECTION_MAX_ATTEMPTS:
+        return False
+
+    action_name = str(getattr(agent, "curr_action_name", "") or "")
+    actor_tag = _execution_unit_tag(agent)
+    agent.last_execution_abort = {
+        "team_name": team_name,
+        "action_name": action_name,
+        "failure_code": "actor_selection_timeout",
+        "failure_reason": (
+            "actor could not be selected after "
+            f"{ACTOR_SELECTION_MAX_ATTEMPTS} orchestration attempts"
+        ),
+        "actor_tag": actor_tag,
+    }
+    agent.func_list.clear()
+    agent.action_list.clear()
+    agent._rtscortex_semantic_action = None
+    main_agent._actor_selection_retry_key = None
+    main_agent._actor_selection_attempts = 0
+    return True
 
 
 def _release_runtime_observation_barrier(main_agent: Any) -> None:
@@ -1302,6 +2238,7 @@ def _release_runtime_observation_barrier(main_agent: Any) -> None:
         observed_tags = getattr(agent, "team_unit_tag_list", None)
         if not isinstance(observed_tags, list):
             continue
+        observed_teams = getattr(agent, "team_unit_team_list", None)
         for team in getattr(agent, "teams", ()):
             if not isinstance(team, Mapping):
                 continue
@@ -1309,7 +2246,12 @@ def _release_runtime_observation_barrier(main_agent: Any) -> None:
                 int(tag) for tag in team.get("unit_tags", ()) if int(tag) not in disappeared
             ]
             required_tags = live_tags if team.get("select_type") == "select" else live_tags[:1]
-            observed_tags.extend(tag for tag in required_tags if tag not in observed_tags)
+            for tag in required_tags:
+                if tag in observed_tags:
+                    continue
+                observed_tags.append(tag)
+                if isinstance(observed_teams, list):
+                    observed_teams.append(str(team.get("name", "")))
 
 
 def _translated_build_position(
@@ -1351,10 +2293,160 @@ def _execution_unit_tag(agent: Any) -> Optional[int]:
     return None if value is None else int(value)
 
 
+def _worker_unit_name(unit: Any, unit_names: Mapping[int, str]) -> str:
+    value = _observation_value(unit, "unit_type", "")
+    return str(value) if isinstance(value, str) else unit_names.get(int(value), f"unit:{value}")
+
+
+def _worker_player_race(agent: Any) -> str:
+    explicit_race = getattr(agent, "rtscortex_player_race", None)
+    if explicit_race is not None:
+        return str(explicit_race).casefold()
+    config = getattr(agent, "config", None)
+    return str(
+        getattr(config, "rtscortex_player_race", getattr(agent, "race", "protoss"))
+    ).casefold()
+
+
+def _requires_explicit_production_chain(action_name: str) -> bool:
+    spec = _source_action_spec(action_name)
+    return spec is not None and spec.race != "protoss"
+
+
+def _selection_primitive_starts_production_barrier(
+    action_name: str,
+    function_id: int,
+) -> bool:
+    spec = production_spec(action_name)
+    if spec is not None and spec.producer_consumed:
+        return function_id == 9
+    return function_id == 2
+
+
+def _source_action_spec(action_name: str) -> Optional[_SourceActionSpec]:
+    return production_spec(action_name) or addon_spec(action_name) or morph_spec(action_name)
+
+
+def _is_worker_owned_near_build_final_primitive(agent: Any, action_name: str) -> bool:
+    spec = BUILD_SPECS.get(action_name)
+    if spec is None or spec.placement_kind not in {"geyser", "expansion"} or not agent.func_list:
+        return False
+    if _worker_player_race(agent) == "protoss":
+        return False
+    function_id = int(agent.func_list[0][0])
+    return function_id not in {0, 573}
+
+
+def _is_worker_owned_larva_selection(agent: Any, action_name: str) -> bool:
+    spec = production_spec(action_name)
+    return bool(
+        spec is not None
+        and spec.producer_consumed
+        and agent.func_list
+        and int(agent.func_list[0][0]) == 9
+    )
+
+
+def _translate_worker_owned_zero_argument_primitive(agent: Any, obs: Any) -> tuple[int, Any]:
+    """Dispatch a reviewed zero-argument feature primitive with full provenance."""
+
+    requested_id, function, arguments = agent.func_list.pop(0)
+    requested_arguments = list(arguments)
+    ordinal = int(agent._rtscortex_translation_ordinal)
+    agent._rtscortex_translation_ordinal += 1
+    total = int(agent._rtscortex_translation_total)
+    available = set(_observation_value(obs.observation, "available_actions", ()))
+    reason: Optional[str] = None
+    emitted_id = int(requested_id)
+    requested_name = str(getattr(function, "name", getattr(function, "__name__", requested_id)))
+    if emitted_id not in available:
+        reason = f"function {requested_name} is not available"
+    elif requested_arguments:
+        reason = f"zero-argument primitive received {requested_arguments!r}"
+    function_call = function() if reason is None else _no_op()
+    if reason is not None:
+        emitted_id = 0
+    agent.last_translation_result = {
+        "action_name": agent.curr_action_name,
+        "requested_function_id": int(requested_id),
+        "requested_function_name": requested_name,
+        "emitted_function_id": emitted_id,
+        "emitted_function_name": _function_name(emitted_id),
+        "ordinal": ordinal,
+        "total": total,
+        "accepted": emitted_id == int(requested_id),
+        "requested_arguments": requested_arguments,
+        "resolved_arguments": [],
+        "reason": reason,
+    }
+    return emitted_id, function_call
+
+
+def _translate_worker_owned_near_build_primitive(agent: Any, obs: Any) -> tuple[int, Any]:
+    """Resolve non-Protoss gas and expansion anchors without upstream factories."""
+
+    requested_id, function, arguments = agent.func_list.pop(0)
+    requested_arguments = list(arguments)
+    ordinal = int(agent._rtscortex_translation_ordinal)
+    agent._rtscortex_translation_ordinal += 1
+    total = int(agent._rtscortex_translation_total)
+    available = set(_observation_value(obs.observation, "available_actions", ()))
+    reason: Optional[str] = None
+    resolved_arguments: list[Any] = []
+    emitted_id = int(requested_id)
+    function_call: Any
+    if emitted_id not in available:
+        reason = f"function {getattr(function, 'name', emitted_id)} is not available"
+    elif len(requested_arguments) != 2 or not isinstance(requested_arguments[1], int):
+        reason = f"Near build expected queue flag and anchor tag, got {requested_arguments!r}"
+    else:
+        queue = requested_arguments[0]
+        queue = "now" if agent.first_action and queue in {"now", "queued"} else queue
+        llm_action = importlib.import_module("llm_pysc2.lib.llm_action")
+        resolver = (
+            llm_action.get_arg_screen_tag_gas_building
+            if BUILD_SPECS[str(agent.curr_action_name)].placement_kind == "geyser"
+            else llm_action.get_arg_screen_tag_base_building
+        )
+        position, valid = resolver(
+            obs,
+            int(requested_arguments[1]),
+            int(agent.size_screen),
+            str(agent.curr_action_name),
+        )
+        if not valid:
+            reason = str(position)
+        else:
+            resolved_arguments = [queue, position]
+    if reason is None:
+        function_call = function(*resolved_arguments)
+        if agent.first_action and resolved_arguments[0] == "now":
+            agent.first_action = False
+    else:
+        emitted_id = 0
+        function_call = _no_op()
+    if not agent.action_list and not agent.func_list:
+        agent.first_action = True
+    agent.last_translation_result = {
+        "action_name": agent.curr_action_name,
+        "requested_function_id": int(requested_id),
+        "requested_function_name": str(getattr(function, "name", requested_id)),
+        "emitted_function_id": emitted_id,
+        "emitted_function_name": _function_name(emitted_id),
+        "ordinal": ordinal,
+        "total": total,
+        "accepted": emitted_id == int(requested_id),
+        "requested_arguments": requested_arguments,
+        "resolved_arguments": resolved_arguments if emitted_id == int(requested_id) else [],
+        "reason": reason,
+    }
+    return emitted_id, function_call
+
+
 def _production_source_invalid_reason(
     observation: Any,
     source_tag: Optional[int],
-    spec: ProductionSpec,
+    spec: _SourceActionSpec,
     unit_names: Mapping[int, str],
 ) -> Optional[str]:
     if source_tag is None:
@@ -1400,6 +2492,8 @@ def _production_source_invalid_reason(
         return f"{spec.action_name} producer {hex(source_tag)} is no longer complete"
     if int(value("active", 0)) != 0 or int(value("order_length", 0)) != 0:
         return f"{spec.action_name} producer {hex(source_tag)} became busy before final dispatch"
+    if addon_spec(spec.action_name) is not None and int(value("add_on_tag", 0)) != 0:
+        return f"{spec.action_name} producer {hex(source_tag)} already has an add-on"
     return None
 
 
@@ -1435,6 +2529,136 @@ def _producer_is_visible(
         ):
             return True
     return False
+
+
+def _producer_is_selected(observation: Any, producer_tag: int) -> bool:
+    """Return whether the exact producer, rather than an overlapping unit, is selected."""
+
+    for collection_name in ("raw_units", "feature_units"):
+        units = _observation_value(observation, collection_name, ())
+        for unit in units:
+            if int(_observation_value(unit, "tag", 0)) != producer_tag:
+                continue
+            if int(_observation_value(unit, "alliance", 0)) != 1:
+                return False
+            return bool(_observation_value(unit, "is_selected", False))
+    return False
+
+
+def _selected_production_source_tags(
+    observation: Any,
+    *,
+    producer_type: str,
+    unit_names: Mapping[int, str],
+) -> tuple[int, ...]:
+    """Return selected producer tags, preferring the feature-action view."""
+
+    for collection_name in ("feature_units", "raw_units"):
+        selected_tags = {
+            int(_observation_value(unit, "tag", 0))
+            for unit in _observation_value(observation, collection_name, ())
+            if int(_observation_value(unit, "alliance", 0)) == 1
+            and bool(_observation_value(unit, "is_selected", False))
+            and _worker_unit_name(unit, unit_names) == producer_type
+            and int(_observation_value(unit, "tag", 0)) > 0
+        }
+        if selected_tags:
+            return tuple(sorted(selected_tags))
+    return ()
+
+
+def _zerg_larva_townhall_tag(
+    observation: Any,
+    *,
+    larva_tag: int,
+    unit_names: Mapping[int, str],
+) -> Optional[int]:
+    """Choose the completed Zerg townhall nearest to a preflight Larva."""
+
+    raw_units = list(_observation_value(observation, "raw_units", ()))
+    larva = next(
+        (
+            unit
+            for unit in raw_units
+            if int(_observation_value(unit, "tag", 0)) == int(larva_tag)
+            and int(_observation_value(unit, "alliance", 0)) == 1
+            and _worker_unit_name(unit, unit_names) == "Larva"
+        ),
+        None,
+    )
+    if larva is None:
+        return None
+    larva_x = float(_observation_value(larva, "x", 0.0))
+    larva_y = float(_observation_value(larva, "y", 0.0))
+    candidates: list[tuple[float, int]] = []
+    for unit in raw_units:
+        if int(_observation_value(unit, "alliance", 0)) != 1:
+            continue
+        if _worker_unit_name(unit, unit_names) not in {"Hatchery", "Lair", "Hive"}:
+            continue
+        progress = float(_observation_value(unit, "build_progress", 0.0))
+        progress = progress / 100.0 if progress > 1.0 else progress
+        if progress < 1.0:
+            continue
+        tag = int(_observation_value(unit, "tag", 0))
+        x = float(_observation_value(unit, "x", 0.0))
+        y = float(_observation_value(unit, "y", 0.0))
+        candidates.append(((x - larva_x) ** 2 + (y - larva_y) ** 2, tag))
+    return None if not candidates else min(candidates)[1]
+
+
+def _production_reselection_position(
+    observation: Any,
+    producer_tag: Optional[int],
+    *,
+    attempt: int,
+    size_screen: int,
+) -> Optional[tuple[int, int]]:
+    """Choose stable interior points away from units at a producer's center."""
+
+    if producer_tag is None:
+        return None
+    for unit in _observation_value(observation, "feature_units", ()):
+        if int(_observation_value(unit, "tag", 0)) != producer_tag:
+            continue
+        if int(_observation_value(unit, "alliance", 0)) != 1:
+            return None
+        if not bool(_observation_value(unit, "is_on_screen", True)):
+            return None
+        x = int(_observation_value(unit, "x", 0))
+        y = int(_observation_value(unit, "y", 0))
+        radius = float(_observation_value(unit, "radius", 1.0))
+        offset = max(1, int(round(radius * 0.5)))
+        offsets = ((-offset, -offset), (offset, -offset), (-offset, offset), (offset, offset))
+        dx, dy = offsets[attempt % len(offsets)]
+        return (
+            min(max(1, x + dx), size_screen - 2),
+            min(max(1, y + dy), size_screen - 2),
+        )
+    return None
+
+
+def _visible_feature_position(
+    observation: Any,
+    unit_tag: Optional[int],
+) -> Optional[tuple[int, int]]:
+    """Return the current screen point for one visible friendly feature unit."""
+
+    if unit_tag is None:
+        return None
+    feature_units = _observation_value(observation, "feature_units", ())
+    for unit in feature_units:
+        if int(_observation_value(unit, "tag", 0)) != unit_tag:
+            continue
+        if int(_observation_value(unit, "alliance", 0)) != 1:
+            return None
+        if not bool(_observation_value(unit, "is_on_screen", True)):
+            return None
+        return (
+            int(_observation_value(unit, "x", 0)),
+            int(_observation_value(unit, "y", 0)),
+        )
+    return None
 
 
 def _single_position(arguments: Any) -> Optional[tuple[float, float]]:
@@ -1493,6 +2717,8 @@ def _resolve_build_action_position(
     preferred_anchor_tag: Optional[int] = None,
     excluded_positions: set[tuple[int, int]] | None = None,
     force_resample: bool = False,
+    unit_names: Optional[Mapping[int, str]] = None,
+    builder_tags: Optional[Collection[int]] = None,
 ) -> Optional[list[int]]:
     action_name = str(action.get("name", ""))
     requested = _screen_argument(action)
@@ -1504,13 +2730,20 @@ def _resolve_build_action_position(
             preferred_anchor_tag=preferred_anchor_tag,
             excluded_positions=excluded_positions or set(),
             force_resample=force_resample,
+            unit_names=unit_names or {},
+            builder_tags=builder_tags,
         )
         if position is None:
             return None
     else:
         candidates = [
             candidate
-            for candidate in build_screen_candidates(observation, action_name)
+            for candidate in build_screen_candidates(
+                observation,
+                action_name,
+                unit_names=unit_names or {},
+                builder_tags=builder_tags,
+            )
             if tuple(candidate) not in (excluded_positions or set())
         ]
         if not candidates:
@@ -1519,6 +2752,94 @@ def _resolve_build_action_position(
         if position is None:
             return None
     return _replace_screen_action_position(action, position)
+
+
+def _resolve_translator_compatible_build_position(
+    action: dict[str, Any],
+    observation: Any,
+    *,
+    world_target: tuple[float, float],
+    preferred_anchor_tag: Optional[int],
+    excluded_positions: set[tuple[int, int]],
+    force_resample: bool,
+    screen_size: int,
+    unit_names: Mapping[int, str],
+    builder_tags: Optional[Collection[int]] = None,
+) -> Optional[list[int]]:
+    """Resample until the pinned translator accepts the same screen position."""
+
+    action_name = str(action.get("name", ""))
+    excluded = set(excluded_positions)
+    attempts = len(build_screen_candidates(observation, action_name, unit_names=unit_names)) + 1
+    for _ in range(attempts):
+        position = _resolve_build_action_position(
+            action,
+            observation,
+            world_target=world_target,
+            preferred_anchor_tag=preferred_anchor_tag,
+            excluded_positions=excluded,
+            force_resample=force_resample,
+            unit_names=unit_names,
+            builder_tags=builder_tags,
+        )
+        if position is None:
+            excluded_positions.update(excluded)
+            return None
+        if _translator_screen_build_is_legal(
+            observation,
+            position,
+            screen_size,
+            action_name,
+        ):
+            excluded_positions.update(excluded)
+            return position
+        excluded.add(_screen_position_key(position))
+        force_resample = True
+    excluded_positions.update(excluded)
+    return None
+
+
+def _translator_screen_build_is_legal(
+    observation: Any,
+    position: list[int],
+    screen_size: int,
+    action_name: str,
+) -> bool:
+    """Mirror the pinned upstream sampled-grid build argument contract."""
+
+    spec = BUILD_SPECS.get(action_name)
+    feature_screen = _observation_value(observation, "feature_screen", None)
+    buildable = _observation_value(feature_screen, "buildable", None)
+    pathable = _observation_value(feature_screen, "pathable", None)
+    player_relative = _observation_value(feature_screen, "player_relative", None)
+    power = _observation_value(feature_screen, "power", None)
+    if (
+        spec is None
+        or spec.placement_kind != "screen"
+        or screen_size <= 0
+        or buildable is None
+        or pathable is None
+        or player_relative is None
+    ):
+        return False
+    ratio = int(screen_size / 24)
+    x0 = int(min(max(0, position[0]), screen_size))
+    y0 = int(min(max(0, position[1]), screen_size))
+    if spec.requires_power and (power is None or power[y0][x0] == 0):
+        return False
+    first_x = int(x0 - ratio * (spec.footprint - 1) / 2)
+    first_y = int(y0 - ratio * (spec.footprint - 1) / 2)
+    for x_index in range(spec.footprint):
+        for y_index in range(spec.footprint):
+            x = int(first_x + x_index * ratio)
+            y = int(first_y + y_index * ratio)
+            if not (0 < x < screen_size and 0 < y < screen_size):
+                return False
+            if buildable[y][x] != 1 or pathable[y][x] != 1:
+                return False
+            if player_relative[y][x] not in (0, 1):
+                return False
+    return True
 
 
 def _build_world_target_key(world_target: tuple[float, float]) -> tuple[float, float]:
@@ -1569,6 +2890,19 @@ def _replace_screen_action_position(
         refreshed_functions.append((function_id, function, refreshed_arguments))
     action["func"] = refreshed_functions
     return position
+
+
+def _next_primitive_is_screen_build(
+    action_name: str,
+    functions: list[Any],
+) -> bool:
+    spec = BUILD_SPECS.get(action_name)
+    if spec is None or spec.placement_kind != "screen" or not functions:
+        return False
+    function = functions[0]
+    if not isinstance(function, (list, tuple)) or len(function) != 3:
+        return False
+    return str(getattr(function[1], "name", "")).startswith("Build_")
 
 
 def _isolate_next_action(action_list: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1720,9 +3054,10 @@ def _semantic_target_failure(
             return "friendly_target", f"target {hex(target_tag)} is not an enemy"
         return "target_not_visible", f"enemy target {hex(target_tag)} is not targetable"
 
+    spec = BUILD_SPECS.get(action_name)
     failure_code = (
         "invalid_geyser_tag"
-        if action_name == "Build_Assimilator_Near"
+        if spec is not None and spec.placement_kind == "geyser"
         else "invalid_expansion_anchor"
     )
     return failure_code, f"semantic target {hex(target_tag)} is no longer legal"
@@ -1843,6 +3178,10 @@ def _translation_failure_code(reason: Optional[str], action_name: str) -> Option
             return "invalid_geyser_tag"
         if "Nexus" in action_name:
             return "invalid_expansion_anchor"
+    if addon_spec(action_name) is not None and (
+        "not available" in normalized or "function" in normalized
+    ):
+        return "no_legal_addon_placement"
     if "not available" in normalized or "function" in normalized:
         return "translator_rejected"
     return "translator_rejected"
@@ -1853,7 +3192,7 @@ def _upstream_replaced_production_with_noop(
     translation_result: Mapping[str, Any],
 ) -> bool:
     return (
-        is_production_action(semantic_action_name)
+        is_source_bound_action(semantic_action_name)
         and str(translation_result.get("action_name", "")) == "No_Operation"
         and int(translation_result.get("requested_function_id", -1)) == 0
         and bool(translation_result.get("accepted", False))

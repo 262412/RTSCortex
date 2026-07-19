@@ -20,7 +20,12 @@ from rtscortex.playbook import (
     LessonStatus,
     PlaybookContext,
     PlaybookQuery,
+    PlaybookRule,
+    PlaybookRuleCategory,
+    PlaybookRuleEffect,
     PlaybookRuleKind,
+    PlaybookRuleStatus,
+    PlaybookRuleStrength,
     PlaybookStore,
 )
 
@@ -119,9 +124,57 @@ def test_playbook_promotes_only_repeated_outcome_backed_experience(tmp_path: Pat
         )
     )
     assert selection.lesson_ids == (second_lessons[0].lesson_id,)
+    executable = [rule for rule in playbook.rules() if rule.status is PlaybookRuleStatus.ACTIVE]
+    assert len(executable) == 1
+    assert executable[0].strength is PlaybookRuleStrength.SOFT
+    assert executable[0].source_run_ids == ("run-1", "run-2")
 
     first_store.close()
     second_store.close()
+    playbook.close()
+
+
+def test_playbook_records_new_opposing_outcome_as_rule_contradiction(tmp_path: Path) -> None:
+    playbook = PlaybookStore(tmp_path / "playbook.sqlite3")
+    reviewer = CortexPlaybookReviewer(playbook, promotion_support=2)
+    for run_id in ("run-1", "run-2"):
+        store, result = _episode_events(tmp_path, run_id)
+        reviewer.review_episode(
+            store.events_after(run_id, 0, 100, episode_id="episode"),
+            result,
+            agent_race="protoss",
+            opponent_race="zerg",
+        )
+        store.close()
+
+    third_store, third_result = _episode_events(tmp_path, "run-3")
+    third_store.append_event(
+        run_id="run-3",
+        episode_id="episode",
+        step_id=3,
+        event_type="macro_plan_rejected",
+        payload={
+            "classification": "mapped_deferred",
+            "reason": "missing_prerequisite_gateway",
+            "proposal": {"steps": [{"canonical_action": "BUILD STARGATE"}]},
+        },
+    )
+    reviewer.review_episode(
+        third_store.events_after("run-3", 0, 100, episode_id="episode"),
+        third_result,
+        agent_race="protoss",
+        opponent_race="zerg",
+    )
+
+    preferred = next(
+        rule
+        for rule in playbook.rules()
+        if rule.action_names == ("BUILD STARGATE",) and rule.effect.value == "prefer"
+    )
+    assert preferred.contradiction_count == 1
+    assert preferred.contradiction_seeds == (0,)
+    assert preferred in reviewer.last_rule_updates
+    third_store.close()
     playbook.close()
 
 
@@ -176,8 +229,79 @@ def test_playbook_does_not_promote_bridge_failure_as_strategy(tmp_path: Path) ->
         lesson for lesson in lessons if lesson.rule_kind is PlaybookRuleKind.EXECUTION_GUARD
     )
     assert guard.status is LessonStatus.PROMOTED
-    assert guard.avoid_action is None
+    assert guard.avoid_action == "BUILD NEXUS"
+    executable_guard = next(
+        rule for rule in playbook.rules() if rule.action_names == ("BUILD NEXUS",)
+    )
+    assert executable_guard.status is PlaybookRuleStatus.CANDIDATE
 
+    store.close()
+    playbook.close()
+
+
+def test_playbook_repairs_unscoped_v2_execution_candidate(tmp_path: Path) -> None:
+    playbook = PlaybookStore(tmp_path / "playbook.sqlite3")
+    reviewer = CortexPlaybookReviewer(playbook, promotion_support=1)
+    store, result = _episode_events(tmp_path, "run")
+    store.append_event(
+        run_id="run",
+        episode_id="episode",
+        step_id=3,
+        event_type="command_lineage",
+        payload={
+            "command_id": "failed-command",
+            "semantic_action": "BUILD NEXUS",
+            "lineage": {"source_role": "macro"},
+        },
+    )
+    store.append_event(
+        run_id="run",
+        episode_id="episode",
+        step_id=4,
+        event_type="execution",
+        payload=ExecutionReport(
+            run_id="run",
+            episode_id="episode",
+            step_id=4,
+            command_id="failed-command",
+            success=False,
+            action_name="Build_Nexus_Near",
+            actor="Builder/Probe-1",
+            source=ActionSource.PLANNER,
+            status=ExecutionStatus.FAILED,
+            execution_stage=ExecutionStage.TRANSLATION,
+            failure_code="invalid_expansion_anchor",
+        ),
+    )
+    cases, _ = reviewer.review_episode(
+        store.events_after("run", 0, 100, episode_id="episode"),
+        result,
+        agent_race="protoss",
+        opponent_race="zerg",
+    )
+    failed = next(case for case in cases if case.command_id == "failed-command")
+    playbook.upsert_rule(
+        PlaybookRule(
+            rule_id="playbook-rule:unscoped",
+            canonical_key="unscoped",
+            category=PlaybookRuleCategory.EXECUTION_GUARD,
+            conditions=(),
+            effect=PlaybookRuleEffect.AVOID,
+            status=PlaybookRuleStatus.CANDIDATE,
+            strength=PlaybookRuleStrength.ADVISORY,
+            confidence=0.75,
+            source_case_ids=(failed.case_id,),
+            source_run_ids=(failed.run_id,),
+        )
+    )
+
+    CortexPlaybookReviewer(playbook, promotion_support=1)
+
+    rules = playbook.rules()
+    repaired_source = next(rule for rule in rules if rule.canonical_key == "unscoped")
+    assert repaired_source.status is PlaybookRuleStatus.RETIRED
+    assert repaired_source.evidence["repair_reason"] == "unscoped_execution_candidate"
+    assert any(rule.action_names == ("BUILD NEXUS",) for rule in rules)
     store.close()
     playbook.close()
 
@@ -284,6 +408,11 @@ def test_playbook_promotes_repeated_producer_failure_as_compact_execution_rule(
     assert guard.status is LessonStatus.PROMOTED
     assert guard.support_count == 2
     assert "fresh feature observation" in guard.statement
+    executable_guard = next(
+        rule for rule in playbook.rules() if rule.action_names == ("TRAIN ADEPT",)
+    )
+    assert executable_guard.status is PlaybookRuleStatus.ACTIVE
+    assert executable_guard.strength is PlaybookRuleStrength.SOFT
     selection = playbook.retrieve(
         PlaybookQuery(
             context=PlaybookContext(

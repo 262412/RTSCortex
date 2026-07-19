@@ -72,3 +72,52 @@ def test_reflex_ignores_builder_and_respects_actor_specific_enemy_candidates() -
     assert [(command.actor, command.arguments) for command in commands] == [
         ("CombatGroup0/Zealot-1", ["0x1"])
     ]
+
+
+def test_zerg_queen_controller_prioritizes_inject_over_creep_when_safe() -> None:
+    observation = make_observation().model_copy(
+        update={
+            "available_actions": [
+                AvailableAction(
+                    name="Effect_InjectLarva",
+                    argument_names=["tag"],
+                    argument_types=[ActionArgumentType.TAG],
+                    actor_scopes=["CombatGroup1/Queen-1"],
+                    argument_candidates=[["0xb00"]],
+                ),
+                AvailableAction(
+                    name="Build_CreepTumor_Queen_Screen",
+                    argument_names=["screen"],
+                    argument_types=[ActionArgumentType.POSITION],
+                    actor_scopes=["CombatGroup1/Queen-1"],
+                    argument_candidates=[[[65, 65]]],
+                ),
+            ]
+        }
+    )
+
+    commands = ReflexEngine(enabled=True, low_health_threshold=0.25).evaluate(observation)
+
+    assert [(command.actor, command.name, command.arguments) for command in commands] == [
+        ("CombatGroup1/Queen-1", "Effect_InjectLarva", ["0xb00"])
+    ]
+
+
+def test_zerg_queen_controller_defers_economy_abilities_during_attack_alert() -> None:
+    observation = make_observation(alerts=["under_attack"]).model_copy(
+        update={
+            "available_actions": [
+                AvailableAction(
+                    name="Effect_InjectLarva",
+                    argument_names=["tag"],
+                    argument_types=[ActionArgumentType.TAG],
+                    actor_scopes=["CombatGroup1/Queen-1"],
+                    argument_candidates=[["0xb00"]],
+                )
+            ]
+        }
+    )
+
+    commands = ReflexEngine(enabled=True, low_health_threshold=0.25).evaluate(observation)
+
+    assert commands == []

@@ -101,6 +101,42 @@ def _reserve_run_dir(output_root: Path, prefix: str) -> tuple[str, Path]:
     raise RuntimeError("could not reserve a unique run directory")
 
 
+def _live_worker_environment(
+    config: ExperimentConfig,
+    live_worker: LiveWorkerSpec,
+) -> dict[str, str]:
+    environment = {
+        "SC2PATH": str(live_worker.sc2_path),
+        "RTSCORTEX_AGENT_RACE": config.environment.agent_race,
+        "RTSCORTEX_PENDING_PLAN_STEP_DELAY_SECONDS": str(
+            config.environment.pending_plan_step_delay_seconds
+        ),
+        "RTSCORTEX_PAUSE_UNTIL_FIRST_PLAN": str(config.environment.pause_until_first_plan).lower(),
+        "RTSCORTEX_RUNTIME_REQUEST_TIMEOUT_SECONDS": str(
+            config.runtime.planner_timeout_seconds + 5.0
+        ),
+        "RTSCORTEX_ACTION_EFFECT_TIMEOUT_GAME_LOOPS": str(
+            config.environment.action_effect_timeout_game_loops
+        ),
+        "RTSCORTEX_OBSERVATION_GAP_WATCHDOG_GAME_LOOPS": str(
+            config.environment.observation_gap_watchdog_game_loops
+        ),
+        "RTSCORTEX_OBSERVATION_GAP_HARD_LIMIT_GAME_LOOPS": str(
+            config.environment.observation_gap_hard_limit_game_loops
+        ),
+        "RTSCORTEX_CONSOLE_ENABLED": str(config.console.enabled).lower(),
+        "RTSCORTEX_CONSOLE_FRAME_FPS": str(config.console.frame_fps),
+        "RTSCORTEX_CONSOLE_JPEG_QUALITY": str(config.console.jpeg_quality),
+        "RTSCORTEX_CONSOLE_RGB_SCREEN_SIZE": str(config.console.rgb_screen_size),
+        "RTSCORTEX_CONSOLE_RGB_MINIMAP_SIZE": str(config.console.rgb_minimap_size),
+    }
+    if config.environment.simulation_speed_multiplier is not None:
+        environment["RTSCORTEX_SIMULATION_SPEED_MULTIPLIER"] = str(
+            config.environment.simulation_speed_multiplier
+        )
+    return environment
+
+
 def _active_model_label(config: ExperimentConfig) -> str:
     if config.agent.variant == "cortex" and config.cortex.macro.kind == "hima":
         suffix = config.cortex.macro.candidate.removeprefix("protoss-")
@@ -108,6 +144,8 @@ def _active_model_label(config: ExperimentConfig) -> str:
     if config.agent.variant == "cortex" and config.cortex.macro.kind == "hima_ensemble":
         race = config.cortex.macro.ensemble_members[0].candidate.rsplit("-", 1)[0]
         return f"HIMA {race.title()} a/b/c Ensemble"
+    if config.agent.variant == "cortex" and config.cortex.macro.kind == "scripted":
+        return f"Scripted {config.environment.agent_race.title()} canary"
     return config.provider.model
 
 
@@ -259,36 +297,7 @@ def run_experiment(
         runtime = build_runtime(config, run_dir)
         if live_worker is not None:
             assert runtime_socket is not None
-            worker_environment = {
-                "SC2PATH": str(live_worker.sc2_path),
-                "RTSCORTEX_PENDING_PLAN_STEP_DELAY_SECONDS": str(
-                    config.environment.pending_plan_step_delay_seconds
-                ),
-                "RTSCORTEX_PAUSE_UNTIL_FIRST_PLAN": str(
-                    config.environment.pause_until_first_plan
-                ).lower(),
-                "RTSCORTEX_RUNTIME_REQUEST_TIMEOUT_SECONDS": str(
-                    config.runtime.planner_timeout_seconds + 5.0
-                ),
-                "RTSCORTEX_ACTION_EFFECT_TIMEOUT_GAME_LOOPS": str(
-                    config.environment.action_effect_timeout_game_loops
-                ),
-                "RTSCORTEX_OBSERVATION_GAP_WATCHDOG_GAME_LOOPS": str(
-                    config.environment.observation_gap_watchdog_game_loops
-                ),
-                "RTSCORTEX_OBSERVATION_GAP_HARD_LIMIT_GAME_LOOPS": str(
-                    config.environment.observation_gap_hard_limit_game_loops
-                ),
-                "RTSCORTEX_CONSOLE_ENABLED": str(config.console.enabled).lower(),
-                "RTSCORTEX_CONSOLE_FRAME_FPS": str(config.console.frame_fps),
-                "RTSCORTEX_CONSOLE_JPEG_QUALITY": str(config.console.jpeg_quality),
-                "RTSCORTEX_CONSOLE_RGB_SCREEN_SIZE": str(config.console.rgb_screen_size),
-                "RTSCORTEX_CONSOLE_RGB_MINIMAP_SIZE": str(config.console.rgb_minimap_size),
-            }
-            if config.environment.simulation_speed_multiplier is not None:
-                worker_environment["RTSCORTEX_SIMULATION_SPEED_MULTIPLIER"] = str(
-                    config.environment.simulation_speed_multiplier
-                )
+            worker_environment = _live_worker_environment(config, live_worker)
             console_hub: LiveConsoleHub | None = None
             console_api = None
             if config.console.enabled:

@@ -1,0 +1,13 @@
+diff --git a/llm_pysc2/agents/llm_pysc2_agent_main.py b/llm_pysc2/agents/llm_pysc2_agent_main.py
+--- a/llm_pysc2/agents/llm_pysc2_agent_main.py
++++ b/llm_pysc2/agents/llm_pysc2_agent_main.py
+@@ -637,6 +637,9 @@ class MainAgent(base_agent.BaseAgent):
+         return func_call
+ 
+       translation_result = getattr(agent, 'last_translation_result', None)
++      if func_id == 0 and getattr(agent, '_rtscortex_camera_settlement_noop', False):
++        logger.success(f"[ID {self.log_id}] 7.3.6 Agent {agent_name}: return RTSCortex camera settlement no_op")
++        return func_call
+       if func_id == 0 and translation_result is not None and \
+           translation_result.get('accepted') and \
+           translation_result.get('requested_function_id') == 0 and \

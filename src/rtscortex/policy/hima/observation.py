@@ -6,6 +6,10 @@ import json
 from collections import Counter
 
 from rtscortex.policy.hima.models import HIMAInputContext, HIMAObservationSnapshot
+from rtscortex.policy.hima.race_vocabulary import (
+    hima_actions_for_race,
+    resolve_race_hima_action,
+)
 from rtscortex.policy.hima.vocabulary import HIMA_PROTOSS_ACTIONS, resolve_hima_action
 from rtscortex.policy.models import PolicyObservationFixture
 
@@ -72,6 +76,31 @@ _RESEARCH_ORDER = tuple(
 class HIMAObservationAdapter:
     """Build the exact upstream five-field, own-state-only JSON payload."""
 
+    def __init__(self, *, race: str = "protoss") -> None:
+        self.race = race.casefold()
+        actions = hima_actions_for_race(self.race)
+        self._train_names = {
+            action.upstream_name.casefold(): action.upstream_name
+            for action in actions
+            if action.category == "train"
+        }
+        self._build_names = {
+            action.upstream_name.casefold(): action.upstream_name
+            for action in actions
+            if action.category == "build"
+        }
+        self._research_names = {
+            action.upstream_name.casefold(): action.upstream_name
+            for action in actions
+            if action.category == "research"
+        }
+        self._unit_order = tuple(
+            action.upstream_name for action in actions if action.category in {"train", "build"}
+        )
+        self._research_order = tuple(
+            action.upstream_name for action in actions if action.category == "research"
+        )
+
     def adapt(self, fixture: PolicyObservationFixture) -> HIMAObservationSnapshot:
         """Compatibility entrypoint for immutable comparison fixtures."""
 
@@ -88,7 +117,7 @@ class HIMAObservationAdapter:
         state = context.observation.state
         unit_counts: Counter[str] = Counter()
         for unit in state.own_units:
-            name = _TRAIN_NAMES.get(unit.unit_type.casefold())
+            name = self._train_names.get(unit.unit_type.casefold())
             if name is not None:
                 unit_counts[name] += 1
 
@@ -99,24 +128,26 @@ class HIMAObservationAdapter:
             # Upstream deliberately reports completed Warp Gates as Gateways.
             if lookup_name == "warpgate":
                 lookup_name = "gateway"
-            name = _BUILD_NAMES.get(lookup_name)
+            name = self._build_names.get(lookup_name)
             if name is not None:
                 unit_counts[name] += 1
 
-        visible_units = {name: unit_counts[name] for name in _UNIT_ORDER if unit_counts[name] > 0}
+        visible_units = {
+            name: unit_counts[name] for name in self._unit_order if unit_counts[name] > 0
+        }
         completed_research = {
             name
             for raw_name in state.upgrades
-            if (name := _normalize_research(raw_name)) is not None
+            if (name := self._normalize_research(raw_name)) is not None
         }
         previous_action = tuple(
-            _normalize_previous_action(raw_action) for raw_action in context.previous_actions
+            self._normalize_previous_action(raw_action) for raw_action in context.previous_actions
         )
         return HIMAObservationSnapshot(
             supply_used=state.economy.supply_used,
             supply_capacity=state.economy.supply_cap,
             unit=visible_units,
-            research=tuple(name for name in _RESEARCH_ORDER if name in completed_research),
+            research=tuple(name for name in self._research_order if name in completed_research),
             previous_action=previous_action,
         )
 
@@ -141,6 +172,24 @@ class HIMAObservationAdapter:
         snapshot = self.adapt_context(context)
         return snapshot, self.serialize(snapshot)
 
+    def _normalize_previous_action(self, raw_action: str) -> str:
+        action = resolve_race_hima_action(raw_action, race=self.race)
+        if action is None:
+            raise ValueError(
+                f"previous HIMA action is not in the pinned {self.race.title()} vocabulary: "
+                f"{raw_action}"
+            )
+        return action.upstream_name
+
+    def _normalize_research(self, raw_name: str) -> str | None:
+        normalized = raw_name.casefold()
+        direct = self._research_names.get(normalized)
+        if direct is not None:
+            return direct
+        if self.race != "protoss":
+            return None
+        return _normalize_protoss_research(raw_name)
+
 
 def _normalize_previous_action(raw_action: str) -> str:
     action = resolve_hima_action(raw_action)
@@ -151,7 +200,7 @@ def _normalize_previous_action(raw_action: str) -> str:
     return action.upstream_name
 
 
-def _normalize_research(raw_name: str) -> str | None:
+def _normalize_protoss_research(raw_name: str) -> str | None:
     normalized = raw_name.casefold()
     direct = _RESEARCH_NAMES.get(normalized)
     if direct is not None:

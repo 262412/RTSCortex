@@ -5,17 +5,19 @@ run:
 environment:
   adapter: llm_pysc2
   scenario: Simple64
-  max_steps: 1000
+  max_steps: 5200
   agent_race: protoss
   opponent_race: zerg
   opponent_difficulty: very_easy
   opponent_build: macro
   step_mul: 1
-  game_steps_per_episode: 800
-  simulation_speed_multiplier: 0.25
+  game_steps_per_episode: 5200
+  simulation_speed_multiplier: 0.125
   pause_until_first_plan: true
   sc2_path: ~/scratch/StarCraftII
   action_effect_timeout_game_loops: 112
+  observation_gap_watchdog_game_loops: 112
+  observation_gap_hard_limit_game_loops: 448
   worker_python: ~/fastscratch/envs/rtscortex-llm-pysc2/bin/python
 runtime:
   deterministic: false
@@ -28,6 +30,10 @@ agent:
 cortex:
   situation:
     kind: deterministic
+  arbiter:
+    mode: shadow
+    switch_margin: 1.0
+    max_intents: 7
   macro:
     kind: hima_ensemble
     python_executable: ~/fastscratch/envs/rtscortex-hima/bin/python
@@ -42,6 +48,7 @@ cortex:
         model_path: ~/fastscratch/cache/huggingface/hub/models--SNUMPR--Protoss-c/snapshots/09ae752994bcd458d3b91f5b97dcdacd626edccb
         device: cuda:1
     coordinator: deterministic_v1
+    ensemble_schedule: staggered
     allow_unlicensed_weights: true
     required: true
     interval_game_loops: 112
@@ -64,6 +71,9 @@ cortex:
     min_confidence: 0.6
     promotion_support: 2
     include_candidates: false
+    rule_mode: shadow
+    max_hard_rules: 8
+    max_soft_rules: 8
 reflex:
   enabled: true
   low_health_threshold: 0.25

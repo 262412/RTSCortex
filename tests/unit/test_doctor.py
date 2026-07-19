@@ -108,6 +108,9 @@ def test_worker_patch_is_required_only_for_live_runs(tmp_path: Path) -> None:
         "elif not self._all_agent_executing_finished():\n"
         "    pass\n"
         "return translator settlement no_op\n"
+        "_rtscortex_camera_settlement_noop\n"
+        "_rtscortex_exact_single_unit_selection\n"
+        "_rtscortex_transport_noop_without_actor_selection\n"
         "if tag not in self.unit_uid_disappear:\n"
         "agent.curr_action_name != 'No_Operation'\n"
         "wait for confirmed disappearance\n"
@@ -189,7 +192,8 @@ def test_worker_patch_is_required_only_for_live_runs(tmp_path: Path) -> None:
         "Stale worker workplace\n"
         "if len(working_place_unit_list) == 0:\n"
         "_rtscortex_force_runtime_decision\n"
-        "_rtscortex_accept_visible_team_unit\n",
+        "_rtscortex_accept_visible_team_unit\n"
+        "_rtscortex_validate_gather_target\n",
         encoding="utf-8",
     )
 
@@ -272,6 +276,42 @@ def test_worker_patch_is_required_only_for_live_runs(tmp_path: Path) -> None:
     assert visible_selection_check.status == "error"
     assert "0016-accept-visible-team-unit.patch" in visible_selection_check.detail
     funcs_source.write_text(complete_funcs_source, encoding="utf-8")
+
+    funcs_source.write_text(
+        complete_funcs_source.replace("_rtscortex_validate_gather_target\n", ""),
+        encoding="utf-8",
+    )
+    gather_target_check = _worker_patch_check(tmp_path, required=True)
+    assert gather_target_check.status == "error"
+    assert "0020-validate-gather-screen-target.patch" in gather_target_check.detail
+    funcs_source.write_text(complete_funcs_source, encoding="utf-8")
+
+    source.write_text(
+        complete_main_source.replace("_rtscortex_camera_settlement_noop\n", ""),
+        encoding="utf-8",
+    )
+    camera_settlement_check = _worker_patch_check(tmp_path, required=True)
+    assert camera_settlement_check.status == "error"
+    assert "0017-return-camera-settlement-noop.patch" in camera_settlement_check.detail
+    source.write_text(complete_main_source, encoding="utf-8")
+
+    source.write_text(
+        complete_main_source.replace("_rtscortex_exact_single_unit_selection\n", ""),
+        encoding="utf-8",
+    )
+    exact_selection_check = _worker_patch_check(tmp_path, required=True)
+    assert exact_selection_check.status == "error"
+    assert "0018-use-exact-single-unit-selection.patch" in exact_selection_check.detail
+    source.write_text(complete_main_source, encoding="utf-8")
+
+    source.write_text(
+        complete_main_source.replace("_rtscortex_transport_noop_without_actor_selection\n", ""),
+        encoding="utf-8",
+    )
+    transport_noop_check = _worker_patch_check(tmp_path, required=True)
+    assert transport_noop_check.status == "error"
+    assert "0019-bypass-actor-selection-for-transport-noop.patch" in (transport_noop_check.detail)
+    source.write_text(complete_main_source, encoding="utf-8")
 
     complete_main_source = source.read_text(encoding="utf-8")
     source.write_text(

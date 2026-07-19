@@ -66,10 +66,11 @@ only be applied for live sessions, then reversed to restore the clean gitlink. E
 semantics, camera control, team management, automatic economy, text-action translation,
 and PySC2 action validation remain upstream-owned.
 
-Fourteen reviewed patches cover the waiting-response transport no-op, real SC2 random seed,
+Seventeen reviewed patches cover the waiting-response transport no-op, real SC2 random seed,
 row-major feature planes, structured translator provenance, exact Near placement,
 pre-translation abort attribution, transient-unit disappearance grace, and Nexus resource
 clearance with exact screen-to-world scaling and visibility checks, plus episode truncation,
-atomic logs, gas-worker management, reserved Builder workers, and stale workplace refresh.
+atomic logs, gas-worker management, reserved Builder workers, stale workplace refresh,
+bounded observation-gap recovery, visible-team camera selection, and production camera yielding.
 Their exact scope and reproducible apply/reverse order are documented in
 [`patches/README.md`](patches/README.md).

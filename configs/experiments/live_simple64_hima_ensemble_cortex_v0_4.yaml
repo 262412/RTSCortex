@@ -28,6 +28,11 @@ agent:
 cortex:
   situation:
     kind: deterministic
+  arbiter:
+    # Keep the Strategic Intent Arbiter observational until the paired-seed gates pass.
+    mode: shadow
+    switch_margin: 1.0
+    max_intents: 7
   macro:
     kind: hima_ensemble
     python_executable: ~/fastscratch/envs/rtscortex-hima/bin/python
@@ -63,6 +68,10 @@ cortex:
     min_confidence: 0.6
     promotion_support: 2
     include_candidates: false
+    # Legacy lessons remain advisory; executable rules are evaluated without blocking live play.
+    rule_mode: shadow
+    max_hard_rules: 8
+    max_soft_rules: 8
 reflex:
   enabled: true
   low_health_threshold: 0.25

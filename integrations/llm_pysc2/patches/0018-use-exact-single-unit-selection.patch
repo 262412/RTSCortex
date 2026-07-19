@@ -1,0 +1,14 @@
+diff --git a/llm_pysc2/agents/llm_pysc2_agent_main.py b/llm_pysc2/agents/llm_pysc2_agent_main.py
+--- a/llm_pysc2/agents/llm_pysc2_agent_main.py
++++ b/llm_pysc2/agents/llm_pysc2_agent_main.py
+@@ -539,6 +539,9 @@ class MainAgent(base_agent.BaseAgent):
+                 if team['select_type'] == 'select':
+                   logger.debug(f"[ID {self.log_id}] Agent {agent_name} status: 7.3.3.1")
+-                  if self.func_id_history[-1] in [2, 3]:
++                  if getattr(self, '_rtscortex_exact_single_unit_selection', False):
++                    x, y = min(max(0, unit_f.x), self.size_screen), min(max(0, unit_f.y), self.size_screen)
++                    func_id, func_call = (2, actions.FUNCTIONS.select_point('select', (x, y)))
++                  elif self.func_id_history[-1] in [2, 3]:
+                     d = self.select_rect_threshold
+                     x1, x2 = min(max(0, unit_f.x - d), self.size_screen), min(max(0, unit_f.x + d), self.size_screen)
+                     y1, y2 = min(max(0, unit_f.y - d), self.size_screen), min(max(0, unit_f.y + d), self.size_screen)

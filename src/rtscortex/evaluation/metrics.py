@@ -872,7 +872,7 @@ def compute_execution_metrics(events: list[StoredEvent]) -> ExecutionMetrics:
             if (
                 command_id in production_pysc2_accepted_ids
                 and status == "succeeded"
-                and confirmation_kind == "producer_order"
+                and confirmation_kind in {"producer_order", "producer_morph"}
             ):
                 production_order_confirmed_ids.add(command_id)
             elif (
@@ -901,7 +901,7 @@ def compute_execution_metrics(events: list[StoredEvent]) -> ExecutionMetrics:
 
             if (
                 production_evidence is not None
-                and confirmation_kind in {"producer_order", "new_unit"}
+                and confirmation_kind in {"producer_order", "producer_morph", "new_unit"}
                 and command_id in production_pysc2_accepted_ids
                 and status == "succeeded"
             ):
@@ -1487,7 +1487,8 @@ def _production_confirmation_latencies(events: list[StoredEvent]) -> list[float]
             or _execution_status(payload) != "succeeded"
             or not isinstance(evidence, dict)
             or evidence.get("effect_kind") != "production"
-            or evidence.get("confirmation_kind") not in {"producer_order", "new_unit"}
+            or evidence.get("confirmation_kind")
+            not in {"producer_order", "producer_morph", "new_unit"}
         ):
             continue
         latency = _confirmation_latency(evidence)

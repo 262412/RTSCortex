@@ -5,12 +5,13 @@ from __future__ import annotations
 import ast
 import re
 
-from rtscortex.policy.hima.models import (
-    HIMA_ADAPTER_VERSION,
-    HIMA_PARSER_VERSION,
-    HIMA_VOCABULARY_VERSION,
+from rtscortex.policy.hima.models import HIMA_ADAPTER_VERSION
+from rtscortex.policy.hima.race_vocabulary import (
+    HIMA_PARSER_VERSIONS,
+    HIMA_VOCABULARY_VERSIONS,
+    hima_actions_for_race,
+    resolve_race_hima_action,
 )
-from rtscortex.policy.hima.vocabulary import resolve_hima_action
 from rtscortex.policy.models import (
     MacroActionStep,
     MacroPolicyProposal,
@@ -30,6 +31,10 @@ _ACTIONS_LIST_RE = re.compile(
     r"\bactions\s*:\s*(\[[^\]]*\])",
     re.IGNORECASE | re.DOTALL,
 )
+_ACTIONS_LIST_START_RE = re.compile(r"\bactions\s*:\s*\[", re.IGNORECASE)
+_TRUNCATED_ACTION_ITEM_RE = re.compile(
+    r"\s*(?P<quote>['\"])(?P<token>[^'\"]+)(?P=quote)\s*(?P<separator>,|$)"
+)
 _NONSTANDARD_ACTION_ITEM_RE = re.compile(
     r"\s*(?P<quote>['\"])(?P<token>[^'\"]+)(?P=quote)\s*:\s*"
     r"(?P<repeat>[+-]?\d+)\s*|"
@@ -48,6 +53,10 @@ _ACTION_BOUNDARY = (
 
 class HIMAProposalParser:
     """Parse pinned HIMA formats while retaining all malformed input diagnostics."""
+
+    def __init__(self, *, race: str = "protoss") -> None:
+        self.race = race.casefold()
+        hima_actions_for_race(self.race)
 
     def parse(
         self,
@@ -74,6 +83,15 @@ class HIMAProposalParser:
 
         rationale = _parse_rationale(bounded_output)
         tokens, extraction_diagnostics = _extract_tokens(bounded_output)
+        if truncated and tokens is None and not extraction_diagnostics:
+            tokens = _extract_truncated_action_prefix(bounded_output)
+            if tokens:
+                extraction_diagnostics.append(
+                    ParseDiagnostic(
+                        code="truncated_action_prefix_recovered",
+                        message=("Recovered complete action items before the truncated list tail."),
+                    )
+                )
         diagnostics.extend(extraction_diagnostics)
 
         steps: list[MacroActionStep] = []
@@ -95,12 +113,15 @@ class HIMAProposalParser:
             )
         else:
             for ordinal, raw_token, repeat in tokens:
-                action = resolve_hima_action(raw_token)
+                action = resolve_race_hima_action(raw_token, race=self.race)
                 if action is None:
                     diagnostics.append(
                         ParseDiagnostic(
                             code="unknown_action_token",
-                            message=("Token is not in the pinned Protoss macro-action vocabulary."),
+                            message=(
+                                f"Token is not in the pinned {self.race.title()} "
+                                "macro-action vocabulary."
+                            ),
                             raw_token=raw_token,
                             ordinal=ordinal,
                             repeat=repeat,
@@ -147,8 +168,8 @@ class HIMAProposalParser:
             steps=steps,
             raw_output=bounded_output,
             adapter_version=HIMA_ADAPTER_VERSION,
-            vocabulary_version=HIMA_VOCABULARY_VERSION,
-            parser_version=HIMA_PARSER_VERSION,
+            vocabulary_version=HIMA_VOCABULARY_VERSIONS[self.race],
+            parser_version=HIMA_PARSER_VERSIONS[self.race],
             diagnostics=diagnostics,
         )
 
@@ -281,6 +302,28 @@ def _extract_action_list(
             continue
         tokens.append((ordinal, item.strip(), 1))
     return tokens, diagnostics
+
+
+def _extract_truncated_action_prefix(
+    raw_output: str,
+) -> list[tuple[int, str, int]] | None:
+    """Recover only fully quoted items from an unterminated official Actions list."""
+
+    match = _ACTIONS_LIST_START_RE.search(raw_output)
+    if match is None:
+        return None
+    candidate = raw_output[match.end() :]
+    tokens: list[tuple[int, str, int]] = []
+    position = 0
+    while len(tokens) < MAX_ACTION_ITEMS:
+        item = _TRUNCATED_ACTION_ITEM_RE.match(candidate, position)
+        if item is None:
+            break
+        tokens.append((len(tokens), item.group("token").strip(), 1))
+        position = item.end()
+        if item.group("separator") != ",":
+            break
+    return tokens or None
 
 
 def _extract_nonstandard_action_items(

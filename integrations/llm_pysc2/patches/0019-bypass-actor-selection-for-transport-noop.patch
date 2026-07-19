@@ -1,0 +1,19 @@
+diff --git a/llm_pysc2/agents/llm_pysc2_agent_main.py b/llm_pysc2/agents/llm_pysc2_agent_main.py
+--- a/llm_pysc2/agents/llm_pysc2_agent_main.py
++++ b/llm_pysc2/agents/llm_pysc2_agent_main.py
+@@ -518,6 +518,15 @@ class MainAgent(base_agent.BaseAgent):
+               agent.curr_action_name = agent.action_list[0]['name']
+               agent.curr_action_args = agent.action_list[0]['arg']
+ 
++            # RTSCortex transport no-ops have no actor semantics. Executing them
++            # must not move the camera or select a team head unit.
++            if getattr(self, '_rtscortex_transport_noop_without_actor_selection', False) and \
++                len(agent.func_list) == 0 and len(agent.action_list) != 0 and \
++                agent.curr_action_name == 'No_Operation':
++              func_id, func_call = agent.get_func(obs)
++              self.func_id_history.append(func_id)
++              return func_call
++
+             # obtain team and head unit tag
+             logger.debug(f"[ID {self.log_id}] Agent {agent_name} status: 7.3.2")
+             team, tag = agent._get_unacted_team_and_unit_tag()

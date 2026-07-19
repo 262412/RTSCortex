@@ -68,12 +68,44 @@ git -C third_party/LLM-PySC2 apply --check \
   ../../integrations/llm_pysc2/patches/0016-accept-visible-team-unit.patch
 git -C third_party/LLM-PySC2 apply \
   ../../integrations/llm_pysc2/patches/0016-accept-visible-team-unit.patch
+git -C third_party/LLM-PySC2 apply --check \
+  ../../integrations/llm_pysc2/patches/0017-return-camera-settlement-noop.patch
+git -C third_party/LLM-PySC2 apply \
+  ../../integrations/llm_pysc2/patches/0017-return-camera-settlement-noop.patch
+git -C third_party/LLM-PySC2 apply --check \
+  ../../integrations/llm_pysc2/patches/0018-use-exact-single-unit-selection.patch
+git -C third_party/LLM-PySC2 apply \
+  ../../integrations/llm_pysc2/patches/0018-use-exact-single-unit-selection.patch
+git -C third_party/LLM-PySC2 apply --check \
+  ../../integrations/llm_pysc2/patches/0019-bypass-actor-selection-for-transport-noop.patch
+git -C third_party/LLM-PySC2 apply \
+  ../../integrations/llm_pysc2/patches/0019-bypass-actor-selection-for-transport-noop.patch
+git -C third_party/LLM-PySC2 apply --check \
+  ../../integrations/llm_pysc2/patches/0020-validate-gather-screen-target.patch
+git -C third_party/LLM-PySC2 apply \
+  ../../integrations/llm_pysc2/patches/0020-validate-gather-screen-target.patch
 ```
 
 After the live run, restore the clean pinned checkout by reversing exactly these reviewed
 patches in reverse order:
 
 ```bash
+git -C third_party/LLM-PySC2 apply --reverse --check \
+  ../../integrations/llm_pysc2/patches/0020-validate-gather-screen-target.patch
+git -C third_party/LLM-PySC2 apply --reverse \
+  ../../integrations/llm_pysc2/patches/0020-validate-gather-screen-target.patch
+git -C third_party/LLM-PySC2 apply --reverse --check \
+  ../../integrations/llm_pysc2/patches/0019-bypass-actor-selection-for-transport-noop.patch
+git -C third_party/LLM-PySC2 apply --reverse \
+  ../../integrations/llm_pysc2/patches/0019-bypass-actor-selection-for-transport-noop.patch
+git -C third_party/LLM-PySC2 apply --reverse --check \
+  ../../integrations/llm_pysc2/patches/0018-use-exact-single-unit-selection.patch
+git -C third_party/LLM-PySC2 apply --reverse \
+  ../../integrations/llm_pysc2/patches/0018-use-exact-single-unit-selection.patch
+git -C third_party/LLM-PySC2 apply --reverse --check \
+  ../../integrations/llm_pysc2/patches/0017-return-camera-settlement-noop.patch
+git -C third_party/LLM-PySC2 apply --reverse \
+  ../../integrations/llm_pysc2/patches/0017-return-camera-settlement-noop.patch
 git -C third_party/LLM-PySC2 apply --reverse --check \
   ../../integrations/llm_pysc2/patches/0016-accept-visible-team-unit.patch
 git -C third_party/LLM-PySC2 apply --reverse \
@@ -233,12 +265,32 @@ instead of indexing an empty list.
 `0015-observation-gap-watchdog.patch` lets the Worker skip optional upstream team gathering
 when the gap since the latest Runtime decision exceeds the configured game-loop threshold.
 
-`0016-accept-visible-team-unit.patch` stops camera centering from interrupting the existing
-point-to-rectangle selection fallback when a team unit is already visible. RTSCortex enables
-this behavior because its Runtime observation is global; selection remains required later for
-actual feature actions.
+`0016-accept-visible-team-unit.patch` stops camera centering from interrupting selection when a
+team unit is already safely visible. Units on the outer two-percent viewport margin are still
+recentered because PySC2 cannot reliably select a clipped actor at the feature-screen edge.
+RTSCortex enables this behavior because its Runtime observation is global; selection remains
+required later for actual feature actions.
 
-CI applies all sixteen patches in order under Python 3.9, compiles and imports both projects, and
+`0017-return-camera-settlement-noop.patch` yields the current SC2 step after a production
+camera move. The producer visibility timeout therefore counts distinct PySC2 observations
+instead of repeated translator calls within one upstream waiting loop.
+
+`0018-use-exact-single-unit-selection.patch` makes RTSCortex single-unit teams use exact point
+selection instead of the upstream exponentially expanding rectangle fallback. This prevents a
+Builder or exact production actor from remaining unselected until the rectangle radius overflows,
+while leaving the original fallback available to non-RTSCortex users.
+
+`0019-bypass-actor-selection-for-transport-noop.patch` executes RTSCortex transport-level
+`No_Operation` directly. A control no-op has no actor semantics, so it must not move the camera
+or select a Builder, producer, or combat unit merely to idle that team. This prevents idle teams
+from starving Runtime observations through repeated feature-layer selection attempts.
+
+`0020-validate-gather-screen-target.patch` rejects off-screen and out-of-range feature-unit
+coordinates before upstream automatic team gathering emits `Move_screen`. New units can still
+join their logical team, but orchestration cannot terminate SC2 with a negative or edge-overflow
+screen target.
+
+CI applies all twenty patches in order under Python 3.9, compiles and imports both projects, and
 runs `integrations/llm_pysc2/tests/python39_contract_smoke.py`. The smoke locks the v1.1
 candidate mapping, multi-argument translator rejection, Nexus camera-settlement primitive,
 exact Nexus anchor, floating-point resource clearance, visible complete-footprint behavior,

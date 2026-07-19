@@ -18,7 +18,10 @@ from rtscortex.runtime.live import (
     LiveEnvironmentError,
     atomic_log_directory_patch_is_applied,
     build_feature_plane_patch_is_applied,
+    camera_settlement_noop_patch_is_applied,
+    exact_single_unit_selection_patch_is_applied,
     gas_rebalance_worker_management_patch_is_applied,
+    gather_screen_target_patch_is_applied,
     live_scenario_spec,
     max_frames_episode_hook_patch_is_applied,
     near_placement_patch_is_applied,
@@ -31,6 +34,7 @@ from rtscortex.runtime.live import (
     sc2_build,
     transient_unit_grace_patch_is_applied,
     translation_result_patch_is_applied,
+    transport_noop_actor_bypass_patch_is_applied,
     visible_team_selection_patch_is_applied,
     waiting_response_patch_is_applied,
     worker_workplace_refresh_patch_is_applied,
@@ -63,7 +67,7 @@ def run_doctor(
     checks.append(_core_venv_check(project_root / ".venv"))
     if config is not None and config.provider.kind == "openai_compatible":
         checks.append(_provider_check(config))
-    if config is not None and config.cortex.macro.kind != "disabled":
+    if config is not None and config.cortex.macro.kind in {"hima", "hima_ensemble"}:
         checks.extend(_hima_checks(config))
     submodule = project_root / "third_party" / "LLM-PySC2"
     commit = _git_commit(submodule)
@@ -252,6 +256,14 @@ def _worker_patch_check(project_root: Path, *, required: bool) -> Check:
         missing.append("0015-observation-gap-watchdog.patch")
     if not visible_team_selection_patch_is_applied(project_root):
         missing.append("0016-accept-visible-team-unit.patch")
+    if not camera_settlement_noop_patch_is_applied(project_root):
+        missing.append("0017-return-camera-settlement-noop.patch")
+    if not exact_single_unit_selection_patch_is_applied(project_root):
+        missing.append("0018-use-exact-single-unit-selection.patch")
+    if not transport_noop_actor_bypass_patch_is_applied(project_root):
+        missing.append("0019-bypass-actor-selection-for-transport-noop.patch")
+    if not gather_screen_target_patch_is_applied(project_root):
+        missing.append("0020-validate-gather-screen-target.patch")
     status = "ok" if not missing else ("error" if required else "optional")
     detail = "all worker patches applied" if not missing else "apply " + ", ".join(missing)
     return Check("worker_patch", status, detail)

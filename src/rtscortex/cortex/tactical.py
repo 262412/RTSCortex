@@ -42,6 +42,8 @@ class DeterministicTacticalAgent:
 
     agent_id = "deterministic-tactical-agent"
     agent_version = "0.2.0"
+    provider_id = agent_id
+    provider_version = agent_version
 
     def __init__(
         self,

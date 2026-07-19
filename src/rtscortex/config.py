@@ -108,7 +108,7 @@ class AgentSettings(SettingsModel):
 
 
 class CortexSituationSettings(SettingsModel):
-    kind: Literal["deterministic"] = "deterministic"
+    kind: Literal["deterministic", "model_shadow", "model_active"] = "deterministic"
 
 
 class CortexHIMAEnsembleMemberSettings(SettingsModel):
@@ -118,8 +118,8 @@ class CortexHIMAEnsembleMemberSettings(SettingsModel):
 
 
 class CortexMacroSettings(SettingsModel):
-    kind: Literal["disabled", "hima", "hima_ensemble"] = "disabled"
-    candidate: Literal["protoss-a", "protoss-b", "protoss-c"] = "protoss-a"
+    kind: Literal["disabled", "hima", "hima_ensemble", "scripted"] = "disabled"
+    candidate: HIMACandidate = "protoss-a"
     python_executable: Path = Path("~/fastscratch/envs/rtscortex-hima/bin/python")
     model_path: Path | None = None
     device: str = "cuda:0"
@@ -132,6 +132,13 @@ class CortexMacroSettings(SettingsModel):
     restart_limit: int = Field(default=1, ge=0)
     ensemble_members: list[CortexHIMAEnsembleMemberSettings] = Field(default_factory=list)
     coordinator: Literal["deterministic_v1"] = "deterministic_v1"
+    ensemble_schedule: Literal["barrier", "staggered"] = "barrier"
+    scripted_actions: list[str] = Field(default_factory=list, max_length=128)
+    scripted_objective: str = Field(
+        default="Execute the deterministic engineering canary.",
+        min_length=1,
+        max_length=500,
+    )
 
     @model_validator(mode="after")
     def require_hima_model_path(self) -> CortexMacroSettings:
@@ -147,11 +154,26 @@ class CortexMacroSettings(SettingsModel):
                 raise ValueError("HIMA ensemble members must be the a/b/c checkpoints for one race")
         elif self.ensemble_members:
             raise ValueError("ensemble_members are only valid for kind=hima_ensemble")
+        if self.kind == "scripted" and not self.scripted_actions:
+            raise ValueError("scripted macro policy requires scripted_actions")
+        if self.kind != "scripted" and self.scripted_actions:
+            raise ValueError("scripted_actions are only valid for kind=scripted")
         return self
 
 
+class CortexArbiterSettings(SettingsModel):
+    mode: Literal["disabled", "shadow", "active"] = "shadow"
+    switch_margin: float = Field(default=1.0, ge=0.0)
+    max_intents: int = Field(default=7, ge=1, le=7)
+
+
 class CortexTacticalSettings(SettingsModel):
-    kind: Literal["deterministic", "deterministic_reflex"] = "deterministic"
+    kind: Literal[
+        "deterministic",
+        "deterministic_reflex",
+        "model_shadow",
+        "model_active",
+    ] = "deterministic"
     retreat_health_threshold: float = Field(default=0.3, ge=0.0, le=1.0)
     minimum_advance_army_supply: int = Field(default=4, ge=1)
     reacquire_cooldown_game_loops: int = Field(default=112, ge=1)
@@ -177,6 +199,9 @@ class CortexPlaybookSettings(SettingsModel):
     min_confidence: float = Field(default=0.6, ge=0.0, le=1.0)
     promotion_support: int = Field(default=2, ge=1)
     include_candidates: bool = False
+    rule_mode: Literal["disabled", "shadow", "active"] = "shadow"
+    max_hard_rules: int = Field(default=8, ge=1, le=8)
+    max_soft_rules: int = Field(default=8, ge=1, le=8)
 
 
 class CortexSettings(SettingsModel):
@@ -186,6 +211,7 @@ class CortexSettings(SettingsModel):
     executor: CortexExecutorSettings = Field(default_factory=CortexExecutorSettings)
     explanation: CortexExplanationSettings = Field(default_factory=CortexExplanationSettings)
     playbook: CortexPlaybookSettings = Field(default_factory=CortexPlaybookSettings)
+    arbiter: CortexArbiterSettings = Field(default_factory=CortexArbiterSettings)
 
 
 class ReflexSettings(SettingsModel):
@@ -247,9 +273,14 @@ class ExperimentConfig(SettingsModel):
 
     @model_validator(mode="after")
     def validate_race_brain_matches_agent(self) -> ExperimentConfig:
-        if self.cortex.macro.kind != "hima_ensemble":
+        if self.agent.variant == "cortex" and self.environment.agent_race == "random":
+            raise ValueError("Cortex live mode requires a concrete agent_race")
+        if self.cortex.macro.kind == "hima":
+            race = self.cortex.macro.candidate.rsplit("-", 1)[0]
+        elif self.cortex.macro.kind == "hima_ensemble":
+            race = self.cortex.macro.ensemble_members[0].candidate.rsplit("-", 1)[0]
+        else:
             return self
-        race = self.cortex.macro.ensemble_members[0].candidate.rsplit("-", 1)[0]
         if self.environment.agent_race != race:
             raise ValueError(
                 "HIMA ensemble race must match environment.agent_race; "

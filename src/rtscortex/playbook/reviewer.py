@@ -8,6 +8,7 @@ from collections.abc import Sequence
 from rtscortex.contracts import EpisodeOutcome, EpisodeResult, ExecutionReport
 from rtscortex.game_phase import GamePhase
 from rtscortex.memory import StoredEvent
+from rtscortex.playbook.lifecycle import PlaybookRuleLifecycle
 from rtscortex.playbook.models import (
     DecisionCase,
     DecisionQuality,
@@ -15,7 +16,11 @@ from rtscortex.playbook.models import (
     LessonStatus,
     PlaybookContext,
     PlaybookLesson,
+    PlaybookRule,
+    PlaybookRuleCategory,
+    PlaybookRuleEffect,
     PlaybookRuleKind,
+    PlaybookRuleStatus,
 )
 from rtscortex.playbook.store import PlaybookStore
 
@@ -26,7 +31,42 @@ class CortexPlaybookReviewer:
     def __init__(self, store: PlaybookStore, *, promotion_support: int = 2) -> None:
         self.store = store
         self.promotion_support = promotion_support
+        self._rule_lifecycle = PlaybookRuleLifecycle()
+        self.last_rule_updates: tuple[PlaybookRule, ...] = ()
         self.rebuild_lessons()
+        self._repair_unscoped_execution_candidates()
+
+    def _repair_unscoped_execution_candidates(self) -> None:
+        """Retire early v2 candidates that accidentally targeted every action."""
+
+        cases_by_id = {case.case_id: case for case in self.store.cases()}
+        for rule in self.store.rules():
+            if (
+                rule.category is not PlaybookRuleCategory.EXECUTION_GUARD
+                or rule.status is not PlaybookRuleStatus.CANDIDATE
+                or rule.action_names
+            ):
+                continue
+            source_cases = [
+                cases_by_id[case_id]
+                for case_id in rule.source_case_ids
+                if case_id in cases_by_id
+                and cases_by_id[case_id].quality is DecisionQuality.EXECUTION_ERROR
+            ]
+            actions = {case.semantic_action for case in source_cases}
+            if len(actions) != 1 or not source_cases:
+                continue
+            self._consolidate(source_cases[0], update_executable_rule=True)
+            evidence = dict(rule.evidence)
+            evidence["repair_reason"] = "unscoped_execution_candidate"
+            self.store.upsert_rule(
+                rule.model_copy(
+                    update={
+                        "status": PlaybookRuleStatus.RETIRED,
+                        "evidence": evidence,
+                    }
+                )
+            )
 
     def rebuild_lessons(self) -> list[PlaybookLesson]:
         """Backfill deduplicated rules from cases written by earlier runtime versions."""
@@ -39,7 +79,7 @@ class CortexPlaybookReviewer:
         return [
             lesson
             for case in representatives.values()
-            if (lesson := self._consolidate(case)) is not None
+            if (lesson := self._consolidate(case, update_executable_rule=False)) is not None
         ]
 
     def review_episode(
@@ -50,6 +90,8 @@ class CortexPlaybookReviewer:
         agent_race: str,
         opponent_race: str,
     ) -> tuple[list[DecisionCase], list[PlaybookLesson]]:
+        self.last_rule_updates = ()
+        rules_before = {rule.canonical_key: rule.model_dump_json() for rule in self.store.rules()}
         lineages = {
             str(event.payload.get("command_id")): event
             for event in events
@@ -71,7 +113,7 @@ class CortexPlaybookReviewer:
             )
             if self.store.add_case(rejected):
                 cases.append(rejected)
-                lesson = self._consolidate(rejected)
+                lesson = self._consolidate(rejected, update_executable_rule=True)
                 if lesson is not None:
                     lessons.append(lesson)
         for event in events:
@@ -108,6 +150,7 @@ class CortexPlaybookReviewer:
                 failure_owner=owner,
                 consequence=consequence,
                 evidence={
+                    "seed": result.seed,
                     "execution_status": report.status.value,
                     "execution_stage": (
                         None if report.execution_stage is None else report.execution_stage.value
@@ -126,12 +169,40 @@ class CortexPlaybookReviewer:
             if not self.store.add_case(case):
                 continue
             cases.append(case)
-            lesson = self._consolidate(case)
+            lesson = self._consolidate(case, update_executable_rule=True)
             if lesson is not None:
                 lessons.append(lesson)
+        self._record_contradictions(cases, seed=result.seed)
+        self.last_rule_updates = tuple(
+            rule
+            for rule in self.store.rules()
+            if rules_before.get(rule.canonical_key) != rule.model_dump_json()
+        )
         return cases, lessons
 
-    def _consolidate(self, case: DecisionCase) -> PlaybookLesson | None:
+    def _record_contradictions(
+        self,
+        cases: Sequence[DecisionCase],
+        *,
+        seed: int,
+    ) -> None:
+        for rule in self.store.rules():
+            if rule.status is not PlaybookRuleStatus.ACTIVE:
+                continue
+            for case in cases:
+                if not _rule_matches_case(rule, case) or not _case_contradicts_rule(case, rule):
+                    continue
+                updated = self._rule_lifecycle.record_contradiction(rule, seed=seed)
+                if updated != rule:
+                    self.store.upsert_rule(updated)
+                break
+
+    def _consolidate(
+        self,
+        case: DecisionCase,
+        *,
+        update_executable_rule: bool,
+    ) -> PlaybookLesson | None:
         signature = _case_signature(case)
         if signature is None:
             return None
@@ -164,6 +235,16 @@ class CortexPlaybookReviewer:
             source_episode_ids=source_episode_ids,
         )
         self.store.upsert_lesson(lesson)
+        if update_executable_rule:
+            rule = self.store.upsert_lesson_rule_candidate(lesson, case)
+            if (
+                rule.status is PlaybookRuleStatus.CANDIDATE
+                and rule.action_names
+                and len(set(rule.source_run_ids)) >= 2
+                and rule.confidence >= 0.75
+                and rule.contradiction_count == 0
+            ):
+                self.store.upsert_rule(self._rule_lifecycle.promote_to_soft(rule))
         return lesson
 
 
@@ -249,7 +330,10 @@ def _rule_content(
             f"Before retrying {action}, resolve execution failure {failure_code} "
             "and revalidate the current candidate."
         )
-    return PlaybookRuleKind.EXECUTION_GUARD, statement, None, None
+    # Keep execution experience scoped to the exact failed semantic action.  An
+    # empty action set would match every Intent and Candidate in this phase and
+    # could penalize unrelated play after promotion.
+    return PlaybookRuleKind.EXECUTION_GUARD, statement, None, action
 
 
 def _assess(
@@ -325,7 +409,7 @@ def _rejected_proposal_case(
         quality=DecisionQuality.STRATEGIC_ERROR,
         failure_owner=FailureOwner.CORTEX,
         consequence=f"The proposal was blocked before dispatch: {reason}.",
-        evidence={"classification": classification, "reason": reason},
+        evidence={"classification": classification, "reason": reason, "seed": result.seed},
         episode_outcome=result.outcome.value,
         confidence=0.95,
     )
@@ -355,6 +439,31 @@ def _source_role(payload: dict[str, object]) -> str | None:
         return None
     role = lineage.get("source_role")
     return role if isinstance(role, str) else None
+
+
+def _rule_matches_case(rule: PlaybookRule, case: DecisionCase) -> bool:
+    if rule.action_names and case.semantic_action not in rule.action_names:
+        return False
+    expected = {
+        "agent_race": case.context.agent_race,
+        "opponent_race": case.context.opponent_race,
+        "phase": case.context.phase.value,
+        "map_name": case.context.map_name,
+    }
+    return all(
+        condition.field in expected
+        and condition.operator.value == "eq"
+        and expected[condition.field] == condition.value
+        for condition in rule.conditions
+    )
+
+
+def _case_contradicts_rule(case: DecisionCase, rule: PlaybookRule) -> bool:
+    if case.quality is DecisionQuality.ADVANTAGE_GAINED:
+        return rule.effect in {PlaybookRuleEffect.AVOID, PlaybookRuleEffect.FORBID}
+    if case.quality is DecisionQuality.STRATEGIC_ERROR:
+        return rule.effect in {PlaybookRuleEffect.PREFER, PlaybookRuleEffect.REQUIRE}
+    return False
 
 
 def _macro_plan_id(payload: dict[str, object]) -> str | None:

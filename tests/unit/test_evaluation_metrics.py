@@ -918,6 +918,65 @@ def test_production_funnel_separates_effect_confirmation_from_acceptance_only() 
     assert aggregate["execution"]["confirmation_latency_game_loops_p50"] == 14.0
 
 
+def test_zerg_consumed_larva_morph_counts_as_confirmed_production() -> None:
+    command = {
+        "command_id": "zerg-producer-morph",
+        "name": "Train_Drone",
+        "actor": "Developer/Empty",
+        "source": "planner",
+    }
+    events = [
+        _event(
+            1,
+            "decision",
+            {
+                "planner_candidates": [command],
+                "validated_candidates": [command],
+                "batch": {"commands": [command], "rejected_commands": []},
+            },
+        ),
+        _event(
+            2,
+            "execution",
+            {
+                **command,
+                "protocol_version": "1.1",
+                "action_name": "Train_Drone",
+                "success": True,
+                "status": "succeeded",
+                "execution_stage": "effect_verification",
+                "primitive_trace": [
+                    {
+                        "function_name": "Train_Drone_quick",
+                        "origin": "translator",
+                        "ordinal": 0,
+                        "total": 1,
+                        "accepted": True,
+                    }
+                ],
+                "effect_evidence": {
+                    "effect_kind": "production",
+                    "producer_tag": "0x100",
+                    "producer_type": "Larva",
+                    "expected_unit_type": "Drone",
+                    "expected_order_id": 503,
+                    "accepted_game_loop": 100,
+                    "confirmed_game_loop": 100,
+                    "confirmation_kind": "producer_morph",
+                },
+            },
+        ),
+    ]
+
+    metrics = compute_execution_metrics(events)
+
+    assert metrics.production_funnel["order_confirmed"] == 1
+    assert metrics.production_funnel["effect_confirmed"] == 1
+    assert metrics.production_effect_confirmed_rate == 1.0
+    assert metrics.confirmation_latency_game_loops_p50 == 0.0
+    assert metrics.confirmation_latency_game_loops_samples == 1
+
+
 def test_legacy_train_acceptance_only_is_deprecated_not_gate_applicable() -> None:
     command = {
         "command_id": "legacy-train",

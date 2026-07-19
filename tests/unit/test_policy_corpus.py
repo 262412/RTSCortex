@@ -10,12 +10,15 @@ from rtscortex.policy.corpus import (
     _RUNTIME_TO_HIMA_SHORT_ACTION,
     PolicyCorpusBuildConfig,
     PolicyCorpusSourceConfig,
+    _corpus_race_semantics,
     _observation_phase,
+    _phase_goal,
     load_policy_corpus_config,
     state_fingerprint,
 )
 from rtscortex.policy.models import PolicyFixtureStratum
-from rtscortex.progress import GoalRequirementKind
+from rtscortex.progress import GoalProgressStatus, GoalProgressVerifier, GoalRequirementKind
+from rtscortex.races import RaceId
 from tests.helpers import make_observation
 
 
@@ -158,7 +161,117 @@ sources:
     config = load_policy_corpus_config(config_path)
 
     assert config.corpus_id == "test"
+    assert config.race is RaceId.PROTOSS
     assert config.sources[0].seed == 7
+
+
+def test_zerg_worker_frontier_does_not_misclassify_opening_as_production() -> None:
+    observation = make_observation(include_enemy=False).model_copy(
+        update={
+            "available_actions": [
+                AvailableAction(name="Train_Drone", actor_scopes=["larva"]),
+                AvailableAction(name="Train_Overlord", actor_scopes=["larva"]),
+            ]
+        }
+    )
+
+    assert _observation_phase(observation, RaceId.ZERG) is PolicyFixtureStratum.EARLY
+
+
+def test_canonical_unit_under_attack_alert_defines_combat_phase() -> None:
+    observation = make_observation(
+        include_enemy=False,
+        alerts=["unit_under_attack"],
+    )
+
+    assert _observation_phase(observation, RaceId.TERRAN) is PolicyFixtureStratum.COMBAT
+
+
+def test_zerg_phase_classification_separates_technology_and_army_production() -> None:
+    observation = make_observation(include_enemy=False)
+    with_lair = observation.model_copy(
+        update={
+            "state": observation.state.model_copy(
+                update={
+                    "own_structures": [
+                        UnitState(
+                            unit_id="lair-1",
+                            unit_type="Lair",
+                            alliance="self",
+                            status="active",
+                        )
+                    ]
+                }
+            ),
+            "available_actions": [],
+        }
+    )
+    with_roach_frontier = observation.model_copy(
+        update={"available_actions": [AvailableAction(name="Train_Roach", actor_scopes=["larva"])]}
+    )
+    with_idle_spawning_pool = observation.model_copy(
+        update={
+            "state": observation.state.model_copy(
+                update={
+                    "own_structures": [
+                        UnitState(
+                            unit_id="pool-1",
+                            unit_type="SpawningPool",
+                            alliance="self",
+                            status="active",
+                        )
+                    ]
+                }
+            ),
+            "available_actions": [],
+        }
+    )
+
+    assert _observation_phase(with_lair, RaceId.ZERG) is PolicyFixtureStratum.TECHNOLOGY
+    assert _observation_phase(with_roach_frontier, RaceId.ZERG) is PolicyFixtureStratum.PRODUCTION
+    assert (
+        _observation_phase(with_idle_spawning_pool, RaceId.ZERG) is PolicyFixtureStratum.PRODUCTION
+    )
+
+
+def test_zerg_previous_action_names_come_from_the_active_race_profile() -> None:
+    mapping = _corpus_race_semantics(RaceId.ZERG).runtime_to_hima_short_action
+
+    assert mapping["Train_Drone"] == "Drone"
+    assert mapping["Build_SpawningPool_Screen"] == "SpawningPool"
+    assert "Build_Pylon_Screen" not in mapping
+
+
+def test_zerg_idle_spawning_pool_can_form_a_blocked_production_fixture() -> None:
+    semantics = _corpus_race_semantics(RaceId.ZERG)
+    base = make_observation(include_enemy=False)
+    observation = base.model_copy(
+        update={
+            "state": base.state.model_copy(
+                update={
+                    "economy": EconomyState(minerals=0, supply_used=15, supply_cap=15),
+                    "own_structures": [
+                        UnitState(
+                            unit_id="pool-1",
+                            unit_type="SpawningPool",
+                            alliance="self",
+                            status="active",
+                        )
+                    ],
+                }
+            ),
+            "available_actions": [],
+        }
+    )
+    verifier = GoalProgressVerifier(action_specs=semantics.profile.progress_action_specs)
+    goal = _phase_goal(
+        verifier,
+        observation,
+        PolicyFixtureStratum.PRODUCTION,
+        RaceId.ZERG,
+    )
+
+    assert verifier.verify(observation, goal).status is GoalProgressStatus.BLOCKED
 
 
 def test_future_corpora_recognize_oracle_phoenix_and_shield_battery_events() -> None:

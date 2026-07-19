@@ -64,9 +64,10 @@ uv run rtscortex run \
 uv run rtscortex playbook show --promoted-only
 ```
 
-Terran and Zerg a/b/c checkpoint identities are pinned in the public Race Brain catalog,
-but live dispatch remains unavailable until their race-specific observation vocabularies
-and Runtime action mappings are implemented.
+Protoss, Terran, and Zerg a/b/c checkpoint identities are pinned in the public Race Brain
+catalog. Their race-specific vocabularies, Runtime mappings, and live Worker adapters share
+one Cortex runtime. Terran still lacks a quota-complete 48-state corpus and some specialized
+effect verification; these are explicit validation gaps rather than dispatch stubs.
 
 Policy Comparison v0.2 provides a 48-state, six-stratum shadow benchmark for the current
 Qwen planner and optional local HIMA Protoss specialists. It never dispatches candidate
@@ -74,6 +75,7 @@ actions and never downloads model weights. Start with the fully offline workflow
 
 ```bash
 uv run rtscortex policy-corpus verify benchmarks/policy/protoss_v0_2/manifest.yaml
+uv run rtscortex policy-corpus verify benchmarks/policy/zerg_v0_3/manifest.yaml
 uv run rtscortex policy-compare --config configs/policy/comparison_v0_2.offline.yaml
 ```
 

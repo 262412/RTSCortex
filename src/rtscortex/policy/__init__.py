@@ -33,6 +33,7 @@ from rtscortex.policy.corpus import (
     build_policy_corpus_from_file,
     load_policy_corpus,
     load_policy_corpus_config,
+    load_policy_corpus_manifest,
     state_fingerprint,
     verify_policy_corpus,
 )
@@ -209,6 +210,7 @@ __all__ = [
     "load_historical_observations",
     "load_policy_corpus",
     "load_policy_corpus_config",
+    "load_policy_corpus_manifest",
     "render_policy_comparison_report",
     "resolve_hima_action",
     "state_fingerprint",

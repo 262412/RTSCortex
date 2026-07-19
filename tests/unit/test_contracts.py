@@ -314,6 +314,7 @@ def test_effect_evidence_round_trips_production_provenance_without_breaking_lega
         effect_kind="production",
         producer_tag="0xabc",
         producer_type="Stargate",
+        producer_observed_type="Stargate",
         expected_unit_type="VoidRay",
         expected_order_id=57,
         baseline_unit_tags=["0x1"],
@@ -331,12 +332,73 @@ def test_effect_evidence_round_trips_production_provenance_without_breaking_lega
     assert legacy.effect_kind is None
     assert legacy.baseline_unit_tags == []
     assert legacy.production_order_seen is False
+    assert legacy.producer_consumed is False
     assert legacy.confirmation_kind is None
 
     with pytest.raises(ValidationError):
         EffectEvidence(effect_kind="accepted")  # type: ignore[arg-type]
     with pytest.raises(ValidationError):
         EffectEvidence(confirmation_kind="acceptance_only")  # type: ignore[arg-type]
+
+    zerg = EffectEvidence(
+        effect_kind="production",
+        requested_producer_tag="0x200",
+        producer_tag="0x100",
+        producer_type="Larva",
+        producer_observed_type="Cocoon",
+        producer_consumed=True,
+        expected_unit_type="Zergling",
+        expected_order_id=528,
+        confirmation_kind="producer_morph",
+    )
+    assert EffectEvidence.model_validate_json(zerg.model_dump_json()) == zerg
+
+
+def test_effect_evidence_accepts_terran_addon_confirmation() -> None:
+    evidence = EffectEvidence(
+        effect_kind="addon",
+        target_type="BarracksReactor",
+        producer_tag="0xabc",
+        producer_type="Barracks",
+        expected_order_id=208,
+        new_structure_tag="0xdef",
+        confirmation_kind="new_structure",
+    )
+
+    assert EffectEvidence.model_validate_json(evidence.model_dump_json()) == evidence
+
+
+def test_effect_evidence_accepts_zerg_structure_morph_confirmation() -> None:
+    evidence = EffectEvidence(
+        effect_kind="morph",
+        target_type="Lair",
+        target_tag="0xabc",
+        producer_tag="0xabc",
+        producer_type="Hatchery",
+        producer_observed_type="Lair",
+        expected_order_id=388,
+        confirmation_kind="source_morph",
+        source_build_progress=0.1,
+    )
+
+    assert EffectEvidence.model_validate_json(evidence.model_dump_json()) == evidence
+
+
+def test_effect_evidence_accepts_zerg_larva_inject_confirmation() -> None:
+    evidence = EffectEvidence(
+        effect_kind="inject",
+        target_type="Hatchery",
+        target_tag="0xabc",
+        builder_tag="0xdef",
+        producer_tag="0xdef",
+        producer_type="Queen",
+        expected_order_id=315,
+        baseline_target_buff_ids=[],
+        target_buff_ids=[11],
+        confirmation_kind="target_buff",
+    )
+
+    assert EffectEvidence.model_validate_json(evidence.model_dump_json()) == evidence
 
 
 def test_episode_result_contract_round_trip_and_invalid_samples() -> None:

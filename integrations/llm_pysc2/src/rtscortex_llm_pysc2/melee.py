@@ -129,6 +129,7 @@ class RTSCortexMeleeConfig(ProtossAgentConfig):  # type: ignore[misc]
         # stopped and reassigned deterministically by the Bridge.
         self.ENABLE_AUTO_WORKER_MANAGE = True
         self.ENABLE_AUTO_WORKER_TRAINING = True
+        _ensure_assimilator_camera_settlement(self.AGENTS)
         _ensure_no_operation(self.AGENTS)
 
 
@@ -138,6 +139,40 @@ def _ensure_no_operation(agents: dict[str, dict[str, Any]]) -> None:
         for actions in agent["action"].values():
             if not any(action["name"] == "No_Operation" for action in actions):
                 actions.insert(0, deepcopy(no_operation))
+
+
+def _ensure_assimilator_camera_settlement(agents: dict[str, dict[str, Any]]) -> None:
+    """Move the camera to the exact geyser before resolving its screen position."""
+
+    nexus_action = _find_action(agents, "Build_Nexus_Near")
+    assimilator_action = _find_action(agents, "Build_Assimilator_Near")
+    nexus_functions = list(nexus_action.get("func", ()))
+    assimilator_functions = list(assimilator_action.get("func", ()))
+    if (
+        len(nexus_functions) < 2
+        or int(nexus_functions[0][0]) != 573
+        or int(nexus_functions[1][0]) != 0
+        or not assimilator_functions
+        or int(assimilator_functions[-1][0]) != 40
+    ):
+        raise RuntimeError("pinned Protoss Near-build action contract changed")
+    assimilator_action["func"] = [
+        deepcopy(nexus_functions[0]),
+        deepcopy(nexus_functions[1]),
+        assimilator_functions[-1],
+    ]
+
+
+def _find_action(
+    agents: dict[str, dict[str, Any]],
+    action_name: str,
+) -> dict[str, Any]:
+    for agent in agents.values():
+        for actions in agent["action"].values():
+            for action in actions:
+                if action["name"] == action_name:
+                    return cast(dict[str, Any], action)
+    raise RuntimeError(f"ProtossAgentConfig does not expose {action_name}")
 
 
 def _find_no_operation(agents: dict[str, dict[str, Any]]) -> dict[str, Any]:
