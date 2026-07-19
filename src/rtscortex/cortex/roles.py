@@ -57,6 +57,10 @@ class _RoutingRoleAgent:
         if isinstance(intent, ReflexIntent):
             if self.role_id is RoleId.RETREAT:
                 return "retreat" in intent.objective.casefold()
+            if intent.action_names[0] == "Effect_InjectLarva":
+                return self.role_id is RoleId.ECONOMY
+            if intent.action_names[0] == "Build_CreepTumor_Queen_Screen":
+                return self.role_id is RoleId.DEFENSE
             return self.role_id is RoleId.DEFENSE
         if isinstance(intent, TacticalIntent):
             if "retreat" in intent.objective.casefold():

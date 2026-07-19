@@ -10,6 +10,10 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from rtscortex_llm_pysc2.addon import addon_spec
+from rtscortex_llm_pysc2.inject_effect_verifier import (
+    INJECT_ACTION,
+    INJECT_TARGET_BUFF_ID,
+)
 from rtscortex_llm_pysc2.morph import morph_spec
 from rtscortex_llm_pysc2.production import (
     production_spec,
@@ -21,6 +25,9 @@ SCREEN_WORLD_GRID = 24.0
 TERRAN_ADDON_GAS_CLEARANCE_WORLD = 7.0
 ALLIANCES = {1: "self", 2: "ally", 3: "neutral", 4: "enemy"}
 SC2_ALERT_NAMES = {6: "building_under_attack", 19: "unit_under_attack"}
+QUEEN_CONTROLLER_ACTIONS = frozenset(
+    {INJECT_ACTION, "Build_CreepTumor_Queen_Screen"}
+)
 TOWNHALL_NAMES = frozenset(
     {
         "nexus",
@@ -207,6 +214,14 @@ BUILD_SPECS = {
         prerequisites=("EvolutionChamber",),
         requires_creep=True,
     ),
+    "Build_CreepTumor_Queen_Screen": BuildSpec(
+        "CreepTumorQueen",
+        "screen",
+        1,
+        False,
+        0,
+        requires_creep=True,
+    ),
 }
 
 # PySC2's ``FeatureUnit.order_id_*`` fields expose the pinned RAW action IDs
@@ -238,6 +253,7 @@ BUILD_RAW_FUNCTION_IDS = {
     "SpawningPool": 217,
     "SpineCrawler": 218,
     "SporeCrawler": 220,
+    "CreepTumorQueen": 189,
 }
 TERRAN_BUILD_RAW_FUNCTION_IDS = frozenset(
     BUILD_RAW_FUNCTION_IDS[spec.target_structure]
@@ -595,6 +611,17 @@ def _unit_order_entries(unit: Any) -> tuple[tuple[int, float], ...]:
     )
 
 
+def _unit_buff_ids(unit: Any) -> tuple[int, ...]:
+    explicit = _value(unit, "buff_ids", None)
+    if explicit is not None:
+        return tuple(int(value) for value in explicit if int(value) > 0)
+    return tuple(
+        int(_value(unit, f"buff_id_{index}", 0))
+        for index in range(2)
+        if int(_value(unit, f"buff_id_{index}", 0)) > 0
+    )
+
+
 def _normalized_progress(value: Any) -> float:
     progress = float(value)
     if progress > 1.0:
@@ -704,8 +731,16 @@ def _available_team_actions(
         argument_types = tuple("tag" if name == "tag" else "position" for name in argument_names)
         function_ids = [int(triple[0]) for triple in action.get("func", ())]
         build_spec = BUILD_SPECS.get(action_name)
+        if action_name in QUEEN_CONTROLLER_ACTIONS and not _own_unit_has_energy(
+            observation,
+            "Queen",
+            minimum_energy=25.0,
+            unit_names=unit_names,
+        ):
+            continue
         if (
             build_spec is None
+            and action_name not in QUEEN_CONTROLLER_ACTIONS
             and available_ids is not None
             and any(value not in available_ids for value in function_ids)
         ):
@@ -812,6 +847,21 @@ def _completed_own_structures(observation: Any, unit_names: Mapping[int, str]) -
     }
 
 
+def _own_unit_has_energy(
+    observation: Any,
+    unit_type: str,
+    *,
+    minimum_energy: float,
+    unit_names: Mapping[int, str],
+) -> bool:
+    return any(
+        int(_value(unit, "alliance", 0)) == 1
+        and _unit_name(unit, unit_names) == unit_type
+        and float(_value(unit, "energy", 0.0)) >= minimum_energy
+        for unit in _value(observation, "raw_units", ())
+    )
+
+
 def _terran_builder_is_constructing(
     observation: Any,
     team: Mapping[str, Any],
@@ -857,6 +907,21 @@ def _argument_candidates(
     unit_names: Mapping[int, str],
     include_home_minimap: bool,
 ) -> Optional[list[list[Any]]]:
+    if action_name == INJECT_ACTION:
+        return [
+            [tag]
+            for tag in sorted(
+                {
+                    int(_value(unit, "tag", 0))
+                    for unit in _value(observation, "raw_units", ())
+                    if int(_value(unit, "alliance", 0)) == 1
+                    and _unit_name(unit, unit_names) in {"Hatchery", "Lair", "Hive"}
+                    and _build_progress(unit) >= 1.0
+                    and INJECT_TARGET_BUFF_ID not in _unit_buff_ids(unit)
+                    and int(_value(unit, "tag", 0)) > 0
+                }
+            )
+        ]
     if action_name == "Attack_Unit":
         return [
             [int(_value(unit, "tag", 0))]

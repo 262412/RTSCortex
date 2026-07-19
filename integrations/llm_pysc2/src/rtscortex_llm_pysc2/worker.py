@@ -1537,7 +1537,15 @@ def _unit_metadata() -> tuple[dict[int, str], tuple[int, ...]]:
     for race in (units.Neutral, units.Protoss, units.Terran, units.Zerg):
         names.update({int(value): value.name for value in race})
     utils = importlib.import_module("llm_pysc2.lib.utils")
-    return names, tuple(int(value) for value in utils.BUILDING_TYPE)
+    building_types = {int(value) for value in utils.BUILDING_TYPE}
+    building_types.update(
+        {
+            int(units.Zerg.CreepTumor),
+            int(units.Zerg.CreepTumorBurrowed),
+            int(units.Zerg.CreepTumorQueen),
+        }
+    )
+    return names, tuple(sorted(building_types))
 
 
 def _upgrade_metadata() -> dict[int, str]:

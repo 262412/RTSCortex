@@ -23,6 +23,7 @@ from rtscortex_llm_pysc2.extractor import (
     semantic_argument_candidates,
 )
 from rtscortex_llm_pysc2.hook import RuntimeDecisionBroker, RuntimeQueryMixin
+from rtscortex_llm_pysc2.inject_effect_verifier import INJECT_TARGET_BUFF_ID
 from rtscortex_llm_pysc2.morph import MORPH_SPECS
 from rtscortex_llm_pysc2.observation import ObservationMapper
 from rtscortex_llm_pysc2.production import PRODUCTION_SPECS
@@ -54,6 +55,7 @@ from rtscortex_llm_pysc2.worker import (
     _should_block_gas_rebalance,
     _translated_build_position,
     _translation_failure_code,
+    _unit_metadata,
     _upstream_replaced_production_with_noop,
     _worker_player_race,
 )
@@ -2061,6 +2063,68 @@ def test_zerg_building_requires_creep_across_the_full_footprint() -> None:
     assert build_screen_candidates(observation, "Build_SpawningPool_Screen") == []
 
 
+def test_zerg_queen_controller_candidates_require_uninjected_townhall_and_creep() -> None:
+    creep = [[1 for _ in range(128)] for _ in range(128)]
+    hatchery = SimpleNamespace(
+        tag=0xB00,
+        unit_type=86,
+        alliance=1,
+        build_progress=100,
+        buff_ids=[],
+        x=30,
+        y=30,
+    )
+    observation = SimpleNamespace(
+        player_common=SimpleNamespace(minerals=0, vespene=0),
+        raw_units=[
+            hatchery,
+            SimpleNamespace(
+                tag=0xA00,
+                unit_type=126,
+                alliance=1,
+                energy=50,
+                build_progress=100,
+                x=31,
+                y=30,
+            ),
+        ],
+        feature_units=[],
+        feature_screen=SimpleNamespace(
+            buildable=UniformGrid(1),
+            pathable=UniformGrid(1),
+            player_relative=UniformGrid(0),
+            power=UniformGrid(0),
+            creep=Grid(creep),
+        ),
+    )
+    unit_names = {86: "Hatchery", 126: "Queen"}
+
+    assert semantic_argument_candidates(
+        observation,
+        "Effect_InjectLarva",
+        unit_names=unit_names,
+    ) == [[0xB00]]
+    assert [65, 65] in build_screen_candidates(
+        observation,
+        "Build_CreepTumor_Queen_Screen",
+        unit_names=unit_names,
+    )
+
+    hatchery.buff_ids = [INJECT_TARGET_BUFF_ID]
+    assert semantic_argument_candidates(
+        observation,
+        "Effect_InjectLarva",
+        unit_names=unit_names,
+    ) == []
+    creep[65][65] = 0
+    assert not screen_build_position_is_legal(
+        observation,
+        "Build_CreepTumor_Queen_Screen",
+        [65, 65],
+        unit_names=unit_names,
+    )
+
+
 def test_cybernetics_core_candidates_require_completed_gateway_and_power() -> None:
     observation = SimpleNamespace(
         player_common=SimpleNamespace(minerals=500),
@@ -3137,6 +3201,56 @@ def test_train_registry_pins_multirace_worker_actions_and_raw_orders() -> None:
         "Train_Zergling": 528,
         "Train_Roach": 519,
         "Train_Hydralisk": 507,
+    }
+
+
+def test_worker_metadata_classifies_all_zerg_creep_tumor_forms_as_structures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeUnit(int):
+        name: str
+
+        def __new__(cls, value: int, name: str) -> FakeUnit:
+            unit = int.__new__(cls, value)
+            unit.name = name
+            return unit
+
+    class FakeRace(list[FakeUnit]):
+        CreepTumor: FakeUnit
+        CreepTumorBurrowed: FakeUnit
+        CreepTumorQueen: FakeUnit
+
+    tumors = FakeRace(
+        [
+            FakeUnit(87, "CreepTumor"),
+            FakeUnit(137, "CreepTumorBurrowed"),
+            FakeUnit(138, "CreepTumorQueen"),
+        ]
+    )
+    tumors.CreepTumor = tumors[0]
+    tumors.CreepTumorBurrowed = tumors[1]
+    tumors.CreepTumorQueen = tumors[2]
+
+    def fake_import(name: str) -> Any:
+        if name == "pysc2.lib.units":
+            return SimpleNamespace(
+                Neutral=[],
+                Protoss=[],
+                Terran=[],
+                Zerg=tumors,
+            )
+        if name == "llm_pysc2.lib.utils":
+            return SimpleNamespace(BUILDING_TYPE=[])
+        raise AssertionError(f"unexpected import: {name}")
+
+    monkeypatch.setattr(importlib, "import_module", fake_import)
+    unit_names, building_types = _unit_metadata()
+
+    assert {87, 137, 138}.issubset(building_types)
+    assert {unit_names[unit_type] for unit_type in (87, 137, 138)} == {
+        "CreepTumor",
+        "CreepTumorBurrowed",
+        "CreepTumorQueen",
     }
 
 

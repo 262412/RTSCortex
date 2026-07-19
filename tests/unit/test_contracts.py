@@ -383,6 +383,23 @@ def test_effect_evidence_accepts_zerg_structure_morph_confirmation() -> None:
     assert EffectEvidence.model_validate_json(evidence.model_dump_json()) == evidence
 
 
+def test_effect_evidence_accepts_zerg_larva_inject_confirmation() -> None:
+    evidence = EffectEvidence(
+        effect_kind="inject",
+        target_type="Hatchery",
+        target_tag="0xabc",
+        builder_tag="0xdef",
+        producer_tag="0xdef",
+        producer_type="Queen",
+        expected_order_id=315,
+        baseline_target_buff_ids=[],
+        target_buff_ids=[11],
+        confirmation_kind="target_buff",
+    )
+
+    assert EffectEvidence.model_validate_json(evidence.model_dump_json()) == evidence
+
+
 def test_episode_result_contract_round_trip_and_invalid_samples() -> None:
     result = EpisodeResult(
         run_id="run-1",

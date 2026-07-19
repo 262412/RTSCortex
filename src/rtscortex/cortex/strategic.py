@@ -210,7 +210,12 @@ class StrategicIntentAdapter:
             # A planned static-defense building belongs to Defense, but is not an
             # emergency by itself.  Only an actual reflex/retreat signal may bypass
             # commitments and the normal switch margin.
-            emergency=role is RoleId.RETREAT or isinstance(intent, ReflexIntent),
+            emergency=(
+                role is RoleId.RETREAT
+                or isinstance(intent, ReflexIntent)
+                and first_action
+                not in {"Effect_InjectLarva", "Build_CreepTumor_Queen_Screen"}
+            ),
             horizon_game_loops=commitment,
             ttl_game_loops=intent.ttl_game_loops,
             source_id=intent.source_id,

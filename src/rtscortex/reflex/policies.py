@@ -38,6 +38,31 @@ class ReflexEngine:
             alert.casefold() in {"under_attack", "building_under_attack", "unit_under_attack"}
             for alert in observation.alerts
         )
+        if not under_attack:
+            controller_action = available.get("Effect_InjectLarva") or available.get(
+                "Build_CreepTumor_Queen_Screen"
+            )
+            if controller_action is not None and controller_action.argument_candidates:
+                actor = next(
+                    (
+                        scope
+                        for scope in controller_action.actor_scopes
+                        if scope.startswith("CombatGroup")
+                    ),
+                    None,
+                )
+                if actor is not None:
+                    commands.append(
+                        self._command(
+                            observation,
+                            index=len(commands),
+                            actor=actor,
+                            name=controller_action.name,
+                            arguments=list(controller_action.argument_candidates[0]),
+                            priority=(80 if controller_action.name == "Effect_InjectLarva" else 45),
+                            ttl_game_loops=8,
+                        )
+                    )
         enemy_ids = {
             _normalize_tag(enemy.unit_id): enemy.unit_id
             for enemy in observation.state.visible_enemies

@@ -4,6 +4,10 @@ from typing import Any
 
 from rtscortex_llm_pysc2.addon import ADDON_SPECS, AddonSpec
 from rtscortex_llm_pysc2.effect_verifier import ActionEffectVerifier
+from rtscortex_llm_pysc2.inject_effect_verifier import (
+    INJECT_RAW_FUNCTION_ID,
+    INJECT_TARGET_BUFF_ID,
+)
 from rtscortex_llm_pysc2.morph import MORPH_SPECS, MorphSpec
 from rtscortex_llm_pysc2.production import PRODUCTION_SPECS, ProductionSpec
 from rtscortex_llm_pysc2.routing import RoutedCommand
@@ -771,6 +775,51 @@ def test_forge_order_38_and_new_tag_confirm_build_effect() -> None:
     assert verdict.evidence["order_seen"] is True
 
 
+def test_queen_creep_tumor_confirms_a_new_structure_at_the_selected_position() -> None:
+    verifier = ActionEffectVerifier(timeout_game_loops=10)
+    command = RoutedCommand(
+        command_id="command-creep",
+        actor="CombatGroup1/Queen-1",
+        team_name="Queen-1",
+        name="Build_CreepTumor_Queen_Screen",
+        source="reflex",
+        requested_arguments=([65, 65],),
+        resolved_arguments=([65, 65],),
+        rendered_action="<Build_CreepTumor_Queen_Screen([65,65])>",
+    )
+    verifier.track(command)
+    verifier.prepare(
+        command.command_id,
+        _observation(game_loop=100, minerals=250, builder_orders=[]),
+        0xABC,
+    )
+    verifier.accept_primitive(command.command_id, game_loop=101)
+    current = _observation(
+        game_loop=102,
+        minerals=250,
+        structures=["Nexus", "CreepTumorQueen"],
+        builder_orders=[189],
+    )
+    tumor = next(
+        unit for unit in current["raw_units"] if unit["unit_type"] == "CreepTumorQueen"
+    )
+    tumor["x"] = 31.875
+    tumor["y"] = 30
+    feature_tumor = next(
+        unit for unit in current["feature_units"] if unit["tag"] == tumor["tag"]
+    )
+    feature_tumor["x"] = 65
+    feature_tumor["y"] = 65
+
+    verdict = verifier.observe(current)[0]
+
+    assert verdict.success is True
+    assert verdict.evidence is not None
+    assert verdict.evidence["effect_kind"] == "build"
+    assert verdict.evidence["target_type"] == "CreepTumorQueen"
+    assert verdict.evidence["order_seen"] is True
+
+
 def test_all_supported_train_actions_confirm_the_exact_producer_order() -> None:
     for index, spec in enumerate(PRODUCTION_SPECS.values()):
         verifier = ActionEffectVerifier(timeout_game_loops=10)
@@ -893,6 +942,57 @@ def test_zerg_lair_morph_fallback_confirms_same_tag_type_change() -> None:
     assert verdict.evidence["producer_observed_type"] == "Lair"
     assert verdict.evidence["source_build_progress"] == 0.1
     assert verdict.evidence["confirmation_kind"] == "source_morph"
+
+
+def test_zerg_larva_inject_confirms_the_exact_townhall_buff() -> None:
+    verifier = ActionEffectVerifier(timeout_game_loops=10)
+    command = _inject_command()
+    verifier.track(command)
+    verifier.prepare(
+        command.command_id,
+        _inject_observation(game_loop=100),
+        0xA00,
+    )
+    verifier.accept_primitive(command.command_id, game_loop=101)
+
+    verdict = verifier.observe(
+        _inject_observation(
+            game_loop=102,
+            target_buffs=[INJECT_TARGET_BUFF_ID],
+        )
+    )[0]
+
+    assert verdict.success is True
+    assert verdict.evidence is not None
+    assert verdict.evidence["effect_kind"] == "inject"
+    assert verdict.evidence["builder_tag"] == "0xa00"
+    assert verdict.evidence["target_tag"] == "0xb00"
+    assert verdict.evidence["target_buff_ids"] == [INJECT_TARGET_BUFF_ID]
+    assert verdict.evidence["confirmation_kind"] == "target_buff"
+
+
+def test_zerg_larva_inject_can_confirm_the_exact_queen_order() -> None:
+    verifier = ActionEffectVerifier(timeout_game_loops=10)
+    command = _inject_command()
+    verifier.track(command)
+    verifier.prepare(
+        command.command_id,
+        _inject_observation(game_loop=100),
+        0xA00,
+    )
+    verifier.accept_primitive(command.command_id, game_loop=101)
+
+    verdict = verifier.observe(
+        _inject_observation(
+            game_loop=102,
+            queen_orders=[INJECT_RAW_FUNCTION_ID],
+        )
+    )[0]
+
+    assert verdict.success is True
+    assert verdict.evidence is not None
+    assert verdict.evidence["producer_orders"] == [INJECT_RAW_FUNCTION_ID]
+    assert verdict.evidence["confirmation_kind"] == "producer_order"
 
 
 def test_new_unit_near_the_exact_producer_can_confirm_missed_short_order() -> None:
@@ -1223,6 +1323,47 @@ def _morph_command(spec: MorphSpec) -> RoutedCommand:
         resolved_arguments=(),
         rendered_action=f"<{spec.action_name}()>",
     )
+
+
+def _inject_command() -> RoutedCommand:
+    return RoutedCommand(
+        command_id="command-inject",
+        actor="CombatGroup1/Queen-1",
+        team_name="Queen-1",
+        name="Effect_InjectLarva",
+        source="reflex",
+        requested_arguments=(0xB00,),
+        resolved_arguments=(0xB00,),
+        rendered_action="<Effect_InjectLarva(0xb00)>",
+    )
+
+
+def _inject_observation(
+    *,
+    game_loop: int,
+    queen_orders: list[int] | None = None,
+    target_buffs: list[int] | None = None,
+) -> dict[str, Any]:
+    orders = queen_orders or []
+    return {
+        "game_loop": game_loop,
+        "raw_units": [
+            {
+                "tag": 0xA00,
+                "unit_type": "Queen",
+                "alliance": 1,
+                "energy": 50,
+                "order_length": len(orders),
+                **{f"order_id_{index}": order for index, order in enumerate(orders)},
+            },
+            {
+                "tag": 0xB00,
+                "unit_type": "Hatchery",
+                "alliance": 1,
+                "buff_ids": target_buffs or [],
+            },
+        ],
+    }
 
 
 def _morph_observation(

@@ -560,15 +560,17 @@ ZERG_PROFILE_DATA = RaceProfileData(
     hima_vocabulary_version="hima-zerg-63-v1",
     runtime_mapping_ready=True,
     live_worker_ready=True,
-    effect_verification_kinds=("build", "production", "morph", "move"),
+    effect_verification_kinds=("build", "production", "morph", "inject", "move"),
     controller_capabilities=(
         "gas_workers",
         "supply_emergency",
         "resource_fallback",
         "prerequisite_closure",
+        "queen_larva_inject",
+        "queen_creep_tumor",
     ),
     limitations=(
-        "inject_and_active_creep_controllers_pending",
+        "creep_tumor_chain_spread_pending",
     ),
 )
 

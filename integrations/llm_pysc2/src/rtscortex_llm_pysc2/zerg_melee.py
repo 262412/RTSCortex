@@ -107,6 +107,26 @@ PRODUCTION_ACTIONS = [
     _action("Train_Hydralisk", [], F.Train_Hydralisk_quick, "queued"),
     _action("Morph_Lair", [], F.Morph_Lair_quick, "queued"),
 ]
+INJECT_LARVA_ACTION = _action(
+    "Effect_InjectLarva",
+    ["tag"],
+    F.llm_pysc2_move_camera,
+    "world_tag",
+)
+INJECT_LARVA_ACTION["func"] = [
+    (573, F.llm_pysc2_move_camera, ("world_tag",)),
+    (int(F.Effect_InjectLarva_screen.id), F.Effect_InjectLarva_screen, ("queued", "screen_tag")),
+]
+QUEEN_CONTROLLER_ACTIONS = [
+    INJECT_LARVA_ACTION,
+    _action(
+        "Build_CreepTumor_Queen_Screen",
+        ["screen"],
+        F.Build_CreepTumor_Queen_screen,
+        "queued",
+        "screen",
+    ),
+]
 
 
 def _llm_settings(config: AgentConfig, *, translator_o: str = "default") -> dict[str, Any]:
@@ -167,13 +187,24 @@ class RTSCortexZergMeleeConfig(AgentConfig):  # type: ignore[misc]
                 "action": {"EmptyGroup": [NO_OPERATION, *PRODUCTION_ACTIONS]},
             },
             "CombatGroup0": _combat_agent(self, "Zergling-1", units.Zerg.Zergling),
-            "CombatGroup1": _combat_agent(self, "Queen-1", units.Zerg.Queen),
+            "CombatGroup1": _combat_agent(
+                self,
+                "Queen-1",
+                units.Zerg.Queen,
+                extra_actions=QUEEN_CONTROLLER_ACTIONS,
+            ),
             "CombatGroup2": _combat_agent(self, "Roach-1", units.Zerg.Roach),
             "CombatGroup3": _combat_agent(self, "Hydralisk-1", units.Zerg.Hydralisk),
         }
 
 
-def _combat_agent(config: AgentConfig, team_name: str, unit_type: Any) -> dict[str, Any]:
+def _combat_agent(
+    config: AgentConfig,
+    team_name: str,
+    unit_type: Any,
+    *,
+    extra_actions: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     return {
         "describe": f"Zerg combat controller for {team_name}.",
         "llm": _llm_settings(config),
@@ -185,7 +216,7 @@ def _combat_agent(config: AgentConfig, team_name: str, unit_type: Any) -> dict[s
                 "select_type": "select_all_type",
             }
         ],
-        "action": {unit_type: list(UNIT_ACTIONS)},
+        "action": {unit_type: [*UNIT_ACTIONS, *(extra_actions or [])]},
     }
 
 

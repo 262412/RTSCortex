@@ -10,6 +10,7 @@ from typing import Any, Optional
 from rtscortex_llm_pysc2.addon_effect_verifier import AddonEffectVerifier
 from rtscortex_llm_pysc2.effect_types import EffectVerdict
 from rtscortex_llm_pysc2.extractor import BUILD_RAW_FUNCTION_IDS, BUILD_SPECS
+from rtscortex_llm_pysc2.inject_effect_verifier import InjectEffectVerifier
 from rtscortex_llm_pysc2.morph_effect_verifier import MorphEffectVerifier
 from rtscortex_llm_pysc2.production_effect_verifier import ProductionEffectVerifier
 from rtscortex_llm_pysc2.routing import RoutedCommand
@@ -106,6 +107,10 @@ class ActionEffectVerifier:
             timeout_game_loops=timeout_game_loops,
             unit_names=self.unit_names,
         )
+        self.injects = InjectEffectVerifier(
+            timeout_game_loops=timeout_game_loops,
+            unit_names=self.unit_names,
+        )
 
     def track(self, command: RoutedCommand) -> bool:
         """Register an effectful command, returning false for immediate actions."""
@@ -117,6 +122,8 @@ class ActionEffectVerifier:
         if self.addons.track(command):
             return True
         if self.morphs.track(command):
+            return True
+        if self.injects.track(command):
             return True
         target = _target_structure(command.name)
         if target is None and command.name != "Move_Minimap":
@@ -147,6 +154,7 @@ class ActionEffectVerifier:
             or self.production.is_tracked(command_id)
             or self.addons.is_tracked(command_id)
             or self.morphs.is_tracked(command_id)
+            or self.injects.is_tracked(command_id)
         )
 
     @property
@@ -161,6 +169,8 @@ class ActionEffectVerifier:
         if self.addons.is_tracked(command_id):
             return
         if self.morphs.is_tracked(command_id):
+            return
+        if self.injects.is_tracked(command_id):
             return
         pending_move = self._pending_moves.get(command_id)
         if pending_move is not None:
@@ -191,6 +201,9 @@ class ActionEffectVerifier:
         if self.morphs.is_tracked(command_id):
             self.morphs.prepare(command_id, observation, producer_tag)
             return
+        if self.injects.is_tracked(command_id):
+            self.injects.prepare(command_id, observation, builder_tag)
+            return
         pending_move = self._pending_moves.get(command_id)
         if pending_move is not None:
             pending_move.builder_tag = None if builder_tag is None else int(builder_tag)
@@ -220,6 +233,9 @@ class ActionEffectVerifier:
         if self.morphs.is_tracked(command_id):
             self.morphs.accept_primitive(command_id, game_loop=game_loop)
             return
+        if self.injects.is_tracked(command_id):
+            self.injects.accept_primitive(command_id, game_loop=game_loop)
+            return
         pending_move = self._pending_moves.get(command_id)
         if pending_move is not None:
             if pending_move.dispatched_game_loop is None:
@@ -238,6 +254,7 @@ class ActionEffectVerifier:
         self.production.cancel(command_id)
         self.addons.cancel(command_id)
         self.morphs.cancel(command_id)
+        self.injects.cancel(command_id)
 
     def observe(self, observation: Any) -> list[EffectVerdict]:
         """Evaluate all accepted effectful commands against one observation."""
@@ -245,6 +262,7 @@ class ActionEffectVerifier:
         verdicts = self.production.observe(observation)
         verdicts.extend(self.addons.observe(observation))
         verdicts.extend(self.morphs.observe(observation))
+        verdicts.extend(self.injects.observe(observation))
         verdicts.extend(self._observe_moves(observation))
         accepted = [
             pending
@@ -376,6 +394,7 @@ class ActionEffectVerifier:
         verdicts = self.production.fail_pending(reason)
         verdicts.extend(self.addons.fail_pending(reason))
         verdicts.extend(self.morphs.fail_pending(reason))
+        verdicts.extend(self.injects.fail_pending(reason))
         for command_id, pending in list(self._pending.items()):
             if pending.accepted_game_loop is None:
                 continue
@@ -735,6 +754,9 @@ class ActionEffectVerifier:
 
 
 def _target_structure(action_name: str) -> Optional[str]:
+    spec = BUILD_SPECS.get(action_name)
+    if spec is not None:
+        return spec.target_structure
     if not action_name.startswith("Build_"):
         return None
     stem = action_name.removeprefix("Build_")

@@ -14,6 +14,8 @@ from rtscortex.cortex import (
     IntentArbiter,
     IntentDecisionStatus,
     ResourceClaim,
+    RoleAgentContext,
+    RoleAgentCoordinator,
     RoleId,
     StrategicIntent,
     StrategicIntentAdapter,
@@ -152,7 +154,13 @@ def test_race_profile_capabilities_match_implemented_live_readiness() -> None:
     assert zerg["macro_contract_ready"] is True
     assert zerg["runtime_mapping_ready"] is True
     assert zerg["live_worker_ready"] is True
-    assert zerg["effect_verification_kinds"] == ["build", "production", "morph", "move"]
+    assert zerg["effect_verification_kinds"] == [
+        "build",
+        "production",
+        "morph",
+        "inject",
+        "move",
+    ]
 
 
 def test_situation_v2_keeps_unobserved_map_facts_unknown() -> None:
@@ -222,6 +230,54 @@ def test_only_actual_defense_reflex_is_an_emergency() -> None:
     assert static_defense.emergency is False
     assert defense_reflex.role is RoleId.DEFENSE
     assert defense_reflex.emergency is True
+
+
+def test_zerg_queen_controller_routes_inject_to_economy_and_creep_to_defense() -> None:
+    observation = _observation()
+    assessment = DeterministicSituationAnalyzer().assess(observation)
+    profile = race_profile("zerg")
+    coordinator = RoleAgentCoordinator(profile, StrategicIntentAdapter(profile))
+    intents = (
+        ReflexIntent(
+            intent_id="inject",
+            run_id=observation.run_id,
+            episode_id=observation.episode_id,
+            step_id=observation.step_id,
+            created_game_loop=observation.game_loop,
+            objective="Maintain deterministic Zerg larva production",
+            action_names=["Effect_InjectLarva"],
+            actor_scopes=["CombatGroup1/Queen-1"],
+            ttl_game_loops=8,
+            source_id="zerg-controller",
+            source_version="1",
+        ),
+        ReflexIntent(
+            intent_id="creep",
+            run_id=observation.run_id,
+            episode_id=observation.episode_id,
+            step_id=observation.step_id,
+            created_game_loop=observation.game_loop,
+            objective="Extend deterministic Zerg creep coverage",
+            action_names=["Build_CreepTumor_Queen_Screen"],
+            actor_scopes=["CombatGroup1/Queen-1"],
+            ttl_game_loops=8,
+            source_id="zerg-controller",
+            source_version="1",
+        ),
+    )
+
+    routed = coordinator.evaluate(
+        RoleAgentContext(
+            observation=observation,
+            situation=assessment,
+            source_intents=intents,
+        )
+    )
+
+    assert routed["inject"].role is RoleId.ECONOMY
+    assert routed["creep"].role is RoleId.DEFENSE
+    assert routed["inject"].emergency is False
+    assert routed["creep"].emergency is False
 
 
 def test_legacy_playbook_migration_is_advisory_and_non_blocking(tmp_path: Path) -> None:

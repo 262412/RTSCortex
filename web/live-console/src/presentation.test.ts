@@ -148,6 +148,12 @@ describe("Chinese event presentation", () => {
     );
     expect(actionLabel("Train_Adept")).toBe("训练使徒（Train_Adept）");
     expect(actionLabel("Train_VoidRay")).toBe("训练虚空辉光舰（Train_VoidRay）");
+    expect(actionLabel("Effect_InjectLarva")).toBe(
+      "虫后向基地注入幼虫（Effect_InjectLarva）",
+    );
+    expect(actionLabel("Build_CreepTumor_Queen_Screen")).toBe(
+      "虫后放置菌毯肿瘤（Build_CreepTumor_Queen_Screen）",
+    );
     expect(fieldLabel("producer_tag")).toBe("生产建筑 Tag");
     expect(fieldLabel("confirmation_kind")).toBe("生产确认方式");
     expect(semanticScalar("production", "effect_kind")).toBe("生产（production）");
@@ -159,6 +165,12 @@ describe("Chinese event presentation", () => {
     );
     expect(semanticScalar("production_source_invalidated", "failure_code")).toBe(
       "生产建筑在执行前已失效（production_source_invalidated）",
+    );
+    expect(semanticScalar("target_buff", "confirmation_kind")).toBe(
+      "目标获得状态效果（target_buff）",
+    );
+    expect(semanticScalar("no_inject_effect_observed", "failure_code")).toBe(
+      "未观察到幼虫注入订单或状态效果（no_inject_effect_observed）",
     );
     expect(eventSummary(confirmed)).toBe("训练使徒 · 成功 · 效果验证");
     expect(eventSummary(acceptanceOnly)).toBe(

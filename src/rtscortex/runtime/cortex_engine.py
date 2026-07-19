@@ -1646,11 +1646,7 @@ class CortexRuntimeEngine(RuntimeEngine):
             episode_id=observation.episode_id,
             step_id=observation.step_id,
             created_game_loop=observation.game_loop,
-            objective=(
-                "Protect threatened units immediately"
-                if command.name == "Retreat"
-                else "Respond to the visible enemy threat"
-            ),
+            objective=self._reflex_objective(command.name),
             action_names=[command.name],
             actor_scopes=[command.actor],
             priority=command.priority,
@@ -1664,6 +1660,16 @@ class CortexRuntimeEngine(RuntimeEngine):
             intent,
             command_id=command.command_id,
         )
+
+    @staticmethod
+    def _reflex_objective(action_name: str) -> str:
+        if action_name == "Retreat":
+            return "Protect threatened units immediately"
+        if action_name == "Effect_InjectLarva":
+            return "Maintain deterministic Zerg larva production"
+        if action_name == "Build_CreepTumor_Queen_Screen":
+            return "Extend deterministic Zerg creep coverage"
+        return "Respond to the visible enemy threat"
 
     def _compile_intent(
         self,
