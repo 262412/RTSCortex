@@ -1109,6 +1109,8 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
 class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
     """Keep the upstream environment loop and attach RTSCortex at its query seam."""
 
+    select_rect_threshold: int
+
     def __init__(self) -> None:
         _require_upstream()
         self.worker_settings = WorkerSettings.from_environment()
@@ -1202,11 +1204,17 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
             return _finish_terminal(self, obs, _base_agent_step, _no_op)
         _rebind_builder_to_selected_worker(self, obs.observation)
         _refresh_consumed_zerg_builder(self, obs.observation)
+        _refresh_zerg_morphed_combat_teams(self, obs.observation)
         observation_loop = _observation_game_loop(obs.observation)
         # RTSCortex consumes a global raw snapshot. Do not make every Runtime tick
         # wait for optional upstream camera/selection-based text gathering.
         _release_runtime_observation_barrier(self)
         watchdog_preempted = self._update_observation_gap_watchdog(observation_loop)
+        runtime_observation_due = _runtime_observation_is_due(
+            observation_loop,
+            last_decision_game_loop=self.decision_broker.last_decision_game_loop,
+            watchdog_game_loops=self.worker_settings.observation_gap_watchdog_game_loops,
+        )
         effect_verification_blocked = (
             self.decision_broker.coordinator.effect_verifier.blocks_auto_worker_management
         )
@@ -1216,12 +1224,21 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
             blocked=_should_block_gas_rebalance(
                 effect_verification_blocked=effect_verification_blocked,
                 observation_watchdog_active=self._observation_watchdog_active,
+                runtime_observation_due=runtime_observation_due,
             ),
+        )
+        self.select_rect_threshold = min(
+            int(self.select_rect_threshold),
+            max(1, int(self.size_screen)),
         )
         upstream_step = super().step
         action = _run_with_auto_worker_management_guard(
             self.config,
-            blocked=effect_verification_blocked or watchdog_preempted,
+            blocked=(
+                effect_verification_blocked
+                or watchdog_preempted
+                or runtime_observation_due
+            ),
             upstream_step=lambda: upstream_step(obs),
         )
         self._consume_execution_aborts(obs)
@@ -1769,10 +1786,29 @@ def _should_block_gas_rebalance(
     *,
     effect_verification_blocked: bool,
     observation_watchdog_active: bool,
+    runtime_observation_due: bool,
 ) -> bool:
     """Keep deterministic gas management enabled after Runtime recovers."""
 
-    return effect_verification_blocked or observation_watchdog_active
+    return (
+        effect_verification_blocked
+        or observation_watchdog_active
+        or runtime_observation_due
+    )
+
+
+def _runtime_observation_is_due(
+    game_loop: int,
+    *,
+    last_decision_game_loop: Optional[int],
+    watchdog_game_loops: int,
+) -> bool:
+    """Yield optional worker automation before it reaches the watchdog boundary."""
+
+    if last_decision_game_loop is None:
+        return False
+    observation_budget = max(1, watchdog_game_loops // 2)
+    return game_loop - last_decision_game_loop >= observation_budget
 
 
 def _prime_deterministic_gas_rebalance(
@@ -2020,6 +2056,142 @@ def _refresh_consumed_zerg_builder(main_agent: Any, observation: Any) -> bool:
         replacement_tag,
     )
     return True
+
+
+def _refresh_zerg_morphed_combat_teams(main_agent: Any, observation: Any) -> int:
+    """Recover Zerg combat teams whose cocoon tag was mistaken for a reappearance."""
+
+    settings = getattr(main_agent, "worker_settings", None)
+    if str(getattr(settings, "agent_race", "")).casefold() != "zerg":
+        return 0
+    agents = getattr(main_agent, "agents", {})
+    if not isinstance(agents, Mapping):
+        return 0
+    raw_units = list(_observation_value(observation, "raw_units", ()))
+    refreshed = 0
+    for agent_name, agent in sorted(agents.items()):
+        if not str(agent_name).startswith("CombatGroup"):
+            continue
+        teams = [team for team in getattr(agent, "teams", ()) if isinstance(team, dict)]
+        if len(teams) != 1:
+            continue
+        team = teams[0]
+        allowed_types = {int(unit_type) for unit_type in team.get("unit_type", ())}
+        if not allowed_types:
+            continue
+        live_units = {
+            int(_observation_value(unit, "tag", 0)): unit
+            for unit in raw_units
+            if int(_observation_value(unit, "tag", 0)) > 0
+            and int(_observation_value(unit, "alliance", 0)) == 1
+            and int(_observation_value(unit, "unit_type", -1)) in allowed_types
+            and float(_observation_value(unit, "build_progress", 0.0)) in {1.0, 100.0}
+        }
+        configured_tags = [int(tag) for tag in team.get("unit_tags", ()) if int(tag) > 0]
+        selected_tags = sorted(
+            tag
+            for tag, unit in live_units.items()
+            if bool(_observation_value(unit, "is_selected", False))
+        )
+        team_name = str(team.get("name", ""))
+        current_tag = int(getattr(agent, "team_unit_tag_curr", 0) or 0)
+        if (
+            selected_tags
+            and current_tag > 0
+            and current_tag not in selected_tags
+            and str(getattr(agent, "team_unit_team_curr", "")) == team_name
+            and agent._is_executing_actions()
+        ):
+            replacement_tag = selected_tags[0]
+            team["unit_tags"] = [replacement_tag]
+            agent.unit_tag_list = [
+                replacement_tag if int(tag) == current_tag else int(tag)
+                for tag in getattr(agent, "unit_tag_list", ())
+            ]
+            if replacement_tag not in agent.unit_tag_list:
+                agent.unit_tag_list.append(replacement_tag)
+            agent.unit_raw_list = [live_units[replacement_tag]]
+            agent.team_unit_tag_curr = replacement_tag
+            agent._rtscortex_last_zerg_combat_rebind = (
+                current_tag,
+                replacement_tag,
+            )
+            refreshed += 1
+            continue
+        if any(tag in live_units for tag in configured_tags):
+            continue
+        if not live_units:
+            if configured_tags:
+                action_name = str(getattr(agent, "curr_action_name", ""))
+                if action_name and action_name != "No_Operation" and agent._is_executing_actions():
+                    agent.last_execution_abort = {
+                        "team_name": str(team.get("name", "")),
+                        "action_name": action_name,
+                        "failure_code": "actor_not_available",
+                        "failure_reason": "Zerg combat actor disappeared from the raw observation",
+                        "actor_tag": configured_tags[0],
+                    }
+                agent.func_list.clear()
+                agent.action_list.clear()
+                with agent.lock:
+                    agent.action_lists.clear()
+                team["unit_tags"] = []
+                team["unit_tags_selected"] = []
+                team["obs"] = []
+                team["pos"] = []
+                team["minimap_pos"] = []
+                agent.unit_tag_list = []
+                agent.unit_raw_list = []
+                agent.team_unit_obs_list = []
+                agent.team_unit_tag_list = []
+                agent.team_unit_team_list = []
+                agent.team_unit_tag_curr = None
+                agent.team_unit_team_curr = None
+                agent.enable = False
+                agent._rtscortex_last_zerg_combat_disable = tuple(configured_tags)
+            continue
+        # The upstream MainAgent assumes its enabled-agent roster remains stable
+        # from the first query in a main-loop round until every response has been
+        # consumed. Activating a newly morphed combat unit while that lock is held
+        # can make an already completed Builder query run twice and strand another
+        # participant at the shared Broker barrier. Defer only new activations;
+        # an already enabled agent may still rebind its same-type actor above.
+        if not getattr(agent, "enable", False) and bool(
+            getattr(main_agent, "main_loop_lock", False)
+        ):
+            agent._rtscortex_pending_zerg_combat_tag = min(live_units)
+            continue
+        replacement_tag = min(live_units)
+        old_tags = set(configured_tags)
+        team["unit_tags"] = [replacement_tag]
+        team["unit_tags_selected"] = []
+        team["obs"] = []
+        team["pos"] = []
+        team["minimap_pos"] = []
+        agent.unit_tag_list = [
+            int(tag)
+            for tag in getattr(agent, "unit_tag_list", ())
+            if int(tag) not in old_tags and int(tag) != replacement_tag
+        ]
+        agent.unit_tag_list.append(replacement_tag)
+        agent.unit_raw_list = [live_units[replacement_tag]]
+        agent.team_unit_obs_list = []
+        agent.team_unit_tag_list = [replacement_tag]
+        agent.team_unit_team_list = [team_name]
+        agent.team_unit_tag_curr = None
+        agent.team_unit_team_curr = None
+        current_loop = int(getattr(main_agent, "main_loop_step", 0))
+        agent.main_loop_step = current_loop
+        agent.query_llm_times = current_loop
+        agent.executing_times = current_loop
+        agent.enable = True
+        agent._rtscortex_last_zerg_combat_refresh = (
+            tuple(sorted(old_tags)),
+            replacement_tag,
+        )
+        agent._rtscortex_pending_zerg_combat_tag = None
+        refreshed += 1
+    return refreshed
 
 
 def _release_runtime_observation_barrier(main_agent: Any) -> None:

@@ -23,6 +23,7 @@ from rtscortex_llm_pysc2.extractor import BUILD_RAW_FUNCTION_IDS
 from rtscortex_llm_pysc2.observation import _map_argument_candidates
 from rtscortex_llm_pysc2.production import PRODUCTION_SPECS
 from rtscortex_llm_pysc2.terran_melee import RTSCortexTerranMeleeConfig
+from rtscortex_llm_pysc2.zerg_melee import QUEEN_CONTROLLER_ACTIONS
 
 
 def _assert_candidate_mapping() -> None:
@@ -159,6 +160,15 @@ def _assert_build_order_ids_use_raw_function_domain() -> None:
         "Refinery": 320,
         "Starport": 329,
         "SupplyDepot": 319,
+        "EvolutionChamber": 1156,
+        "Extractor": 1154,
+        "Hatchery": 1152,
+        "HydraliskDen": 1157,
+        "RoachWarren": 1165,
+        "SpawningPool": 1155,
+        "SpineCrawler": 1166,
+        "SporeCrawler": 1167,
+        "CreepTumorQueen": 1694,
     }
     assert BUILD_RAW_FUNCTION_IDS == {
         structure: int(actions.RAW_ABILITY_ID_TO_FUNC_ID[ability_id])
@@ -224,6 +234,48 @@ def _assert_direct_production_contract() -> None:
             75,
             2,
             ("Starport",),
+        ),
+        "Train_Drone": (467, 503, "Larva", "Drone", 50, 0, 1, ()),
+        "Train_Overlord": (483, 515, "Larva", "Overlord", 100, 0, 0, ()),
+        "Train_Queen": (
+            486,
+            516,
+            "Hatchery",
+            "Queen",
+            150,
+            0,
+            2,
+            ("SpawningPool",),
+        ),
+        "Train_Zergling": (
+            504,
+            528,
+            "Larva",
+            "Zergling",
+            50,
+            0,
+            1,
+            ("SpawningPool",),
+        ),
+        "Train_Roach": (
+            489,
+            519,
+            "Larva",
+            "Roach",
+            75,
+            25,
+            2,
+            ("RoachWarren",),
+        ),
+        "Train_Hydralisk": (
+            472,
+            507,
+            "Larva",
+            "Hydralisk",
+            100,
+            50,
+            2,
+            ("HydraliskDen",),
         ),
     }
     assert {
@@ -318,6 +370,15 @@ def _assert_terran_worker_contract() -> None:
         "Train_Medivac",
         "Train_VikingFighter",
     }.issubset(developer_actions)
+
+
+def _assert_zerg_queen_controller_settlement_contract() -> None:
+    functions_by_action = {
+        action["name"]: [int(function[0]) for function in action["func"]]
+        for action in QUEEN_CONTROLLER_ACTIONS
+    }
+    assert functions_by_action["Effect_InjectLarva"] == [573, 0, 204]
+    assert functions_by_action["Build_CreepTumor_Queen_Screen"] == [0, 46]
 
 
 def _agent_with_tracked_team() -> LLMAgent:
@@ -810,6 +871,7 @@ def main() -> None:
     _assert_direct_production_contract()
     _assert_terran_addon_contract()
     _assert_terran_worker_contract()
+    _assert_zerg_queen_controller_settlement_contract()
     _assert_raw_unit_presence_controls_team_lifecycle()
     _assert_transient_disappearance_grace()
     _assert_confirmed_disappearance_removes_actor()

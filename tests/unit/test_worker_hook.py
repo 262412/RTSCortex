@@ -15,6 +15,7 @@ from rtscortex_llm_pysc2.broker import PrimitiveDispatch, SharedDecisionBroker
 from rtscortex_llm_pysc2.coordinator import BridgeCoordinator
 from rtscortex_llm_pysc2.extractor import (
     TimeStepExtractor,
+    _own_unit_has_energy,
     build_screen_candidates,
     current_team_order,
     nexus_placement_footprint_is_visible,
@@ -46,11 +47,13 @@ from rtscortex_llm_pysc2.worker import (
     _rebind_builder_to_selected_worker,
     _refresh_build_action_position,
     _refresh_consumed_zerg_builder,
+    _refresh_zerg_morphed_combat_teams,
     _release_runtime_observation_barrier,
     _replace_screen_action_position,
     _requires_explicit_production_chain,
     _resolve_build_action_position,
     _run_with_auto_worker_management_guard,
+    _runtime_observation_is_due,
     _scenario_config,
     _semantic_target_failure,
     _should_block_gas_rebalance,
@@ -757,6 +760,7 @@ def test_observation_gap_watchdog_latches_lightweight_observations_after_recover
     assert not _should_block_gas_rebalance(
         effect_verification_blocked=False,
         observation_watchdog_active=agent._observation_watchdog_active,
+        runtime_observation_due=False,
     )
 
     broker.last_decision_game_loop = 130
@@ -768,6 +772,25 @@ def test_effect_verification_still_blocks_deterministic_gas_rebalance() -> None:
     assert _should_block_gas_rebalance(
         effect_verification_blocked=True,
         observation_watchdog_active=False,
+        runtime_observation_due=False,
+    )
+
+
+def test_optional_worker_automation_yields_before_watchdog_boundary() -> None:
+    assert not _runtime_observation_is_due(
+        211,
+        last_decision_game_loop=100,
+        watchdog_game_loops=224,
+    )
+    assert _runtime_observation_is_due(
+        212,
+        last_decision_game_loop=100,
+        watchdog_game_loops=224,
+    )
+    assert not _runtime_observation_is_due(
+        999,
+        last_decision_game_loop=None,
+        watchdog_game_loops=224,
     )
 
 
@@ -1194,6 +1217,210 @@ def test_zerg_builder_refresh_keeps_a_live_builder() -> None:
 
     assert _refresh_consumed_zerg_builder(main_agent, observation) is False
     assert team["unit_tags"] == [10]
+
+
+def test_zerg_morphed_combat_units_recover_their_configured_teams() -> None:
+    queen_team = {
+        "name": "Queen-1",
+        "unit_type": [126],
+        "unit_tags": [],
+        "unit_tags_selected": [],
+        "obs": [],
+        "pos": [],
+        "minimap_pos": [],
+    }
+    queen_agent = SimpleNamespace(
+        teams=[queen_team],
+        unit_tag_list=[],
+        unit_raw_list=[],
+        team_unit_obs_list=[],
+        team_unit_tag_list=[],
+        team_unit_team_list=[],
+        team_unit_tag_curr=None,
+        team_unit_team_curr=None,
+        enable=False,
+    )
+    main_agent = SimpleNamespace(
+        worker_settings=SimpleNamespace(agent_race="zerg"),
+        agents={"CombatGroup1": queen_agent},
+        main_loop_step=144,
+    )
+    queen = SimpleNamespace(
+        tag=0x102200001,
+        alliance=1,
+        unit_type=126,
+        build_progress=100,
+    )
+
+    assert (
+        _refresh_zerg_morphed_combat_teams(
+            main_agent,
+            SimpleNamespace(raw_units=[queen]),
+        )
+        == 1
+    )
+    assert queen_team["unit_tags"] == [0x102200001]
+    assert queen_agent.unit_tag_list == [0x102200001]
+    assert queen_agent.team_unit_tag_list == [0x102200001]
+    assert queen_agent.team_unit_team_list == ["Queen-1"]
+    assert queen_agent.main_loop_step == 144
+    assert queen_agent.query_llm_times == 144
+    assert queen_agent.executing_times == 144
+    assert queen_agent.enable is True
+
+
+def test_zerg_morphed_combat_activation_waits_for_next_main_loop_round() -> None:
+    queen_team = {
+        "name": "Queen-1",
+        "unit_type": [126],
+        "unit_tags": [],
+        "unit_tags_selected": [],
+        "obs": [],
+        "pos": [],
+        "minimap_pos": [],
+    }
+    queen_agent = SimpleNamespace(
+        teams=[queen_team],
+        unit_tag_list=[],
+        unit_raw_list=[],
+        team_unit_obs_list=[],
+        team_unit_tag_list=[],
+        team_unit_team_list=[],
+        team_unit_tag_curr=None,
+        team_unit_team_curr=None,
+        enable=False,
+    )
+    main_agent = SimpleNamespace(
+        worker_settings=SimpleNamespace(agent_race="zerg"),
+        agents={"CombatGroup1": queen_agent},
+        main_loop_step=153,
+        main_loop_lock=True,
+    )
+    queen = SimpleNamespace(
+        tag=0x102200001,
+        alliance=1,
+        unit_type=126,
+        build_progress=100,
+    )
+    observation = SimpleNamespace(raw_units=[queen])
+
+    assert _refresh_zerg_morphed_combat_teams(main_agent, observation) == 0
+    assert queen_agent.enable is False
+    assert queen_team["unit_tags"] == []
+    assert queen_agent._rtscortex_pending_zerg_combat_tag == 0x102200001
+
+    main_agent.main_loop_lock = False
+    assert _refresh_zerg_morphed_combat_teams(main_agent, observation) == 1
+    assert queen_agent.enable is True
+    assert queen_team["unit_tags"] == [0x102200001]
+    assert queen_agent.query_llm_times == 153
+
+
+def test_zerg_morphed_combat_refresh_preserves_a_live_team_anchor() -> None:
+    team = {"name": "Roach-1", "unit_type": [110], "unit_tags": [20]}
+    agent = SimpleNamespace(teams=[team])
+    main_agent = SimpleNamespace(
+        worker_settings=SimpleNamespace(agent_race="zerg"),
+        agents={"CombatGroup2": agent},
+    )
+    observation = SimpleNamespace(
+        raw_units=[
+            SimpleNamespace(
+                tag=20,
+                alliance=1,
+                unit_type=110,
+                build_progress=100,
+            )
+        ]
+    )
+
+    assert _refresh_zerg_morphed_combat_teams(main_agent, observation) == 0
+    assert team["unit_tags"] == [20]
+
+
+def test_zerg_combat_team_rebinds_to_the_same_type_unit_actually_selected() -> None:
+    team = {"name": "Queen-1", "unit_type": [126], "unit_tags": [20]}
+    agent = SimpleNamespace(
+        teams=[team],
+        _is_executing_actions=lambda: True,
+        team_unit_tag_curr=20,
+        team_unit_team_curr="Queen-1",
+        unit_tag_list=[20],
+        unit_raw_list=[],
+    )
+    main_agent = SimpleNamespace(
+        worker_settings=SimpleNamespace(agent_race="zerg"),
+        agents={"CombatGroup1": agent},
+    )
+    observation = SimpleNamespace(
+        raw_units=[
+            SimpleNamespace(
+                tag=20,
+                alliance=1,
+                unit_type=126,
+                build_progress=100,
+                is_selected=False,
+            ),
+            SimpleNamespace(
+                tag=30,
+                alliance=1,
+                unit_type=126,
+                build_progress=100,
+                is_selected=True,
+            ),
+        ]
+    )
+
+    assert _refresh_zerg_morphed_combat_teams(main_agent, observation) == 1
+    assert team["unit_tags"] == [30]
+    assert agent.unit_tag_list == [30]
+    assert agent.team_unit_tag_curr == 30
+    assert agent._rtscortex_last_zerg_combat_rebind == (20, 30)
+
+
+def test_zerg_missing_combat_actor_disables_team_and_aborts_active_command() -> None:
+    team = {"name": "Queen-1", "unit_type": [126], "unit_tags": [20]}
+    agent = SimpleNamespace(
+        teams=[team],
+        curr_action_name="Move_Minimap",
+        _is_executing_actions=lambda: True,
+        func_list=[object()],
+        action_list=[object()],
+        action_lists=[object()],
+        lock=threading.Lock(),
+        unit_tag_list=[20],
+        unit_raw_list=[object()],
+        team_unit_obs_list=[object()],
+        team_unit_tag_list=[20],
+        team_unit_team_list=["Queen-1"],
+        team_unit_tag_curr=20,
+        team_unit_team_curr="Queen-1",
+        enable=True,
+    )
+    main_agent = SimpleNamespace(
+        worker_settings=SimpleNamespace(agent_race="zerg"),
+        agents={"CombatGroup1": agent},
+    )
+
+    assert (
+        _refresh_zerg_morphed_combat_teams(
+            main_agent,
+            SimpleNamespace(raw_units=[]),
+        )
+        == 0
+    )
+    assert team["unit_tags"] == []
+    assert agent.enable is False
+    assert agent.func_list == []
+    assert agent.action_list == []
+    assert agent.action_lists == []
+    assert agent.last_execution_abort == {
+        "team_name": "Queen-1",
+        "action_name": "Move_Minimap",
+        "failure_code": "actor_not_available",
+        "failure_reason": "Zerg combat actor disappeared from the raw observation",
+        "actor_tag": 20,
+    }
 
 
 def test_deterministic_gas_rebalance_respects_effect_and_main_loop_guards() -> None:
@@ -2420,6 +2647,52 @@ def test_zerg_queen_controller_candidates_require_uninjected_townhall_and_creep(
         "Build_CreepTumor_Queen_Screen",
         [65, 65],
         unit_names=unit_names,
+    )
+
+
+def test_zerg_queen_controller_availability_uses_the_actor_queen() -> None:
+    low_energy_actor = SimpleNamespace(
+        tag=0xA00,
+        unit_type=126,
+        alliance=1,
+        energy=15,
+        order_length=0,
+    )
+    high_energy_other = SimpleNamespace(
+        tag=0xA01,
+        unit_type=126,
+        alliance=1,
+        energy=50,
+        order_length=0,
+    )
+    observation = SimpleNamespace(raw_units=[low_energy_actor, high_energy_other])
+    unit_names = {126: "Queen"}
+
+    assert not _own_unit_has_energy(
+        observation,
+        "Queen",
+        minimum_energy=25,
+        unit_names=unit_names,
+        unit_tags=[0xA00],
+    )
+    assert _own_unit_has_energy(
+        observation,
+        "Queen",
+        minimum_energy=25,
+        unit_names=unit_names,
+        unit_tags=[0xA01],
+    )
+
+    high_energy_other.order_length = 1
+    high_energy_other.order_id_0 = 315
+    high_energy_other.order_progress_0 = 0
+    assert not _own_unit_has_energy(
+        observation,
+        "Queen",
+        minimum_energy=25,
+        unit_names=unit_names,
+        unit_tags=[0xA01],
+        forbidden_order_ids=[315],
     )
 
 

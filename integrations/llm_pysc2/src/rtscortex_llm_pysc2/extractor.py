@@ -12,6 +12,7 @@ from typing import Any, Optional
 from rtscortex_llm_pysc2.addon import addon_spec
 from rtscortex_llm_pysc2.inject_effect_verifier import (
     INJECT_ACTION,
+    INJECT_RAW_FUNCTION_ID,
     INJECT_TARGET_BUFF_ID,
 )
 from rtscortex_llm_pysc2.morph import morph_spec
@@ -736,6 +737,8 @@ def _available_team_actions(
             "Queen",
             minimum_energy=25.0,
             unit_names=unit_names,
+            unit_tags=team.get("unit_tags", ()),
+            forbidden_order_ids=(INJECT_RAW_FUNCTION_ID,),
         ):
             continue
         if (
@@ -853,11 +856,19 @@ def _own_unit_has_energy(
     *,
     minimum_energy: float,
     unit_names: Mapping[int, str],
+    unit_tags: Optional[Collection[int]] = None,
+    forbidden_order_ids: Collection[int] = (),
 ) -> bool:
+    allowed_tags = None if unit_tags is None else {int(tag) for tag in unit_tags}
+    forbidden_orders = {int(order_id) for order_id in forbidden_order_ids}
     return any(
         int(_value(unit, "alliance", 0)) == 1
         and _unit_name(unit, unit_names) == unit_type
+        and (allowed_tags is None or int(_value(unit, "tag", 0)) in allowed_tags)
         and float(_value(unit, "energy", 0.0)) >= minimum_energy
+        and not forbidden_orders.intersection(
+            order_id for order_id, _progress in _unit_order_entries(unit)
+        )
         for unit in _value(observation, "raw_units", ())
     )
 

@@ -115,17 +115,27 @@ INJECT_LARVA_ACTION = _action(
 )
 INJECT_LARVA_ACTION["func"] = [
     (573, F.llm_pysc2_move_camera, ("world_tag",)),
+    (0, F.no_op, ()),
     (int(F.Effect_InjectLarva_screen.id), F.Effect_InjectLarva_screen, ("queued", "screen_tag")),
+]
+CREEP_TUMOR_ACTION = _action(
+    "Build_CreepTumor_Queen_Screen",
+    ["screen"],
+    F.Build_CreepTumor_Queen_screen,
+    "queued",
+    "screen",
+)
+CREEP_TUMOR_ACTION["func"] = [
+    (0, F.no_op, ()),
+    (
+        int(F.Build_CreepTumor_Queen_screen.id),
+        F.Build_CreepTumor_Queen_screen,
+        ("queued", "screen"),
+    ),
 ]
 QUEEN_CONTROLLER_ACTIONS = [
     INJECT_LARVA_ACTION,
-    _action(
-        "Build_CreepTumor_Queen_Screen",
-        ["screen"],
-        F.Build_CreepTumor_Queen_screen,
-        "queued",
-        "screen",
-    ),
+    CREEP_TUMOR_ACTION,
 ]
 
 

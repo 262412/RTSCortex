@@ -16,7 +16,7 @@ environment:
   pause_until_first_plan: true
   sc2_path: ~/scratch/StarCraftII
   action_effect_timeout_game_loops: 112
-  observation_gap_watchdog_game_loops: 112
+  observation_gap_watchdog_game_loops: 224
   observation_gap_hard_limit_game_loops: 448
   worker_python: ~/fastscratch/envs/rtscortex-llm-pysc2/bin/python
 runtime:
