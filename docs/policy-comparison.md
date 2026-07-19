@@ -74,6 +74,29 @@ Its expected candidate states are:
 Use `configs/policy/comparison_v0_2.yaml` to evaluate the current OpenAI-compatible Qwen
 endpoint. This still does not download or load HIMA weights.
 
+The installed Zerg a/b/c checkpoints can be evaluated, one process at a time, with:
+
+```bash
+uv run rtscortex policy-compare \
+  --config configs/policy/comparison_zerg_v0_3.yaml
+```
+
+The first Zerg v0.3 baseline completed all `144/144` specialist-fixture evaluations with
+no candidate failure and no illegal Runtime frontier. Classification conservation was 100%.
+
+| Candidate | Parse validity | Mapping coverage | Legal frontiers | Deferred frontiers | Goal advancing |
+|---|---:|---:|---:|---:|---:|
+| Zerg-a | 100.0% | 94.8% | 11/48 | 37/48 | 0/5 |
+| Zerg-b | 99.9% | 96.0% | 8/48 | 40/48 | 0/5 |
+| Zerg-c | 100.0% | 96.9% | 8/48 | 40/48 | 1/5 |
+
+This proves integration viability, not strong strategic quality. The largest unsupported
+families were Zergling speed, Mutalisk/Spire, Roach speed, Ravager, Overseer, and level-one
+combat upgrades. Those gaps should be closed before treating the 27-match suite as a useful
+Race Brain quality measurement. Zerg-a currently exposes the most immediately legal
+frontiers; Zerg-c provides the broadest mapping coverage and the only goal-advancing frontier
+in this corpus.
+
 ## Local HIMA boundary
 
 HIMA is pinned to upstream revision

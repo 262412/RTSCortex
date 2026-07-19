@@ -19,12 +19,14 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from rtscortex.config import load_config
-from rtscortex.policy.corpus import load_policy_corpus
+from rtscortex.policy.corpus import load_policy_corpus, load_policy_corpus_manifest
 from rtscortex.policy.hima.models import (
     HIMA_ADAPTER_VERSION,
-    HIMA_PARSER_VERSION,
     HIMA_UPSTREAM_REVISION,
-    HIMA_VOCABULARY_VERSION,
+)
+from rtscortex.policy.hima.race_vocabulary import (
+    HIMA_PARSER_VERSIONS,
+    HIMA_VOCABULARY_VERSIONS,
 )
 from rtscortex.policy.hima.subagent import HIMA_PINNED_REVISIONS
 from rtscortex.policy.models import (
@@ -41,7 +43,7 @@ from rtscortex.policy.report import (
 from rtscortex.policy.shadow import PolicyShadowRunner
 from rtscortex.policy.subagents import (
     HIERNET_SC2_SPEC,
-    HIMA_PROTOSS_SPECS,
+    HIMA_RACE_SPECS,
     QWEN3_8B_SPEC,
     LLMPlanningPolicySubagent,
     PolicySubagentRegistration,
@@ -208,12 +210,14 @@ def run_policy_comparison(
     )
     if target.exists():
         raise PolicyComparisonError(f"comparison output directory already exists: {target}")
+    manifest = load_policy_corpus_manifest(manifest_path)
     fixtures = load_policy_corpus(manifest_path)
+    hima_specs = HIMA_RACE_SPECS[manifest.race.value]
     target.mkdir(parents=True)
 
     candidates: list[_CandidateResult] = []
     candidates.append(_run_qwen_candidate(config, fixtures))
-    for variant, spec in zip(HIMA_VARIANTS, HIMA_PROTOSS_SPECS, strict=True):
+    for variant, spec in zip(HIMA_VARIANTS, hima_specs, strict=True):
         candidates.append(
             _run_hima_candidate(
                 config,
@@ -224,7 +228,7 @@ def run_policy_comparison(
                 spec=spec,
             )
         )
-    candidates.append(_run_hiernet_candidate(config, fixtures))
+    candidates.append(_run_hiernet_candidate(config, fixtures, race=manifest.race.value))
 
     comparison = _merge_candidate_comparisons(fixtures, candidates)
     reports = write_policy_comparison_reports(comparison, target)
@@ -345,7 +349,7 @@ def _run_hima_candidate(
             spec,
             PolicyAvailability(
                 status=PolicyAvailabilityStatus.SKIPPED,
-                reason=f"HIMA Protoss-{variant} is disabled in the comparison config",
+                reason=f"HIMA {spec.race}-{variant} is disabled in the comparison config",
             ),
             execution_backend="not_started",
             revision=HIMA_PINNED_REVISIONS[spec.model_id],
@@ -473,8 +477,12 @@ def _run_hima_candidate(
 def _run_hiernet_candidate(
     config: PolicyComparisonConfig,
     fixtures: Sequence[PolicyObservationFixture],
+    *,
+    race: str,
 ) -> _CandidateResult:
     reason = "adapter_not_implemented"
+    if race != "protoss":
+        reason += f"; corpus race {race} is unsupported"
     if not config.hiernet.enabled:
         reason += "; HierNet candidate is disabled"
     return _static_candidate(
@@ -613,13 +621,14 @@ def _write_candidate_artifacts(result: _CandidateResult, root: Path) -> None:
         "shadow_only": True,
         "network_downloads_allowed": False,
     }
-    if candidate_id.startswith("hima-protoss-"):
+    if candidate_id.startswith("hima-") and first is not None:
+        race = first.spec.race.casefold()
         provenance.update(
             {
                 "hima_upstream_revision": HIMA_UPSTREAM_REVISION,
                 "adapter_version": HIMA_ADAPTER_VERSION,
-                "parser_version": HIMA_PARSER_VERSION,
-                "vocabulary_version": HIMA_VOCABULARY_VERSION,
+                "parser_version": HIMA_PARSER_VERSIONS[race],
+                "vocabulary_version": HIMA_VOCABULARY_VERSIONS[race],
             }
         )
     (candidate_dir / "provenance.json").write_text(

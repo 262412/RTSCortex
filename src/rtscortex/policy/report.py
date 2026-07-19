@@ -9,10 +9,10 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from rtscortex.policy.hima.models import (
-    HIMA_ADAPTER_VERSION,
-    HIMA_PARSER_VERSION,
-    HIMA_VOCABULARY_VERSION,
+from rtscortex.policy.hima.models import HIMA_ADAPTER_VERSION
+from rtscortex.policy.hima.race_vocabulary import (
+    HIMA_PARSER_VERSIONS,
+    HIMA_VOCABULARY_VERSIONS,
 )
 from rtscortex.policy.hima.subagent import HIMA_PINNED_REVISIONS
 from rtscortex.policy.models import (
@@ -683,9 +683,10 @@ def _candidate_identity(records: Sequence[PolicyShadowRecord]) -> dict[str, obje
     parser_versions = {proposal.parser_version for proposal in macro_proposals}
     vocabulary_versions = {proposal.vocabulary_version for proposal in macro_proposals}
     if is_hima:
+        race = first.spec.race.casefold() if first is not None else "protoss"
         adapter_versions.add(HIMA_ADAPTER_VERSION)
-        parser_versions.add(HIMA_PARSER_VERSION)
-        vocabulary_versions.add(HIMA_VOCABULARY_VERSION)
+        parser_versions.add(HIMA_PARSER_VERSIONS[race])
+        vocabulary_versions.add(HIMA_VOCABULARY_VERSIONS[race])
     return {
         "display_name": first.spec.display_name if first is not None else "",
         "model_id": model_id,

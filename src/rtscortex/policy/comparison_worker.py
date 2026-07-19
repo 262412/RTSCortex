@@ -7,13 +7,14 @@ import asyncio
 from pathlib import Path
 
 from rtscortex.policy.comparison import HIMAWorkerRequest, validate_hima_model_path
-from rtscortex.policy.corpus import load_policy_corpus
+from rtscortex.policy.corpus import load_policy_corpus, load_policy_corpus_manifest
 from rtscortex.policy.hima.observation import HIMAObservationAdapter
 from rtscortex.policy.hima.parser import HIMAProposalParser
+from rtscortex.policy.hima.race_vocabulary import hima_race_for_model
 from rtscortex.policy.hima.subagent import HIMAPolicySubagent, TransformersHIMAGenerator
 from rtscortex.policy.models import PolicyAvailability, PolicyAvailabilityStatus
 from rtscortex.policy.shadow import PolicyShadowRunner
-from rtscortex.policy.subagents import HIMA_PROTOSS_SPECS, PolicySubagentRegistration
+from rtscortex.policy.subagents import HIMA_ALL_SPECS, PolicySubagentRegistration
 
 
 def run_worker(request_path: Path, response_path: Path) -> None:
@@ -22,11 +23,18 @@ def run_worker(request_path: Path, response_path: Path) -> None:
     request = HIMAWorkerRequest.model_validate_json(request_path.read_text(encoding="utf-8"))
     validate_hima_model_path(request.model_id, request.model_path)
     spec = next(
-        (candidate for candidate in HIMA_PROTOSS_SPECS if candidate.model_id == request.model_id),
+        (candidate for candidate in HIMA_ALL_SPECS if candidate.model_id == request.model_id),
         None,
     )
     if spec is None:
         raise ValueError(f"no HIMA policy spec exists for {request.model_id}")
+    manifest = load_policy_corpus_manifest(request.manifest_path)
+    model_race = hima_race_for_model(request.model_id)
+    if manifest.race.value != model_race:
+        raise ValueError(
+            f"HIMA checkpoint race {model_race} does not match corpus race "
+            f"{manifest.race.value}"
+        )
     fixtures = load_policy_corpus(request.manifest_path)
     generator = TransformersHIMAGenerator(
         request.model_path,
@@ -37,8 +45,8 @@ def run_worker(request_path: Path, response_path: Path) -> None:
     subagent = HIMAPolicySubagent(
         spec,
         generator,
-        HIMAObservationAdapter(),
-        HIMAProposalParser(),
+        HIMAObservationAdapter(race=model_race),
+        HIMAProposalParser(race=model_race),
     )
     comparison = asyncio.run(
         PolicyShadowRunner().compare(

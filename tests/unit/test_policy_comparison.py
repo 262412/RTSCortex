@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 import rtscortex.policy.comparison as comparison_module
+import rtscortex.policy.comparison_worker as comparison_worker_module
 from rtscortex.policy.comparison import (
     PolicyComparisonConfig,
     PolicyComparisonError,
@@ -19,18 +20,31 @@ from rtscortex.policy.comparison import (
 )
 from rtscortex.policy.corpus import load_policy_corpus
 from rtscortex.policy.hima.subagent import HIMA_PINNED_REVISIONS
-from rtscortex.policy.models import PolicyAvailability, PolicyAvailabilityStatus
+from rtscortex.policy.models import (
+    PolicyAvailability,
+    PolicyAvailabilityStatus,
+    PolicyShadowComparison,
+)
 from rtscortex.policy.shadow import PolicyShadowRunner
-from rtscortex.policy.subagents import HIMA_PROTOSS_SPECS, PolicySubagentRegistration
+from rtscortex.policy.subagents import (
+    HIMA_PROTOSS_SPECS,
+    HIMA_RACE_SPECS,
+    PolicySubagentRegistration,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 CORPUS_MANIFEST = PROJECT_ROOT / "benchmarks/policy/protoss_v0_2/manifest.yaml"
+ZERG_CORPUS_MANIFEST = PROJECT_ROOT / "benchmarks/policy/zerg_v0_3/manifest.yaml"
 
 
-def _offline_config(tmp_path: Path) -> PolicyComparisonConfig:
+def _offline_config(
+    tmp_path: Path,
+    *,
+    manifest_path: Path = CORPUS_MANIFEST,
+) -> PolicyComparisonConfig:
     return PolicyComparisonConfig.model_validate(
         {
-            "corpus_manifest": CORPUS_MANIFEST,
+            "corpus_manifest": manifest_path,
             "output_root": tmp_path,
             "qwen": {"enabled": False},
             "hima": {"enabled": ["a", "b", "c"]},
@@ -193,6 +207,77 @@ def test_offline_comparison_writes_complete_no_download_artifact_tree(
         or name == "huggingface_hub"
         or name.startswith("huggingface_hub.")
     } == imported_model_modules_before
+
+
+def test_zerg_corpus_selects_zerg_specialists_and_race_provenance(
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "zerg-offline-result"
+
+    artifacts = run_policy_comparison(
+        _offline_config(tmp_path, manifest_path=ZERG_CORPUS_MANIFEST),
+        output_dir=output_dir,
+    )
+
+    assert artifacts.comparison.candidate_ids == [
+        "qwen3-8b-current",
+        "hima-zerg-a",
+        "hima-zerg-b",
+        "hima-zerg-c",
+        "hiernet-sc2-protoss",
+    ]
+    provenance = json.loads(
+        (output_dir / "candidates/hima-zerg-a/provenance.json").read_text()
+    )
+    assert provenance["vocabulary_version"] == "hima-zerg-63-v1"
+    assert provenance["parser_version"] == "hima-zerg-parser-v2"
+    report = artifacts.reports.report_path.read_text()
+    assert "hima-zerg-parser-v2" in report
+    assert "hima-protoss-parser-v5" not in report
+
+
+def test_comparison_worker_uses_the_manifest_race_for_zerg(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = HIMA_RACE_SPECS["zerg"][0]
+    revision = HIMA_PINNED_REVISIONS[spec.model_id]
+    checkpoint = _snapshot_path(tmp_path, model_id=spec.model_id, revision=revision)
+    request_path = tmp_path / "request.json"
+    response_path = tmp_path / "response.json"
+    request_path.write_text(
+        comparison_module.HIMAWorkerRequest(
+            manifest_path=ZERG_CORPUS_MANIFEST,
+            model_id=spec.model_id,
+            model_path=checkpoint,
+            device="cpu",
+            allow_unlicensed_weights=True,
+        ).model_dump_json(),
+        encoding="utf-8",
+    )
+
+    class FakeGenerator:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            del args, kwargs
+
+        async def generate(self, *, user_message: str) -> str:
+            assert '"unit"' in user_message
+            return 'Actions: ["Drone"]'
+
+    monkeypatch.setattr(
+        comparison_worker_module,
+        "TransformersHIMAGenerator",
+        FakeGenerator,
+    )
+
+    comparison_worker_module.run_worker(request_path, response_path)
+
+    comparison = PolicyShadowComparison.model_validate_json(
+        response_path.read_text()
+    )
+    assert comparison.candidate_ids == ["hima-zerg-a"]
+    assert len(comparison.records) == 48
+    assert all(record.spec.race == "Zerg" for record in comparison.records)
 
 
 def test_hima_candidates_run_sequentially_and_one_failure_is_isolated(

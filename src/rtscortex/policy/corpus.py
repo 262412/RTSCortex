@@ -423,6 +423,12 @@ def load_policy_corpus(
     return fixtures
 
 
+def load_policy_corpus_manifest(manifest_path: Path) -> PolicyCorpusManifest:
+    """Load one strict corpus manifest, including its active race."""
+
+    return _load_manifest(manifest_path)
+
+
 def verify_policy_corpus(
     manifest_path: Path,
     *,
