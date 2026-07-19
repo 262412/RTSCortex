@@ -36,7 +36,9 @@ def _assert_candidate_mapping() -> None:
         action for action in llm_action.PROTOSS_ACTION_BUILD if action["name"] == "Build_Nexus_Near"
     )
     assert [function_id for function_id, _, _ in nexus["func"]] == [573, 0, 65]
-    assert "return translator settlement no_op" in inspect.getsource(MainAgent.step)
+    main_step_source = inspect.getsource(MainAgent.step)
+    assert "return translator settlement no_op" in main_step_source
+    assert "_rtscortex_transport_noop_without_actor_selection" in main_step_source
 
 
 def _assert_reserved_builder_worker_guard() -> None:

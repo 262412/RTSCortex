@@ -76,12 +76,20 @@ git -C third_party/LLM-PySC2 apply --check \
   ../../integrations/llm_pysc2/patches/0018-use-exact-single-unit-selection.patch
 git -C third_party/LLM-PySC2 apply \
   ../../integrations/llm_pysc2/patches/0018-use-exact-single-unit-selection.patch
+git -C third_party/LLM-PySC2 apply --check \
+  ../../integrations/llm_pysc2/patches/0019-bypass-actor-selection-for-transport-noop.patch
+git -C third_party/LLM-PySC2 apply \
+  ../../integrations/llm_pysc2/patches/0019-bypass-actor-selection-for-transport-noop.patch
 ```
 
 After the live run, restore the clean pinned checkout by reversing exactly these reviewed
 patches in reverse order:
 
 ```bash
+git -C third_party/LLM-PySC2 apply --reverse --check \
+  ../../integrations/llm_pysc2/patches/0019-bypass-actor-selection-for-transport-noop.patch
+git -C third_party/LLM-PySC2 apply --reverse \
+  ../../integrations/llm_pysc2/patches/0019-bypass-actor-selection-for-transport-noop.patch
 git -C third_party/LLM-PySC2 apply --reverse --check \
   ../../integrations/llm_pysc2/patches/0018-use-exact-single-unit-selection.patch
 git -C third_party/LLM-PySC2 apply --reverse \
@@ -263,7 +271,12 @@ selection instead of the upstream exponentially expanding rectangle fallback. Th
 Builder or exact production actor from remaining unselected until the rectangle radius overflows,
 while leaving the original fallback available to non-RTSCortex users.
 
-CI applies all eighteen patches in order under Python 3.9, compiles and imports both projects, and
+`0019-bypass-actor-selection-for-transport-noop.patch` executes RTSCortex transport-level
+`No_Operation` directly. A control no-op has no actor semantics, so it must not move the camera
+or select a Builder, producer, or combat unit merely to idle that team. This prevents idle teams
+from starving Runtime observations through repeated feature-layer selection attempts.
+
+CI applies all nineteen patches in order under Python 3.9, compiles and imports both projects, and
 runs `integrations/llm_pysc2/tests/python39_contract_smoke.py`. The smoke locks the v1.1
 candidate mapping, multi-argument translator rejection, Nexus camera-settlement primitive,
 exact Nexus anchor, floating-point resource clearance, visible complete-footprint behavior,

@@ -901,6 +901,7 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
         super().__init__(config, subagent)
         self._rtscortex_accept_visible_team_unit = True
         self._rtscortex_exact_single_unit_selection = True
+        self._rtscortex_transport_noop_without_actor_selection = True
         _apply_scenario_bootstrap(self, self.worker_settings.scenario)
         if self.worker_settings.console_enabled:
             self._frame_publisher = RGBFramePublisher(
@@ -930,6 +931,7 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
         self.decision_broker.observe_effects(obs.observation)
         if _is_terminal(obs):
             return _finish_terminal(self, obs, _base_agent_step, _no_op)
+        _rebind_builder_to_selected_worker(self, obs.observation)
         observation_loop = _observation_game_loop(obs.observation)
         # RTSCortex consumes a global raw snapshot. Do not make every Runtime tick
         # wait for optional upstream camera/selection-based text gathering.
@@ -1536,6 +1538,69 @@ def _reserved_builder_worker_tags(main_agent: Any) -> set[int]:
             continue
         tags.update(int(tag) for tag in team.get("unit_tags", ()) if int(tag) > 0)
     return tags
+
+
+def _rebind_builder_to_selected_worker(main_agent: Any, observation: Any) -> bool:
+    """Adopt the exact same-type worker selected by a crowded feature click."""
+
+    agents = getattr(main_agent, "agents", {})
+    if not isinstance(agents, Mapping):
+        return False
+    builder = agents.get("Builder")
+    if (
+        builder is None
+        or not bool(builder._is_executing_actions())
+        or not str(getattr(builder, "curr_action_name", "")).startswith("Build_")
+    ):
+        return False
+    original_tag = int(getattr(builder, "team_unit_tag_curr", 0) or 0)
+    team_name = str(getattr(builder, "team_unit_team_curr", ""))
+    if original_tag <= 0 or not team_name:
+        return False
+    raw_units = list(getattr(observation, "raw_units", ()))
+    original = next(
+        (unit for unit in raw_units if int(getattr(unit, "tag", 0)) == original_tag),
+        None,
+    )
+    if original is None:
+        return False
+    gas_worker_tags = {
+        int(tag)
+        for info in getattr(main_agent, "nexus_info_dict", {}).values()
+        for key in ("worker_g_tag_list", "worker_g1_tag_list", "worker_g2_tag_list")
+        for tag in info.get(key, ())
+    }
+    selected = [
+        unit
+        for unit in raw_units
+        if bool(getattr(unit, "is_selected", False))
+        and int(getattr(unit, "alliance", 0)) == 1
+        and int(getattr(unit, "unit_type", 0)) == int(getattr(original, "unit_type", -1))
+        and int(getattr(unit, "tag", 0)) not in gas_worker_tags
+    ]
+    if len(selected) != 1:
+        return False
+    selected_tag = int(selected[0].tag)
+    if selected_tag == original_tag:
+        return False
+    team = next(
+        (
+            item
+            for item in getattr(builder, "teams", ())
+            if isinstance(item, Mapping) and str(item.get("name", "")) == team_name
+        ),
+        None,
+    )
+    unit_tags = None if team is None else team.get("unit_tags")
+    if not isinstance(unit_tags, list) or original_tag not in unit_tags:
+        return False
+    unit_tags[:] = [
+        selected_tag if int(tag) == original_tag else int(tag)
+        for tag in unit_tags
+    ]
+    builder.team_unit_tag_curr = selected_tag
+    builder._rtscortex_last_builder_rebind = (original_tag, selected_tag)
+    return True
 
 
 def _release_runtime_observation_barrier(main_agent: Any) -> None:

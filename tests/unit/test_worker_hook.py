@@ -40,6 +40,7 @@ from rtscortex_llm_pysc2.worker import (
     _prime_deterministic_gas_rebalance,
     _producer_is_visible,
     _production_source_invalid_reason,
+    _rebind_builder_to_selected_worker,
     _refresh_build_action_position,
     _release_runtime_observation_barrier,
     _replace_screen_action_position,
@@ -883,6 +884,59 @@ def test_deterministic_gas_rebalance_evicts_builder_already_on_gas() -> None:
     assert agent.stop_worker is builder_worker
     assert agent.stop_worker_nexus_tag == 100
     assert agent.stop_worker_at == "g1"
+
+
+def test_builder_rebinds_to_actual_same_type_worker_selected_by_feature_click() -> None:
+    team = {"name": "Builder-SCV-1", "unit_tags": [10]}
+    builder = SimpleNamespace(
+        _is_executing_actions=lambda: True,
+        curr_action_name="Build_Barracks_Screen",
+        team_unit_tag_curr=10,
+        team_unit_team_curr="Builder-SCV-1",
+        teams=[team],
+    )
+    main_agent = SimpleNamespace(
+        agents={"Builder": builder},
+        nexus_info_dict={"100": {"worker_g_tag_list": []}},
+    )
+    observation = SimpleNamespace(
+        raw_units=[
+            SimpleNamespace(tag=10, alliance=1, unit_type=45, is_selected=False),
+            SimpleNamespace(tag=20, alliance=1, unit_type=45, is_selected=True),
+        ]
+    )
+
+    rebound = _rebind_builder_to_selected_worker(main_agent, observation)
+
+    assert rebound is True
+    assert builder.team_unit_tag_curr == 20
+    assert team["unit_tags"] == [20]
+    assert builder._rtscortex_last_builder_rebind == (10, 20)
+
+
+def test_builder_never_rebinds_to_selected_gas_worker() -> None:
+    team = {"name": "Builder-SCV-1", "unit_tags": [10]}
+    builder = SimpleNamespace(
+        _is_executing_actions=lambda: True,
+        curr_action_name="Build_Barracks_Screen",
+        team_unit_tag_curr=10,
+        team_unit_team_curr="Builder-SCV-1",
+        teams=[team],
+    )
+    main_agent = SimpleNamespace(
+        agents={"Builder": builder},
+        nexus_info_dict={"100": {"worker_g1_tag_list": [20]}},
+    )
+    observation = SimpleNamespace(
+        raw_units=[
+            SimpleNamespace(tag=10, alliance=1, unit_type=45, is_selected=False),
+            SimpleNamespace(tag=20, alliance=1, unit_type=45, is_selected=True),
+        ]
+    )
+
+    assert _rebind_builder_to_selected_worker(main_agent, observation) is False
+    assert builder.team_unit_tag_curr == 10
+    assert team["unit_tags"] == [10]
 
 
 def test_deterministic_gas_rebalance_respects_effect_and_main_loop_guards() -> None:

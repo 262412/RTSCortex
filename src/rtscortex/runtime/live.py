@@ -244,6 +244,11 @@ def prepare_live_worker(
             "the LLM-PySC2 exact single-unit selection patch is not applied; see "
             "integrations/llm_pysc2/patches/README.md"
         )
+    if not transport_noop_actor_bypass_patch_is_applied(project_root):
+        errors.append(
+            "the LLM-PySC2 transport-noop actor bypass patch is not applied; see "
+            "integrations/llm_pysc2/patches/README.md"
+        )
 
     if errors:
         raise LiveEnvironmentError("Live environment validation failed:\n- " + "\n- ".join(errors))
@@ -1051,6 +1056,17 @@ def exact_single_unit_selection_patch_is_applied(project_root: Path) -> bool:
     if not source.is_file():
         return False
     return "_rtscortex_exact_single_unit_selection" in source.read_text(encoding="utf-8")
+
+
+def transport_noop_actor_bypass_patch_is_applied(project_root: Path) -> bool:
+    """Return whether transport no-ops bypass camera and actor selection."""
+
+    source = project_root / "third_party/LLM-PySC2/llm_pysc2/agents/llm_pysc2_agent_main.py"
+    if not source.is_file():
+        return False
+    return "_rtscortex_transport_noop_without_actor_selection" in source.read_text(
+        encoding="utf-8"
+    )
 
 
 def _signal_process(worker: asyncio.subprocess.Process, sig: signal.Signals) -> None:

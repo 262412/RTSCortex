@@ -33,6 +33,7 @@ from rtscortex.runtime.live import (
     sc2_build,
     transient_unit_grace_patch_is_applied,
     translation_result_patch_is_applied,
+    transport_noop_actor_bypass_patch_is_applied,
     visible_team_selection_patch_is_applied,
     waiting_response_patch_is_applied,
     worker_workplace_refresh_patch_is_applied,
@@ -258,6 +259,8 @@ def _worker_patch_check(project_root: Path, *, required: bool) -> Check:
         missing.append("0017-return-camera-settlement-noop.patch")
     if not exact_single_unit_selection_patch_is_applied(project_root):
         missing.append("0018-use-exact-single-unit-selection.patch")
+    if not transport_noop_actor_bypass_patch_is_applied(project_root):
+        missing.append("0019-bypass-actor-selection-for-transport-noop.patch")
     status = "ok" if not missing else ("error" if required else "optional")
     detail = "all worker patches applied" if not missing else "apply " + ", ".join(missing)
     return Check("worker_patch", status, detail)

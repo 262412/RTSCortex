@@ -110,6 +110,7 @@ def test_worker_patch_is_required_only_for_live_runs(tmp_path: Path) -> None:
         "return translator settlement no_op\n"
         "_rtscortex_camera_settlement_noop\n"
         "_rtscortex_exact_single_unit_selection\n"
+        "_rtscortex_transport_noop_without_actor_selection\n"
         "if tag not in self.unit_uid_disappear:\n"
         "agent.curr_action_name != 'No_Operation'\n"
         "wait for confirmed disappearance\n"
@@ -291,6 +292,19 @@ def test_worker_patch_is_required_only_for_live_runs(tmp_path: Path) -> None:
     exact_selection_check = _worker_patch_check(tmp_path, required=True)
     assert exact_selection_check.status == "error"
     assert "0018-use-exact-single-unit-selection.patch" in exact_selection_check.detail
+    source.write_text(complete_main_source, encoding="utf-8")
+
+    source.write_text(
+        complete_main_source.replace(
+            "_rtscortex_transport_noop_without_actor_selection\n", ""
+        ),
+        encoding="utf-8",
+    )
+    transport_noop_check = _worker_patch_check(tmp_path, required=True)
+    assert transport_noop_check.status == "error"
+    assert "0019-bypass-actor-selection-for-transport-noop.patch" in (
+        transport_noop_check.detail
+    )
     source.write_text(complete_main_source, encoding="utf-8")
 
     complete_main_source = source.read_text(encoding="utf-8")
