@@ -381,8 +381,8 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
             )
             if build_reselection is not None:
                 return build_reselection
-            if _requires_terran_production_chain(action_name):
-                self._prime_terran_production_chain(action)
+            if _requires_explicit_production_chain(action_name):
+                self._prime_production_chain(action)
         if _next_primitive_is_screen_build(semantic_action_name, self.func_list):
             command_id = self.broker.command_id_for(
                 self.name,
@@ -456,8 +456,8 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
         self._prefer_available_generic_addon_function(semantic_action_name, obs)
         candidate_action = copy.deepcopy(action)
         self._rtscortex_translation_attempt = None
-        if _is_terran_near_build_final_primitive(self, semantic_action_name):
-            result = _translate_terran_near_build_primitive(self, obs)
+        if _is_worker_owned_near_build_final_primitive(self, semantic_action_name):
+            result = _translate_worker_owned_near_build_primitive(self, obs)
         else:
             result = super().get_func(obs)
         metadata = getattr(self, "last_translation_result", None)
@@ -704,12 +704,12 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
         actions = importlib.import_module("pysc2.lib.actions")
         return 2, actions.FUNCTIONS.select_point("select", position)
 
-    def _prime_terran_production_chain(self, action: Mapping[str, Any]) -> None:
-        """Bind a Terran train action to the exact producer selected by RTSCortex."""
+    def _prime_production_chain(self, action: Mapping[str, Any]) -> None:
+        """Bind a non-Protoss action to the exact producer selected by RTSCortex."""
 
         producer_tag = self._rtscortex_production_source_tag
         if producer_tag is None:
-            raise RuntimeError("Terran production chain lacks producer provenance")
+            raise RuntimeError("production chain lacks producer provenance")
         actions = importlib.import_module("pysc2.lib.actions")
         semantic_action = self.action_list.pop(0)
         self.func_list = [
@@ -1447,6 +1447,10 @@ def _scenario_config(scenario: str, *, agent_race: str = "protoss") -> Any:
                 "rtscortex_llm_pysc2.terran_melee",
                 "RTSCortexTerranMeleeConfig",
             ),
+            "zerg": (
+                "rtscortex_llm_pysc2.zerg_melee",
+                "RTSCortexZergMeleeConfig",
+            ),
         }.get(normalized_race),
     }
     try:
@@ -1866,23 +1870,23 @@ def _worker_player_race(agent: Any) -> str:
     ).casefold()
 
 
-def _requires_terran_production_chain(action_name: str) -> bool:
+def _requires_explicit_production_chain(action_name: str) -> bool:
     spec = production_spec(action_name) or addon_spec(action_name)
-    return spec is not None and spec.race == "terran"
+    return spec is not None and spec.race != "protoss"
 
 
-def _is_terran_near_build_final_primitive(agent: Any, action_name: str) -> bool:
-    if (
-        action_name not in {"Build_Refinery_Near", "Build_CommandCenter_Near"}
-        or not agent.func_list
-    ):
+def _is_worker_owned_near_build_final_primitive(agent: Any, action_name: str) -> bool:
+    spec = BUILD_SPECS.get(action_name)
+    if spec is None or spec.placement_kind not in {"geyser", "expansion"} or not agent.func_list:
+        return False
+    if _worker_player_race(agent) == "protoss":
         return False
     function_id = int(agent.func_list[0][0])
-    return function_id in {44, 79}
+    return function_id not in {0, 573}
 
 
-def _translate_terran_near_build_primitive(agent: Any, obs: Any) -> tuple[int, Any]:
-    """Resolve Terran gas and expansion anchors without upstream Terran factories."""
+def _translate_worker_owned_near_build_primitive(agent: Any, obs: Any) -> tuple[int, Any]:
+    """Resolve non-Protoss gas and expansion anchors without upstream factories."""
 
     requested_id, function, arguments = agent.func_list.pop(0)
     requested_arguments = list(arguments)
@@ -1898,7 +1902,7 @@ def _translate_terran_near_build_primitive(agent: Any, obs: Any) -> tuple[int, A
         reason = f"function {getattr(function, 'name', emitted_id)} is not available"
     elif len(requested_arguments) != 2 or not isinstance(requested_arguments[1], int):
         reason = (
-            f"Terran Near build expected queue flag and anchor tag, got {requested_arguments!r}"
+            f"Near build expected queue flag and anchor tag, got {requested_arguments!r}"
         )
     else:
         queue = requested_arguments[0]
@@ -1906,7 +1910,7 @@ def _translate_terran_near_build_primitive(agent: Any, obs: Any) -> tuple[int, A
         llm_action = importlib.import_module("llm_pysc2.lib.llm_action")
         resolver = (
             llm_action.get_arg_screen_tag_gas_building
-            if agent.curr_action_name == "Build_Refinery_Near"
+            if BUILD_SPECS[str(agent.curr_action_name)].placement_kind == "geyser"
             else llm_action.get_arg_screen_tag_base_building
         )
         position, valid = resolver(

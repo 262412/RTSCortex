@@ -169,30 +169,23 @@ def test_hima_ensemble_rejects_mixed_races() -> None:
         )
 
 
-def test_terran_cortex_is_live_but_zerg_remains_offline() -> None:
+@pytest.mark.parametrize("race", ["protoss", "terran", "zerg"])
+def test_all_builtin_race_cortex_profiles_allow_live_worker(race: str) -> None:
     offline = ExperimentConfig.model_validate(
         {
-            "environment": {"adapter": "mock", "agent_race": "terran"},
+            "environment": {"adapter": "mock", "agent_race": race},
             "agent": {"variant": "cortex"},
         }
     )
-    assert offline.environment.agent_race == "terran"
+    assert offline.environment.agent_race == race
 
     live = ExperimentConfig.model_validate(
         {
-            "environment": {"adapter": "llm_pysc2", "agent_race": "terran"},
+            "environment": {"adapter": "llm_pysc2", "agent_race": race},
             "agent": {"variant": "cortex"},
         }
     )
-    assert live.environment.agent_race == "terran"
-
-    with pytest.raises(ValidationError, match="does not yet implement Zerg"):
-        ExperimentConfig.model_validate(
-            {
-                "environment": {"adapter": "llm_pysc2", "agent_race": "zerg"},
-                "agent": {"variant": "cortex"},
-            }
-        )
+    assert live.environment.agent_race == race
 
 
 def test_hima_ensemble_race_must_match_agent() -> None:

@@ -246,6 +246,8 @@ class EffectEvidence(ContractModel):
     builder_tag: str | None = None
     producer_tag: str | None = None
     producer_type: str | None = None
+    producer_observed_type: str | None = None
+    producer_consumed: bool = False
     expected_unit_type: str | None = None
     expected_order_id: int | None = Field(default=None, ge=0)
     baseline_structure_tags: list[str] = Field(default_factory=list)
@@ -276,7 +278,12 @@ class EffectEvidence(ContractModel):
     resource_delta: dict[str, int] = Field(default_factory=dict)
     order_seen: bool = False
     production_order_seen: bool = False
-    confirmation_kind: Literal["producer_order", "new_unit", "new_structure"] | None = None
+    confirmation_kind: Literal[
+        "producer_order",
+        "producer_morph",
+        "new_unit",
+        "new_structure",
+    ] | None = None
     order_last_seen_game_loop: int | None = Field(default=None, ge=0)
     post_order_grace_game_loops: int | None = Field(default=None, ge=1)
     mineral_delta: int | None = None

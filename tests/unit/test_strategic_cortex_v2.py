@@ -151,7 +151,8 @@ def test_race_profile_capabilities_match_implemented_live_readiness() -> None:
     assert terran["live_worker_ready"] is True
     assert zerg["macro_contract_ready"] is True
     assert zerg["runtime_mapping_ready"] is True
-    assert zerg["live_worker_ready"] is False
+    assert zerg["live_worker_ready"] is True
+    assert zerg["effect_verification_kinds"] == ["build", "production", "move"]
 
 
 def test_situation_v2_keeps_unobserved_map_facts_unknown() -> None:

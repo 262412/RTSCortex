@@ -314,6 +314,7 @@ def test_effect_evidence_round_trips_production_provenance_without_breaking_lega
         effect_kind="production",
         producer_tag="0xabc",
         producer_type="Stargate",
+        producer_observed_type="Stargate",
         expected_unit_type="VoidRay",
         expected_order_id=57,
         baseline_unit_tags=["0x1"],
@@ -331,12 +332,25 @@ def test_effect_evidence_round_trips_production_provenance_without_breaking_lega
     assert legacy.effect_kind is None
     assert legacy.baseline_unit_tags == []
     assert legacy.production_order_seen is False
+    assert legacy.producer_consumed is False
     assert legacy.confirmation_kind is None
 
     with pytest.raises(ValidationError):
         EffectEvidence(effect_kind="accepted")  # type: ignore[arg-type]
     with pytest.raises(ValidationError):
         EffectEvidence(confirmation_kind="acceptance_only")  # type: ignore[arg-type]
+
+    zerg = EffectEvidence(
+        effect_kind="production",
+        producer_tag="0x100",
+        producer_type="Larva",
+        producer_observed_type="Egg",
+        producer_consumed=True,
+        expected_unit_type="Zergling",
+        expected_order_id=528,
+        confirmation_kind="producer_morph",
+    )
+    assert EffectEvidence.model_validate_json(zerg.model_dump_json()) == zerg
 
 
 def test_effect_evidence_accepts_terran_addon_confirmation() -> None:

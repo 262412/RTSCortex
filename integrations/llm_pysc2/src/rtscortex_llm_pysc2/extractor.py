@@ -43,6 +43,7 @@ class BuildSpec:
     vespene_cost: int = 0
     prerequisites: tuple[str, ...] = ()
     reserves_addon_space: bool = False
+    requires_creep: bool = False
 
 
 @dataclass(frozen=True)
@@ -141,6 +142,70 @@ BUILD_SPECS = {
         100,
         prerequisites=("EngineeringBay",),
     ),
+    "Build_Hatchery_Near": BuildSpec("Hatchery", "expansion", 5, False, 300),
+    "Build_Extractor_Near": BuildSpec(
+        "Extractor",
+        "geyser",
+        3,
+        False,
+        25,
+        prerequisites=("Hatchery",),
+    ),
+    "Build_SpawningPool_Screen": BuildSpec(
+        "SpawningPool",
+        "screen",
+        3,
+        False,
+        200,
+        prerequisites=("Hatchery",),
+        requires_creep=True,
+    ),
+    "Build_RoachWarren_Screen": BuildSpec(
+        "RoachWarren",
+        "screen",
+        3,
+        False,
+        150,
+        prerequisites=("SpawningPool",),
+        requires_creep=True,
+    ),
+    "Build_EvolutionChamber_Screen": BuildSpec(
+        "EvolutionChamber",
+        "screen",
+        3,
+        False,
+        75,
+        prerequisites=("Hatchery",),
+        requires_creep=True,
+    ),
+    "Build_HydraliskDen_Screen": BuildSpec(
+        "HydraliskDen",
+        "screen",
+        3,
+        False,
+        100,
+        vespene_cost=100,
+        prerequisites=("Lair",),
+        requires_creep=True,
+    ),
+    "Build_SpineCrawler_Screen": BuildSpec(
+        "SpineCrawler",
+        "screen",
+        2,
+        False,
+        100,
+        prerequisites=("SpawningPool",),
+        requires_creep=True,
+    ),
+    "Build_SporeCrawler_Screen": BuildSpec(
+        "SporeCrawler",
+        "screen",
+        2,
+        False,
+        75,
+        prerequisites=("EvolutionChamber",),
+        requires_creep=True,
+    ),
 }
 
 # PySC2's ``FeatureUnit.order_id_*`` fields expose the pinned RAW action IDs
@@ -164,6 +229,14 @@ BUILD_RAW_FUNCTION_IDS = {
     "Refinery": 214,
     "Starport": 221,
     "SupplyDepot": 222,
+    "EvolutionChamber": 192,
+    "Extractor": 193,
+    "Hatchery": 197,
+    "HydraliskDen": 198,
+    "RoachWarren": 215,
+    "SpawningPool": 217,
+    "SpineCrawler": 218,
+    "SporeCrawler": 220,
 }
 TERRAN_BUILD_RAW_FUNCTION_IDS = frozenset(
     BUILD_RAW_FUNCTION_IDS[spec.target_structure]
@@ -1656,6 +1729,7 @@ def _build_screen_candidates(
     pathable = _value(feature_screen, "pathable", None)
     player_relative = _value(feature_screen, "player_relative", None)
     power = _value(feature_screen, "power", None)
+    creep = _value(feature_screen, "creep", None)
     feature_units = _value(observation, "feature_units", ())
     shape = getattr(buildable, "shape", ())
     if not shape or buildable is None or pathable is None or player_relative is None:
@@ -1679,6 +1753,7 @@ def _build_screen_candidates(
         pathable,
         player_relative,
         power,
+        creep,
         occupied_positions=tuple(
             (
                 int(_value(unit, "x", 0)),
@@ -1697,6 +1772,7 @@ def _build_screen_candidates(
         building_size=spec.footprint,
         reserve_addon_space=spec.reserves_addon_space,
         require_power=spec.requires_power,
+        require_creep=spec.requires_creep,
         semantic_anchor=semantic_anchor,
     )
     if spec.reserves_addon_space:
@@ -1783,6 +1859,7 @@ def _build_screen_position_is_legal(
     pathable = _value(feature_screen, "pathable", None)
     player_relative = _value(feature_screen, "player_relative", None)
     power = _value(feature_screen, "power", None)
+    creep = _value(feature_screen, "creep", None)
     dimensions = _screen_dimensions(observation)
     if (
         dimensions is None
@@ -1798,8 +1875,10 @@ def _build_screen_position_is_legal(
         pathable,
         player_relative,
         power,
+        creep,
         screen_size,
         require_power=spec.requires_power,
+        require_creep=spec.requires_creep,
     )
     return (
         _build_footprint_is_clear(
@@ -1871,6 +1950,7 @@ def _valid_build_positions(
     pathable: Any,
     player_relative: Any,
     power: Any,
+    creep: Any,
     *,
     occupied_positions: tuple[tuple[int, int, float], ...],
     reserved_bounds: tuple[tuple[int, int, int, int], ...],
@@ -1878,6 +1958,7 @@ def _valid_build_positions(
     building_size: int,
     reserve_addon_space: bool,
     require_power: bool,
+    require_creep: bool,
     semantic_anchor: tuple[float, float],
 ) -> list[list[int]]:
     ratio = max(1, int(screen_size / 24))
@@ -1887,8 +1968,10 @@ def _valid_build_positions(
         pathable,
         player_relative,
         power,
+        creep,
         screen_size,
         require_power=require_power,
+        require_creep=require_creep,
     )
     candidates: list[tuple[float, float, int, int]] = []
     for x0 in range(stride, screen_size, stride):
@@ -2042,9 +2125,11 @@ def _invalid_build_cell_prefix(
     pathable: Any,
     player_relative: Any,
     power: Any,
+    creep: Any,
     screen_size: int,
     *,
     require_power: bool,
+    require_creep: bool,
 ) -> list[list[int]]:
     prefix = [[0] * (screen_size + 1) for _ in range(screen_size + 1)]
     for y in range(screen_size):
@@ -2062,6 +2147,8 @@ def _invalid_build_cell_prefix(
                 )
                 or require_power
                 and (power is None or power[y][x] != 1)
+                or require_creep
+                and (creep is None or creep[y][x] != 1)
             )
             current_row[x + 1] = previous_row[x + 1] + row_total
     return prefix

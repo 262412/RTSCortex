@@ -275,14 +275,6 @@ class ExperimentConfig(SettingsModel):
     def validate_race_brain_matches_agent(self) -> ExperimentConfig:
         if self.agent.variant == "cortex" and self.environment.agent_race == "random":
             raise ValueError("Cortex live mode requires a concrete agent_race")
-        if (
-            self.agent.variant == "cortex"
-            and self.environment.adapter == "llm_pysc2"
-            and self.environment.agent_race == "zerg"
-        ):
-            raise ValueError(
-                "the RTSCortex LLM-PySC2 Worker does not yet implement Zerg live actions"
-            )
         if self.cortex.macro.kind == "hima":
             race = self.cortex.macro.candidate.rsplit("-", 1)[0]
         elif self.cortex.macro.kind == "hima_ensemble":

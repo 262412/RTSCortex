@@ -45,7 +45,7 @@ from rtscortex_llm_pysc2.worker import (
     _refresh_build_action_position,
     _release_runtime_observation_barrier,
     _replace_screen_action_position,
-    _requires_terran_production_chain,
+    _requires_explicit_production_chain,
     _resolve_build_action_position,
     _run_with_auto_worker_management_guard,
     _scenario_config,
@@ -1337,9 +1337,10 @@ def test_worker_player_race_prefers_explicit_bridge_race_over_upstream_compatibi
         RTSCortexMainAgent.__init__
     )
     source = inspect.getsource(RTSCortexLLMAgent.get_func)
-    assert "_requires_terran_production_chain(action_name)" in source
-    assert _requires_terran_production_chain("Train_Marine") is True
-    assert _requires_terran_production_chain("Train_Zealot") is False
+    assert "_requires_explicit_production_chain(action_name)" in source
+    assert _requires_explicit_production_chain("Train_Marine") is True
+    assert _requires_explicit_production_chain("Train_Zergling") is True
+    assert _requires_explicit_production_chain("Train_Zealot") is False
 
 
 def test_terran_production_chain_bypasses_upstream_source_lookup(
@@ -1363,7 +1364,7 @@ def test_terran_production_chain_bypasses_upstream_source_lookup(
         lambda _name: SimpleNamespace(FUNCTIONS=functions),
     )
 
-    agent._prime_terran_production_chain(action)
+    agent._prime_production_chain(action)
 
     assert [int(item[0]) for item in agent.func_list] == [573, 2, 477]
     assert agent.action_list == []
@@ -1399,10 +1400,10 @@ def test_terran_addon_uses_exact_producer_chain(monkeypatch: pytest.MonkeyPatch)
         "rtscortex_llm_pysc2.worker.importlib.import_module",
         lambda _name: SimpleNamespace(FUNCTIONS=functions),
     )
-    agent._prime_terran_production_chain(action)
+    agent._prime_production_chain(action)
 
     assert [int(item[0]) for item in agent.func_list] == [573, 2, 73]
-    assert _requires_terran_production_chain("Build_BarracksReactor") is True
+    assert _requires_explicit_production_chain("Build_BarracksReactor") is True
 
 
 def test_timestep_extractor_enumerates_stable_pathable_move_and_blink_candidates() -> None:
@@ -2013,6 +2014,49 @@ def test_gateway_candidates_use_row_major_power_plane() -> None:
     )
 
     assert build_screen_candidates(transposed_observation, "Build_Gateway_Screen") == []
+
+
+def test_zerg_building_requires_creep_across_the_full_footprint() -> None:
+    creep = [[1 for _ in range(128)] for _ in range(128)]
+    observation = SimpleNamespace(
+        raw_units=[
+            SimpleNamespace(
+                tag=0xA00,
+                unit_type=86,
+                alliance=1,
+                build_progress=100,
+                x=30,
+                y=30,
+            )
+        ],
+        feature_units=[],
+        feature_screen=SimpleNamespace(
+            buildable=UniformGrid(1),
+            pathable=UniformGrid(1),
+            player_relative=UniformGrid(0),
+            power=UniformGrid(0),
+            creep=Grid(creep),
+        ),
+    )
+    unit_names = {86: "Hatchery"}
+
+    assert screen_build_position_is_legal(
+        observation,
+        "Build_SpawningPool_Screen",
+        [65, 65],
+        unit_names=unit_names,
+    )
+
+    creep[65][65] = 0
+    assert not screen_build_position_is_legal(
+        observation,
+        "Build_SpawningPool_Screen",
+        [65, 65],
+        unit_names=unit_names,
+    )
+
+    observation.feature_screen.creep = UniformGrid(0)
+    assert build_screen_candidates(observation, "Build_SpawningPool_Screen") == []
 
 
 def test_cybernetics_core_candidates_require_completed_gateway_and_power() -> None:
@@ -3085,6 +3129,12 @@ def test_train_registry_pins_multirace_worker_actions_and_raw_orders() -> None:
         "Train_SiegeTank": 521,
         "Train_Medivac": 512,
         "Train_VikingFighter": 525,
+        "Train_Drone": 503,
+        "Train_Overlord": 515,
+        "Train_Queen": 516,
+        "Train_Zergling": 528,
+        "Train_Roach": 519,
+        "Train_Hydralisk": 507,
     }
 
 
@@ -4550,6 +4600,39 @@ def test_worker_selects_rtscortex_terran_melee_config(
     monkeypatch.setattr(importlib, "import_module", fake_import)
 
     selected = _scenario_config("Simple64", agent_race="terran")
+
+    assert selected is config
+    assert config.reset_args == {
+        "model_name": "gpt-3.5-turbo",
+        "api_base": "http://127.0.0.1",
+        "api_key": "rtscortex-unused",
+    }
+
+
+def test_worker_selects_rtscortex_zerg_melee_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeZergMeleeConfig:
+        def __init__(self) -> None:
+            self.AGENTS: dict[str, Any] = {}
+            self.reset_args: dict[str, Any] | None = None
+
+        def reset_llm(self, **kwargs: Any) -> None:
+            self.reset_args = kwargs
+
+    config = FakeZergMeleeConfig()
+    no_op_function = object()
+
+    def fake_import(name: str) -> Any:
+        if name == "rtscortex_llm_pysc2.zerg_melee":
+            return SimpleNamespace(RTSCortexZergMeleeConfig=lambda: config)
+        if name == "pysc2.lib.actions":
+            return SimpleNamespace(FUNCTIONS=SimpleNamespace(no_op=no_op_function))
+        raise AssertionError(f"unexpected import: {name}")
+
+    monkeypatch.setattr(importlib, "import_module", fake_import)
+
+    selected = _scenario_config("Simple64", agent_race="zerg")
 
     assert selected is config
     assert config.reset_args == {

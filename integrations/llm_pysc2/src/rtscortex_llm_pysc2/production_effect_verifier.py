@@ -28,6 +28,7 @@ class _ProductionEvidence:
     units: tuple[_UnitEvidence, ...]
     producer_orders: Optional[tuple[int, ...]]
     producer_position: Optional[tuple[float, float]]
+    producer_observed_type: Optional[str]
     minerals: int
     vespene: int
     supply_used: int
@@ -133,6 +134,14 @@ class ProductionEffectVerifier:
             ):
                 assignments[command_id] = ("producer_order", None)
                 claimed_orders.add(order_key)
+
+        for pending in accepted:
+            command_id = pending.command.command_id
+            if command_id in assignments or not pending.spec.producer_consumed:
+                continue
+            current = current_by_command[command_id]
+            if current.producer_observed_type in pending.spec.intermediate_types:
+                assignments[command_id] = ("producer_morph", None)
 
         unit_pairs: list[tuple[float, int, str, int]] = []
         for pending in accepted:
@@ -280,17 +289,22 @@ class ProductionEffectVerifier:
                 key=lambda item: item.tag,
             )
         )
-        producer = next(
+        producer_unit = next(
             (
                 unit
                 for unit in raw_units
                 if pending.producer_tag is not None
                 and int(_value(unit, "tag", -1)) == pending.producer_tag
                 and int(_value(unit, "alliance", 0)) == 1
-                and self._unit_name(unit) == pending.spec.producer_type
             ),
             None,
         )
+        producer_type = None if producer_unit is None else self._unit_name(producer_unit)
+        producer_is_valid = producer_type == pending.spec.producer_type or (
+            pending.spec.producer_consumed
+            and producer_type in pending.spec.intermediate_types
+        )
+        producer = producer_unit if producer_is_valid else None
         player = _value(observation, "player_common", _value(observation, "player", None))
         if player is None:
             raise ValueError("raw SC2 observation has no player data")
@@ -306,6 +320,7 @@ class ProductionEffectVerifier:
                     float(_value(producer, "y", 0.0)),
                 )
             ),
+            producer_observed_type=producer_type,
             minerals=int(_value(player, "minerals", 0)),
             vespene=int(_value(player, "vespene", 0)),
             supply_used=int(_value(player, "food_used", 0)),
@@ -331,6 +346,8 @@ class ProductionEffectVerifier:
             "builder_tag": None,
             "producer_tag": None if pending.producer_tag is None else hex(pending.producer_tag),
             "producer_type": pending.spec.producer_type,
+            "producer_observed_type": current.producer_observed_type,
+            "producer_consumed": pending.spec.producer_consumed,
             "expected_unit_type": pending.spec.unit_type,
             "expected_order_id": pending.spec.raw_order_id,
             "baseline_structure_tags": [],

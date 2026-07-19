@@ -385,6 +385,13 @@ TERRAN_PROFILE_DATA = RaceProfileData(
 
 ZERG_PROGRESS_ACTION_SPECS: tuple[ProgressActionSpec, ...] = (
     ProgressActionSpec(
+        "Train_Drone",
+        GoalRequirementKind.UNIT,
+        "Drone",
+        minerals=50,
+        supply=1,
+    ),
+    ProgressActionSpec(
         "Train_Overlord",
         GoalRequirementKind.UNIT,
         "Overlord",
@@ -455,7 +462,9 @@ ZERG_PROGRESS_ACTION_SPECS: tuple[ProgressActionSpec, ...] = (
         GoalRequirementKind.STRUCTURE,
         "SporeCrawler",
         minerals=75,
-        prerequisites=(StatePrerequisite(GoalRequirementKind.STRUCTURE, "SpawningPool"),),
+        prerequisites=(
+            StatePrerequisite(GoalRequirementKind.STRUCTURE, "EvolutionChamber"),
+        ),
     ),
     ProgressActionSpec(
         "Train_Queen",
@@ -496,6 +505,7 @@ ZERG_PROGRESS_ACTION_SPECS: tuple[ProgressActionSpec, ...] = (
 _ZERG_MAPPINGS = tuple(
     MacroActionMapping(_canonical_hima_action(verb, name), (runtime_action,))
     for verb, name, runtime_action in (
+        ("TRAIN", "Drone", "Train_Drone"),
         ("TRAIN", "Overlord", "Train_Overlord"),
         ("BUILD", "Hatchery", "Build_Hatchery_Near"),
         ("BUILD", "Extractor", "Build_Extractor_Near"),
@@ -524,7 +534,12 @@ ZERG_PROFILE_DATA = RaceProfileData(
     macro_action_mappings=_ZERG_MAPPINGS,
     action_domains=_domains(
         ZERG_PROGRESS_ACTION_SPECS,
-        economy={"Train_Overlord", "Build_Hatchery_Near", "Build_Extractor_Near"},
+        economy={
+            "Train_Drone",
+            "Train_Overlord",
+            "Build_Hatchery_Near",
+            "Build_Extractor_Near",
+        },
         technology={"Morph_Lair", "Build_EvolutionChamber_Screen"},
         defense={"Build_SpineCrawler_Screen", "Build_SporeCrawler_Screen"},
     ),
@@ -535,6 +550,7 @@ ZERG_PROFILE_DATA = RaceProfileData(
             if spec.name.startswith("Build_")
         },
         "Morph_Lair": ("Hatchery",),
+        "Train_Drone": ("Larva",),
         "Train_Overlord": ("Larva",),
         "Train_Queen": ("Hatchery", "Lair", "Hive"),
         "Train_Zergling": ("Larva",),
@@ -543,11 +559,17 @@ ZERG_PROFILE_DATA = RaceProfileData(
     },
     hima_vocabulary_version="hima-zerg-63-v1",
     runtime_mapping_ready=True,
-    effect_verification_kinds=(),
-    controller_capabilities=(),
+    live_worker_ready=True,
+    effect_verification_kinds=("build", "production", "move"),
+    controller_capabilities=(
+        "gas_workers",
+        "supply_emergency",
+        "resource_fallback",
+        "prerequisite_closure",
+    ),
     limitations=(
-        "llm_pysc2_worker_not_implemented",
-        "larva_inject_creep_and_morph_pending",
+        "morph_effect_verification_pending",
+        "inject_and_active_creep_controllers_pending",
     ),
 )
 

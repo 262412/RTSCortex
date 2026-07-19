@@ -803,6 +803,37 @@ def test_all_supported_train_actions_confirm_the_exact_producer_order() -> None:
         assert verdict.evidence["confirmation_kind"] == "producer_order"
 
 
+def test_consumed_zerg_larva_confirms_when_the_same_tag_becomes_an_egg() -> None:
+    spec = PRODUCTION_SPECS["Train_Zergling"]
+    verifier = ActionEffectVerifier(timeout_game_loops=10)
+    command = _production_command(spec)
+    verifier.track(command)
+    verifier.prepare(
+        command.command_id,
+        _production_observation(spec, game_loop=100),
+        None,
+        producer_tag=0xA00,
+    )
+    verifier.accept_primitive(command.command_id, game_loop=101)
+
+    verdict = verifier.observe(
+        _production_observation(
+            spec,
+            game_loop=102,
+            producer_type="Egg",
+        )
+    )[0]
+
+    assert verdict.success is True
+    assert verdict.evidence is not None
+    assert verdict.evidence["producer_tag"] == "0xa00"
+    assert verdict.evidence["producer_type"] == "Larva"
+    assert verdict.evidence["producer_observed_type"] == "Egg"
+    assert verdict.evidence["producer_consumed"] is True
+    assert verdict.evidence["confirmation_kind"] == "producer_morph"
+    assert verdict.evidence["production_order_seen"] is False
+
+
 def test_new_unit_near_the_exact_producer_can_confirm_missed_short_order() -> None:
     spec = PRODUCTION_SPECS["Train_Adept"]
     verifier = ActionEffectVerifier(timeout_game_loops=10)
@@ -1181,6 +1212,7 @@ def _production_observation(
     *,
     game_loop: int,
     producer_tag: int = 0xA00,
+    producer_type: str | None = None,
     producer_position: tuple[float, float] = (20, 20),
     producer_orders: list[int] | None = None,
     producers: list[tuple[int, tuple[float, float], list[int]]] | None = None,
@@ -1199,7 +1231,7 @@ def _production_observation(
         raw_units.append(
             {
                 "tag": tag,
-                "unit_type": spec.producer_type,
+                "unit_type": producer_type or spec.producer_type,
                 "alliance": 1,
                 "is_structure": True,
                 "order_length": len(orders),

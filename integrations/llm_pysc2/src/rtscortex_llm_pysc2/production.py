@@ -28,6 +28,8 @@ class ProductionSpec:
     supply: int
     prerequisites: tuple[str, ...]
     race: str = "protoss"
+    producer_consumed: bool = False
+    intermediate_types: tuple[str, ...] = ()
 
 
 _PRODUCTION_SPECS = (
@@ -181,9 +183,97 @@ _PRODUCTION_SPECS = (
         ("Starport",),
         race="terran",
     ),
+    ProductionSpec(
+        "Train_Drone",
+        "Larva",
+        "Drone",
+        467,
+        503,
+        1342,
+        50,
+        0,
+        1,
+        (),
+        race="zerg",
+        producer_consumed=True,
+        intermediate_types=("Egg",),
+    ),
+    ProductionSpec(
+        "Train_Overlord",
+        "Larva",
+        "Overlord",
+        483,
+        515,
+        1344,
+        100,
+        0,
+        0,
+        (),
+        race="zerg",
+        producer_consumed=True,
+        intermediate_types=("Egg",),
+    ),
+    ProductionSpec(
+        "Train_Queen",
+        "Hatchery",
+        "Queen",
+        486,
+        516,
+        1632,
+        150,
+        0,
+        2,
+        ("SpawningPool",),
+        race="zerg",
+    ),
+    ProductionSpec(
+        "Train_Zergling",
+        "Larva",
+        "Zergling",
+        504,
+        528,
+        1343,
+        50,
+        0,
+        1,
+        ("SpawningPool",),
+        race="zerg",
+        producer_consumed=True,
+        intermediate_types=("Egg",),
+    ),
+    ProductionSpec(
+        "Train_Roach",
+        "Larva",
+        "Roach",
+        489,
+        519,
+        1351,
+        75,
+        25,
+        2,
+        ("RoachWarren",),
+        race="zerg",
+        producer_consumed=True,
+        intermediate_types=("Egg",),
+    ),
+    ProductionSpec(
+        "Train_Hydralisk",
+        "Larva",
+        "Hydralisk",
+        472,
+        507,
+        1345,
+        100,
+        50,
+        2,
+        ("HydraliskDen",),
+        race="zerg",
+        producer_consumed=True,
+        intermediate_types=("Egg",),
+    ),
 )
 
-PRODUCTION_REGISTRY_VERSION = "simple64-multirace-v2"
+PRODUCTION_REGISTRY_VERSION = "simple64-multirace-v3"
 PRODUCTION_SPECS: Mapping[str, ProductionSpec] = MappingProxyType(
     {spec.action_name: spec for spec in _PRODUCTION_SPECS}
 )
@@ -192,7 +282,7 @@ PRODUCTION_SPECS_BY_RACE: Mapping[str, Mapping[str, ProductionSpec]] = MappingPr
         race: MappingProxyType(
             {spec.action_name: spec for spec in _PRODUCTION_SPECS if spec.race == race}
         )
-        for race in ("protoss", "terran")
+        for race in ("protoss", "terran", "zerg")
     }
 )
 PRODUCTION_SPECS_BY_RAW_ORDER: Mapping[int, ProductionSpec] = MappingProxyType(
