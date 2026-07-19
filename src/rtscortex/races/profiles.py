@@ -542,10 +542,10 @@ ZERG_PROFILE_DATA = RaceProfileData(
         "Train_Hydralisk": ("Larva",),
     },
     hima_vocabulary_version="hima-zerg-63-v1",
+    runtime_mapping_ready=True,
     effect_verification_kinds=(),
     controller_capabilities=(),
     limitations=(
-        "runtime_mapping_partial",
         "llm_pysc2_worker_not_implemented",
         "larva_inject_creep_and_morph_pending",
     ),
