@@ -524,14 +524,8 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
             )
             and not final_primitive
         ):
-            self._rtscortex_production_selection_loop = _observation_game_loop(
-                obs.observation
-            )
-        if (
-            not accepted
-            and failure_code == "no_legal_addon_placement"
-            and producer_tag is not None
-        ):
+            self._rtscortex_production_selection_loop = _observation_game_loop(obs.observation)
+        if not accepted and failure_code == "no_legal_addon_placement" and producer_tag is not None:
             rejected_sources = getattr(self, "_rtscortex_rejected_addon_sources", None)
             if rejected_sources is None:
                 rejected_sources = {}
@@ -786,8 +780,7 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
         if next_function_id != 2 or int(self._rtscortex_translation_ordinal) != 1:
             return False
         producer_tag = (
-            self._rtscortex_production_navigation_tag
-            or self._rtscortex_production_source_tag
+            self._rtscortex_production_navigation_tag or self._rtscortex_production_source_tag
         )
         if producer_tag is None:
             return False
@@ -843,8 +836,7 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
         selected_tag: Optional[int] = None
         direct_production_spec = production_spec(action_name)
         available_function_ids = {
-            int(value)
-            for value in _observation_value(obs.observation, "available_actions", ())
+            int(value) for value in _observation_value(obs.observation, "available_actions", ())
         }
         final_function_id = int(self.func_list[0][0])
         consumed_production_is_available = (
@@ -902,9 +894,7 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
                 self._rtscortex_camera_settlement_noop = True
                 return 0, _no_op()
             self._rtscortex_production_selection_attempts += 1
-            self._rtscortex_production_selection_loop = _observation_game_loop(
-                obs.observation
-            )
+            self._rtscortex_production_selection_loop = _observation_game_loop(obs.observation)
             actions = importlib.import_module("pysc2.lib.actions")
             return 9, actions.FUNCTIONS.select_larva()
         producer_tag = self._rtscortex_production_source_tag
@@ -915,8 +905,7 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
             size_screen=int(self.size_screen),
         )
         if position is None or (
-            self._rtscortex_production_selection_attempts
-            >= PRODUCTION_SELECTION_MAX_ATTEMPTS
+            self._rtscortex_production_selection_attempts >= PRODUCTION_SELECTION_MAX_ATTEMPTS
         ):
             self._settle_production_command_failure(
                 action_name,
@@ -938,9 +927,7 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
             self._rtscortex_camera_settlement_noop = True
             return 0, _no_op()
         self._rtscortex_production_selection_attempts += 1
-        self._rtscortex_production_selection_loop = _observation_game_loop(
-            obs.observation
-        )
+        self._rtscortex_production_selection_loop = _observation_game_loop(obs.observation)
         actions = importlib.import_module("pysc2.lib.actions")
         return 2, actions.FUNCTIONS.select_point("select", position)
 
@@ -956,7 +943,9 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
         source_kind = (
             "addon"
             if addon_spec(action_name) is not None
-            else "morph" if morph_spec(action_name) is not None else "production"
+            else "morph"
+            if morph_spec(action_name) is not None
+            else "production"
         )
         source_tag = self._rtscortex_production_source_tag
         ordinal = int(attempt.get("ordinal", 0))
@@ -1243,11 +1232,7 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
         upstream_step = super().step
         action = _run_with_auto_worker_management_guard(
             self.config,
-            blocked=(
-                effect_verification_blocked
-                or watchdog_preempted
-                or runtime_observation_due
-            ),
+            blocked=(effect_verification_blocked or watchdog_preempted or runtime_observation_due),
             upstream_step=lambda: upstream_step(obs),
         )
         self._consume_execution_aborts(obs)
@@ -1381,9 +1366,7 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
             # Anchor the barrier to the observation that confirms PySC2 accepted
             # it, so the final train/add-on primitive cannot run in this same
             # handler invocation with stale feature-action availability.
-            self._pending_primitive_agent._rtscortex_production_selection_loop = (
-                settlement_loop
-            )
+            self._pending_primitive_agent._rtscortex_production_selection_loop = settlement_loop
         self.decision_broker.settle_primitive(
             dispatch,
             success=not action_results,
@@ -1799,11 +1782,7 @@ def _should_block_gas_rebalance(
 ) -> bool:
     """Keep deterministic gas management enabled after Runtime recovers."""
 
-    return (
-        effect_verification_blocked
-        or observation_watchdog_active
-        or runtime_observation_due
-    )
+    return effect_verification_blocked or observation_watchdog_active or runtime_observation_due
 
 
 def _runtime_observation_is_due(
@@ -1981,10 +1960,7 @@ def _rebind_builder_to_selected_worker(main_agent: Any, observation: Any) -> boo
     unit_tags = None if team is None else team.get("unit_tags")
     if not isinstance(unit_tags, list) or original_tag not in unit_tags:
         return False
-    unit_tags[:] = [
-        selected_tag if int(tag) == original_tag else int(tag)
-        for tag in unit_tags
-    ]
+    unit_tags[:] = [selected_tag if int(tag) == original_tag else int(tag) for tag in unit_tags]
     builder.team_unit_tag_curr = selected_tag
     builder._rtscortex_last_builder_rebind = (original_tag, selected_tag)
     return True
@@ -2382,9 +2358,7 @@ def _translate_worker_owned_zero_argument_primitive(agent: Any, obs: Any) -> tup
     available = set(_observation_value(obs.observation, "available_actions", ()))
     reason: Optional[str] = None
     emitted_id = int(requested_id)
-    requested_name = str(
-        getattr(function, "name", getattr(function, "__name__", requested_id))
-    )
+    requested_name = str(getattr(function, "name", getattr(function, "__name__", requested_id)))
     if emitted_id not in available:
         reason = f"function {requested_name} is not available"
     elif requested_arguments:
@@ -2424,9 +2398,7 @@ def _translate_worker_owned_near_build_primitive(agent: Any, obs: Any) -> tuple[
     if emitted_id not in available:
         reason = f"function {getattr(function, 'name', emitted_id)} is not available"
     elif len(requested_arguments) != 2 or not isinstance(requested_arguments[1], int):
-        reason = (
-            f"Near build expected queue flag and anchor tag, got {requested_arguments!r}"
-        )
+        reason = f"Near build expected queue flag and anchor tag, got {requested_arguments!r}"
     else:
         queue = requested_arguments[0]
         queue = "now" if agent.first_action and queue in {"now", "queued"} else queue
@@ -2798,9 +2770,7 @@ def _resolve_translator_compatible_build_position(
 
     action_name = str(action.get("name", ""))
     excluded = set(excluded_positions)
-    attempts = (
-        len(build_screen_candidates(observation, action_name, unit_names=unit_names)) + 1
-    )
+    attempts = len(build_screen_candidates(observation, action_name, unit_names=unit_names)) + 1
     for _ in range(attempts):
         position = _resolve_build_action_position(
             action,

@@ -1069,9 +1069,7 @@ def transport_noop_actor_bypass_patch_is_applied(project_root: Path) -> bool:
     source = project_root / "third_party/LLM-PySC2/llm_pysc2/agents/llm_pysc2_agent_main.py"
     if not source.is_file():
         return False
-    return "_rtscortex_transport_noop_without_actor_selection" in source.read_text(
-        encoding="utf-8"
-    )
+    return "_rtscortex_transport_noop_without_actor_selection" in source.read_text(encoding="utf-8")
 
 
 def gather_screen_target_patch_is_applied(project_root: Path) -> bool:

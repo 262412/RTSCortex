@@ -33,41 +33,99 @@ from rtscortex.policy.subagents import HIMA_RACE_SPECS
 from rtscortex.races import race_profile
 
 _OFFICIAL_TERRAN_ACTIONS = (
-    *((action_id, name, "train") for action_id, name in enumerate(
-        (
-            "SCV", "MULE", "Marine", "Reaper", "Marauder", "Ghost", "Hellion",
-            "WidowMine", "Cyclone", "SiegeTank", "Thor", "VikingFighter", "Medivac",
-            "Liberator", "Banshee", "Raven", "Battlecruiser",
-        ),
-        start=100,
-    )),
-    *((action_id, name, "build") for action_id, name in enumerate(
-        (
-            "CommandCenter", "Refinery", "OrbitalCommand", "PlanetaryFortress",
-            "Barracks", "Factory", "Starport", "BarracksReactor", "BarracksTechLab",
-            "FactoryReactor", "FactoryTechLab", "StarportReactor", "StarportTechLab",
-            "SupplyDepot", "EngineeringBay", "Bunker", "MissileTurret", "SensorTower",
-            "GhostAcademy", "Armory", "FusionCore",
-        ),
-        start=200,
-    )),
-    *((action_id, name, "research") for action_id, name in enumerate(
-        (
-            "TerranInfantryWeaponsLevel1", "TerranInfantryWeaponsLevel2",
-            "TerranInfantryWeaponsLevel3", "TerranInfantryArmorsLevel1",
-            "TerranInfantryArmorsLevel2", "TerranInfantryArmorsLevel3",
-            "TerranVehicleWeaponsLevel1", "TerranVehicleWeaponsLevel2",
-            "TerranVehicleWeaponsLevel3", "TerranShipWeaponsLevel1",
-            "TerranShipWeaponsLevel2", "TerranShipWeaponsLevel3",
-            "TerranVehicleAndShipArmorsLevel1", "TerranVehicleAndShipArmorsLevel2",
-            "TerranVehicleAndShipArmorsLevel3", "TerranBuildingArmor", "HiSecAutoTracking",
-            "Stimpack", "ShieldWall", "PunisherGrenades", "PersonalCloaking", "SmartServos",
-            "HighCapacityBarrels", "DrillClaws", "CycloneLockOnDamageUpgrade",
-            "MedivacIncreaseSpeedBoost", "LiberatorAGRangeUpgrade", "BansheeCloak",
-            "BansheeSpeed", "InterferenceMatrix", "BattlecruiserEnableSpecializations",
-        ),
-        start=300,
-    )),
+    *(
+        (action_id, name, "train")
+        for action_id, name in enumerate(
+            (
+                "SCV",
+                "MULE",
+                "Marine",
+                "Reaper",
+                "Marauder",
+                "Ghost",
+                "Hellion",
+                "WidowMine",
+                "Cyclone",
+                "SiegeTank",
+                "Thor",
+                "VikingFighter",
+                "Medivac",
+                "Liberator",
+                "Banshee",
+                "Raven",
+                "Battlecruiser",
+            ),
+            start=100,
+        )
+    ),
+    *(
+        (action_id, name, "build")
+        for action_id, name in enumerate(
+            (
+                "CommandCenter",
+                "Refinery",
+                "OrbitalCommand",
+                "PlanetaryFortress",
+                "Barracks",
+                "Factory",
+                "Starport",
+                "BarracksReactor",
+                "BarracksTechLab",
+                "FactoryReactor",
+                "FactoryTechLab",
+                "StarportReactor",
+                "StarportTechLab",
+                "SupplyDepot",
+                "EngineeringBay",
+                "Bunker",
+                "MissileTurret",
+                "SensorTower",
+                "GhostAcademy",
+                "Armory",
+                "FusionCore",
+            ),
+            start=200,
+        )
+    ),
+    *(
+        (action_id, name, "research")
+        for action_id, name in enumerate(
+            (
+                "TerranInfantryWeaponsLevel1",
+                "TerranInfantryWeaponsLevel2",
+                "TerranInfantryWeaponsLevel3",
+                "TerranInfantryArmorsLevel1",
+                "TerranInfantryArmorsLevel2",
+                "TerranInfantryArmorsLevel3",
+                "TerranVehicleWeaponsLevel1",
+                "TerranVehicleWeaponsLevel2",
+                "TerranVehicleWeaponsLevel3",
+                "TerranShipWeaponsLevel1",
+                "TerranShipWeaponsLevel2",
+                "TerranShipWeaponsLevel3",
+                "TerranVehicleAndShipArmorsLevel1",
+                "TerranVehicleAndShipArmorsLevel2",
+                "TerranVehicleAndShipArmorsLevel3",
+                "TerranBuildingArmor",
+                "HiSecAutoTracking",
+                "Stimpack",
+                "ShieldWall",
+                "PunisherGrenades",
+                "PersonalCloaking",
+                "SmartServos",
+                "HighCapacityBarrels",
+                "DrillClaws",
+                "CycloneLockOnDamageUpgrade",
+                "MedivacIncreaseSpeedBoost",
+                "LiberatorAGRangeUpgrade",
+                "BansheeCloak",
+                "BansheeSpeed",
+                "InterferenceMatrix",
+                "BattlecruiserEnableSpecializations",
+            ),
+            start=300,
+        )
+    ),
 )
 
 
@@ -104,19 +162,26 @@ def test_official_hima_race_vocabulary_contract(
 def test_official_hima_race_tokens_are_not_cross_resolved() -> None:
     assert HIMA_TERRAN_ACTIONS[0].upstream_name == "SCV"
     assert HIMA_ZERG_ACTIONS[0].upstream_name == "Drone"
-    assert HIMAProposalParser(race="terran").parse('Actions: ["SCV", "SupplyDepot"]').steps[
-        1
-    ].canonical_action == "BUILD SUPPLYDEPOT"
+    assert (
+        HIMAProposalParser(race="terran")
+        .parse('Actions: ["SCV", "SupplyDepot"]')
+        .steps[1]
+        .canonical_action
+        == "BUILD SUPPLYDEPOT"
+    )
     proposal = HIMAProposalParser(race="zerg").parse('Actions: ["SCV"]')
     assert proposal.steps == []
     assert proposal.diagnostics[0].code == "unknown_action_token"
 
 
 def test_official_hima_terran_vocabulary_matches_pinned_constants_exactly() -> None:
-    assert tuple(
-        (action.upstream_action_id, action.upstream_name, action.category)
-        for action in HIMA_TERRAN_ACTIONS
-    ) == _OFFICIAL_TERRAN_ACTIONS
+    assert (
+        tuple(
+            (action.upstream_action_id, action.upstream_name, action.category)
+            for action in HIMA_TERRAN_ACTIONS
+        )
+        == _OFFICIAL_TERRAN_ACTIONS
+    )
 
 
 def test_terran_observation_adapter_keeps_official_five_fields() -> None:

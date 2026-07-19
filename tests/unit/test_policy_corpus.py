@@ -207,11 +207,7 @@ def test_zerg_phase_classification_separates_technology_and_army_production() ->
         }
     )
     with_roach_frontier = observation.model_copy(
-        update={
-            "available_actions": [
-                AvailableAction(name="Train_Roach", actor_scopes=["larva"])
-            ]
-        }
+        update={"available_actions": [AvailableAction(name="Train_Roach", actor_scopes=["larva"])]}
     )
     with_idle_spawning_pool = observation.model_copy(
         update={
@@ -232,13 +228,9 @@ def test_zerg_phase_classification_separates_technology_and_army_production() ->
     )
 
     assert _observation_phase(with_lair, RaceId.ZERG) is PolicyFixtureStratum.TECHNOLOGY
+    assert _observation_phase(with_roach_frontier, RaceId.ZERG) is PolicyFixtureStratum.PRODUCTION
     assert (
-        _observation_phase(with_roach_frontier, RaceId.ZERG)
-        is PolicyFixtureStratum.PRODUCTION
-    )
-    assert (
-        _observation_phase(with_idle_spawning_pool, RaceId.ZERG)
-        is PolicyFixtureStratum.PRODUCTION
+        _observation_phase(with_idle_spawning_pool, RaceId.ZERG) is PolicyFixtureStratum.PRODUCTION
     )
 
 

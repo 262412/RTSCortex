@@ -258,14 +258,12 @@ def _unit_orders(unit: Any) -> tuple[int, ...]:
     explicit = _value(unit, "orders", None)
     if explicit is not None:
         values = (
-            int(_value(order, "ability_id", _value(order, "order_id", order)))
-            for order in explicit
+            int(_value(order, "ability_id", _value(order, "order_id", order))) for order in explicit
         )
         return tuple(_normalized_order_id(value) for value in values)
     count = min(max(int(_value(unit, "order_length", 0)), 0), 4)
     return tuple(
-        _normalized_order_id(int(_value(unit, f"order_id_{index}", 0)))
-        for index in range(count)
+        _normalized_order_id(int(_value(unit, f"order_id_{index}", 0))) for index in range(count)
     )
 
 

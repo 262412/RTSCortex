@@ -63,9 +63,7 @@ def test_build_load_and_verify_balanced_corpus(tmp_path: Path) -> None:
     assert first_result.fixtures_path.read_bytes() == second_result.fixtures_path.read_bytes()
     assert first_result.manifest.fixtures_sha256 == second_result.manifest.fixtures_sha256
     assert first_result.manifest.race is RaceId.PROTOSS
-    assert all(
-        fixture.fixture_id.startswith("test-protoss-v0.2:") for fixture in fixtures
-    )
+    assert all(fixture.fixture_id.startswith("test-protoss-v0.2:") for fixture in fixtures)
 
 
 def test_verifier_detects_tampered_fixture_file(tmp_path: Path) -> None:

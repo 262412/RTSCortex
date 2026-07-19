@@ -62,9 +62,7 @@ class ScriptedMacroPolicyClient:
         objective: str,
     ) -> MacroPolicyProposal:
         raw_output = f"Reason: {objective} Actions: {json.dumps(actions)}"
-        return self._parser.parse(raw_output).model_copy(
-            update={"strategic_objective": objective}
-        )
+        return self._parser.parse(raw_output).model_copy(update={"strategic_objective": objective})
 
     async def health(self) -> HIMALiveHealth:
         if self._closed:
@@ -101,9 +99,7 @@ class ScriptedMacroPolicyClient:
             self._completed_prefix += 1
         remaining = self._actions[self._completed_prefix :]
         proposal = (
-            self._parse_actions(remaining, self._objective)
-            if remaining
-            else self._empty_proposal
+            self._parse_actions(remaining, self._objective) if remaining else self._empty_proposal
         )
         snapshot = self._adapter.adapt_context(context)
         observation = context.observation

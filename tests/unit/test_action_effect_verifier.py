@@ -800,14 +800,10 @@ def test_queen_creep_tumor_confirms_a_new_structure_at_the_selected_position() -
         structures=["Nexus", "CreepTumorQueen"],
         builder_orders=[189],
     )
-    tumor = next(
-        unit for unit in current["raw_units"] if unit["unit_type"] == "CreepTumorQueen"
-    )
+    tumor = next(unit for unit in current["raw_units"] if unit["unit_type"] == "CreepTumorQueen")
     tumor["x"] = 31.875
     tumor["y"] = 30
-    feature_tumor = next(
-        unit for unit in current["feature_units"] if unit["tag"] == tumor["tag"]
-    )
+    feature_tumor = next(unit for unit in current["feature_units"] if unit["tag"] == tumor["tag"])
     feature_tumor["x"] = 65
     feature_tumor["y"] = 65
 
@@ -925,9 +921,7 @@ def test_consumed_zerg_larva_rebinds_to_the_unique_cocoon_tag() -> None:
 
 
 def test_all_larva_production_uses_the_pinned_pysc2_cocoon_name() -> None:
-    larva_specs = [
-        spec for spec in PRODUCTION_SPECS.values() if spec.producer_type == "Larva"
-    ]
+    larva_specs = [spec for spec in PRODUCTION_SPECS.values() if spec.producer_type == "Larva"]
 
     assert len(larva_specs) == 5
     assert {spec.intermediate_types for spec in larva_specs} == {("Cocoon",)}

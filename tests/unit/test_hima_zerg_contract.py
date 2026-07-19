@@ -31,38 +31,93 @@ from rtscortex.policy.subagents import HIMA_RACE_SPECS
 from rtscortex.races import race_profile
 
 _OFFICIAL_ZERG_ACTIONS = (
-    *((action_id, name, "train") for action_id, name in enumerate(
-        (
-            "Drone", "Overlord", "Zergling", "Queen", "Roach", "Baneling", "Ravager",
-            "Overseer", "Hydralisk", "Mutalisk", "Corruptor", "Infestor", "SwarmHostMP",
-            "LurkerMP", "Viper", "BroodLord", "Ultralisk",
-        ),
-        start=100,
-    )),
-    *((action_id, name, "build") for action_id, name in enumerate(
-        (
-            "Hatchery", "Extractor", "Lair", "Hive", "SpawningPool",
-            "EvolutionChamber", "RoachWarren", "BanelingNest", "SpineCrawler",
-            "SporeCrawler", "HydraliskDen", "InfestationPit", "LurkerDenMP", "Spire",
-            "NydusNetwork", "UltraliskCavern", "GreaterSpire",
-        ),
-        start=200,
-    )),
-    *((action_id, name, "research") for action_id, name in enumerate(
-        (
-            "ZergMeleeWeaponsLevel1", "ZergMeleeWeaponsLevel2", "ZergMeleeWeaponsLevel3",
-            "ZergMissileWeaponsLevel1", "ZergMissileWeaponsLevel2",
-            "ZergMissileWeaponsLevel3", "ZergGroundArmorsLevel1",
-            "ZergGroundArmorsLevel2", "ZergGroundArmorsLevel3",
-            "ZergFlyerWeaponsLevel1", "ZergFlyerWeaponsLevel2", "ZergFlyerWeaponsLevel3",
-            "ZergFlyerArmorsLevel1", "ZergFlyerArmorsLevel2", "ZergFlyerArmorsLevel3",
-            "Burrow", "overlordspeed", "zerglingmovementspeed", "zerglingattackspeed",
-            "GlialReconstitution", "TunnelingClaws", "CentrificalHooks",
-            "EvolveMuscularAugments", "EvolveGroovedSpines", "NeuralParasite",
-            "DiggingClaws", "LurkerRange", "ChitinousPlating", "AnabolicSynthesis",
-        ),
-        start=300,
-    )),
+    *(
+        (action_id, name, "train")
+        for action_id, name in enumerate(
+            (
+                "Drone",
+                "Overlord",
+                "Zergling",
+                "Queen",
+                "Roach",
+                "Baneling",
+                "Ravager",
+                "Overseer",
+                "Hydralisk",
+                "Mutalisk",
+                "Corruptor",
+                "Infestor",
+                "SwarmHostMP",
+                "LurkerMP",
+                "Viper",
+                "BroodLord",
+                "Ultralisk",
+            ),
+            start=100,
+        )
+    ),
+    *(
+        (action_id, name, "build")
+        for action_id, name in enumerate(
+            (
+                "Hatchery",
+                "Extractor",
+                "Lair",
+                "Hive",
+                "SpawningPool",
+                "EvolutionChamber",
+                "RoachWarren",
+                "BanelingNest",
+                "SpineCrawler",
+                "SporeCrawler",
+                "HydraliskDen",
+                "InfestationPit",
+                "LurkerDenMP",
+                "Spire",
+                "NydusNetwork",
+                "UltraliskCavern",
+                "GreaterSpire",
+            ),
+            start=200,
+        )
+    ),
+    *(
+        (action_id, name, "research")
+        for action_id, name in enumerate(
+            (
+                "ZergMeleeWeaponsLevel1",
+                "ZergMeleeWeaponsLevel2",
+                "ZergMeleeWeaponsLevel3",
+                "ZergMissileWeaponsLevel1",
+                "ZergMissileWeaponsLevel2",
+                "ZergMissileWeaponsLevel3",
+                "ZergGroundArmorsLevel1",
+                "ZergGroundArmorsLevel2",
+                "ZergGroundArmorsLevel3",
+                "ZergFlyerWeaponsLevel1",
+                "ZergFlyerWeaponsLevel2",
+                "ZergFlyerWeaponsLevel3",
+                "ZergFlyerArmorsLevel1",
+                "ZergFlyerArmorsLevel2",
+                "ZergFlyerArmorsLevel3",
+                "Burrow",
+                "overlordspeed",
+                "zerglingmovementspeed",
+                "zerglingattackspeed",
+                "GlialReconstitution",
+                "TunnelingClaws",
+                "CentrificalHooks",
+                "EvolveMuscularAugments",
+                "EvolveGroovedSpines",
+                "NeuralParasite",
+                "DiggingClaws",
+                "LurkerRange",
+                "ChitinousPlating",
+                "AnabolicSynthesis",
+            ),
+            start=300,
+        )
+    ),
 )
 
 
@@ -124,10 +179,13 @@ def _zerg_observation(*, available: bool = False) -> ObservationEnvelope:
 
 
 def test_official_hima_zerg_vocabulary_matches_pinned_constants_exactly() -> None:
-    assert tuple(
-        (action.upstream_action_id, action.upstream_name, action.category)
-        for action in HIMA_ZERG_ACTIONS
-    ) == _OFFICIAL_ZERG_ACTIONS
+    assert (
+        tuple(
+            (action.upstream_action_id, action.upstream_name, action.category)
+            for action in HIMA_ZERG_ACTIONS
+        )
+        == _OFFICIAL_ZERG_ACTIONS
+    )
 
 
 def test_zerg_observation_adapter_keeps_official_five_fields() -> None:
@@ -178,9 +236,7 @@ def test_zerg_parser_does_not_fuzzy_match_unknown_tokens() -> None:
     proposal = HIMAProposalParser(race="zerg").parse('Actions: ["Zerglings"]')
 
     assert proposal.steps == []
-    assert [diagnostic.code for diagnostic in proposal.diagnostics] == [
-        "unknown_action_token"
-    ]
+    assert [diagnostic.code for diagnostic in proposal.diagnostics] == ["unknown_action_token"]
 
 
 def test_zerg_mapper_uses_zerg_runtime_profile() -> None:

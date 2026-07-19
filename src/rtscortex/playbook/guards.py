@@ -145,8 +145,7 @@ def _evaluate(
     required = {
         action
         for rule in applicable
-        if rule.effect is PlaybookRuleEffect.REQUIRE
-        and rule.strength is PlaybookRuleStrength.HARD
+        if rule.effect is PlaybookRuleEffect.REQUIRE and rule.strength is PlaybookRuleStrength.HARD
         for action in rule.action_names
     }
     blocked = False

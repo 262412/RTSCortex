@@ -358,15 +358,18 @@ class CommandLineage(ContractModel):
     situation_assessment_id: str | None = None
     macro_plan_id: str | None = None
     strategic_intent_id: str | None = None
-    responsibility: Literal[
-        "economy",
-        "technology",
-        "production",
-        "defense",
-        "offense",
-        "focus_fire",
-        "retreat",
-    ] | None = None
+    responsibility: (
+        Literal[
+            "economy",
+            "technology",
+            "production",
+            "defense",
+            "offense",
+            "focus_fire",
+            "retreat",
+        ]
+        | None
+    ) = None
     arbiter_mode: Literal["disabled", "shadow", "active"] = "disabled"
     intent_decision: Literal["selected", "deferred", "rejected", "preempted"] | None = None
     playbook_rule_ids: tuple[str, ...] = ()

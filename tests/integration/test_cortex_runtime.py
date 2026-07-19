@@ -370,9 +370,7 @@ def test_tactical_shadow_records_without_changing_active_action(tmp_path: Path) 
         state=SC2State(
             economy=EconomyState(army_supply=4, supply_used=16, supply_cap=23),
             own_units=[UnitState(unit_id="0x10", unit_type="Adept", alliance="self")],
-            visible_enemies=[
-                UnitState(unit_id="0x20", unit_type="Zergling", alliance="enemy")
-            ],
+            visible_enemies=[UnitState(unit_id="0x20", unit_type="Zergling", alliance="enemy")],
         ),
         available_actions=[
             AvailableAction(
@@ -673,9 +671,7 @@ def test_missing_technology_prerequisite_is_closed_by_technology_agent(
         await runtime.tick(initial)
         for _ in range(5):
             await asyncio.sleep(0)
-        waiting = await runtime.tick(
-            initial.model_copy(update={"step_id": 1, "game_loop": 1})
-        )
+        waiting = await runtime.tick(initial.model_copy(update={"step_id": 1, "game_loop": 1}))
         assert waiting.commands == []
         assert runtime._macro_plan is not None
         assert runtime._macro_plan_frozen is False
@@ -683,18 +679,12 @@ def test_missing_technology_prerequisite_is_closed_by_technology_agent(
 
         batch = await runtime.tick(gateway_complete)
 
-        assert [command.name for command in batch.commands] == [
-            "Build_CyberneticsCore_Screen"
-        ]
+        assert [command.name for command in batch.commands] == ["Build_CyberneticsCore_Screen"]
         assert runtime._macro_plan.steps[0].semantic_action == "BUILD STARGATE"
         assert runtime._macro_plan.steps[0].status.value == "deferred"
-        preemptions = store.events_of_type(
-            "cortex-run", "episode-1", "macro_frontier_preempted"
-        )
+        preemptions = store.events_of_type("cortex-run", "episode-1", "macro_frontier_preempted")
         assert preemptions[-1].payload["reason"] == "prerequisite_closure"
-        role_events = store.events_of_type(
-            "cortex-run", "episode-1", "role_intent_emitted"
-        )
+        role_events = store.events_of_type("cortex-run", "episode-1", "role_intent_emitted")
         assert role_events[-1].payload["intent"]["role"] == "technology"
         lineage = store.events_of_type("cortex-run", "episode-1", "command_lineage")
         assert lineage[-1].payload["macro_step_ordinal"] is None
@@ -948,9 +938,7 @@ def test_gas_blocked_stargate_uses_legal_zealot_fallback(tmp_path: Path) -> None
 def test_terran_gas_blocked_addon_builds_first_refinery(tmp_path: Path) -> None:
     base = _config(tmp_path)
     config = base.model_copy(
-        update={
-            "environment": base.environment.model_copy(update={"agent_race": "terran"})
-        }
+        update={"environment": base.environment.model_copy(update={"agent_race": "terran"})}
     )
     runtime = CortexRuntimeEngine(
         config=config,
@@ -989,9 +977,7 @@ def test_terran_gas_blocked_addon_builds_first_refinery(tmp_path: Path) -> None:
             )
         ],
     )
-    proposal = HIMAProposalParser(race="terran").parse(
-        "Actions: ['BarracksReactor']"
-    )
+    proposal = HIMAProposalParser(race="terran").parse("Actions: ['BarracksReactor']")
     blocked = PolicyActionAssessment(
         ordinal=0,
         source_action="BUILD BARRACKSREACTOR",

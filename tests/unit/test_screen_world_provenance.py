@@ -532,9 +532,10 @@ def test_agent_resamples_screen_build_after_translator_rejects_candidate(
     assert broker.claims == 0
     assert agent._rtscortex_translation_ordinal == 0
     assert agent.func_list
-    assert tuple(attempted_positions[0]) in agent._rtscortex_rejected_build_positions[
-        "Build_Pylon_Screen"
-    ]
+    assert (
+        tuple(attempted_positions[0])
+        in agent._rtscortex_rejected_build_positions["Build_Pylon_Screen"]
+    )
 
     second = agent.get_func(SimpleNamespace(observation=observation))
 

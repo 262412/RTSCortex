@@ -223,9 +223,7 @@ class HIMAEnsemblePolicyClient:
             refreshed_member_ids=tuple(
                 f"hima-{self.race}-{cluster}" for cluster in refreshed_clusters
             ),
-            max_member_age_game_loops=max(
-                member.source_age_game_loops for member in members
-            ),
+            max_member_age_game_loops=max(member.source_age_game_loops for member in members),
             selected_member_id=selected.member_id,
             selected_source_age_game_loops=selected.source_age_game_loops,
             selected=_rebind_selected_response(
@@ -264,9 +262,7 @@ class HIMAEnsemblePolicyClient:
         grouped_responses = await asyncio.gather(
             *(propose_group(group) for group in self.execution_groups)
         )
-        return {
-            cluster: response for group in grouped_responses for cluster, response in group
-        }
+        return {cluster: response for group in grouped_responses for cluster, response in group}
 
     async def close(self) -> None:
         await asyncio.gather(

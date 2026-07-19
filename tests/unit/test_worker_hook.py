@@ -1212,9 +1212,7 @@ def test_zerg_builder_refresh_keeps_a_live_builder() -> None:
         decision_broker=SimpleNamespace(extractor=SimpleNamespace(unit_names={104: "Drone"})),
         nexus_info_dict={},
     )
-    observation = SimpleNamespace(
-        raw_units=[SimpleNamespace(tag=10, alliance=1, unit_type=104)]
-    )
+    observation = SimpleNamespace(raw_units=[SimpleNamespace(tag=10, alliance=1, unit_type=104)])
 
     assert _refresh_consumed_zerg_builder(main_agent, observation) is False
     assert team["unit_tags"] == [10]
@@ -2698,12 +2696,15 @@ def test_zerg_build_candidates_require_a_reachable_builder_approach() -> None:
 
     assert candidates
     assert all(x < 64 for x, _y in candidates)
-    assert build_screen_candidates(
-        observation,
-        "Build_EvolutionChamber_Screen",
-        unit_names=unit_names,
-        builder_tags=[0xBAD],
-    ) == []
+    assert (
+        build_screen_candidates(
+            observation,
+            "Build_EvolutionChamber_Screen",
+            unit_names=unit_names,
+            builder_tags=[0xBAD],
+        )
+        == []
+    )
 
 
 def test_zerg_queen_controller_candidates_require_uninjected_townhall_and_creep() -> None:
@@ -2754,11 +2755,14 @@ def test_zerg_queen_controller_candidates_require_uninjected_townhall_and_creep(
     )
 
     hatchery.buff_ids = [INJECT_TARGET_BUFF_ID]
-    assert semantic_argument_candidates(
-        observation,
-        "Effect_InjectLarva",
-        unit_names=unit_names,
-    ) == []
+    assert (
+        semantic_argument_candidates(
+            observation,
+            "Effect_InjectLarva",
+            unit_names=unit_names,
+        )
+        == []
+    )
     creep[65][65] = 0
     assert not screen_build_position_is_legal(
         observation,
@@ -5069,11 +5073,14 @@ def test_worker_anchors_production_selection_barrier_to_acceptance_observation()
     main_agent._settle_previous_primitive(timestep)
 
     assert upstream_agent._rtscortex_production_selection_loop == 3127
-    assert RTSCortexLLMAgent._wait_for_production_selection(
-        upstream_agent,
-        "Build_BarracksTechLab",
-        timestep,
-    ) is True
+    assert (
+        RTSCortexLLMAgent._wait_for_production_selection(
+            upstream_agent,
+            "Build_BarracksTechLab",
+            timestep,
+        )
+        is True
+    )
     assert calls == [(dispatch, True, None, 3127)]
     assert main_agent._pending_primitive is None
     assert main_agent._pending_primitive_agent is None

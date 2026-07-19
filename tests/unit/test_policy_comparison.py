@@ -226,9 +226,7 @@ def test_zerg_corpus_selects_zerg_specialists_and_race_provenance(
         "hima-zerg-c",
         "hiernet-sc2-protoss",
     ]
-    provenance = json.loads(
-        (output_dir / "candidates/hima-zerg-a/provenance.json").read_text()
-    )
+    provenance = json.loads((output_dir / "candidates/hima-zerg-a/provenance.json").read_text())
     assert provenance["vocabulary_version"] == "hima-zerg-63-v1"
     assert provenance["parser_version"] == "hima-zerg-parser-v2"
     report = artifacts.reports.report_path.read_text()
@@ -272,9 +270,7 @@ def test_comparison_worker_uses_the_manifest_race_for_zerg(
 
     comparison_worker_module.run_worker(request_path, response_path)
 
-    comparison = PolicyShadowComparison.model_validate_json(
-        response_path.read_text()
-    )
+    comparison = PolicyShadowComparison.model_validate_json(response_path.read_text())
     assert comparison.candidate_ids == ["hima-zerg-a"]
     assert len(comparison.records) == 48
     assert all(record.spec.race == "Zerg" for record in comparison.records)

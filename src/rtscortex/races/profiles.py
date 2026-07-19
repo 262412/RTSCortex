@@ -462,9 +462,7 @@ ZERG_PROGRESS_ACTION_SPECS: tuple[ProgressActionSpec, ...] = (
         GoalRequirementKind.STRUCTURE,
         "SporeCrawler",
         minerals=75,
-        prerequisites=(
-            StatePrerequisite(GoalRequirementKind.STRUCTURE, "EvolutionChamber"),
-        ),
+        prerequisites=(StatePrerequisite(GoalRequirementKind.STRUCTURE, "EvolutionChamber"),),
     ),
     ProgressActionSpec(
         "Train_Queen",
@@ -569,9 +567,7 @@ ZERG_PROFILE_DATA = RaceProfileData(
         "queen_larva_inject",
         "queen_creep_tumor",
     ),
-    limitations=(
-        "creep_tumor_chain_spread_pending",
-    ),
+    limitations=("creep_tumor_chain_spread_pending",),
 )
 
 

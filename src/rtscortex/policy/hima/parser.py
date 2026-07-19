@@ -89,9 +89,7 @@ class HIMAProposalParser:
                 extraction_diagnostics.append(
                     ParseDiagnostic(
                         code="truncated_action_prefix_recovered",
-                        message=(
-                            "Recovered complete action items before the truncated list tail."
-                        ),
+                        message=("Recovered complete action items before the truncated list tail."),
                     )
                 )
         diagnostics.extend(extraction_diagnostics)

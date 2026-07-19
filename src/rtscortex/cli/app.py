@@ -111,9 +111,7 @@ def _live_worker_environment(
         "RTSCORTEX_PENDING_PLAN_STEP_DELAY_SECONDS": str(
             config.environment.pending_plan_step_delay_seconds
         ),
-        "RTSCORTEX_PAUSE_UNTIL_FIRST_PLAN": str(
-            config.environment.pause_until_first_plan
-        ).lower(),
+        "RTSCORTEX_PAUSE_UNTIL_FIRST_PLAN": str(config.environment.pause_until_first_plan).lower(),
         "RTSCORTEX_RUNTIME_REQUEST_TIMEOUT_SECONDS": str(
             config.runtime.planner_timeout_seconds + 5.0
         ),

@@ -12,76 +12,189 @@ from rtscortex.policy.hima.vocabulary import HIMA_PROTOSS_ACTIONS
 HIMARace = Literal["protoss", "terran", "zerg"]
 
 _TERRAN_ACTIONS: tuple[tuple[int, str, str], ...] = (
-    *((action_id, name, "train") for action_id, name in enumerate(
-        (
-            "SCV", "MULE", "Marine", "Reaper", "Marauder", "Ghost", "Hellion",
-            "WidowMine", "Cyclone", "SiegeTank", "Thor", "VikingFighter", "Medivac",
-            "Liberator", "Banshee", "Raven", "Battlecruiser",
-        ),
-        start=100,
-    )),
-    *((action_id, name, "build") for action_id, name in enumerate(
-        (
-            "CommandCenter", "Refinery", "OrbitalCommand", "PlanetaryFortress",
-            "Barracks", "Factory", "Starport", "BarracksReactor", "BarracksTechLab",
-            "FactoryReactor", "FactoryTechLab", "StarportReactor", "StarportTechLab",
-            "SupplyDepot", "EngineeringBay", "Bunker", "MissileTurret", "SensorTower",
-            "GhostAcademy", "Armory", "FusionCore",
-        ),
-        start=200,
-    )),
-    *((action_id, name, "research") for action_id, name in enumerate(
-        (
-            "TerranInfantryWeaponsLevel1", "TerranInfantryWeaponsLevel2",
-            "TerranInfantryWeaponsLevel3", "TerranInfantryArmorsLevel1",
-            "TerranInfantryArmorsLevel2", "TerranInfantryArmorsLevel3",
-            "TerranVehicleWeaponsLevel1", "TerranVehicleWeaponsLevel2",
-            "TerranVehicleWeaponsLevel3", "TerranShipWeaponsLevel1",
-            "TerranShipWeaponsLevel2", "TerranShipWeaponsLevel3",
-            "TerranVehicleAndShipArmorsLevel1", "TerranVehicleAndShipArmorsLevel2",
-            "TerranVehicleAndShipArmorsLevel3", "TerranBuildingArmor", "HiSecAutoTracking",
-            "Stimpack", "ShieldWall", "PunisherGrenades", "PersonalCloaking", "SmartServos",
-            "HighCapacityBarrels", "DrillClaws", "CycloneLockOnDamageUpgrade",
-            "MedivacIncreaseSpeedBoost", "LiberatorAGRangeUpgrade", "BansheeCloak",
-            "BansheeSpeed", "InterferenceMatrix", "BattlecruiserEnableSpecializations",
-        ),
-        start=300,
-    )),
+    *(
+        (action_id, name, "train")
+        for action_id, name in enumerate(
+            (
+                "SCV",
+                "MULE",
+                "Marine",
+                "Reaper",
+                "Marauder",
+                "Ghost",
+                "Hellion",
+                "WidowMine",
+                "Cyclone",
+                "SiegeTank",
+                "Thor",
+                "VikingFighter",
+                "Medivac",
+                "Liberator",
+                "Banshee",
+                "Raven",
+                "Battlecruiser",
+            ),
+            start=100,
+        )
+    ),
+    *(
+        (action_id, name, "build")
+        for action_id, name in enumerate(
+            (
+                "CommandCenter",
+                "Refinery",
+                "OrbitalCommand",
+                "PlanetaryFortress",
+                "Barracks",
+                "Factory",
+                "Starport",
+                "BarracksReactor",
+                "BarracksTechLab",
+                "FactoryReactor",
+                "FactoryTechLab",
+                "StarportReactor",
+                "StarportTechLab",
+                "SupplyDepot",
+                "EngineeringBay",
+                "Bunker",
+                "MissileTurret",
+                "SensorTower",
+                "GhostAcademy",
+                "Armory",
+                "FusionCore",
+            ),
+            start=200,
+        )
+    ),
+    *(
+        (action_id, name, "research")
+        for action_id, name in enumerate(
+            (
+                "TerranInfantryWeaponsLevel1",
+                "TerranInfantryWeaponsLevel2",
+                "TerranInfantryWeaponsLevel3",
+                "TerranInfantryArmorsLevel1",
+                "TerranInfantryArmorsLevel2",
+                "TerranInfantryArmorsLevel3",
+                "TerranVehicleWeaponsLevel1",
+                "TerranVehicleWeaponsLevel2",
+                "TerranVehicleWeaponsLevel3",
+                "TerranShipWeaponsLevel1",
+                "TerranShipWeaponsLevel2",
+                "TerranShipWeaponsLevel3",
+                "TerranVehicleAndShipArmorsLevel1",
+                "TerranVehicleAndShipArmorsLevel2",
+                "TerranVehicleAndShipArmorsLevel3",
+                "TerranBuildingArmor",
+                "HiSecAutoTracking",
+                "Stimpack",
+                "ShieldWall",
+                "PunisherGrenades",
+                "PersonalCloaking",
+                "SmartServos",
+                "HighCapacityBarrels",
+                "DrillClaws",
+                "CycloneLockOnDamageUpgrade",
+                "MedivacIncreaseSpeedBoost",
+                "LiberatorAGRangeUpgrade",
+                "BansheeCloak",
+                "BansheeSpeed",
+                "InterferenceMatrix",
+                "BattlecruiserEnableSpecializations",
+            ),
+            start=300,
+        )
+    ),
 )
 
 _ZERG_ACTIONS: tuple[tuple[int, str, str], ...] = (
-    *((action_id, name, "train") for action_id, name in enumerate(
-        (
-            "Drone", "Overlord", "Zergling", "Queen", "Roach", "Baneling", "Ravager",
-            "Overseer", "Hydralisk", "Mutalisk", "Corruptor", "Infestor", "SwarmHostMP",
-            "LurkerMP", "Viper", "BroodLord", "Ultralisk",
-        ),
-        start=100,
-    )),
-    *((action_id, name, "build") for action_id, name in enumerate(
-        (
-            "Hatchery", "Extractor", "Lair", "Hive", "SpawningPool", "EvolutionChamber",
-            "RoachWarren", "BanelingNest", "SpineCrawler", "SporeCrawler", "HydraliskDen",
-            "InfestationPit", "LurkerDenMP", "Spire", "NydusNetwork", "UltraliskCavern",
-            "GreaterSpire",
-        ),
-        start=200,
-    )),
-    *((action_id, name, "research") for action_id, name in enumerate(
-        (
-            "ZergMeleeWeaponsLevel1", "ZergMeleeWeaponsLevel2", "ZergMeleeWeaponsLevel3",
-            "ZergMissileWeaponsLevel1", "ZergMissileWeaponsLevel2",
-            "ZergMissileWeaponsLevel3", "ZergGroundArmorsLevel1", "ZergGroundArmorsLevel2",
-            "ZergGroundArmorsLevel3", "ZergFlyerWeaponsLevel1", "ZergFlyerWeaponsLevel2",
-            "ZergFlyerWeaponsLevel3", "ZergFlyerArmorsLevel1", "ZergFlyerArmorsLevel2",
-            "ZergFlyerArmorsLevel3", "Burrow", "overlordspeed", "zerglingmovementspeed",
-            "zerglingattackspeed", "GlialReconstitution", "TunnelingClaws",
-            "CentrificalHooks", "EvolveMuscularAugments", "EvolveGroovedSpines",
-            "NeuralParasite", "DiggingClaws", "LurkerRange", "ChitinousPlating",
-            "AnabolicSynthesis",
-        ),
-        start=300,
-    )),
+    *(
+        (action_id, name, "train")
+        for action_id, name in enumerate(
+            (
+                "Drone",
+                "Overlord",
+                "Zergling",
+                "Queen",
+                "Roach",
+                "Baneling",
+                "Ravager",
+                "Overseer",
+                "Hydralisk",
+                "Mutalisk",
+                "Corruptor",
+                "Infestor",
+                "SwarmHostMP",
+                "LurkerMP",
+                "Viper",
+                "BroodLord",
+                "Ultralisk",
+            ),
+            start=100,
+        )
+    ),
+    *(
+        (action_id, name, "build")
+        for action_id, name in enumerate(
+            (
+                "Hatchery",
+                "Extractor",
+                "Lair",
+                "Hive",
+                "SpawningPool",
+                "EvolutionChamber",
+                "RoachWarren",
+                "BanelingNest",
+                "SpineCrawler",
+                "SporeCrawler",
+                "HydraliskDen",
+                "InfestationPit",
+                "LurkerDenMP",
+                "Spire",
+                "NydusNetwork",
+                "UltraliskCavern",
+                "GreaterSpire",
+            ),
+            start=200,
+        )
+    ),
+    *(
+        (action_id, name, "research")
+        for action_id, name in enumerate(
+            (
+                "ZergMeleeWeaponsLevel1",
+                "ZergMeleeWeaponsLevel2",
+                "ZergMeleeWeaponsLevel3",
+                "ZergMissileWeaponsLevel1",
+                "ZergMissileWeaponsLevel2",
+                "ZergMissileWeaponsLevel3",
+                "ZergGroundArmorsLevel1",
+                "ZergGroundArmorsLevel2",
+                "ZergGroundArmorsLevel3",
+                "ZergFlyerWeaponsLevel1",
+                "ZergFlyerWeaponsLevel2",
+                "ZergFlyerWeaponsLevel3",
+                "ZergFlyerArmorsLevel1",
+                "ZergFlyerArmorsLevel2",
+                "ZergFlyerArmorsLevel3",
+                "Burrow",
+                "overlordspeed",
+                "zerglingmovementspeed",
+                "zerglingattackspeed",
+                "GlialReconstitution",
+                "TunnelingClaws",
+                "CentrificalHooks",
+                "EvolveMuscularAugments",
+                "EvolveGroovedSpines",
+                "NeuralParasite",
+                "DiggingClaws",
+                "LurkerRange",
+                "ChitinousPlating",
+                "AnabolicSynthesis",
+            ),
+            start=300,
+        )
+    ),
 )
 
 

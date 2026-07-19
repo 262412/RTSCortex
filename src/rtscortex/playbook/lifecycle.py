@@ -115,12 +115,8 @@ class PlaybookRuleLifecycle:
 
 
 def _is_strategic_blocking_rule(rule: PlaybookRule) -> bool:
-    return (
-        rule.category
-        in {
-            PlaybookRuleCategory.RACE_MACRO,
-            PlaybookRuleCategory.MATCHUP_STRATEGY,
-            PlaybookRuleCategory.MAP_SPECIFIC,
-        }
-        and rule.effect in {PlaybookRuleEffect.REQUIRE, PlaybookRuleEffect.FORBID}
-    )
+    return rule.category in {
+        PlaybookRuleCategory.RACE_MACRO,
+        PlaybookRuleCategory.MATCHUP_STRATEGY,
+        PlaybookRuleCategory.MAP_SPECIFIC,
+    } and rule.effect in {PlaybookRuleEffect.REQUIRE, PlaybookRuleEffect.FORBID}

@@ -95,9 +95,7 @@ class HIMAObservationAdapter:
             if action.category == "research"
         }
         self._unit_order = tuple(
-            action.upstream_name
-            for action in actions
-            if action.category in {"train", "build"}
+            action.upstream_name for action in actions if action.category in {"train", "build"}
         )
         self._research_order = tuple(
             action.upstream_name for action in actions if action.category == "research"

@@ -71,9 +71,7 @@ async def _assert_scripted_macro_client_uses_pinned_race_parser_and_projection()
         ),
         request_id="request-scripted-suffix",
     )
-    assert [step.canonical_action for step in suffix.proposal.steps] == [
-        "BUILD BARRACKSTECHLAB"
-    ]
+    assert [step.canonical_action for step in suffix.proposal.steps] == ["BUILD BARRACKSTECHLAB"]
 
     completed_state = observation.model_copy(
         update={

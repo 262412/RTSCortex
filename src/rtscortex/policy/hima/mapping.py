@@ -44,6 +44,8 @@ def hima_runtime_mappings(race: str) -> tuple[HIMAMacroMapping, ...]:
         HIMAMacroMapping(mapping.semantic_action, mapping.runtime_actions)
         for mapping in race_profile(race).data.macro_action_mappings
     )
+
+
 _STEP_PARSE_ERROR_CODES = frozenset(
     {
         "action_limit_exceeded",
@@ -81,9 +83,7 @@ class HIMAMacroActionMapper:
                 for item in profile.macro_action_mappings
             )
         }
-        self._progress_specs_by_action = {
-            spec.name: spec for spec in profile.progress_action_specs
-        }
+        self._progress_specs_by_action = {spec.name: spec for spec in profile.progress_action_specs}
         self._managed_worker_action = f"TRAIN {profile.worker_type.upper()}"
 
     def assess(
@@ -99,10 +99,7 @@ class HIMAMacroActionMapper:
             diagnostic
             for diagnostic in proposal.diagnostics
             if diagnostic.code in _STEP_PARSE_ERROR_CODES
-            and not (
-                recovered_truncated_prefix
-                and diagnostic.code == "output_truncated"
-            )
+            and not (recovered_truncated_prefix and diagnostic.code == "output_truncated")
         ]
         logical_ordinals = [step.ordinal for step in proposal.steps]
         logical_ordinals.extend(

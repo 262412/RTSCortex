@@ -26,9 +26,7 @@ SCREEN_WORLD_GRID = 24.0
 TERRAN_ADDON_GAS_CLEARANCE_WORLD = 7.0
 ALLIANCES = {1: "self", 2: "ally", 3: "neutral", 4: "enemy"}
 SC2_ALERT_NAMES = {6: "building_under_attack", 19: "unit_under_attack"}
-QUEEN_CONTROLLER_ACTIONS = frozenset(
-    {INJECT_ACTION, "Build_CreepTumor_Queen_Screen"}
-)
+QUEEN_CONTROLLER_ACTIONS = frozenset({INJECT_ACTION, "Build_CreepTumor_Queen_Screen"})
 TOWNHALL_NAMES = frozenset(
     {
         "nexus",

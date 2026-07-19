@@ -410,11 +410,7 @@ def _situation_facts(
         ),
         SituationFact(
             name="visible_enemy_force_composition",
-            status=(
-                KnowledgeStatus.CONFIRMED
-                if enemies_visible
-                else KnowledgeStatus.UNKNOWN
-            ),
+            status=(KnowledgeStatus.CONFIRMED if enemies_visible else KnowledgeStatus.UNKNOWN),
             confidence=1.0 if enemies_visible else 0.0,
             source="visible_enemies",
             evidence=(f"units:{enemy_force.total_units}",),
@@ -445,11 +441,7 @@ def _situation_facts(
         ),
         SituationFact(
             name="enemy_transition",
-            status=(
-                KnowledgeStatus.INFERRED
-                if possible_transitions
-                else KnowledgeStatus.UNKNOWN
-            ),
+            status=(KnowledgeStatus.INFERRED if possible_transitions else KnowledgeStatus.UNKNOWN),
             confidence=0.5 if possible_transitions else 0.0,
             source="visible_force_and_technology_rules",
             evidence=possible_transitions,

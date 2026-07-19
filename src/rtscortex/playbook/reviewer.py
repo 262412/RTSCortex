@@ -91,9 +91,7 @@ class CortexPlaybookReviewer:
         opponent_race: str,
     ) -> tuple[list[DecisionCase], list[PlaybookLesson]]:
         self.last_rule_updates = ()
-        rules_before = {
-            rule.canonical_key: rule.model_dump_json() for rule in self.store.rules()
-        }
+        rules_before = {rule.canonical_key: rule.model_dump_json() for rule in self.store.rules()}
         lineages = {
             str(event.payload.get("command_id")): event
             for event in events

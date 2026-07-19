@@ -370,9 +370,7 @@ def compute_cortex_observability(
             "live_worker_ready",
         ),
         race_limitations=tuple(
-            item
-            for item in race_profile_payload.get("limitations", [])
-            if isinstance(item, str)
+            item for item in race_profile_payload.get("limitations", []) if isinstance(item, str)
         ),
         race_brain_selected_members=dict(sorted(race_brain_selected.items())),
         race_brain_selected_by_phase=dict(sorted(race_brain_selected_by_phase.items())),

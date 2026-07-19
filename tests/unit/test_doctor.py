@@ -305,16 +305,12 @@ def test_worker_patch_is_required_only_for_live_runs(tmp_path: Path) -> None:
     source.write_text(complete_main_source, encoding="utf-8")
 
     source.write_text(
-        complete_main_source.replace(
-            "_rtscortex_transport_noop_without_actor_selection\n", ""
-        ),
+        complete_main_source.replace("_rtscortex_transport_noop_without_actor_selection\n", ""),
         encoding="utf-8",
     )
     transport_noop_check = _worker_patch_check(tmp_path, required=True)
     assert transport_noop_check.status == "error"
-    assert "0019-bypass-actor-selection-for-transport-noop.patch" in (
-        transport_noop_check.detail
-    )
+    assert "0019-bypass-actor-selection-for-transport-noop.patch" in (transport_noop_check.detail)
     source.write_text(complete_main_source, encoding="utf-8")
 
     complete_main_source = source.read_text(encoding="utf-8")

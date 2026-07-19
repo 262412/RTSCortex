@@ -379,8 +379,7 @@ class ProductionEffectVerifier:
         )
         producer_type = None if producer_unit is None else self._unit_name(producer_unit)
         producer_is_valid = producer_type == pending.spec.producer_type or (
-            pending.spec.producer_consumed
-            and producer_type in pending.spec.intermediate_types
+            pending.spec.producer_consumed and producer_type in pending.spec.intermediate_types
         )
         producer = producer_unit if producer_is_valid else None
         player = _value(observation, "player_common", _value(observation, "player", None))

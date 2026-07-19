@@ -32,8 +32,7 @@ def run_worker(request_path: Path, response_path: Path) -> None:
     model_race = hima_race_for_model(request.model_id)
     if manifest.race.value != model_race:
         raise ValueError(
-            f"HIMA checkpoint race {model_race} does not match corpus race "
-            f"{manifest.race.value}"
+            f"HIMA checkpoint race {model_race} does not match corpus race {manifest.race.value}"
         )
     fixtures = load_policy_corpus(request.manifest_path)
     generator = TransformersHIMAGenerator(

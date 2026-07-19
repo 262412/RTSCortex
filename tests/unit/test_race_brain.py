@@ -252,9 +252,7 @@ def test_race_brain_runs_device_groups_in_parallel_and_members_in_order() -> Non
 
 
 def test_race_brain_staggered_schedule_refreshes_one_current_member_per_cycle() -> None:
-    clients = {
-        cluster: _Client(cluster, "Actions: ['Pylon']") for cluster in ("a", "b", "c")
-    }
+    clients = {cluster: _Client(cluster, "Actions: ['Pylon']") for cluster in ("a", "b", "c")}
     client = HIMAEnsemblePolicyClient(
         clients,
         race="protoss",
@@ -263,21 +261,11 @@ def test_race_brain_staggered_schedule_refreshes_one_current_member_per_cycle() 
     )
 
     initial_observation = _observation()
-    initial = asyncio.run(
-        client.propose(HIMAInputContext(observation=initial_observation))
-    )
-    second_observation = initial_observation.model_copy(
-        update={"step_id": 1, "game_loop": 112}
-    )
-    second = asyncio.run(
-        client.propose(HIMAInputContext(observation=second_observation))
-    )
-    third_observation = initial_observation.model_copy(
-        update={"step_id": 2, "game_loop": 224}
-    )
-    third = asyncio.run(
-        client.propose(HIMAInputContext(observation=third_observation))
-    )
+    initial = asyncio.run(client.propose(HIMAInputContext(observation=initial_observation)))
+    second_observation = initial_observation.model_copy(update={"step_id": 1, "game_loop": 112})
+    second = asyncio.run(client.propose(HIMAInputContext(observation=second_observation)))
+    third_observation = initial_observation.model_copy(update={"step_id": 2, "game_loop": 224})
+    third = asyncio.run(client.propose(HIMAInputContext(observation=third_observation)))
 
     assert initial.refreshed_member_ids == (
         "hima-protoss-a",
@@ -293,9 +281,12 @@ def test_race_brain_staggered_schedule_refreshes_one_current_member_per_cycle() 
     assert third.selected_source_age_game_loops == 112
     assert third.selected.step_id == third_observation.step_id
     assert third.selected.game_loop == third_observation.game_loop
-    assert third.selected.projection_hash == HIMAObservationAdapter().adapt_context(
-        HIMAInputContext(observation=third_observation)
-    ).projection_hash
+    assert (
+        third.selected.projection_hash
+        == HIMAObservationAdapter()
+        .adapt_context(HIMAInputContext(observation=third_observation))
+        .projection_hash
+    )
     selected_source = next(
         member for member in third.members if member.member_id == third.selected_member_id
     )

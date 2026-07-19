@@ -237,10 +237,7 @@ class CortexRuntimeEngine(RuntimeEngine):
             raise ValueError("model_shadow Situation requires a shadow SituationProvider")
         if config.cortex.tactical.kind == "model_active" and tactical_provider is None:
             raise ValueError("model_active tactical policy requires a TacticalPolicyProvider")
-        if (
-            config.cortex.tactical.kind == "model_shadow"
-            and shadow_tactical_provider is None
-        ):
+        if config.cortex.tactical.kind == "model_shadow" and shadow_tactical_provider is None:
             raise ValueError("model_shadow tactical policy requires a shadow provider")
         self._situation = situation_provider or DeterministicSituationAnalyzer(
             valid_for_game_loops=1
@@ -353,9 +350,7 @@ class CortexRuntimeEngine(RuntimeEngine):
                     "provider_version": self._shadow_tactical.provider_version,
                     "latency_ms": (time.perf_counter() - shadow_started) * 1_000,
                     "active_intent_ids": [intent.intent_id for intent in tactical_intents],
-                    "shadow_intents": [
-                        intent.model_dump(mode="json") for intent in shadow_intents
-                    ],
+                    "shadow_intents": [intent.model_dump(mode="json") for intent in shadow_intents],
                 },
             )
         tactical_prepared = [
@@ -632,9 +627,7 @@ class CortexRuntimeEngine(RuntimeEngine):
         if arbitration_event is not None:
             arbitration_payload = arbitration_event.payload.get("arbitration")
             agenda_payload = (
-                arbitration_payload.get("agenda")
-                if isinstance(arbitration_payload, dict)
-                else None
+                arbitration_payload.get("agenda") if isinstance(arbitration_payload, dict) else None
             )
             if isinstance(agenda_payload, dict):
                 agenda = StrategicAgenda.model_validate(agenda_payload)
@@ -1010,12 +1003,9 @@ class CortexRuntimeEngine(RuntimeEngine):
     ) -> None:
         metadata = response.proposal.generation_metadata
         self._last_planner_failure = IdleReason.NO_LEGAL_ACTION
-        self._next_macro_retry_game_loop = (
-            observation.game_loop
-            + min(
-                self.config.cortex.macro.interval_game_loops,
-                _MACRO_REJECTION_RETRY_GAME_LOOPS,
-            )
+        self._next_macro_retry_game_loop = observation.game_loop + min(
+            self.config.cortex.macro.interval_game_loops,
+            _MACRO_REJECTION_RETRY_GAME_LOOPS,
         )
         self._urgent_replan_requested = False
         self._record_cortex_event(
@@ -1097,9 +1087,7 @@ class CortexRuntimeEngine(RuntimeEngine):
                 "acceptance_delay_game_loops": max(
                     0, observation.game_loop - proposal_source_game_loop
                 ),
-                "accepted_while_command_inflight": (
-                    self._macro_inflight_command_id is not None
-                ),
+                "accepted_while_command_inflight": (self._macro_inflight_command_id is not None),
                 "inflight_command_id": self._macro_inflight_command_id,
                 "is_revision": is_revision,
                 "latency_ms": latency_ms,
@@ -1268,8 +1256,7 @@ class CortexRuntimeEngine(RuntimeEngine):
         ):
             return None
         advances_plan_step = any(
-            step.ordinal == frontier.ordinal
-            and step.canonical_action == frontier.source_action
+            step.ordinal == frontier.ordinal and step.canonical_action == frontier.source_action
             for step in remaining_proposal.steps
         )
         step = self._macro_step(frontier.ordinal) if advances_plan_step else None
@@ -1322,9 +1309,7 @@ class CortexRuntimeEngine(RuntimeEngine):
             return None
         free_supply = self._free_supply(observation)
         supply_action = self._supply_macro_action()
-        gas_runtime_action = self._runtime_action_for_target(
-            self._race_profile.data.gas_structure
-        )
+        gas_runtime_action = self._runtime_action_for_target(self._race_profile.data.gas_structure)
         gas_action = self._semantic_action_for_runtime(gas_runtime_action)
         townhall_action = self._semantic_action_for_target(
             self._race_profile.data.townhall_types[0]
@@ -1436,8 +1421,7 @@ class CortexRuntimeEngine(RuntimeEngine):
         if report is None:
             return False
         return report.unique_next_action is not None or any(
-            blocker.kind is GoalBlockerKind.PREREQUISITE_IN_PROGRESS
-            for blocker in report.blockers
+            blocker.kind is GoalBlockerKind.PREREQUISITE_IN_PROGRESS for blocker in report.blockers
         )
 
     def _legal_synthetic_action(
@@ -1474,8 +1458,7 @@ class CortexRuntimeEngine(RuntimeEngine):
         )
         if (
             assessment is None
-            or assessment.classification
-            is not PolicyActionClassification.MAPPED_LEGAL_NOW
+            or assessment.classification is not PolicyActionClassification.MAPPED_LEGAL_NOW
         ):
             return None
         return assessment
@@ -1527,9 +1510,7 @@ class CortexRuntimeEngine(RuntimeEngine):
         return self._semantic_action_for_runtime(selected.name)
 
     def _semantic_action_for_target(self, effect_target: str) -> str:
-        return self._semantic_action_for_runtime(
-            self._runtime_action_for_target(effect_target)
-        )
+        return self._semantic_action_for_runtime(self._runtime_action_for_target(effect_target))
 
     def _runtime_action_for_target(self, effect_target: str) -> str:
         matching = [
@@ -1799,9 +1780,7 @@ class CortexRuntimeEngine(RuntimeEngine):
         mode = self.config.cortex.arbiter.mode
         if mode == "disabled" or not self._strategic_by_legacy_intent:
             return prepared
-        intents, playbook_deltas, playbook_rule_ids = self._guard_strategic_intents(
-            observation
-        )
+        intents, playbook_deltas, playbook_rule_ids = self._guard_strategic_intents(observation)
         result = self._strategic_arbiter.arbitrate(
             intents,
             observation,

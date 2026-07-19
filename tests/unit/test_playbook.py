@@ -169,8 +169,7 @@ def test_playbook_records_new_opposing_outcome_as_rule_contradiction(tmp_path: P
     preferred = next(
         rule
         for rule in playbook.rules()
-        if rule.action_names == ("BUILD STARGATE",)
-        and rule.effect.value == "prefer"
+        if rule.action_names == ("BUILD STARGATE",) and rule.effect.value == "prefer"
     )
     assert preferred.contradiction_count == 1
     assert preferred.contradiction_seeds == (0,)

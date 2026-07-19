@@ -168,9 +168,7 @@ class StrategicIntentAdapter:
 
     def __init__(self, profile: RaceProfile) -> None:
         self.profile = profile
-        self._specs = {
-            spec.name: spec for spec in profile.data.progress_action_specs
-        }
+        self._specs = {spec.name: spec for spec in profile.data.progress_action_specs}
 
     def adapt(self, intent: CortexIntent) -> StrategicIntent:
         role = self._role(intent)
@@ -213,8 +211,7 @@ class StrategicIntentAdapter:
             emergency=(
                 role is RoleId.RETREAT
                 or isinstance(intent, ReflexIntent)
-                and first_action
-                not in {"Effect_InjectLarva", "Build_CreepTumor_Queen_Screen"}
+                and first_action not in {"Effect_InjectLarva", "Build_CreepTumor_Queen_Screen"}
             ),
             horizon_game_loops=commitment,
             ttl_game_loops=intent.ttl_game_loops,
@@ -529,10 +526,7 @@ def _subset_is_feasible(
     selected_ids = {intent.intent_id for intent in intents}
     if any(set(conflict.intent_ids).issubset(selected_ids) for conflict in conflicts):
         return False
-    if any(
-        not set(intent.dependency_intent_ids).issubset(selected_ids)
-        for intent in intents
-    ):
+    if any(not set(intent.dependency_intent_ids).issubset(selected_ids) for intent in intents):
         return False
     claim = _sum_claims(intent.resource_claim for intent in intents)
     economy = observation.state.economy

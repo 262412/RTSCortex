@@ -231,8 +231,7 @@ class PlaybookStore:
                 (run_id,),
             ).fetchall()
         return [
-            PlaybookRuleApplication.model_validate_json(str(row["payload_json"]))
-            for row in rows
+            PlaybookRuleApplication.model_validate_json(str(row["payload_json"])) for row in rows
         ]
 
     def migrate_legacy_lessons(self) -> int:
@@ -337,9 +336,7 @@ def _legacy_rule(lesson: PlaybookLesson) -> PlaybookRule:
         else PlaybookRuleEffect.AVOID
     )
     actions = tuple(
-        action
-        for action in (lesson.recommended_action, lesson.avoid_action)
-        if action is not None
+        action for action in (lesson.recommended_action, lesson.avoid_action) if action is not None
     )
     canonical = hashlib.sha256(
         f"legacy|{lesson.signature}|{effect.value}|{'|'.join(actions)}".encode()
@@ -381,9 +378,7 @@ def _candidate_rule(lesson: PlaybookLesson, source_case: DecisionCase) -> Playbo
         else PlaybookRuleEffect.AVOID
     )
     actions = tuple(
-        action
-        for action in (lesson.recommended_action, lesson.avoid_action)
-        if action is not None
+        action for action in (lesson.recommended_action, lesson.avoid_action) if action is not None
     )
     canonical_payload = "|".join(
         (
@@ -426,9 +421,7 @@ def _merge_rule_evidence(existing: PlaybookRule, incoming: PlaybookRule) -> Play
     contradiction_seeds = tuple(
         dict.fromkeys((*existing.contradiction_seeds, *incoming.contradiction_seeds))
     )
-    source_run_ids = tuple(
-        dict.fromkeys((*existing.source_run_ids, *incoming.source_run_ids))
-    )
+    source_run_ids = tuple(dict.fromkeys((*existing.source_run_ids, *incoming.source_run_ids)))
     preserve_active = (
         incoming.status is PlaybookRuleStatus.CANDIDATE
         and existing.status is PlaybookRuleStatus.ACTIVE
@@ -452,16 +445,10 @@ def _merge_rule_evidence(existing: PlaybookRule, incoming: PlaybookRule) -> Play
                 dict.fromkeys((*existing.source_case_ids, *incoming.source_case_ids))
             ),
             "source_run_ids": source_run_ids,
-            "source_seeds": tuple(
-                dict.fromkeys((*existing.source_seeds, *incoming.source_seeds))
-            ),
+            "source_seeds": tuple(dict.fromkeys((*existing.source_seeds, *incoming.source_seeds))),
             "contradiction_seeds": contradiction_seeds,
-            "shadow_state_count": max(
-                existing.shadow_state_count, incoming.shadow_state_count
-            ),
-            "false_block_count": max(
-                existing.false_block_count, incoming.false_block_count
-            ),
+            "shadow_state_count": max(existing.shadow_state_count, incoming.shadow_state_count),
+            "false_block_count": max(existing.false_block_count, incoming.false_block_count),
             "evidence": {**existing.evidence, **incoming.evidence},
         }
     )

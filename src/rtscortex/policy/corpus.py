@@ -52,9 +52,7 @@ _CONDITION_PHASES: tuple[PolicyFixtureStratum, ...] = (
     PolicyFixtureStratum.COMBAT,
 )
 _PREVIOUS_ACTION_WINDOW_GAME_LOOPS = int(60 * 22.4)
-_DEFENSIVE_ALERT_NAMES = frozenset(
-    {"underattack", "buildingunderattack", "unitunderattack"}
-)
+_DEFENSIVE_ALERT_NAMES = frozenset({"underattack", "buildingunderattack", "unitunderattack"})
 
 
 def _canonical_static(value: str) -> str:
@@ -100,9 +98,7 @@ _TECHNOLOGY_TARGET_OVERRIDES: Mapping[RaceId, frozenset[str]] = {
             "starporttechlab",
         }
     ),
-    RaceId.ZERG: frozenset(
-        {"lair", "hive", "evolutionchamber", "hydraliskden"}
-    ),
+    RaceId.ZERG: frozenset({"lair", "hive", "evolutionchamber", "hydraliskden"}),
 }
 
 
@@ -121,11 +117,7 @@ def _corpus_race_semantics(race: RaceId | str) -> _CorpusRaceSemantics:
             else:
                 parts = runtime_action.split("_")
                 short_action = next(
-                    (
-                        part
-                        for part in parts[1:]
-                        if part not in {"Screen", "Near", "Minimap"}
-                    ),
+                    (part for part in parts[1:] if part not in {"Screen", "Near", "Minimap"}),
                     mapping.semantic_action.split(maxsplit=1)[-1],
                 )
             runtime_to_hima_short_action[runtime_action] = short_action
@@ -173,9 +165,7 @@ _PROTOSS_CORPUS_SEMANTICS = _corpus_race_semantics(RaceId.PROTOSS)
 # Compatibility aliases for the v0.2 Protoss corpus and existing callers.
 _PRODUCTION_STRUCTURES = _PROTOSS_CORPUS_SEMANTICS.production_structures
 _TECHNOLOGY_STRUCTURES = _PROTOSS_CORPUS_SEMANTICS.technology_structures
-_RUNTIME_TO_HIMA_SHORT_ACTION = dict(
-    _PROTOSS_CORPUS_SEMANTICS.runtime_to_hima_short_action
-)
+_RUNTIME_TO_HIMA_SHORT_ACTION = dict(_PROTOSS_CORPUS_SEMANTICS.runtime_to_hima_short_action)
 _IN_PROGRESS_ACTIONS = _PROTOSS_CORPUS_SEMANTICS.in_progress_actions
 
 
@@ -337,8 +327,7 @@ def build_policy_corpus(
 
     semantics = _corpus_race_semantics(config.race)
     sources = tuple(
-        _load_source(source, semantics=semantics, base_dir=base_dir)
-        for source in config.sources
+        _load_source(source, semantics=semantics, base_dir=base_dir) for source in config.sources
     )
     candidates = _collect_candidates(
         sources,
@@ -829,9 +818,7 @@ def _classify_observation(
         for unit in (*observation.state.own_units, *observation.state.own_structures)
         if _canonical(unit.status or "") in _IN_PROGRESS_STATUSES
     ]
-    defensive_alerts = [
-        alert for alert in observation.alerts if _is_defensive_alert(alert)
-    ]
+    defensive_alerts = [alert for alert in observation.alerts if _is_defensive_alert(alert)]
     condition_tags = [report.status.value]
     if report.defensive_hold_required:
         condition_tags.append("defensive_hold_required")
@@ -970,9 +957,7 @@ def _phase_action(
             return "Train_Stalker", True
         if defensive_hold:
             return "Build_ShieldBattery_Screen", False
-        action = (
-            "Train_Stalker" if "cyberneticscore" in completed_structures else "Train_Zealot"
-        )
+        action = "Train_Stalker" if "cyberneticscore" in completed_structures else "Train_Zealot"
         return action, True
     if race is RaceId.TERRAN:
         if phase is PolicyFixtureStratum.EARLY:
@@ -1009,9 +994,7 @@ def _phase_action(
     if defensive_hold:
         return "Build_SpineCrawler_Screen", False
     return (
-        ("Train_Roach", True)
-        if "roachwarren" in completed_structures
-        else ("Train_Zergling", True)
+        ("Train_Roach", True) if "roachwarren" in completed_structures else ("Train_Zergling", True)
     )
 
 
