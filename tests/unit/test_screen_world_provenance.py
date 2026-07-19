@@ -333,6 +333,8 @@ def test_agent_reprojects_screen_build_again_after_selection_chain(
         for x in range(54, 75):
             buildable[y][x] = 1
             pathable[y][x] = 1
+    for coordinate in range(32, 55):
+        pathable[coordinate][coordinate] = 1
     observation = _observation(
         anchor_screen=(32, 32),
         buildable=buildable,

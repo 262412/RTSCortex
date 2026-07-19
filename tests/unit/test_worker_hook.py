@@ -2588,6 +2588,59 @@ def test_zerg_building_requires_creep_across_the_full_footprint() -> None:
     assert build_screen_candidates(observation, "Build_SpawningPool_Screen") == []
 
 
+def test_zerg_build_candidates_require_a_reachable_builder_approach() -> None:
+    pathable = [[1 for _ in range(128)] for _ in range(128)]
+    for y in range(128):
+        pathable[y][64] = 0
+    observation = SimpleNamespace(
+        raw_units=[
+            SimpleNamespace(
+                tag=0xA00,
+                unit_type=86,
+                alliance=1,
+                build_progress=100,
+                x=30,
+                y=30,
+            )
+        ],
+        feature_units=[
+            SimpleNamespace(
+                tag=0xD00,
+                unit_type=104,
+                alliance=1,
+                is_on_screen=True,
+                x=20,
+                y=64,
+                radius=0.375,
+            )
+        ],
+        feature_screen=SimpleNamespace(
+            buildable=UniformGrid(1),
+            pathable=Grid(pathable),
+            player_relative=UniformGrid(0),
+            power=UniformGrid(0),
+            creep=UniformGrid(1),
+        ),
+    )
+    unit_names = {86: "Hatchery", 104: "Drone"}
+
+    candidates = build_screen_candidates(
+        observation,
+        "Build_EvolutionChamber_Screen",
+        unit_names=unit_names,
+        builder_tags=[0xD00],
+    )
+
+    assert candidates
+    assert all(x < 64 for x, _y in candidates)
+    assert build_screen_candidates(
+        observation,
+        "Build_EvolutionChamber_Screen",
+        unit_names=unit_names,
+        builder_tags=[0xBAD],
+    ) == []
+
+
 def test_zerg_queen_controller_candidates_require_uninjected_townhall_and_creep() -> None:
     creep = [[1 for _ in range(128)] for _ in range(128)]
     hatchery = SimpleNamespace(

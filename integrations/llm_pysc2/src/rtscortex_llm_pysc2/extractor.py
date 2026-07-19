@@ -1608,12 +1608,14 @@ def build_screen_candidates(
     action_name: str,
     *,
     unit_names: Optional[Mapping[int, str]] = None,
+    builder_tags: Optional[Collection[int]] = None,
 ) -> list[list[int]]:
     return _build_screen_candidates(
         observation,
         action_name,
         limit=8,
         unit_names=unit_names or {},
+        builder_tags=builder_tags,
     )
 
 
@@ -1668,6 +1670,7 @@ def resolve_screen_build_world_target(
     excluded_positions: Collection[tuple[int, int]] = (),
     force_resample: bool = False,
     unit_names: Optional[Mapping[int, str]] = None,
+    builder_tags: Optional[Collection[int]] = None,
 ) -> Optional[list[int]]:
     """Reproject a routed build target and validate it against the current camera."""
 
@@ -1696,6 +1699,7 @@ def resolve_screen_build_world_target(
             spec,
             projected,
             unit_names=unit_names or {},
+            builder_tags=builder_tags,
         )
     ):
         return projected
@@ -1707,6 +1711,7 @@ def resolve_screen_build_world_target(
             action_name,
             limit=None,
             unit_names=unit_names or {},
+            builder_tags=builder_tags,
         )
         if tuple(candidate) not in excluded
     ]
@@ -1776,6 +1781,7 @@ def screen_build_position_is_legal(
     position: Sequence[int],
     *,
     unit_names: Optional[Mapping[int, str]] = None,
+    builder_tags: Optional[Collection[int]] = None,
 ) -> bool:
     """Validate one exact screen position against the action's full footprint."""
 
@@ -1789,6 +1795,7 @@ def screen_build_position_is_legal(
             spec,
             position,
             unit_names=unit_names or {},
+            builder_tags=builder_tags,
         )
     )
 
@@ -1799,6 +1806,7 @@ def _build_screen_candidates(
     *,
     limit: Optional[int],
     unit_names: Mapping[int, str],
+    builder_tags: Optional[Collection[int]] = None,
 ) -> list[list[int]]:
     spec = BUILD_SPECS.get(action_name)
     if spec is None or spec.placement_kind != "screen":
@@ -1829,6 +1837,19 @@ def _build_screen_candidates(
         if own_positions
         else (screen_size / 2, screen_size / 2)
     )
+    reachable_builder_cells = (
+        None
+        if action_name == "Build_CreepTumor_Queen_Screen"
+        else _builder_reachable_cells(
+            pathable,
+            feature_units,
+            unit_names,
+            screen_size,
+            builder_tags=builder_tags,
+        )
+    )
+    if builder_tags is not None and reachable_builder_cells == frozenset():
+        return []
     candidates = _valid_build_positions(
         buildable,
         pathable,
@@ -1855,6 +1876,7 @@ def _build_screen_candidates(
         require_power=spec.requires_power,
         require_creep=spec.requires_creep,
         semantic_anchor=semantic_anchor,
+        reachable_builder_cells=reachable_builder_cells,
     )
     if spec.reserves_addon_space:
         candidates = [
@@ -1934,6 +1956,7 @@ def _build_screen_position_is_legal(
     position: Sequence[int],
     *,
     unit_names: Mapping[int, str],
+    builder_tags: Optional[Collection[int]] = None,
 ) -> bool:
     feature_screen = _value(observation, "feature_screen", None)
     buildable = _value(feature_screen, "buildable", None)
@@ -1961,22 +1984,42 @@ def _build_screen_position_is_legal(
         require_power=spec.requires_power,
         require_creep=spec.requires_creep,
     )
+    bounds = _build_footprint_bounds_for_spec(
+        int(position[0]),
+        int(position[1]),
+        ratio,
+        spec,
+    )
+    reachable_builder_cells = (
+        None
+        if spec.target_structure == "CreepTumorQueen"
+        else _builder_reachable_cells(
+            pathable,
+            _value(observation, "feature_units", ()),
+            unit_names,
+            screen_size,
+            builder_tags=builder_tags,
+        )
+    )
+    if builder_tags is not None and reachable_builder_cells == frozenset():
+        return False
     return (
         _build_footprint_is_clear(
             prefix,
             _occupied_positions(observation),
-            _build_footprint_bounds_for_spec(
-                int(position[0]),
-                int(position[1]),
-                ratio,
-                spec,
-            ),
+            bounds,
             screen_size,
             reserved_bounds=_terran_addon_reservation_bounds(
                 observation,
                 unit_names,
                 screen_size,
             ),
+        )
+        and _build_has_reachable_approach(
+            bounds,
+            reachable_builder_cells,
+            screen_size,
+            margin=ratio,
         )
         and (
             not spec.reserves_addon_space
@@ -2041,6 +2084,7 @@ def _valid_build_positions(
     require_power: bool,
     require_creep: bool,
     semantic_anchor: tuple[float, float],
+    reachable_builder_cells: Optional[frozenset[tuple[int, int]]],
 ) -> list[list[int]]:
     ratio = max(1, int(screen_size / 24))
     stride = max(4, ratio)
@@ -2066,12 +2110,121 @@ def _valid_build_positions(
                 bounds,
                 screen_size,
                 reserved_bounds=reserved_bounds,
+            ) and _build_has_reachable_approach(
+                bounds,
+                reachable_builder_cells,
+                screen_size,
+                margin=ratio,
             ):
                 anchor_distance = (x0 - semantic_anchor[0]) ** 2 + (y0 - semantic_anchor[1]) ** 2
                 center_distance = (x0 - screen_size / 2) ** 2 + (y0 - screen_size / 2) ** 2
                 candidates.append((anchor_distance, center_distance, x0, y0))
     candidates.sort()
     return [[x, y] for _, _, x, y in candidates]
+
+
+def _builder_reachable_cells(
+    pathable: Any,
+    feature_units: Sequence[Any],
+    unit_names: Mapping[int, str],
+    screen_size: int,
+    *,
+    builder_tags: Optional[Collection[int]],
+) -> Optional[frozenset[tuple[int, int]]]:
+    """Return screen cells reachable from visible worker builders."""
+
+    allowed_tags = None if builder_tags is None else {int(tag) for tag in builder_tags}
+    starts = {
+        (int(_value(unit, "x", 0)), int(_value(unit, "y", 0)))
+        for unit in feature_units
+        if int(_value(unit, "alliance", 0)) == 1
+        and bool(_value(unit, "is_on_screen", True))
+        and (
+            int(_value(unit, "tag", 0)) in allowed_tags
+            if allowed_tags is not None
+            else _unit_name(unit, unit_names) in {"Probe", "SCV", "Drone"}
+        )
+    }
+    if not starts:
+        return frozenset() if builder_tags is not None else None
+
+    ratio = max(1, int(screen_size / SCREEN_WORLD_GRID))
+    blocked: set[tuple[int, int]] = set()
+    start_tags = allowed_tags or set()
+    for unit in feature_units:
+        if not bool(_value(unit, "is_on_screen", True)):
+            continue
+        tag = int(_value(unit, "tag", 0))
+        if tag in start_tags:
+            continue
+        alliance = int(_value(unit, "alliance", 0))
+        radius = max(0.0, float(_value(unit, "radius", 0.0)))
+        if alliance != 3 and radius < 1.0:
+            continue
+        unit_x = int(_value(unit, "x", 0))
+        unit_y = int(_value(unit, "y", 0))
+        cell_radius = max(1, math.ceil(radius * ratio))
+        for y in range(max(0, unit_y - cell_radius), min(screen_size, unit_y + cell_radius + 1)):
+            for x in range(
+                max(0, unit_x - cell_radius),
+                min(screen_size, unit_x + cell_radius + 1),
+            ):
+                if (x - unit_x) ** 2 + (y - unit_y) ** 2 <= cell_radius**2:
+                    blocked.add((x, y))
+
+    frontier = [
+        point
+        for point in sorted(starts)
+        if 0 <= point[0] < screen_size
+        and 0 <= point[1] < screen_size
+        and pathable[point[1]][point[0]] == 1
+    ]
+    reachable = set(frontier)
+    index = 0
+    while index < len(frontier):
+        x, y = frontier[index]
+        index += 1
+        for dx, dy in (
+            (-1, -1),
+            (0, -1),
+            (1, -1),
+            (-1, 0),
+            (1, 0),
+            (-1, 1),
+            (0, 1),
+            (1, 1),
+        ):
+            neighbor = (x + dx, y + dy)
+            if (
+                neighbor in reachable
+                or neighbor in blocked
+                or not 0 <= neighbor[0] < screen_size
+                or not 0 <= neighbor[1] < screen_size
+                or pathable[neighbor[1]][neighbor[0]] != 1
+            ):
+                continue
+            reachable.add(neighbor)
+            frontier.append(neighbor)
+    return frozenset(reachable)
+
+
+def _build_has_reachable_approach(
+    bounds: tuple[int, int, int, int],
+    reachable_cells: Optional[frozenset[tuple[int, int]]],
+    screen_size: int,
+    *,
+    margin: int,
+) -> bool:
+    if reachable_cells is None:
+        return True
+    min_x, max_x, min_y, max_y = bounds
+    for y in range(max(0, min_y - margin), min(screen_size, max_y + margin + 1)):
+        for x in range(max(0, min_x - margin), min(screen_size, max_x + margin + 1)):
+            if min_x <= x <= max_x and min_y <= y <= max_y:
+                continue
+            if (x, y) in reachable_cells:
+                return True
+    return False
 
 
 def _build_cell_is_valid(

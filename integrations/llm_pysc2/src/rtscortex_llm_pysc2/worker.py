@@ -420,6 +420,11 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
                     ),
                     screen_size=int(self.size_screen),
                     unit_names=self.unit_names,
+                    builder_tags=(
+                        [builder_tag]
+                        if (builder_tag := _execution_unit_tag(self)) is not None
+                        else []
+                    ),
                 )
                 if resolved is None:
                     requested = _screen_argument(action)
@@ -2691,6 +2696,7 @@ def _resolve_build_action_position(
     excluded_positions: set[tuple[int, int]] | None = None,
     force_resample: bool = False,
     unit_names: Optional[Mapping[int, str]] = None,
+    builder_tags: Optional[Collection[int]] = None,
 ) -> Optional[list[int]]:
     action_name = str(action.get("name", ""))
     requested = _screen_argument(action)
@@ -2703,6 +2709,7 @@ def _resolve_build_action_position(
             excluded_positions=excluded_positions or set(),
             force_resample=force_resample,
             unit_names=unit_names or {},
+            builder_tags=builder_tags,
         )
         if position is None:
             return None
@@ -2713,6 +2720,7 @@ def _resolve_build_action_position(
                 observation,
                 action_name,
                 unit_names=unit_names or {},
+                builder_tags=builder_tags,
             )
             if tuple(candidate) not in (excluded_positions or set())
         ]
@@ -2734,6 +2742,7 @@ def _resolve_translator_compatible_build_position(
     force_resample: bool,
     screen_size: int,
     unit_names: Mapping[int, str],
+    builder_tags: Optional[Collection[int]] = None,
 ) -> Optional[list[int]]:
     """Resample until the pinned translator accepts the same screen position."""
 
@@ -2751,6 +2760,7 @@ def _resolve_translator_compatible_build_position(
             excluded_positions=excluded,
             force_resample=force_resample,
             unit_names=unit_names,
+            builder_tags=builder_tags,
         )
         if position is None:
             excluded_positions.update(excluded)
