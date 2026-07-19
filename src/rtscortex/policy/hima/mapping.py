@@ -91,10 +91,18 @@ class HIMAMacroActionMapper:
         proposal: MacroPolicyProposal,
         fixture: PolicyObservationFixture,
     ) -> list[PolicyActionAssessment]:
+        recovered_truncated_prefix = any(
+            diagnostic.code == "truncated_action_prefix_recovered"
+            for diagnostic in proposal.diagnostics
+        )
         parse_errors = [
             diagnostic
             for diagnostic in proposal.diagnostics
             if diagnostic.code in _STEP_PARSE_ERROR_CODES
+            and not (
+                recovered_truncated_prefix
+                and diagnostic.code == "output_truncated"
+            )
         ]
         logical_ordinals = [step.ordinal for step in proposal.steps]
         logical_ordinals.extend(

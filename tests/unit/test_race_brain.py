@@ -30,9 +30,10 @@ from rtscortex.policy.hima import (
 
 
 class _Client:
-    def __init__(self, cluster: str, output: str) -> None:
+    def __init__(self, cluster: str, output: str, *, truncated: bool = False) -> None:
         self.cluster = cluster
         self.output = output
+        self.truncated = truncated
         self.calls = 0
 
     async def health(self) -> HIMALiveHealth:
@@ -60,7 +61,10 @@ class _Client:
             step_id=context.observation.step_id,
             game_loop=context.observation.game_loop,
             projection_hash=snapshot.projection_hash,
-            proposal=HIMAProposalParser().parse(self.output),
+            proposal=HIMAProposalParser().parse(
+                self.output,
+                truncated=self.truncated,
+            ),
         )
 
     async def close(self) -> None:
@@ -165,6 +169,33 @@ def test_race_brain_isolates_invalid_member_output() -> None:
     assert invalid.frontier is not None
     assert invalid.frontier.classification.value == "parse_error"
     assert invalid.score < 0
+
+
+def test_race_brain_keeps_recovered_truncated_prefix_usable() -> None:
+    clients = {
+        "a": _Client("a", "Actions: ['Pylon']"),
+        "b": _Client(
+            "b",
+            'Actions: ["Pylon", "Gateway", "Pyl',
+            truncated=True,
+        ),
+        "c": _Client("c", "Actions: ['Gateway']"),
+    }
+    client = HIMAEnsemblePolicyClient(clients, race="protoss")
+
+    response = asyncio.run(
+        client.propose(
+            HIMAInputContext(observation=_observation()),
+            request_id="recovered-truncated-prefix",
+        )
+    )
+
+    recovered = next(member for member in response.members if member.cluster == "b")
+    assert recovered.frontier is not None
+    assert recovered.frontier.classification.value == "mapped_legal_now"
+    assert "recovered truncated prefix penalty" in recovered.score_reasons
+    assert response.valid_member_count == 3
+    assert response.degraded_member_ids == ()
 
 
 def test_unsupported_frontier_is_a_runtime_gap_not_a_degraded_member() -> None:

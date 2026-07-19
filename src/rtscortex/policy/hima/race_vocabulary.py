@@ -117,7 +117,7 @@ HIMA_VOCABULARY_VERSIONS = MappingProxyType(
 )
 HIMA_PARSER_VERSIONS = MappingProxyType(
     {
-        race: f"hima-{race}-parser-v1" if race != "protoss" else "hima-protoss-parser-v4"
+        race: f"hima-{race}-parser-v2" if race != "protoss" else "hima-protoss-parser-v5"
         for race in HIMA_ACTIONS_BY_RACE
     }
 )

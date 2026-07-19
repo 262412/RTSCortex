@@ -228,6 +228,35 @@ def test_parser_bounds_action_items_and_marks_generation_truncation() -> None:
     assert [step.canonical_action for step in truncated.steps] == ["TRAIN PROBE"]
 
 
+def test_parser_recovers_complete_prefix_from_unterminated_actions_list() -> None:
+    proposal = HIMAProposalParser(race="zerg").parse(
+        'Reason: keep producing. Actions: ["Drone", "Roach", "Dron',
+        truncated=True,
+    )
+
+    assert [step.canonical_action for step in proposal.steps] == [
+        "TRAIN DRONE",
+        "TRAIN ROACH",
+    ]
+    assert [item.code for item in proposal.diagnostics] == [
+        "output_truncated",
+        "truncated_action_prefix_recovered",
+    ]
+
+
+def test_parser_does_not_recover_an_incomplete_first_action() -> None:
+    proposal = HIMAProposalParser(race="zerg").parse(
+        'Reason: keep producing. Actions: ["Dro',
+        truncated=True,
+    )
+
+    assert proposal.steps == []
+    assert [item.code for item in proposal.diagnostics] == [
+        "output_truncated",
+        "action_section_missing",
+    ]
+
+
 def test_parser_reports_missing_and_empty_action_sections() -> None:
     missing = HIMAProposalParser().parse("Reason: Add more production.")
     empty = HIMAProposalParser().parse("Actions: []")
