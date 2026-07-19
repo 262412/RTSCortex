@@ -185,6 +185,7 @@ class ExecutionTracker:
             pre_dispatch_codes = {
                 "actor_not_available",
                 "actor_not_visible",
+                "actor_selection_timeout",
                 "candidate_invalidated",
                 "friendly_target",
                 "invalid_expansion_anchor",

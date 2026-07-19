@@ -202,6 +202,7 @@ class RTSCortexZergMeleeConfig(AgentConfig):  # type: ignore[misc]
                 "Queen-1",
                 units.Zerg.Queen,
                 extra_actions=QUEEN_CONTROLLER_ACTIONS,
+                select_type="select",
             ),
             "CombatGroup2": _combat_agent(self, "Roach-1", units.Zerg.Roach),
             "CombatGroup3": _combat_agent(self, "Hydralisk-1", units.Zerg.Hydralisk),
@@ -214,6 +215,7 @@ def _combat_agent(
     unit_type: Any,
     *,
     extra_actions: list[dict[str, Any]] | None = None,
+    select_type: str = "select_all_type",
 ) -> dict[str, Any]:
     return {
         "describe": f"Zerg combat controller for {team_name}.",
@@ -223,7 +225,7 @@ def _combat_agent(
                 "name": team_name,
                 "unit_type": [unit_type],
                 "game_group": -1,
-                "select_type": "select_all_type",
+                "select_type": select_type,
             }
         ],
         "action": {unit_type: [*UNIT_ACTIONS, *(extra_actions or [])]},

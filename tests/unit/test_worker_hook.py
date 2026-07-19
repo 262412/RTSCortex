@@ -33,6 +33,7 @@ from rtscortex_llm_pysc2.worker import (
     RTSCortexLLMAgent,
     RTSCortexMainAgent,
     WorkerSettings,
+    _abort_stalled_actor_selection,
     _apply_scenario_bootstrap,
     _available_addon_function_id,
     _candidate_dispatch_failure,
@@ -1421,6 +1422,70 @@ def test_zerg_missing_combat_actor_disables_team_and_aborts_active_command() -> 
         "failure_reason": "Zerg combat actor disappeared from the raw observation",
         "actor_tag": 20,
     }
+
+
+def test_actor_selection_retries_abort_only_the_stalled_command() -> None:
+    command_id = "command-inject"
+    agent = SimpleNamespace(
+        name="CombatGroup1",
+        team_unit_team_curr="Queen-1",
+        team_unit_tag_curr=0x102280001,
+        curr_action_name="Effect_InjectLarva",
+        func_list=[object()],
+        action_list=[object()],
+        action_lists=[[{"name": "Move_Minimap"}]],
+        last_execution_abort=None,
+        _rtscortex_semantic_action={"name": "Effect_InjectLarva"},
+    )
+    main_agent = SimpleNamespace(
+        _pending_primitive=PrimitiveDispatch(
+            command_id=command_id,
+            function_name="select_rect",
+            final_primitive=False,
+            origin="orchestration",
+            requested_function_id=3,
+            emitted_function_id=3,
+        ),
+        _pending_primitive_agent=agent,
+        _actor_selection_retry_key=None,
+        _actor_selection_attempts=0,
+    )
+
+    for _ in range(7):
+        assert _abort_stalled_actor_selection(main_agent) is False
+    assert _abort_stalled_actor_selection(main_agent) is True
+
+    assert agent.last_execution_abort == {
+        "team_name": "Queen-1",
+        "action_name": "Effect_InjectLarva",
+        "failure_code": "actor_selection_timeout",
+        "failure_reason": "actor could not be selected after 8 orchestration attempts",
+        "actor_tag": 0x102280001,
+    }
+    assert agent.func_list == []
+    assert agent.action_list == []
+    assert agent.action_lists == [[{"name": "Move_Minimap"}]]
+    assert agent._rtscortex_semantic_action is None
+
+
+def test_actor_selection_retry_counter_resets_after_translator_primitive() -> None:
+    main_agent = SimpleNamespace(
+        _pending_primitive=PrimitiveDispatch(
+            command_id="command-train",
+            function_name="Train_Roach_quick",
+            final_primitive=True,
+            origin="translator",
+            requested_function_id=495,
+            emitted_function_id=495,
+        ),
+        _pending_primitive_agent=SimpleNamespace(),
+        _actor_selection_retry_key=("old-command", "Queen-1"),
+        _actor_selection_attempts=7,
+    )
+
+    assert _abort_stalled_actor_selection(main_agent) is False
+    assert main_agent._actor_selection_retry_key is None
+    assert main_agent._actor_selection_attempts == 0
 
 
 def test_deterministic_gas_rebalance_respects_effect_and_main_loop_guards() -> None:

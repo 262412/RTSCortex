@@ -23,7 +23,10 @@ from rtscortex_llm_pysc2.extractor import BUILD_RAW_FUNCTION_IDS
 from rtscortex_llm_pysc2.observation import _map_argument_candidates
 from rtscortex_llm_pysc2.production import PRODUCTION_SPECS
 from rtscortex_llm_pysc2.terran_melee import RTSCortexTerranMeleeConfig
-from rtscortex_llm_pysc2.zerg_melee import QUEEN_CONTROLLER_ACTIONS
+from rtscortex_llm_pysc2.zerg_melee import (
+    QUEEN_CONTROLLER_ACTIONS,
+    RTSCortexZergMeleeConfig,
+)
 
 
 def _assert_candidate_mapping() -> None:
@@ -139,6 +142,33 @@ def _assert_visible_team_unit_bypasses_camera_recentering() -> None:
     function_id, _ = get_camera_func_smart(main_agent, observation, unit.tag)
 
     assert function_id == 0
+
+    edge_unit = SimpleNamespace(tag=0xB, unit_type=126, x=0, y=65)
+    edge_observation = SimpleNamespace(
+        observation=SimpleNamespace(raw_units=[edge_unit], feature_units=[edge_unit])
+    )
+    main_agent.world_x_offset = 0
+    main_agent.world_y_offset = 0
+    main_agent.world_range = 128
+    main_agent.last_two_camera_pos = []
+
+    edge_function_id, _ = get_camera_func_smart(
+        main_agent,
+        edge_observation,
+        edge_unit.tag,
+    )
+
+    assert edge_function_id == 573
+
+
+def _assert_zerg_queen_uses_exact_single_actor_selection() -> None:
+    config = RTSCortexZergMeleeConfig()
+    queen_team = config.AGENTS["CombatGroup1"]["team"][0]
+    roach_team = config.AGENTS["CombatGroup2"]["team"][0]
+
+    assert queen_team["name"] == "Queen-1"
+    assert queen_team["select_type"] == "select"
+    assert roach_team["select_type"] == "select_all_type"
 
 
 def _assert_build_order_ids_use_raw_function_domain() -> None:
@@ -867,6 +897,7 @@ def main() -> None:
     _assert_gather_target_is_visible_and_in_bounds()
     _assert_single_unit_selection_uses_exact_point()
     _assert_visible_team_unit_bypasses_camera_recentering()
+    _assert_zerg_queen_uses_exact_single_actor_selection()
     _assert_build_order_ids_use_raw_function_domain()
     _assert_direct_production_contract()
     _assert_terran_addon_contract()

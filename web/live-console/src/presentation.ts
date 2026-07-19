@@ -460,6 +460,7 @@ const VALUE_LABELS: Record<string, string> = {
   production_source_invalidated: "生产建筑在执行前已失效",
   production_provenance_missing: "生产效果证据缺少必要来源信息",
   actor_not_available: "执行者当前不可用",
+  actor_selection_timeout: "连续尝试后仍无法选中执行者",
   no_build_order_observed: "未观察到建造订单",
   worker_order_replaced: "工人订单被替换",
   target_not_created: "目标建筑未出现",

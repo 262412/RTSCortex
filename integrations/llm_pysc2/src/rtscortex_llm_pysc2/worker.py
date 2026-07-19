@@ -48,6 +48,7 @@ from rtscortex_llm_pysc2.protocol import RuntimeClient
 PRODUCTION_CAMERA_SETTLE_MAX_OBSERVATIONS = 4
 PRODUCTION_SELECTION_MAX_ATTEMPTS = 4
 BUILD_SELECTION_RETRY_MAX_OBSERVATIONS = 2
+ACTOR_SELECTION_MAX_ATTEMPTS = 8
 BUILD_TRANSLATOR_RETRY_FAILURE_CODES = frozenset(
     {"blocked", "need_power", "not_pathable", "no_legal_placement"}
 )
@@ -1150,6 +1151,8 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
         )
         self._pending_primitive: Optional[PrimitiveDispatch] = None
         self._pending_primitive_agent: Optional[Any] = None
+        self._actor_selection_retry_key: Optional[tuple[str, str]] = None
+        self._actor_selection_attempts = 0
         self.transport_noop_primitives = 0
         self._observation_watchdog_active = False
         self._observation_watchdog_preempted = False
@@ -1203,6 +1206,7 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
 
     def _step(self, obs: Any) -> Any:
         self._submit_console_frame(obs)
+        _abort_stalled_actor_selection(self)
         self._settle_previous_primitive(obs)
         self.decision_broker.observe_effects(obs.observation)
         if _is_terminal(obs):
@@ -2197,6 +2201,52 @@ def _refresh_zerg_morphed_combat_teams(main_agent: Any, observation: Any) -> int
         agent._rtscortex_pending_zerg_combat_tag = None
         refreshed += 1
     return refreshed
+
+
+def _abort_stalled_actor_selection(main_agent: Any) -> bool:
+    """Bound orchestration retries so one unselectable actor cannot stall every agent."""
+
+    dispatch = getattr(main_agent, "_pending_primitive", None)
+    agent = getattr(main_agent, "_pending_primitive_agent", None)
+    if (
+        dispatch is None
+        or agent is None
+        or str(getattr(dispatch, "origin", "")) != "orchestration"
+        or int(getattr(dispatch, "requested_function_id", 0) or 0) not in {2, 3, 4}
+    ):
+        if dispatch is not None and str(getattr(dispatch, "origin", "")) == "translator":
+            main_agent._actor_selection_retry_key = None
+            main_agent._actor_selection_attempts = 0
+        return False
+
+    command_id = str(getattr(dispatch, "command_id", ""))
+    team_name = str(getattr(agent, "team_unit_team_curr", "") or "")
+    key = (command_id, team_name)
+    if key != getattr(main_agent, "_actor_selection_retry_key", None):
+        main_agent._actor_selection_retry_key = key
+        main_agent._actor_selection_attempts = 0
+    main_agent._actor_selection_attempts += 1
+    if main_agent._actor_selection_attempts < ACTOR_SELECTION_MAX_ATTEMPTS:
+        return False
+
+    action_name = str(getattr(agent, "curr_action_name", "") or "")
+    actor_tag = _execution_unit_tag(agent)
+    agent.last_execution_abort = {
+        "team_name": team_name,
+        "action_name": action_name,
+        "failure_code": "actor_selection_timeout",
+        "failure_reason": (
+            "actor could not be selected after "
+            f"{ACTOR_SELECTION_MAX_ATTEMPTS} orchestration attempts"
+        ),
+        "actor_tag": actor_tag,
+    }
+    agent.func_list.clear()
+    agent.action_list.clear()
+    agent._rtscortex_semantic_action = None
+    main_agent._actor_selection_retry_key = None
+    main_agent._actor_selection_attempts = 0
+    return True
 
 
 def _release_runtime_observation_barrier(main_agent: Any) -> None:

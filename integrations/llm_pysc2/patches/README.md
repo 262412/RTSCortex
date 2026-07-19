@@ -265,10 +265,11 @@ instead of indexing an empty list.
 `0015-observation-gap-watchdog.patch` lets the Worker skip optional upstream team gathering
 when the gap since the latest Runtime decision exceeds the configured game-loop threshold.
 
-`0016-accept-visible-team-unit.patch` stops camera centering from interrupting the existing
-point-to-rectangle selection fallback when a team unit is already visible. RTSCortex enables
-this behavior because its Runtime observation is global; selection remains required later for
-actual feature actions.
+`0016-accept-visible-team-unit.patch` stops camera centering from interrupting selection when a
+team unit is already safely visible. Units on the outer two-percent viewport margin are still
+recentered because PySC2 cannot reliably select a clipped actor at the feature-screen edge.
+RTSCortex enables this behavior because its Runtime observation is global; selection remains
+required later for actual feature actions.
 
 `0017-return-camera-settlement-noop.patch` yields the current SC2 step after a production
 camera move. The producer visibility timeout therefore counts distinct PySC2 observations
