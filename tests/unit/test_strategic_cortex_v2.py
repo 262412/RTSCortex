@@ -139,7 +139,7 @@ def test_race_profiles_lock_role_ownership_and_producer_semantics(
     assert profile.producers_for_action(action_name) == expected_producers
 
 
-def test_race_profile_capabilities_do_not_overstate_live_readiness() -> None:
+def test_race_profile_capabilities_match_implemented_live_readiness() -> None:
     protoss = race_profile("protoss").data.capability_snapshot()
     terran = race_profile("terran").data.capability_snapshot()
     zerg = race_profile("zerg").data.capability_snapshot()
@@ -147,8 +147,8 @@ def test_race_profile_capabilities_do_not_overstate_live_readiness() -> None:
     assert protoss["runtime_mapping_ready"] is True
     assert protoss["live_worker_ready"] is True
     assert terran["macro_contract_ready"] is True
-    assert terran["runtime_mapping_ready"] is False
-    assert terran["live_worker_ready"] is False
+    assert terran["runtime_mapping_ready"] is True
+    assert terran["live_worker_ready"] is True
     assert zerg["macro_contract_ready"] is True
     assert zerg["runtime_mapping_ready"] is False
     assert zerg["live_worker_ready"] is False

@@ -366,6 +366,8 @@ TERRAN_PROFILE_DATA = RaceProfileData(
         "Research_Stimpack": ("BarracksTechLab",),
     },
     hima_vocabulary_version="hima-terran-69-v1",
+    runtime_mapping_ready=True,
+    live_worker_ready=True,
     effect_verification_kinds=("build", "production", "addon", "move"),
     controller_capabilities=(
         "gas_workers",
