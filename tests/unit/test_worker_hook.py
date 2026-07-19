@@ -1620,6 +1620,86 @@ def test_build_candidates_dilate_feature_unit_radius_around_footprint() -> None:
     assert [65, 65] not in candidates
 
 
+def test_terran_production_build_reserves_right_side_addon_footprint() -> None:
+    observation = SimpleNamespace(
+        feature_units=[
+            SimpleNamespace(
+                x=80,
+                y=65,
+                radius=0.5,
+                alliance=1,
+                is_on_screen=True,
+            )
+        ],
+        feature_screen=SimpleNamespace(
+            buildable=UniformGrid(1),
+            pathable=UniformGrid(1),
+            player_relative=UniformGrid(0),
+            power=UniformGrid(0),
+        ),
+        raw_units=[
+            SimpleNamespace(
+                alliance=1,
+                unit_type=19,
+                build_progress=100,
+            ),
+            SimpleNamespace(
+                alliance=1,
+                unit_type=18,
+                build_progress=100,
+            ),
+        ],
+    )
+
+    assert not screen_build_position_is_legal(
+        observation,
+        "Build_Barracks_Screen",
+        [65, 65],
+        unit_names={18: "CommandCenter", 19: "SupplyDepot"},
+    )
+    assert screen_build_position_is_legal(
+        observation,
+        "Build_EngineeringBay_Screen",
+        [65, 65],
+        unit_names={18: "CommandCenter", 19: "SupplyDepot"},
+    )
+
+
+def test_terran_production_build_requires_buildable_addon_footprint() -> None:
+    buildable = [[1 for _ in range(128)] for _ in range(128)]
+    buildable[65][80] = 0
+    observation = SimpleNamespace(
+        feature_units=[],
+        feature_screen=SimpleNamespace(
+            buildable=Grid(buildable),
+            pathable=UniformGrid(1),
+            player_relative=UniformGrid(0),
+            power=UniformGrid(0),
+        ),
+        raw_units=[
+            SimpleNamespace(
+                alliance=1,
+                unit_type=21,
+                build_progress=100,
+            )
+        ],
+    )
+
+    assert not screen_build_position_is_legal(
+        observation,
+        "Build_Factory_Screen",
+        [65, 65],
+        unit_names={21: "Barracks"},
+    )
+    buildable[65][80] = 1
+    assert screen_build_position_is_legal(
+        observation,
+        "Build_Factory_Screen",
+        [65, 65],
+        unit_names={21: "Barracks"},
+    )
+
+
 def test_feature_screen_radius_is_not_scaled_twice_for_build_occupancy() -> None:
     observation = SimpleNamespace(
         feature_units=[

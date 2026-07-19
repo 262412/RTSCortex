@@ -41,6 +41,7 @@ class BuildSpec:
     mineral_cost: int
     vespene_cost: int = 0
     prerequisites: tuple[str, ...] = ()
+    reserves_addon_space: bool = False
 
 
 @dataclass(frozen=True)
@@ -91,6 +92,7 @@ BUILD_SPECS = {
         False,
         150,
         prerequisites=("SupplyDepot",),
+        reserves_addon_space=True,
     ),
     "Build_Refinery_Near": BuildSpec("Refinery", "geyser", 3, False, 75),
     "Build_CommandCenter_Near": BuildSpec("CommandCenter", "expansion", 5, False, 400),
@@ -102,6 +104,7 @@ BUILD_SPECS = {
         150,
         vespene_cost=100,
         prerequisites=("Barracks",),
+        reserves_addon_space=True,
     ),
     "Build_Starport_Screen": BuildSpec(
         "Starport",
@@ -111,6 +114,7 @@ BUILD_SPECS = {
         150,
         vespene_cost=100,
         prerequisites=("Factory",),
+        reserves_addon_space=True,
     ),
     "Build_EngineeringBay_Screen": BuildSpec(
         "EngineeringBay",
@@ -1651,6 +1655,7 @@ def _build_screen_candidates(
         ),
         screen_size=screen_size,
         building_size=spec.footprint,
+        reserve_addon_space=spec.reserves_addon_space,
         require_power=spec.requires_power,
         semantic_anchor=semantic_anchor,
     )
@@ -1747,7 +1752,12 @@ def _build_screen_position_is_legal(
     return _build_footprint_is_clear(
         prefix,
         _occupied_positions(observation),
-        _build_footprint_bounds(int(position[0]), int(position[1]), ratio, spec.footprint),
+        _build_footprint_bounds_for_spec(
+            int(position[0]),
+            int(position[1]),
+            ratio,
+            spec,
+        ),
         screen_size,
     )
 
@@ -1773,6 +1783,7 @@ def _valid_build_positions(
     occupied_positions: tuple[tuple[int, int, float], ...],
     screen_size: int,
     building_size: int,
+    reserve_addon_space: bool,
     require_power: bool,
     semantic_anchor: tuple[float, float],
 ) -> list[list[int]]:
@@ -1790,6 +1801,8 @@ def _valid_build_positions(
     for x0 in range(stride, screen_size, stride):
         for y0 in range(stride, screen_size, stride):
             bounds = _build_footprint_bounds(x0, y0, ratio, building_size)
+            if reserve_addon_space:
+                bounds = _extend_bounds_for_terran_addon(bounds, ratio)
             if _build_footprint_is_clear(
                 invalid_cell_prefix,
                 occupied_positions,
@@ -1836,6 +1849,28 @@ def _build_footprint_bounds(
         first_y - cell_radius,
         last_y + cell_radius,
     )
+
+
+def _build_footprint_bounds_for_spec(
+    center_x: int,
+    center_y: int,
+    ratio: int,
+    spec: BuildSpec,
+) -> tuple[int, int, int, int]:
+    bounds = _build_footprint_bounds(center_x, center_y, ratio, spec.footprint)
+    if spec.reserves_addon_space:
+        return _extend_bounds_for_terran_addon(bounds, ratio)
+    return bounds
+
+
+def _extend_bounds_for_terran_addon(
+    bounds: tuple[int, int, int, int],
+    ratio: int,
+) -> tuple[int, int, int, int]:
+    """Reserve the two world-grid columns to the right used by a Terran add-on."""
+
+    min_x, max_x, min_y, max_y = bounds
+    return min_x, max_x + 2 * ratio, min_y, max_y
 
 
 def _build_footprint_is_clear(
