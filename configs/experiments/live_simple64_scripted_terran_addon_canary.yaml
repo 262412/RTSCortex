@@ -45,8 +45,8 @@ cortex:
       - Marine
       - BarracksTechLab
     required: true
-    interval_game_loops: 112
-    plan_ttl_game_loops: 448
+    interval_game_loops: 10000
+    plan_ttl_game_loops: 10000
     timeout_seconds: 15.0
   tactical:
     kind: deterministic
