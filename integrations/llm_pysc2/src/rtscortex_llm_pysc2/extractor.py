@@ -1090,7 +1090,6 @@ def _gas_structure_candidates(
     target_structure: str,
 ) -> list[int]:
     raw_units = list(_value(observation, "raw_units", ()))
-    raw_by_tag = {int(_value(unit, "tag", 0)): unit for unit in raw_units}
     townhalls = [
         unit
         for unit in raw_units
@@ -1105,19 +1104,21 @@ def _gas_structure_candidates(
         and _unit_name(unit, unit_names) == target_structure
     ]
     candidates = []
-    for unit in _value(observation, "feature_units", ()):
+    # Near-build translation moves the camera to the exact world tag before it
+    # resolves the feature-layer target.  Requiring the geyser to already be on
+    # the current screen makes this action disappear whenever combat moves the
+    # camera away from the main base.
+    for unit in raw_units:
         tag = int(_value(unit, "tag", 0))
-        raw = raw_by_tag.get(tag, unit)
         if (
             tag <= 0
             or int(_value(unit, "alliance", 0)) != 3
-            or not bool(_value(unit, "is_on_screen", True))
-            or not _is_gas(_unit_name(raw, unit_names))
+            or not _is_gas(_unit_name(unit, unit_names))
         ):
             continue
-        if not any(_distance(raw, townhall) < 10.0 for townhall in townhalls):
+        if not any(_distance(unit, townhall) < 10.0 for townhall in townhalls):
             continue
-        if any(_distance(raw, gas_structure) < 2.0 for gas_structure in gas_structures):
+        if any(_distance(unit, gas_structure) < 2.0 for gas_structure in gas_structures):
             continue
         candidates.append(tag)
     return sorted(set(candidates))

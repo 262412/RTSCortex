@@ -1860,7 +1860,7 @@ def test_shield_battery_requires_core_power_and_clear_full_footprint() -> None:
     )
 
 
-def test_assimilator_candidates_require_nearby_unoccupied_visible_geyser() -> None:
+def test_assimilator_candidates_use_nearby_unoccupied_raw_geyser() -> None:
     nexus = SimpleNamespace(
         tag=1,
         unit_type=59,
@@ -1895,6 +1895,13 @@ def test_assimilator_candidates_require_nearby_unoccupied_visible_geyser() -> No
     )
     unit_names = {59: "Nexus", 61: "Assimilator", 342: "VespeneGeyser"}
 
+    assert semantic_argument_candidates(
+        observation,
+        "Build_Assimilator_Near",
+        unit_names=unit_names,
+    ) == [[100]]
+
+    observation.feature_units = []
     assert semantic_argument_candidates(
         observation,
         "Build_Assimilator_Near",
