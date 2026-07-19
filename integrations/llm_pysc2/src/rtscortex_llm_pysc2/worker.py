@@ -1091,6 +1091,7 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
         dispatch = self._pending_primitive
         if dispatch is None:
             return
+        settlement_loop = _observation_game_loop(obs.observation)
         action_results = list(getattr(obs.observation, "action_result", ()))
         failure_reason = None
         if action_results:
@@ -1119,11 +1120,28 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
                             self._pending_primitive_agent._rtscortex_rejected_build_targets.setdefault(
                                 action_name, set()
                             ).add(world_target)
+        elif (
+            dispatch.origin == "translator"
+            and dispatch.requested_function_id == 2
+            and not dispatch.final_primitive
+            and self._pending_primitive_agent is not None
+            and (
+                production_spec(self._pending_primitive_agent.curr_action_name) is not None
+                or addon_spec(self._pending_primitive_agent.curr_action_name) is not None
+            )
+        ):
+            # The select primitive was created from the previous observation.
+            # Anchor the barrier to the observation that confirms PySC2 accepted
+            # it, so the final train/add-on primitive cannot run in this same
+            # handler invocation with stale feature-action availability.
+            self._pending_primitive_agent._rtscortex_production_selection_loop = (
+                settlement_loop
+            )
         self.decision_broker.settle_primitive(
             dispatch,
             success=not action_results,
             failure_reason=failure_reason,
-            game_loop=_observation_game_loop(obs.observation),
+            game_loop=settlement_loop,
         )
         self._pending_primitive = None
         if self._pending_primitive_agent is not None:

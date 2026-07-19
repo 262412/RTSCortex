@@ -4001,6 +4001,60 @@ def test_worker_maps_next_action_result_to_pysc2_rejection_and_clears_chain() ->
     ]
 
 
+def test_worker_anchors_production_selection_barrier_to_acceptance_observation() -> None:
+    calls: list[tuple[PrimitiveDispatch, bool, str | None, int]] = []
+
+    class Broker:
+        def settle_primitive(
+            self,
+            dispatch: PrimitiveDispatch,
+            *,
+            success: bool,
+            failure_reason: str | None,
+            game_loop: int,
+        ) -> None:
+            calls.append((dispatch, success, failure_reason, game_loop))
+
+    dispatch = PrimitiveDispatch(
+        command_id="command-techlab",
+        function_name="select_point",
+        final_primitive=False,
+        ordinal=1,
+        total=3,
+        requested_function_id=2,
+        emitted_function_id=2,
+    )
+    upstream_agent = cast(
+        Any,
+        SimpleNamespace(
+            curr_action_name="Build_BarracksTechLab",
+            func_list=[(94, object(), ("queued",))],
+            _rtscortex_translation_ordinal=2,
+            _rtscortex_production_selection_loop=3126,
+            _rtscortex_active_build_route=None,
+        ),
+    )
+    main_agent = cast(Any, object.__new__(RTSCortexMainAgent))
+    main_agent._pending_primitive = dispatch
+    main_agent._pending_primitive_agent = upstream_agent
+    main_agent.decision_broker = Broker()
+    timestep = SimpleNamespace(
+        observation=SimpleNamespace(game_loop=[3127], action_result=[]),
+    )
+
+    main_agent._settle_previous_primitive(timestep)
+
+    assert upstream_agent._rtscortex_production_selection_loop == 3127
+    assert RTSCortexLLMAgent._wait_for_production_selection(
+        upstream_agent,
+        "Build_BarracksTechLab",
+        timestep,
+    ) is True
+    assert calls == [(dispatch, True, None, 3127)]
+    assert main_agent._pending_primitive is None
+    assert main_agent._pending_primitive_agent is None
+
+
 def test_broker_requires_a_contiguous_translator_sequence() -> None:
     runtime = FakeRuntime()
     coordinator = BridgeCoordinator(runtime)
