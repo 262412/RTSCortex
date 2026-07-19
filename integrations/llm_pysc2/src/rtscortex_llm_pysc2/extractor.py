@@ -821,7 +821,14 @@ def _argument_candidates(
     if not _build_prerequisites_satisfied(observation, spec, unit_names):
         return []
     if spec.placement_kind == "screen":
-        return [[candidate] for candidate in build_screen_candidates(observation, action_name)]
+        return [
+            [candidate]
+            for candidate in build_screen_candidates(
+                observation,
+                action_name,
+                unit_names=unit_names,
+            )
+        ]
     if spec.placement_kind == "geyser":
         return [
             [tag]
@@ -1441,8 +1448,18 @@ def _available_function_ids(
     return frozenset(int(value) for value in values)
 
 
-def build_screen_candidates(observation: Any, action_name: str) -> list[list[int]]:
-    return _build_screen_candidates(observation, action_name, limit=8)
+def build_screen_candidates(
+    observation: Any,
+    action_name: str,
+    *,
+    unit_names: Optional[Mapping[int, str]] = None,
+) -> list[list[int]]:
+    return _build_screen_candidates(
+        observation,
+        action_name,
+        limit=8,
+        unit_names=unit_names or {},
+    )
 
 
 def screen_to_world_target(
@@ -1495,6 +1512,7 @@ def resolve_screen_build_world_target(
     preferred_anchor_tag: Optional[int] = None,
     excluded_positions: Collection[tuple[int, int]] = (),
     force_resample: bool = False,
+    unit_names: Optional[Mapping[int, str]] = None,
 ) -> Optional[list[int]]:
     """Reproject a routed build target and validate it against the current camera."""
 
@@ -1518,13 +1536,23 @@ def resolve_screen_build_world_target(
     if (
         not force_resample
         and tuple(projected) not in excluded
-        and _build_screen_position_is_legal(observation, spec, projected)
+        and _build_screen_position_is_legal(
+            observation,
+            spec,
+            projected,
+            unit_names=unit_names or {},
+        )
     ):
         return projected
 
     candidates = [
         candidate
-        for candidate in _build_screen_candidates(observation, action_name, limit=None)
+        for candidate in _build_screen_candidates(
+            observation,
+            action_name,
+            limit=None,
+            unit_names=unit_names or {},
+        )
         if tuple(candidate) not in excluded
     ]
     stride = max(4, int(height / SCREEN_WORLD_GRID))
@@ -1601,7 +1629,12 @@ def screen_build_position_is_legal(
         spec is not None
         and spec.placement_kind == "screen"
         and _build_prerequisites_satisfied(observation, spec, unit_names or {})
-        and _build_screen_position_is_legal(observation, spec, position)
+        and _build_screen_position_is_legal(
+            observation,
+            spec,
+            position,
+            unit_names=unit_names or {},
+        )
     )
 
 
@@ -1610,6 +1643,7 @@ def _build_screen_candidates(
     action_name: str,
     *,
     limit: Optional[int],
+    unit_names: Mapping[int, str],
 ) -> list[list[int]]:
     spec = BUILD_SPECS.get(action_name)
     if spec is None or spec.placement_kind != "screen":
@@ -1652,6 +1686,11 @@ def _build_screen_candidates(
             )
             for unit in feature_units
             if bool(_value(unit, "is_on_screen", True))
+        ),
+        reserved_bounds=_terran_addon_reservation_bounds(
+            observation,
+            unit_names,
+            screen_size,
         ),
         screen_size=screen_size,
         building_size=spec.footprint,
@@ -1725,6 +1764,8 @@ def _build_screen_position_is_legal(
     observation: Any,
     spec: BuildSpec,
     position: Sequence[int],
+    *,
+    unit_names: Mapping[int, str],
 ) -> bool:
     feature_screen = _value(observation, "feature_screen", None)
     buildable = _value(feature_screen, "buildable", None)
@@ -1759,6 +1800,11 @@ def _build_screen_position_is_legal(
             spec,
         ),
         screen_size,
+        reserved_bounds=_terran_addon_reservation_bounds(
+            observation,
+            unit_names,
+            screen_size,
+        ),
     )
 
 
@@ -1781,6 +1827,7 @@ def _valid_build_positions(
     power: Any,
     *,
     occupied_positions: tuple[tuple[int, int, float], ...],
+    reserved_bounds: tuple[tuple[int, int, int, int], ...],
     screen_size: int,
     building_size: int,
     reserve_addon_space: bool,
@@ -1808,6 +1855,7 @@ def _valid_build_positions(
                 occupied_positions,
                 bounds,
                 screen_size,
+                reserved_bounds=reserved_bounds,
             ):
                 anchor_distance = (x0 - semantic_anchor[0]) ** 2 + (y0 - semantic_anchor[1]) ** 2
                 center_distance = (x0 - screen_size / 2) ** 2 + (y0 - screen_size / 2) ** 2
@@ -1873,11 +1921,38 @@ def _extend_bounds_for_terran_addon(
     return min_x, max_x + 2 * ratio, min_y, max_y
 
 
+def _terran_addon_reservation_bounds(
+    observation: Any,
+    unit_names: Mapping[int, str],
+    screen_size: int,
+) -> tuple[tuple[int, int, int, int], ...]:
+    ratio = max(1, int(screen_size / SCREEN_WORLD_GRID))
+    reservations: list[tuple[int, int, int, int]] = []
+    for unit in _value(observation, "feature_units", ()):
+        if (
+            not bool(_value(unit, "is_on_screen", True))
+            or int(_value(unit, "alliance", 0)) != 1
+            or _unit_name(unit, unit_names) not in {"Barracks", "Factory", "Starport"}
+        ):
+            continue
+        main_bounds = _build_footprint_bounds(
+            int(_value(unit, "x", 0)),
+            int(_value(unit, "y", 0)),
+            ratio,
+            3,
+        )
+        _, max_x, min_y, max_y = _extend_bounds_for_terran_addon(main_bounds, ratio)
+        reservations.append((main_bounds[1] + 1, max_x, min_y, max_y))
+    return tuple(reservations)
+
+
 def _build_footprint_is_clear(
     invalid_cell_prefix: list[list[int]],
     occupied_positions: tuple[tuple[int, int, float], ...],
     bounds: tuple[int, int, int, int],
     screen_size: int,
+    *,
+    reserved_bounds: tuple[tuple[int, int, int, int], ...] = (),
 ) -> bool:
     min_x, max_x, min_y, max_y = bounds
     if min_x <= 0 or min_y <= 0 or max_x >= screen_size or max_y >= screen_size:
@@ -1888,6 +1963,8 @@ def _build_footprint_is_clear(
         for unit_x, unit_y, radius in occupied_positions
     ):
         return False
+    if any(_rectangles_overlap(bounds, reserved) for reserved in reserved_bounds):
+        return False
     return (
         _rectangle_sum(
             invalid_cell_prefix,
@@ -1897,6 +1974,20 @@ def _build_footprint_is_clear(
             max_y,
         )
         == 0
+    )
+
+
+def _rectangles_overlap(
+    left: tuple[int, int, int, int],
+    right: tuple[int, int, int, int],
+) -> bool:
+    left_min_x, left_max_x, left_min_y, left_max_y = left
+    right_min_x, right_max_x, right_min_y, right_max_y = right
+    return not (
+        left_max_x < right_min_x
+        or right_max_x < left_min_x
+        or left_max_y < right_min_y
+        or right_max_y < left_min_y
     )
 
 

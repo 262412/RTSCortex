@@ -269,6 +269,7 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
                                 in self._rtscortex_rejected_build_targets.get(action_name, set())
                             ),
                             screen_size=int(self.size_screen),
+                            unit_names=self.unit_names,
                         )
                     else:
                         resolved = _resolve_screen_point_action_position(
@@ -398,6 +399,7 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
                         )
                     ),
                     screen_size=int(self.size_screen),
+                    unit_names=self.unit_names,
                 )
                 if resolved is None:
                     requested = _screen_argument(action)
@@ -1955,6 +1957,7 @@ def _resolve_build_action_position(
     preferred_anchor_tag: Optional[int] = None,
     excluded_positions: set[tuple[int, int]] | None = None,
     force_resample: bool = False,
+    unit_names: Optional[Mapping[int, str]] = None,
 ) -> Optional[list[int]]:
     action_name = str(action.get("name", ""))
     requested = _screen_argument(action)
@@ -1966,13 +1969,18 @@ def _resolve_build_action_position(
             preferred_anchor_tag=preferred_anchor_tag,
             excluded_positions=excluded_positions or set(),
             force_resample=force_resample,
+            unit_names=unit_names or {},
         )
         if position is None:
             return None
     else:
         candidates = [
             candidate
-            for candidate in build_screen_candidates(observation, action_name)
+            for candidate in build_screen_candidates(
+                observation,
+                action_name,
+                unit_names=unit_names or {},
+            )
             if tuple(candidate) not in (excluded_positions or set())
         ]
         if not candidates:
@@ -1992,12 +2000,15 @@ def _resolve_translator_compatible_build_position(
     excluded_positions: set[tuple[int, int]],
     force_resample: bool,
     screen_size: int,
+    unit_names: Mapping[int, str],
 ) -> Optional[list[int]]:
     """Resample until the pinned translator accepts the same screen position."""
 
     action_name = str(action.get("name", ""))
     excluded = set(excluded_positions)
-    attempts = len(build_screen_candidates(observation, action_name)) + 1
+    attempts = (
+        len(build_screen_candidates(observation, action_name, unit_names=unit_names)) + 1
+    )
     for _ in range(attempts):
         position = _resolve_build_action_position(
             action,
@@ -2006,6 +2017,7 @@ def _resolve_translator_compatible_build_position(
             preferred_anchor_tag=preferred_anchor_tag,
             excluded_positions=excluded,
             force_resample=force_resample,
+            unit_names=unit_names,
         )
         if position is None:
             excluded_positions.update(excluded)

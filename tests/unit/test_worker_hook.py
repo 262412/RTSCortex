@@ -1700,6 +1700,47 @@ def test_terran_production_build_requires_buildable_addon_footprint() -> None:
     )
 
 
+def test_new_build_avoids_existing_terran_producer_addon_reservation() -> None:
+    observation = SimpleNamespace(
+        feature_units=[
+            SimpleNamespace(
+                x=55,
+                y=65,
+                radius=1.5,
+                alliance=1,
+                unit_type=21,
+                is_on_screen=True,
+            )
+        ],
+        feature_screen=SimpleNamespace(
+            buildable=UniformGrid(1),
+            pathable=UniformGrid(1),
+            player_relative=UniformGrid(0),
+            power=UniformGrid(0),
+        ),
+        raw_units=[
+            SimpleNamespace(
+                alliance=1,
+                unit_type=19,
+                build_progress=100,
+            )
+        ],
+    )
+
+    assert not screen_build_position_is_legal(
+        observation,
+        "Build_Barracks_Screen",
+        [70, 65],
+        unit_names={19: "SupplyDepot", 21: "Barracks"},
+    )
+    assert screen_build_position_is_legal(
+        observation,
+        "Build_Barracks_Screen",
+        [30, 65],
+        unit_names={19: "SupplyDepot", 21: "Barracks"},
+    )
+
+
 def test_feature_screen_radius_is_not_scaled_twice_for_build_occupancy() -> None:
     observation = SimpleNamespace(
         feature_units=[
