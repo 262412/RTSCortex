@@ -6,7 +6,8 @@ sent to Runtime, Bridge, PySC2, or StarCraft II.
 
 ## Corpus
 
-The checked-in Protoss and Zerg corpora each contain 48 real protocol v1.1 observations:
+The checked-in Protoss, Terran, and Zerg corpora each contain 48 real protocol v1.1
+observations:
 eight each for
 `early`, `technology`, `production`, `combat`, `blocked`, and `in_progress`. Blocked and
 in-progress fixtures retain their underlying phase tag, deterministic goal evidence,
@@ -18,6 +19,8 @@ Verify the materialized corpus without requiring its original journals:
 ```bash
 uv run rtscortex policy-corpus verify \
   benchmarks/policy/protoss_v0_2/manifest.yaml
+uv run rtscortex policy-corpus verify \
+  benchmarks/policy/terran_v0_3/manifest.yaml
 uv run rtscortex policy-corpus verify \
   benchmarks/policy/zerg_v0_3/manifest.yaml
 ```
@@ -47,11 +50,11 @@ as `Train_Drone` do not by themselves turn a Zerg opening into a production fixt
 completed army prerequisite such as `SpawningPool` makes resource-blocked production
 representable.
 
-The Terran source pool is recorded in
-`configs/policy/corpus_sources_terran_v0_3.yaml`, but it intentionally has no checked-in
-manifest yet: the available real journals do not satisfy the two-fixture blocked-production
-and blocked-combat phase quotas. The strict builder reports this gap instead of fabricating
-states or reducing the quota.
+The Terran corpus uses a combined-arms production frontier and changes its combat goal to
+`Train_SiegeTank` when visible enemy evidence includes Roach or Ravager technology. This
+keeps its blocked-production and blocked-combat fixtures tied to real prerequisites,
+resources, and observations. The checked-in manifest preserves two fixtures for every
+blocked and in-progress phase without synthetic states or reduced quotas.
 
 ## Offline workflow smoke
 

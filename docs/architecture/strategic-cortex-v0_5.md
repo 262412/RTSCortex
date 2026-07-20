@@ -51,13 +51,13 @@ not perform strategic reasoning.
 | Runtime action mapping | Ready | Ready for current Simple64 frontier | Ready for current Simple64 frontier |
 | Live LLM-PySC2 Worker | Ready | Ready | Ready |
 | Effect verification | Build, production and move | Build, production, add-on and move | Build, production, morph, inject and move |
-| Live 48-state corpus | Protoss v0.2 | Source coverage incomplete | Zerg v0.3 |
+| Live 48-state corpus | Protoss v0.2 | Terran v0.3 | Zerg v0.3 |
 | Seeds 0/1/2 engineering regression | Ready | Ready | Ready |
 
 The pinned LLM-PySC2 environment remains unchanged, while reviewed Bridge adapters provide
 race-specific observation, actor routing and action/effect semantics. All three races use the
 same Cortex runtime. Current explicit gaps are Terran research/morph verification, chained
-Zerg creep spread, a complete Terran corpus, and the 27-match tactical-quality suite.
+Zerg creep spread, and the 27-match tactical-quality suite.
 
 The installed specialist checkpoints are pinned and loaded with `local_files_only=True`:
 
@@ -138,8 +138,8 @@ intent, arbitration decision, Playbook rules, candidate and terminal execution r
 3. Run paired Playbook on/off seeds; promote only the rules that satisfy the published gates.
 4. Completed: Terran Worker, add-on effects, smoke and seed regression.
 5. Completed: Zerg larva, inject, creep/morph provenance, seed regression, and 48-state corpus.
-6. Capture the missing real Terran blocked-production and blocked-combat states, then
-   materialize and verify its 48-state corpus.
+6. Completed: Terran blocked-production and blocked-combat coverage and its verified
+   48-state corpus.
 7. Complete the remaining race-effect gaps, then run the 27-match tactical-quality suite.
 
 This order intentionally keeps “model can produce a proposal” separate from “the race is safe

@@ -274,6 +274,112 @@ def test_zerg_idle_spawning_pool_can_form_a_blocked_production_fixture() -> None
     assert verifier.verify(observation, goal).status is GoalProgressStatus.BLOCKED
 
 
+def test_terran_production_fixture_tracks_the_combined_arms_frontier() -> None:
+    semantics = _corpus_race_semantics(RaceId.TERRAN)
+    base = make_observation(include_enemy=False)
+    observation = base.model_copy(
+        update={
+            "state": base.state.model_copy(
+                update={
+                    "economy": EconomyState(
+                        minerals=150,
+                        vespene=0,
+                        supply_used=12,
+                        supply_cap=23,
+                    ),
+                    "own_structures": [
+                        UnitState(
+                            unit_id="depot-1",
+                            unit_type="SupplyDepot",
+                            alliance="self",
+                            status="active",
+                        ),
+                        UnitState(
+                            unit_id="barracks-1",
+                            unit_type="Barracks",
+                            alliance="self",
+                            status="active",
+                        ),
+                    ],
+                }
+            ),
+            "available_actions": [
+                AvailableAction(name="Train_Marine", actor_scopes=["barracks"])
+            ],
+        }
+    )
+    verifier = GoalProgressVerifier(action_specs=semantics.profile.progress_action_specs)
+    goal = _phase_goal(
+        verifier,
+        observation,
+        PolicyFixtureStratum.PRODUCTION,
+        RaceId.TERRAN,
+    )
+    report = verifier.verify(observation, goal)
+
+    assert goal.requirements[0].action_name == "Train_SiegeTank"
+    assert report.status is GoalProgressStatus.BLOCKED
+    assert {blocker.kind.value for blocker in report.blockers} >= {
+        "missing_prerequisite",
+        "insufficient_vespene",
+    }
+
+
+def test_terran_combat_fixture_responds_to_observed_roach_technology() -> None:
+    semantics = _corpus_race_semantics(RaceId.TERRAN)
+    base = make_observation(include_enemy=False)
+    observation = base.model_copy(
+        update={
+            "state": base.state.model_copy(
+                update={
+                    "economy": EconomyState(
+                        minerals=150,
+                        vespene=0,
+                        supply_used=12,
+                        supply_cap=23,
+                    ),
+                    "own_structures": [
+                        UnitState(
+                            unit_id="depot-1",
+                            unit_type="SupplyDepot",
+                            alliance="self",
+                            status="active",
+                        ),
+                        UnitState(
+                            unit_id="barracks-1",
+                            unit_type="Barracks",
+                            alliance="self",
+                            status="active",
+                        ),
+                    ],
+                    "visible_enemies": [
+                        UnitState(
+                            unit_id="roach-warren-1",
+                            unit_type="RoachWarren",
+                            alliance="enemy",
+                            status="active",
+                        )
+                    ],
+                }
+            ),
+            "available_actions": [
+                AvailableAction(name="Train_Marine", actor_scopes=["barracks"])
+            ],
+        }
+    )
+    verifier = GoalProgressVerifier(action_specs=semantics.profile.progress_action_specs)
+    goal = _phase_goal(
+        verifier,
+        observation,
+        PolicyFixtureStratum.COMBAT,
+        RaceId.TERRAN,
+    )
+    report = verifier.verify(observation, goal)
+
+    assert goal.requirements[0].action_name == "Train_SiegeTank"
+    assert report.status is GoalProgressStatus.BLOCKED
+
+
 def test_future_corpora_recognize_oracle_phoenix_and_shield_battery_events() -> None:
     assert {
         action: _RUNTIME_TO_HIMA_SHORT_ACTION[action]

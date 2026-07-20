@@ -53,6 +53,7 @@ _CONDITION_PHASES: tuple[PolicyFixtureStratum, ...] = (
 )
 _PREVIOUS_ACTION_WINDOW_GAME_LOOPS = int(60 * 22.4)
 _DEFENSIVE_ALERT_NAMES = frozenset({"underattack", "buildingunderattack", "unitunderattack"})
+_TERRAN_SIEGE_RESPONSE_ENEMY_TYPES = frozenset({"roach", "ravager", "roachwarren"})
 
 
 def _canonical_static(value: str) -> str:
@@ -921,6 +922,9 @@ def _phase_goal(
         completed_structures=completed_structures,
         upgrades=upgrades,
         defensive_hold=any(_is_defensive_alert(alert) for alert in observation.alerts),
+        visible_enemy_types={
+            _canonical(enemy.unit_type) for enemy in observation.state.visible_enemies
+        },
     )
     return verifier.goal_from_action_names(
         goal_id=f"{race.value}-{phase.value}-next-v1",
@@ -937,6 +941,7 @@ def _phase_action(
     completed_structures: set[str],
     upgrades: set[str],
     defensive_hold: bool,
+    visible_enemy_types: set[str],
 ) -> tuple[str, bool]:
     if phase not in _CONDITION_PHASES:
         raise ValueError(f"unsupported policy corpus phase: {phase.value}")
@@ -973,8 +978,12 @@ def _phase_action(
                 return "Build_Starport_Screen", False
             return "Train_SiegeTank", True
         if phase is PolicyFixtureStratum.PRODUCTION:
-            return "Train_SiegeTank" if "factory" in completed_structures else "Train_Marine", True
-        return ("Build_Bunker_Screen", False) if defensive_hold else ("Train_Marine", True)
+            return "Train_SiegeTank", True
+        if defensive_hold:
+            return "Build_Bunker_Screen", False
+        if visible_enemy_types & _TERRAN_SIEGE_RESPONSE_ENEMY_TYPES:
+            return "Train_SiegeTank", True
+        return "Train_Marine", True
     if phase is PolicyFixtureStratum.EARLY:
         if "spawningpool" not in completed_structures:
             return "Build_SpawningPool_Screen", False

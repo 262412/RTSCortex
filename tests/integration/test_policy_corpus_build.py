@@ -33,7 +33,11 @@ from rtscortex.policy.models import PolicyFixtureStratum
 from rtscortex.races import RaceId
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-PINNED_CORPUS_MANIFEST = PROJECT_ROOT / "benchmarks/policy/protoss_v0_2/manifest.yaml"
+PINNED_CORPUS_MANIFESTS = (
+    PROJECT_ROOT / "benchmarks/policy/protoss_v0_2/manifest.yaml",
+    PROJECT_ROOT / "benchmarks/policy/terran_v0_3/manifest.yaml",
+    PROJECT_ROOT / "benchmarks/policy/zerg_v0_3/manifest.yaml",
+)
 
 
 def test_build_load_and_verify_balanced_corpus(tmp_path: Path) -> None:
@@ -124,9 +128,12 @@ def test_builder_reports_missing_condition_phase_without_fabrication(
         build_policy_corpus(config, tmp_path / "corpus")
 
 
-def test_checked_in_corpus_has_exact_stage_aware_condition_coverage() -> None:
-    verification = verify_policy_corpus(PINNED_CORPUS_MANIFEST)
-    fixtures = load_policy_corpus(PINNED_CORPUS_MANIFEST)
+@pytest.mark.parametrize("manifest_path", PINNED_CORPUS_MANIFESTS)
+def test_checked_in_corpora_have_exact_stage_aware_condition_coverage(
+    manifest_path: Path,
+) -> None:
+    verification = verify_policy_corpus(manifest_path)
+    fixtures = load_policy_corpus(manifest_path)
 
     assert verification.valid
     assert verification.fixture_count == 48
