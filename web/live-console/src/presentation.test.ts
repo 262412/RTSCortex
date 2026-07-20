@@ -154,6 +154,16 @@ describe("Chinese event presentation", () => {
     expect(actionLabel("Build_CreepTumor_Queen_Screen")).toBe(
       "虫后放置菌毯肿瘤（Build_CreepTumor_Queen_Screen）",
     );
+    expect(actionLabel("Build_CreepTumor_Tumor_Screen")).toBe(
+      "菌毯肿瘤继续扩散（Build_CreepTumor_Tumor_Screen）",
+    );
+    expect(actionLabel("Effect_CalldownMULE_Screen")).toBe(
+      "呼叫矿骡采矿（Effect_CalldownMULE_Screen）",
+    );
+    expect(actionLabel("Train_SCV")).toBe("训练 SCV（Train_SCV）");
+    expect(actionLabel("Morph_OrbitalCommand")).toBe(
+      "升级为轨道指挥部（Morph_OrbitalCommand）",
+    );
     expect(fieldLabel("requested_producer_tag")).toBe("请求生产来源 Tag");
     expect(fieldLabel("producer_tag")).toBe("实际生产来源 Tag");
     expect(fieldLabel("confirmation_kind")).toBe("生产确认方式");
@@ -170,6 +180,11 @@ describe("Chinese event presentation", () => {
     expect(semanticScalar("target_buff", "confirmation_kind")).toBe(
       "目标获得状态效果（target_buff）",
     );
+    expect(semanticScalar("upgrade_observed", "confirmation_kind")).toBe(
+      "科技升级已完成（upgrade_observed）",
+    );
+    expect(semanticScalar("research", "effect_kind")).toBe("科技研究（research）");
+    expect(semanticScalar("ability", "effect_kind")).toBe("经济技能（ability）");
     expect(semanticScalar("no_inject_effect_observed", "failure_code")).toBe(
       "未观察到幼虫注入订单或状态效果（no_inject_effect_observed）",
     );

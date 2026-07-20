@@ -860,7 +860,24 @@ def _render_execution(
                 "  - Production confirmed by new unit "
                 f"{_code(evidence.new_unit_tag or 'unknown')} ({_code(unit_type)})."
             )
-    elif (
+    if report.effect_evidence and report.effect_evidence.effect_kind == "research":
+        evidence = report.effect_evidence
+        lines.append(
+            "  - Research confirmed by "
+            f"{_code(evidence.confirmation_kind or 'unknown')} for "
+            f"{_code(evidence.expected_upgrade or evidence.target_type or 'unknown upgrade')} "
+            f"on {_code(evidence.producer_tag or 'unknown producer')}."
+        )
+    if report.effect_evidence and report.effect_evidence.effect_kind == "ability":
+        evidence = report.effect_evidence
+        lines.append(
+            "  - Economy ability confirmed by new unit "
+            f"{_code(evidence.new_unit_tag or 'unknown')} from "
+            f"{_code(evidence.producer_tag or 'unknown producer')}."
+        )
+    if (
+        report.effect_evidence is None
+        and
         report.action_name is not None
         and report.action_name.startswith("Train_")
         and report.status.value == "succeeded"

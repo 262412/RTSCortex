@@ -17,6 +17,7 @@ from rtscortex.cortex import (
 )
 from rtscortex.policy.hima import HIMALiveProposalResponse, HIMAProposalParser
 from rtscortex.policy.models import PolicyActionClassification
+from rtscortex.races import TERRAN_PROFILE_DATA
 from tests.helpers import make_observation
 
 
@@ -50,6 +51,21 @@ def _response(raw_output: str) -> HIMALiveProposalResponse:
     )
 
 
+def _terran_response(
+    raw_output: str,
+    observation: ObservationEnvelope,
+) -> HIMALiveProposalResponse:
+    return HIMALiveProposalResponse(
+        request_id="terran-request-1",
+        run_id=observation.run_id,
+        episode_id=observation.episode_id,
+        step_id=observation.step_id,
+        game_loop=observation.game_loop,
+        projection_hash="b" * 64,
+        proposal=HIMAProposalParser(race="terran").parse(raw_output),
+    )
+
+
 def test_macro_plan_projection_is_deterministic_and_preserves_step_semantics() -> None:
     observation = _pylon_observation()
     response = _response("Actions: ['Probe', 'Pylon', 'Gateway']")
@@ -75,6 +91,42 @@ def test_macro_plan_projection_is_deterministic_and_preserves_step_semantics() -
     assert first.steps[1].runtime_actions == ["Build_Pylon_Screen"]
     assert first.steps[2].status is MacroStepStatus.PENDING
     assert first.steps[2].reason == "future_horizon_not_evaluated"
+
+
+def test_terran_mule_remains_in_lineage_but_is_managed_outside_goal_progress() -> None:
+    observation = make_observation(include_enemy=False, game_loop=224).model_copy(
+        update={
+            "available_actions": [
+                AvailableAction(
+                    name="Train_SCV",
+                    actor_scopes=["Developer/Empty"],
+                )
+            ]
+        }
+    )
+    response = _terran_response(
+        "Actions: ['SCV', 'SupplyDepot', 'OrbitalCommand', 'MULE']",
+        observation,
+    )
+
+    plan = macro_plan_from_hima(
+        response,
+        observation,
+        ttl_game_loops=448,
+        profile=TERRAN_PROFILE_DATA,
+    )
+    goal = macro_goal_spec(plan, observation, profile=TERRAN_PROFILE_DATA)
+
+    mule_step = next(step for step in plan.steps if step.semantic_action == "TRAIN MULE")
+    assert mule_step.runtime_actions == ["Effect_CalldownMULE_Screen"]
+    assert mule_step.status is MacroStepStatus.OBSOLETE
+    assert mule_step.reason == "managed_automatically"
+    assert goal is not None
+    assert [requirement.action_name for requirement in goal.requirements] == [
+        "Train_SCV",
+        "Build_SupplyDepot_Screen",
+        "Morph_OrbitalCommand",
+    ]
 
 
 def test_macro_plan_rejects_uncorrelated_response_and_invalid_ttl() -> None:

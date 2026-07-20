@@ -211,7 +211,15 @@ class StrategicIntentAdapter:
             emergency=(
                 role is RoleId.RETREAT
                 or isinstance(intent, ReflexIntent)
-                and first_action not in {"Effect_InjectLarva", "Build_CreepTumor_Queen_Screen"}
+                and first_action
+                not in {
+                    "Effect_InjectLarva",
+                    "Build_CreepTumor_Queen_Screen",
+                    "Build_CreepTumor_Tumor_Screen",
+                    "Train_SCV",
+                    "Morph_OrbitalCommand",
+                    "Effect_CalldownMULE_Screen",
+                }
             ),
             horizon_game_loops=commitment,
             ttl_game_loops=intent.ttl_game_loops,

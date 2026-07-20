@@ -39,15 +39,26 @@ class ReflexEngine:
             for alert in observation.alerts
         )
         if not under_attack:
-            controller_action = available.get("Effect_InjectLarva") or available.get(
-                "Build_CreepTumor_Queen_Screen"
+            controller_action = (
+                available.get("Effect_InjectLarva")
+                or available.get("Build_CreepTumor_Queen_Screen")
+                or available.get("Build_CreepTumor_Tumor_Screen")
+                or available.get("Morph_OrbitalCommand")
+                or available.get("Effect_CalldownMULE_Screen")
+                or (
+                    available.get("Train_SCV")
+                    if _automatic_scv_is_needed(observation)
+                    else None
+                )
             )
-            if controller_action is not None and controller_action.argument_candidates:
+            if controller_action is not None and (
+                not controller_action.argument_names or controller_action.argument_candidates
+            ):
                 actor = next(
                     (
                         scope
                         for scope in controller_action.actor_scopes
-                        if scope.startswith("CombatGroup")
+                        if scope.startswith(("CombatGroup", "Developer"))
                     ),
                     None,
                 )
@@ -58,8 +69,12 @@ class ReflexEngine:
                             index=len(commands),
                             actor=actor,
                             name=controller_action.name,
-                            arguments=list(controller_action.argument_candidates[0]),
-                            priority=(80 if controller_action.name == "Effect_InjectLarva" else 45),
+                            arguments=(
+                                []
+                                if not controller_action.argument_names
+                                else list((controller_action.argument_candidates or [])[0])
+                            ),
+                            priority=_controller_priority(controller_action.name),
                             ttl_game_loops=8,
                         )
                     )
@@ -129,6 +144,28 @@ class ReflexEngine:
             source=ActionSource.REFLEX,
         )
 
+
+def _automatic_scv_is_needed(observation: ObservationEnvelope) -> bool:
+    townhall_types = {"CommandCenter", "OrbitalCommand", "PlanetaryFortress"}
+    completed_townhalls = sum(
+        structure.unit_type in townhall_types and structure.status != "constructing"
+        for structure in observation.state.own_structures
+    )
+    if completed_townhalls <= 0:
+        return False
+    target_workers = min(80, completed_townhalls * 22)
+    return observation.state.economy.workers < target_workers
+
+
+def _controller_priority(action_name: str) -> int:
+    return {
+        "Effect_InjectLarva": 80,
+        "Morph_OrbitalCommand": 78,
+        "Effect_CalldownMULE_Screen": 75,
+        "Train_SCV": 65,
+        "Build_CreepTumor_Queen_Screen": 45,
+        "Build_CreepTumor_Tumor_Screen": 40,
+    }[action_name]
 
 def _normalize_tag(value: object) -> str:
     if isinstance(value, int) and not isinstance(value, bool):

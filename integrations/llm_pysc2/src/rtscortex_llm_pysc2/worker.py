@@ -12,6 +12,7 @@ from functools import partial
 from numbers import Integral
 from typing import Any, Optional, Protocol
 
+from rtscortex_llm_pysc2.ability import ABILITY_SPECS, ability_spec
 from rtscortex_llm_pysc2.addon import ADDON_SPECS, addon_spec
 from rtscortex_llm_pysc2.broker import PrimitiveDispatch, SharedDecisionBroker
 from rtscortex_llm_pysc2.clock import FixedRateGameClock, InitialPlanningBarrier
@@ -44,6 +45,7 @@ from rtscortex_llm_pysc2.production import (
     production_spec,
 )
 from rtscortex_llm_pysc2.protocol import RuntimeClient
+from rtscortex_llm_pysc2.research import RESEARCH_SPECS, research_spec
 
 PRODUCTION_CAMERA_SETTLE_MAX_OBSERVATIONS = 4
 PRODUCTION_SELECTION_MAX_ATTEMPTS = 4
@@ -306,6 +308,7 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
                                     self.unit_names,
                                 )
                             ),
+                            unit_names=self.unit_names,
                         )
             if (is_screen_build or is_screen_point) and resolved is None:
                 if is_screen_build:
@@ -829,7 +832,10 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
             if source_spec is None
             else _selected_production_source_tags(
                 obs.observation,
-                producer_type=source_spec.producer_type,
+                producer_types=(
+                    source_spec.producer_type,
+                    *getattr(source_spec, "alternate_producer_types", ()),
+                ),
                 unit_names=self.unit_names,
             )
         )
@@ -945,6 +951,10 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
             if addon_spec(action_name) is not None
             else "morph"
             if morph_spec(action_name) is not None
+            else "research"
+            if research_spec(action_name) is not None
+            else "ability"
+            if ability_spec(action_name) is not None
             else "production"
         )
         source_tag = self._rtscortex_production_source_tag
@@ -1716,6 +1726,26 @@ def _production_action_source_types(agent_race: str = "protoss") -> dict[int, in
         )
         if producer is not None:
             result[morph.feature_function_id] = int(producer)
+    for research in RESEARCH_SPECS.values():
+        if research.race != agent_race:
+            continue
+        producer = getattr(
+            getattr(units, agent_race.capitalize()),
+            research.producer_type,
+            None,
+        )
+        if producer is not None:
+            result[research.feature_function_id] = int(producer)
+    for ability in ABILITY_SPECS.values():
+        if ability.race != agent_race:
+            continue
+        producer = getattr(
+            getattr(units, agent_race.capitalize()),
+            ability.producer_type,
+            None,
+        )
+        if producer is not None:
+            result[ability.feature_function_id] = int(producer)
     return result
 
 
@@ -2260,7 +2290,10 @@ def _translated_build_position(
 ) -> Optional[list[int]]:
     """Return the actual final screen target emitted by an upstream build translator."""
 
-    if not action_name.startswith("Build_") or not isinstance(arguments, (list, tuple)):
+    if (
+        not action_name.startswith("Build_")
+        and action_name != "Effect_CalldownMULE_Screen"
+    ) or not isinstance(arguments, (list, tuple)):
         return None
     for value in reversed(arguments):
         if (
@@ -2324,7 +2357,13 @@ def _selection_primitive_starts_production_barrier(
 
 
 def _source_action_spec(action_name: str) -> Optional[_SourceActionSpec]:
-    return production_spec(action_name) or addon_spec(action_name) or morph_spec(action_name)
+    return (
+        production_spec(action_name)
+        or addon_spec(action_name)
+        or morph_spec(action_name)
+        or research_spec(action_name)
+        or ability_spec(action_name)
+    )
 
 
 def _is_worker_owned_near_build_final_primitive(agent: Any, action_name: str) -> bool:
@@ -2481,7 +2520,11 @@ def _production_source_invalid_reason(
         if isinstance(unit_type, str)
         else unit_names.get(int(unit_type), f"unit:{int(unit_type)}")
     )
-    if int(value("alliance", 0)) != 1 or source_name != spec.producer_type:
+    valid_source_types = {
+        spec.producer_type,
+        *getattr(spec, "alternate_producer_types", ()),
+    }
+    if int(value("alliance", 0)) != 1 or source_name not in valid_source_types:
         return (
             f"{spec.action_name} producer {hex(source_tag)} changed identity to "
             f"{source_name!r} alliance {int(value('alliance', 0))}"
@@ -2490,7 +2533,37 @@ def _production_source_invalid_reason(
     normalized_progress = progress / 100.0 if progress > 1.0 else progress
     if normalized_progress < 1.0:
         return f"{spec.action_name} producer {hex(source_tag)} is no longer complete"
-    if int(value("active", 0)) != 0 or int(value("order_length", 0)) != 0:
+    minimum_energy = float(getattr(spec, "minimum_energy", 0.0))
+    if float(value("energy", 0.0)) < minimum_energy:
+        return (
+            f"{spec.action_name} producer {hex(source_tag)} has less than "
+            f"{minimum_energy:g} energy"
+        )
+    required_addon = getattr(spec, "required_addon_type", None)
+    if required_addon is not None:
+        addon_tag = int(value("add_on_tag", 0))
+        addon = next(
+            (
+                unit
+                for unit in raw_units
+                if int(
+                    unit.get("tag", -1)
+                    if isinstance(unit, Mapping)
+                    else getattr(unit, "tag", -1)
+                )
+                == addon_tag
+            ),
+            None,
+        )
+        addon_type = None if addon is None else _worker_unit_name(addon, unit_names)
+        if addon_type != required_addon:
+            return (
+                f"{spec.action_name} producer {hex(source_tag)} no longer has "
+                f"{required_addon}"
+            )
+    if bool(getattr(spec, "requires_idle", True)) and (
+        int(value("active", 0)) != 0 or int(value("order_length", 0)) != 0
+    ):
         return f"{spec.action_name} producer {hex(source_tag)} became busy before final dispatch"
     if addon_spec(spec.action_name) is not None and int(value("add_on_tag", 0)) != 0:
         return f"{spec.action_name} producer {hex(source_tag)} already has an add-on"
@@ -2548,7 +2621,7 @@ def _producer_is_selected(observation: Any, producer_tag: int) -> bool:
 def _selected_production_source_tags(
     observation: Any,
     *,
-    producer_type: str,
+    producer_types: Collection[str],
     unit_names: Mapping[int, str],
 ) -> tuple[int, ...]:
     """Return selected producer tags, preferring the feature-action view."""
@@ -2559,7 +2632,7 @@ def _selected_production_source_tags(
             for unit in _observation_value(observation, collection_name, ())
             if int(_observation_value(unit, "alliance", 0)) == 1
             and bool(_observation_value(unit, "is_selected", False))
-            and _worker_unit_name(unit, unit_names) == producer_type
+            and _worker_unit_name(unit, unit_names) in producer_types
             and int(_observation_value(unit, "tag", 0)) > 0
         }
         if selected_tags:
@@ -2857,6 +2930,7 @@ def _resolve_screen_point_action_position(
     world_target: tuple[float, float],
     preferred_anchor_tag: Optional[int],
     require_power: bool,
+    unit_names: Mapping[int, str],
 ) -> Optional[list[int]]:
     position = resolve_screen_point_world_target(
         observation,
@@ -2864,6 +2938,7 @@ def _resolve_screen_point_action_position(
         world_target,
         preferred_anchor_tag=preferred_anchor_tag,
         require_power=require_power,
+        unit_names=unit_names,
     )
     if position is None:
         return None

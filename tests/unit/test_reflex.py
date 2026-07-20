@@ -1,6 +1,12 @@
 from __future__ import annotations
 
-from rtscortex.contracts import ActionArgumentType, AvailableAction
+from rtscortex.contracts import (
+    ActionArgumentType,
+    AvailableAction,
+    EconomyState,
+    SC2State,
+    UnitState,
+)
 from rtscortex.reflex import ReflexEngine
 from rtscortex.runtime.validation import ActionValidator
 from tests.helpers import make_observation
@@ -100,6 +106,55 @@ def test_zerg_queen_controller_prioritizes_inject_over_creep_when_safe() -> None
 
     assert [(command.actor, command.name, command.arguments) for command in commands] == [
         ("CombatGroup1/Queen-1", "Effect_InjectLarva", ["0xb00"])
+    ]
+
+
+def test_terran_economy_controller_automatically_trains_scv_below_saturation() -> None:
+    observation = make_observation().model_copy(
+        update={
+            "state": SC2State(
+                economy=EconomyState(minerals=500, supply_used=14, supply_cap=23, workers=12),
+                own_structures=[
+                    UnitState(
+                        unit_id="0xc00",
+                        unit_type="CommandCenter",
+                        alliance="self",
+                        status="idle",
+                    )
+                ],
+            ),
+            "available_actions": [
+                AvailableAction(name="Train_SCV", actor_scopes=["Developer/Empty"])
+            ],
+        }
+    )
+
+    commands = ReflexEngine(enabled=True, low_health_threshold=0.25).evaluate(observation)
+
+    assert [(command.actor, command.name, command.priority) for command in commands] == [
+        ("Developer/Empty", "Train_SCV", 65)
+    ]
+
+
+def test_chained_creep_is_used_after_queen_controllers_are_unavailable() -> None:
+    observation = make_observation().model_copy(
+        update={
+            "available_actions": [
+                AvailableAction(
+                    name="Build_CreepTumor_Tumor_Screen",
+                    argument_names=["screen"],
+                    argument_types=[ActionArgumentType.POSITION],
+                    actor_scopes=["CombatGroup4/CreepTumor-1"],
+                    argument_candidates=[[[78, 64]]],
+                )
+            ]
+        }
+    )
+
+    commands = ReflexEngine(enabled=True, low_health_threshold=0.25).evaluate(observation)
+
+    assert [(command.actor, command.name, command.arguments) for command in commands] == [
+        ("CombatGroup4/CreepTumor-1", "Build_CreepTumor_Tumor_Screen", [[78, 64]])
     ]
 
 

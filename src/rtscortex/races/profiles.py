@@ -104,18 +104,32 @@ PROTOSS_PROFILE_DATA = RaceProfileData(
     hima_vocabulary_version="hima-protoss-60-v2",
     runtime_mapping_ready=True,
     live_worker_ready=True,
-    effect_verification_kinds=("build", "production", "move"),
+    effect_verification_kinds=("build", "production", "research", "move"),
     controller_capabilities=(
         "gas_workers",
         "supply_emergency",
         "resource_fallback",
         "prerequisite_closure",
     ),
-    limitations=("research_effect_verification_pending",),
+    limitations=(),
 )
 
 
 TERRAN_PROGRESS_ACTION_SPECS: tuple[ProgressActionSpec, ...] = (
+    ProgressActionSpec(
+        "Train_SCV",
+        GoalRequirementKind.UNIT,
+        "SCV",
+        minerals=50,
+        supply=1,
+    ),
+    ProgressActionSpec(
+        "Morph_OrbitalCommand",
+        GoalRequirementKind.STRUCTURE,
+        "OrbitalCommand",
+        minerals=150,
+        prerequisites=(StatePrerequisite(GoalRequirementKind.STRUCTURE, "Barracks"),),
+    ),
     ProgressActionSpec(
         "Build_SupplyDepot_Screen",
         GoalRequirementKind.STRUCTURE,
@@ -292,6 +306,9 @@ TERRAN_PROGRESS_ACTION_SPECS: tuple[ProgressActionSpec, ...] = (
 _TERRAN_MAPPINGS = tuple(
     MacroActionMapping(_canonical_hima_action(verb, name), (runtime_action,))
     for verb, name, runtime_action in (
+        ("TRAIN", "SCV", "Train_SCV"),
+        ("TRAIN", "MULE", "Effect_CalldownMULE_Screen"),
+        ("BUILD", "OrbitalCommand", "Morph_OrbitalCommand"),
         ("BUILD", "SupplyDepot", "Build_SupplyDepot_Screen"),
         ("BUILD", "Barracks", "Build_Barracks_Screen"),
         ("BUILD", "Refinery", "Build_Refinery_Near"),
@@ -329,6 +346,9 @@ TERRAN_PROFILE_DATA = RaceProfileData(
     action_domains=_domains(
         TERRAN_PROGRESS_ACTION_SPECS,
         economy={
+            "Train_SCV",
+            "Morph_OrbitalCommand",
+            "Effect_CalldownMULE_Screen",
             "Build_SupplyDepot_Screen",
             "Build_Refinery_Near",
             "Build_CommandCenter_Near",
@@ -364,22 +384,33 @@ TERRAN_PROFILE_DATA = RaceProfileData(
         "Train_Medivac": ("Starport",),
         "Train_VikingFighter": ("Starport",),
         "Research_Stimpack": ("BarracksTechLab",),
+        "Train_SCV": ("CommandCenter", "OrbitalCommand", "PlanetaryFortress"),
+        "Morph_OrbitalCommand": ("CommandCenter",),
+        "Effect_CalldownMULE_Screen": ("OrbitalCommand",),
     },
     hima_vocabulary_version="hima-terran-69-v1",
     runtime_mapping_ready=True,
     live_worker_ready=True,
-    effect_verification_kinds=("build", "production", "addon", "move"),
+    effect_verification_kinds=(
+        "build",
+        "production",
+        "addon",
+        "morph",
+        "research",
+        "ability",
+        "move",
+    ),
     controller_capabilities=(
         "gas_workers",
         "supply_emergency",
         "resource_fallback",
         "prerequisite_closure",
+        "automatic_scv_training",
+        "orbital_command_morph",
+        "mule_calldown",
     ),
-    limitations=(
-        "morph_effect_verification_pending",
-        "research_effect_verification_pending",
-        "automatic_scv_training_pending",
-    ),
+    controller_managed_actions=("Effect_CalldownMULE_Screen",),
+    limitations=(),
 )
 
 
@@ -539,7 +570,11 @@ ZERG_PROFILE_DATA = RaceProfileData(
             "Build_Extractor_Near",
         },
         technology={"Morph_Lair", "Build_EvolutionChamber_Screen"},
-        defense={"Build_SpineCrawler_Screen", "Build_SporeCrawler_Screen"},
+        defense={
+            "Build_SpineCrawler_Screen",
+            "Build_SporeCrawler_Screen",
+            "Build_CreepTumor_Tumor_Screen",
+        },
     ),
     action_producers={
         **{
@@ -554,6 +589,11 @@ ZERG_PROFILE_DATA = RaceProfileData(
         "Train_Zergling": ("Larva",),
         "Train_Roach": ("Larva",),
         "Train_Hydralisk": ("Larva",),
+        "Build_CreepTumor_Tumor_Screen": (
+            "CreepTumor",
+            "CreepTumorBurrowed",
+            "CreepTumorQueen",
+        ),
     },
     hima_vocabulary_version="hima-zerg-63-v1",
     runtime_mapping_ready=True,
@@ -566,8 +606,9 @@ ZERG_PROFILE_DATA = RaceProfileData(
         "prerequisite_closure",
         "queen_larva_inject",
         "queen_creep_tumor",
+        "chained_creep_tumor",
     ),
-    limitations=("creep_tumor_chain_spread_pending",),
+    limitations=(),
 )
 
 

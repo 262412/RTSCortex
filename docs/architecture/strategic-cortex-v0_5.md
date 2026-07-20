@@ -140,7 +140,14 @@ intent, arbitration decision, Playbook rules, candidate and terminal execution r
 5. Completed: Zerg larva, inject, creep/morph provenance, seed regression, and 48-state corpus.
 6. Completed: Terran blocked-production and blocked-combat coverage and its verified
    48-state corpus.
-7. Complete the remaining race-effect gaps, then run the 27-match tactical-quality suite.
+7. Completed: exact-source Terran Stimpack research verification, RTSCortex-owned automatic
+   SCV production, Orbital morphing, MULE calldown verification, and mature-tumor Zerg creep
+   chaining. HIMA MULE steps remain in plan lineage but are marked controller-managed and stay
+   outside persistent GoalProgress; the Economy controller owns their dispatch. These actions
+   all pass through Runtime, Bridge and terminal effect verification; none use the untracked
+   upstream worker-training switch.
+8. Run the 27-match tactical-quality suite after the new race-economy controllers pass the
+   staged Simple64 smoke and seeds `[0, 1, 2]` engineering regression.
 
 This order intentionally keeps “model can produce a proposal” separate from “the race is safe
 to execute in PySC2.”

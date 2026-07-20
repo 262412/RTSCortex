@@ -85,6 +85,7 @@ def macro_plan_from_hima(
             assessment_by_step.get((step.ordinal, step.canonical_action)),
             mappings_by_macro=mappings_by_macro,
             managed_worker_action=f"TRAIN {profile.worker_type.upper()}",
+            controller_managed_actions=frozenset(profile.controller_managed_actions),
         )
         for step in sorted(proposal.steps, key=lambda item: item.ordinal)
     ]
@@ -138,6 +139,8 @@ def macro_goal_spec(
             break
         if step.status is MacroStepStatus.BLOCKED:
             break
+        if step.status is MacroStepStatus.OBSOLETE:
+            continue
         if not step.runtime_actions:
             # The sole soft unsupported action is TRAIN PROBE, which RTSCortex manages
             # automatically.  Other unsupported actions are marked BLOCKED above.
@@ -266,6 +269,7 @@ def _macro_step(
     *,
     mappings_by_macro: dict[str, HIMAMacroMapping],
     managed_worker_action: str,
+    controller_managed_actions: frozenset[str],
 ) -> MacroStep:
     mapping = mappings_by_macro.get(semantic_action)
     if mapping is None:
@@ -276,6 +280,18 @@ def _macro_step(
             repeat=repeat,
             status=(MacroStepStatus.OBSOLETE if managed else MacroStepStatus.BLOCKED),
             reason="managed_automatically" if managed else "unsupported_by_runtime",
+        )
+
+    if mapping.runtime_actions and all(
+        action in controller_managed_actions for action in mapping.runtime_actions
+    ):
+        return MacroStep(
+            ordinal=ordinal,
+            semantic_action=semantic_action,
+            runtime_actions=list(mapping.runtime_actions),
+            repeat=repeat,
+            status=MacroStepStatus.OBSOLETE,
+            reason="managed_automatically",
         )
 
     classification = assessment.classification if assessment is not None else None

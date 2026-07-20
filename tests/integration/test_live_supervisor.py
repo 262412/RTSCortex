@@ -337,6 +337,15 @@ def test_console_port_preflight_rejects_an_occupied_loopback_port() -> None:
             ensure_console_port_available(port)
 
 
+def test_console_port_preflight_reuses_a_recently_closed_listener() -> None:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        port = int(listener.getsockname()[1])
+
+    ensure_console_port_available(port)
+
+
 @pytest.mark.skipif(os.name == "nt", reason="Unix-domain socket test")
 def test_runtime_client_reconnects_after_unix_socket_restart(tmp_path: Path) -> None:
     runtime = build_runtime(make_config(tmp_path), tmp_path / "reconnect-artifacts")

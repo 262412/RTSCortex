@@ -163,7 +163,8 @@ class ProductionEffectVerifier:
             baseline_tags = {
                 source.tag
                 for source in baseline.producer_sources
-                if source.unit_type == pending.spec.producer_type
+                if source.unit_type
+                in {pending.spec.producer_type, *pending.spec.alternate_producer_types}
             }
             current = current_by_command[command_id]
             for source in current.producer_sources:
@@ -328,6 +329,7 @@ class ProductionEffectVerifier:
         raw_units = list(_value(observation, "raw_units", ()))
         producer_source_types = {
             pending.spec.producer_type,
+            *pending.spec.alternate_producer_types,
             *pending.spec.intermediate_types,
         }
         producer_sources = tuple(
@@ -378,7 +380,10 @@ class ProductionEffectVerifier:
             None,
         )
         producer_type = None if producer_unit is None else self._unit_name(producer_unit)
-        producer_is_valid = producer_type == pending.spec.producer_type or (
+        producer_is_valid = producer_type in {
+            pending.spec.producer_type,
+            *pending.spec.alternate_producer_types,
+        } or (
             pending.spec.producer_consumed and producer_type in pending.spec.intermediate_types
         )
         producer = producer_unit if producer_is_valid else None

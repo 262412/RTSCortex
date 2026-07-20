@@ -12,7 +12,9 @@ from rtscortex_llm_pysc2.effect_types import EffectVerdict
 from rtscortex_llm_pysc2.extractor import BUILD_RAW_FUNCTION_IDS, BUILD_SPECS
 from rtscortex_llm_pysc2.inject_effect_verifier import InjectEffectVerifier
 from rtscortex_llm_pysc2.morph_effect_verifier import MorphEffectVerifier
+from rtscortex_llm_pysc2.mule_effect_verifier import MuleEffectVerifier
 from rtscortex_llm_pysc2.production_effect_verifier import ProductionEffectVerifier
+from rtscortex_llm_pysc2.research_effect_verifier import ResearchEffectVerifier
 from rtscortex_llm_pysc2.routing import RoutedCommand
 
 DEFAULT_ACTION_EFFECT_TIMEOUT_GAME_LOOPS = 112
@@ -111,6 +113,14 @@ class ActionEffectVerifier:
             timeout_game_loops=timeout_game_loops,
             unit_names=self.unit_names,
         )
+        self.research = ResearchEffectVerifier(
+            timeout_game_loops=timeout_game_loops,
+            unit_names=self.unit_names,
+        )
+        self.mules = MuleEffectVerifier(
+            timeout_game_loops=timeout_game_loops,
+            unit_names=self.unit_names,
+        )
 
     def track(self, command: RoutedCommand) -> bool:
         """Register an effectful command, returning false for immediate actions."""
@@ -124,6 +134,10 @@ class ActionEffectVerifier:
         if self.morphs.track(command):
             return True
         if self.injects.track(command):
+            return True
+        if self.research.track(command):
+            return True
+        if self.mules.track(command):
             return True
         target = _target_structure(command.name)
         if target is None and command.name != "Move_Minimap":
@@ -155,6 +169,8 @@ class ActionEffectVerifier:
             or self.addons.is_tracked(command_id)
             or self.morphs.is_tracked(command_id)
             or self.injects.is_tracked(command_id)
+            or self.research.is_tracked(command_id)
+            or self.mules.is_tracked(command_id)
         )
 
     @property
@@ -171,6 +187,11 @@ class ActionEffectVerifier:
         if self.morphs.is_tracked(command_id):
             return
         if self.injects.is_tracked(command_id):
+            return
+        if self.research.is_tracked(command_id):
+            return
+        if self.mules.is_tracked(command_id):
+            self.mules.resolve_arguments(command_id, arguments)
             return
         pending_move = self._pending_moves.get(command_id)
         if pending_move is not None:
@@ -204,6 +225,12 @@ class ActionEffectVerifier:
         if self.injects.is_tracked(command_id):
             self.injects.prepare(command_id, observation, builder_tag)
             return
+        if self.research.is_tracked(command_id):
+            self.research.prepare(command_id, observation, producer_tag)
+            return
+        if self.mules.is_tracked(command_id):
+            self.mules.prepare(command_id, observation, producer_tag)
+            return
         pending_move = self._pending_moves.get(command_id)
         if pending_move is not None:
             pending_move.builder_tag = None if builder_tag is None else int(builder_tag)
@@ -236,6 +263,12 @@ class ActionEffectVerifier:
         if self.injects.is_tracked(command_id):
             self.injects.accept_primitive(command_id, game_loop=game_loop)
             return
+        if self.research.is_tracked(command_id):
+            self.research.accept_primitive(command_id, game_loop=game_loop)
+            return
+        if self.mules.is_tracked(command_id):
+            self.mules.accept_primitive(command_id, game_loop=game_loop)
+            return
         pending_move = self._pending_moves.get(command_id)
         if pending_move is not None:
             if pending_move.dispatched_game_loop is None:
@@ -255,6 +288,8 @@ class ActionEffectVerifier:
         self.addons.cancel(command_id)
         self.morphs.cancel(command_id)
         self.injects.cancel(command_id)
+        self.research.cancel(command_id)
+        self.mules.cancel(command_id)
 
     def observe(self, observation: Any) -> list[EffectVerdict]:
         """Evaluate all accepted effectful commands against one observation."""
@@ -263,6 +298,8 @@ class ActionEffectVerifier:
         verdicts.extend(self.addons.observe(observation))
         verdicts.extend(self.morphs.observe(observation))
         verdicts.extend(self.injects.observe(observation))
+        verdicts.extend(self.research.observe(observation))
+        verdicts.extend(self.mules.observe(observation))
         verdicts.extend(self._observe_moves(observation))
         accepted = [
             pending
@@ -395,6 +432,8 @@ class ActionEffectVerifier:
         verdicts.extend(self.addons.fail_pending(reason))
         verdicts.extend(self.morphs.fail_pending(reason))
         verdicts.extend(self.injects.fail_pending(reason))
+        verdicts.extend(self.research.fail_pending(reason))
+        verdicts.extend(self.mules.fail_pending(reason))
         for command_id, pending in list(self._pending.items()):
             if pending.accepted_game_loop is None:
                 continue
@@ -487,7 +526,7 @@ class ActionEffectVerifier:
             unit
             for unit in raw_units
             if int(_value(unit, "alliance", 0)) == 1
-            and self._unit_name(unit) == pending.target_structure
+            and self._unit_name(unit) in _target_structure_names(pending.target_structure)
         ]
         builder = next(
             (
@@ -764,6 +803,12 @@ def _target_structure(action_name: str) -> Optional[str]:
         if stem.endswith(suffix):
             return stem.removesuffix(suffix)
     return None
+
+
+def _target_structure_names(target_structure: str) -> frozenset[str]:
+    if target_structure.startswith("CreepTumor"):
+        return frozenset({"CreepTumor", "CreepTumorBurrowed", "CreepTumorQueen"})
+    return frozenset({target_structure})
 
 
 def _position_argument(values: Sequence[Any]) -> Optional[tuple[float, float]]:

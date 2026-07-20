@@ -247,6 +247,8 @@ class EffectEvidence(ContractModel):
             "addon",
             "morph",
             "inject",
+            "research",
+            "ability",
         ]
         | None
     ) = None
@@ -297,6 +299,7 @@ class EffectEvidence(ContractModel):
             "target_buff",
             "new_unit",
             "new_structure",
+            "upgrade_observed",
         ]
         | None
     ) = None
@@ -310,6 +313,10 @@ class EffectEvidence(ContractModel):
     source_build_progress: float | None = Field(default=None, ge=0.0, le=1.0)
     baseline_target_buff_ids: list[int] = Field(default_factory=list)
     target_buff_ids: list[int] = Field(default_factory=list)
+    expected_upgrade: str | None = None
+    expected_upgrade_id: int | None = Field(default=None, ge=0)
+    baseline_upgrade_ids: list[int] = Field(default_factory=list)
+    upgrade_ids: list[int] = Field(default_factory=list)
     baseline_builder_position: tuple[float, float] | None = None
     observed_builder_position: tuple[float, float] | None = None
     builder_displacement: float | None = Field(default=None, ge=0)

@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+from rtscortex_llm_pysc2.ability import ability_spec
 from rtscortex_llm_pysc2.addon import addon_spec
 from rtscortex_llm_pysc2.inject_effect_verifier import (
     INJECT_ACTION,
@@ -20,6 +21,7 @@ from rtscortex_llm_pysc2.production import (
     production_spec,
     production_spec_for_order,
 )
+from rtscortex_llm_pysc2.research import research_spec
 
 SUPPORTED_ARGUMENTS = frozenset({"minimap", "screen", "tag"})
 SCREEN_WORLD_GRID = 24.0
@@ -27,6 +29,8 @@ TERRAN_ADDON_GAS_CLEARANCE_WORLD = 7.0
 ALLIANCES = {1: "self", 2: "ally", 3: "neutral", 4: "enemy"}
 SC2_ALERT_NAMES = {6: "building_under_attack", 19: "unit_under_attack"}
 QUEEN_CONTROLLER_ACTIONS = frozenset({INJECT_ACTION, "Build_CreepTumor_Queen_Screen"})
+TUMOR_CONTROLLER_ACTION = "Build_CreepTumor_Tumor_Screen"
+MULE_ACTION = "Effect_CalldownMULE_Screen"
 TOWNHALL_NAMES = frozenset(
     {
         "nexus",
@@ -221,6 +225,14 @@ BUILD_SPECS = {
         0,
         requires_creep=True,
     ),
+    TUMOR_CONTROLLER_ACTION: BuildSpec(
+        "CreepTumor",
+        "screen",
+        1,
+        False,
+        0,
+        requires_creep=True,
+    ),
 }
 
 # PySC2's ``FeatureUnit.order_id_*`` fields expose the pinned RAW action IDs
@@ -253,6 +265,7 @@ BUILD_RAW_FUNCTION_IDS = {
     "SpineCrawler": 218,
     "SporeCrawler": 220,
     "CreepTumorQueen": 189,
+    "CreepTumor": 190,
 }
 TERRAN_BUILD_RAW_FUNCTION_IDS = frozenset(
     BUILD_RAW_FUNCTION_IDS[spec.target_structure]
@@ -271,13 +284,11 @@ TERRAN_BUILD_RAW_FUNCTION_IDS = frozenset(
     }
 )
 
-SCREEN_POINT_ACTIONS = frozenset({"Move_Screen", "Ability_Blink_Screen"})
+SCREEN_POINT_ACTIONS = frozenset({"Move_Screen", "Ability_Blink_Screen", MULE_ACTION})
 MINIMAP_POINT_ACTIONS = frozenset({"Move_Minimap"})
 SELECT_BLINK_ACTION = "Select_Unit_Blink_Screen"
-PRODUCTION_ACTION_PREFIXES = ("Train_", "Research_")
+PRODUCTION_ACTION_PREFIXES = ("Train_",)
 MIN_PRODUCTION_SOURCE_HEALTH_FRACTION = 0.2
-RESEARCH_PREREQUISITES = {"Research_WarpGate": ("CyberneticsCore",)}
-RESEARCH_COSTS = {"Research_WarpGate": (50, 50, 0)}
 
 
 def semantic_argument_candidates(
@@ -307,6 +318,8 @@ def is_source_bound_action(action_name: str) -> bool:
         is_production_action(action_name)
         or addon_spec(action_name) is not None
         or morph_spec(action_name) is not None
+        or research_spec(action_name) is not None
+        or ability_spec(action_name) is not None
     )
 
 
@@ -323,10 +336,14 @@ def production_source_tag(
     action_name = str(action.get("name", ""))
     if not is_source_bound_action(action_name):
         return None
-    spec = production_spec(action_name) or addon_spec(action_name) or morph_spec(action_name)
-    cost = (
-        None if spec is None else (spec.minerals, spec.vespene, spec.supply)
-    ) or RESEARCH_COSTS.get(action_name)
+    spec = (
+        production_spec(action_name)
+        or addon_spec(action_name)
+        or morph_spec(action_name)
+        or research_spec(action_name)
+        or ability_spec(action_name)
+    )
+    cost = None if spec is None else (spec.minerals, spec.vespene, spec.supply)
     if cost is not None and not _production_cost_is_available(observation, *cost):
         return None
     source_types = {
@@ -334,12 +351,18 @@ def production_source_tag(
         for function_id in _action_function_ids(action)
         if function_id in action_source_types
     }
-    if len(source_types) != 1:
+    source_names = (
+        {
+            spec.producer_type,
+            *getattr(spec, "alternate_producer_types", ()),
+        }
+        if spec is not None
+        else set()
+    )
+    if not source_names and len(source_types) != 1:
         return None
     raw_units = list(_value(observation, "raw_units", ()))
-    prerequisites = (
-        spec.prerequisites if spec is not None else RESEARCH_PREREQUISITES.get(action_name, ())
-    )
+    prerequisites = spec.prerequisites if spec is not None else ()
     completed_structures = {
         _unit_name(unit, unit_names)
         for unit in raw_units
@@ -347,19 +370,36 @@ def production_source_tag(
     }
     if not set(prerequisites).issubset(completed_structures):
         return None
-    source_type = next(iter(source_types))
+    source_type = next(iter(source_types)) if source_types else None
     excluded = {int(tag) for tag in excluded_source_tags}
+    addon_by_tag = {
+        int(_value(unit, "tag", 0)): _unit_name(unit, unit_names)
+        for unit in raw_units
+        if int(_value(unit, "alliance", 0)) == 1
+    }
+    required_addon = getattr(spec, "required_addon_type", None)
+    minimum_energy = float(getattr(spec, "minimum_energy", 0.0))
+    requires_idle = bool(getattr(spec, "requires_idle", True))
     candidates = [
         unit
         for unit in raw_units
         if int(_value(unit, "alliance", 0)) == 1
-        and int(_value(unit, "unit_type", 0)) == source_type
+        and (
+            _unit_name(unit, unit_names) in source_names
+            if source_names
+            else int(_value(unit, "unit_type", 0)) == source_type
+        )
         and _build_progress(unit) >= 1.0
         and _health_fraction(unit) >= MIN_PRODUCTION_SOURCE_HEALTH_FRACTION
-        and int(_value(unit, "active", 0)) == 0
+        and (not requires_idle or int(_value(unit, "active", 0)) == 0)
+        and float(_value(unit, "energy", 0.0)) >= minimum_energy
         and int(_value(unit, "tag", 0)) > 0
         and int(_value(unit, "tag", 0)) not in excluded
         and (addon_spec(action_name) is None or int(_value(unit, "add_on_tag", 0)) == 0)
+        and (
+            required_addon is None
+            or addon_by_tag.get(int(_value(unit, "add_on_tag", 0))) == required_addon
+        )
     ]
     if not candidates:
         return None
@@ -367,7 +407,12 @@ def production_source_tag(
     # not sort or skip ahead, otherwise the cached producer provenance can
     # silently refer to a different building than translator primitive 573.
     selected = candidates[0]
-    if int(_value(selected, "order_length", 0)) != 0:
+    if requires_idle and int(_value(selected, "order_length", 0)) != 0:
+        return None
+    research = research_spec(action_name)
+    if research is not None and research.upgrade_id in {
+        int(value) for value in _value(observation, "upgrades", ())
+    }:
         return None
     return int(_value(selected, "tag", 0))
 
@@ -563,7 +608,10 @@ def _extract_production_queue(
             continue
         for order_id, progress in _unit_order_entries(unit):
             spec = production_spec_for_order(order_id)
-            if spec is None or spec.producer_type != producer_type:
+            if spec is None or producer_type not in {
+                spec.producer_type,
+                *spec.alternate_producer_types,
+            }:
                 continue
             producer_counts[spec.action_name] += 1
             result.append(
@@ -639,6 +687,7 @@ def _extract_team_actions(
     teams = []
     for agent_name in sorted(agents):
         agent = agents[agent_name]
+        _prioritize_creep_tumor_source(agent)
         team_definitions = {
             str(team["name"]): team for team in agent.config.AGENTS[agent_name]["team"]
         }
@@ -672,6 +721,47 @@ def _extract_team_actions(
                 }
             )
     return teams
+
+
+def _prioritize_creep_tumor_source(agent: Any) -> None:
+    """Put the next mature tumor first without duplicating one logical actor.
+
+    Upstream records one observation per single-selected tumor, while RTSCortex
+    intentionally exposes one logical team. Reordering all three parallel lists
+    keeps the observation used for availability and the tag later used for
+    execution identical.
+    """
+
+    if getattr(agent, "name", "") != "CombatGroup4":
+        return
+    observations = list(getattr(agent, "team_unit_obs_list", ()))
+    tags = list(getattr(agent, "team_unit_tag_list", ()))
+    teams = list(getattr(agent, "team_unit_team_list", ()))
+    if not (len(observations) == len(tags) == len(teams)):
+        return
+    source_index = next(
+        (
+            index
+            for index, timestep in enumerate(observations)
+            if 47
+            in {
+                int(value)
+                for value in _value(
+                    _value(timestep, "observation", timestep),
+                    "available_actions",
+                    (),
+                )
+            }
+        ),
+        None,
+    )
+    if source_index is None or source_index == 0:
+        return
+    for values in (observations, tags, teams):
+        values.insert(0, values.pop(source_index))
+    agent.team_unit_obs_list[:] = observations
+    agent.team_unit_tag_list[:] = tags
+    agent.team_unit_team_list[:] = teams
 
 
 def current_team_order(agent: Any) -> tuple[str, ...]:
@@ -737,6 +827,10 @@ def _available_team_actions(
             unit_names=unit_names,
             unit_tags=team.get("unit_tags", ()),
             forbidden_order_ids=(INJECT_RAW_FUNCTION_ID,),
+        ):
+            continue
+        if action_name == TUMOR_CONTROLLER_ACTION and (
+            available_ids is None or 47 not in available_ids
         ):
             continue
         if (
@@ -931,6 +1025,14 @@ def _argument_candidates(
                 }
             )
         ]
+    if action_name == MULE_ACTION:
+        return [
+            [[int(_value(unit, "x", 0)), int(_value(unit, "y", 0))]]
+            for unit in _value(observation, "feature_units", ())
+            if int(_value(unit, "alliance", 0)) == 3
+            and bool(_value(unit, "is_on_screen", True))
+            and _is_mineral(_unit_name(unit, unit_names))
+        ][:8]
     if action_name == "Attack_Unit":
         return [
             [int(_value(unit, "tag", 0))]
@@ -1735,6 +1837,7 @@ def resolve_screen_point_world_target(
     *,
     preferred_anchor_tag: Optional[int] = None,
     require_power: bool = False,
+    unit_names: Optional[Mapping[int, str]] = None,
 ) -> Optional[list[int]]:
     """Reproject a movement target into the current legal screen candidate domain."""
 
@@ -1751,10 +1854,19 @@ def resolve_screen_point_world_target(
     height, width = dimensions
     if not (0 <= projected[0] < width and 0 <= projected[1] < height):
         return None
-    candidates = _movement_screen_candidates(
-        observation,
-        blink=action_name == "Ability_Blink_Screen",
-        require_power=require_power,
+    candidates = (
+        [candidate[0] for candidate in _argument_candidates(
+            observation,
+            MULE_ACTION,
+            unit_names=unit_names or {},
+            include_home_minimap=False,
+        ) or []]
+        if action_name == MULE_ACTION
+        else _movement_screen_candidates(
+            observation,
+            blink=action_name == "Ability_Blink_Screen",
+            require_power=require_power,
+        )
     )
     if projected in candidates:
         return projected
@@ -1837,7 +1949,7 @@ def _build_screen_candidates(
     )
     reachable_builder_cells = (
         None
-        if action_name == "Build_CreepTumor_Queen_Screen"
+        if action_name in {"Build_CreepTumor_Queen_Screen", TUMOR_CONTROLLER_ACTION}
         else _builder_reachable_cells(
             pathable,
             feature_units,
@@ -1886,6 +1998,39 @@ def _build_screen_candidates(
                 unit_names,
             )
         ]
+    if action_name == TUMOR_CONTROLLER_ACTION:
+        source_positions = [
+            (float(_value(unit, "x", 0.0)), float(_value(unit, "y", 0.0)))
+            for unit in feature_units
+            if int(_value(unit, "alliance", 0)) == 1
+            and bool(_value(unit, "is_on_screen", True))
+            and bool(_value(unit, "is_selected", False))
+            and _unit_name(unit, unit_names)
+            in {"CreepTumor", "CreepTumorBurrowed", "CreepTumorQueen"}
+        ]
+        if len(source_positions) != 1:
+            return []
+        source_x, source_y = source_positions[0]
+        pixels_per_world = screen_size / SCREEN_WORLD_GRID
+        minimum_distance = 4.0 * pixels_per_world
+        maximum_distance = 9.5 * pixels_per_world
+        candidates = [
+            candidate
+            for candidate in candidates
+            if minimum_distance
+            <= math.dist((float(candidate[0]), float(candidate[1])), (source_x, source_y))
+            <= maximum_distance
+        ]
+        candidates.sort(
+            key=lambda candidate: (
+                -math.dist(
+                    (float(candidate[0]), float(candidate[1])),
+                    semantic_anchor,
+                ),
+                candidate[1],
+                candidate[0],
+            )
+        )
     return candidates if limit is None else candidates[:limit]
 
 

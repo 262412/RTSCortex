@@ -190,8 +190,13 @@ export function eventCategory(event: StoredEvent): Exclude<EventCategory, "all">
   if (type === "goal_progress") return "planner";
   if (
     action?.startsWith("train_") ||
+    action?.startsWith("research_") ||
+    action === "morph_orbitalcommand" ||
+    action === "effect_calldownmule_screen" ||
     payloadText.includes('"train_') ||
     payloadText.includes('"effect_kind":"production"') ||
+    payloadText.includes('"effect_kind":"research"') ||
+    payloadText.includes('"effect_kind":"ability"') ||
     type.includes("production")
   ) return "production";
   if (action?.includes("build") || payloadText.includes("structure") || type.includes("build")) return "build";

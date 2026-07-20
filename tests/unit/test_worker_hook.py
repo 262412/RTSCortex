@@ -16,6 +16,7 @@ from rtscortex_llm_pysc2.coordinator import BridgeCoordinator
 from rtscortex_llm_pysc2.extractor import (
     TimeStepExtractor,
     _own_unit_has_energy,
+    _prioritize_creep_tumor_source,
     build_screen_candidates,
     current_team_order,
     nexus_placement_footprint_is_visible,
@@ -2772,6 +2773,70 @@ def test_zerg_queen_controller_candidates_require_uninjected_townhall_and_creep(
     )
 
 
+def test_chained_creep_candidates_require_one_selected_mature_tumor_and_cast_range() -> None:
+    observation = SimpleNamespace(
+        player_common=SimpleNamespace(minerals=0, vespene=0),
+        raw_units=[],
+        feature_units=[
+            SimpleNamespace(
+                tag=0xC00,
+                unit_type=137,
+                alliance=1,
+                is_on_screen=True,
+                is_selected=True,
+                radius=0.5,
+                x=64,
+                y=64,
+            )
+        ],
+        feature_screen=SimpleNamespace(
+            buildable=UniformGrid(1),
+            pathable=UniformGrid(1),
+            player_relative=UniformGrid(0),
+            power=UniformGrid(0),
+            creep=UniformGrid(1),
+        ),
+    )
+
+    candidates = build_screen_candidates(
+        observation,
+        "Build_CreepTumor_Tumor_Screen",
+        unit_names={137: "CreepTumorBurrowed"},
+    )
+
+    assert candidates
+    assert all(
+        128 / 6 <= ((x - 64) ** 2 + (y - 64) ** 2) ** 0.5 <= 128 * 9.5 / 24
+        for x, y in candidates
+    )
+    observation.feature_units[0].is_selected = False
+    assert (
+        build_screen_candidates(
+            observation,
+            "Build_CreepTumor_Tumor_Screen",
+            unit_names={137: "CreepTumorBurrowed"},
+        )
+        == []
+    )
+
+
+def test_chained_creep_prioritizes_the_next_tumor_with_available_ability() -> None:
+    unavailable = SimpleNamespace(observation=SimpleNamespace(available_actions=[0, 2]))
+    available = SimpleNamespace(observation=SimpleNamespace(available_actions=[0, 47]))
+    agent = SimpleNamespace(
+        name="CombatGroup4",
+        team_unit_obs_list=[unavailable, available],
+        team_unit_tag_list=[0xC00, 0xC01],
+        team_unit_team_list=["CreepTumor-1", "CreepTumor-1"],
+    )
+
+    _prioritize_creep_tumor_source(agent)
+
+    assert agent.team_unit_obs_list == [available, unavailable]
+    assert agent.team_unit_tag_list == [0xC01, 0xC00]
+    assert agent.team_unit_team_list == ["CreepTumor-1", "CreepTumor-1"]
+
+
 def test_zerg_queen_controller_availability_uses_the_actor_queen() -> None:
     low_energy_actor = SimpleNamespace(
         tag=0xA00,
@@ -3797,6 +3862,7 @@ def test_train_stalker_requires_completed_cybernetics_core() -> None:
 
 def test_research_warpgate_requires_its_full_resource_cost() -> None:
     timestep = _fake_timestep()
+    timestep.observation.upgrades = []
     core = _unit(0xDEF, 72, 1, 36, 35, 500, 255)
     core.build_progress = 100
     core.active = 0
@@ -3855,6 +3921,103 @@ def test_production_source_resolver_returns_the_idle_completed_structure_tag() -
     )
 
 
+def test_terran_economy_sources_cover_scv_orbital_mule_and_stimpack() -> None:
+    timestep = _fake_timestep()
+    timestep.observation.upgrades = []
+    barracks = _unit(0xB00, 21, 1, 30, 30, 1000, 255)
+    barracks.build_progress = 100
+    barracks.active = 0
+    barracks.add_on_tag = 0xB01
+    tech_lab = _unit(0xB01, 37, 1, 32, 30, 400, 255)
+    tech_lab.build_progress = 100
+    command_center = _unit(0xC00, 18, 1, 35, 35, 1500, 255)
+    command_center.build_progress = 100
+    command_center.active = 0
+    orbital = _unit(0xC01, 132, 1, 45, 35, 1500, 255)
+    orbital.build_progress = 100
+    orbital.active = 0
+    orbital.energy = 75
+    timestep.observation.raw_units.extend([barracks, tech_lab, command_center, orbital])
+    names = {
+        18: "CommandCenter",
+        21: "Barracks",
+        37: "BarracksTechLab",
+        132: "OrbitalCommand",
+    }
+
+    assert production_source_tag(
+        timestep.observation,
+        {"name": "Train_SCV", "func": [(490, None, ())]},
+        unit_names=names,
+        action_source_types={490: 18},
+    ) == 0xC00
+    assert production_source_tag(
+        timestep.observation,
+        {"name": "Morph_OrbitalCommand", "func": [(309, None, ())]},
+        unit_names=names,
+        action_source_types={309: 18},
+    ) == 0xC00
+    assert production_source_tag(
+        timestep.observation,
+        {"name": "Effect_CalldownMULE_Screen", "func": [(183, None, ())]},
+        unit_names=names,
+        action_source_types={183: 132},
+    ) == 0xC01
+    assert production_source_tag(
+        timestep.observation,
+        {"name": "Research_Stimpack", "func": [(405, None, ())]},
+        unit_names=names,
+        action_source_types={405: 21},
+    ) == 0xB00
+
+    orbital.active = 1
+    orbital.order_length = 1
+    orbital.order_id_0 = 520
+    assert production_source_tag(
+        timestep.observation,
+        {"name": "Effect_CalldownMULE_Screen", "func": [(183, None, ())]},
+        unit_names=names,
+        action_source_types={183: 132},
+    ) == 0xC01
+    orbital.energy = 49
+    assert production_source_tag(
+        timestep.observation,
+        {"name": "Effect_CalldownMULE_Screen", "func": [(183, None, ())]},
+        unit_names=names,
+        action_source_types={183: 132},
+    ) is None
+
+
+def test_stimpack_source_requires_the_exact_barracks_techlab() -> None:
+    timestep = _fake_timestep()
+    timestep.observation.upgrades = []
+    barracks = _unit(0xB00, 21, 1, 30, 30, 1000, 255)
+    barracks.build_progress = 100
+    barracks.active = 0
+    barracks.add_on_tag = 0
+    timestep.observation.raw_units.append(barracks)
+    action = {"name": "Research_Stimpack", "func": [(405, None, ())]}
+    names = {21: "Barracks", 37: "BarracksTechLab"}
+
+    assert production_source_tag(
+        timestep.observation,
+        action,
+        unit_names=names,
+        action_source_types={405: 21},
+    ) is None
+
+    tech_lab = _unit(0xB01, 37, 1, 32, 30, 400, 255)
+    tech_lab.build_progress = 100
+    barracks.add_on_tag = 0xB01
+    timestep.observation.raw_units.append(tech_lab)
+    assert production_source_tag(
+        timestep.observation,
+        action,
+        unit_names=names,
+        action_source_types={405: 21},
+    ) == 0xB00
+
+
 def test_production_source_follows_upstream_raw_order_instead_of_tag_order() -> None:
     timestep = _fake_timestep()
     first = _unit(0xBBB, 62, 1, 36, 35, 500, 255)
@@ -3888,6 +4051,7 @@ def test_train_registry_pins_multirace_worker_actions_and_raw_orders() -> None:
         "Train_SiegeTank": 521,
         "Train_Medivac": 512,
         "Train_VikingFighter": 525,
+        "Train_SCV": 520,
         "Train_Drone": 503,
         "Train_Overlord": 515,
         "Train_Queen": 516,

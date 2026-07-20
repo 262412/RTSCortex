@@ -51,6 +51,7 @@ class RaceProfileData:
     live_worker_ready: bool = False
     effect_verification_kinds: tuple[str, ...] = ()
     controller_capabilities: tuple[str, ...] = ()
+    controller_managed_actions: tuple[str, ...] = ()
     limitations: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
@@ -60,6 +61,19 @@ class RaceProfileData:
         semantic_actions = [mapping.semantic_action for mapping in self.macro_action_mappings]
         if len(semantic_actions) != len(set(semantic_actions)):
             raise ValueError(f"{self.race.value} macro mappings must be unique")
+        if len(self.controller_managed_actions) != len(set(self.controller_managed_actions)):
+            raise ValueError(f"{self.race.value} controller-managed actions must be unique")
+        mapped_runtime_actions = {
+            action
+            for mapping in self.macro_action_mappings
+            for action in mapping.runtime_actions
+        }
+        unknown_managed_actions = set(self.controller_managed_actions) - mapped_runtime_actions
+        if unknown_managed_actions:
+            rendered = ", ".join(sorted(unknown_managed_actions))
+            raise ValueError(
+                f"{self.race.value} controller-managed actions lack macro mappings: {rendered}"
+            )
         object.__setattr__(self, "action_domains", MappingProxyType(dict(self.action_domains)))
         object.__setattr__(
             self,
@@ -82,6 +96,7 @@ class RaceProfileData:
             "live_worker_ready": self.live_worker_ready,
             "effect_verification_kinds": list(self.effect_verification_kinds),
             "controller_capabilities": list(self.controller_capabilities),
+            "controller_managed_actions": list(self.controller_managed_actions),
             "limitations": list(self.limitations),
         }
 

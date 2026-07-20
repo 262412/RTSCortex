@@ -13,6 +13,60 @@ from rtscortex_llm_pysc2.production import PRODUCTION_SPECS, ProductionSpec
 from rtscortex_llm_pysc2.routing import RoutedCommand
 
 
+def test_stimpack_research_is_confirmed_by_exact_barracks_order() -> None:
+    verifier = ActionEffectVerifier(timeout_game_loops=112)
+    command = RoutedCommand(
+        command_id="research-stim",
+        actor="Developer/Empty",
+        team_name="Empty",
+        name="Research_Stimpack",
+        source="planner",
+        rendered_action="<Research_Stimpack()>",
+    )
+    verifier.track(command)
+    verifier.prepare(command.command_id, _research_observation(100, []), None, producer_tag=0xB00)
+    verifier.accept_primitive(command.command_id, game_loop=104)
+
+    verdicts = verifier.observe(_research_observation(108, [730]))
+
+    assert len(verdicts) == 1
+    assert verdicts[0].success is True
+    assert verdicts[0].evidence is not None
+    assert verdicts[0].evidence["effect_kind"] == "research"
+    assert verdicts[0].evidence["producer_tag"] == "0xb00"
+    assert verdicts[0].evidence["expected_upgrade"] == "Stimpack"
+    assert verdicts[0].evidence["expected_order_id"] == 451
+    assert verdicts[0].evidence["confirmation_kind"] == "producer_order"
+
+
+def test_mule_calldown_is_confirmed_only_by_a_new_mule_tag() -> None:
+    verifier = ActionEffectVerifier(timeout_game_loops=112)
+    command = RoutedCommand(
+        command_id="mule-1",
+        actor="Developer/Empty",
+        team_name="Empty",
+        name="Effect_CalldownMULE_Screen",
+        source="reflex",
+        requested_arguments=([44, 52],),
+        resolved_arguments=([44, 52],),
+        rendered_action="<Effect_CalldownMULE_Screen([44,52])>",
+    )
+    verifier.track(command)
+    verifier.prepare(command.command_id, _mule_observation(200), None, producer_tag=0xC00)
+    verifier.accept_primitive(command.command_id, game_loop=204)
+
+    assert verifier.observe(_mule_observation(208, energy=25)) == []
+    verdicts = verifier.observe(_mule_observation(212, energy=25, mule_tags=[0xD00]))
+
+    assert len(verdicts) == 1
+    assert verdicts[0].success is True
+    assert verdicts[0].evidence is not None
+    assert verdicts[0].evidence["effect_kind"] == "ability"
+    assert verdicts[0].evidence["producer_tag"] == "0xc00"
+    assert verdicts[0].evidence["new_unit_tag"] == "0xd00"
+    assert verdicts[0].evidence["confirmation_kind"] == "new_unit"
+
+
 def test_build_effect_is_confirmed_when_target_structure_appears() -> None:
     verifier = ActionEffectVerifier(timeout_game_loops=112)
     command = _build_command()
@@ -813,6 +867,46 @@ def test_queen_creep_tumor_confirms_a_new_structure_at_the_selected_position() -
     assert verdict.evidence is not None
     assert verdict.evidence["effect_kind"] == "build"
     assert verdict.evidence["target_type"] == "CreepTumorQueen"
+    assert verdict.evidence["order_seen"] is True
+
+
+def test_chained_creep_tumor_accepts_the_burrowed_target_form() -> None:
+    verifier = ActionEffectVerifier(timeout_game_loops=10)
+    command = RoutedCommand(
+        command_id="command-creep-chain",
+        actor="CombatGroup4/CreepTumor-1",
+        team_name="CreepTumor-1",
+        name="Build_CreepTumor_Tumor_Screen",
+        source="reflex",
+        requested_arguments=([65, 65],),
+        resolved_arguments=([65, 65],),
+        rendered_action="<Build_CreepTumor_Tumor_Screen([65,65])>",
+    )
+    verifier.track(command)
+    baseline = _observation(game_loop=100, minerals=250, builder_orders=[])
+    baseline["raw_units"][0]["unit_type"] = "CreepTumorBurrowed"
+    verifier.prepare(command.command_id, baseline, 0xABC)
+    verifier.accept_primitive(command.command_id, game_loop=101)
+    current = _observation(
+        game_loop=102,
+        minerals=250,
+        structures=["Nexus", "CreepTumorBurrowed"],
+        builder_orders=[190],
+    )
+    current["raw_units"][0]["unit_type"] = "CreepTumorBurrowed"
+    tumor = next(
+        unit
+        for unit in current["raw_units"][1:]
+        if unit["unit_type"] == "CreepTumorBurrowed"
+    )
+    tumor["x"] = 31.875
+    tumor["y"] = 30
+
+    verdict = verifier.observe(current)[0]
+
+    assert verdict.success is True
+    assert verdict.evidence is not None
+    assert verdict.evidence["target_type"] == "CreepTumor"
     assert verdict.evidence["order_seen"] is True
 
 
@@ -1690,3 +1784,49 @@ def _move_observation(
             camera[y][x] = 1
     observation["feature_minimap"] = {"camera": camera}
     return observation
+
+
+def _research_observation(game_loop: int, orders: list[int]) -> dict[str, Any]:
+    return {
+        "game_loop": game_loop,
+        "player_common": {"minerals": 500, "vespene": 500},
+        "upgrades": [],
+        "raw_units": [
+            {
+                "tag": 0xB00,
+                "unit_type": "Barracks",
+                "alliance": 1,
+                "order_length": len(orders),
+                **{f"order_id_{index}": order for index, order in enumerate(orders)},
+            }
+        ],
+    }
+
+
+def _mule_observation(
+    game_loop: int,
+    *,
+    energy: float = 75,
+    mule_tags: list[int] | None = None,
+) -> dict[str, Any]:
+    return {
+        "game_loop": game_loop,
+        "raw_units": [
+            {
+                "tag": 0xC00,
+                "unit_type": "OrbitalCommand",
+                "alliance": 1,
+                "energy": energy,
+                "order_length": 0,
+            },
+            *[
+                {
+                    "tag": tag,
+                    "unit_type": "MULE",
+                    "alliance": 1,
+                    "order_length": 0,
+                }
+                for tag in mule_tags or []
+            ],
+        ],
+    }

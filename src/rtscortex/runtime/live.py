@@ -341,6 +341,10 @@ def ensure_console_port_available(port: int) -> None:
         raise LiveEnvironmentError(f"invalid console port: {port}")
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            # Uvicorn enables address reuse on its listener. Mirror that behavior
+            # here so a just-finished Console connection in TIME_WAIT does not
+            # make the next sequential episode look like a live port conflict.
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             probe.bind(("127.0.0.1", port))
     except OSError as error:
         raise LiveEnvironmentError(

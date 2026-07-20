@@ -133,6 +133,21 @@ CREEP_TUMOR_ACTION["func"] = [
         ("queued", "screen"),
     ),
 ]
+CHAINED_CREEP_TUMOR_ACTION = _action(
+    "Build_CreepTumor_Tumor_Screen",
+    ["screen"],
+    F.Build_CreepTumor_Tumor_screen,
+    "queued",
+    "screen",
+)
+CHAINED_CREEP_TUMOR_ACTION["func"] = [
+    (0, F.no_op, ()),
+    (
+        int(F.Build_CreepTumor_Tumor_screen.id),
+        F.Build_CreepTumor_Tumor_screen,
+        ("queued", "screen"),
+    ),
+]
 QUEEN_CONTROLLER_ACTIONS = [
     INJECT_LARVA_ACTION,
     CREEP_TUMOR_ACTION,
@@ -206,6 +221,14 @@ class RTSCortexZergMeleeConfig(AgentConfig):  # type: ignore[misc]
             ),
             "CombatGroup2": _combat_agent(self, "Roach-1", units.Zerg.Roach),
             "CombatGroup3": _combat_agent(self, "Hydralisk-1", units.Zerg.Hydralisk),
+            "CombatGroup4": _combat_agent(
+                self,
+                "CreepTumor-1",
+                units.Zerg.CreepTumorBurrowed,
+                extra_actions=[CHAINED_CREEP_TUMOR_ACTION],
+                select_type="select",
+                alternate_types=(units.Zerg.CreepTumor, units.Zerg.CreepTumorQueen),
+            ),
         }
 
 
@@ -216,19 +239,21 @@ def _combat_agent(
     *,
     extra_actions: list[dict[str, Any]] | None = None,
     select_type: str = "select_all_type",
+    alternate_types: tuple[Any, ...] = (),
 ) -> dict[str, Any]:
+    unit_types = [unit_type, *alternate_types]
     return {
         "describe": f"Zerg combat controller for {team_name}.",
         "llm": _llm_settings(config),
         "team": [
             {
                 "name": team_name,
-                "unit_type": [unit_type],
+                "unit_type": unit_types,
                 "game_group": -1,
                 "select_type": select_type,
             }
         ],
-        "action": {unit_type: [*UNIT_ACTIONS, *(extra_actions or [])]},
+        "action": {value: [*UNIT_ACTIONS, *(extra_actions or [])] for value in unit_types},
     }
 
 

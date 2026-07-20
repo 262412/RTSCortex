@@ -1650,6 +1650,14 @@ class CortexRuntimeEngine(RuntimeEngine):
             return "Maintain deterministic Zerg larva production"
         if action_name == "Build_CreepTumor_Queen_Screen":
             return "Extend deterministic Zerg creep coverage"
+        if action_name == "Build_CreepTumor_Tumor_Screen":
+            return "Continue deterministic Zerg creep expansion from a mature tumor"
+        if action_name == "Train_SCV":
+            return "Maintain deterministic Terran worker production"
+        if action_name == "Morph_OrbitalCommand":
+            return "Upgrade the Terran economy to Orbital Command"
+        if action_name == "Effect_CalldownMULE_Screen":
+            return "Convert available Orbital energy into mineral income"
         return "Respond to the visible enemy threat"
 
     def _compile_intent(

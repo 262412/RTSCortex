@@ -30,6 +30,7 @@ class ProductionSpec:
     race: str = "protoss"
     producer_consumed: bool = False
     intermediate_types: tuple[str, ...] = ()
+    alternate_producer_types: tuple[str, ...] = ()
 
 
 _PRODUCTION_SPECS = (
@@ -104,6 +105,20 @@ _PRODUCTION_SPECS = (
         150,
         3,
         ("Stargate",),
+    ),
+    ProductionSpec(
+        "Train_SCV",
+        "CommandCenter",
+        "SCV",
+        490,
+        520,
+        524,
+        50,
+        0,
+        1,
+        (),
+        race="terran",
+        alternate_producer_types=("OrbitalCommand", "PlanetaryFortress"),
     ),
     ProductionSpec(
         "Train_Marine",
@@ -273,7 +288,7 @@ _PRODUCTION_SPECS = (
     ),
 )
 
-PRODUCTION_REGISTRY_VERSION = "simple64-multirace-v3"
+PRODUCTION_REGISTRY_VERSION = "simple64-multirace-v4"
 PRODUCTION_SPECS: Mapping[str, ProductionSpec] = MappingProxyType(
     {spec.action_name: spec for spec in _PRODUCTION_SPECS}
 )

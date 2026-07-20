@@ -27,6 +27,19 @@ class MorphSpec:
 
 _MORPH_SPECS = (
     MorphSpec(
+        "Morph_OrbitalCommand",
+        "CommandCenter",
+        "OrbitalCommand",
+        309,
+        394,
+        1516,
+        150,
+        0,
+        0,
+        ("CommandCenter", "Barracks"),
+        race="terran",
+    ),
+    MorphSpec(
         "Morph_Lair",
         "Hatchery",
         "Lair",
@@ -40,7 +53,7 @@ _MORPH_SPECS = (
     ),
 )
 
-MORPH_REGISTRY_VERSION = "simple64-zerg-morph-v1"
+MORPH_REGISTRY_VERSION = "simple64-multirace-morph-v2"
 MORPH_SPECS: Mapping[str, MorphSpec] = MappingProxyType(
     {spec.action_name: spec for spec in _MORPH_SPECS}
 )
