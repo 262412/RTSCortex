@@ -2262,7 +2262,13 @@ def _release_runtime_observation_barrier(main_agent: Any) -> None:
     agents = getattr(main_agent, "agents", {})
     if not isinstance(agents, Mapping):
         return
-    for agent in agents.values():
+    for agent_name, agent in agents.items():
+        # Builder screen actions require an observation captured after moving
+        # the camera to and selecting the exact worker. Marking Builder ready
+        # without that observation makes screen placements impossible to bind
+        # to the actor and previously produced stale/unreachable candidates.
+        if str(agent_name) == "Builder":
+            continue
         if not getattr(agent, "enable", False) or not agent._is_waiting_query():
             continue
         observed_tags = getattr(agent, "team_unit_tag_list", None)
@@ -3124,6 +3130,21 @@ def _semantic_target_failure(
             None,
         )
         if target is None:
+            raw_target = next(
+                (
+                    unit
+                    for unit in _observation_value(observation, "raw_units", ())
+                    if int(_observation_value(unit, "tag", -1)) == target_tag
+                ),
+                None,
+            )
+            if raw_target is None:
+                return "target_not_visible", f"enemy target {hex(target_tag)} is not visible"
+            if int(_observation_value(raw_target, "alliance", 0)) != 4:
+                return "friendly_target", f"target {hex(target_tag)} is not an enemy"
+            functions = action.get("func", ())
+            if functions and int(functions[0][0]) == 573:
+                return None
             return "target_not_visible", f"enemy target {hex(target_tag)} is not visible"
         if int(_observation_value(target, "alliance", 0)) != 4:
             return "friendly_target", f"target {hex(target_tag)} is not an enemy"

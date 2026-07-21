@@ -103,20 +103,13 @@ _HIMA_PREVIOUS_ACTION_WINDOW_GAME_LOOPS = int(60 * 22.4)
 _MACRO_REJECTION_RETRY_GAME_LOOPS = 16
 
 
-def _deferred_frontier_requires_replan(frontier: PolicyActionAssessment) -> bool:
-    reason = frontier.reason_code or ""
-    return reason == "insufficient_supply" or reason.startswith("missing_prerequisite_")
-
-
 def _macro_frontier_is_usable(frontier: PolicyActionAssessment | None) -> bool:
     if frontier is None:
         return False
-    if frontier.classification is PolicyActionClassification.MAPPED_LEGAL_NOW:
-        return True
-    return (
-        frontier.classification is PolicyActionClassification.MAPPED_DEFERRED
-        and not _deferred_frontier_requires_replan(frontier)
-    )
+    return frontier.classification in {
+        PolicyActionClassification.MAPPED_LEGAL_NOW,
+        PolicyActionClassification.MAPPED_DEFERRED,
+    }
 
 
 class MacroPolicyClient(Protocol):
@@ -1104,6 +1097,22 @@ class CortexRuntimeEngine(RuntimeEngine):
                 "goal_spec": None if goal is None else goal.model_dump(mode="json"),
             },
         )
+        if (
+            frontier_assessment is not None
+            and frontier_assessment.classification
+            is PolicyActionClassification.MAPPED_DEFERRED
+        ):
+            self._record_cortex_event(
+                observation,
+                "macro_frontier_deferred",
+                {
+                    "plan_id": plan.plan_id,
+                    "ordinal": frontier_assessment.ordinal,
+                    "semantic_action": frontier_assessment.source_action,
+                    "runtime_action": frontier_assessment.runtime_action,
+                    "reason": frontier_assessment.reason_code,
+                },
+            )
 
     def _macro_goal_progress(
         self,
@@ -1177,30 +1186,29 @@ class CortexRuntimeEngine(RuntimeEngine):
             )
             frontier = fallback
         if frontier.classification is PolicyActionClassification.MAPPED_DEFERRED:
-            if _deferred_frontier_requires_replan(frontier):
-                if self._prerequisite_resolution(frontier, observation) is not None:
-                    self._set_macro_step_status(
-                        frontier.ordinal,
-                        MacroStepStatus.DEFERRED,
-                        frontier.reason_code,
-                    )
-                    return None
-                self._set_macro_step_status(
-                    frontier.ordinal,
-                    MacroStepStatus.BLOCKED,
-                    frontier.reason_code,
-                )
-                self._macro_plan_frozen = True
-                self._next_macro_retry_game_loop = (
-                    observation.game_loop + self.config.cortex.macro.interval_game_loops
-                )
-                self._urgent_replan_requested = True
-                return None
+            step = self._macro_step(frontier.ordinal)
+            status_changed = (
+                step is None
+                or step.status is not MacroStepStatus.DEFERRED
+                or step.reason != frontier.reason_code
+            )
             self._set_macro_step_status(
                 frontier.ordinal,
                 MacroStepStatus.DEFERRED,
                 frontier.reason_code,
             )
+            if status_changed:
+                self._record_cortex_event(
+                    observation,
+                    "macro_frontier_deferred",
+                    {
+                        "plan_id": self._macro_plan.plan_id,
+                        "ordinal": frontier.ordinal,
+                        "semantic_action": frontier.source_action,
+                        "runtime_action": frontier.runtime_action,
+                        "reason": frontier.reason_code,
+                    },
+                )
             return None
         if frontier.classification in {
             PolicyActionClassification.PARSE_ERROR,
@@ -1224,6 +1232,33 @@ class CortexRuntimeEngine(RuntimeEngine):
                 MacroStepStatus.OBSOLETE,
                 frontier.reason_code,
             )
+            return None
+        pending_structure = self._pending_structure_target(frontier, observation)
+        if pending_structure is not None:
+            step = self._macro_step(frontier.ordinal)
+            status_changed = (
+                step is None
+                or step.status is not MacroStepStatus.DEFERRED
+                or step.reason != "same_structure_in_progress"
+            )
+            self._set_macro_step_status(
+                frontier.ordinal,
+                MacroStepStatus.DEFERRED,
+                "same_structure_in_progress",
+            )
+            if status_changed:
+                self._record_cortex_event(
+                    observation,
+                    "macro_structure_deferred",
+                    {
+                        "plan_id": self._macro_plan.plan_id,
+                        "ordinal": frontier.ordinal,
+                        "semantic_action": frontier.source_action,
+                        "runtime_action": frontier.runtime_action,
+                        "target_structure": pending_structure,
+                        "reason": "same_structure_in_progress",
+                    },
+                )
             return None
         if (
             frontier.source_action == self._supply_macro_action()
@@ -1494,6 +1529,32 @@ class CortexRuntimeEngine(RuntimeEngine):
 
     def _supply_macro_action(self) -> str:
         return self._semantic_action_for_target(self._race_profile.data.supply_provider)
+
+    def _pending_structure_target(
+        self,
+        frontier: PolicyActionAssessment,
+        observation: ObservationEnvelope,
+    ) -> str | None:
+        if frontier.runtime_action is None:
+            return None
+        spec = next(
+            (
+                item
+                for item in self._race_profile.data.progress_action_specs
+                if item.name == frontier.runtime_action and item.effect_kind.value == "structure"
+            ),
+            None,
+        )
+        if spec is None:
+            return None
+        constructing = sum(
+            structure.unit_type.casefold() == spec.effect_target.casefold()
+            and structure.status == "constructing"
+            for structure in observation.state.own_structures
+        )
+        step = self._macro_step(frontier.ordinal)
+        completed_in_plan = 0 if step is None else step.completed_repeats
+        return spec.effect_target if constructing > completed_in_plan else None
 
     def _fallback_unit_macro_action(self) -> str:
         worker = self._race_profile.data.worker_type.casefold()
@@ -2168,12 +2229,14 @@ class CortexRuntimeEngine(RuntimeEngine):
             self._playbook_selection = None
             self._playbook_rules = ()
             return
+        context = self._playbook_context(assessment)
         self._playbook_rules = self._playbook_store.rules_for_guard(
+            context=context,
             max_hard=self.config.cortex.playbook.max_hard_rules,
             max_soft=self.config.cortex.playbook.max_soft_rules,
         )
         query = PlaybookQuery(
-            context=self._playbook_context(assessment),
+            context=context,
             top_k=self.config.cortex.playbook.top_k,
             min_confidence=self.config.cortex.playbook.min_confidence,
             include_candidates=self.config.cortex.playbook.include_candidates,

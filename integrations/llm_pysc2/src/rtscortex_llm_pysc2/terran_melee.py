@@ -54,6 +54,11 @@ UNIT_ACTIONS = [
     _action("Move_Screen", ["screen"], F.Move_screen, "queued", "screen"),
     _action("Attack_Unit", ["tag"], F.Attack_screen, "queued", "screen_tag"),
 ]
+UNIT_ACTIONS[-1]["func"] = [
+    (573, F.llm_pysc2_move_camera, ("world_tag",)),
+    (0, F.no_op, ()),
+    (int(F.Attack_screen.id), F.Attack_screen, ("queued", "screen_tag")),
+]
 NON_ATTACKING_UNIT_ACTIONS = [
     _action("Stop", [], F.Stop_quick, "now"),
     NO_OPERATION,

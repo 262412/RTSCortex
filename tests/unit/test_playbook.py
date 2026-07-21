@@ -18,6 +18,7 @@ from rtscortex.playbook import (
     CortexPlaybookReviewer,
     DecisionQuality,
     LessonStatus,
+    PlaybookCondition,
     PlaybookContext,
     PlaybookQuery,
     PlaybookRule,
@@ -154,8 +155,8 @@ def test_playbook_records_new_opposing_outcome_as_rule_contradiction(tmp_path: P
         step_id=3,
         event_type="macro_plan_rejected",
         payload={
-            "classification": "mapped_deferred",
-            "reason": "missing_prerequisite_gateway",
+            "classification": "illegal_action",
+            "reason": "illegal_runtime_frontier",
             "proposal": {"steps": [{"canonical_action": "BUILD STARGATE"}]},
         },
     )
@@ -306,7 +307,7 @@ def test_playbook_repairs_unscoped_v2_execution_candidate(tmp_path: Path) -> Non
     playbook.close()
 
 
-def test_playbook_records_rejected_macro_proposal_as_cortex_error(tmp_path: Path) -> None:
+def test_playbook_records_illegal_macro_proposal_as_cortex_error(tmp_path: Path) -> None:
     playbook = PlaybookStore(tmp_path / "playbook.sqlite3")
     reviewer = CortexPlaybookReviewer(playbook, promotion_support=1)
     store, result = _episode_events(tmp_path, "run")
@@ -316,8 +317,8 @@ def test_playbook_records_rejected_macro_proposal_as_cortex_error(tmp_path: Path
         step_id=0,
         event_type="macro_plan_rejected",
         payload={
-            "classification": "unsupported_by_runtime",
-            "reason": "no_runtime_frontier",
+            "classification": "illegal_action",
+            "reason": "illegal_runtime_frontier",
             "proposal": {"steps": [{"canonical_action": "RESEARCH PSIONIC STORM"}]},
         },
     )
@@ -339,6 +340,92 @@ def test_playbook_records_rejected_macro_proposal_as_cortex_error(tmp_path: Path
 
     store.close()
     playbook.close()
+
+
+def test_playbook_does_not_learn_temporarily_deferred_macro_proposal(
+    tmp_path: Path,
+) -> None:
+    playbook = PlaybookStore(tmp_path / "playbook.sqlite3")
+    reviewer = CortexPlaybookReviewer(playbook, promotion_support=1)
+    store, result = _episode_events(tmp_path, "run")
+    store.append_event(
+        run_id="run",
+        episode_id="episode",
+        step_id=0,
+        event_type="macro_plan_rejected",
+        payload={
+            "classification": "mapped_deferred",
+            "reason": "missing_prerequisite_gateway",
+            "proposal": {"steps": [{"canonical_action": "TRAIN PROBE"}]},
+        },
+    )
+    store.append_event(
+        run_id="run",
+        episode_id="episode",
+        step_id=0,
+        event_type="macro_plan_rejected",
+        payload={
+            "classification": "unsupported_by_runtime",
+            "reason": "not_implemented",
+            "proposal": {"steps": [{"canonical_action": "TRAIN TEMPEST"}]},
+        },
+    )
+
+    cases, _ = reviewer.review_episode(
+        store.events_after("run", 0, 100, episode_id="episode"),
+        result,
+        agent_race="protoss",
+        opponent_race="zerg",
+    )
+
+    assert all(not case.command_id.startswith("proposal:") for case in cases)
+    assert all("TRAIN PROBE" not in rule.action_names for rule in playbook.rules())
+    assert all("TRAIN TEMPEST" not in rule.action_names for rule in playbook.rules())
+
+    store.close()
+    playbook.close()
+
+
+def test_playbook_guard_rule_cap_is_applied_after_context_filter(tmp_path: Path) -> None:
+    store = PlaybookStore(tmp_path / "playbook.sqlite3")
+    for index in range(8):
+        store.upsert_rule(
+            PlaybookRule(
+                rule_id=f"rule:terran:{index}",
+                canonical_key=f"terran:{index}",
+                category=PlaybookRuleCategory.EXECUTION_GUARD,
+                conditions=(PlaybookCondition(field="agent_race", value="terran"),),
+                effect=PlaybookRuleEffect.AVOID,
+                strength=PlaybookRuleStrength.SOFT,
+                status=PlaybookRuleStatus.ACTIVE,
+                action_names=("Train_Marine",),
+                confidence=0.95,
+            )
+        )
+    protoss = PlaybookRule(
+        rule_id="rule:protoss",
+        canonical_key="protoss",
+        category=PlaybookRuleCategory.EXECUTION_GUARD,
+        conditions=(PlaybookCondition(field="agent_race", value="protoss"),),
+        effect=PlaybookRuleEffect.AVOID,
+        strength=PlaybookRuleStrength.SOFT,
+        status=PlaybookRuleStatus.ACTIVE,
+        action_names=("Build_Pylon_Screen",),
+        confidence=0.8,
+    )
+    store.upsert_rule(protoss)
+
+    selected = store.rules_for_guard(
+        context=PlaybookContext(
+            agent_race="protoss",
+            opponent_race="zerg",
+            phase=GamePhase.EARLY,
+            map_name="Simple64",
+        )
+    )
+
+    assert selected == (protoss,)
+    store.close()
 
 
 def test_playbook_promotes_repeated_producer_failure_as_compact_execution_rule(
@@ -411,8 +498,8 @@ def test_playbook_promotes_repeated_producer_failure_as_compact_execution_rule(
     executable_guard = next(
         rule for rule in playbook.rules() if rule.action_names == ("TRAIN ADEPT",)
     )
-    assert executable_guard.status is PlaybookRuleStatus.ACTIVE
-    assert executable_guard.strength is PlaybookRuleStrength.SOFT
+    assert executable_guard.status is PlaybookRuleStatus.CANDIDATE
+    assert executable_guard.strength is PlaybookRuleStrength.ADVISORY
     selection = playbook.retrieve(
         PlaybookQuery(
             context=PlaybookContext(
@@ -424,4 +511,33 @@ def test_playbook_promotes_repeated_producer_failure_as_compact_execution_rule(
         )
     )
     assert guard.lesson_id in selection.lesson_ids
+    playbook.close()
+
+
+def test_playbook_quarantines_legacy_soft_execution_penalty(tmp_path: Path) -> None:
+    playbook = PlaybookStore(tmp_path / "playbook.sqlite3")
+    playbook.upsert_rule(
+        PlaybookRule(
+            rule_id="rule:unsafe-execution-penalty",
+            canonical_key="unsafe-execution-penalty",
+            category=PlaybookRuleCategory.EXECUTION_GUARD,
+            conditions=(PlaybookCondition(field="agent_race", value="protoss"),),
+            effect=PlaybookRuleEffect.AVOID,
+            strength=PlaybookRuleStrength.SOFT,
+            status=PlaybookRuleStatus.ACTIVE,
+            action_names=("Attack_Unit",),
+            confidence=0.95,
+        )
+    )
+
+    CortexPlaybookReviewer(playbook)
+
+    rule = next(
+        rule
+        for rule in playbook.rules()
+        if rule.canonical_key == "unsafe-execution-penalty"
+    )
+    assert rule.status is PlaybookRuleStatus.SUSPENDED
+    assert rule.strength is PlaybookRuleStrength.ADVISORY
+    assert rule.evidence["suspension_reason"] == "missing_typed_failure_precondition"
     playbook.close()

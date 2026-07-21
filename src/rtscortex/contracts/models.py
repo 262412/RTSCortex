@@ -255,6 +255,7 @@ class EffectEvidence(ContractModel):
     target_type: str | None = None
     target_position: tuple[float, float] | None = None
     target_tag: str | None = None
+    actor_tag: str | None = None
     builder_tag: str | None = None
     requested_producer_tag: str | None = None
     producer_tag: str | None = None
@@ -320,6 +321,9 @@ class EffectEvidence(ContractModel):
     baseline_builder_position: tuple[float, float] | None = None
     observed_builder_position: tuple[float, float] | None = None
     builder_displacement: float | None = Field(default=None, ge=0)
+    baseline_actor_position: tuple[float, float] | None = None
+    observed_actor_position: tuple[float, float] | None = None
+    actor_displacement: float | None = Field(default=None, ge=0)
     move_order_seen: bool = False
 
 

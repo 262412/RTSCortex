@@ -41,6 +41,8 @@ class PlaybookRuleLifecycle:
             raise ValueError("soft promotion requires evidence from two runs")
         if rule.confidence < 0.75 or rule.contradiction_count:
             raise ValueError("soft promotion confidence or contradiction gate failed")
+        if rule.category is PlaybookRuleCategory.EXECUTION_GUARD:
+            raise ValueError("execution guard requires a typed failure precondition")
         return rule.model_copy(
             update={
                 "status": PlaybookRuleStatus.ACTIVE,

@@ -355,6 +355,11 @@ describe("Chinese event presentation", () => {
         repeat: 1,
       },
     });
+    const structureDeferred = event("macro_structure_deferred", {
+      runtime_action: "Build_Gateway_Screen",
+      target_structure: "Gateway",
+      reason: "same_structure_in_progress",
+    });
     const failure = event("specialist_failed", {
       role: "macro",
       model_id: "hima-a",
@@ -373,6 +378,9 @@ describe("Chinese event presentation", () => {
       "command-1 · 计划 plan-1 → 意图 intent-1 → 候选 candidate-1",
     );
     expect(eventSummary(macroStep)).toBe("建造水晶塔 · 已确认 · 1/1");
+    expect(eventTitle(structureDeferred)).toBe("同类建筑在建，动作已延后");
+    expect(eventSummary(structureDeferred)).toContain("建造传送门");
+    expect(eventSummary(structureDeferred)).toContain("等待 Gateway");
     expect(eventSummary(failure)).toBe("宏观决策（macro） · hima-a · request timed out");
     expect(eventSemanticPayload(selection)).toEqual({
       candidate_id: "candidate-1",

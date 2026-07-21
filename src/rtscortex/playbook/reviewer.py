@@ -21,6 +21,7 @@ from rtscortex.playbook.models import (
     PlaybookRuleEffect,
     PlaybookRuleKind,
     PlaybookRuleStatus,
+    PlaybookRuleStrength,
 )
 from rtscortex.playbook.store import PlaybookStore
 
@@ -35,6 +36,7 @@ class CortexPlaybookReviewer:
         self.last_rule_updates: tuple[PlaybookRule, ...] = ()
         self.rebuild_lessons()
         self._repair_unscoped_execution_candidates()
+        self._quarantine_unsafe_execution_penalties()
 
     def _repair_unscoped_execution_candidates(self) -> None:
         """Retire early v2 candidates that accidentally targeted every action."""
@@ -63,6 +65,28 @@ class CortexPlaybookReviewer:
                 rule.model_copy(
                     update={
                         "status": PlaybookRuleStatus.RETIRED,
+                        "evidence": evidence,
+                    }
+                )
+            )
+
+    def _quarantine_unsafe_execution_penalties(self) -> None:
+        """Prevent historical engine failures from becoming strategy penalties."""
+
+        for rule in self.store.rules():
+            if (
+                rule.category is not PlaybookRuleCategory.EXECUTION_GUARD
+                or rule.status is not PlaybookRuleStatus.ACTIVE
+                or rule.strength is PlaybookRuleStrength.ADVISORY
+            ):
+                continue
+            evidence = dict(rule.evidence)
+            evidence["suspension_reason"] = "missing_typed_failure_precondition"
+            self.store.upsert_rule(
+                rule.model_copy(
+                    update={
+                        "status": PlaybookRuleStatus.SUSPENDED,
+                        "strength": PlaybookRuleStrength.ADVISORY,
                         "evidence": evidence,
                     }
                 )
@@ -103,6 +127,8 @@ class CortexPlaybookReviewer:
         lessons: list[PlaybookLesson] = []
         for event in events:
             if event.event_type != "macro_plan_rejected":
+                continue
+            if event.payload.get("classification") not in {"illegal_action", "parse_error"}:
                 continue
             rejected = _rejected_proposal_case(
                 event,
@@ -239,6 +265,7 @@ class CortexPlaybookReviewer:
             rule = self.store.upsert_lesson_rule_candidate(lesson, case)
             if (
                 rule.status is PlaybookRuleStatus.CANDIDATE
+                and rule.category is not PlaybookRuleCategory.EXECUTION_GUARD
                 and rule.action_names
                 and len(set(rule.source_run_ids)) >= 2
                 and rule.confidence >= 0.75

@@ -569,7 +569,7 @@ def test_unusable_initial_macro_plan_fails_required_startup_barrier(
     asyncio.run(exercise())
 
 
-def test_missing_prerequisite_plan_is_rejected_without_hot_loop(
+def test_missing_prerequisite_plan_is_retained_without_hot_loop(
     tmp_path: Path,
 ) -> None:
     client = _FakeMacroClient("Actions: ['Gateway']")
@@ -589,18 +589,24 @@ def test_missing_prerequisite_plan_is_rejected_without_hot_loop(
         await runtime.tick(blocked)
         for _ in range(5):
             await asyncio.sleep(0)
-        rejected = await runtime.tick(blocked.model_copy(update={"step_id": 1, "game_loop": 1}))
-        assert rejected.commands == []
-        assert rejected.planner_pending is False
-        assert runtime._macro_plan is None
+        deferred = await runtime.tick(blocked.model_copy(update={"step_id": 1, "game_loop": 1}))
+        assert deferred.commands == []
+        assert deferred.planner_pending is False
+        assert runtime._macro_plan is not None
+        assert runtime._macro_plan.steps[0].status.value == "deferred"
+        assert runtime._macro_plan.steps[0].reason == "missing_prerequisite_pylon"
+        assert runtime._macro_plan_frozen is False
+        assert runtime._urgent_replan_requested is False
         await runtime.tick(blocked.model_copy(update={"step_id": 2, "game_loop": 2}))
         assert len(client.contexts) == 1
-        await runtime.tick(blocked.model_copy(update={"step_id": 3, "game_loop": 17}))
-        for _ in range(5):
-            await asyncio.sleep(0)
-        assert len(client.contexts) == 2
-        failures = store.events_of_type("cortex-run", "episode-1", "macro_plan_rejected")
-        assert failures[-1].payload["reason"] == "missing_prerequisite_pylon"
+        assert not store.events_of_type("cortex-run", "episode-1", "macro_plan_rejected")
+        accepted = store.events_of_type("cortex-run", "episode-1", "macro_plan_accepted")
+        assert accepted[-1].payload["runtime_frontier"] == "Build_Gateway_Screen"
+        deferred_events = store.events_of_type(
+            "cortex-run", "episode-1", "macro_frontier_deferred"
+        )
+        assert len(deferred_events) == 1
+        assert deferred_events[0].payload["reason"] == "missing_prerequisite_pylon"
         assert not store.events_of_type("cortex-run", "episode-1", "specialist_failed")
         await runtime.close()
 
@@ -812,6 +818,124 @@ def test_macro_skips_redundant_pylon_when_supply_headroom_is_already_large(
         assert runtime._macro_plan.steps[0].status.value == "obsolete"
         events = runtime.store.events_of_type("cortex-run", "episode-1", "macro_step_deduplicated")
         assert events[-1].payload["free_supply"] == 19
+        await runtime.close()
+
+    asyncio.run(exercise())
+
+
+def test_macro_defers_duplicate_supply_provider_while_one_is_constructing(
+    tmp_path: Path,
+) -> None:
+    runtime = CortexRuntimeEngine(
+        config=_config(tmp_path),
+        store=_store(tmp_path),
+        provider=FakeProvider(),
+        macro_client=_FakeMacroClient("Actions: ['Pylon']"),
+    )
+    base = _macro_observation(step_id=0, game_loop=0)
+    observation = base.model_copy(
+        update={
+            "state": base.state.model_copy(
+                update={
+                    "economy": EconomyState(
+                        minerals=500,
+                        supply_used=15,
+                        supply_cap=15,
+                        workers=12,
+                    ),
+                    "own_structures": [
+                        UnitState(
+                            unit_id="0x1",
+                            unit_type="Pylon",
+                            alliance="self",
+                            status="constructing",
+                        )
+                    ],
+                }
+            )
+        }
+    )
+
+    async def exercise() -> None:
+        await runtime.start()
+        await runtime.tick(observation)
+        for _ in range(5):
+            await asyncio.sleep(0)
+        batch = await runtime.tick(
+            observation.model_copy(update={"step_id": 1, "game_loop": 1})
+        )
+
+        assert batch.commands == []
+        assert runtime._macro_plan is not None
+        assert runtime._macro_plan.steps[0].status.value == "deferred"
+        events = runtime.store.events_of_type(
+            "cortex-run", "episode-1", "macro_structure_deferred"
+        )
+        assert len(events) == 1
+        assert events[0].payload["reason"] == "same_structure_in_progress"
+        assert events[0].payload["target_structure"] == "Pylon"
+        await runtime.close()
+
+    asyncio.run(exercise())
+
+
+def test_macro_defers_duplicate_tech_structure_while_one_is_constructing(
+    tmp_path: Path,
+) -> None:
+    runtime = CortexRuntimeEngine(
+        config=_config(tmp_path),
+        store=_store(tmp_path),
+        provider=FakeProvider(),
+        macro_client=_FakeMacroClient("Actions: ['Gateway']"),
+    )
+    observation = ObservationEnvelope(
+        run_id="cortex-run",
+        episode_id="episode-1",
+        step_id=0,
+        game_loop=0,
+        state=SC2State(
+            economy=EconomyState(
+                minerals=500,
+                supply_used=12,
+                supply_cap=23,
+                workers=12,
+            ),
+            own_structures=[
+                UnitState(unit_id="0x1", unit_type="Pylon", alliance="self"),
+                UnitState(
+                    unit_id="0x2",
+                    unit_type="Gateway",
+                    alliance="self",
+                    status="constructing",
+                ),
+            ],
+        ),
+        available_actions=[
+            AvailableAction(
+                name="Build_Gateway_Screen",
+                argument_names=["screen"],
+                argument_types=[ActionArgumentType.POSITION],
+                actor_scopes=["Builder/Probe-1"],
+                argument_candidates=[[[70, 90]]],
+            )
+        ],
+    )
+
+    async def exercise() -> None:
+        await runtime.start()
+        await runtime.tick(observation)
+        for _ in range(5):
+            await asyncio.sleep(0)
+        batch = await runtime.tick(
+            observation.model_copy(update={"step_id": 1, "game_loop": 1})
+        )
+
+        assert batch.commands == []
+        events = runtime.store.events_of_type(
+            "cortex-run", "episode-1", "macro_structure_deferred"
+        )
+        assert len(events) == 1
+        assert events[0].payload["target_structure"] == "Gateway"
         await runtime.close()
 
     asyncio.run(exercise())

@@ -857,8 +857,8 @@ def test_observation_gap_watchdog_releases_optional_team_selection_barrier() -> 
     _release_runtime_observation_barrier(main_agent)
     _release_runtime_observation_barrier(main_agent)
 
-    assert exact.team_unit_tag_list == [0xA]
-    assert exact.team_unit_team_list == ["Probe-1"]
+    assert exact.team_unit_tag_list == []
+    assert exact.team_unit_team_list == []
     assert grouped.team_unit_tag_list == [0xC]
     assert grouped.team_unit_team_list == ["Zealot-1"]
     assert busy.team_unit_tag_list == []
@@ -2707,6 +2707,98 @@ def test_zerg_build_candidates_require_a_reachable_builder_approach() -> None:
         == []
     )
 
+    semantic = semantic_argument_candidates(
+        observation,
+        "Build_EvolutionChamber_Screen",
+        unit_names=unit_names,
+        builder_tags=[0xD00],
+    )
+    assert semantic
+    assert all(candidate[0][0] < 64 for candidate in semantic)
+
+    # Feature pathability can mark the worker's occupied pixel as blocked even
+    # though adjacent terrain is reachable. Candidate generation must seed the
+    # flood fill from the nearest pathable cells instead of declaring the actor
+    # unreachable.
+    pathable[64][20] = 0
+    occupied_start_candidates = build_screen_candidates(
+        observation,
+        "Build_EvolutionChamber_Screen",
+        unit_names=unit_names,
+        builder_tags=[0xD00],
+    )
+    assert occupied_start_candidates
+    assert all(x < 64 for x, _y in occupied_start_candidates)
+
+    observation.feature_units[0].is_selected = True
+    selected_fallback_candidates = build_screen_candidates(
+        observation,
+        "Build_EvolutionChamber_Screen",
+        unit_names=unit_names,
+        builder_tags=[0xBAD],
+    )
+    assert selected_fallback_candidates
+    assert all(x < 64 for x, _y in selected_fallback_candidates)
+
+
+def test_builder_reachability_does_not_treat_mineral_line_as_a_permanent_wall() -> None:
+    observation = SimpleNamespace(
+        raw_units=[],
+        feature_units=[
+            SimpleNamespace(
+                tag=0xB01,
+                unit_type=84,
+                alliance=1,
+                is_on_screen=True,
+                is_selected=True,
+                x=64,
+                y=64,
+                radius=0.375,
+            ),
+            *[
+                SimpleNamespace(
+                    tag=tag,
+                    unit_type=341,
+                    alliance=3,
+                    is_on_screen=True,
+                    is_selected=False,
+                    x=x,
+                    y=y,
+                    radius=1.5,
+                )
+                for tag, (x, y) in enumerate(
+                    (
+                        (56, 64),
+                        (72, 64),
+                        (64, 56),
+                        (64, 72),
+                        (58, 58),
+                        (70, 58),
+                        (58, 70),
+                        (70, 70),
+                    ),
+                    start=0xC00,
+                )
+            ],
+        ],
+        feature_screen=SimpleNamespace(
+            buildable=UniformGrid(1),
+            pathable=UniformGrid(1),
+            player_relative=UniformGrid(0),
+            power=UniformGrid(0),
+            creep=UniformGrid(0),
+        ),
+    )
+
+    candidates = build_screen_candidates(
+        observation,
+        "Build_Pylon_Screen",
+        unit_names={84: "Probe", 341: "MineralField"},
+        builder_tags=[0xB01],
+    )
+
+    assert candidates
+
 
 def test_zerg_queen_controller_candidates_require_uninjected_townhall_and_creep() -> None:
     creep = [[1 for _ in range(128)] for _ in range(128)]
@@ -3421,6 +3513,27 @@ def test_worker_semantic_revalidation_distinguishes_enemy_and_build_targets() ->
         )
         is None
     )
+    raw_only_enemy = SimpleNamespace(tag=9, alliance=4, is_on_screen=False)
+    raw_only_observation = SimpleNamespace(
+        feature_units=[friendly],
+        raw_units=[raw_only_enemy],
+    )
+    assert (
+        _semantic_target_failure(
+            {
+                "name": "Attack_Unit",
+                "arg": [9],
+                "func": [
+                    (573, object(), ("world_tag",)),
+                    (0, object(), ()),
+                    (12, object(), ("queued", "screen_tag")),
+                ],
+            },
+            raw_only_observation,
+            {},
+        )
+        is None
+    )
     assert _translation_failure_code("area not pathable", "Build_Pylon_Screen") == ("not_pathable")
     assert (
         _translation_failure_code(
@@ -3897,6 +4010,38 @@ def test_research_warpgate_requires_its_full_resource_cost() -> None:
     assert [action["name"] for action in with_full_cost["teams"][0]["available_actions"]] == [
         "No_Operation",
         "Research_WarpGate",
+    ]
+
+
+def test_research_warpgate_is_hidden_while_the_upgrade_order_is_in_progress() -> None:
+    timestep = _fake_timestep()
+    timestep.observation.upgrades = []
+    researching_core = _unit(0xDEF, 72, 1, 36, 35, 500, 255)
+    researching_core.build_progress = 100
+    researching_core.active = 1
+    researching_core.order_length = 1
+    researching_core.order_id_0 = 82
+    idle_core = _unit(0xFED, 72, 1, 37, 35, 500, 255)
+    idle_core.build_progress = 100
+    idle_core.active = 0
+    timestep.observation.raw_units.extend([researching_core, idle_core])
+    research = {"name": "Research_WarpGate", "arg": [], "func": [(428, None, ())]}
+    agent = _developer_agent(timestep, [research])
+
+    snapshot = TimeStepExtractor(
+        "run-worker",
+        "episode-worker",
+        unit_names={72: "CyberneticsCore"},
+        action_source_types={428: 72},
+    ).extract(
+        timestep,
+        {"Developer": agent},
+        {"Developer": "production overview"},
+        step_id=1,
+    )
+
+    assert [action["name"] for action in snapshot["teams"][0]["available_actions"]] == [
+        "No_Operation"
     ]
 
 
@@ -5705,6 +5850,7 @@ class FakeAgent(RuntimeQueryMixin):
         self.action_lists: list[Any] = []
         self.team_unit_team_list = [team_name]
         self.team_unit_obs_list = [timestep]
+        self.team_unit_tag_list = [int(timestep.observation.raw_units[0].tag)]
         self.text_observation_calls = 0
         self.action_translation_calls = 0
         self.action_text = ""

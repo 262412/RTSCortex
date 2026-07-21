@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal
@@ -143,7 +144,7 @@ def _evaluate(
         and all(_matches(condition, values) for condition in rule.conditions)
     ]
     required = {
-        action
+        _action_key(action)
         for rule in applicable
         if rule.effect is PlaybookRuleEffect.REQUIRE and rule.strength is PlaybookRuleStrength.HARD
         for action in rule.action_names
@@ -153,7 +154,10 @@ def _evaluate(
     applications: list[PlaybookRuleApplication] = []
     applied_ids: list[str] = []
     for rule in applicable:
-        targets_action = not rule.action_names or action_name in rule.action_names
+        action_key = _action_key(action_name)
+        targets_action = not rule.action_names or action_key in {
+            _action_key(action) for action in rule.action_names
+        }
         targets_role = not rule.role_ids or role in rule.role_ids
         matched = targets_action and targets_role
         rule_blocked = False
@@ -170,7 +174,7 @@ def _evaluate(
                 rule_blocked = (
                     rule.strength is PlaybookRuleStrength.HARD
                     and bool(required)
-                    and action_name not in required
+                    and action_key not in required
                 )
                 rule_delta = 0.5 if matched and not rule_blocked else 0.0
         effective_block = rule_blocked and mode == "active"
@@ -212,6 +216,15 @@ def _evaluate(
         rule_ids=tuple(dict.fromkeys(applied_ids)),
         applications=tuple(applications),
     )
+
+
+def _action_key(action_name: str) -> str:
+    key = re.sub(r"[^A-Za-z0-9]", "", action_name).upper()
+    if key.startswith("BUILD"):
+        for suffix in ("SCREEN", "NEAR"):
+            if key.endswith(suffix):
+                return key[: -len(suffix)]
+    return key
 
 
 def _matches(condition: PlaybookCondition, values: Mapping[str, object]) -> bool:

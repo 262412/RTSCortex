@@ -12,6 +12,8 @@ from rtscortex.playbook.models import (
     DecisionCase,
     LessonStatus,
     PlaybookCondition,
+    PlaybookConditionOperator,
+    PlaybookContext,
     PlaybookHit,
     PlaybookLesson,
     PlaybookQuery,
@@ -169,10 +171,14 @@ class PlaybookStore:
     def rules_for_guard(
         self,
         *,
+        context: PlaybookContext | None = None,
         max_hard: int = 8,
         max_soft: int = 8,
     ) -> tuple[PlaybookRule, ...]:
-        active = [rule for rule in self.rules() if rule.status is PlaybookRuleStatus.ACTIVE]
+        rules = self.rules()
+        if context is not None:
+            rules = [rule for rule in rules if _rule_matches_context(rule, context)]
+        active = [rule for rule in rules if rule.status is PlaybookRuleStatus.ACTIVE]
         now = datetime.now(UTC)
         active = [rule for rule in active if _rule_is_unexpired(rule, now)]
         hard = sorted(
@@ -186,7 +192,7 @@ class PlaybookStore:
         advisory = sorted(
             (
                 rule
-                for rule in self.rules()
+                for rule in rules
                 if rule.status is PlaybookRuleStatus.LEGACY
                 and rule.strength is PlaybookRuleStrength.ADVISORY
             ),
@@ -297,6 +303,31 @@ class PlaybookStore:
 
     def close(self) -> None:
         self._connection.close()
+
+
+def _rule_matches_context(rule: PlaybookRule, context: PlaybookContext) -> bool:
+    values: dict[str, object] = {
+        "agent_race": context.agent_race,
+        "opponent_race": context.opponent_race,
+        "phase": context.phase.value,
+        "map_name": context.map_name,
+        "alert": context.tags,
+    }
+    for condition in rule.conditions:
+        if condition.field not in values:
+            continue
+        actual = values[condition.field]
+        expected = condition.value
+        if condition.operator is PlaybookConditionOperator.EQ and actual != expected:
+            return False
+        if condition.operator is PlaybookConditionOperator.IN:
+            options = expected if isinstance(expected, tuple) else (expected,)
+            if actual not in options:
+                return False
+        if condition.operator is PlaybookConditionOperator.CONTAINS:
+            if not isinstance(actual, tuple) or expected not in actual:
+                return False
+    return True
 
 
 def _match_score(query: PlaybookQuery, lesson: PlaybookLesson) -> tuple[float, list[str]]:

@@ -130,6 +130,7 @@ class RTSCortexMeleeConfig(ProtossAgentConfig):  # type: ignore[misc]
         self.ENABLE_AUTO_WORKER_MANAGE = True
         self.ENABLE_AUTO_WORKER_TRAINING = True
         _ensure_assimilator_camera_settlement(self.AGENTS)
+        _ensure_attack_target_reacquisition(self.AGENTS)
         _ensure_no_operation(self.AGENTS)
 
 
@@ -161,6 +162,27 @@ def _ensure_assimilator_camera_settlement(agents: dict[str, dict[str, Any]]) -> 
         deepcopy(nexus_functions[1]),
         assimilator_functions[-1],
     ]
+
+
+def _ensure_attack_target_reacquisition(agents: dict[str, dict[str, Any]]) -> None:
+    """Move to the exact enemy tag after selecting the combat control group."""
+
+    nexus_functions = list(_find_action(agents, "Build_Nexus_Near").get("func", ()))
+    if len(nexus_functions) < 2 or [int(item[0]) for item in nexus_functions[:2]] != [573, 0]:
+        raise RuntimeError("pinned Protoss camera-settlement contract changed")
+    for agent in agents.values():
+        for actions in agent["action"].values():
+            for action in actions:
+                if action["name"] != "Attack_Unit":
+                    continue
+                functions = list(action.get("func", ()))
+                if not functions or int(functions[-1][0]) != 12:
+                    raise RuntimeError("pinned Protoss Attack_Unit contract changed")
+                action["func"] = [
+                    deepcopy(nexus_functions[0]),
+                    deepcopy(nexus_functions[1]),
+                    functions[-1],
+                ]
 
 
 def _find_action(

@@ -946,6 +946,31 @@ def _render_cortex_event(event: StoredEvent) -> list[str]:
             f"- Event {event_id} · Macro step {_code(action)} is {_code(status)} "
             f"(`{completed}/{repeat}`){suffix}."
         ]
+    if event.event_type in {
+        "macro_frontier_deferred",
+        "macro_frontier_preempted",
+        "macro_structure_deferred",
+    }:
+        action = _payload_text(
+            payload,
+            "blocked_runtime_action",
+            "runtime_action",
+            "blocked_action",
+            "semantic_action",
+        ) or "unknown"
+        reason = _payload_text(payload, "reason", "blocked_reason") or "unspecified"
+        fallback = _payload_text(payload, "fallback_runtime_action", "fallback_action")
+        target = _payload_text(payload, "target_structure")
+        details = []
+        if fallback:
+            details.append(f"fallback {_code(fallback)}")
+        if target:
+            details.append(f"target {_code(target)}")
+        suffix = f"; {'; '.join(details)}" if details else ""
+        return [
+            f"- Event {event_id} · Macro action {_code(action)} deferred: "
+            f"{_inline(reason)}{suffix}."
+        ]
     if event.event_type == "intent_emitted":
         intent = _nested_payload(payload, "intent")
         intent_id = _payload_text(payload, "intent_id") or _payload_text(intent, "intent_id")

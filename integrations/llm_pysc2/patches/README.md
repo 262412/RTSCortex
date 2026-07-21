@@ -268,7 +268,10 @@ when the gap since the latest Runtime decision exceeds the configured game-loop 
 `0016-accept-visible-team-unit.patch` stops camera centering from interrupting selection when a
 team unit is already safely visible. Units on the outer two-percent viewport margin are still
 recentered because PySC2 cannot reliably select a clipped actor at the feature-screen edge.
-RTSCortex enables this behavior because its Runtime observation is global; selection remains
+The Builder is recentered whenever it is off-center so observation-time build candidates and
+dispatch-time placement share one stable viewport. Once it is centered, the current viewport wins
+over a stale cached team camera position instead of moving the camera away again. RTSCortex enables
+the broader visible-unit behavior because its Runtime observation is global; selection remains
 required later for actual feature actions.
 
 `0017-return-camera-settlement-noop.patch` yields the current SC2 step after a production

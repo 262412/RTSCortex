@@ -351,6 +351,56 @@ def test_playbook_hard_rule_requires_active_mode_to_block() -> None:
     assert active.blocked is True
 
 
+def test_playbook_matches_hima_semantic_build_action_to_runtime_candidate() -> None:
+    rule = PlaybookRule(
+        rule_id="rule:placement",
+        canonical_key="placement",
+        category=PlaybookRuleCategory.EXECUTION_GUARD,
+        conditions=(PlaybookCondition(field="agent_race", value="protoss"),),
+        effect=PlaybookRuleEffect.AVOID,
+        strength=PlaybookRuleStrength.SOFT,
+        status=PlaybookRuleStatus.ACTIVE,
+        action_names=("BUILD PYLON",),
+        confidence=0.9,
+    )
+    candidate = ExecutableCandidate(
+        candidate_id="candidate:" + "1" * 64,
+        observation_fingerprint="0" * 64,
+        intent_id="intent:pylon",
+        action_name="Build_Pylon_Screen",
+        actor="Builder/Builder-Probe-1",
+        arguments=[[64, 64]],
+        features=CandidateFeatures(
+            action_rank=0,
+            actor_rank=0,
+            argument_rank=0,
+            compile_ordinal=0,
+        ),
+    )
+    situation = DeterministicSituationAnalyzer().assess(_observation(), ())
+
+    result = PlaybookCandidateGuard().evaluate(
+        candidate,
+        role="economy",
+        context=PlaybookContext(
+            agent_race="protoss",
+            opponent_race="zerg",
+            phase=GamePhase.EARLY,
+            map_name="Simple64",
+        ),
+        situation=situation,
+        rules=(rule,),
+        run_id="run",
+        episode_id="episode",
+        step_id=1,
+        game_loop=32,
+        mode="active",
+    )
+
+    assert result.rule_ids == (rule.rule_id,)
+    assert result.score_delta == -0.5
+
+
 def test_playbook_promotion_rejects_insufficient_evidence() -> None:
     rule = PlaybookRule(
         rule_id="rule:test",
@@ -366,6 +416,24 @@ def test_playbook_promotion_rejects_insufficient_evidence() -> None:
     )
 
     with pytest.raises(ValueError, match="two runs"):
+        PlaybookRuleLifecycle().promote_to_soft(rule)
+
+
+def test_playbook_promotion_rejects_untyped_execution_penalty() -> None:
+    rule = PlaybookRule(
+        rule_id="rule:test",
+        canonical_key="test",
+        category=PlaybookRuleCategory.EXECUTION_GUARD,
+        conditions=(PlaybookCondition(field="agent_race", value="protoss"),),
+        effect=PlaybookRuleEffect.AVOID,
+        strength=PlaybookRuleStrength.ADVISORY,
+        status=PlaybookRuleStatus.CANDIDATE,
+        action_names=("Attack_Unit",),
+        confidence=0.9,
+        source_run_ids=("run-1", "run-2"),
+    )
+
+    with pytest.raises(ValueError, match="typed failure precondition"):
         PlaybookRuleLifecycle().promote_to_soft(rule)
 
 

@@ -30,6 +30,9 @@ const EVENT_TITLES: Record<string, string> = {
   tactical_policy_shadow: "影子战术策略已完成评估",
   macro_plan_accepted: "专用宏观计划已采用",
   macro_plan_rejected: "专用宏观计划被拒绝",
+  macro_frontier_deferred: "宏观动作正在等待条件",
+  macro_frontier_preempted: "阻塞动作已切换到后备方案",
+  macro_structure_deferred: "同类建筑在建，动作已延后",
   macro_step_updated: "宏观计划步骤已更新",
   intent_emitted: "决策意图已生成",
   role_intent_emitted: "职责 Agent 已提交意图",
@@ -228,6 +231,7 @@ const FIELD_LABELS: Record<string, string> = {
   elapsed_game_loops: "验证耗时",
   target_type: "目标类型",
   new_structure_tag: "新建筑 Tag",
+  actor_tag: "执行单位 Tag",
   builder_tag: "建造工 Tag",
   target_tag: "目标 Tag",
   target_position: "目标位置",
@@ -253,6 +257,9 @@ const FIELD_LABELS: Record<string, string> = {
   resource_delta: "资源变化",
   mineral_delta: "晶体矿变化",
   builder_displacement: "建造工位移",
+  baseline_actor_position: "执行单位初始位置",
+  observed_actor_position: "执行单位观测位置",
+  actor_displacement: "执行单位位移",
   move_order_seen: "观察到移动订单",
   active_order_extension: "因活动订单延长验证",
   alerts: "告警",
@@ -476,6 +483,7 @@ const VALUE_LABELS: Record<string, string> = {
   worker_order_replaced: "工人订单被替换",
   target_not_created: "目标建筑未出现",
   builder_not_observable: "无法继续观察建造工",
+  actor_not_observable: "无法继续观察执行单位",
   producer_not_observable: "无法继续观察生产建筑",
   no_production_order_observed: "未观察到生产订单",
   production_order_replaced: "生产订单被替换",
@@ -796,6 +804,18 @@ export function eventSummary(event: StoredEvent): string {
     const reason = readString(step, "reason");
     return `${actionLabel(runtimeAction ?? semanticAction, false)} · ${semanticScalar(stepStatus)} · ${completed}/${repeat}${reason ? ` · ${semanticScalar(reason)}` : ""}`;
   }
+  if (["macro_frontier_deferred", "macro_frontier_preempted", "macro_structure_deferred"].includes(event.event_type)) {
+    const action = readString(payload, "blocked_runtime_action", "runtime_action", "blocked_action", "semantic_action") ?? "unknown";
+    const reason = readString(payload, "reason", "blocked_reason") ?? "unknown";
+    const fallback = readString(payload, "fallback_runtime_action", "fallback_action");
+    const target = readString(payload, "target_structure");
+    return [
+      actionLabel(action, false),
+      semanticScalar(reason),
+      fallback ? `后备：${actionLabel(fallback, false)}` : undefined,
+      target ? `等待 ${semanticScalar(target)}` : undefined,
+    ].filter(Boolean).join(" · ");
+  }
   if (event.event_type === "intent_emitted") {
     const intent = asObject(payload.intent) ?? payload;
     const role = readString(payload, "role", "source_role", "intent_kind", "source") ?? readString(intent, "role", "source_role", "intent_kind", "source");
@@ -996,7 +1016,7 @@ export function eventSemanticPayload(event: StoredEvent): JsonValue {
       ["assessment", payload.assessment],
     ]);
   }
-  if (["race_profile_activated", "tactical_policy_shadow", "playbook_rule_updated", "macro_plan_accepted", "macro_plan_rejected", "macro_step_updated", "intent_emitted", "role_intent_emitted", "intent_arbitrated", "intent_arbiter_shadow_diff", "candidate_set_built", "executor_selection", "command_lineage", "specialist_failed", "specialist_ready", "specialist_recovered", "playbook_rule_applied"].includes(event.event_type)) {
+  if (["race_profile_activated", "tactical_policy_shadow", "playbook_rule_updated", "macro_plan_accepted", "macro_plan_rejected", "macro_frontier_deferred", "macro_frontier_preempted", "macro_structure_deferred", "macro_step_updated", "intent_emitted", "role_intent_emitted", "intent_arbitrated", "intent_arbiter_shadow_diff", "candidate_set_built", "executor_selection", "command_lineage", "specialist_failed", "specialist_ready", "specialist_recovered", "playbook_rule_applied"].includes(event.event_type)) {
     return compactObject([
       ["race", payload.race],
       ["macro_contract_ready", payload.macro_contract_ready],
@@ -1015,6 +1035,8 @@ export function eventSemanticPayload(event: StoredEvent): JsonValue {
       ["reason", payload.reason ?? payload.failure_code ?? payload.failure_reason ?? payload.message],
       ["latency_ms", payload.latency_ms],
       ["fallback_reason", payload.fallback_reason],
+      ["fallback_action", payload.fallback_runtime_action ?? payload.fallback_action],
+      ["target_structure", payload.target_structure],
       ["plan", payload.plan],
       ["steps", payload.step],
       ["intent", payload.intent],

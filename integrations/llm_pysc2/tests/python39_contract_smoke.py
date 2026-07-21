@@ -20,6 +20,7 @@ from pysc2.env import run_loop
 from pysc2.lib import actions, features
 from rtscortex_llm_pysc2.addon import ADDON_SPECS
 from rtscortex_llm_pysc2.extractor import BUILD_RAW_FUNCTION_IDS
+from rtscortex_llm_pysc2.melee import RTSCortexMeleeConfig
 from rtscortex_llm_pysc2.observation import _map_argument_candidates
 from rtscortex_llm_pysc2.production import PRODUCTION_SPECS
 from rtscortex_llm_pysc2.terran_melee import RTSCortexTerranMeleeConfig
@@ -129,7 +130,7 @@ def _assert_single_unit_selection_uses_exact_point() -> None:
 
 def _assert_visible_team_unit_bypasses_camera_recentering() -> None:
     assert "_rtscortex_accept_visible_team_unit" in inspect.getsource(get_camera_func_smart)
-    unit = SimpleNamespace(tag=0xA, x=90, y=65)
+    unit = SimpleNamespace(tag=0xA, unit_type=84, x=90, y=65)
     observation = SimpleNamespace(
         observation=SimpleNamespace(raw_units=[unit], feature_units=[unit])
     )
@@ -137,11 +138,57 @@ def _assert_visible_team_unit_bypasses_camera_recentering() -> None:
         log_id=0,
         size_screen=128,
         _rtscortex_accept_visible_team_unit=True,
+        AGENT_NAMES=["CombatGroup0"],
+        agent_id=0,
     )
 
     function_id, _ = get_camera_func_smart(main_agent, observation, unit.tag)
 
     assert function_id == 0
+
+    builder = SimpleNamespace(
+        log_id=0,
+        size_screen=128,
+        _rtscortex_accept_visible_team_unit=True,
+        AGENT_NAMES=["Builder"],
+        agent_id=0,
+        world_x_offset=0,
+        world_y_offset=0,
+        world_range=128,
+        last_two_camera_pos=[],
+    )
+    builder_function_id, _ = get_camera_func_smart(builder, observation, unit.tag)
+
+    assert builder_function_id == 573
+
+    centered_builder_unit = SimpleNamespace(
+        tag=0xA,
+        unit_type=84,
+        x=64,
+        y=63,
+        is_selected=True,
+        alliance=1,
+    )
+    centered_builder_observation = SimpleNamespace(
+        observation=SimpleNamespace(
+            raw_units=[centered_builder_unit],
+            feature_units=[centered_builder_unit],
+        )
+    )
+    stale_team = {
+        "name": "Builder-Probe-1",
+        "obs": [centered_builder_observation],
+        "pos": [[60.5, 23.0]],
+        "unit_tags": [centered_builder_unit.tag],
+    }
+    centered_builder_function_id, _ = get_camera_func_smart(
+        builder,
+        centered_builder_observation,
+        centered_builder_unit.tag,
+        team=stale_team,
+    )
+
+    assert centered_builder_function_id == 0
 
     edge_unit = SimpleNamespace(tag=0xB, unit_type=126, x=0, y=65)
     edge_observation = SimpleNamespace(
@@ -169,6 +216,27 @@ def _assert_zerg_queen_uses_exact_single_actor_selection() -> None:
     assert queen_team["name"] == "Queen-1"
     assert queen_team["select_type"] == "select"
     assert roach_team["select_type"] == "select_all_type"
+
+
+def _assert_all_races_reacquire_attack_targets() -> None:
+    for config_type in (
+        RTSCortexMeleeConfig,
+        RTSCortexTerranMeleeConfig,
+        RTSCortexZergMeleeConfig,
+    ):
+        config = config_type()
+        attacks = [
+            action
+            for agent in config.AGENTS.values()
+            for actions in agent["action"].values()
+            for action in actions
+            if action["name"] == "Attack_Unit"
+        ]
+        assert attacks
+        assert all(
+            [function_id for function_id, _, _ in action["func"]] == [573, 0, 12]
+            for action in attacks
+        )
 
 
 def _assert_build_order_ids_use_raw_function_domain() -> None:
@@ -199,6 +267,7 @@ def _assert_build_order_ids_use_raw_function_domain() -> None:
         "SpineCrawler": 1166,
         "SporeCrawler": 1167,
         "CreepTumorQueen": 1694,
+        "CreepTumor": 1733,
     }
     assert BUILD_RAW_FUNCTION_IDS == {
         structure: int(actions.RAW_ABILITY_ID_TO_FUNC_ID[ability_id])
@@ -232,6 +301,7 @@ def _assert_direct_production_contract() -> None:
         "Train_Phoenix": (484, 55, "Stargate", "Phoenix", 150, 100, 2, ("Stargate",)),
         "Train_VoidRay": (500, 57, "Stargate", "VoidRay", 250, 150, 4, ("Stargate",)),
         "Train_Oracle": (482, 58, "Stargate", "Oracle", 150, 150, 3, ("Stargate",)),
+        "Train_SCV": (490, 520, "CommandCenter", "SCV", 50, 0, 1, ()),
         "Train_Marine": (477, 511, "Barracks", "Marine", 50, 0, 1, ("Barracks",)),
         "Train_Marauder": (
             476,
@@ -898,6 +968,7 @@ def main() -> None:
     _assert_single_unit_selection_uses_exact_point()
     _assert_visible_team_unit_bypasses_camera_recentering()
     _assert_zerg_queen_uses_exact_single_actor_selection()
+    _assert_all_races_reacquire_attack_targets()
     _assert_build_order_ids_use_raw_function_domain()
     _assert_direct_production_contract()
     _assert_terran_addon_contract()

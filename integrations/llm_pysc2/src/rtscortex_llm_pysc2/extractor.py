@@ -21,7 +21,7 @@ from rtscortex_llm_pysc2.production import (
     production_spec,
     production_spec_for_order,
 )
-from rtscortex_llm_pysc2.research import research_spec
+from rtscortex_llm_pysc2.research import research_spec, research_spec_for_order
 
 SUPPORTED_ARGUMENTS = frozenset({"minimap", "screen", "tag"})
 SCREEN_WORLD_GRID = 24.0
@@ -296,6 +296,7 @@ def semantic_argument_candidates(
     action_name: str,
     *,
     unit_names: Mapping[int, str],
+    builder_tags: Optional[Collection[int]] = None,
 ) -> Optional[list[list[Any]]]:
     """Return the single semantic candidate domain used at observe and dispatch time."""
 
@@ -304,6 +305,7 @@ def semantic_argument_candidates(
         action_name,
         unit_names=unit_names,
         include_home_minimap=True,
+        builder_tags=builder_tags,
     )
 
 
@@ -370,6 +372,20 @@ def production_source_tag(
     }
     if not set(prerequisites).issubset(completed_structures):
         return None
+    research = research_spec(action_name)
+    if research is not None:
+        if research.upgrade_id in {
+            int(value) for value in _value(observation, "upgrades", ())
+        }:
+            return None
+        if any(
+            (active_spec := research_spec_for_order(order_id)) is not None
+            and active_spec.action_name == research.action_name
+            for unit in raw_units
+            if int(_value(unit, "alliance", 0)) == 1
+            for order_id, _ in _unit_order_entries(unit)
+        ):
+            return None
     source_type = next(iter(source_types)) if source_types else None
     excluded = {int(tag) for tag in excluded_source_tags}
     addon_by_tag = {
@@ -408,11 +424,6 @@ def production_source_tag(
     # silently refer to a different building than translator primitive 573.
     selected = candidates[0]
     if requires_idle and int(_value(selected, "order_length", 0)) != 0:
-        return None
-    research = research_spec(action_name)
-    if research is not None and research.upgrade_id in {
-        int(value) for value in _value(observation, "upgrades", ())
-    }:
         return None
     return int(_value(selected, "tag", 0))
 
@@ -712,6 +723,12 @@ def _extract_team_actions(
                 unit_names=unit_names,
                 owned_unit_types=owned_unit_types,
                 action_source_types=action_source_types,
+                actor_tags=(
+                    (int(agent.team_unit_tag_list[index]),)
+                    if index < len(getattr(agent, "team_unit_tag_list", ()))
+                    and int(agent.team_unit_tag_list[index]) > 0
+                    else tuple(int(tag) for tag in team.get("unit_tags", ()) if int(tag) > 0)
+                ),
             )
             teams.append(
                 {
@@ -791,6 +808,7 @@ def _available_team_actions(
     unit_names: Mapping[int, str],
     owned_unit_types: set[int],
     action_source_types: Mapping[int, int],
+    actor_tags: Collection[int],
 ) -> list[dict[str, Any]]:
     action_space = agent.config.AGENTS[agent.name]["action"]
     unit_types = list(team.get("unit_type", ())) or ["EmptyGroup"]
@@ -868,6 +886,11 @@ def _available_team_actions(
             action_name,
             unit_names=unit_names,
             include_home_minimap=agent.name.startswith("CombatGroup"),
+            builder_tags=(
+                actor_tags
+                if agent.name == "Builder" and build_spec is not None
+                else None
+            ),
         )
         if (
             agent.name == "Builder"
@@ -1009,6 +1032,7 @@ def _argument_candidates(
     *,
     unit_names: Mapping[int, str],
     include_home_minimap: bool,
+    builder_tags: Optional[Collection[int]] = None,
 ) -> Optional[list[list[Any]]]:
     if action_name == INJECT_ACTION:
         return [
@@ -1076,14 +1100,16 @@ def _argument_candidates(
     if not _build_prerequisites_satisfied(observation, spec, unit_names):
         return []
     if spec.placement_kind == "screen":
-        return [
+        candidates = [
             [candidate]
             for candidate in build_screen_candidates(
                 observation,
                 action_name,
                 unit_names=unit_names,
+                builder_tags=builder_tags,
             )
         ]
+        return candidates
     if spec.placement_kind == "geyser":
         return [
             [tag]
@@ -2288,40 +2314,49 @@ def _builder_reachable_cells(
             else _unit_name(unit, unit_names) in {"Probe", "SCV", "Drone"}
         )
     }
+    if allowed_tags is not None and not starts:
+        selected_workers = [
+            unit
+            for unit in feature_units
+            if int(_value(unit, "alliance", 0)) == 1
+            and bool(_value(unit, "is_on_screen", True))
+            and bool(_value(unit, "is_selected", False))
+            and _unit_name(unit, unit_names) in {"Probe", "SCV", "Drone"}
+        ]
+        if len(selected_workers) == 1:
+            starts = {
+                (
+                    int(_value(selected_workers[0], "x", 0)),
+                    int(_value(selected_workers[0], "y", 0)),
+                )
+            }
     if not starts:
         return frozenset() if builder_tags is not None else None
 
     ratio = max(1, int(screen_size / SCREEN_WORLD_GRID))
-    blocked: set[tuple[int, int]] = set()
-    start_tags = allowed_tags or set()
-    for unit in feature_units:
-        if not bool(_value(unit, "is_on_screen", True)):
+    frontier: list[tuple[int, int]] = []
+    for start_x, start_y in sorted(starts):
+        if (
+            0 <= start_x < screen_size
+            and 0 <= start_y < screen_size
+            and pathable[start_y][start_x] == 1
+        ):
+            frontier.append((start_x, start_y))
             continue
-        tag = int(_value(unit, "tag", 0))
-        if tag in start_tags:
-            continue
-        alliance = int(_value(unit, "alliance", 0))
-        radius = max(0.0, float(_value(unit, "radius", 0.0)))
-        if alliance != 3 and radius < 1.0:
-            continue
-        unit_x = int(_value(unit, "x", 0))
-        unit_y = int(_value(unit, "y", 0))
-        cell_radius = max(1, math.ceil(radius * ratio))
-        for y in range(max(0, unit_y - cell_radius), min(screen_size, unit_y + cell_radius + 1)):
-            for x in range(
-                max(0, unit_x - cell_radius),
-                min(screen_size, unit_x + cell_radius + 1),
-            ):
-                if (x - unit_x) ** 2 + (y - unit_y) ** 2 <= cell_radius**2:
-                    blocked.add((x, y))
-
-    frontier = [
-        point
-        for point in sorted(starts)
-        if 0 <= point[0] < screen_size
-        and 0 <= point[1] < screen_size
-        and pathable[point[1]][point[0]] == 1
-    ]
+        for radius in range(1, max(2, ratio) + 1):
+            nearby = sorted(
+                (start_x + dx, start_y + dy)
+                for dx in range(-radius, radius + 1)
+                for dy in range(-radius, radius + 1)
+                if max(abs(dx), abs(dy)) == radius
+                and 0 <= start_x + dx < screen_size
+                and 0 <= start_y + dy < screen_size
+                and pathable[start_y + dy][start_x + dx] == 1
+            )
+            if nearby:
+                frontier.extend(nearby)
+                break
+    frontier = sorted(set(frontier))
     reachable = set(frontier)
     index = 0
     while index < len(frontier):
@@ -2340,7 +2375,6 @@ def _builder_reachable_cells(
             neighbor = (x + dx, y + dy)
             if (
                 neighbor in reachable
-                or neighbor in blocked
                 or not 0 <= neighbor[0] < screen_size
                 or not 0 <= neighbor[1] < screen_size
                 or pathable[neighbor[1]][neighbor[0]] != 1

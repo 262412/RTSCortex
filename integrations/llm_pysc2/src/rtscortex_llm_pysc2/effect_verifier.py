@@ -71,13 +71,13 @@ class _PendingMove:
     command: RoutedCommand
     resolved_arguments: tuple[Any, ...]
     target_position: tuple[float, float]
-    builder_tag: Optional[int] = None
+    actor_tag: Optional[int] = None
     dispatched_game_loop: Optional[int] = None
     accepted_game_loop: Optional[int] = None
     latest_game_loop: Optional[int] = None
-    baseline_builder_position: Optional[tuple[float, float]] = None
-    latest_builder_position: Optional[tuple[float, float]] = None
-    latest_builder_orders: tuple[int, ...] = ()
+    baseline_actor_position: Optional[tuple[float, float]] = None
+    latest_actor_position: Optional[tuple[float, float]] = None
+    latest_actor_orders: tuple[int, ...] = ()
     move_order_seen: bool = False
 
 
@@ -233,13 +233,13 @@ class ActionEffectVerifier:
             return
         pending_move = self._pending_moves.get(command_id)
         if pending_move is not None:
-            pending_move.builder_tag = None if builder_tag is None else int(builder_tag)
+            pending_move.actor_tag = None if builder_tag is None else int(builder_tag)
             pending_move.dispatched_game_loop = _game_loop(observation)
             pending_move.latest_game_loop = pending_move.dispatched_game_loop
-            builder = _unit_by_tag(observation, pending_move.builder_tag)
-            pending_move.baseline_builder_position = _unit_position(builder)
-            pending_move.latest_builder_position = pending_move.baseline_builder_position
-            pending_move.latest_builder_orders = () if builder is None else _unit_orders(builder)
+            actor = _unit_by_tag(observation, pending_move.actor_tag)
+            pending_move.baseline_actor_position = _unit_position(actor)
+            pending_move.latest_actor_position = pending_move.baseline_actor_position
+            pending_move.latest_actor_orders = () if actor is None else _unit_orders(actor)
             return
 
         pending = self._get(command_id)
@@ -379,14 +379,14 @@ class ActionEffectVerifier:
             if pending.accepted_game_loop is None:
                 continue
             pending.latest_game_loop = game_loop
-            builder = _unit_by_tag(observation, pending.builder_tag)
-            pending.latest_builder_position = _unit_position(builder)
-            pending.latest_builder_orders = () if builder is None else _unit_orders(builder)
-            if MOVE_RAW_FUNCTION_ID in pending.latest_builder_orders:
+            actor = _unit_by_tag(observation, pending.actor_tag)
+            pending.latest_actor_position = _unit_position(actor)
+            pending.latest_actor_orders = () if actor is None else _unit_orders(actor)
+            if MOVE_RAW_FUNCTION_ID in pending.latest_actor_orders:
                 pending.move_order_seen = True
             displacement = _optional_position_distance(
-                pending.baseline_builder_position,
-                pending.latest_builder_position,
+                pending.baseline_actor_position,
+                pending.latest_actor_position,
             )
             if pending.move_order_seen or (
                 displacement is not None
@@ -405,20 +405,18 @@ class ActionEffectVerifier:
             elapsed = game_loop - pending.accepted_game_loop
             if elapsed < self.timeout_game_loops:
                 continue
-            builder_detail = (
-                "builder is not observable"
-                if builder is None
-                else f"builder position remained {pending.latest_builder_position}"
+            actor_detail = (
+                "actor is not observable"
+                if actor is None
+                else f"actor position remained {pending.latest_actor_position}"
             )
             verdicts.append(
                 EffectVerdict(
                     command_id,
                     False,
-                    f"Move_Minimap did not start after {elapsed} game loops ({builder_detail})",
+                    f"Move_Minimap did not start after {elapsed} game loops ({actor_detail})",
                     status="failed",
-                    failure_code=(
-                        "builder_not_observable" if builder is None else "effect_timeout"
-                    ),
+                    failure_code="actor_not_observable" if actor is None else "effect_timeout",
                     evidence=self._move_effect_evidence(pending, confirmed=False),
                 )
             )
@@ -487,13 +485,14 @@ class ActionEffectVerifier:
             "target_type": "Move_Minimap",
             "target_position": pending.target_position,
             "target_tag": None,
-            "builder_tag": None if pending.builder_tag is None else hex(pending.builder_tag),
+            "actor_tag": None if pending.actor_tag is None else hex(pending.actor_tag),
+            "builder_tag": None if pending.actor_tag is None else hex(pending.actor_tag),
             "baseline_structure_tags": [],
             "observed_structure_tag": None,
             "dispatched_loop": pending.dispatched_game_loop,
             "accepted_loop": pending.accepted_game_loop,
             "confirmed_loop": current_loop if confirmed else None,
-            "worker_orders": [str(order) for order in pending.latest_builder_orders],
+            "worker_orders": [str(order) for order in pending.latest_actor_orders],
             "resource_delta": {},
             "order_seen": pending.move_order_seen,
             "order_last_seen_game_loop": None,
@@ -503,11 +502,17 @@ class ActionEffectVerifier:
             "base_timeout_game_loops": self.timeout_game_loops,
             "effective_timeout_game_loops": self.timeout_game_loops,
             "active_order_extension": False,
-            "baseline_builder_position": pending.baseline_builder_position,
-            "observed_builder_position": pending.latest_builder_position,
+            "baseline_actor_position": pending.baseline_actor_position,
+            "observed_actor_position": pending.latest_actor_position,
+            "actor_displacement": _optional_position_distance(
+                pending.baseline_actor_position,
+                pending.latest_actor_position,
+            ),
+            "baseline_builder_position": pending.baseline_actor_position,
+            "observed_builder_position": pending.latest_actor_position,
             "builder_displacement": _optional_position_distance(
-                pending.baseline_builder_position,
-                pending.latest_builder_position,
+                pending.baseline_actor_position,
+                pending.latest_actor_position,
             ),
             "move_order_seen": pending.move_order_seen,
         }

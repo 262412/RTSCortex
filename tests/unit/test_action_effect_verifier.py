@@ -656,6 +656,36 @@ def test_move_minimap_times_out_after_one_base_window_without_unit_effect() -> N
     assert verdict.evidence["effective_timeout_game_loops"] == 10
 
 
+def test_move_minimap_uses_actor_semantics_when_the_unit_disappears() -> None:
+    verifier = ActionEffectVerifier(timeout_game_loops=10)
+    command = _move_command()
+    verifier.track(command)
+    verifier.prepare(
+        command.command_id,
+        _move_observation(game_loop=100, center=(8, 8), builder_position=(30, 30)),
+        0xABC,
+    )
+    verifier.accept_primitive(command.command_id, game_loop=101)
+    missing_actor = _move_observation(
+        game_loop=111,
+        center=(48, 48),
+        builder_position=(30, 30),
+    )
+    missing_actor["raw_units"] = [
+        unit for unit in missing_actor["raw_units"] if unit["tag"] != 0xABC
+    ]
+
+    verdict = verifier.observe(missing_actor)[0]
+
+    assert verdict.success is False
+    assert verdict.failure_code == "actor_not_observable"
+    assert "actor is not observable" in (verdict.failure_reason or "")
+    assert verdict.evidence is not None
+    assert verdict.evidence["actor_tag"] == "0xabc"
+    assert verdict.evidence["baseline_actor_position"] == (30.0, 30.0)
+    assert verdict.evidence["observed_actor_position"] is None
+
+
 def test_move_minimap_is_unconfirmed_when_episode_ends_in_transit() -> None:
     verifier = ActionEffectVerifier(timeout_game_loops=10)
     command = _move_command()

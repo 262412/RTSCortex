@@ -83,7 +83,11 @@ def melee_config_type(monkeypatch: pytest.MonkeyPatch) -> Iterator[tuple[type[An
                     "action": {
                         "Zealot": [
                             {"name": "No_Operation", "arg": [], "func": [(0, None, ())]},
-                            {"name": "Attack_Unit", "arg": ["tag"], "func": []},
+                            {
+                                "name": "Attack_Unit",
+                                "arg": ["tag"],
+                                "func": [(12, "attack-screen", ("queued", "screen_tag"))],
+                            },
                         ]
                     },
                 },
@@ -92,7 +96,11 @@ def melee_config_type(monkeypatch: pytest.MonkeyPatch) -> Iterator[tuple[type[An
                     "action": {
                         "Stalker": [
                             {"name": "No_Operation", "arg": [], "func": [(0, None, ())]},
-                            {"name": "Attack_Unit", "arg": ["tag"], "func": []},
+                            {
+                                "name": "Attack_Unit",
+                                "arg": ["tag"],
+                                "func": [(12, "attack-screen", ("queued", "screen_tag"))],
+                            },
                         ]
                     },
                 },
@@ -105,7 +113,11 @@ def melee_config_type(monkeypatch: pytest.MonkeyPatch) -> Iterator[tuple[type[An
                             {"name": "Hold_Position", "arg": [], "func": []},
                             {"name": "Move_Minimap", "arg": ["minimap"], "func": []},
                             {"name": "Move_Screen", "arg": ["screen"], "func": []},
-                            {"name": "Attack_Unit", "arg": ["tag"], "func": []},
+                            {
+                                "name": "Attack_Unit",
+                                "arg": ["tag"],
+                                "func": [(12, "attack-screen", ("queued", "screen_tag"))],
+                            },
                             {"name": "Ability_PrismaticAlignment", "arg": [], "func": []},
                         ]
                     },
@@ -119,7 +131,11 @@ def melee_config_type(monkeypatch: pytest.MonkeyPatch) -> Iterator[tuple[type[An
                             {"name": "Hold_Position", "arg": [], "func": []},
                             {"name": "Move_Minimap", "arg": ["minimap"], "func": []},
                             {"name": "Move_Screen", "arg": ["screen"], "func": []},
-                            {"name": "Attack_Unit", "arg": ["tag"], "func": []},
+                            {
+                                "name": "Attack_Unit",
+                                "arg": ["tag"],
+                                "func": [(12, "attack-screen", ("queued", "screen_tag"))],
+                            },
                             {
                                 "name": "Ability_AdeptPhaseShift_Screen",
                                 "arg": ["screen"],
@@ -236,6 +252,24 @@ def test_melee_config_moves_camera_before_assimilator_screen_translation(
     assert assimilator["func"][0][2] == ("world_tag",)
     assert assimilator["func"][2][2] == ("queued", "screen_tag")
     assert config.AGENTS_ALWAYS_DISABLE == []
+
+
+def test_melee_config_reacquires_enemy_before_attack_translation(
+    melee_config_type: tuple[type[Any], list[Any]],
+) -> None:
+    config_type, _ = melee_config_type
+    config = config_type()
+
+    for agent_name in ("CombatGroup0", "CombatGroup1", "CombatGroup3", "CombatGroup7"):
+        attack = next(
+            action
+            for actions in config.AGENTS[agent_name]["action"].values()
+            for action in actions
+            if action["name"] == "Attack_Unit"
+        )
+        assert [function_id for function_id, _, _ in attack["func"]] == [573, 0, 12]
+        assert attack["func"][0][2] == ("world_tag",)
+        assert attack["func"][-1][2] == ("queued", "screen_tag")
 
 
 def test_melee_config_gives_every_actor_action_set_a_noop_without_mutating_upstream(

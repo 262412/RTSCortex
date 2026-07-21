@@ -42,6 +42,11 @@ UNIT_ACTIONS = [
     _action("Move_Screen", ["screen"], F.Move_screen, "queued", "screen"),
     _action("Attack_Unit", ["tag"], F.Attack_screen, "queued", "screen_tag"),
 ]
+UNIT_ACTIONS[-1]["func"] = [
+    (573, F.llm_pysc2_move_camera, ("world_tag",)),
+    (0, F.no_op, ()),
+    (int(F.Attack_screen.id), F.Attack_screen, ("queued", "screen_tag")),
+]
 BUILD_ACTIONS = [
     _action("Build_Hatchery_Near", ["tag"], F.llm_pysc2_move_camera, "world_tag"),
     _action("Build_Extractor_Near", ["tag"], F.llm_pysc2_move_camera, "world_tag"),
