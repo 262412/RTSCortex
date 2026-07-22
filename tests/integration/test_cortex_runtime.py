@@ -9,6 +9,7 @@ from rtscortex.config import (
     AgentSettings,
     CortexHIMAEnsembleMemberSettings,
     CortexMacroSettings,
+    CortexPlaybookSettings,
     CortexSettings,
     CortexTacticalSettings,
     ExperimentConfig,
@@ -34,6 +35,7 @@ from rtscortex.contracts import (
 from rtscortex.cortex import HIMAEnsemblePolicyClient, SituationAssessment, TacticalIntent
 from rtscortex.evaluation import compute_cortex_observability
 from rtscortex.memory import EventStore
+from rtscortex.playbook import CortexPlaybookReviewer, PlaybookStore
 from rtscortex.policy.hima import (
     HIMA_ADAPTER_VERSION,
     HIMA_PARSER_VERSION,
@@ -1337,6 +1339,83 @@ def test_episode_transition_requires_terminalizing_a_dispatched_command(
         await runtime.close()
 
     asyncio.run(exercise())
+
+
+def test_completed_episode_emits_strategic_consequence_and_review_summary(
+    tmp_path: Path,
+) -> None:
+    base = _config(tmp_path, macro=False)
+    config = base.model_copy(
+        update={
+            "cortex": base.cortex.model_copy(
+                update={
+                    "playbook": CortexPlaybookSettings(
+                        enabled=True,
+                        database_path=tmp_path / "playbook.sqlite3",
+                    )
+                }
+            )
+        }
+    )
+    playbook = PlaybookStore(tmp_path / "playbook.sqlite3")
+    runtime = CortexRuntimeEngine(
+        config=config,
+        store=_store(tmp_path),
+        provider=FakeProvider(),
+        macro_client=None,
+        playbook_store=playbook,
+        playbook_reviewer=CortexPlaybookReviewer(playbook),
+    )
+    for step_id, game_loop in ((10, 1_000), (20, 1_224)):
+        runtime.store.append_event(
+            run_id="cortex-run",
+            episode_id="episode-1",
+            step_id=step_id,
+            event_type="situation_assessed",
+            payload={
+                "game_loop": game_loop,
+                "phase": "combat",
+                "threat_level": "high",
+                "economy_status": "stable",
+                "army_readiness": "ready",
+                "own_force": {"estimated_resource_value": 800, "total_units": 8},
+                "visible_enemy_force": {
+                    "estimated_resource_value": 700,
+                    "total_units": 7,
+                },
+                "bases": {"own_base_count": 2, "own_production_capacity": 4},
+                "scouting": {"enemy_visible": True},
+            },
+        )
+
+    runtime.end_episode(
+        EpisodeResult(
+            run_id="cortex-run",
+            episode_id="episode-1",
+            scenario="Simple64",
+            seed=0,
+            outcome=EpisodeOutcome.DEFEAT,
+            steps=20,
+        )
+    )
+
+    consequences = runtime.store.events_of_type(
+        "cortex-run",
+        "episode-1",
+        "strategic_consequence_attributed",
+    )
+    reviews = runtime.store.events_of_type(
+        "cortex-run",
+        "episode-1",
+        "postgame_review_completed",
+    )
+    assert len(consequences) == 1
+    assert consequences[0].payload["consequence_type"] == "threat_unanswered"
+    assert reviews[0].payload["strategic_consequence_count"] == 1
+    assert reviews[0].payload["strategic_consequence_counts"] == {
+        "threat_unanswered": 1
+    }
+    asyncio.run(runtime.close())
 
 
 def test_required_timed_out_macro_specialist_fails_closed_on_next_episode(

@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Sequence
+from typing import cast
 
-from rtscortex.contracts import EpisodeOutcome, EpisodeResult, ExecutionReport
+from rtscortex.contracts import EpisodeResult, ExecutionReport
 from rtscortex.game_phase import GamePhase
 from rtscortex.memory import StoredEvent
+from rtscortex.playbook.attribution import StrategicConsequenceAttributor
 from rtscortex.playbook.lifecycle import PlaybookRuleLifecycle
 from rtscortex.playbook.models import (
     DecisionCase,
@@ -16,12 +18,14 @@ from rtscortex.playbook.models import (
     LessonStatus,
     PlaybookContext,
     PlaybookLesson,
+    PlaybookRoleId,
     PlaybookRule,
     PlaybookRuleCategory,
     PlaybookRuleEffect,
     PlaybookRuleKind,
     PlaybookRuleStatus,
     PlaybookRuleStrength,
+    StrategicConsequence,
 )
 from rtscortex.playbook.store import PlaybookStore
 
@@ -33,7 +37,9 @@ class CortexPlaybookReviewer:
         self.store = store
         self.promotion_support = promotion_support
         self._rule_lifecycle = PlaybookRuleLifecycle()
+        self._attributor = StrategicConsequenceAttributor()
         self.last_rule_updates: tuple[PlaybookRule, ...] = ()
+        self.last_consequences: tuple[StrategicConsequence, ...] = ()
         self.rebuild_lessons()
         self._repair_unscoped_execution_candidates()
         self._quarantine_unsafe_execution_penalties()
@@ -115,6 +121,12 @@ class CortexPlaybookReviewer:
         opponent_race: str,
     ) -> tuple[list[DecisionCase], list[PlaybookLesson]]:
         self.last_rule_updates = ()
+        self.last_consequences = self._attributor.attribute(
+            events,
+            result,
+            agent_race=agent_race,
+            opponent_race=opponent_race,
+        )
         rules_before = {rule.canonical_key: rule.model_dump_json() for rule in self.store.rules()}
         lineages = {
             str(event.payload.get("command_id")): event
@@ -125,6 +137,20 @@ class CortexPlaybookReviewer:
         phases = _phase_timeline(events)
         cases: list[DecisionCase] = []
         lessons: list[PlaybookLesson] = []
+        for consequence in self.last_consequences:
+            case = _consequence_case(
+                consequence,
+                result,
+                events=events,
+                agent_race=agent_race,
+                opponent_race=opponent_race,
+            )
+            if not self.store.add_case(case):
+                continue
+            cases.append(case)
+            lesson = self._consolidate(case, update_executable_rule=True)
+            if lesson is not None:
+                lessons.append(lesson)
         for event in events:
             if event.event_type != "macro_plan_rejected":
                 continue
@@ -153,7 +179,7 @@ class CortexPlaybookReviewer:
             semantic_action = str(
                 lineage_event.payload.get("semantic_action") or report.action_name or "unknown"
             )
-            quality, owner, confidence, consequence = _assess(report, result)
+            quality, owner, confidence, consequence_text = _assess(report)
             context = PlaybookContext(
                 agent_race=agent_race,
                 opponent_race=opponent_race,
@@ -174,7 +200,7 @@ class CortexPlaybookReviewer:
                 context=context,
                 quality=quality,
                 failure_owner=owner,
-                consequence=consequence,
+                consequence=consequence_text,
                 evidence={
                     "seed": result.seed,
                     "execution_status": report.status.value,
@@ -240,11 +266,26 @@ class CortexPlaybookReviewer:
             dict.fromkeys(f"{candidate.run_id}/{candidate.episode_id}" for candidate in matching)
         )
         support = len(source_episode_ids)
+        source_seeds = {
+            seed
+            for candidate in matching
+            if isinstance((seed := candidate.evidence.get("seed")), int)
+        }
+        independent_seed_gate = case.consequence_type is None or len(source_seeds) >= 2
         status = (
-            LessonStatus.PROMOTED if support >= self.promotion_support else LessonStatus.CANDIDATE
+            LessonStatus.PROMOTED
+            if support >= self.promotion_support and independent_seed_gate
+            else LessonStatus.CANDIDATE
         )
         confidence = min(0.95, 0.65 + support * 0.1)
-        rule_kind, statement, recommended_action, avoid_action = _rule_content(case)
+        (
+            rule_kind,
+            statement,
+            recommended_action,
+            avoid_action,
+            recommended_role,
+            avoid_role,
+        ) = _rule_content(case)
         lesson = PlaybookLesson(
             lesson_id=_stable_id("lesson", signature),
             signature=signature,
@@ -253,6 +294,9 @@ class CortexPlaybookReviewer:
             statement=statement,
             recommended_action=recommended_action,
             avoid_action=avoid_action,
+            recommended_role=recommended_role,
+            avoid_role=avoid_role,
+            consequence_type=case.consequence_type,
             status=status,
             confidence=confidence,
             support_count=support,
@@ -264,10 +308,11 @@ class CortexPlaybookReviewer:
         if update_executable_rule:
             rule = self.store.upsert_lesson_rule_candidate(lesson, case)
             if (
-                rule.status is PlaybookRuleStatus.CANDIDATE
+                bool(rule.action_names or rule.role_ids)
+                and rule.status is PlaybookRuleStatus.CANDIDATE
                 and rule.category is not PlaybookRuleCategory.EXECUTION_GUARD
-                and rule.action_names
                 and len(set(rule.source_run_ids)) >= 2
+                and len(set(rule.source_seeds)) >= 2
                 and rule.confidence >= 0.75
                 and rule.contradiction_count == 0
             ):
@@ -276,6 +321,20 @@ class CortexPlaybookReviewer:
 
 
 def _case_signature(case: DecisionCase) -> str | None:
+    if case.consequence_type is not None:
+        role = str(case.evidence.get("role") or "none")
+        effect = str(case.evidence.get("effect") or "unknown")
+        return "|".join(
+            (
+                case.context.agent_race,
+                case.context.opponent_race,
+                case.context.phase.value,
+                case.consequence_type.value,
+                role,
+                case.semantic_action,
+                effect,
+            )
+        )
     if case.quality is DecisionQuality.ADVANTAGE_GAINED:
         return "|".join(
             (
@@ -313,13 +372,31 @@ def _case_signature(case: DecisionCase) -> str | None:
 
 def _rule_content(
     case: DecisionCase,
-) -> tuple[PlaybookRuleKind, str, str | None, str | None]:
+) -> tuple[
+    PlaybookRuleKind,
+    str,
+    str | None,
+    str | None,
+    PlaybookRoleId | None,
+    PlaybookRoleId | None,
+]:
+    if case.consequence_type is not None:
+        effect = str(case.evidence.get("effect") or "prefer")
+        role = case.evidence.get("role")
+        typed_role = cast(PlaybookRoleId, role) if isinstance(role, str) else None
+        action = None if case.semantic_action.startswith("ROLE:") else case.semantic_action
+        statement = case.consequence[:360]
+        if effect == "prefer":
+            return PlaybookRuleKind.STRATEGY, statement, action, None, typed_role, None
+        return PlaybookRuleKind.STRATEGY, statement, None, action, None, typed_role
     if case.quality is DecisionQuality.ADVANTAGE_GAINED:
         return (
             PlaybookRuleKind.STRATEGY,
             f"In {case.context.opponent_race} {case.context.phase.value}, "
             f"{case.semantic_action} had a verified effect in a winning episode.",
             case.semantic_action,
+            None,
+            None,
             None,
         )
     if case.quality is DecisionQuality.STRATEGIC_ERROR:
@@ -330,6 +407,8 @@ def _rule_content(
             "prefer a currently legal frontier.",
             None,
             case.semantic_action,
+            None,
+            None,
         )
     failure_code = str(case.evidence.get("failure_code") or "unknown")
     action = case.semantic_action
@@ -360,20 +439,12 @@ def _rule_content(
     # Keep execution experience scoped to the exact failed semantic action.  An
     # empty action set would match every Intent and Candidate in this phase and
     # could penalize unrelated play after promotion.
-    return PlaybookRuleKind.EXECUTION_GUARD, statement, None, action
+    return PlaybookRuleKind.EXECUTION_GUARD, statement, None, action, None, None
 
 
 def _assess(
     report: ExecutionReport,
-    result: EpisodeResult,
 ) -> tuple[DecisionQuality, FailureOwner, float, str]:
-    if report.success and result.outcome is EpisodeOutcome.VICTORY:
-        return (
-            DecisionQuality.ADVANTAGE_GAINED,
-            FailureOwner.NONE,
-            0.85,
-            "The action produced a verified effect and the episode ended in victory.",
-        )
     if report.success:
         return (
             DecisionQuality.CORRECT_EXECUTION,
@@ -400,6 +471,69 @@ def _assess(
         0.9 if quality is DecisionQuality.EXECUTION_ERROR else 0.4,
         f"The action ended as {report.status.value} at {stage or 'unknown'}: "
         f"{report.failure_code or report.failure_reason or 'no detail'}.",
+    )
+
+
+def _consequence_case(
+    consequence: StrategicConsequence,
+    result: EpisodeResult,
+    *,
+    events: Sequence[StoredEvent],
+    agent_race: str,
+    opponent_race: str,
+) -> DecisionCase:
+    source_event_id = max(consequence.source_event_ids)
+    source = next((event for event in events if event.event_id == source_event_id), None)
+    semantic_action = consequence.semantic_action or f"ROLE:{consequence.role}"
+    role = consequence.role
+    condition_values = consequence.condition.model_dump(mode="json")
+    tags = tuple(
+        value
+        for value in (
+            consequence.consequence_type.value,
+            role,
+            f"threat_{consequence.condition.threat_level}",
+            f"readiness_{consequence.condition.army_readiness}",
+        )
+        if value is not None
+    )
+    return DecisionCase(
+        case_id=_stable_id("case", consequence.consequence_id),
+        run_id=result.run_id,
+        episode_id=result.episode_id,
+        source_event_id=source_event_id,
+        source_step_id=result.steps if source is None else source.step_id,
+        command_id=consequence.consequence_id,
+        semantic_action=semantic_action,
+        objective=consequence.objective,
+        context=PlaybookContext(
+            agent_race=agent_race,
+            opponent_race=opponent_race,
+            phase=consequence.condition.phase,
+            map_name=result.scenario,
+            tags=tags,
+        ),
+        quality=consequence.quality,
+        failure_owner=(
+            FailureOwner.NONE
+            if consequence.quality is DecisionQuality.ADVANTAGE_GAINED
+            else FailureOwner.CORTEX
+        ),
+        consequence=consequence.explanation,
+        evidence={
+            **consequence.evidence,
+            "seed": result.seed,
+            "reason": consequence.consequence_type.value,
+            "consequence_type": consequence.consequence_type.value,
+            "effect": consequence.effect.value,
+            "role": role,
+            "condition_values": condition_values,
+            "source_event_ids": list(consequence.source_event_ids),
+        },
+        episode_outcome=result.outcome.value,
+        confidence=consequence.confidence,
+        consequence_id=consequence.consequence_id,
+        consequence_type=consequence.consequence_type,
     )
 
 
@@ -471,11 +605,17 @@ def _source_role(payload: dict[str, object]) -> str | None:
 def _rule_matches_case(rule: PlaybookRule, case: DecisionCase) -> bool:
     if rule.action_names and case.semantic_action not in rule.action_names:
         return False
+    role = case.evidence.get("role")
+    if rule.role_ids and role not in rule.role_ids:
+        return False
+    condition_values = case.evidence.get("condition_values")
+    typed_conditions = condition_values if isinstance(condition_values, dict) else {}
     expected = {
         "agent_race": case.context.agent_race,
         "opponent_race": case.context.opponent_race,
         "phase": case.context.phase.value,
         "map_name": case.context.map_name,
+        **typed_conditions,
     }
     return all(
         condition.field in expected
@@ -486,6 +626,17 @@ def _rule_matches_case(rule: PlaybookRule, case: DecisionCase) -> bool:
 
 
 def _case_contradicts_rule(case: DecisionCase, rule: PlaybookRule) -> bool:
+    consequence_effect = case.evidence.get("effect")
+    if case.consequence_type is not None and isinstance(consequence_effect, str):
+        try:
+            case_effect = PlaybookRuleEffect(consequence_effect)
+        except ValueError:
+            return False
+        positive = {PlaybookRuleEffect.PREFER, PlaybookRuleEffect.REQUIRE}
+        negative = {PlaybookRuleEffect.AVOID, PlaybookRuleEffect.FORBID}
+        return (case_effect in positive and rule.effect in negative) or (
+            case_effect in negative and rule.effect in positive
+        )
     if case.quality is DecisionQuality.ADVANTAGE_GAINED:
         return rule.effect in {PlaybookRuleEffect.AVOID, PlaybookRuleEffect.FORBID}
     if case.quality is DecisionQuality.STRATEGIC_ERROR:

@@ -39,6 +39,8 @@ class PlaybookRuleLifecycle:
             raise ValueError("only candidate rules can be promoted to soft")
         if len(set(rule.source_run_ids)) < 2:
             raise ValueError("soft promotion requires evidence from two runs")
+        if len(set(rule.source_seeds)) < 2:
+            raise ValueError("soft promotion requires evidence from two seeds")
         if rule.confidence < 0.75 or rule.contradiction_count:
             raise ValueError("soft promotion confidence or contradiction gate failed")
         if rule.category is PlaybookRuleCategory.EXECUTION_GUARD:

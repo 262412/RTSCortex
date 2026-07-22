@@ -12,7 +12,16 @@ from rtscortex.contracts import (
     ExecutionStage,
     ExecutionStatus,
 )
-from rtscortex.cortex import GamePhase
+from rtscortex.cortex import (
+    ArmyReadiness,
+    EconomyStatus,
+    GamePhase,
+    ResourceClaim,
+    RoleId,
+    SituationAssessment,
+    StrategicIntent,
+    ThreatLevel,
+)
 from rtscortex.memory import EventStore
 from rtscortex.playbook import (
     CortexPlaybookReviewer,
@@ -20,6 +29,7 @@ from rtscortex.playbook import (
     LessonStatus,
     PlaybookCondition,
     PlaybookContext,
+    PlaybookIntentGuard,
     PlaybookQuery,
     PlaybookRule,
     PlaybookRuleCategory,
@@ -42,36 +52,55 @@ def test_playbook_public_import_succeeds_in_cold_interpreter() -> None:
     assert completed.returncode == 0, completed.stderr
 
 
-def _episode_events(root: Path, run_id: str) -> tuple[EventStore, EpisodeResult]:
+def _episode_events(
+    root: Path,
+    run_id: str,
+    *,
+    seed: int = 0,
+) -> tuple[EventStore, EpisodeResult]:
     store = EventStore(root / f"{run_id}.sqlite3", root / f"{run_id}.jsonl")
     store.append_event(
         run_id=run_id,
         episode_id="episode",
-        step_id=0,
+        step_id=100,
         event_type="situation_assessed",
-        payload={"phase": "technology"},
-    )
-    store.append_event(
-        run_id=run_id,
-        episode_id="episode",
-        step_id=1,
-        event_type="command_lineage",
         payload={
-            "command_id": f"{run_id}:command",
-            "macro_plan_id": f"{run_id}:plan",
-            "semantic_action": "BUILD STARGATE",
-            "lineage": {"source_role": "macro"},
+            "game_loop": 100,
+            "phase": "technology",
+            "threat_level": "none",
+            "economy_status": "stable",
+            "army_readiness": "forming",
+            "own_force": {"estimated_resource_value": 200, "total_units": 2},
+            "visible_enemy_force": {"estimated_resource_value": 0, "total_units": 0},
+            "bases": {"own_base_count": 1, "own_production_capacity": 1},
+            "scouting": {"enemy_visible": False},
         },
     )
     store.append_event(
         run_id=run_id,
         episode_id="episode",
-        step_id=2,
+        step_id=120,
+        event_type="command_lineage",
+        payload={
+            "command_id": f"{run_id}:command",
+            "macro_plan_id": f"{run_id}:plan",
+            "semantic_action": "BUILD STARGATE",
+            "lineage": {
+                "source_role": "macro",
+                "responsibility": "technology",
+                "selected_game_loop": 120,
+            },
+        },
+    )
+    store.append_event(
+        run_id=run_id,
+        episode_id="episode",
+        step_id=121,
         event_type="execution",
         payload=ExecutionReport(
             run_id=run_id,
             episode_id="episode",
-            step_id=2,
+            step_id=121,
             command_id=f"{run_id}:command",
             success=True,
             action_name="Build_Stargate_Screen",
@@ -82,13 +111,30 @@ def _episode_events(root: Path, run_id: str) -> tuple[EventStore, EpisodeResult]
             execution_stage=ExecutionStage.EFFECT_VERIFICATION,
         ),
     )
+    store.append_event(
+        run_id=run_id,
+        episode_id="episode",
+        step_id=620,
+        event_type="situation_assessed",
+        payload={
+            "game_loop": 620,
+            "phase": "technology",
+            "threat_level": "none",
+            "economy_status": "stable",
+            "army_readiness": "forming",
+            "own_force": {"estimated_resource_value": 550, "total_units": 4},
+            "visible_enemy_force": {"estimated_resource_value": 0, "total_units": 0},
+            "bases": {"own_base_count": 1, "own_production_capacity": 2},
+            "scouting": {"enemy_visible": False},
+        },
+    )
     return store, EpisodeResult(
         run_id=run_id,
         episode_id="episode",
         scenario="Simple64",
-        seed=0,
+        seed=seed,
         outcome=EpisodeOutcome.VICTORY,
-        steps=2,
+        steps=620,
     )
 
 
@@ -103,7 +149,7 @@ def test_playbook_promotes_only_repeated_outcome_backed_experience(tmp_path: Pat
         agent_race="protoss",
         opponent_race="zerg",
     )
-    second_store, second_result = _episode_events(tmp_path, "run-2")
+    second_store, second_result = _episode_events(tmp_path, "run-2", seed=1)
     _, second_lessons = reviewer.review_episode(
         second_store.events_after("run-2", 0, 100, episode_id="episode"),
         second_result,
@@ -135,11 +181,181 @@ def test_playbook_promotes_only_repeated_outcome_backed_experience(tmp_path: Pat
     playbook.close()
 
 
-def test_playbook_records_new_opposing_outcome_as_rule_contradiction(tmp_path: Path) -> None:
+def _persistent_threat_episode(
+    root: Path,
+    run_id: str,
+    *,
+    seed: int,
+) -> tuple[EventStore, EpisodeResult]:
+    store = EventStore(root / f"{run_id}.sqlite3", root / f"{run_id}.jsonl")
+    for step_id, game_loop in ((10, 1_000), (20, 1_224)):
+        store.append_event(
+            run_id=run_id,
+            episode_id="episode",
+            step_id=step_id,
+            event_type="situation_assessed",
+            payload={
+                "game_loop": game_loop,
+                "phase": "combat",
+                "threat_level": "high",
+                "economy_status": "stable",
+                "army_readiness": "ready",
+                "own_force": {"estimated_resource_value": 800, "total_units": 8},
+                "visible_enemy_force": {
+                    "estimated_resource_value": 700,
+                    "total_units": 7,
+                },
+                "bases": {"own_base_count": 2, "own_production_capacity": 4},
+                "scouting": {"enemy_visible": True},
+            },
+        )
+    return store, EpisodeResult(
+        run_id=run_id,
+        episode_id="episode",
+        scenario="Simple64",
+        seed=seed,
+        outcome=EpisodeOutcome.DEFEAT,
+        steps=20,
+    )
+
+
+def test_strategic_consequence_iterates_into_next_match_intent_scoring(
+    tmp_path: Path,
+) -> None:
     playbook = PlaybookStore(tmp_path / "playbook.sqlite3")
     reviewer = CortexPlaybookReviewer(playbook, promotion_support=2)
-    for run_id in ("run-1", "run-2"):
-        store, result = _episode_events(tmp_path, run_id)
+    for run_id, seed in (("threat-run-1", 0), ("threat-run-2", 0)):
+        store, result = _persistent_threat_episode(tmp_path, run_id, seed=seed)
+        reviewer.review_episode(
+            store.events_after(run_id, 0, 100, episode_id="episode"),
+            result,
+            agent_race="protoss",
+            opponent_race="zerg",
+        )
+        store.close()
+
+    repeated_same_seed = next(
+        rule
+        for rule in playbook.rules()
+        if rule.evidence.get("consequence_type") == "threat_unanswered"
+    )
+    assert repeated_same_seed.status is PlaybookRuleStatus.CANDIDATE
+    repeated_lesson = next(
+        lesson
+        for lesson in playbook.lessons()
+        if lesson.consequence_type is not None
+        and lesson.consequence_type.value == "threat_unanswered"
+    )
+    assert repeated_lesson.status is LessonStatus.CANDIDATE
+
+    store, result = _persistent_threat_episode(tmp_path, "threat-run-3", seed=1)
+    reviewer.review_episode(
+        store.events_after("threat-run-3", 0, 100, episode_id="episode"),
+        result,
+        agent_race="protoss",
+        opponent_race="zerg",
+    )
+    store.close()
+
+    rule = next(
+        rule
+        for rule in playbook.rules()
+        if rule.evidence.get("consequence_type") == "threat_unanswered"
+    )
+    assert rule.status is PlaybookRuleStatus.ACTIVE
+    assert rule.strength is PlaybookRuleStrength.SOFT
+    assert rule.effect is PlaybookRuleEffect.PREFER
+    assert rule.role_ids == ("defense",)
+    assert set(rule.source_seeds) == {0, 1}
+    assert rule.contradiction_count == 0
+    promoted_lesson = next(
+        lesson
+        for lesson in playbook.lessons()
+        if lesson.consequence_type is not None
+        and lesson.consequence_type.value == "threat_unanswered"
+    )
+    assert promoted_lesson.status is LessonStatus.PROMOTED
+    assert {(condition.field, condition.value) for condition in rule.conditions} >= {
+        ("phase", "combat"),
+        ("threat_level", "high"),
+        ("army_readiness", "ready"),
+    }
+
+    situation = SituationAssessment(
+        assessment_id="assessment:next-match",
+        run_id="next-run",
+        episode_id="episode",
+        step_id=1,
+        game_loop=1_300,
+        valid_until_game_loop=1_316,
+        phase=GamePhase.COMBAT,
+        threat_level=ThreatLevel.HIGH,
+        economy_status=EconomyStatus.STABLE,
+        army_readiness=ArmyReadiness.READY,
+        source_kind="deterministic",
+        source_id="test",
+        source_version="1",
+    )
+    context = PlaybookContext(
+        agent_race="protoss",
+        opponent_race="zerg",
+        phase=GamePhase.COMBAT,
+        map_name="Simple64",
+    )
+    defense = StrategicIntent(
+        intent_id="intent:defense",
+        continuity_key="defense:respond",
+        run_id="next-run",
+        episode_id="episode",
+        step_id=1,
+        created_game_loop=1_300,
+        role=RoleId.DEFENSE,
+        objective="answer the threat",
+        desired_effect="remove the threat",
+        action_names=("Move_Minimap",),
+        resource_claim=ResourceClaim(reservation_game_loops=16),
+        source_id="test",
+        source_version="1",
+    )
+    offense = defense.model_copy(
+        update={
+            "intent_id": "intent:offense",
+            "continuity_key": "offense:push",
+            "role": RoleId.OFFENSE,
+        }
+    )
+    guard = PlaybookIntentGuard()
+    selected_rules = playbook.rules_for_guard(context=context)
+
+    defense_result = guard.evaluate(
+        defense,
+        context=context,
+        situation=situation,
+        rules=selected_rules,
+        game_loop=1_300,
+        mode="active",
+    )
+    offense_result = guard.evaluate(
+        offense,
+        context=context,
+        situation=situation,
+        rules=selected_rules,
+        game_loop=1_300,
+        mode="active",
+    )
+
+    assert defense_result.score_delta == 0.5
+    assert defense_result.rule_ids == (rule.rule_id,)
+    assert offense_result.score_delta == 0.0
+    assert offense_result.rule_ids == ()
+    playbook.close()
+
+
+def test_playbook_does_not_apply_unscoped_contradiction_to_typed_rule(tmp_path: Path) -> None:
+    playbook = PlaybookStore(tmp_path / "playbook.sqlite3")
+    reviewer = CortexPlaybookReviewer(playbook, promotion_support=2)
+    for seed, run_id in enumerate(("run-1", "run-2")):
+        store, result = _episode_events(tmp_path, run_id, seed=seed)
         reviewer.review_episode(
             store.events_after(run_id, 0, 100, episode_id="episode"),
             result,
@@ -172,9 +388,8 @@ def test_playbook_records_new_opposing_outcome_as_rule_contradiction(tmp_path: P
         for rule in playbook.rules()
         if rule.action_names == ("BUILD STARGATE",) and rule.effect.value == "prefer"
     )
-    assert preferred.contradiction_count == 1
-    assert preferred.contradiction_seeds == (0,)
-    assert preferred in reviewer.last_rule_updates
+    assert preferred.contradiction_count == 0
+    assert preferred.contradiction_seeds == ()
     third_store.close()
     playbook.close()
 

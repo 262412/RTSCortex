@@ -184,20 +184,22 @@ macro mapping, actor routing, prerequisites, and effect semantics, so all three 
 dispatch through the shared Cortex runtime. Only the configured player race is loaded.
 
 CortexPlaybook is a separate cross-run SQLite database. Post-game review stores macro and tactical
-decision with source run, command lineage, effect evidence, consequence, failure owner, and
-confidence. Repeated engineering failures can become `execution_guard` rules, while outcome-backed
-recommendations and repeated blocked frontiers become `strategy` rules. Execution guards never
+decisions with source run, command lineage, effect evidence, strategic consequence, failure owner,
+and confidence. Completed matches deterministically extract unanswered threats, delayed expansion,
+production imbalance, failed timing attacks, unnecessary retreats, unconverted advantages, and
+successful key decisions. Repeated engineering failures remain advisory `execution_guard`
+candidates, while outcome-backed consequences can become `strategy` rules. Execution guards never
 boost or penalize a HIMA proposal; they preserve an explicit precondition for the executor and
-Bridge. A positive strategy lesson is promoted only after the
-same race, opponent, phase, and semantic action has produced a verified effect in at least
-two winning episodes. Every rule signature counts distinct episodes, candidate rules stay hidden
+Bridge. A strategy rule becomes soft only after matching evidence from at least two distinct runs
+and two distinct seeds. Every rule signature counts distinct episodes, candidate rules stay hidden
 by default, statement length is bounded, and retrieval returns only the configured top-k rules.
 Strategy retrieval requires exact race and opponent; global execution guards require exact race.
 This keeps the notebook iterative without allowing repeated copies from one game to dominate it.
 
 The durable v0.4 observability events are `race_brain_coordinated`, `playbook_retrieved`,
 `playbook_case_recorded`, `playbook_lesson_candidate`, `playbook_lesson_promoted`, and
-`postgame_review_completed`. They use the existing EventStore/WebSocket path and are visible
+`strategic_consequence_attributed`, and `postgame_review_completed`. They use the existing
+EventStore/WebSocket path and are visible
 in Live Console without opening a second control interface.
 
 The canonical `SC2State` contains economy, production queue, own units, own structures,

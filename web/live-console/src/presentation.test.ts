@@ -423,6 +423,48 @@ describe("Chinese event presentation", () => {
     expect(eventSummary(revalidated)).toContain("loop 112 → 184");
   });
 
+  it("translates strategic consequence attribution into a readable post-game record", () => {
+    const consequence = event("strategic_consequence_attributed", {
+      consequence_id: `consequence:${"a".repeat(64)}`,
+      consequence_type: "threat_unanswered",
+      quality: "strategic_error",
+      effect: "prefer",
+      role: "defense",
+      semantic_action: null,
+      objective: "Answer the threat before resuming macro play.",
+      start_game_loop: 1_120,
+      end_game_loop: 1_344,
+      source_event_ids: [22, 31],
+      condition: {
+        phase: "combat",
+        threat_level: "high",
+        economy_status: "stable",
+        army_readiness: "ready",
+      },
+      explanation: "The high threat persisted without a successful defensive response.",
+      evidence: { duration_game_loops: 224 },
+    });
+    const review = event("postgame_review_completed", {
+      strategic_consequence_count: 1,
+      case_count: 1,
+      lesson_update_count: 1,
+    });
+
+    expect(eventTitle(consequence)).toBe("战略后果已归因");
+    expect(eventSummary(consequence)).toContain(
+      "威胁未处理（threat_unanswered） · 防守（defense） · loop 1120–1344",
+    );
+    expect(eventSemanticPayload(consequence)).toMatchObject({
+      consequence_type: "threat_unanswered",
+      role: "defense",
+      condition: { threat_level: "high" },
+    });
+    expect(fieldLabel("consequence_type")).toBe("战略后果类型");
+    expect(eventSummary(review)).toBe(
+      "归因 1 个战略后果 · 复盘 1 个关键决策 · 更新 1 条战术经验",
+    );
+  });
+
   it("falls back safely for future event types", () => {
     const unknown = event("world_model_projection", { horizon: 32 });
     expect(eventTitle(unknown)).toBe("world model projection");

@@ -1018,6 +1018,19 @@ def _render_cortex_event(event: StoredEvent) -> list[str]:
             f"- Event {event_id} · Playbook rule {_code(rule_id)} applied to "
             f"{_code(target)}: {_code(reason)}."
         ]
+    if event.event_type == "strategic_consequence_attributed":
+        consequence_type = _payload_text(payload, "consequence_type") or "unknown"
+        role = _payload_text(payload, "role") or "unassigned"
+        consequence_action = _payload_text(payload, "semantic_action")
+        explanation = _payload_text(payload, "explanation") or "no explanation recorded"
+        start_loop = payload.get("start_game_loop", "unknown")
+        end_loop = payload.get("end_game_loop", "unknown")
+        target = f"; action {_code(consequence_action)}" if consequence_action else ""
+        return [
+            f"- Event {event_id} · Strategic consequence {_code(consequence_type)} for "
+            f"role {_code(role)}{target}, loops `{start_loop}–{end_loop}`: "
+            f"{_inline(explanation)}."
+        ]
     if event.event_type == "candidate_set_built":
         candidates = payload.get("candidates", [])
         candidate_count = len(candidates) if isinstance(candidates, list) else 0
@@ -1378,6 +1391,10 @@ def _render_cortex_metrics(metrics: CortexObservabilityMetrics) -> list[str]:
             f"`{metrics.playbook_shadow_block_count}` shadow blocks."
         ),
         (
+            "- Strategic consequences attributed from completed matches: "
+            f"`{sum(metrics.strategic_consequence_counts.values())}`."
+        ),
+        (
             f"- Command lineage coverage: {coverage}; missing "
             f"`{metrics.missing_lineage_commands}`, orphan `{metrics.orphan_lineage_commands}`, "
             f"duplicates `{metrics.duplicate_lineage_commands}`, integrity violations "
@@ -1399,6 +1416,10 @@ def _render_cortex_metrics(metrics: CortexObservabilityMetrics) -> list[str]:
         *_render_count_table("Strategic intents by responsibility", metrics.role_intent_counts),
         *_render_count_table("Strategic intent decisions", metrics.intent_decision_counts),
         *_render_count_table("Strategic intent conflicts", metrics.intent_conflict_counts),
+        *_render_count_table(
+            "Strategic consequences",
+            metrics.strategic_consequence_counts,
+        ),
         *_render_count_table("Cortex selections by executor", metrics.executor_counts),
         *_render_count_table("Specialist failures", metrics.specialist_failure_counts),
         *_render_count_table("Specialists ready", metrics.specialist_ready_counts),

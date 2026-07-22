@@ -52,6 +52,7 @@ const EVENT_TITLES: Record<string, string> = {
   playbook_case_recorded: "关键决策案例已记录",
   playbook_lesson_candidate: "候选战术经验已更新",
   playbook_lesson_promoted: "战术经验已晋升",
+  strategic_consequence_attributed: "战略后果已归因",
   postgame_review_completed: "赛后复盘已完成",
   episode_summary: "对局总结",
   episode_result: "对局结果",
@@ -137,12 +138,25 @@ const FIELD_LABELS: Record<string, string> = {
   quality: "决策质量",
   failure_owner: "失败归属",
   consequence: "观察到的后果",
+  consequence_id: "战略后果 ID",
+  consequence_type: "战略后果类型",
+  effect: "规则影响",
+  objective: "纠正目标",
+  start_game_loop: "证据起始时刻",
+  end_game_loop: "证据结束时刻",
+  source_event_ids: "来源事件 ID",
+  condition: "适用战况",
+  explanation: "归因说明",
   statement: "战术经验",
   rule_kind: "规则类型",
   recommended_action: "建议动作",
   avoid_action: "应避免动作",
+  recommended_role: "建议职责",
+  avoid_role: "应避免职责",
   support_count: "支持对局数",
   contradiction_count: "矛盾对局数",
+  strategic_consequence_count: "战略后果数量",
+  strategic_consequence_counts: "战略后果分类",
   plan_id: "计划 ID",
   macro_plan_id: "宏观计划 ID",
   intent: "决策意图",
@@ -459,6 +473,17 @@ const VALUE_LABELS: Record<string, string> = {
   engaged: "正在交战",
   strategy: "战略规则",
   execution_guard: "执行保护规则",
+  threat_unanswered: "威胁未处理",
+  expansion_delayed: "扩张延迟",
+  production_imbalance: "生产结构失衡",
+  timing_attack_failed: "Timing 进攻失败",
+  unnecessary_retreat: "不必要撤退",
+  advantage_not_converted: "优势未转化",
+  successful_key_decision: "成功关键决策",
+  prefer: "优先采用",
+  avoid: "降低优先级",
+  require: "必须采用",
+  forbid: "禁止采用",
   not_ready: "尚未准备",
   abstain: "主动放弃选择",
   friendly_target: "目标属于己方",
@@ -654,6 +679,8 @@ export function semanticScalar(value: string | number | boolean | null, key?: st
     "effect_kind",
     "confirmation_kind",
     "rule_kind",
+    "consequence_type",
+    "effect",
     "role",
     "source_kind",
     "game_phase",
@@ -782,6 +809,21 @@ export function eventSummary(event: StoredEvent): string {
     const consequence = readString(payload, "consequence");
     return `${actionLabel(semanticAction, false)} · ${semanticScalar(quality)}${consequence ? ` · ${truncate(consequence)}` : ""}`;
   }
+  if (event.event_type === "strategic_consequence_attributed") {
+    const consequenceType = readString(payload, "consequence_type") ?? "unknown";
+    const role = readString(payload, "role");
+    const semanticAction = readString(payload, "semantic_action");
+    const explanation = readString(payload, "explanation");
+    const startLoop = readNumber(payload, "start_game_loop");
+    const endLoop = readNumber(payload, "end_game_loop");
+    return [
+      semanticScalar(consequenceType, "consequence_type"),
+      role ? semanticScalar(role, "role") : undefined,
+      semanticAction ? actionLabel(semanticAction, false) : undefined,
+      startLoop === undefined || endLoop === undefined ? undefined : `loop ${startLoop}–${endLoop}`,
+      explanation ? truncate(explanation) : undefined,
+    ].filter(Boolean).join(" · ");
+  }
   if (event.event_type === "playbook_lesson_candidate" || event.event_type === "playbook_lesson_promoted") {
     const statement = readString(payload, "statement") ?? "战术经验已更新";
     const support = readNumber(payload, "support_count") ?? 0;
@@ -792,7 +834,8 @@ export function eventSummary(event: StoredEvent): string {
   if (event.event_type === "postgame_review_completed") {
     const cases = readNumber(payload, "case_count") ?? 0;
     const lessons = readNumber(payload, "lesson_update_count") ?? 0;
-    return `复盘 ${cases} 个关键决策 · 更新 ${lessons} 条战术经验`;
+    const consequences = readNumber(payload, "strategic_consequence_count") ?? 0;
+    return `归因 ${consequences} 个战略后果 · 复盘 ${cases} 个关键决策 · 更新 ${lessons} 条战术经验`;
   }
   if (event.event_type === "macro_step_updated") {
     const step = asObject(payload.step) ?? payload;
@@ -1014,6 +1057,22 @@ export function eventSemanticPayload(event: StoredEvent): JsonValue {
       ["army_readiness", assessment.army_readiness ?? assessment.readiness],
       ["information_gaps", assessment.information_gaps],
       ["assessment", payload.assessment],
+    ]);
+  }
+  if (event.event_type === "strategic_consequence_attributed") {
+    return compactObject([
+      ["consequence_type", payload.consequence_type],
+      ["quality", payload.quality],
+      ["effect", payload.effect],
+      ["role", payload.role],
+      ["semantic_action", payload.semantic_action],
+      ["objective", payload.objective],
+      ["start_game_loop", payload.start_game_loop],
+      ["end_game_loop", payload.end_game_loop],
+      ["condition", payload.condition],
+      ["explanation", payload.explanation],
+      ["evidence", payload.evidence],
+      ["source_event_ids", payload.source_event_ids],
     ]);
   }
   if (["race_profile_activated", "tactical_policy_shadow", "playbook_rule_updated", "macro_plan_accepted", "macro_plan_rejected", "macro_frontier_deferred", "macro_frontier_preempted", "macro_structure_deferred", "macro_step_updated", "intent_emitted", "role_intent_emitted", "intent_arbitrated", "intent_arbiter_shadow_diff", "candidate_set_built", "executor_selection", "command_lineage", "specialist_failed", "specialist_ready", "specialist_recovered", "playbook_rule_applied"].includes(event.event_type)) {

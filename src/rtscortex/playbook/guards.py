@@ -212,7 +212,7 @@ def _evaluate(
             )
     return GuardResult(
         blocked=blocked,
-        score_delta=delta,
+        score_delta=delta if mode == "active" else 0.0,
         rule_ids=tuple(dict.fromkeys(applied_ids)),
         applications=tuple(applications),
     )

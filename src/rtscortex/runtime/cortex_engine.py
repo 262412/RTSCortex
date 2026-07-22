@@ -2285,6 +2285,17 @@ class CortexRuntimeEngine(RuntimeEngine):
             agent_race=self.config.environment.agent_race,
             opponent_race=self.config.environment.opponent_race,
         )
+        consequence_counts: dict[str, int] = {}
+        for consequence in self._playbook_reviewer.last_consequences:
+            consequence_type = consequence.consequence_type.value
+            consequence_counts[consequence_type] = consequence_counts.get(consequence_type, 0) + 1
+            self.store.append_event(
+                run_id=result.run_id,
+                episode_id=result.episode_id,
+                step_id=result.steps,
+                event_type="strategic_consequence_attributed",
+                payload=consequence,
+            )
         for case in cases:
             self.store.append_event(
                 run_id=result.run_id,
@@ -2322,6 +2333,10 @@ class CortexRuntimeEngine(RuntimeEngine):
             payload={
                 "case_count": len(cases),
                 "lesson_update_count": len(lessons),
+                "strategic_consequence_count": len(
+                    self._playbook_reviewer.last_consequences
+                ),
+                "strategic_consequence_counts": dict(sorted(consequence_counts.items())),
                 "playbook_path": str(self._playbook_reviewer.store.database_path),
             },
         )

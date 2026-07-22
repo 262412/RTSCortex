@@ -1,5 +1,6 @@
 """Cross-episode tactical memory for the SC2-native Cortex runtime."""
 
+from rtscortex.playbook.attribution import StrategicConsequenceAttributor
 from rtscortex.playbook.guards import (
     GuardResult,
     PlaybookCandidateGuard,
@@ -25,6 +26,9 @@ from rtscortex.playbook.models import (
     PlaybookRuleStatus,
     PlaybookRuleStrength,
     PlaybookSelection,
+    StrategicConditionSnapshot,
+    StrategicConsequence,
+    StrategicConsequenceType,
 )
 from rtscortex.playbook.reviewer import CortexPlaybookReviewer
 from rtscortex.playbook.store import PlaybookStore
@@ -53,6 +57,10 @@ __all__ = [
     "PlaybookRuleStrength",
     "PlaybookRuleLifecycle",
     "StrategicABEvidence",
+    "StrategicConditionSnapshot",
+    "StrategicConsequence",
+    "StrategicConsequenceAttributor",
+    "StrategicConsequenceType",
     "PlaybookSelection",
     "PlaybookStore",
 ]

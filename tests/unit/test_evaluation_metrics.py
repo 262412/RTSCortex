@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from rtscortex.contracts import EpisodeOutcome, EpisodeResult
+from rtscortex.evaluation.cortex import compute_cortex_observability
 from rtscortex.evaluation.metrics import (
     aggregate_episode_metrics,
     compute_episode_metrics,
@@ -234,6 +235,33 @@ def test_episode_metrics_include_cortex_hima_requests_and_plans() -> None:
     assert metrics.plan_revisions == 1
     assert metrics.plan_accept_gap_game_loops_p50 == 130.0
     assert metrics.plan_accept_gap_samples == 1
+
+
+def test_cortex_metrics_count_strategic_consequences_by_type() -> None:
+    metrics = compute_cortex_observability(
+        [
+            _event(
+                1,
+                "strategic_consequence_attributed",
+                {"consequence_type": "threat_unanswered"},
+            ),
+            _event(
+                2,
+                "strategic_consequence_attributed",
+                {"consequence_type": "threat_unanswered"},
+            ),
+            _event(
+                3,
+                "strategic_consequence_attributed",
+                {"consequence_type": "successful_key_decision"},
+            ),
+        ]
+    )
+
+    assert metrics.strategic_consequence_counts == {
+        "successful_key_decision": 1,
+        "threat_unanswered": 2,
+    }
 
 
 def test_execution_metrics_separate_control_noops_and_terminal_states() -> None:

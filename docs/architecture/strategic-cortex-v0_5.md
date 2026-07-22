@@ -107,9 +107,45 @@ hard and eight soft matches per decision.
 
 Legacy lessons are preserved as advisory. New evidence is merged by canonical
 condition/effect rather than by text, and repeated evidence from the same run does not inflate
-support. Candidate-to-soft promotion requires independent runs. Hard promotion additionally
+support. Candidate-to-soft promotion requires independent runs and independent seeds. Hard promotion additionally
 requires the configured seed, revision, false-block and paired A/B gates. Independent
 contradictions reduce confidence and eventually suspend or retire a rule.
+
+### Strategic consequence attribution and self-iteration
+
+Post-game attribution runs only for completed `victory`, `defeat`, or `draw` episodes. A
+truncated smoke, Worker error, or incomplete journal cannot teach strategy. The deterministic
+attributor extracts at most one instance of each strategic error and at most three successful
+key decisions from an evidence chain of Situation, command lineage, terminal execution, later
+Situation, and final outcome. It currently detects:
+
+- an unanswered persistent high/critical threat;
+- an affordable expansion delayed beyond the configured strategic window;
+- production capacity that remains too low while resources float;
+- a timing attack followed by a large unfavorable army-value trade;
+- a retreat despite low threat, healthy units, and an observed force advantage;
+- an observed army advantage that persists without offensive conversion;
+- a successful key decision followed by a verified threat, base, production, force, or trade
+  improvement in a victory.
+
+Missing force or base facts are treated as unknown and suppress the affected detector. Resource
+changes alone do not prove strategic causality. Each `StrategicConsequence` records its source
+event IDs, loop interval, typed Situation condition, role/action, explanation, evidence, and
+confidence.
+
+Every consequence becomes a versioned case and a canonical candidate rule. After support from
+at least two distinct runs and two distinct seeds, a non-execution rule may become an active soft
+rule. On the next matching game state, `PlaybookIntentGuard` adjusts the corresponding role or
+action before Intent arbitration; `PlaybookCandidateGuard` applies exact candidate constraints
+before Fast Executor. Execution failures remain advisory until a typed failure precondition exists,
+so historical Bridge bugs cannot become strategic penalties. Contradicting independent seeds lower
+confidence, suspend, and eventually retire rules.
+
+The full-match learning profile is
+`configs/experiments/live_simple64_hima_protoss_ensemble_cortex_v0_5_playbook_learning.yaml`.
+Its 40,000-step ceiling allows SC2 to produce a terminal result while all seeds share one
+cross-run Playbook database. Short smoke/regression profiles remain truncated and intentionally
+produce no strategic lessons.
 
 ## Event lineage
 
@@ -124,6 +160,7 @@ intent_arbitrated
 intent_arbiter_shadow_diff
 playbook_rule_applied
 playbook_rule_updated
+strategic_consequence_attributed
 command_lineage
 ```
 

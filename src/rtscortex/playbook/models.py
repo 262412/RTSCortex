@@ -6,7 +6,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Literal, TypeAlias
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from rtscortex.contracts.models import ContractModel
 from rtscortex.game_phase import GamePhase
@@ -18,6 +18,16 @@ class DecisionQuality(StrEnum):
     STRATEGIC_ERROR = "strategic_error"
     EXECUTION_ERROR = "execution_error"
     INCONCLUSIVE = "inconclusive"
+
+
+class StrategicConsequenceType(StrEnum):
+    THREAT_UNANSWERED = "threat_unanswered"
+    EXPANSION_DELAYED = "expansion_delayed"
+    PRODUCTION_IMBALANCE = "production_imbalance"
+    TIMING_ATTACK_FAILED = "timing_attack_failed"
+    UNNECESSARY_RETREAT = "unnecessary_retreat"
+    ADVANTAGE_NOT_CONVERTED = "advantage_not_converted"
+    SUCCESSFUL_KEY_DECISION = "successful_key_decision"
 
 
 class FailureOwner(StrEnum):
@@ -82,6 +92,15 @@ class PlaybookConditionOperator(StrEnum):
 
 
 PlaybookConditionValue: TypeAlias = str | int | float | bool | tuple[str, ...]
+PlaybookRoleId: TypeAlias = Literal[
+    "economy",
+    "technology",
+    "production",
+    "defense",
+    "offense",
+    "focus_fire",
+    "retreat",
+]
 
 
 class PlaybookCondition(ContractModel):
@@ -157,6 +176,48 @@ class PlaybookContext(ContractModel):
     tags: tuple[str, ...] = ()
 
 
+class StrategicConditionSnapshot(ContractModel):
+    phase: GamePhase
+    threat_level: Literal["none", "low", "high", "critical"]
+    economy_status: Literal["constrained", "stable", "floating"]
+    army_readiness: Literal["empty", "forming", "ready", "engaged"]
+
+
+class StrategicConsequence(ContractModel):
+    """One bounded, evidence-backed strategic outcome extracted after a full match."""
+
+    schema_version: str = "1.0"
+    consequence_id: str = Field(pattern=r"^consequence:[0-9a-f]{64}$")
+    run_id: str = Field(min_length=1)
+    episode_id: str = Field(min_length=1)
+    consequence_type: StrategicConsequenceType
+    quality: DecisionQuality
+    effect: PlaybookRuleEffect
+    role: PlaybookRoleId | None = None
+    semantic_action: str | None = None
+    objective: str = Field(min_length=1)
+    start_game_loop: int = Field(ge=0)
+    end_game_loop: int = Field(ge=0)
+    source_event_ids: tuple[int, ...] = Field(min_length=1)
+    condition: StrategicConditionSnapshot
+    explanation: str = Field(min_length=1, max_length=500)
+    evidence: dict[str, object] = Field(default_factory=dict)
+    confidence: float = Field(ge=0.0, le=1.0)
+
+    @model_validator(mode="after")
+    def validate_consequence(self) -> StrategicConsequence:
+        if self.end_game_loop < self.start_game_loop:
+            raise ValueError("strategic consequence cannot end before it starts")
+        if self.role is None and self.semantic_action is None:
+            raise ValueError("strategic consequence requires a role or semantic action")
+        if self.quality not in {
+            DecisionQuality.STRATEGIC_ERROR,
+            DecisionQuality.ADVANTAGE_GAINED,
+        }:
+            raise ValueError("strategic consequence must identify an error or advantage")
+        return self
+
+
 class DecisionCase(ContractModel):
     case_id: str = Field(min_length=1)
     run_id: str = Field(min_length=1)
@@ -174,6 +235,8 @@ class DecisionCase(ContractModel):
     evidence: dict[str, object] = Field(default_factory=dict)
     episode_outcome: str = Field(min_length=1)
     confidence: float = Field(ge=0.0, le=1.0)
+    consequence_id: str | None = None
+    consequence_type: StrategicConsequenceType | None = None
 
 
 class PlaybookLesson(ContractModel):
@@ -184,6 +247,9 @@ class PlaybookLesson(ContractModel):
     statement: str = Field(min_length=1, max_length=360)
     recommended_action: str | None = None
     avoid_action: str | None = None
+    recommended_role: PlaybookRoleId | None = None
+    avoid_role: PlaybookRoleId | None = None
+    consequence_type: StrategicConsequenceType | None = None
     status: LessonStatus
     confidence: float = Field(ge=0.0, le=1.0)
     support_count: int = Field(ge=0)

@@ -26,6 +26,7 @@ from rtscortex.playbook import (
     PlaybookCandidateGuard,
     PlaybookCondition,
     PlaybookContext,
+    PlaybookIntentGuard,
     PlaybookLesson,
     PlaybookRule,
     PlaybookRuleCategory,
@@ -351,6 +352,51 @@ def test_playbook_hard_rule_requires_active_mode_to_block() -> None:
     assert active.blocked is True
 
 
+def test_playbook_soft_intent_score_is_observed_but_not_applied_in_shadow() -> None:
+    rule = PlaybookRule(
+        rule_id="rule:prefer-defense",
+        canonical_key="prefer-defense",
+        category=PlaybookRuleCategory.TACTICAL_RESPONSE,
+        conditions=(PlaybookCondition(field="agent_race", value="protoss"),),
+        effect=PlaybookRuleEffect.PREFER,
+        strength=PlaybookRuleStrength.SOFT,
+        status=PlaybookRuleStatus.ACTIVE,
+        role_ids=("defense",),
+        confidence=0.9,
+    )
+    observation = _observation()
+    situation = DeterministicSituationAnalyzer().assess(observation)
+    intent = _intent("Move_Minimap", RoleId.DEFENSE)
+    context = PlaybookContext(
+        agent_race="protoss",
+        opponent_race="zerg",
+        phase=situation.phase,
+        map_name="Simple64",
+    )
+    guard = PlaybookIntentGuard()
+
+    shadow = guard.evaluate(
+        intent,
+        context=context,
+        situation=situation,
+        rules=(rule,),
+        game_loop=observation.game_loop,
+        mode="shadow",
+    )
+    active = guard.evaluate(
+        intent,
+        context=context,
+        situation=situation,
+        rules=(rule,),
+        game_loop=observation.game_loop,
+        mode="active",
+    )
+
+    assert shadow.score_delta == 0.0
+    assert shadow.applications[0].score_delta == 0.5
+    assert active.score_delta == 0.5
+
+
 def test_playbook_matches_hima_semantic_build_action_to_runtime_candidate() -> None:
     rule = PlaybookRule(
         rule_id="rule:placement",
@@ -431,6 +477,7 @@ def test_playbook_promotion_rejects_untyped_execution_penalty() -> None:
         action_names=("Attack_Unit",),
         confidence=0.9,
         source_run_ids=("run-1", "run-2"),
+        source_seeds=(0, 1),
     )
 
     with pytest.raises(ValueError, match="typed failure precondition"):

@@ -40,6 +40,7 @@ CORTEX_EVENT_TYPES = frozenset(
         "playbook_case_recorded",
         "playbook_lesson_candidate",
         "playbook_lesson_promoted",
+        "strategic_consequence_attributed",
         "postgame_review_completed",
     }
 )
@@ -80,6 +81,7 @@ class CortexObservabilityMetrics:
     playbook_block_count: int = 0
     playbook_shadow_block_count: int = 0
     playbook_rule_update_count: int = 0
+    strategic_consequence_counts: dict[str, int] = field(default_factory=dict)
     role_lineage_coverage: float = 0.0
     active_race: str | None = None
     race_macro_contract_ready: bool | None = None
@@ -131,6 +133,7 @@ def compute_cortex_observability(
     playbook_applications = 0
     playbook_blocks = 0
     playbook_shadow_blocks = 0
+    strategic_consequences: Counter[str] = Counter()
     race_profile_payload: dict[str, Any] = {}
     current_phase = "unknown"
     race_brain_selected: Counter[str] = Counter()
@@ -207,6 +210,9 @@ def compute_cortex_observability(
                 playbook_blocks += 1
             if payload.get("reason") == "shadow_would_block":
                 playbook_shadow_blocks += 1
+        elif event.event_type == "strategic_consequence_attributed":
+            consequence_type = _text(payload, "consequence_type") or "unknown"
+            strategic_consequences[consequence_type] += 1
         elif event.event_type == "macro_plan_accepted":
             plan_id = _text(payload, "plan_id") or _text(_object(payload.get("plan")), "plan_id")
             if plan_id is not None:
@@ -358,6 +364,7 @@ def compute_cortex_observability(
         playbook_block_count=playbook_blocks,
         playbook_shadow_block_count=playbook_shadow_blocks,
         playbook_rule_update_count=event_counts.get("playbook_rule_updated", 0),
+        strategic_consequence_counts=dict(sorted(strategic_consequences.items())),
         role_lineage_coverage=role_coverage,
         active_race=_text(race_profile_payload, "race"),
         race_macro_contract_ready=_optional_bool(

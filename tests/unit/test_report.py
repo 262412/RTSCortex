@@ -685,6 +685,34 @@ def test_real_legacy_full_match_report_freezes_baseline_lines() -> None:
     assert "Legacy execution-report rate: `759/903` (84.1%) (deprecated)" in report
 
 
+def test_timeline_renders_strategic_consequence_and_aggregate() -> None:
+    report = render_timeline(
+        [
+            _event(
+                1,
+                "strategic_consequence_attributed",
+                {
+                    "consequence_type": "advantage_not_converted",
+                    "role": "offense",
+                    "semantic_action": None,
+                    "start_game_loop": 8_000,
+                    "end_game_loop": 8_896,
+                    "explanation": (
+                        "A verified army advantage persisted without offensive execution"
+                    ),
+                },
+                step_id=100,
+            )
+        ]
+    )
+
+    assert "Strategic consequence `advantage_not_converted`" in report
+    assert "loops `8000–8896`" in report
+    assert "Strategic consequences attributed from completed matches: `1`" in report
+    assert "#### Strategic consequences" in report
+    assert "| `advantage_not_converted` | 1 |" in report
+
+
 def test_legacy_incomplete_mock_journal_still_writes_report_and_cli_succeeds(
     tmp_path: Path,
 ) -> None:

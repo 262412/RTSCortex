@@ -25,6 +25,7 @@ from rtscortex.playbook.models import (
     PlaybookRuleStatus,
     PlaybookRuleStrength,
     PlaybookSelection,
+    StrategicConsequenceType,
 )
 
 
@@ -363,11 +364,14 @@ def _legacy_rule(lesson: PlaybookLesson) -> PlaybookRule:
     )
     effect = (
         PlaybookRuleEffect.PREFER
-        if lesson.recommended_action is not None
+        if lesson.recommended_action is not None or lesson.recommended_role is not None
         else PlaybookRuleEffect.AVOID
     )
     actions = tuple(
         action for action in (lesson.recommended_action, lesson.avoid_action) if action is not None
+    )
+    roles = tuple(
+        role for role in (lesson.recommended_role, lesson.avoid_role) if role is not None
     )
     canonical = hashlib.sha256(
         f"legacy|{lesson.signature}|{effect.value}|{'|'.join(actions)}".encode()
@@ -385,6 +389,7 @@ def _legacy_rule(lesson: PlaybookLesson) -> PlaybookRule:
         strength=PlaybookRuleStrength.ADVISORY,
         status=PlaybookRuleStatus.LEGACY,
         action_names=actions,
+        role_ids=roles,
         confidence=lesson.confidence,
         support_count=lesson.support_count,
         contradiction_count=lesson.contradiction_count,
@@ -397,19 +402,32 @@ def _legacy_rule(lesson: PlaybookLesson) -> PlaybookRule:
 
 
 def _candidate_rule(lesson: PlaybookLesson, source_case: DecisionCase) -> PlaybookRule:
-    conditions = (
+    conditions: tuple[PlaybookCondition, ...] = (
         PlaybookCondition(field="agent_race", value=lesson.context.agent_race),
         PlaybookCondition(field="opponent_race", value=lesson.context.opponent_race),
         PlaybookCondition(field="phase", value=lesson.context.phase.value),
         PlaybookCondition(field="map_name", value=lesson.context.map_name),
     )
+    condition_values = source_case.evidence.get("condition_values")
+    if isinstance(condition_values, dict) and source_case.consequence_type is not None:
+        conditions = (
+            *conditions,
+            *tuple(
+                PlaybookCondition(field=field, value=str(condition_values[field]))  # type: ignore[arg-type]
+                for field in ("threat_level", "economy_status", "army_readiness")
+                if isinstance(condition_values.get(field), str)
+            ),
+        )
     effect = (
         PlaybookRuleEffect.PREFER
-        if lesson.recommended_action is not None
+        if lesson.recommended_action is not None or lesson.recommended_role is not None
         else PlaybookRuleEffect.AVOID
     )
     actions = tuple(
         action for action in (lesson.recommended_action, lesson.avoid_action) if action is not None
+    )
+    roles = tuple(
+        role for role in (lesson.recommended_role, lesson.avoid_role) if role is not None
     )
     canonical_payload = "|".join(
         (
@@ -420,6 +438,7 @@ def _candidate_rule(lesson: PlaybookLesson, source_case: DecisionCase) -> Playbo
             ),
             effect.value,
             *actions,
+            *roles,
         )
     )
     canonical = hashlib.sha256(canonical_payload.encode()).hexdigest()
@@ -427,23 +446,45 @@ def _candidate_rule(lesson: PlaybookLesson, source_case: DecisionCase) -> Playbo
     return PlaybookRule(
         rule_id=f"playbook-rule:{canonical}",
         canonical_key=canonical,
-        category=(
-            PlaybookRuleCategory.EXECUTION_GUARD
-            if lesson.rule_kind is PlaybookRuleKind.EXECUTION_GUARD
-            else PlaybookRuleCategory.MATCHUP_STRATEGY
-        ),
+        category=_rule_category(lesson),
         conditions=conditions,
         effect=effect,
         strength=PlaybookRuleStrength.ADVISORY,
         status=PlaybookRuleStatus.CANDIDATE,
         action_names=actions,
+        role_ids=roles,
         confidence=lesson.confidence,
         support_count=1,
         source_case_ids=(source_case.case_id,),
         source_run_ids=(source_case.run_id,),
         source_seeds=((int(seed),) if isinstance(seed, int) else ()),
-        evidence={"lesson_id": lesson.lesson_id, "statement": lesson.statement},
+        evidence={
+            "lesson_id": lesson.lesson_id,
+            "statement": lesson.statement,
+            "consequence_type": (
+                None if lesson.consequence_type is None else lesson.consequence_type.value
+            ),
+        },
     )
+
+
+def _rule_category(lesson: PlaybookLesson) -> PlaybookRuleCategory:
+    if lesson.rule_kind is PlaybookRuleKind.EXECUTION_GUARD:
+        return PlaybookRuleCategory.EXECUTION_GUARD
+    if lesson.consequence_type in {
+        StrategicConsequenceType.EXPANSION_DELAYED,
+        StrategicConsequenceType.PRODUCTION_IMBALANCE,
+    }:
+        return PlaybookRuleCategory.RACE_MACRO
+    if lesson.consequence_type in {
+        StrategicConsequenceType.THREAT_UNANSWERED,
+        StrategicConsequenceType.TIMING_ATTACK_FAILED,
+        StrategicConsequenceType.UNNECESSARY_RETREAT,
+        StrategicConsequenceType.ADVANTAGE_NOT_CONVERTED,
+        StrategicConsequenceType.SUCCESSFUL_KEY_DECISION,
+    }:
+        return PlaybookRuleCategory.TACTICAL_RESPONSE
+    return PlaybookRuleCategory.MATCHUP_STRATEGY
 
 
 def _merge_rule_evidence(existing: PlaybookRule, incoming: PlaybookRule) -> PlaybookRule:
