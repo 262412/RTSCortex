@@ -137,6 +137,8 @@ class PlaybookRule(ContractModel):
     source_case_ids: tuple[str, ...] = ()
     source_run_ids: tuple[str, ...] = ()
     source_seeds: tuple[int, ...] = ()
+    censored_source_run_ids: tuple[str, ...] = ()
+    censored_source_seeds: tuple[int, ...] = ()
     contradiction_seeds: tuple[int, ...] = ()
     code_revision: str | None = None
     sc2_patch: str | None = None
@@ -203,6 +205,7 @@ class StrategicConsequence(ContractModel):
     explanation: str = Field(min_length=1, max_length=500)
     evidence: dict[str, object] = Field(default_factory=dict)
     confidence: float = Field(ge=0.0, le=1.0)
+    censored: bool = False
 
     @model_validator(mode="after")
     def validate_consequence(self) -> StrategicConsequence:

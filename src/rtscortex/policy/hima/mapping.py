@@ -55,6 +55,7 @@ _STEP_PARSE_ERROR_CODES = frozenset(
         "invalid_action_item",
         "invalid_actions_list",
         "invalid_repeat",
+        "invalid_target_count",
         "output_too_long",
         "output_truncated",
         "unknown_action",

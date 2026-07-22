@@ -43,8 +43,16 @@ class PlaybookRuleLifecycle:
             raise ValueError("soft promotion requires evidence from two seeds")
         if rule.confidence < 0.75 or rule.contradiction_count:
             raise ValueError("soft promotion confidence or contradiction gate failed")
-        if rule.category is PlaybookRuleCategory.EXECUTION_GUARD:
+        if rule.category is PlaybookRuleCategory.EXECUTION_GUARD and not {
+            "threat_level",
+            "economy_status",
+            "army_readiness",
+        }.intersection(condition.field for condition in rule.conditions):
             raise ValueError("execution guard requires a typed failure precondition")
+        if not _is_specific_rule(rule):
+            raise ValueError("soft promotion requires a specific typed condition")
+        if rule.shadow_state_count < 48 or rule.false_block_rate > 0.05:
+            raise ValueError("soft promotion shadow coverage gate failed")
         return rule.model_copy(
             update={
                 "status": PlaybookRuleStatus.ACTIVE,
@@ -72,6 +80,10 @@ class PlaybookRuleLifecycle:
             raise ValueError("hard promotion revision gate failed")
         if rule.shadow_state_count < 48 or rule.false_block_rate > 0.01:
             raise ValueError("hard promotion shadow coverage gate failed")
+        uncensored_runs = set(rule.source_run_ids) - set(rule.censored_source_run_ids)
+        uncensored_seeds = set(rule.source_seeds) - set(rule.censored_source_seeds)
+        if len(uncensored_runs) < 3 or len(uncensored_seeds) < 3:
+            raise ValueError("hard promotion requires three uncensored episode sources")
         if _is_strategic_blocking_rule(rule):
             if strategic_ab is None or strategic_ab.paired_seed_count < 3:
                 raise ValueError("strategic hard promotion requires three paired seeds")
@@ -124,3 +136,17 @@ def _is_strategic_blocking_rule(rule: PlaybookRule) -> bool:
         PlaybookRuleCategory.MATCHUP_STRATEGY,
         PlaybookRuleCategory.MAP_SPECIFIC,
     } and rule.effect in {PlaybookRuleEffect.REQUIRE, PlaybookRuleEffect.FORBID}
+
+
+def _is_specific_rule(rule: PlaybookRule) -> bool:
+    contextual_fields = {
+        condition.field
+        for condition in rule.conditions
+        if condition.field in {
+            "threat_level",
+            "economy_status",
+            "army_readiness",
+            "alert",
+        }
+    }
+    return bool(contextual_fields) and bool(rule.action_names or rule.role_ids)

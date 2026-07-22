@@ -23,7 +23,7 @@ from rtscortex.policy.models import (
     PolicyActionClassification,
     PolicyObservationFixture,
 )
-from rtscortex.progress import GoalProgressVerifier, GoalSpec
+from rtscortex.progress import GoalProgressVerifier, GoalRequirementKind, GoalSpec
 from rtscortex.races import PROTOSS_PROFILE_DATA, RaceProfileData
 
 _MAPPINGS_BY_MACRO = {mapping.macro_action: mapping for mapping in HIMA_RUNTIME_MAPPINGS}
@@ -77,18 +77,54 @@ def macro_plan_from_hima(
         (assessment.ordinal, assessment.source_action): assessment for assessment in assessments
     }
     mappings_by_macro = _mappings_by_macro(profile)
-    steps = [
-        _macro_step(
-            step.ordinal,
-            step.canonical_action,
-            step.repeat,
-            assessment_by_step.get((step.ordinal, step.canonical_action)),
+    progress_specs = {spec.name: spec for spec in profile.progress_action_specs}
+    projected_counts: dict[tuple[GoalRequirementKind, str], int] = {}
+    steps: list[MacroStep] = []
+    for proposal_step in sorted(proposal.steps, key=lambda item: item.ordinal):
+        repeat = proposal_step.repeat
+        target_satisfied = False
+        mapping = mappings_by_macro.get(proposal_step.canonical_action)
+        if proposal_step.target_count is not None and mapping is not None:
+            spec = next(
+                (
+                    progress_specs[action]
+                    for action in mapping.runtime_actions
+                    if action in progress_specs
+                ),
+                None,
+            )
+            if spec is not None:
+                key = (spec.effect_kind, spec.effect_target.casefold())
+                current = projected_counts.setdefault(
+                    key,
+                    _state_effect_count(
+                        projection_observation,
+                        spec.effect_kind,
+                        spec.effect_target,
+                    ),
+                )
+                repeat = max(proposal_step.target_count - current, 0)
+                target_satisfied = repeat == 0
+                projected_counts[key] = max(current, proposal_step.target_count)
+        macro_step = _macro_step(
+            proposal_step.ordinal,
+            proposal_step.canonical_action,
+            max(1, repeat),
+            assessment_by_step.get(
+                (proposal_step.ordinal, proposal_step.canonical_action)
+            ),
             mappings_by_macro=mappings_by_macro,
             managed_worker_action=f"TRAIN {profile.worker_type.upper()}",
             controller_managed_actions=frozenset(profile.controller_managed_actions),
         )
-        for step in sorted(proposal.steps, key=lambda item: item.ordinal)
-    ]
+        if target_satisfied:
+            macro_step = macro_step.model_copy(
+                update={
+                    "status": MacroStepStatus.OBSOLETE,
+                    "reason": "cumulative_target_already_satisfied",
+                }
+            )
+        steps.append(macro_step)
     metadata = proposal.generation_metadata
     raw_proposal = response.model_dump(mode="json")
     plan_digest = sha256(
@@ -316,6 +352,27 @@ def _mappings_by_macro(profile: RaceProfileData) -> dict[str, HIMAMacroMapping]:
     if profile is PROTOSS_PROFILE_DATA:
         return _MAPPINGS_BY_MACRO
     return {mapping.macro_action: mapping for mapping in hima_runtime_mappings(profile.race.value)}
+
+
+def _state_effect_count(
+    observation: ObservationEnvelope,
+    effect_kind: GoalRequirementKind,
+    target: str,
+) -> int:
+    canonical_target = target.casefold().replace("_", "")
+    if effect_kind is GoalRequirementKind.STRUCTURE:
+        values = observation.state.own_structures
+    elif effect_kind is GoalRequirementKind.UNIT:
+        values = observation.state.own_units
+    else:
+        return sum(
+            upgrade.casefold().replace("_", "") == canonical_target
+            for upgrade in observation.state.upgrades
+        )
+    return sum(
+        unit.unit_type.casefold().replace("_", "") == canonical_target
+        for unit in values
+    )
 
 
 def _live_fixture(

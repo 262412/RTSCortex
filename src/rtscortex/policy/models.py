@@ -222,6 +222,11 @@ class MacroActionStep(PolicyModel):
     canonical_action: str = Field(min_length=1)
     category: Literal["train", "build", "research"]
     repeat: int = Field(default=1, ge=1)
+    target_count: int | None = Field(
+        default=None,
+        ge=1,
+        exclude_if=lambda value: value is None,
+    )
     raw_token: str = Field(min_length=1)
 
 

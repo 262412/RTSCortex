@@ -164,6 +164,148 @@ def test_candidate_compiler_filters_friendly_attack_targets() -> None:
     assert [candidate.arguments for candidate in context.candidates] == [["0x20"]]
 
 
+def test_dead_enemy_is_not_a_situation_threat_or_attack_candidate() -> None:
+    base = _observation()
+    observation = base.model_copy(
+        update={
+            "state": base.state.model_copy(
+                update={
+                    "visible_enemies": [
+                        UnitState(
+                            unit_id="0x20",
+                            unit_type="Zergling",
+                            alliance="enemy",
+                            health_fraction=0.0,
+                        )
+                    ]
+                }
+            )
+        }
+    )
+    intent = TacticalIntent(
+        intent_id="intent-dead-target",
+        run_id=observation.run_id,
+        episode_id=observation.episode_id,
+        step_id=observation.step_id,
+        created_game_loop=observation.game_loop,
+        objective="Do not attack a dead target",
+        action_names=["Attack_Unit"],
+        actor_scopes=["CombatGroup/Army-1"],
+        target=IntentTarget(kind=IntentTargetKind.ENEMY, unit_type="Zergling"),
+        source_id="test",
+        source_version="1",
+    )
+
+    assessment = DeterministicSituationAnalyzer().assess(observation)
+
+    assert assessment.threat_level is ThreatLevel.NONE
+    assert assessment.visible_enemy_force.total_units == 0
+    assert CandidateCompiler().compile(observation, intent).candidates == []
+
+
+def test_retreat_state_is_actor_local_and_cools_down_after_arrival() -> None:
+    base = _observation()
+    observation = base.model_copy(
+        update={
+            "state": base.state.model_copy(
+                update={
+                    "own_units": [
+                        UnitState(
+                            unit_id="0x10",
+                            unit_type="Adept",
+                            alliance="self",
+                            position=(50.0, 50.0),
+                            health_fraction=0.2,
+                        ),
+                        UnitState(
+                            unit_id="0x11",
+                            unit_type="VoidRay",
+                            alliance="self",
+                            position=(48.0, 50.0),
+                        ),
+                    ],
+                    "own_structures": [
+                        UnitState(
+                            unit_id="0x12",
+                            unit_type="Nexus",
+                            alliance="self",
+                            position=(10.0, 10.0),
+                        )
+                    ],
+                }
+            ),
+            "available_actions": [
+                AvailableAction(
+                    name="Move_Minimap",
+                    argument_names=["minimap"],
+                    argument_types=[ActionArgumentType.POSITION],
+                    actor_scopes=[
+                        "CombatGroup7/Adept-1",
+                        "CombatGroup8/VoidRay-1",
+                    ],
+                    argument_candidates=[[[90, 90]], [[12, 12]]],
+                ),
+                AvailableAction(
+                    name="Attack_Unit",
+                    argument_names=["tag"],
+                    argument_types=[ActionArgumentType.TAG],
+                    actor_scopes=[
+                        "CombatGroup7/Adept-1",
+                        "CombatGroup8/VoidRay-1",
+                    ],
+                    argument_candidates=[["0x20"]],
+                ),
+            ],
+        }
+    )
+    agent = DeterministicTacticalAgent(
+        retreat_health_threshold=0.3,
+        minimum_advance_army_supply=4,
+        retreat_cooldown_game_loops=112,
+    )
+
+    first = agent.evaluate(
+        observation,
+        DeterministicSituationAnalyzer().assess(observation),
+    )
+    next_tick = observation.model_copy(update={"step_id": 5, "game_loop": 65})
+    second = agent.evaluate(
+        next_tick,
+        DeterministicSituationAnalyzer().assess(next_tick),
+    )
+    arrived = next_tick.model_copy(
+        update={
+            "step_id": 6,
+            "game_loop": 80,
+            "state": next_tick.state.model_copy(
+                update={
+                    "own_units": [
+                        next_tick.state.own_units[0].model_copy(
+                            update={"position": (12.0, 12.0)}
+                        ),
+                        next_tick.state.own_units[1],
+                    ]
+                }
+            ),
+        }
+    )
+    third = agent.evaluate(
+        arrived,
+        DeterministicSituationAnalyzer().assess(arrived),
+    )
+
+    assert {(item.actor_scopes[0], item.action_names[0]) for item in first} == {
+        ("CombatGroup7/Adept-1", "Move_Minimap"),
+        ("CombatGroup8/VoidRay-1", "Attack_Unit"),
+    }
+    assert [(item.actor_scopes[0], item.action_names[0]) for item in second] == [
+        ("CombatGroup8/VoidRay-1", "Attack_Unit")
+    ]
+    assert [(item.actor_scopes[0], item.action_names[0]) for item in third] == [
+        ("CombatGroup8/VoidRay-1", "Attack_Unit")
+    ]
+
+
 def test_tactical_agent_focuses_one_target_and_reacquires_when_it_disappears() -> None:
     observation = _observation().model_copy(
         update={

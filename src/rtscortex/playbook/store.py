@@ -199,7 +199,16 @@ class PlaybookStore:
             ),
             key=lambda rule: (-rule.confidence, rule.rule_id),
         )[:8]
-        return tuple([*hard, *soft, *advisory])
+        candidates = sorted(
+            (
+                rule
+                for rule in rules
+                if rule.status is PlaybookRuleStatus.CANDIDATE
+                and bool(rule.action_names or rule.role_ids)
+            ),
+            key=lambda rule: (-rule.confidence, rule.rule_id),
+        )[:16]
+        return tuple([*hard, *soft, *candidates, *advisory])
 
     def record_rule_application(self, application: PlaybookRuleApplication) -> bool:
         with self._lock:
@@ -217,8 +226,24 @@ class PlaybookStore:
                     application.model_dump_json(),
                 ),
             )
+            inserted = cursor.rowcount == 1
+            if inserted and application.matched:
+                row = self._connection.execute(
+                    "SELECT payload_json FROM playbook_rules_v2 WHERE rule_id = ?",
+                    (application.rule_id,),
+                ).fetchone()
+                if row is not None:
+                    rule = PlaybookRule.model_validate_json(str(row["payload_json"]))
+                    if rule.status is PlaybookRuleStatus.CANDIDATE:
+                        updated = rule.model_copy(
+                            update={"shadow_state_count": rule.shadow_state_count + 1}
+                        )
+                        self._connection.execute(
+                            "UPDATE playbook_rules_v2 SET payload_json = ? WHERE rule_id = ?",
+                            (updated.model_dump_json(), updated.rule_id),
+                        )
             self._connection.commit()
-        return cursor.rowcount == 1
+        return inserted
 
     def rule_applications(
         self,
@@ -458,6 +483,14 @@ def _candidate_rule(lesson: PlaybookLesson, source_case: DecisionCase) -> Playbo
         source_case_ids=(source_case.case_id,),
         source_run_ids=(source_case.run_id,),
         source_seeds=((int(seed),) if isinstance(seed, int) else ()),
+        censored_source_run_ids=(
+            (source_case.run_id,) if source_case.evidence.get("censored") is True else ()
+        ),
+        censored_source_seeds=(
+            (int(seed),)
+            if source_case.evidence.get("censored") is True and isinstance(seed, int)
+            else ()
+        ),
         evidence={
             "lesson_id": lesson.lesson_id,
             "statement": lesson.statement,
@@ -518,6 +551,22 @@ def _merge_rule_evidence(existing: PlaybookRule, incoming: PlaybookRule) -> Play
             ),
             "source_run_ids": source_run_ids,
             "source_seeds": tuple(dict.fromkeys((*existing.source_seeds, *incoming.source_seeds))),
+            "censored_source_run_ids": tuple(
+                dict.fromkeys(
+                    (
+                        *existing.censored_source_run_ids,
+                        *incoming.censored_source_run_ids,
+                    )
+                )
+            ),
+            "censored_source_seeds": tuple(
+                dict.fromkeys(
+                    (
+                        *existing.censored_source_seeds,
+                        *incoming.censored_source_seeds,
+                    )
+                )
+            ),
             "contradiction_seeds": contradiction_seeds,
             "shadow_state_count": max(existing.shadow_state_count, incoming.shadow_state_count),
             "false_block_count": max(existing.false_block_count, incoming.false_block_count),

@@ -32,6 +32,7 @@ from rtscortex.playbook import (
     PlaybookIntentGuard,
     PlaybookQuery,
     PlaybookRule,
+    PlaybookRuleApplication,
     PlaybookRuleCategory,
     PlaybookRuleEffect,
     PlaybookRuleKind,
@@ -171,10 +172,12 @@ def test_playbook_promotes_only_repeated_outcome_backed_experience(tmp_path: Pat
         )
     )
     assert selection.lesson_ids == (second_lessons[0].lesson_id,)
-    executable = [rule for rule in playbook.rules() if rule.status is PlaybookRuleStatus.ACTIVE]
-    assert len(executable) == 1
-    assert executable[0].strength is PlaybookRuleStrength.SOFT
-    assert executable[0].source_run_ids == ("run-1", "run-2")
+    candidate_rules = [
+        rule for rule in playbook.rules() if rule.status is PlaybookRuleStatus.CANDIDATE
+    ]
+    assert len(candidate_rules) == 1
+    assert candidate_rules[0].strength is PlaybookRuleStrength.ADVISORY
+    assert candidate_rules[0].source_run_ids == ("run-1", "run-2")
 
     first_store.close()
     second_store.close()
@@ -247,6 +250,22 @@ def test_strategic_consequence_iterates_into_next_match_intent_scoring(
         and lesson.consequence_type.value == "threat_unanswered"
     )
     assert repeated_lesson.status is LessonStatus.CANDIDATE
+
+    for index in range(48):
+        playbook.record_rule_application(
+            PlaybookRuleApplication(
+                application_id=f"shadow:{index}",
+                rule_id=repeated_same_seed.rule_id,
+                run_id="shadow-run",
+                episode_id="shadow-episode",
+                step_id=index,
+                game_loop=index,
+                target_kind="intent",
+                target_id=f"intent:{index}",
+                matched=True,
+                reason="candidate_shadow_match",
+            )
+        )
 
     store, result = _persistent_threat_episode(tmp_path, "threat-run-3", seed=1)
     reviewer.review_episode(

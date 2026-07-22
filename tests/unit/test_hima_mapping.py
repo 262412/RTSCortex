@@ -173,10 +173,10 @@ def test_hima_protoss_a_fixed_outputs_have_expanded_mapping_golden() -> None:
     assert evaluated_fixture_ids == list(fixtures)
     assert effective_counts == {
         "parse_error": 1,
-        "unsupported_by_runtime": 987,
+        "unsupported_by_runtime": 981,
         "mapped_future": 587,
         "mapped_legal_now": 14,
-        "mapped_deferred": 98,
+        "mapped_deferred": 97,
     }
     assert (
         sum(
@@ -189,9 +189,9 @@ def test_hima_protoss_a_fixed_outputs_have_expanded_mapping_golden() -> None:
                 "obsolete",
             )
         )
-        == 699
+        == 698
     )
-    assert sum(effective_counts.values()) == 1_687
+    assert sum(effective_counts.values()) == 1_680
 
 
 def test_mapper_binds_frontier_actor_and_candidate_from_observation() -> None:

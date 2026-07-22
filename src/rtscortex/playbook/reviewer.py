@@ -230,7 +230,10 @@ class CortexPlaybookReviewer:
             for rule in self.store.rules()
             if rules_before.get(rule.canonical_key) != rule.model_dump_json()
         )
-        return cases, lessons
+        deduplicated_lessons = {
+            (lesson.signature, result.episode_id): lesson for lesson in lessons
+        }
+        return cases, list(deduplicated_lessons.values())
 
     def _record_contradictions(
         self,
@@ -310,13 +313,19 @@ class CortexPlaybookReviewer:
             if (
                 bool(rule.action_names or rule.role_ids)
                 and rule.status is PlaybookRuleStatus.CANDIDATE
-                and rule.category is not PlaybookRuleCategory.EXECUTION_GUARD
                 and len(set(rule.source_run_ids)) >= 2
                 and len(set(rule.source_seeds)) >= 2
                 and rule.confidence >= 0.75
                 and rule.contradiction_count == 0
+                and rule.shadow_state_count >= 48
+                and rule.false_block_rate <= 0.05
             ):
-                self.store.upsert_rule(self._rule_lifecycle.promote_to_soft(rule))
+                try:
+                    promoted = self._rule_lifecycle.promote_to_soft(rule)
+                except ValueError:
+                    pass
+                else:
+                    self.store.upsert_rule(promoted)
         return lesson
 
 
@@ -529,6 +538,7 @@ def _consequence_case(
             "role": role,
             "condition_values": condition_values,
             "source_event_ids": list(consequence.source_event_ids),
+            "censored": consequence.censored,
         },
         episode_outcome=result.outcome.value,
         confidence=consequence.confidence,

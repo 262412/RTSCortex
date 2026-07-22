@@ -59,6 +59,7 @@ from rtscortex_llm_pysc2.worker import (
     _scenario_config,
     _semantic_target_failure,
     _should_block_gas_rebalance,
+    _suppress_pending_build_control_action,
     _translate_worker_owned_zero_argument_primitive,
     _translated_build_position,
     _translation_failure_code,
@@ -975,6 +976,21 @@ def test_auto_worker_management_guard_restores_flag_after_upstream_error() -> No
 
     assert config.ENABLE_AUTO_WORKER_MANAGE is True
     assert config.ENABLE_AUTO_WORKER_TRAINING is True
+
+
+def test_pending_build_suppresses_order_interrupting_hold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "rtscortex_llm_pysc2.worker._no_op",
+        lambda: SimpleNamespace(function=0),
+    )
+    original = SimpleNamespace(function=274)
+
+    suppressed = _suppress_pending_build_control_action(original, blocked=True)
+
+    assert suppressed.function == 0
+    assert _suppress_pending_build_control_action(original, blocked=False) is original
 
 
 def test_deterministic_gas_rebalance_selects_nearest_stable_mineral_worker() -> None:
@@ -3327,6 +3343,29 @@ def test_nexus_candidates_require_scouted_visible_resource_cluster() -> None:
         observation,
         "Build_Nexus_Near",
         unit_names={59: "Nexus", 341: "MineralField"},
+    ) == [[101]]
+
+
+def test_nexus_candidate_survives_camera_move_via_persistent_world_anchor() -> None:
+    observation, feature_resources, _ = _nexus_candidate_observation()
+    extractor = TimeStepExtractor(
+        "run",
+        "episode",
+        unit_names={59: "Nexus", 341: "MineralField"},
+    )
+    extractor._remember_expansion_resources(  # noqa: SLF001 - persistence contract test
+        observation.raw_units,
+        feature_resources,
+    )
+    observation.feature_units = []
+
+    assert semantic_argument_candidates(
+        observation,
+        "Build_Nexus_Near",
+        unit_names={59: "Nexus", 341: "MineralField"},
+        known_expansion_resources=tuple(
+            extractor._known_expansion_resources.values()  # noqa: SLF001
+        ),
     ) == [[101]]
 
 

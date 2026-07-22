@@ -26,6 +26,7 @@ from rtscortex.cortex.models import (
     TacticalIntent,
 )
 from rtscortex.progress import GoalProgressReport
+from rtscortex.targeting import living_targetable_enemies
 
 
 class CandidateCompilationError(ValueError):
@@ -189,7 +190,7 @@ def _candidate_arguments(
         return candidates
     enemy_by_tag = {
         _normalize_tag(enemy.unit_id): enemy
-        for enemy in observation.state.visible_enemies
+        for enemy in living_targetable_enemies(observation.state.visible_enemies)
         if enemy.unit_type == intent.target.unit_type
     }
     return sorted(
@@ -258,7 +259,10 @@ def _candidate_is_semantically_valid(
     ):
         return False
     target = _normalize_tag(candidate.arguments[0])
-    return target in {_normalize_tag(enemy.unit_id) for enemy in observation.state.visible_enemies}
+    return target in {
+        _normalize_tag(enemy.unit_id)
+        for enemy in living_targetable_enemies(observation.state.visible_enemies)
+    }
 
 
 def _command_from_candidate(

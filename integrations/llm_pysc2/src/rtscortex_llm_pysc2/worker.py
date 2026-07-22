@@ -6,7 +6,7 @@ import copy
 import importlib
 import os
 import time
-from collections.abc import Callable, Collection, Mapping
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, replace
 from functools import partial
 from numbers import Integral
@@ -48,7 +48,8 @@ from rtscortex_llm_pysc2.protocol import RuntimeClient
 from rtscortex_llm_pysc2.research import RESEARCH_SPECS, research_spec
 
 PRODUCTION_CAMERA_SETTLE_MAX_OBSERVATIONS = 4
-PRODUCTION_SELECTION_MAX_ATTEMPTS = 4
+PRODUCTION_SELECTION_MAX_ATTEMPTS = 8
+ORDER_INTERRUPT_CONTROL_FUNCTION_IDS = frozenset({274, 453, 454, 455, 456, 558, 559, 571})
 BUILD_SELECTION_RETRY_MAX_OBSERVATIONS = 2
 ACTOR_SELECTION_MAX_ATTEMPTS = 8
 BUILD_TRANSLATOR_RETRY_FAILURE_CODES = frozenset(
@@ -356,6 +357,11 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
                 action,
                 obs.observation,
                 self.unit_names,
+                known_expansion_resources=getattr(
+                    self,
+                    "_rtscortex_known_expansion_resources",
+                    (),
+                ),
             )
             if semantic_failure is not None:
                 semantic_failure_code, semantic_failure_reason = semantic_failure
@@ -1245,6 +1251,10 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
             blocked=(effect_verification_blocked or watchdog_preempted or runtime_observation_due),
             upstream_step=lambda: upstream_step(obs),
         )
+        action = _suppress_pending_build_control_action(
+            action,
+            blocked=effect_verification_blocked,
+        )
         self._consume_execution_aborts(obs)
         if getattr(action, "function", None) == 0:
             self.transport_noop_primitives += 1
@@ -1802,6 +1812,16 @@ def _run_with_auto_worker_management_guard(
     finally:
         config.ENABLE_AUTO_WORKER_MANAGE = worker_management_enabled
         config.ENABLE_AUTO_WORKER_TRAINING = worker_training_enabled
+
+
+def _suppress_pending_build_control_action(action: Any, *, blocked: bool) -> Any:
+    """Do not let upstream Stop/Hold cancel an accepted construction order."""
+
+    if not blocked or int(getattr(action, "function", -1)) not in (
+        ORDER_INTERRUPT_CONTROL_FUNCTION_IDS
+    ):
+        return action
+    return _no_op()
 
 
 def _should_block_gas_rebalance(
@@ -2707,8 +2727,20 @@ def _production_reselection_position(
         x = int(_observation_value(unit, "x", 0))
         y = int(_observation_value(unit, "y", 0))
         radius = float(_observation_value(unit, "radius", 1.0))
-        offset = max(1, int(round(radius * 0.5)))
-        offsets = ((-offset, -offset), (offset, -offset), (-offset, offset), (offset, offset))
+        offset = max(2, int(round(radius * 0.5)))
+        half = max(1, offset // 2)
+        offsets = (
+            (-offset, -offset),
+            (offset, -offset),
+            (-offset, offset),
+            (offset, offset),
+            (0, -offset),
+            (offset, 0),
+            (0, offset),
+            (-offset, 0),
+            (-half, -half),
+            (half, half),
+        )
         dx, dy = offsets[attempt % len(offsets)]
         return (
             min(max(1, x + dx), size_screen - 2),
@@ -3046,6 +3078,8 @@ def _semantic_target_failure(
     action: Mapping[str, Any],
     observation: Any,
     unit_names: Mapping[int, str],
+    *,
+    known_expansion_resources: Sequence[Any] = (),
 ) -> Optional[tuple[str, str]]:
     action_name = str(action.get("name", ""))
     if action_name not in {
@@ -3060,6 +3094,7 @@ def _semantic_target_failure(
         observation,
         action_name,
         unit_names=unit_names,
+        known_expansion_resources=known_expansion_resources,
     )
     if action_name in BUILD_SPECS and action_name.endswith("_Screen"):
         requested = _screen_argument(action)

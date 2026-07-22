@@ -297,6 +297,7 @@ def semantic_argument_candidates(
     *,
     unit_names: Mapping[int, str],
     builder_tags: Optional[Collection[int]] = None,
+    known_expansion_resources: Sequence[Any] = (),
 ) -> Optional[list[list[Any]]]:
     """Return the single semantic candidate domain used at observe and dispatch time."""
 
@@ -306,6 +307,7 @@ def semantic_argument_candidates(
         unit_names=unit_names,
         include_home_minimap=True,
         builder_tags=builder_tags,
+        known_expansion_resources=known_expansion_resources,
     )
 
 
@@ -503,6 +505,7 @@ class TimeStepExtractor:
             int(function_id): int(unit_type)
             for function_id, unit_type in (action_source_types or {}).items()
         }
+        self._known_expansion_resources: dict[int, dict[str, Any]] = {}
 
     def extract(
         self,
@@ -518,6 +521,14 @@ class TimeStepExtractor:
             raise ValueError("PySC2 observation has no player data")
 
         raw_units = list(_value(observation, "raw_units", ()))
+        self._remember_expansion_resources(
+            raw_units,
+            _value(observation, "feature_units", ()),
+        )
+        for agent in agents.values():
+            agent._rtscortex_known_expansion_resources = tuple(
+                self._known_expansion_resources.values()
+            )
         teams = _extract_team_actions(
             agents,
             fallback_observation=observation,
@@ -553,6 +564,40 @@ class TimeStepExtractor:
             "alerts": [_alert_name(value) for value in _value(observation, "alerts", ())],
             "image_uri": None,
         }
+
+    def _remember_expansion_resources(
+        self,
+        raw_units: Sequence[Any],
+        feature_units: Sequence[Any],
+    ) -> None:
+        """Persist scouted neutral resource anchors in world coordinates."""
+
+        scouted_tags = {
+            int(_value(unit, "tag", 0))
+            for unit in feature_units
+            if int(_value(unit, "alliance", 0)) == 3
+            and bool(_value(unit, "is_on_screen", True))
+            and int(_value(unit, "display_type", 1)) == 1
+        }
+        for unit in raw_units:
+            tag = int(_value(unit, "tag", 0))
+            name = _unit_name(unit, self.unit_names)
+            if (
+                tag <= 0
+                or tag not in scouted_tags
+                or int(_value(unit, "alliance", 0)) != 3
+                or not (_is_gas(name) or _is_mineral(name))
+                or int(_value(unit, "display_type", 1)) != 1
+            ):
+                continue
+            self._known_expansion_resources[tag] = {
+                "tag": tag,
+                "unit_type": name,
+                "alliance": 3,
+                "x": float(_value(unit, "x", 0.0)),
+                "y": float(_value(unit, "y", 0.0)),
+                "display_type": 1,
+            }
 
     def _extract_unit(self, unit: Any) -> dict[str, Any]:
         unit_type = int(_value(unit, "unit_type", 0))
@@ -891,6 +936,11 @@ def _available_team_actions(
                 if agent.name == "Builder" and build_spec is not None
                 else None
             ),
+            known_expansion_resources=getattr(
+                agent,
+                "_rtscortex_known_expansion_resources",
+                (),
+            ),
         )
         if (
             agent.name == "Builder"
@@ -1033,6 +1083,7 @@ def _argument_candidates(
     unit_names: Mapping[int, str],
     include_home_minimap: bool,
     builder_tags: Optional[Collection[int]] = None,
+    known_expansion_resources: Sequence[Any] = (),
 ) -> Optional[list[list[Any]]]:
     if action_name == INJECT_ACTION:
         return [
@@ -1119,7 +1170,14 @@ def _argument_candidates(
                 target_structure=spec.target_structure,
             )
         ]
-    return [[tag] for tag in _expansion_anchor_candidates(observation, unit_names)]
+    return [
+        [tag]
+        for tag in _expansion_anchor_candidates(
+            observation,
+            unit_names,
+            known_resources=known_expansion_resources,
+        )
+    ]
 
 
 def _action_function_ids(action: Mapping[str, Any]) -> tuple[int, ...]:
@@ -1429,6 +1487,8 @@ def _gas_structure_candidates(
 def _expansion_anchor_candidates(
     observation: Any,
     unit_names: Mapping[int, str],
+    *,
+    known_resources: Sequence[Any] = (),
 ) -> list[int]:
     raw_units = list(_value(observation, "raw_units", ()))
     visible_resource_tags = {
@@ -1438,13 +1498,17 @@ def _expansion_anchor_candidates(
         and bool(_value(unit, "is_on_screen", True))
         and int(_value(unit, "display_type", 1)) == 1
     }
-    resources = [
-        unit
-        for unit in raw_units
+    known_resource_tags = {
+        int(_value(unit, "tag", 0)) for unit in known_resources
+    }
+    resources_by_tag = {
+        int(_value(unit, "tag", 0)): unit
+        for unit in (*known_resources, *raw_units)
         if int(_value(unit, "alliance", 0)) == 3
         and (_is_gas(_unit_name(unit, unit_names)) or _is_mineral(_unit_name(unit, unit_names)))
         and int(_value(unit, "tag", 0)) > 0
-    ]
+    }
+    resources = list(resources_by_tag.values())
     if not resources:
         return []
     parent = list(range(len(resources)))
@@ -1479,15 +1543,6 @@ def _expansion_anchor_candidates(
     for cluster in clusters.values():
         if sum(_is_mineral(_unit_name(unit, unit_names)) for unit in cluster) < 5:
             continue
-        if (
-            sum(
-                _is_mineral(_unit_name(unit, unit_names))
-                and int(_value(unit, "tag", 0)) in visible_resource_tags
-                for unit in cluster
-            )
-            < 5
-        ):
-            continue
         center_x = sum(float(_value(unit, "x", 0.0)) for unit in cluster) / len(cluster)
         center_y = sum(float(_value(unit, "y", 0.0)) for unit in cluster) / len(cluster)
         if any(_point_distance(center_x, center_y, townhall) < 12.0 for townhall in townhalls):
@@ -1500,9 +1555,9 @@ def _expansion_anchor_candidates(
             ),
         )
         anchor_tag = int(_value(anchor, "tag", 0))
-        if anchor_tag not in visible_resource_tags:
+        if anchor_tag not in visible_resource_tags | known_resource_tags:
             continue
-        if not _nexus_anchor_has_legal_screen_placement(
+        if anchor_tag in visible_resource_tags and not _nexus_anchor_has_legal_screen_placement(
             observation,
             anchor_tag,
             unit_names,

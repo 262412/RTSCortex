@@ -150,13 +150,24 @@ def _types(
     }
 
 
-def test_attribution_requires_a_completed_match() -> None:
+def test_attribution_marks_truncated_match_consequences_as_censored() -> None:
     events = [
         _situation(1, 1_000, threat="high"),
         _situation(2, 1_200, threat="high"),
     ]
 
-    assert _types(events, EpisodeOutcome.TRUNCATED) == set()
+    consequences = StrategicConsequenceAttributor().attribute(
+        events,
+        _result(EpisodeOutcome.TRUNCATED),
+        agent_race="protoss",
+        opponent_race="zerg",
+    )
+
+    assert {item.consequence_type for item in consequences} == {
+        StrategicConsequenceType.THREAT_UNANSWERED
+    }
+    assert all(item.censored for item in consequences)
+    assert all(item.confidence <= 0.7 for item in consequences)
 
 
 def test_attribution_does_not_invent_missing_force_or_base_facts() -> None:

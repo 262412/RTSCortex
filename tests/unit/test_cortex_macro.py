@@ -6,6 +6,7 @@ from rtscortex.contracts import (
     ActionArgumentType,
     AvailableAction,
     ObservationEnvelope,
+    UnitState,
 )
 from rtscortex.cortex import (
     MacroStepStatus,
@@ -91,6 +92,32 @@ def test_macro_plan_projection_is_deterministic_and_preserves_step_semantics() -
     assert first.steps[1].runtime_actions == ["Build_Pylon_Screen"]
     assert first.steps[2].status is MacroStepStatus.PENDING
     assert first.steps[2].reason == "future_horizon_not_evaluated"
+
+
+def test_counted_hima_action_projects_only_remaining_cumulative_target() -> None:
+    observation = _pylon_observation().model_copy(
+        update={
+            "state": _pylon_observation().state.model_copy(
+                update={
+                    "own_structures": [
+                        UnitState(
+                            unit_id="pylon-1",
+                            unit_type="Pylon",
+                            alliance="self",
+                        )
+                    ]
+                }
+            )
+        }
+    )
+    response = _response('Actions: ["Pylon": 3]').model_copy(
+        update={"step_id": observation.step_id, "game_loop": observation.game_loop}
+    )
+
+    plan = macro_plan_from_hima(response, observation, ttl_game_loops=448)
+
+    assert plan.steps[0].repeat == 2
+    assert plan.steps[0].status is MacroStepStatus.PENDING
 
 
 def test_terran_mule_remains_in_lineage_but_is_managed_outside_goal_progress() -> None:

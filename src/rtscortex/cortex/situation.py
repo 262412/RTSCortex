@@ -21,6 +21,7 @@ from rtscortex.cortex.models import (
     SpatialAssessment,
     ThreatLevel,
 )
+from rtscortex.targeting import living_targetable_enemies
 
 _TECH_STRUCTURES = frozenset(
     {
@@ -163,7 +164,7 @@ class DeterministicSituationAnalyzer:
         if episode_key != self._episode_key:
             self._episode_key = episode_key
             self._last_enemy_seen_game_loop = None
-        enemies = observation.state.visible_enemies
+        enemies = living_targetable_enemies(observation.state.visible_enemies)
         if enemies:
             self._last_enemy_seen_game_loop = observation.game_loop
         alerts = {alert.casefold() for alert in observation.alerts}
@@ -173,7 +174,7 @@ class DeterministicSituationAnalyzer:
             for marker in ("under_attack", "under attack", "base_attack")
         )
         army_supply = observation.state.economy.army_supply
-        phase = self._phase(observation, under_attack=under_attack)
+        phase = self._phase(observation, enemies=enemies, under_attack=under_attack)
         threat_level = self._threat_level(len(enemies), under_attack=under_attack)
         economy = observation.state.economy
         if economy.minerals >= 800 or economy.vespene >= 500:
@@ -280,9 +281,14 @@ class DeterministicSituationAnalyzer:
         )
 
     @staticmethod
-    def _phase(observation: ObservationEnvelope, *, under_attack: bool) -> GamePhase:
+    def _phase(
+        observation: ObservationEnvelope,
+        *,
+        enemies: Sequence[UnitState],
+        under_attack: bool,
+    ) -> GamePhase:
         state = observation.state
-        if under_attack or (state.visible_enemies and state.economy.army_supply > 0):
+        if under_attack or (enemies and state.economy.army_supply > 0):
             return GamePhase.COMBAT
         structure_types = {structure.unit_type for structure in state.own_structures}
         if state.upgrades or structure_types.intersection(_TECH_STRUCTURES):

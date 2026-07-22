@@ -484,6 +484,34 @@ def test_playbook_promotion_rejects_untyped_execution_penalty() -> None:
         PlaybookRuleLifecycle().promote_to_soft(rule)
 
 
+def test_playbook_hard_promotion_rejects_only_censored_sources() -> None:
+    rule = PlaybookRule(
+        rule_id="rule:censored",
+        canonical_key="censored",
+        category=PlaybookRuleCategory.TACTICAL_RESPONSE,
+        conditions=(PlaybookCondition(field="threat_level", value="low"),),
+        effect=PlaybookRuleEffect.AVOID,
+        strength=PlaybookRuleStrength.SOFT,
+        status=PlaybookRuleStatus.ACTIVE,
+        role_ids=("retreat",),
+        confidence=0.95,
+        source_run_ids=("run-0", "run-1", "run-2"),
+        source_seeds=(0, 1, 2),
+        censored_source_run_ids=("run-0", "run-1", "run-2"),
+        censored_source_seeds=(0, 1, 2),
+        code_revision="revision",
+        sc2_patch="4.10",
+        shadow_state_count=48,
+    )
+
+    with pytest.raises(ValueError, match="uncensored"):
+        PlaybookRuleLifecycle().promote_to_hard(
+            rule,
+            current_code_revision="revision",
+            current_sc2_patch="4.10",
+        )
+
+
 def test_playbook_contradictions_require_distinct_seeds() -> None:
     rule = PlaybookRule(
         rule_id="rule:test",

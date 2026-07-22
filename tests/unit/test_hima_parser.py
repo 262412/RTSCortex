@@ -125,7 +125,8 @@ def test_parser_reads_hima_counted_actions_list_without_fuzzy_matching() -> None
         "TRAIN VOIDRAY",
         "BUILD SHIELDBATTERY",
     ]
-    assert [step.repeat for step in proposal.steps] == [1, 16, 2]
+    assert [step.repeat for step in proposal.steps] == [1, 1, 1]
+    assert [step.target_count for step in proposal.steps] == [1, 16, 2]
     assert [step.ordinal for step in proposal.steps] == [0, 1, 2]
     assert proposal.diagnostics == []
 
@@ -144,7 +145,8 @@ def test_parser_reads_hima_mixed_counted_and_bare_actions_list() -> None:
         "BUILD PYLON",
         "TRAIN VOIDRAY",
     ]
-    assert [step.repeat for step in proposal.steps] == [3, 14, 1, 1, 1, 1]
+    assert [step.repeat for step in proposal.steps] == [1, 1, 1, 1, 1, 1]
+    assert [step.target_count for step in proposal.steps] == [3, 14, 1, None, None, None]
     assert [step.ordinal for step in proposal.steps] == [0, 1, 2, 3, 4, 5]
     assert proposal.diagnostics == []
 
@@ -154,8 +156,21 @@ def test_parser_reports_invalid_counted_actions_repeat() -> None:
 
     assert proposal.steps == []
     assert [item.code for item in proposal.diagnostics] == [
-        "invalid_repeat",
-        "invalid_repeat",
+        "invalid_target_count",
+        "invalid_target_count",
+    ]
+
+
+def test_parser_recovers_hima_counted_list_with_object_closer() -> None:
+    proposal = HIMAProposalParser().parse('Actions: ["Pylon": 3, "VoidRay": 8}')
+
+    assert [step.canonical_action for step in proposal.steps] == [
+        "BUILD PYLON",
+        "TRAIN VOIDRAY",
+    ]
+    assert [step.target_count for step in proposal.steps] == [3, 8]
+    assert [item.code for item in proposal.diagnostics] == [
+        "malformed_actions_closer_recovered"
     ]
 
 

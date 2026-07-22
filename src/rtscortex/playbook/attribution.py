@@ -84,7 +84,7 @@ class _Trace:
 
 
 class StrategicConsequenceAttributor:
-    """Extract bounded strategic lessons only from completed win/loss/draw episodes."""
+    """Extract bounded strategic lessons from terminal or explicitly censored episodes."""
 
     attributor_id = "deterministic-strategic-consequence-attributor"
     attributor_version = "1.0.0"
@@ -105,6 +105,7 @@ class StrategicConsequenceAttributor:
             EpisodeOutcome.VICTORY,
             EpisodeOutcome.DEFEAT,
             EpisodeOutcome.DRAW,
+            EpisodeOutcome.TRUNCATED,
         }:
             return ()
         trace = _build_trace(events)
@@ -640,7 +641,12 @@ class StrategicConsequenceAttributor:
                 "attributor_id": self.attributor_id,
                 "attributor_version": self.attributor_version,
             },
-            confidence=confidence,
+            confidence=(
+                min(confidence, 0.7)
+                if result.outcome is EpisodeOutcome.TRUNCATED
+                else confidence
+            ),
+            censored=result.outcome is EpisodeOutcome.TRUNCATED,
         )
 
 

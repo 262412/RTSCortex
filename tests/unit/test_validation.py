@@ -241,6 +241,31 @@ def test_validator_rejects_friendly_and_non_visible_attack_targets() -> None:
     )
 
 
+def test_validator_rejects_zero_health_enemy_even_if_worker_candidate_is_stale() -> None:
+    base = make_observation()
+    observation = base.model_copy(
+        update={
+            "state": base.state.model_copy(
+                update={
+                    "visible_enemies": [
+                        base.state.visible_enemies[0].model_copy(
+                            update={"health_fraction": 0.0}
+                        )
+                    ]
+                }
+            )
+        }
+    )
+
+    outcome = ActionValidator(max_actions=1).validate(
+        [command("dead", arguments=["0x1"])],
+        observation,
+    )
+
+    assert outcome.accepted == []
+    assert outcome.rejected == ["dead: target_not_visible"]
+
+
 def test_validator_uses_actor_specific_argument_candidates_for_same_action() -> None:
     base = make_observation()
     observation = base.model_copy(

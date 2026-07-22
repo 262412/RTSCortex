@@ -140,7 +140,10 @@ def _evaluate(
     applicable = [
         rule
         for rule in rules
-        if rule.status in {PlaybookRuleStatus.LEGACY, PlaybookRuleStatus.ACTIVE}
+        if (
+            rule.status in {PlaybookRuleStatus.LEGACY, PlaybookRuleStatus.ACTIVE}
+            or rule.status is PlaybookRuleStatus.CANDIDATE
+        )
         and all(_matches(condition, values) for condition in rule.conditions)
     ]
     required = {
@@ -154,6 +157,7 @@ def _evaluate(
     applications: list[PlaybookRuleApplication] = []
     applied_ids: list[str] = []
     for rule in applicable:
+        shadow_candidate = rule.status is PlaybookRuleStatus.CANDIDATE
         action_key = _action_key(action_name)
         targets_action = not rule.action_names or action_key in {
             _action_key(action) for action in rule.action_names
@@ -177,9 +181,10 @@ def _evaluate(
                     and action_key not in required
                 )
                 rule_delta = 0.5 if matched and not rule_blocked else 0.0
-        effective_block = rule_blocked and mode == "active"
+        effective_block = rule_blocked and mode == "active" and not shadow_candidate
         blocked = blocked or effective_block
-        delta += rule_delta
+        if not shadow_candidate:
+            delta += rule_delta
         if matched or rule_blocked:
             applied_ids.append(rule.rule_id)
         if matched or rule_blocked or rule_delta:
@@ -200,7 +205,9 @@ def _evaluate(
                     blocked=effective_block,
                     score_delta=rule_delta,
                     reason=(
-                        "shadow_would_block"
+                        "candidate_shadow_match"
+                        if shadow_candidate
+                        else "shadow_would_block"
                         if rule_blocked and mode == "shadow"
                         else "rule_blocked"
                         if effective_block

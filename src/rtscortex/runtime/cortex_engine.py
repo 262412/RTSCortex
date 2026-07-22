@@ -2304,7 +2304,11 @@ class CortexRuntimeEngine(RuntimeEngine):
                 event_type="playbook_case_recorded",
                 payload=case,
             )
+        emitted_lesson_signatures: set[str] = set()
         for lesson in lessons:
+            if lesson.signature in emitted_lesson_signatures:
+                continue
+            emitted_lesson_signatures.add(lesson.signature)
             event_type = (
                 "playbook_lesson_promoted"
                 if lesson.status is LessonStatus.PROMOTED
