@@ -249,6 +249,7 @@ class EffectEvidence(ContractModel):
             "inject",
             "research",
             "ability",
+            "combat",
         ]
         | None
     ) = None
@@ -301,6 +302,8 @@ class EffectEvidence(ContractModel):
             "new_unit",
             "new_structure",
             "upgrade_observed",
+            "target_damaged",
+            "target_removed",
         ]
         | None
     ) = None
@@ -325,6 +328,9 @@ class EffectEvidence(ContractModel):
     observed_actor_position: tuple[float, float] | None = None
     actor_displacement: float | None = Field(default=None, ge=0)
     move_order_seen: bool = False
+    baseline_target_health: float | None = Field(default=None, ge=0)
+    observed_target_health: float | None = Field(default=None, ge=0)
+    target_health_delta: float | None = Field(default=None, ge=0)
 
 
 class ExecutionReport(ContractModel):

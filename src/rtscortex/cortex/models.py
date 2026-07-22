@@ -196,9 +196,11 @@ class IntentTargetKind(StrEnum):
 
 class IntentTarget(ContractModel):
     kind: IntentTargetKind = IntentTargetKind.NONE
+    unit_tag: str | None = None
     unit_type: str | None = None
     structure_type: str | None = None
     region: str | None = None
+    position: tuple[int, int] | None = None
 
 
 class _IntentBase(ContractModel):

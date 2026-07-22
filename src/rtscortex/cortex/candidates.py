@@ -180,18 +180,32 @@ def _candidate_arguments(
         return candidates
     if action.name == "Move_Minimap" and intent.target.kind is IntentTargetKind.RETREAT_REGION:
         return candidates[-1:]
+    if action.name == "Move_Minimap" and intent.target.position is not None:
+        target = list(intent.target.position)
+        return [
+            arguments
+            for arguments in candidates
+            if arguments and list(arguments[0]) == target
+        ]
     if (
         action.name == "Move_Minimap"
         and intent.target.kind is IntentTargetKind.ENEMY
         and len(candidates) > 1
     ):
         return candidates[:-1]
-    if action.name != "Attack_Unit" or intent.target.unit_type is None:
+    if action.name != "Attack_Unit":
         return candidates
     enemy_by_tag = {
         _normalize_tag(enemy.unit_id): enemy
         for enemy in living_targetable_enemies(observation.state.visible_enemies)
-        if enemy.unit_type == intent.target.unit_type
+        if (
+            intent.target.unit_type is None
+            or enemy.unit_type == intent.target.unit_type
+        )
+        and (
+            intent.target.unit_tag is None
+            or _normalize_tag(enemy.unit_id) == _normalize_tag(intent.target.unit_tag)
+        )
     }
     return sorted(
         (

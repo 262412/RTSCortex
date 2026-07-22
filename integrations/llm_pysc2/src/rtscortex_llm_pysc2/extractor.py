@@ -311,6 +311,27 @@ def semantic_argument_candidates(
     )
 
 
+def minimap_scout_candidates(observation: Any) -> list[list[int]]:
+    """Return unexplored pathable minimap points for camera scouting."""
+
+    return _movement_minimap_candidates(observation, include_home=False)
+
+
+def expansion_anchor_candidates(
+    observation: Any,
+    *,
+    unit_names: Mapping[int, str],
+    known_expansion_resources: Sequence[Any],
+) -> list[int]:
+    """Return persistent resource-cluster anchors independent of current camera position."""
+
+    return _expansion_anchor_candidates(
+        observation,
+        unit_names,
+        known_resources=known_expansion_resources,
+    )
+
+
 def is_production_action(action_name: str) -> bool:
     return action_name.startswith(PRODUCTION_ACTION_PREFIXES)
 
@@ -507,6 +528,25 @@ class TimeStepExtractor:
         }
         self._known_expansion_resources: dict[int, dict[str, Any]] = {}
 
+    @property
+    def known_expansion_resources(self) -> tuple[dict[str, Any], ...]:
+        return tuple(self._known_expansion_resources.values())
+
+    def observe_expansion_resources(
+        self,
+        observation: Any,
+        agents: Mapping[str, Any],
+    ) -> None:
+        """Update persistent anchors on every Worker frame, not only Runtime ticks."""
+
+        self._remember_expansion_resources(
+            list(_value(observation, "raw_units", ())),
+            _value(observation, "feature_units", ()),
+        )
+        known = self.known_expansion_resources
+        for agent in agents.values():
+            agent._rtscortex_known_expansion_resources = known
+
     def extract(
         self,
         timestep: Any,
@@ -521,14 +561,7 @@ class TimeStepExtractor:
             raise ValueError("PySC2 observation has no player data")
 
         raw_units = list(_value(observation, "raw_units", ()))
-        self._remember_expansion_resources(
-            raw_units,
-            _value(observation, "feature_units", ()),
-        )
-        for agent in agents.values():
-            agent._rtscortex_known_expansion_resources = tuple(
-                self._known_expansion_resources.values()
-            )
+        self.observe_expansion_resources(observation, agents)
         teams = _extract_team_actions(
             agents,
             fallback_observation=observation,

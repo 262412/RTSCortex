@@ -29,7 +29,9 @@ from rtscortex_llm_pysc2.extractor import (
     TimeStepExtractor,
     build_screen_candidates,
     builder_move_requires_power,
+    expansion_anchor_candidates,
     is_source_bound_action,
+    minimap_scout_candidates,
     nexus_placement_footprint_is_visible,
     production_source_tag,
     resolve_screen_build_world_target,
@@ -52,6 +54,8 @@ PRODUCTION_SELECTION_MAX_ATTEMPTS = 8
 ORDER_INTERRUPT_CONTROL_FUNCTION_IDS = frozenset({274, 453, 454, 455, 456, 558, 559, 571})
 BUILD_SELECTION_RETRY_MAX_OBSERVATIONS = 2
 ACTOR_SELECTION_MAX_ATTEMPTS = 8
+DEFAULT_ORCHESTRATION_PRIMITIVE_BUDGET = 16
+DEFAULT_EXPANSION_SCOUT_INTERVAL_GAME_LOOPS = 112
 BUILD_TRANSLATOR_RETRY_FAILURE_CODES = frozenset(
     {"blocked", "need_power", "not_pathable", "no_legal_placement"}
 )
@@ -98,6 +102,9 @@ class WorkerSettings:
     action_effect_timeout_game_loops: int = DEFAULT_ACTION_EFFECT_TIMEOUT_GAME_LOOPS
     observation_gap_watchdog_game_loops: int = DEFAULT_OBSERVATION_GAP_WATCHDOG_GAME_LOOPS
     observation_gap_hard_limit_game_loops: int = DEFAULT_OBSERVATION_GAP_HARD_LIMIT_GAME_LOOPS
+    orchestration_primitive_budget: int = DEFAULT_ORCHESTRATION_PRIMITIVE_BUDGET
+    expansion_scout_enabled: bool = True
+    expansion_scout_interval_game_loops: int = DEFAULT_EXPANSION_SCOUT_INTERVAL_GAME_LOOPS
     console_enabled: bool = False
     console_frame_fps: float = 2.0
     console_jpeg_quality: int = 75
@@ -145,6 +152,28 @@ class WorkerSettings:
             raise RuntimeError(
                 "RTSCORTEX_OBSERVATION_GAP_HARD_LIMIT_GAME_LOOPS must exceed the watchdog threshold"
             )
+        orchestration_primitive_budget = int(
+            os.environ.get(
+                "RTSCORTEX_ORCHESTRATION_PRIMITIVE_BUDGET",
+                str(DEFAULT_ORCHESTRATION_PRIMITIVE_BUDGET),
+            )
+        )
+        if orchestration_primitive_budget < 4:
+            raise RuntimeError("RTSCORTEX_ORCHESTRATION_PRIMITIVE_BUDGET must be at least 4")
+        expansion_scout_enabled = _environment_bool(
+            "RTSCORTEX_EXPANSION_SCOUT_ENABLED",
+            True,
+        )
+        expansion_scout_interval_game_loops = int(
+            os.environ.get(
+                "RTSCORTEX_EXPANSION_SCOUT_INTERVAL_GAME_LOOPS",
+                str(DEFAULT_EXPANSION_SCOUT_INTERVAL_GAME_LOOPS),
+            )
+        )
+        if expansion_scout_interval_game_loops < 16:
+            raise RuntimeError(
+                "RTSCORTEX_EXPANSION_SCOUT_INTERVAL_GAME_LOOPS must be at least 16"
+            )
         pause_until_first_plan = _environment_bool("RTSCORTEX_PAUSE_UNTIL_FIRST_PLAN", False)
         console_enabled = _environment_bool("RTSCORTEX_CONSOLE_ENABLED", False)
         console_frame_fps = float(os.environ.get("RTSCORTEX_CONSOLE_FRAME_FPS", "2"))
@@ -174,10 +203,55 @@ class WorkerSettings:
             action_effect_timeout_game_loops=action_effect_timeout_game_loops,
             observation_gap_watchdog_game_loops=observation_gap_watchdog_game_loops,
             observation_gap_hard_limit_game_loops=observation_gap_hard_limit_game_loops,
+            orchestration_primitive_budget=orchestration_primitive_budget,
+            expansion_scout_enabled=expansion_scout_enabled,
+            expansion_scout_interval_game_loops=expansion_scout_interval_game_loops,
             console_enabled=console_enabled,
             console_frame_fps=console_frame_fps,
             console_jpeg_quality=console_jpeg_quality,
         )
+
+
+class ExpansionScoutController:
+    """Issue bounded camera sweeps until a persistent expansion anchor is known."""
+
+    def __init__(self, *, interval_game_loops: int) -> None:
+        self.interval_game_loops = int(interval_game_loops)
+        self.last_scout_game_loop: Optional[int] = None
+        self.visited_waypoints: set[tuple[int, int]] = set()
+
+    def next_waypoint(
+        self,
+        observation: Any,
+        *,
+        game_loop: int,
+        anchor_available: bool,
+        blocked: bool,
+    ) -> Optional[tuple[int, int]]:
+        if anchor_available or blocked:
+            return None
+        if (
+            self.last_scout_game_loop is not None
+            and game_loop - self.last_scout_game_loop < self.interval_game_loops
+        ):
+            return None
+        candidates = [
+            (int(candidate[0]), int(candidate[1]))
+            for candidate in minimap_scout_candidates(observation)
+            if len(candidate) == 2
+        ]
+        if not candidates:
+            return None
+        waypoint = next(
+            (candidate for candidate in candidates if candidate not in self.visited_waypoints),
+            None,
+        )
+        if waypoint is None:
+            self.visited_waypoints.clear()
+            waypoint = candidates[0]
+        self.visited_waypoints.add(waypoint)
+        self.last_scout_game_loop = int(game_loop)
+        return waypoint
 
 
 class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
@@ -652,13 +726,37 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
                 )
             self._rtscortex_semantic_action = None
             return result
-        if accepted:
+        known_expansion_resources = getattr(
+            self,
+            "_rtscortex_known_expansion_resources",
+            (),
+        )
+        if accepted and dispatch.final_primitive:
+            semantic_failure = _semantic_target_failure(
+                candidate_action,
+                obs.observation,
+                self.unit_names,
+                known_expansion_resources=known_expansion_resources,
+            )
+            if semantic_failure is not None:
+                semantic_failure_code, semantic_failure_reason = semantic_failure
+                self.broker.settle_candidate_invalidation(
+                    dispatch,
+                    failure_code=semantic_failure_code,
+                    failure_reason=semantic_failure_reason,
+                    game_loop=_observation_game_loop(obs.observation),
+                )
+                self.func_list.clear()
+                self._rtscortex_semantic_action = None
+                return 0, _no_op()
+        if accepted and dispatch.final_primitive:
             candidate_failure = _candidate_dispatch_failure(
                 candidate_action,
                 obs.observation,
                 self.unit_names,
                 final_primitive=dispatch.final_primitive,
                 translated_position=translated_position,
+                known_expansion_resources=known_expansion_resources,
             )
             if candidate_failure is not None:
                 self.broker.reject_candidate_outside_dispatch(
@@ -1158,11 +1256,16 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
         self._pending_primitive_agent: Optional[Any] = None
         self._actor_selection_retry_key: Optional[tuple[str, str]] = None
         self._actor_selection_attempts = 0
+        self._orchestration_budget_key: Optional[tuple[str, str]] = None
+        self._orchestration_budget_used = 0
         self.transport_noop_primitives = 0
         self._observation_watchdog_active = False
         self._observation_watchdog_preempted = False
         self._observation_watchdog_baseline_loop: Optional[int] = None
         self._rtscortex_force_runtime_decision = False
+        self.expansion_scout = ExpansionScoutController(
+            interval_game_loops=self.worker_settings.expansion_scout_interval_game_loops
+        )
         self._episode_reported = False
         self.initial_planning_barrier = InitialPlanningBarrier()
         self.game_clock = (
@@ -1211,19 +1314,27 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
 
     def _step(self, obs: Any) -> Any:
         self._submit_console_frame(obs)
+        observation_loop = _observation_game_loop(obs.observation)
+        watchdog_preempted = self._update_observation_gap_watchdog(
+            observation_loop,
+            obs.observation,
+        )
         _abort_stalled_actor_selection(self)
+        _enforce_orchestration_primitive_budget(self, obs.observation)
         self._settle_previous_primitive(obs)
         self.decision_broker.observe_effects(obs.observation)
         if _is_terminal(obs):
             return _finish_terminal(self, obs, _base_agent_step, _no_op)
+        self.decision_broker.extractor.observe_expansion_resources(
+            obs.observation,
+            self.agents,
+        )
         _rebind_builder_to_selected_worker(self, obs.observation)
         _refresh_consumed_zerg_builder(self, obs.observation)
         _refresh_zerg_morphed_combat_teams(self, obs.observation)
-        observation_loop = _observation_game_loop(obs.observation)
         # RTSCortex consumes a global raw snapshot. Do not make every Runtime tick
         # wait for optional upstream camera/selection-based text gathering.
         _release_runtime_observation_barrier(self)
-        watchdog_preempted = self._update_observation_gap_watchdog(observation_loop)
         runtime_observation_due = _runtime_observation_is_due(
             observation_loop,
             last_decision_game_loop=self.decision_broker.last_decision_game_loop,
@@ -1245,6 +1356,19 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
             int(self.select_rect_threshold),
             max(1, int(self.size_screen)),
         )
+        scout_action = self._expansion_scout_action(
+            obs,
+            game_loop=observation_loop,
+            blocked=(
+                effect_verification_blocked
+                or runtime_observation_due
+                or watchdog_preempted
+            ),
+        )
+        if scout_action is not None:
+            if self.game_clock is not None:
+                self.game_clock.wait_for_step()
+            return scout_action
         upstream_step = super().step
         action = _run_with_auto_worker_management_guard(
             self.config,
@@ -1474,7 +1598,11 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
         self._pending_primitive = dispatch
         self._pending_primitive_agent = agent
 
-    def _update_observation_gap_watchdog(self, game_loop: int) -> bool:
+    def _update_observation_gap_watchdog(
+        self,
+        game_loop: int,
+        observation: Any = None,
+    ) -> bool:
         """Preempt optional upstream automation when Runtime observations stall."""
 
         last_decision_loop = self.decision_broker.last_decision_game_loop
@@ -1497,6 +1625,7 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
             self._observation_watchdog_baseline_loop = last_decision_loop
             self._rtscortex_force_runtime_decision = True
             self.decision_broker.record_observation_gap_watchdog_trigger()
+            _recover_observation_gap(self, observation)
         if (
             self._observation_watchdog_preempted
             and gap > self.worker_settings.observation_gap_hard_limit_game_loops
@@ -1511,6 +1640,42 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
         # worker management resume here can consume every subsequent SC2 step
         # and starve the next Runtime decision again.
         return self._observation_watchdog_preempted
+
+    def _expansion_scout_action(
+        self,
+        obs: Any,
+        *,
+        game_loop: int,
+        blocked: bool,
+    ) -> Optional[Any]:
+        if not self.worker_settings.expansion_scout_enabled:
+            return None
+        extractor = self.decision_broker.extractor
+        anchor_available = bool(
+            expansion_anchor_candidates(
+                obs.observation,
+                unit_names=extractor.unit_names,
+                known_expansion_resources=extractor.known_expansion_resources,
+            )
+        )
+        blocked = (
+            blocked
+            or self.decision_broker.last_decision_game_loop is None
+            or bool(getattr(self, "unit_uid_appear", ()))
+            or _worker_has_active_action(self)
+        )
+        waypoint = self.expansion_scout.next_waypoint(
+            obs.observation,
+            game_loop=game_loop,
+            anchor_available=anchor_available,
+            blocked=blocked,
+        )
+        if waypoint is None:
+            return None
+        actions = importlib.import_module("pysc2.lib.actions")
+        self._rtscortex_force_runtime_decision = True
+        self.decision_broker.record_expansion_scout_move()
+        return actions.FUNCTIONS.move_camera(list(waypoint))
 
     def _report_episode(self, obs: Any) -> None:
         reward = float(getattr(obs, "reward", 0.0) or 0.0)
@@ -2246,7 +2411,7 @@ def _abort_stalled_actor_selection(main_agent: Any) -> bool:
         return False
 
     command_id = str(getattr(dispatch, "command_id", ""))
-    team_name = str(getattr(agent, "team_unit_team_curr", "") or "")
+    team_name = _execution_team_name(agent) or ""
     key = (command_id, team_name)
     if key != getattr(main_agent, "_actor_selection_retry_key", None):
         main_agent._actor_selection_retry_key = key
@@ -2273,6 +2438,199 @@ def _abort_stalled_actor_selection(main_agent: Any) -> bool:
     main_agent._actor_selection_retry_key = None
     main_agent._actor_selection_attempts = 0
     return True
+
+
+def _enforce_orchestration_primitive_budget(
+    main_agent: Any,
+    observation: Any,
+) -> bool:
+    """Bound complete camera/selection chains, including repeated camera function 573."""
+
+    dispatch = getattr(main_agent, "_pending_primitive", None)
+    agent = getattr(main_agent, "_pending_primitive_agent", None)
+    if dispatch is None or agent is None:
+        pending_units = getattr(main_agent, "unit_uid_appear", None)
+        function_history = getattr(main_agent, "func_id_history", None)
+        if (
+            not isinstance(pending_units, list)
+            or not pending_units
+            or not isinstance(function_history, list)
+            or not function_history
+            or int(function_history[-1]) not in {2, 3, 4, 573}
+        ):
+            main_agent._orchestration_budget_key = None
+            main_agent._orchestration_budget_used = 0
+            return False
+        key = ("new-unit", str(int(pending_units[0])))
+        if key != getattr(main_agent, "_orchestration_budget_key", None):
+            main_agent._orchestration_budget_key = key
+            main_agent._orchestration_budget_used = 0
+        main_agent._orchestration_budget_used += 1
+        budget = int(main_agent.worker_settings.orchestration_primitive_budget)
+        if main_agent._orchestration_budget_used < budget:
+            return False
+        recovered = _force_group_stalled_new_unit(main_agent, observation)
+        main_agent._orchestration_budget_key = None
+        main_agent._orchestration_budget_used = 0
+        main_agent.main_loop_lock = False
+        main_agent._rtscortex_force_runtime_decision = True
+        if recovered:
+            _record_orchestration_recovery(main_agent)
+        return recovered
+    if str(getattr(dispatch, "origin", "")) == "translator":
+        main_agent._orchestration_budget_key = None
+        main_agent._orchestration_budget_used = 0
+        return False
+    function_id = int(getattr(dispatch, "requested_function_id", 0) or 0)
+    if str(getattr(dispatch, "origin", "")) != "orchestration" or function_id not in {
+        2,
+        3,
+        4,
+        573,
+    }:
+        return False
+    if isinstance(getattr(agent, "last_execution_abort", None), Mapping):
+        return False
+
+    command_id = str(getattr(dispatch, "command_id", ""))
+    team_name = str(getattr(agent, "team_unit_team_curr", "") or "")
+    key = (command_id, team_name)
+    if key != getattr(main_agent, "_orchestration_budget_key", None):
+        main_agent._orchestration_budget_key = key
+        main_agent._orchestration_budget_used = 0
+    main_agent._orchestration_budget_used += 1
+    budget = int(main_agent.worker_settings.orchestration_primitive_budget)
+    if main_agent._orchestration_budget_used < budget:
+        return False
+
+    _abort_orchestration_chain(
+        main_agent,
+        agent,
+        team_name=team_name,
+        failure_code="orchestration_budget_exceeded",
+        failure_reason=(
+            f"camera/selection chain exceeded its {budget}-primitive budget"
+        ),
+    )
+    _force_group_stalled_new_unit(main_agent, observation)
+    main_agent._orchestration_budget_key = None
+    main_agent._orchestration_budget_used = 0
+    main_agent._rtscortex_force_runtime_decision = True
+    _record_orchestration_recovery(main_agent)
+    return True
+
+
+def _recover_observation_gap(main_agent: Any, observation: Any) -> bool:
+    """Force-clear optional camera work so the soft watchdog can recover in-place."""
+
+    recovered = _force_group_stalled_new_unit(main_agent, observation)
+    dispatch = getattr(main_agent, "_pending_primitive", None)
+    agent = getattr(main_agent, "_pending_primitive_agent", None)
+    if (
+        dispatch is not None
+        and agent is not None
+        and str(getattr(dispatch, "origin", "")) == "orchestration"
+        and not isinstance(getattr(agent, "last_execution_abort", None), Mapping)
+    ):
+        _abort_orchestration_chain(
+            main_agent,
+            agent,
+            team_name=_execution_team_name(agent) or "",
+            failure_code="observation_gap_watchdog_recovery",
+            failure_reason="watchdog force-cleared a stalled camera/selection chain",
+        )
+        recovered = True
+    main_agent.main_loop_lock = False
+    main_agent._rtscortex_force_runtime_decision = True
+    if recovered:
+        _record_orchestration_recovery(main_agent)
+    return recovered
+
+
+def _abort_orchestration_chain(
+    main_agent: Any,
+    agent: Any,
+    *,
+    team_name: str,
+    failure_code: str,
+    failure_reason: str,
+) -> None:
+    action_name = str(getattr(agent, "curr_action_name", "") or "")
+    agent.last_execution_abort = {
+        "team_name": team_name,
+        "action_name": action_name,
+        "failure_code": failure_code,
+        "failure_reason": failure_reason,
+        "actor_tag": _execution_unit_tag(agent),
+    }
+    agent.func_list.clear()
+    agent.action_list.clear()
+    agent._rtscortex_semantic_action = None
+    main_agent._actor_selection_retry_key = None
+    main_agent._actor_selection_attempts = 0
+
+
+def _force_group_stalled_new_unit(main_agent: Any, observation: Any) -> bool:
+    """Finish new-unit bookkeeping without another feature-camera round trip."""
+
+    pending = getattr(main_agent, "unit_uid_appear", None)
+    if not isinstance(pending, list) or not pending:
+        return False
+    tag = int(pending[0])
+    unit = next(
+        (
+            item
+            for item in _observation_value(observation, "raw_units", ())
+            if int(_observation_value(item, "tag", -1)) == tag
+        ),
+        None,
+    )
+    if unit is not None:
+        unit_type = int(_observation_value(unit, "unit_type", -1))
+        destinations: list[tuple[int, str, Any, dict[str, Any]]] = []
+        for agent_name, agent in getattr(main_agent, "agents", {}).items():
+            for team in getattr(agent, "teams", ()):
+                if unit_type in {int(value) for value in team.get("unit_type", ())}:
+                    destinations.append(
+                        (len(team.get("unit_tags", ())), str(agent_name), agent, team)
+                    )
+        if destinations:
+            _, _, destination_agent, team = min(
+                destinations,
+                key=lambda value: (value[0], value[1], str(value[3].get("name", ""))),
+            )
+            team.setdefault("unit_tags", [])
+            if tag not in team["unit_tags"]:
+                team["unit_tags"].append(tag)
+            if tag not in destination_agent.unit_tag_list:
+                destination_agent.unit_tag_list.append(tag)
+                destination_agent.unit_raw_list.append(unit)
+    pending[:] = [value for value in pending if int(value) != tag]
+    total = getattr(main_agent, "unit_uid_total", None)
+    if isinstance(total, set):
+        total.add(tag)
+    return True
+
+
+def _worker_has_active_action(main_agent: Any) -> bool:
+    if getattr(main_agent, "_pending_primitive", None) is not None:
+        return True
+    if bool(getattr(main_agent, "main_loop_lock", False)):
+        return True
+    return any(
+        bool(getattr(agent, "func_list", ())) or bool(getattr(agent, "action_list", ()))
+        for agent in getattr(main_agent, "agents", {}).values()
+    )
+
+
+def _record_orchestration_recovery(main_agent: Any) -> None:
+    recorder = getattr(
+        getattr(main_agent, "decision_broker", None),
+        "record_orchestration_recovery",
+        None,
+    )
+    if callable(recorder):
+        recorder()
 
 
 def _release_runtime_observation_barrier(main_agent: Any) -> None:
@@ -3201,13 +3559,21 @@ def _candidate_dispatch_failure(
     *,
     final_primitive: bool,
     translated_position: Optional[list[int]],
+    known_expansion_resources: Sequence[Any] = (),
 ) -> Optional[str]:
     """Return why an accepted primitive is outside its current semantic domain."""
 
+    if not final_primitive:
+        return None
     action_name = str(action.get("name", ""))
     if not _is_candidate_constrained_action(action_name):
         return None
-    failure = _semantic_target_failure(action, observation, unit_names)
+    failure = _semantic_target_failure(
+        action,
+        observation,
+        unit_names,
+        known_expansion_resources=known_expansion_resources,
+    )
     if failure is not None:
         return f"{failure[1]}; accepted primitive would leave the current candidate set"
     spec = BUILD_SPECS.get(action_name)

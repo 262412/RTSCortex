@@ -13,7 +13,7 @@ from rtscortex.contracts import (
     AvailableAction,
     ObservationEnvelope,
 )
-from rtscortex.targeting import living_targetable_enemies
+from rtscortex.targeting import current_screen_enemy_targets, living_targetable_enemies
 
 
 class ActionArbiter:
@@ -269,7 +269,7 @@ def _attack_invariant_failure(
     target = _normalize_tag(command.arguments[0])
     enemy_ids = {
         _normalize_tag(enemy.unit_id)
-        for enemy in living_targetable_enemies(observation.state.visible_enemies)
+        for enemy in current_screen_enemy_targets(observation)
     }
     if target in enemy_ids:
         return None

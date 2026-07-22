@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from rtscortex.contracts import ActionCommand, ActionSource, ObservationEnvelope
-from rtscortex.targeting import living_targetable_enemies
+from rtscortex.targeting import current_screen_enemy_targets
 
 
 class ReflexEngine:
@@ -81,7 +81,7 @@ class ReflexEngine:
                     )
         enemy_ids = {
             _normalize_tag(enemy.unit_id): enemy.unit_id
-            for enemy in living_targetable_enemies(observation.state.visible_enemies)
+            for enemy in current_screen_enemy_targets(observation)
         }
         if under_attack and enemy_ids:
             dispatched_actors: set[str] = set()

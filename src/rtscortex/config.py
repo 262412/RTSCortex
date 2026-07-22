@@ -63,6 +63,9 @@ class EnvironmentSettings(SettingsModel):
     action_effect_timeout_game_loops: int = Field(default=112, ge=1)
     observation_gap_watchdog_game_loops: int = Field(default=448, ge=1)
     observation_gap_hard_limit_game_loops: int = Field(default=1792, ge=2)
+    orchestration_primitive_budget: int = Field(default=16, ge=4)
+    expansion_scout_enabled: bool = True
+    expansion_scout_interval_game_loops: int = Field(default=112, ge=16)
     server_ready_timeout_seconds: float = Field(default=15.0, gt=0.0)
     shutdown_timeout_seconds: float = Field(default=10.0, gt=0.0)
 

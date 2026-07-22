@@ -166,7 +166,7 @@ describe("Chinese event presentation", () => {
     );
     expect(fieldLabel("requested_producer_tag")).toBe("请求生产来源 Tag");
     expect(fieldLabel("producer_tag")).toBe("实际生产来源 Tag");
-    expect(fieldLabel("confirmation_kind")).toBe("生产确认方式");
+    expect(fieldLabel("confirmation_kind")).toBe("效果确认方式");
     expect(semanticScalar("production", "effect_kind")).toBe("生产（production）");
     expect(semanticScalar("producer_order", "confirmation_kind")).toBe(
       "生产订单（producer_order）",
@@ -185,6 +185,13 @@ describe("Chinese event presentation", () => {
     );
     expect(semanticScalar("research", "effect_kind")).toBe("科技研究（research）");
     expect(semanticScalar("ability", "effect_kind")).toBe("经济技能（ability）");
+    expect(semanticScalar("combat", "effect_kind")).toBe("战斗（combat）");
+    expect(semanticScalar("target_damaged", "confirmation_kind")).toBe(
+      "精确目标已受伤（target_damaged）",
+    );
+    expect(semanticScalar("combat_effect_not_observed", "failure_code")).toBe(
+      "未观察到目标受到伤害（combat_effect_not_observed）",
+    );
     expect(semanticScalar("no_inject_effect_observed", "failure_code")).toBe(
       "未观察到幼虫注入订单或状态效果（no_inject_effect_observed）",
     );

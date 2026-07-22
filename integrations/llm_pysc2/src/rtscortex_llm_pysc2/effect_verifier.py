@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 from rtscortex_llm_pysc2.addon_effect_verifier import AddonEffectVerifier
+from rtscortex_llm_pysc2.combat_effect_verifier import CombatEffectVerifier
 from rtscortex_llm_pysc2.effect_types import EffectVerdict
 from rtscortex_llm_pysc2.extractor import BUILD_RAW_FUNCTION_IDS, BUILD_SPECS
 from rtscortex_llm_pysc2.inject_effect_verifier import InjectEffectVerifier
@@ -121,6 +122,10 @@ class ActionEffectVerifier:
             timeout_game_loops=timeout_game_loops,
             unit_names=self.unit_names,
         )
+        self.combat = CombatEffectVerifier(
+            timeout_game_loops=timeout_game_loops,
+            unit_names=self.unit_names,
+        )
 
     def track(self, command: RoutedCommand) -> bool:
         """Register an effectful command, returning false for immediate actions."""
@@ -138,6 +143,8 @@ class ActionEffectVerifier:
         if self.research.track(command):
             return True
         if self.mules.track(command):
+            return True
+        if self.combat.track(command):
             return True
         target = _target_structure(command.name)
         if target is None and command.name != "Move_Minimap":
@@ -171,6 +178,7 @@ class ActionEffectVerifier:
             or self.injects.is_tracked(command_id)
             or self.research.is_tracked(command_id)
             or self.mules.is_tracked(command_id)
+            or self.combat.is_tracked(command_id)
         )
 
     @property
@@ -192,6 +200,9 @@ class ActionEffectVerifier:
             return
         if self.mules.is_tracked(command_id):
             self.mules.resolve_arguments(command_id, arguments)
+            return
+        if self.combat.is_tracked(command_id):
+            self.combat.resolve_arguments(command_id, arguments)
             return
         pending_move = self._pending_moves.get(command_id)
         if pending_move is not None:
@@ -231,6 +242,9 @@ class ActionEffectVerifier:
         if self.mules.is_tracked(command_id):
             self.mules.prepare(command_id, observation, producer_tag)
             return
+        if self.combat.is_tracked(command_id):
+            self.combat.prepare(command_id, observation)
+            return
         pending_move = self._pending_moves.get(command_id)
         if pending_move is not None:
             pending_move.actor_tag = None if builder_tag is None else int(builder_tag)
@@ -269,6 +283,9 @@ class ActionEffectVerifier:
         if self.mules.is_tracked(command_id):
             self.mules.accept_primitive(command_id, game_loop=game_loop)
             return
+        if self.combat.is_tracked(command_id):
+            self.combat.accept_primitive(command_id, game_loop=game_loop)
+            return
         pending_move = self._pending_moves.get(command_id)
         if pending_move is not None:
             if pending_move.dispatched_game_loop is None:
@@ -290,6 +307,7 @@ class ActionEffectVerifier:
         self.injects.cancel(command_id)
         self.research.cancel(command_id)
         self.mules.cancel(command_id)
+        self.combat.cancel(command_id)
 
     def observe(self, observation: Any) -> list[EffectVerdict]:
         """Evaluate all accepted effectful commands against one observation."""
@@ -300,6 +318,7 @@ class ActionEffectVerifier:
         verdicts.extend(self.injects.observe(observation))
         verdicts.extend(self.research.observe(observation))
         verdicts.extend(self.mules.observe(observation))
+        verdicts.extend(self.combat.observe(observation))
         verdicts.extend(self._observe_moves(observation))
         accepted = [
             pending
@@ -432,6 +451,7 @@ class ActionEffectVerifier:
         verdicts.extend(self.injects.fail_pending(reason))
         verdicts.extend(self.research.fail_pending(reason))
         verdicts.extend(self.mules.fail_pending(reason))
+        verdicts.extend(self.combat.fail_pending(reason))
         for command_id, pending in list(self._pending.items()):
             if pending.accepted_game_loop is None:
                 continue

@@ -12,6 +12,73 @@ from rtscortex_llm_pysc2.morph import MORPH_SPECS, MorphSpec
 from rtscortex_llm_pysc2.production import PRODUCTION_SPECS, ProductionSpec
 from rtscortex_llm_pysc2.routing import RoutedCommand
 
+from rtscortex.contracts import EffectEvidence
+
+
+def test_attack_effect_requires_damage_after_pysc2_acceptance() -> None:
+    verifier = ActionEffectVerifier(timeout_game_loops=32)
+    command = _attack_command()
+    assert verifier.track(command) is True
+    verifier.prepare(command.command_id, _attack_observation(100, health=150), 0xA00)
+    verifier.accept_primitive(command.command_id, game_loop=104)
+
+    assert verifier.observe(_attack_observation(108, health=150)) == []
+    verdicts = verifier.observe(_attack_observation(112, health=125))
+
+    assert len(verdicts) == 1
+    assert verdicts[0].success is True
+    assert verdicts[0].evidence is not None
+    assert verdicts[0].evidence["effect_kind"] == "combat"
+    assert verdicts[0].evidence["confirmation_kind"] == "target_damaged"
+    assert verdicts[0].evidence["target_health_delta"] == 25
+
+
+def test_attack_effect_does_not_treat_lost_target_as_confirmed_kill() -> None:
+    verifier = ActionEffectVerifier(timeout_game_loops=16)
+    command = _attack_command()
+    verifier.track(command)
+    verifier.prepare(command.command_id, _attack_observation(100, health=20), 0xA00)
+    verifier.accept_primitive(command.command_id, game_loop=104)
+
+    assert verifier.observe(_attack_observation(108, health=None)) == []
+    verdicts = verifier.observe(_attack_observation(120, health=None))
+
+    assert [verdict.success for verdict in verdicts] == [False]
+    assert [verdict.failure_code for verdict in verdicts] == ["combat_target_lost"]
+    assert verdicts[0].evidence is not None
+    assert verdicts[0].evidence["confirmation_kind"] is None
+
+
+def test_attack_regeneration_cannot_emit_negative_protocol_evidence() -> None:
+    verifier = ActionEffectVerifier(timeout_game_loops=16)
+    command = _attack_command()
+    verifier.track(command)
+    verifier.prepare(command.command_id, _attack_observation(100, health=13), 0xA00)
+    verifier.accept_primitive(command.command_id, game_loop=104)
+
+    assert verifier.observe(_attack_observation(108, health=14)) == []
+    assert verifier.observe(_attack_observation(112, health=None)) == []
+    verdict = verifier.observe(_attack_observation(120, health=None))[0]
+
+    assert verdict.failure_code == "combat_target_lost"
+    assert verdict.evidence is not None
+    assert verdict.evidence["target_health_delta"] == 0
+    EffectEvidence.model_validate(verdict.evidence)
+
+
+def test_attack_effect_times_out_when_target_health_does_not_change() -> None:
+    verifier = ActionEffectVerifier(timeout_game_loops=16)
+    command = _attack_command()
+    verifier.track(command)
+    verifier.prepare(command.command_id, _attack_observation(100, health=150), 0xA00)
+    verifier.accept_primitive(command.command_id, game_loop=104)
+
+    verdicts = verifier.observe(_attack_observation(120, health=150))
+
+    assert [verdict.failure_code for verdict in verdicts] == [
+        "combat_effect_not_observed"
+    ]
+
 
 def test_stimpack_research_is_confirmed_by_exact_barracks_order() -> None:
     verifier = ActionEffectVerifier(timeout_game_loops=112)
@@ -1733,6 +1800,38 @@ def _move_command() -> RoutedCommand:
         resolved_arguments=([48, 48],),
         rendered_action="<Move_Minimap([48,48])>",
     )
+
+
+def _attack_command() -> RoutedCommand:
+    return RoutedCommand(
+        command_id="command-attack",
+        actor="CombatGroup0/Zealot-1",
+        team_name="Zealot-1",
+        name="Attack_Unit",
+        source="planner",
+        requested_arguments=("0xdef",),
+        resolved_arguments=("0xdef",),
+        rendered_action="<Attack_Unit(0xdef)>",
+    )
+
+
+def _attack_observation(
+    game_loop: int,
+    *,
+    health: float | None,
+) -> dict[str, Any]:
+    raw_units: list[dict[str, Any]] = []
+    if health is not None:
+        raw_units.append(
+            {
+                "tag": 0xDEF,
+                "unit_type": "Hatchery",
+                "alliance": 4,
+                "health": health,
+                "shield": 0,
+            }
+        )
+    return {"game_loop": game_loop, "raw_units": raw_units}
 
 
 def _observation(

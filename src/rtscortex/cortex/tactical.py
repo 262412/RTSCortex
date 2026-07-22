@@ -16,7 +16,12 @@ from rtscortex.cortex.models import (
     TacticalIntent,
     ThreatLevel,
 )
-from rtscortex.targeting import living_targetable_enemies
+from rtscortex.targeting import (
+    ENEMY_STRUCTURE_TYPES,
+    current_screen_enemy_targets,
+    last_known_enemy_targets,
+    living_targetable_enemies,
+)
 
 _WORKER_TYPES = frozenset({"Drone", "Probe", "SCV", "MULE"})
 _HIGH_VALUE_THREATS = frozenset(
@@ -52,6 +57,17 @@ class _ActorRetreatState:
     cooldown_until_game_loop: int
 
 
+@dataclass(slots=True)
+class _ActorOffenseState:
+    phase: Literal["advancing", "arrived", "searching", "engaged"]
+    entered_game_loop: int
+    last_command_game_loop: int
+    cooldown_until_game_loop: int
+    waypoint: tuple[int, int] | None = None
+    waypoint_index: int = -1
+    target_tag: str | None = None
+
+
 class DeterministicTacticalAgent:
     """Turn a current situation into exact, candidate-bound combat intents."""
 
@@ -81,8 +97,8 @@ class DeterministicTacticalAgent:
         self.retreat_home_radius = retreat_home_radius
         self._episode_key: tuple[str, str] | None = None
         self._last_focus_target: str | None = None
-        self._last_reacquire_by_actor: dict[str, int] = {}
         self._retreat_by_actor: dict[str, _ActorRetreatState] = {}
+        self._offense_by_actor: dict[str, _ActorOffenseState] = {}
 
     def evaluate(
         self,
@@ -93,6 +109,8 @@ class DeterministicTacticalAgent:
         attack_actors = _actors_for(observation, "Attack_Unit")
         move_actors = _actors_for(observation, "Move_Minimap")
         enemies = living_targetable_enemies(observation.state.visible_enemies)
+        current_targets = current_screen_enemy_targets(observation)
+        last_known_targets = last_known_enemy_targets(observation)
         retreat_intents, retreating_actors = self._retreat_intents(
             observation,
             assessment,
@@ -101,14 +119,31 @@ class DeterministicTacticalAgent:
         )
         attack_actors = [actor for actor in attack_actors if actor not in retreating_actors]
         move_actors = [actor for actor in move_actors if actor not in retreating_actors]
-        if enemies:
-            self._last_reacquire_by_actor.clear()
-        if enemies and attack_actors:
-            target, reacquired = self._focus_target(enemies)
+        if current_targets and attack_actors:
+            target, reacquired = self._focus_target(current_targets)
+            target_tag = _normalize_tag(target.unit_id)
+            for actor in attack_actors:
+                previous = self._offense_by_actor.get(actor)
+                self._offense_by_actor[actor] = _ActorOffenseState(
+                    phase="engaged",
+                    entered_game_loop=(
+                        observation.game_loop
+                        if previous is None
+                        else previous.entered_game_loop
+                    ),
+                    last_command_game_loop=observation.game_loop,
+                    cooldown_until_game_loop=observation.game_loop,
+                    target_tag=target_tag,
+                )
+            target_kind = (
+                "enemy structure"
+                if target.unit_type in ENEMY_STRUCTURE_TYPES
+                else "enemy unit"
+            )
             objective = (
-                f"Reacquire and focus fire {target.unit_type}"
+                f"Reacquire and focus fire {target_kind} {target.unit_type}"
                 if reacquired
-                else f"Focus fire visible {target.unit_type}"
+                else f"Focus fire current-screen {target_kind} {target.unit_type}"
             )
             attack_intents = [
                 self._intent(
@@ -119,6 +154,7 @@ class DeterministicTacticalAgent:
                     objective=objective,
                     target=IntentTarget(
                         kind=IntentTargetKind.ENEMY,
+                        unit_tag=target_tag,
                         unit_type=target.unit_type,
                     ),
                     priority=75,
@@ -132,38 +168,94 @@ class DeterministicTacticalAgent:
             assessment.army_readiness is ArmyReadiness.READY
             or observation.state.economy.army_supply >= self.minimum_advance_army_supply
         )
-        if not enemies and ready_to_advance and move_actors:
-            eligible_actors = [
-                actor
-                for actor in move_actors
-                if observation.game_loop
-                - self._last_reacquire_by_actor.get(
-                    actor,
-                    observation.game_loop - self.reacquire_cooldown_game_loops,
+        if ready_to_advance and move_actors:
+            intents = self._offense_search_intents(
+                observation,
+                assessment,
+                move_actors,
+                last_known_targets=last_known_targets,
+            )
+            return [*retreat_intents, *intents]
+        return retreat_intents
+
+    def _offense_search_intents(
+        self,
+        observation: ObservationEnvelope,
+        assessment: SituationAssessment,
+        actors: list[str],
+        *,
+        last_known_targets: list[UnitState],
+    ) -> list[TacticalIntent]:
+        available_actors = set(actors)
+        for actor in tuple(self._offense_by_actor):
+            if actor not in available_actors:
+                del self._offense_by_actor[actor]
+
+        intents: list[TacticalIntent] = []
+        for actor in actors:
+            candidates = _minimap_candidates_for_actor(observation, actor)
+            if not candidates:
+                self._offense_by_actor.pop(actor, None)
+                continue
+            state = self._offense_by_actor.get(actor)
+            if state is not None and state.waypoint not in candidates:
+                # The exact candidate disappeared from the unexplored frontier.
+                # Treat it as arrived/obsolete instead of dispatching it forever.
+                state.phase = "arrived"
+                state.waypoint = None
+            if (
+                state is not None
+                and observation.game_loop < state.cooldown_until_game_loop
+            ):
+                continue
+
+            previous_index = -1 if state is None else state.waypoint_index
+            next_index = (previous_index + 1) % len(candidates)
+            waypoint = candidates[next_index]
+            if state is None:
+                state = _ActorOffenseState(
+                    phase="searching" if last_known_targets else "advancing",
+                    entered_game_loop=observation.game_loop,
+                    last_command_game_loop=observation.game_loop,
+                    cooldown_until_game_loop=(
+                        observation.game_loop + self.reacquire_cooldown_game_loops
+                    ),
+                    waypoint=waypoint,
+                    waypoint_index=next_index,
                 )
-                >= self.reacquire_cooldown_game_loops
-            ]
-            intents = [
+                self._offense_by_actor[actor] = state
+            else:
+                state.phase = "searching" if last_known_targets else "advancing"
+                state.last_command_game_loop = observation.game_loop
+                state.cooldown_until_game_loop = (
+                    observation.game_loop + self.reacquire_cooldown_game_loops
+                )
+                state.waypoint = waypoint
+                state.waypoint_index = next_index
+                state.target_tag = None
+
+            objective = (
+                "Reacquire the last-known enemy and search for surviving structures"
+                if last_known_targets
+                else "Search unexplored map sectors for enemy units and structures"
+            )
+            intents.append(
                 self._intent(
                     observation,
                     assessment,
                     actor=actor,
                     action_name="Move_Minimap",
-                    objective="Advance to reacquire the enemy force",
+                    objective=objective,
                     target=IntentTarget(
                         kind=IntentTargetKind.ENEMY,
-                        region="unexplored",
+                        region="reacquire" if last_known_targets else "unexplored",
+                        position=waypoint,
                     ),
                     priority=60,
                     ttl_game_loops=16,
                 )
-                for actor in eligible_actors
-            ]
-            self._last_reacquire_by_actor.update(
-                dict.fromkeys(eligible_actors, observation.game_loop)
             )
-            return [*retreat_intents, *intents]
-        return retreat_intents
+        return intents
 
     def _retreat_intents(
         self,
@@ -268,8 +360,8 @@ class DeterministicTacticalAgent:
             return
         self._episode_key = episode_key
         self._last_focus_target = None
-        self._last_reacquire_by_actor.clear()
         self._retreat_by_actor.clear()
+        self._offense_by_actor.clear()
 
     def _focus_target(self, enemies: list[UnitState]) -> tuple[UnitState, bool]:
         by_tag = {_normalize_tag(enemy.unit_id): enemy for enemy in enemies}
@@ -299,7 +391,14 @@ class DeterministicTacticalAgent:
                 str(observation.step_id),
                 actor,
                 action_name,
-                target.unit_type or target.region or "none",
+                target.unit_tag
+                or target.unit_type
+                or (
+                    ",".join(str(value) for value in target.position)
+                    if target.position is not None
+                    else target.region
+                )
+                or "none",
             )
         )
         return TacticalIntent(
@@ -337,6 +436,10 @@ def _target_rank(enemy: UnitState) -> tuple[int, float, str]:
         class_rank = 0
     elif enemy.unit_type in _WORKER_TYPES:
         class_rank = 2
+    elif enemy.unit_type in _TOWNHALL_TYPES:
+        class_rank = 3
+    elif enemy.unit_type in ENEMY_STRUCTURE_TYPES:
+        class_rank = 4
     else:
         class_rank = 1
     return class_rank, enemy.health_fraction, _normalize_tag(enemy.unit_id)
@@ -389,3 +492,23 @@ def _normalize_tag(value: object) -> str:
     if isinstance(value, int) and not isinstance(value, bool):
         return hex(value)
     return str(value).casefold()
+
+
+def _minimap_candidates_for_actor(
+    observation: ObservationEnvelope,
+    actor: str,
+) -> list[tuple[int, int]]:
+    candidates: list[tuple[int, int]] = []
+    for action in observation.available_actions:
+        if action.name != "Move_Minimap" or actor not in action.actor_scopes:
+            continue
+        for arguments in action.argument_candidates or ():
+            if (
+                not arguments
+                or not isinstance(arguments[0], (list, tuple))
+                or len(arguments[0]) != 2
+            ):
+                continue
+            candidates.append((int(arguments[0][0]), int(arguments[0][1])))
+    # The extractor reserves the final candidate for the home retreat region.
+    return list(dict.fromkeys(candidates[:-1] if len(candidates) > 1 else candidates))

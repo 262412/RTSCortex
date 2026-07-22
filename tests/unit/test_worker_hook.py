@@ -31,6 +31,7 @@ from rtscortex_llm_pysc2.observation import ObservationMapper
 from rtscortex_llm_pysc2.production import PRODUCTION_SPECS
 from rtscortex_llm_pysc2.routing import RoutedActionBatch, RoutedCommand
 from rtscortex_llm_pysc2.worker import (
+    ExpansionScoutController,
     RTSCortexLLMAgent,
     RTSCortexMainAgent,
     WorkerSettings,
@@ -39,6 +40,7 @@ from rtscortex_llm_pysc2.worker import (
     _available_addon_function_id,
     _candidate_dispatch_failure,
     _canonical_pysc2_arguments,
+    _enforce_orchestration_primitive_budget,
     _execution_team_name,
     _finish_terminal,
     _isolate_next_action,
@@ -47,6 +49,7 @@ from rtscortex_llm_pysc2.worker import (
     _producer_is_visible,
     _production_source_invalid_reason,
     _rebind_builder_to_selected_worker,
+    _recover_observation_gap,
     _refresh_build_action_position,
     _refresh_consumed_zerg_builder,
     _refresh_zerg_morphed_combat_teams,
@@ -70,6 +73,25 @@ from rtscortex_llm_pysc2.worker import (
 )
 
 from rtscortex.contracts import ObservationEnvelope
+
+
+def _combat_observation(
+    game_loop: int,
+    target_health: dict[int, float],
+) -> dict[str, Any]:
+    return {
+        "game_loop": game_loop,
+        "raw_units": [
+            {
+                "tag": tag,
+                "unit_type": "Hatchery" if tag == 0xDEF else "Zergling",
+                "alliance": 4,
+                "health": health,
+                "shield": 0,
+            }
+            for tag, health in target_health.items()
+        ],
+    }
 
 
 def test_timestep_extractor_produces_json_safe_five_part_snapshot() -> None:
@@ -190,7 +212,13 @@ def test_shared_broker_calls_runtime_once_and_distributes_to_all_agents() -> Non
         total=1,
     )
     assert dispatch is not None
-    broker.settle_primitive(dispatch, success=True)
+    broker.prepare_effect(
+        dispatch,
+        _combat_observation(100, {0x101480001: 35.0}),
+        builder_tag=0x10,
+    )
+    broker.settle_primitive(dispatch, success=True, game_loop=100)
+    broker.observe_effects(_combat_observation(104, {0x101480001: 20.0}))
     broker.end_episode(_episode_result())
 
     assert runtime.execution_reports[0]["command_id"] == "command-attack"
@@ -317,6 +345,8 @@ def test_worker_error_episode_preserves_bridge_counters() -> None:
                 "unattributed_primitives": 1,
                 "candidate_outside_pysc2_dispatches": 0,
                 "observation_gap_watchdog_triggers": 0,
+                "orchestration_recoveries": 0,
+                "expansion_scout_camera_moves": 0,
             },
             "failure_reason": "RuntimeError: bridge failed",
         }
@@ -363,6 +393,8 @@ def test_worker_max_frame_hook_reports_explicit_truncation() -> None:
                 "unattributed_primitives": 0,
                 "candidate_outside_pysc2_dispatches": 0,
                 "observation_gap_watchdog_triggers": 0,
+                "orchestration_recoveries": 0,
+                "expansion_scout_camera_moves": 0,
             },
             "failure_reason": "max_agent_steps_reached",
         }
@@ -386,6 +418,9 @@ def test_worker_settings_prefer_canonical_runtime_environment(
     monkeypatch.setenv("RTSCORTEX_ACTION_EFFECT_TIMEOUT_GAME_LOOPS", "96")
     monkeypatch.setenv("RTSCORTEX_OBSERVATION_GAP_WATCHDOG_GAME_LOOPS", "448")
     monkeypatch.setenv("RTSCORTEX_OBSERVATION_GAP_HARD_LIMIT_GAME_LOOPS", "1792")
+    monkeypatch.setenv("RTSCORTEX_ORCHESTRATION_PRIMITIVE_BUDGET", "20")
+    monkeypatch.setenv("RTSCORTEX_EXPANSION_SCOUT_ENABLED", "true")
+    monkeypatch.setenv("RTSCORTEX_EXPANSION_SCOUT_INTERVAL_GAME_LOOPS", "96")
 
     settings = WorkerSettings.from_environment()
 
@@ -400,6 +435,9 @@ def test_worker_settings_prefer_canonical_runtime_environment(
     assert settings.action_effect_timeout_game_loops == 96
     assert settings.observation_gap_watchdog_game_loops == 448
     assert settings.observation_gap_hard_limit_game_loops == 1792
+    assert settings.orchestration_primitive_budget == 20
+    assert settings.expansion_scout_enabled is True
+    assert settings.expansion_scout_interval_game_loops == 96
 
 
 def test_production_camera_waits_for_exact_producer_feature_observation() -> None:
@@ -1501,6 +1539,179 @@ def test_actor_selection_retry_counter_resets_after_translator_primitive() -> No
     assert _abort_stalled_actor_selection(main_agent) is False
     assert main_agent._actor_selection_retry_key is None
     assert main_agent._actor_selection_attempts == 0
+
+
+def test_camera_selection_chain_budget_force_groups_unit_and_aborts_command() -> None:
+    unit = SimpleNamespace(tag=0x44, unit_type=311)
+    team = {"name": "Adept-1", "unit_type": [311], "unit_tags": []}
+    agent = SimpleNamespace(
+        name="CombatGroup7",
+        teams=[team],
+        team_unit_team_curr="Adept-1",
+        team_unit_tag_curr=0x44,
+        curr_action_name="Move_Minimap",
+        func_list=[object()],
+        action_list=[object()],
+        action_lists=[[{"name": "Move_Minimap"}]],
+        unit_tag_list=[],
+        unit_raw_list=[],
+        last_execution_abort=None,
+        _rtscortex_semantic_action={"name": "Move_Minimap"},
+    )
+    main_agent = SimpleNamespace(
+        worker_settings=SimpleNamespace(orchestration_primitive_budget=4),
+        _pending_primitive=PrimitiveDispatch(
+            command_id="command-camera",
+            function_name="llm_pysc2_move_camera",
+            final_primitive=False,
+            origin="orchestration",
+            requested_function_id=573,
+            emitted_function_id=573,
+        ),
+        _pending_primitive_agent=agent,
+        _orchestration_budget_key=None,
+        _orchestration_budget_used=0,
+        _actor_selection_retry_key=None,
+        _actor_selection_attempts=0,
+        _rtscortex_force_runtime_decision=False,
+        agents={"CombatGroup7": agent},
+        unit_uid_appear=[0x44],
+        unit_uid_total=set(),
+    )
+    observation = SimpleNamespace(raw_units=[unit])
+
+    for _ in range(3):
+        assert _enforce_orchestration_primitive_budget(main_agent, observation) is False
+    assert _enforce_orchestration_primitive_budget(main_agent, observation) is True
+
+    assert agent.last_execution_abort["failure_code"] == "orchestration_budget_exceeded"
+    assert agent.func_list == []
+    assert agent.action_list == []
+    assert agent.action_lists == [[{"name": "Move_Minimap"}]]
+    assert team["unit_tags"] == [0x44]
+    assert agent.unit_tag_list == [0x44]
+    assert main_agent.unit_uid_appear == []
+    assert main_agent._rtscortex_force_runtime_decision is True
+
+
+def test_watchdog_recovery_clears_camera_chain_before_hard_timeout() -> None:
+    unit = SimpleNamespace(tag=0x55, unit_type=311)
+    team = {"name": "Adept-1", "unit_type": [311], "unit_tags": []}
+    agent = SimpleNamespace(
+        name="CombatGroup7",
+        teams=[team],
+        team_unit_team_curr="Adept-1",
+        team_unit_tag_curr=0x55,
+        curr_action_name="Move_Minimap",
+        func_list=[object()],
+        action_list=[object()],
+        unit_tag_list=[],
+        unit_raw_list=[],
+        last_execution_abort=None,
+        _rtscortex_semantic_action={"name": "Move_Minimap"},
+    )
+    main_agent = SimpleNamespace(
+        _pending_primitive=PrimitiveDispatch(
+            command_id="command-watchdog-camera",
+            function_name="llm_pysc2_move_camera",
+            final_primitive=False,
+            origin="orchestration",
+            requested_function_id=573,
+            emitted_function_id=573,
+        ),
+        _pending_primitive_agent=agent,
+        _actor_selection_retry_key=None,
+        _actor_selection_attempts=0,
+        _rtscortex_force_runtime_decision=False,
+        main_loop_lock=True,
+        agents={"CombatGroup7": agent},
+        unit_uid_appear=[0x55],
+        unit_uid_total=set(),
+    )
+
+    assert _recover_observation_gap(main_agent, SimpleNamespace(raw_units=[unit])) is True
+    assert agent.last_execution_abort["failure_code"] == "observation_gap_watchdog_recovery"
+    assert main_agent.main_loop_lock is False
+    assert main_agent.unit_uid_appear == []
+
+
+def test_unclaimed_new_unit_camera_loop_is_also_bounded() -> None:
+    unit = SimpleNamespace(tag=0x66, unit_type=311)
+    team = {"name": "Adept-1", "unit_type": [311], "unit_tags": []}
+    agent = SimpleNamespace(
+        teams=[team],
+        unit_tag_list=[],
+        unit_raw_list=[],
+        func_list=[],
+        action_list=[],
+    )
+    main_agent = SimpleNamespace(
+        worker_settings=SimpleNamespace(orchestration_primitive_budget=4),
+        _pending_primitive=None,
+        _pending_primitive_agent=None,
+        _orchestration_budget_key=None,
+        _orchestration_budget_used=0,
+        _rtscortex_force_runtime_decision=False,
+        main_loop_lock=False,
+        agents={"CombatGroup7": agent},
+        unit_uid_appear=[0x66],
+        unit_uid_total=set(),
+        func_id_history=[573],
+    )
+    observation = SimpleNamespace(raw_units=[unit])
+
+    for _ in range(3):
+        assert _enforce_orchestration_primitive_budget(main_agent, observation) is False
+    assert _enforce_orchestration_primitive_budget(main_agent, observation) is True
+
+    assert team["unit_tags"] == [0x66]
+    assert main_agent.unit_uid_appear == []
+    assert main_agent._rtscortex_force_runtime_decision is True
+
+
+def test_expansion_scout_controller_rotates_unexplored_camera_waypoints() -> None:
+    class Plane(list[list[int]]):
+        @property
+        def shape(self) -> tuple[int, int]:
+            return len(self), len(self[0])
+
+    size = 16
+    feature_minimap = SimpleNamespace(
+        pathable=Plane([[1] * size for _ in range(size)]),
+        player_relative=Plane([[0] * size for _ in range(size)]),
+        visibility_map=Plane([[0] * size for _ in range(size)]),
+    )
+    observation = SimpleNamespace(feature_minimap=feature_minimap)
+    controller = ExpansionScoutController(interval_game_loops=16)
+
+    first = controller.next_waypoint(
+        observation,
+        game_loop=100,
+        anchor_available=False,
+        blocked=False,
+    )
+    too_soon = controller.next_waypoint(
+        observation,
+        game_loop=108,
+        anchor_available=False,
+        blocked=False,
+    )
+    second = controller.next_waypoint(
+        observation,
+        game_loop=116,
+        anchor_available=False,
+        blocked=False,
+    )
+
+    assert first is not None
+    assert too_soon is None
+    assert second is not None and second != first
+    assert controller.next_waypoint(
+        observation,
+        game_loop=132,
+        anchor_available=True,
+        blocked=False,
+    ) is None
 
 
 def test_deterministic_gas_rebalance_respects_effect_and_main_loop_guards() -> None:
@@ -3368,6 +3579,24 @@ def test_nexus_candidate_survives_camera_move_via_persistent_world_anchor() -> N
         ),
     ) == [[101]]
 
+    assert (
+        _candidate_dispatch_failure(
+            {
+                "name": "Build_Nexus_Near",
+                "arg": [hex(101)],
+                "func": [(573, object(), ("world",))],
+            },
+            observation,
+            {59: "Nexus", 341: "MineralField"},
+            final_primitive=False,
+            translated_position=None,
+            known_expansion_resources=tuple(
+                extractor._known_expansion_resources.values()  # noqa: SLF001
+            ),
+        )
+        is None
+    )
+
 
 def test_nexus_candidate_requires_the_exact_anchor_to_be_currently_visible() -> None:
     observation, feature_resources, _ = _nexus_candidate_observation()
@@ -3683,6 +3912,22 @@ def test_worker_detects_an_accepted_primitive_outside_current_candidates() -> No
     assert "current candidate set" in failure
 
 
+def test_worker_defers_semantic_candidate_revalidation_until_final_primitive() -> None:
+    observation = _fake_timestep().observation
+    own_tag = observation.feature_units[0].tag
+
+    assert (
+        _candidate_dispatch_failure(
+            {"name": "Attack_Unit", "arg": [hex(own_tag)], "func": []},
+            observation,
+            {104: "Drone", 311: "Adept"},
+            final_primitive=False,
+            translated_position=None,
+        )
+        is None
+    )
+
+
 def test_candidate_outside_dispatch_counter_is_persisted_and_fails_command(
     tmp_path: Path,
 ) -> None:
@@ -3729,6 +3974,8 @@ def test_candidate_outside_dispatch_counter_is_persisted_and_fails_command(
         "unattributed_primitives": 0,
         "candidate_outside_pysc2_dispatches": 0,
         "observation_gap_watchdog_triggers": 0,
+        "orchestration_recoveries": 0,
+        "expansion_scout_camera_moves": 0,
     }
 
     with pytest.raises(RuntimeError, match="outside the current candidate set"):
@@ -3761,6 +4008,62 @@ def test_candidate_outside_dispatch_counter_is_persisted_and_fails_command(
         "failure_code": "bridge_integrity_error",
         "detail": "Attack_Unit target is outside the current candidate set",
     }
+
+
+def test_broker_settles_normal_candidate_invalidation_without_integrity_abort() -> None:
+    runtime = FakeRuntime()
+    coordinator = BridgeCoordinator(runtime)
+    broker = SharedDecisionBroker(
+        coordinator,
+        TimeStepExtractor("run-worker", "episode-worker"),
+    )
+    _register_bridge_route(
+        broker,
+        coordinator,
+        _bridge_route(
+            "Builder",
+            ("Builder-Probe-1",),
+            RoutedCommand(
+                command_id="command-stale-expansion",
+                actor="Builder/Builder-Probe-1",
+                team_name="Builder-Probe-1",
+                name="Build_Nexus_Near",
+                rendered_action="<Build_Nexus_Near(0x100900001)>",
+                requested_arguments=("0x100900001",),
+                resolved_arguments=("0x100900001",),
+            ),
+            step_id=56,
+        ),
+    )
+    dispatch = broker.claim_primitive(
+        "Builder",
+        "Builder-Probe-1",
+        "Build_Nexus_Near",
+        "Build_Nexus_screen",
+        final_primitive=True,
+        ordinal=0,
+        total=1,
+        requested_function_id=65,
+        emitted_function_id=65,
+    )
+    assert dispatch is not None
+
+    broker.settle_candidate_invalidation(
+        dispatch,
+        failure_code="invalid_expansion_anchor",
+        failure_reason="semantic target 0x100900001 is no longer legal",
+        game_loop=900,
+    )
+
+    assert broker.metrics()["candidate_outside_pysc2_dispatches"] == 0
+    assert len(runtime.execution_reports) == 1
+    report = runtime.execution_reports[0]
+    assert report["command_id"] == "command-stale-expansion"
+    assert report["status"] == "failed"
+    assert report["execution_stage"] == "pre_dispatch"
+    assert report["failure_code"] == "invalid_expansion_anchor"
+    assert report["primitive_trace"][0]["accepted"] is False
+    assert report["primitive_trace"][0]["emitted_function_id"] == 0
 
 
 def test_pysc2_argument_normalization_matches_symbolic_and_encoded_enums() -> None:
@@ -5154,6 +5457,11 @@ def test_broker_attributes_builder_failure_and_combat_success_in_same_step() -> 
 
     assert builder is not None
     assert combat is not None
+    broker.prepare_effect(
+        combat,
+        _combat_observation(20810, {0xDEF: 100.0}),
+        builder_tag=0x10,
+    )
     broker.settle_primitive(
         builder,
         success=False,
@@ -5161,6 +5469,7 @@ def test_broker_attributes_builder_failure_and_combat_success_in_same_step() -> 
         game_loop=20811,
     )
     broker.settle_primitive(combat, success=True, game_loop=20811)
+    broker.observe_effects(_combat_observation(20812, {0xDEF: 80.0}))
 
     reports = {report["command_id"]: report for report in runtime.execution_reports}
     assert set(reports) == {"command-builder", "command-combat"}
@@ -5227,8 +5536,21 @@ def test_broker_keeps_same_attack_action_isolated_by_explicit_team() -> None:
 
     assert beta is not None and beta.command_id == "attack-beta"
     assert alpha is not None and alpha.command_id == "attack-alpha"
+    broker.prepare_effect(
+        beta,
+        _combat_observation(899, {0xAAA: 100.0, 0xBBB: 100.0}),
+        builder_tag=0x20,
+    )
+    broker.prepare_effect(
+        alpha,
+        _combat_observation(899, {0xAAA: 100.0, 0xBBB: 100.0}),
+        builder_tag=0x10,
+    )
     broker.settle_primitive(beta, success=True, game_loop=900)
     broker.settle_primitive(alpha, success=True, game_loop=900)
+    broker.observe_effects(
+        _combat_observation(904, {0xAAA: 80.0, 0xBBB: 70.0})
+    )
 
     reports = {report["command_id"]: report for report in runtime.execution_reports}
     assert reports["attack-alpha"]["actor"] == "Combat/Alpha"

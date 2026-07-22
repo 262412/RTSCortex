@@ -124,6 +124,15 @@ def _live_worker_environment(
         "RTSCORTEX_OBSERVATION_GAP_HARD_LIMIT_GAME_LOOPS": str(
             config.environment.observation_gap_hard_limit_game_loops
         ),
+        "RTSCORTEX_ORCHESTRATION_PRIMITIVE_BUDGET": str(
+            config.environment.orchestration_primitive_budget
+        ),
+        "RTSCORTEX_EXPANSION_SCOUT_ENABLED": str(
+            config.environment.expansion_scout_enabled
+        ).lower(),
+        "RTSCORTEX_EXPANSION_SCOUT_INTERVAL_GAME_LOOPS": str(
+            config.environment.expansion_scout_interval_game_loops
+        ),
         "RTSCORTEX_CONSOLE_ENABLED": str(config.console.enabled).lower(),
         "RTSCORTEX_CONSOLE_FRAME_FPS": str(config.console.frame_fps),
         "RTSCORTEX_CONSOLE_JPEG_QUALITY": str(config.console.jpeg_quality),

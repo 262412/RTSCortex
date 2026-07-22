@@ -374,6 +374,93 @@ def test_tactical_agent_focuses_one_target_and_reacquires_when_it_disappears() -
     assert second[0].objective.startswith("Reacquire")
 
 
+def test_tactical_agent_attacks_current_screen_structure_when_units_are_last_known() -> None:
+    base = _observation()
+    observation = base.model_copy(
+        update={
+            "state": base.state.model_copy(
+                update={
+                    "visible_enemies": [
+                        UnitState(
+                            unit_id="0x20",
+                            unit_type="Zergling",
+                            alliance="enemy",
+                        ),
+                        UnitState(
+                            unit_id="0x30",
+                            unit_type="Hatchery",
+                            alliance="enemy",
+                        ),
+                    ]
+                }
+            ),
+            "available_actions": [
+                AvailableAction(
+                    name="Attack_Unit",
+                    argument_names=["tag"],
+                    argument_types=[ActionArgumentType.TAG],
+                    actor_scopes=["CombatGroup/Army-1"],
+                    argument_candidates=[["0x30"]],
+                )
+            ],
+        }
+    )
+    agent = DeterministicTacticalAgent(
+        retreat_health_threshold=0.3,
+        minimum_advance_army_supply=4,
+    )
+
+    [intent] = agent.evaluate(
+        observation,
+        DeterministicSituationAnalyzer().assess(observation),
+    )
+    context = CandidateCompiler().compile(observation, intent)
+
+    assert intent.target.unit_tag == "0x30"
+    assert intent.target.unit_type == "Hatchery"
+    assert "enemy structure" in intent.objective
+    assert [candidate.arguments for candidate in context.candidates] == [["0x30"]]
+
+
+def test_last_known_enemy_without_screen_target_triggers_reacquire_move() -> None:
+    base = _observation()
+    observation = base.model_copy(
+        update={
+            "available_actions": [
+                AvailableAction(
+                    name="Move_Minimap",
+                    argument_names=["minimap"],
+                    argument_types=[ActionArgumentType.POSITION],
+                    actor_scopes=["CombatGroup/Army-1"],
+                    argument_candidates=[[[20, 30]], [[50, 50]], [[10, 10]]],
+                )
+            ]
+        }
+    )
+    agent = DeterministicTacticalAgent(
+        retreat_health_threshold=0.3,
+        minimum_advance_army_supply=4,
+        reacquire_cooldown_game_loops=16,
+    )
+
+    [first] = agent.evaluate(
+        observation,
+        DeterministicSituationAnalyzer().assess(observation),
+    )
+    later = observation.model_copy(update={"step_id": 5, "game_loop": 80})
+    [second] = agent.evaluate(
+        later,
+        DeterministicSituationAnalyzer().assess(later),
+    )
+
+    assert first.target.region == "reacquire"
+    assert first.target.position == (20, 30)
+    assert second.target.position == (50, 50)
+    assert CandidateCompiler().compile(later, second).candidates[0].arguments == [
+        [50, 50]
+    ]
+
+
 def test_tactical_retreat_selects_reserved_home_minimap_candidate() -> None:
     observation = _observation().model_copy(
         update={

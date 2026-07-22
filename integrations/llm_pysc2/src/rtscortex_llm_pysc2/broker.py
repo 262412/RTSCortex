@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from collections import defaultdict, deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from threading import Condition
 from time import monotonic
@@ -91,6 +91,8 @@ class SharedDecisionBroker:
         self.unattributed_primitives = 0
         self.candidate_outside_pysc2_dispatches = 0
         self.observation_gap_watchdog_triggers = 0
+        self.orchestration_recoveries = 0
+        self.expansion_scout_camera_moves = 0
         self._metrics_path = None if metrics_path is None else Path(metrics_path)
         with self._condition:
             self._persist_metrics_locked()
@@ -103,6 +105,8 @@ class SharedDecisionBroker:
                 "unattributed_primitives": self.unattributed_primitives,
                 "candidate_outside_pysc2_dispatches": (self.candidate_outside_pysc2_dispatches),
                 "observation_gap_watchdog_triggers": self.observation_gap_watchdog_triggers,
+                "orchestration_recoveries": self.orchestration_recoveries,
+                "expansion_scout_camera_moves": self.expansion_scout_camera_moves,
             }
 
     @property
@@ -115,6 +119,16 @@ class SharedDecisionBroker:
     def record_observation_gap_watchdog_trigger(self) -> None:
         with self._condition:
             self.observation_gap_watchdog_triggers += 1
+            self._persist_metrics_locked()
+
+    def record_orchestration_recovery(self) -> None:
+        with self._condition:
+            self.orchestration_recoveries += 1
+            self._persist_metrics_locked()
+
+    def record_expansion_scout_move(self) -> None:
+        with self._condition:
+            self.expansion_scout_camera_moves += 1
             self._persist_metrics_locked()
 
     def record_unattributed_primitive(self) -> None:
@@ -144,6 +158,27 @@ class SharedDecisionBroker:
             game_loop=game_loop,
             requested_function_id=dispatch.requested_function_id,
             emitted_function_id=dispatch.emitted_function_id,
+        )
+
+    def settle_candidate_invalidation(
+        self,
+        dispatch: PrimitiveDispatch,
+        *,
+        failure_code: str,
+        failure_reason: str,
+        game_loop: Optional[int],
+    ) -> None:
+        """Fail one command whose previously valid semantic target became stale."""
+
+        self.settle_primitive(
+            replace(
+                dispatch,
+                failure_code=failure_code,
+                emitted_function_id=0,
+            ),
+            success=False,
+            failure_reason=failure_reason,
+            game_loop=game_loop,
         )
 
     def raise_unattributed_integrity(self, reason: str) -> NoReturn:
@@ -690,6 +725,8 @@ class SharedDecisionBroker:
                     "unattributed_primitives": self.unattributed_primitives,
                     "candidate_outside_pysc2_dispatches": (self.candidate_outside_pysc2_dispatches),
                     "observation_gap_watchdog_triggers": (self.observation_gap_watchdog_triggers),
+                    "orchestration_recoveries": self.orchestration_recoveries,
+                    "expansion_scout_camera_moves": self.expansion_scout_camera_moves,
                 }
             ),
             encoding="utf-8",
