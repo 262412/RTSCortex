@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import uuid
+from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Literal
@@ -34,7 +35,7 @@ from rtscortex.evaluation import (
 )
 from rtscortex.evaluation.replay import replay_event_log
 from rtscortex.memory import EventStore, read_event_log
-from rtscortex.playbook import PlaybookStore
+from rtscortex.playbook import PlaybookPromotionSweep, PlaybookStore
 from rtscortex.policy import (
     LLMPlanningPolicySubagent,
     PolicyShadowComparison,
@@ -191,6 +192,43 @@ def playbook_show(
             indent=2,
         )
     )
+
+
+@playbook_app.command("promote")
+def playbook_promote(
+    database: Annotated[
+        Path,
+        typer.Option("--database", dir_okay=False, help="CortexPlaybook v2 SQLite path."),
+    ] = Path("~/scratch/outputs/RTSCortex/cortex-playbook-v2.sqlite3"),
+    run_root: Annotated[
+        Path | None,
+        typer.Option(
+            "--run-root",
+            file_okay=False,
+            help="Root containing source run directories; defaults to the database parent.",
+        ),
+    ] = None,
+) -> None:
+    """Replay historical shadow states and persist eligible active/soft rules."""
+
+    path = database.expanduser()
+    if not path.is_file():
+        raise typer.BadParameter(
+            f"playbook database does not exist: {path}",
+            param_hint="--database",
+        )
+    resolved_run_root = path.parent if run_root is None else run_root.expanduser()
+    if not resolved_run_root.is_dir():
+        raise typer.BadParameter(
+            f"run root does not exist: {resolved_run_root}",
+            param_hint="--run-root",
+        )
+    store = PlaybookStore(path)
+    try:
+        result = PlaybookPromotionSweep(store, run_root=resolved_run_root).run()
+    finally:
+        store.close()
+    typer.echo(json.dumps(asdict(result), ensure_ascii=False, indent=2, sort_keys=True))
 
 
 def _snapshot_config(config: ExperimentConfig, run_dir: Path) -> None:

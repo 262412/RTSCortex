@@ -139,6 +139,22 @@ def _is_strategic_blocking_rule(rule: PlaybookRule) -> bool:
 
 
 def _is_specific_rule(rule: PlaybookRule) -> bool:
+    allowed_roles = {
+        "economy",
+        "technology",
+        "production",
+        "defense",
+        "offense",
+        "focus_fire",
+        "retreat",
+    }
+    invalid_actions = {
+        action for action in rule.action_names if action.strip().casefold() in {"", "unknown"}
+    }
+    if invalid_actions:
+        return False
+    if any(role not in allowed_roles for role in rule.role_ids):
+        return False
     contextual_fields = {
         condition.field
         for condition in rule.conditions

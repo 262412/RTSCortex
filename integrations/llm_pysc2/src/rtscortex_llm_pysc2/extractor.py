@@ -289,7 +289,6 @@ MINIMAP_POINT_ACTIONS = frozenset({"Move_Minimap"})
 SELECT_BLINK_ACTION = "Select_Unit_Blink_Screen"
 PRODUCTION_ACTION_PREFIXES = ("Train_",)
 MIN_PRODUCTION_SOURCE_HEALTH_FRACTION = 0.2
-EXPANSION_ANCHOR_RETRY_COOLDOWN_GAME_LOOPS = 672
 
 
 def semantic_argument_candidates(
@@ -532,7 +531,7 @@ class TimeStepExtractor:
             for function_id, unit_type in (action_source_types or {}).items()
         }
         self._known_expansion_resources: dict[int, dict[str, Any]] = {}
-        self._suppressed_expansion_anchors: dict[int, int] = {}
+        self._suppressed_expansion_anchors: set[int] = set()
         self._latest_game_loop = 0
 
     @property
@@ -541,23 +540,16 @@ class TimeStepExtractor:
 
     @property
     def suppressed_expansion_anchors(self) -> frozenset[int]:
-        return frozenset(
-            tag
-            for tag, retry_after in self._suppressed_expansion_anchors.items()
-            if retry_after > self._latest_game_loop
-        )
+        return frozenset(self._suppressed_expansion_anchors)
 
     def suppress_expansion_anchor(
         self,
         tag: int,
         *,
         game_loop: int,
-        cooldown_game_loops: int = EXPANSION_ANCHOR_RETRY_COOLDOWN_GAME_LOOPS,
     ) -> None:
         self._latest_game_loop = max(self._latest_game_loop, int(game_loop))
-        self._suppressed_expansion_anchors[int(tag)] = (
-            int(game_loop) + int(cooldown_game_loops)
-        )
+        self._suppressed_expansion_anchors.add(int(tag))
 
     def observe_expansion_resources(
         self,
@@ -571,11 +563,6 @@ class TimeStepExtractor:
             _value(observation, "feature_units", ()),
         )
         self._latest_game_loop = int(_scalar(_value(observation, "game_loop", 0)))
-        self._suppressed_expansion_anchors = {
-            tag: retry_after
-            for tag, retry_after in self._suppressed_expansion_anchors.items()
-            if retry_after > self._latest_game_loop
-        }
         known = self.known_expansion_resources
         suppressed = self.suppressed_expansion_anchors
         for agent in agents.values():

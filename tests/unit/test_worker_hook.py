@@ -44,7 +44,9 @@ from rtscortex_llm_pysc2.worker import (
     _execution_team_name,
     _finish_terminal,
     _isolate_next_action,
+    _normalize_new_unit_queue,
     _pending_plan_idle_delay,
+    _prepare_runtime_observation_bypass,
     _prime_deterministic_gas_rebalance,
     _producer_is_visible,
     _production_source_invalid_reason,
@@ -373,6 +375,7 @@ def test_worker_error_episode_preserves_bridge_counters() -> None:
                 "observation_gap_watchdog_triggers": 0,
                 "orchestration_recoveries": 0,
                 "expansion_scout_camera_moves": 0,
+                "expansion_candidate_exhaustions": 0,
             },
             "failure_reason": "RuntimeError: bridge failed",
         }
@@ -421,6 +424,7 @@ def test_worker_max_frame_hook_reports_explicit_truncation() -> None:
                 "observation_gap_watchdog_triggers": 0,
                 "orchestration_recoveries": 0,
                 "expansion_scout_camera_moves": 0,
+                "expansion_candidate_exhaustions": 0,
             },
             "failure_reason": "max_agent_steps_reached",
         }
@@ -1680,8 +1684,8 @@ def test_unclaimed_new_unit_camera_loop_is_also_bounded() -> None:
         _rtscortex_force_runtime_decision=False,
         main_loop_lock=False,
         agents={"CombatGroup7": agent},
-        unit_uid_appear=[0x66],
-        unit_uid_total=set(),
+        unit_uid_appear=[0x66, 0x66],
+        unit_uid_total=[],
         func_id_history=[573],
     )
     observation = SimpleNamespace(raw_units=[unit])
@@ -1692,7 +1696,72 @@ def test_unclaimed_new_unit_camera_loop_is_also_bounded() -> None:
 
     assert team["unit_tags"] == [0x66]
     assert main_agent.unit_uid_appear == []
+    assert main_agent.unit_uid_total == [0x66]
+    assert main_agent._rtscortex_unit_quarantine == {0x66}
     assert main_agent._rtscortex_force_runtime_decision is True
+
+    main_agent.unit_uid_appear[:] = [0x66, 0x66]
+    _normalize_new_unit_queue(main_agent)
+    assert main_agent.unit_uid_appear == []
+
+
+def test_runtime_observation_bypass_groups_each_new_unit_once_before_upstream_func1() -> None:
+    oracle = SimpleNamespace(
+        tag=0x71,
+        unit_type=495,
+        alliance=1,
+        build_progress=100,
+    )
+    phoenix = SimpleNamespace(
+        tag=0x72,
+        unit_type=78,
+        alliance=1,
+        build_progress=100,
+    )
+    team = {
+        "name": "Oracle-1",
+        "unit_type": [495, 78],
+        "unit_tags": [],
+    }
+    agent = SimpleNamespace(
+        teams=[team],
+        unit_tag_list=[],
+        unit_raw_list=[],
+    )
+    main_agent = SimpleNamespace(
+        agents={"CombatGroup8": agent},
+        unit_uid=[],
+        unit_uid_appear=[0x71, 0x71, 0x72],
+        unit_uid_total=[],
+        main_loop_lock=True,
+        temp_head_unit_tag=0x71,
+        temp_curr_unit_tag=0x72,
+        temp_head_unit=oracle,
+        temp_curr_unit=phoenix,
+        temp_team_unit_tags=[0x71, 0x72],
+        flag_locked_func4=True,
+    )
+    observation = SimpleNamespace(raw_units=[oracle, phoenix])
+
+    assert _prepare_runtime_observation_bypass(main_agent, observation) is True
+
+    assert main_agent.unit_uid_appear == []
+    assert main_agent.unit_uid == [0x71, 0x72]
+    assert main_agent.unit_uid_total == [0x71, 0x72]
+    assert main_agent._rtscortex_unit_quarantine == {0x71, 0x72}
+    assert team["unit_tags"] == [0x71, 0x72]
+    assert team["unit_tags_selected"] == [0x71, 0x72]
+    assert agent.unit_tag_list == [0x71, 0x72]
+    assert main_agent.main_loop_lock is False
+    assert main_agent.temp_head_unit_tag is None
+    assert main_agent.temp_curr_unit_tag is None
+    assert main_agent.flag_locked_func4 is False
+
+    main_agent.unit_uid = []
+    main_agent.unit_uid_appear[:] = [0x71, 0x72, 0x72]
+    assert _prepare_runtime_observation_bypass(main_agent, observation) is False
+    assert main_agent.unit_uid_appear == []
+    assert team["unit_tags"] == [0x71, 0x72]
 
 
 def test_expansion_scout_controller_rotates_unexplored_camera_waypoints() -> None:
@@ -1736,6 +1805,46 @@ def test_expansion_scout_controller_rotates_unexplored_camera_waypoints() -> Non
         observation,
         game_loop=132,
         anchor_available=True,
+        blocked=False,
+    ) is None
+
+
+def test_expansion_scout_controller_reports_exhaustion_without_repeating_waypoints() -> None:
+    class Plane(list[list[int]]):
+        @property
+        def shape(self) -> tuple[int, int]:
+            return len(self), len(self[0])
+
+    size = 8
+    feature_minimap = SimpleNamespace(
+        pathable=Plane([[1] * size for _ in range(size)]),
+        player_relative=Plane([[0] * size for _ in range(size)]),
+        visibility_map=Plane([[0] * size for _ in range(size)]),
+    )
+    observation = SimpleNamespace(feature_minimap=feature_minimap)
+    controller = ExpansionScoutController(interval_game_loops=16)
+    visited: list[tuple[int, int]] = []
+    game_loop = 0
+    for _ in range(100):
+        waypoint = controller.next_waypoint(
+            observation,
+            game_loop=game_loop,
+            anchor_available=False,
+            blocked=False,
+        )
+        game_loop += 16
+        if waypoint is not None:
+            visited.append(waypoint)
+        if controller.exhausted:
+            break
+
+    assert controller.exhausted is True
+    assert visited
+    assert len(visited) == len(set(visited))
+    assert controller.next_waypoint(
+        observation,
+        game_loop=game_loop + 16,
+        anchor_available=False,
         blocked=False,
     ) is None
 
@@ -3672,7 +3781,7 @@ def test_persistent_nexus_anchor_drives_camera_after_leaving_raw_observation() -
     assert agent.last_translation_result["resolved_arguments"] == [(54, 84)]
 
 
-def test_failed_expansion_anchor_is_suppressed_until_cooldown_expires() -> None:
+def test_failed_expansion_anchor_is_permanently_suppressed_and_next_cluster_survives() -> None:
     observation, feature_resources, _ = _nexus_candidate_observation()
     observation.game_loop = [100]
     extractor = TimeStepExtractor(
@@ -3684,7 +3793,30 @@ def test_failed_expansion_anchor_is_suppressed_until_cooldown_expires() -> None:
         observation.raw_units,
         feature_resources,
     )
-    extractor.suppress_expansion_anchor(101, game_loop=100, cooldown_game_loops=32)
+    second_cluster: tuple[dict[str, Any], ...] = tuple(
+        {
+            "tag": 201 + index,
+            "unit_type": "MineralField",
+            "alliance": 3,
+            "x": 90 + offset_x,
+            "y": 90 + offset_y,
+        }
+        for index, (offset_x, offset_y) in enumerate(
+            (
+                (7, 0),
+                (5, 5),
+                (0, 7),
+                (-5, 5),
+                (-7, 0),
+                (-5, -5),
+                (0, -7),
+                (5, -5),
+            )
+        )
+    )
+    for resource in second_cluster:
+        extractor._known_expansion_resources[int(resource["tag"])] = resource  # noqa: SLF001
+    extractor.suppress_expansion_anchor(101, game_loop=100)
 
     assert semantic_argument_candidates(
         observation,
@@ -3692,7 +3824,7 @@ def test_failed_expansion_anchor_is_suppressed_until_cooldown_expires() -> None:
         unit_names={59: "Nexus", 341: "MineralField"},
         known_expansion_resources=extractor.known_expansion_resources,
         excluded_expansion_anchors=extractor.suppressed_expansion_anchors,
-    ) == []
+    ) == [[201]]
 
     observation.game_loop = [132]
     extractor.observe_expansion_resources(observation, {})
@@ -3702,7 +3834,7 @@ def test_failed_expansion_anchor_is_suppressed_until_cooldown_expires() -> None:
         unit_names={59: "Nexus", 341: "MineralField"},
         known_expansion_resources=extractor.known_expansion_resources,
         excluded_expansion_anchors=extractor.suppressed_expansion_anchors,
-    ) == [[101]]
+    ) == [[201]]
 
 
 def test_failed_expansion_effect_suppresses_command_anchor() -> None:
@@ -4102,6 +4234,7 @@ def test_candidate_outside_dispatch_counter_is_persisted_and_fails_command(
         "observation_gap_watchdog_triggers": 0,
         "orchestration_recoveries": 0,
         "expansion_scout_camera_moves": 0,
+        "expansion_candidate_exhaustions": 0,
     }
 
     with pytest.raises(RuntimeError, match="outside the current candidate set"):

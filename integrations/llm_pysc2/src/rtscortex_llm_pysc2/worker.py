@@ -220,6 +220,7 @@ class ExpansionScoutController:
         self.interval_game_loops = int(interval_game_loops)
         self.last_scout_game_loop: Optional[int] = None
         self.visited_waypoints: set[tuple[int, int]] = set()
+        self.exhausted = False
 
     def next_waypoint(
         self,
@@ -229,7 +230,10 @@ class ExpansionScoutController:
         anchor_available: bool,
         blocked: bool,
     ) -> Optional[tuple[int, int]]:
-        if anchor_available or blocked:
+        if anchor_available:
+            self.exhausted = False
+            return None
+        if blocked or self.exhausted:
             return None
         if (
             self.last_scout_game_loop is not None
@@ -242,14 +246,15 @@ class ExpansionScoutController:
             if len(candidate) == 2
         ]
         if not candidates:
+            self.exhausted = True
             return None
         waypoint = next(
             (candidate for candidate in candidates if candidate not in self.visited_waypoints),
             None,
         )
         if waypoint is None:
-            self.visited_waypoints.clear()
-            waypoint = candidates[0]
+            self.exhausted = True
+            return None
         self.visited_waypoints.add(waypoint)
         self.last_scout_game_loop = int(game_loop)
         return waypoint
@@ -1307,6 +1312,7 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
         self._observation_watchdog_preempted = False
         self._observation_watchdog_baseline_loop: Optional[int] = None
         self._rtscortex_force_runtime_decision = False
+        self._rtscortex_unit_quarantine: set[int] = set()
         self.expansion_scout = ExpansionScoutController(
             interval_game_loops=self.worker_settings.expansion_scout_interval_game_loops
         )
@@ -1363,6 +1369,7 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
             observation_loop,
             obs.observation,
         )
+        _normalize_new_unit_queue(self)
         _abort_stalled_actor_selection(self)
         _enforce_orchestration_primitive_budget(self, obs.observation)
         self._settle_previous_primitive(obs)
@@ -1376,14 +1383,23 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
         _rebind_builder_to_selected_worker(self, obs.observation)
         _refresh_consumed_zerg_builder(self, obs.observation)
         _refresh_zerg_morphed_combat_teams(self, obs.observation)
-        # RTSCortex consumes a global raw snapshot. Do not make every Runtime tick
-        # wait for optional upstream camera/selection-based text gathering.
-        _release_runtime_observation_barrier(self)
         runtime_observation_due = _runtime_observation_is_due(
             observation_loop,
             last_decision_game_loop=self.decision_broker.last_decision_game_loop,
             watchdog_game_loops=self.worker_settings.observation_gap_watchdog_game_loops,
         )
+        if (
+            self._observation_watchdog_active
+            or self._rtscortex_force_runtime_decision
+            or runtime_observation_due
+        ):
+            # Complete upstream new-unit bookkeeping from the global raw snapshot
+            # before MainAgent.step reaches main_agent_func1. Camera/selection work
+            # is optional and must never delay the next Runtime observation.
+            _prepare_runtime_observation_bypass(self, obs.observation)
+        # RTSCortex consumes a global raw snapshot. Do not make every Runtime tick
+        # wait for optional upstream camera/selection-based text gathering.
+        _release_runtime_observation_barrier(self)
         effect_verification_blocked = (
             self.decision_broker.coordinator.effect_verifier.blocks_auto_worker_management
         )
@@ -1413,12 +1429,19 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
             if self.game_clock is not None:
                 self.game_clock.wait_for_step()
             return scout_action
+        decision_loop_before_upstream = self.decision_broker.last_decision_game_loop
         upstream_step = super().step
         action = _run_with_auto_worker_management_guard(
             self.config,
             blocked=(effect_verification_blocked or watchdog_preempted or runtime_observation_due),
             upstream_step=lambda: upstream_step(obs),
         )
+        decision_loop_after_upstream = self.decision_broker.last_decision_game_loop
+        if (
+            decision_loop_after_upstream is not None
+            and decision_loop_after_upstream != decision_loop_before_upstream
+        ):
+            self._rtscortex_force_runtime_decision = False
         action = _suppress_pending_build_control_action(
             action,
             blocked=effect_verification_blocked,
@@ -1709,12 +1732,15 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
             or bool(getattr(self, "unit_uid_appear", ()))
             or _worker_has_active_action(self)
         )
+        was_exhausted = self.expansion_scout.exhausted
         waypoint = self.expansion_scout.next_waypoint(
             obs.observation,
             game_loop=game_loop,
             anchor_available=anchor_available,
             blocked=blocked,
         )
+        if self.expansion_scout.exhausted and not was_exhausted:
+            self.decision_broker.record_expansion_candidate_exhaustion()
         if waypoint is None:
             return None
         actions = importlib.import_module("pysc2.lib.actions")
@@ -2491,6 +2517,7 @@ def _enforce_orchestration_primitive_budget(
 ) -> bool:
     """Bound complete camera/selection chains, including repeated camera function 573."""
 
+    _normalize_new_unit_queue(main_agent)
     dispatch = getattr(main_agent, "_pending_primitive", None)
     agent = getattr(main_agent, "_pending_primitive_agent", None)
     if dispatch is None or agent is None:
@@ -2618,6 +2645,7 @@ def _abort_orchestration_chain(
 def _force_group_stalled_new_unit(main_agent: Any, observation: Any) -> bool:
     """Finish new-unit bookkeeping without another feature-camera round trip."""
 
+    _normalize_new_unit_queue(main_agent)
     pending = getattr(main_agent, "unit_uid_appear", None)
     if not isinstance(pending, list) or not pending:
         return False
@@ -2651,10 +2679,111 @@ def _force_group_stalled_new_unit(main_agent: Any, observation: Any) -> bool:
                 destination_agent.unit_tag_list.append(tag)
                 destination_agent.unit_raw_list.append(unit)
     pending[:] = [value for value in pending if int(value) != tag]
+    _remember_processed_unit_tag(main_agent, tag)
+    return True
+
+
+def _remember_processed_unit_tag(main_agent: Any, tag: int) -> None:
+    """Persist recovered/grouped tags across early returns in upstream func1."""
+
+    normalized_tag = int(tag)
+    quarantine = getattr(main_agent, "_rtscortex_unit_quarantine", None)
+    if not isinstance(quarantine, set):
+        quarantine = set()
+        main_agent._rtscortex_unit_quarantine = quarantine
+    quarantine.add(normalized_tag)
     total = getattr(main_agent, "unit_uid_total", None)
     if isinstance(total, set):
-        total.add(tag)
-    return True
+        total.add(normalized_tag)
+    elif isinstance(total, list):
+        if normalized_tag not in total:
+            total.append(normalized_tag)
+    else:
+        main_agent.unit_uid_total = {normalized_tag}
+
+
+def _refresh_unit_quarantine(main_agent: Any) -> set[int]:
+    """Remember every tag already owned by an upstream team or seen set."""
+
+    quarantine = getattr(main_agent, "_rtscortex_unit_quarantine", None)
+    if not isinstance(quarantine, set):
+        quarantine = set()
+        main_agent._rtscortex_unit_quarantine = quarantine
+    total = getattr(main_agent, "unit_uid_total", ())
+    if isinstance(total, (list, tuple, set, frozenset)):
+        quarantine.update(int(tag) for tag in total)
+    for agent in getattr(main_agent, "agents", {}).values():
+        for team in getattr(agent, "teams", ()):
+            quarantine.update(int(tag) for tag in team.get("unit_tags", ()))
+    return quarantine
+
+
+def _normalize_new_unit_queue(main_agent: Any) -> None:
+    """Keep the upstream new-unit queue unique and exclude processed tags."""
+
+    pending = getattr(main_agent, "unit_uid_appear", None)
+    if not isinstance(pending, list):
+        return
+    quarantine = _refresh_unit_quarantine(main_agent)
+    seen: set[int] = set()
+    normalized: list[int] = []
+    for value in pending:
+        tag = int(value)
+        if tag in seen or tag in quarantine:
+            continue
+        seen.add(tag)
+        normalized.append(tag)
+    pending[:] = normalized
+
+
+def _prepare_runtime_observation_bypass(main_agent: Any, observation: Any) -> bool:
+    """Bypass func1 camera work and expose the current raw snapshot to Runtime."""
+
+    _normalize_new_unit_queue(main_agent)
+    pending = getattr(main_agent, "unit_uid_appear", None)
+    if not isinstance(pending, list):
+        pending = []
+        main_agent.unit_uid_appear = pending
+    quarantine = _refresh_unit_quarantine(main_agent)
+    current_tags: list[int] = []
+    previous_tags = {int(tag) for tag in getattr(main_agent, "unit_uid", ())}
+    for unit in _observation_value(observation, "raw_units", ()):
+        if int(_observation_value(unit, "alliance", -1)) != 1:
+            continue
+        if float(_observation_value(unit, "build_progress", 0.0)) < 100.0:
+            continue
+        tag = int(_observation_value(unit, "tag", -1))
+        if tag < 0:
+            continue
+        current_tags.append(tag)
+        if tag not in previous_tags and tag not in quarantine and tag not in pending:
+            pending.append(tag)
+
+    recovered = False
+    for _ in range(len(set(int(tag) for tag in pending))):
+        if not _force_group_stalled_new_unit(main_agent, observation):
+            break
+        recovered = True
+    main_agent.unit_uid = current_tags
+    main_agent.main_loop_lock = False
+    _clear_optional_team_gathering(main_agent)
+    _normalize_new_unit_queue(main_agent)
+    return recovered
+
+
+def _clear_optional_team_gathering(main_agent: Any) -> None:
+    """Prevent upstream func4 camera work from delaying a forced Runtime tick."""
+
+    for agent in getattr(main_agent, "agents", {}).values():
+        for team in getattr(agent, "teams", ()):
+            tags = [int(tag) for tag in team.get("unit_tags", ())]
+            team["unit_tags_selected"] = list(dict.fromkeys(tags))
+    main_agent.temp_head_unit_tag = None
+    main_agent.temp_curr_unit_tag = None
+    main_agent.temp_head_unit = None
+    main_agent.temp_curr_unit = None
+    main_agent.temp_team_unit_tags = []
+    main_agent.flag_locked_func4 = False
 
 
 def _worker_has_active_action(main_agent: Any) -> bool:

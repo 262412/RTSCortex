@@ -27,6 +27,7 @@ from rtscortex.playbook.models import (
     PlaybookRuleStrength,
     StrategicConsequence,
 )
+from rtscortex.playbook.promotion import PlaybookPromotionSweep, PromotionSweepResult
 from rtscortex.playbook.store import PlaybookStore
 
 
@@ -40,9 +41,11 @@ class CortexPlaybookReviewer:
         self._attributor = StrategicConsequenceAttributor()
         self.last_rule_updates: tuple[PlaybookRule, ...] = ()
         self.last_consequences: tuple[StrategicConsequence, ...] = ()
+        self.last_promotion_sweep = PromotionSweepResult(0, (), (), (), {}, {})
         self.rebuild_lessons()
         self._repair_unscoped_execution_candidates()
         self._quarantine_unsafe_execution_penalties()
+        self.last_promotion_sweep = PlaybookPromotionSweep(self.store).run()
 
     def _repair_unscoped_execution_candidates(self) -> None:
         """Retire early v2 candidates that accidentally targeted every action."""

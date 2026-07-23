@@ -30,6 +30,7 @@ from rtscortex.playbook import (
     PlaybookCondition,
     PlaybookContext,
     PlaybookIntentGuard,
+    PlaybookPromotionSweep,
     PlaybookQuery,
     PlaybookRule,
     PlaybookRuleApplication,
@@ -899,6 +900,110 @@ def test_shadow_validated_execution_rule_becomes_soft_and_changes_score(
 
     assert result.score_delta == -0.5
     assert result.rule_ids == (rule.rule_id,)
+    playbook.close()
+
+
+def test_promotion_sweep_replays_multi_seed_states_and_activates_soft_rule(
+    tmp_path: Path,
+) -> None:
+    playbook = PlaybookStore(tmp_path / "cortex-playbook-v2.sqlite3")
+    run_ids = ("historical-seed-0", "historical-seed-1")
+    rule = playbook.upsert_rule(
+        PlaybookRule(
+            rule_id="rule:historical-offense",
+            canonical_key="historical-offense",
+            category=PlaybookRuleCategory.TACTICAL_RESPONSE,
+            conditions=(
+                PlaybookCondition(field="agent_race", value="protoss"),
+                PlaybookCondition(field="opponent_race", value="zerg"),
+                PlaybookCondition(field="phase", value="combat"),
+                PlaybookCondition(field="map_name", value="Simple64"),
+                PlaybookCondition(field="threat_level", value="low"),
+                PlaybookCondition(field="economy_status", value="stable"),
+                PlaybookCondition(field="army_readiness", value="engaged"),
+            ),
+            effect=PlaybookRuleEffect.PREFER,
+            strength=PlaybookRuleStrength.ADVISORY,
+            status=PlaybookRuleStatus.CANDIDATE,
+            role_ids=("offense",),
+            confidence=0.85,
+            source_run_ids=run_ids,
+            source_seeds=(0, 1),
+        )
+    )
+    for run_id in run_ids:
+        run_dir = tmp_path / run_id
+        event_store = EventStore(run_dir / "events.sqlite3", run_dir / "events.jsonl")
+        for index in range(30):
+            event_store.append_event(
+                run_id=run_id,
+                episode_id="episode",
+                step_id=index,
+                event_type="situation_assessed",
+                payload={
+                    "phase": "combat",
+                    "threat_level": "low",
+                    "economy_status": "stable",
+                    "army_readiness": "engaged",
+                },
+            )
+        event_store.close()
+
+    sweep = PlaybookPromotionSweep(playbook, run_root=tmp_path).run()
+
+    assert sweep.matched_state_count_by_rule[rule.rule_id] == 60
+    assert sweep.promoted_rule_ids == (rule.rule_id,)
+    promoted = next(item for item in playbook.rules() if item.rule_id == rule.rule_id)
+    assert promoted.status is PlaybookRuleStatus.ACTIVE
+    assert promoted.strength is PlaybookRuleStrength.SOFT
+    assert promoted.shadow_state_count == 60
+
+    situation = SituationAssessment(
+        assessment_id="assessment:promotion",
+        run_id="next-run",
+        episode_id="episode",
+        step_id=1,
+        game_loop=100,
+        valid_until_game_loop=101,
+        phase=GamePhase.COMBAT,
+        threat_level=ThreatLevel.LOW,
+        economy_status=EconomyStatus.STABLE,
+        army_readiness=ArmyReadiness.ENGAGED,
+        source_kind="deterministic",
+        source_id="test",
+        source_version="1",
+    )
+    intent = StrategicIntent(
+        intent_id="intent:offense",
+        continuity_key="offense:advance",
+        run_id="next-run",
+        episode_id="episode",
+        step_id=1,
+        created_game_loop=100,
+        role=RoleId.OFFENSE,
+        objective="advance",
+        desired_effect="convert the advantage",
+        action_names=("Attack_Unit",),
+        resource_claim=ResourceClaim(reservation_game_loops=16),
+        source_id="test",
+        source_version="1",
+    )
+    guard_result = PlaybookIntentGuard().evaluate(
+        intent,
+        context=PlaybookContext(
+            agent_race="protoss",
+            opponent_race="zerg",
+            phase=GamePhase.COMBAT,
+            map_name="Simple64",
+        ),
+        situation=situation,
+        rules=playbook.rules_for_guard(),
+        game_loop=100,
+        mode="active",
+    )
+
+    assert guard_result.score_delta == 0.5
+    assert guard_result.rule_ids == (rule.rule_id,)
     playbook.close()
 
 

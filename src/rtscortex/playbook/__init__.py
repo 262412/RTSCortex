@@ -30,6 +30,7 @@ from rtscortex.playbook.models import (
     StrategicConsequence,
     StrategicConsequenceType,
 )
+from rtscortex.playbook.promotion import PlaybookPromotionSweep, PromotionSweepResult
 from rtscortex.playbook.reviewer import CortexPlaybookReviewer
 from rtscortex.playbook.store import PlaybookStore
 
@@ -56,6 +57,8 @@ __all__ = [
     "PlaybookRuleStatus",
     "PlaybookRuleStrength",
     "PlaybookRuleLifecycle",
+    "PlaybookPromotionSweep",
+    "PromotionSweepResult",
     "StrategicABEvidence",
     "StrategicConditionSnapshot",
     "StrategicConsequence",

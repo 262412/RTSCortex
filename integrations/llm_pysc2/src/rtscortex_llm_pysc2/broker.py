@@ -94,6 +94,7 @@ class SharedDecisionBroker:
         self.observation_gap_watchdog_triggers = 0
         self.orchestration_recoveries = 0
         self.expansion_scout_camera_moves = 0
+        self.expansion_candidate_exhaustions = 0
         self._metrics_path = None if metrics_path is None else Path(metrics_path)
         with self._condition:
             self._persist_metrics_locked()
@@ -108,6 +109,7 @@ class SharedDecisionBroker:
                 "observation_gap_watchdog_triggers": self.observation_gap_watchdog_triggers,
                 "orchestration_recoveries": self.orchestration_recoveries,
                 "expansion_scout_camera_moves": self.expansion_scout_camera_moves,
+                "expansion_candidate_exhaustions": self.expansion_candidate_exhaustions,
             }
 
     @property
@@ -130,6 +132,11 @@ class SharedDecisionBroker:
     def record_expansion_scout_move(self) -> None:
         with self._condition:
             self.expansion_scout_camera_moves += 1
+            self._persist_metrics_locked()
+
+    def record_expansion_candidate_exhaustion(self) -> None:
+        with self._condition:
+            self.expansion_candidate_exhaustions += 1
             self._persist_metrics_locked()
 
     def record_unattributed_primitive(self) -> None:
@@ -738,6 +745,9 @@ class SharedDecisionBroker:
                     "observation_gap_watchdog_triggers": (self.observation_gap_watchdog_triggers),
                     "orchestration_recoveries": self.orchestration_recoveries,
                     "expansion_scout_camera_moves": self.expansion_scout_camera_moves,
+                    "expansion_candidate_exhaustions": (
+                        self.expansion_candidate_exhaustions
+                    ),
                 }
             ),
             encoding="utf-8",
