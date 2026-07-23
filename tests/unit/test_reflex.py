@@ -136,6 +136,33 @@ def test_terran_economy_controller_automatically_trains_scv_below_saturation() -
     ]
 
 
+def test_protoss_economy_controller_automatically_trains_probe_below_saturation() -> None:
+    observation = make_observation().model_copy(
+        update={
+            "state": SC2State(
+                economy=EconomyState(minerals=500, supply_used=14, supply_cap=23, workers=12),
+                own_structures=[
+                    UnitState(
+                        unit_id="0xnexus",
+                        unit_type="Nexus",
+                        alliance="self",
+                        status="idle",
+                    )
+                ],
+            ),
+            "available_actions": [
+                AvailableAction(name="Train_Probe", actor_scopes=["Developer/Empty"])
+            ],
+        }
+    )
+
+    commands = ReflexEngine(enabled=True, low_health_threshold=0.25).evaluate(observation)
+
+    assert [(command.actor, command.name, command.priority) for command in commands] == [
+        ("Developer/Empty", "Train_Probe", 65)
+    ]
+
+
 def test_chained_creep_is_used_after_queen_controllers_are_unavailable() -> None:
     observation = make_observation().model_copy(
         update={

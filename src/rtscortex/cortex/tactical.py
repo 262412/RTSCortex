@@ -7,7 +7,7 @@ import math
 from dataclasses import dataclass, field
 from typing import Literal
 
-from rtscortex.contracts import ObservationEnvelope, UnitState
+from rtscortex.contracts import ExecutionReport, ExecutionStatus, ObservationEnvelope, UnitState
 from rtscortex.cortex.models import (
     ArmyReadiness,
     IntentTarget,
@@ -71,11 +71,18 @@ class _ActorOffenseState:
     obsolete_waypoints: dict[tuple[int, int], int] = field(default_factory=dict)
 
 
+@dataclass(slots=True)
+class _TargetFailureState:
+    failure_count: int
+    quarantined_until_game_loop: int
+    failure_code: str
+
+
 class DeterministicTacticalAgent:
     """Turn a current situation into exact, candidate-bound combat intents."""
 
     agent_id = "deterministic-tactical-agent"
-    agent_version = "0.3.0"
+    agent_version = "0.4.0"
     provider_id = agent_id
     provider_version = agent_version
 
@@ -91,7 +98,13 @@ class DeterministicTacticalAgent:
         offense_arrival_radius: float = 4.0,
         offense_stall_game_loops: int = 112,
         offense_waypoint_retry_game_loops: int = 336,
+        target_retry_limit: int = 2,
+        target_quarantine_game_loops: int = 112,
     ) -> None:
+        if target_retry_limit < 1:
+            raise ValueError("target_retry_limit must be positive")
+        if target_quarantine_game_loops < 1:
+            raise ValueError("target_quarantine_game_loops must be positive")
         self.retreat_health_threshold = retreat_health_threshold
         self.minimum_advance_army_supply = minimum_advance_army_supply
         self.reacquire_cooldown_game_loops = reacquire_cooldown_game_loops
@@ -104,8 +117,11 @@ class DeterministicTacticalAgent:
         self.offense_arrival_radius = offense_arrival_radius
         self.offense_stall_game_loops = offense_stall_game_loops
         self.offense_waypoint_retry_game_loops = offense_waypoint_retry_game_loops
+        self.target_retry_limit = target_retry_limit
+        self.target_quarantine_game_loops = target_quarantine_game_loops
         self._episode_key: tuple[str, str] | None = None
-        self._last_focus_target: str | None = None
+        self._focus_target_by_actor: dict[str, str] = {}
+        self._target_failures: dict[tuple[str, str], _TargetFailureState] = {}
         self._retreat_by_actor: dict[str, _ActorRetreatState] = {}
         self._offense_by_actor: dict[str, _ActorOffenseState] = {}
         self._known_enemy_structures: dict[str, tuple[float, float]] = {}
@@ -130,10 +146,19 @@ class DeterministicTacticalAgent:
         )
         attack_actors = [actor for actor in attack_actors if actor not in retreating_actors]
         move_actors = [actor for actor in move_actors if actor not in retreating_actors]
+        attack_intents: list[TacticalIntent] = []
+        engaged_actors: set[str] = set()
         if current_targets and attack_actors:
-            target, reacquired = self._focus_target(current_targets)
-            target_tag = _normalize_tag(target.unit_id)
             for actor in attack_actors:
+                actor_targets = self._attack_targets_for_actor(
+                    observation,
+                    actor,
+                    current_targets,
+                )
+                if not actor_targets:
+                    continue
+                target, reacquired = self._focus_target(actor, actor_targets)
+                target_tag = _normalize_tag(target.unit_id)
                 previous = self._offense_by_actor.get(actor)
                 self._offense_by_actor[actor] = _ActorOffenseState(
                     phase="engaged",
@@ -146,48 +171,105 @@ class DeterministicTacticalAgent:
                     cooldown_until_game_loop=observation.game_loop,
                     target_tag=target_tag,
                 )
-            target_kind = (
-                "enemy structure"
-                if target.unit_type in ENEMY_STRUCTURE_TYPES
-                else "enemy unit"
-            )
-            objective = (
-                f"Reacquire and focus fire {target_kind} {target.unit_type}"
-                if reacquired
-                else f"Focus fire current-screen {target_kind} {target.unit_type}"
-            )
-            attack_intents = [
-                self._intent(
-                    observation,
-                    assessment,
-                    actor=actor,
-                    action_name="Attack_Unit",
-                    objective=objective,
-                    target=IntentTarget(
-                        kind=IntentTargetKind.ENEMY,
-                        unit_tag=target_tag,
-                        unit_type=target.unit_type,
-                    ),
-                    priority=75,
-                    ttl_game_loops=8,
+                target_kind = (
+                    "enemy structure"
+                    if target.unit_type in ENEMY_STRUCTURE_TYPES
+                    else "enemy unit"
                 )
-                for actor in attack_actors
-            ]
-            return [*retreat_intents, *attack_intents]
+                objective = (
+                    f"Reacquire and focus fire {target_kind} {target.unit_type}"
+                    if reacquired
+                    else f"Focus fire current-screen {target_kind} {target.unit_type}"
+                )
+                attack_intents.append(
+                    self._intent(
+                        observation,
+                        assessment,
+                        actor=actor,
+                        action_name="Attack_Unit",
+                        objective=objective,
+                        target=IntentTarget(
+                            kind=IntentTargetKind.ENEMY,
+                            unit_tag=target_tag,
+                            unit_type=target.unit_type,
+                        ),
+                        priority=75,
+                        ttl_game_loops=8,
+                    )
+                )
+                engaged_actors.add(actor)
 
         ready_to_advance = (
             assessment.army_readiness is ArmyReadiness.READY
             or observation.state.economy.army_supply >= self.minimum_advance_army_supply
         )
-        if ready_to_advance and move_actors:
+        searching_actors = [actor for actor in move_actors if actor not in engaged_actors]
+        if ready_to_advance and searching_actors:
             intents = self._offense_search_intents(
                 observation,
                 assessment,
-                move_actors,
+                searching_actors,
                 last_known_targets=last_known_targets,
             )
-            return [*retreat_intents, *intents]
-        return retreat_intents
+            return [*retreat_intents, *attack_intents, *intents]
+        return [*retreat_intents, *attack_intents]
+
+    def record_execution(
+        self,
+        report: ExecutionReport,
+        *,
+        game_loop: int,
+    ) -> dict[str, object] | None:
+        if report.action_name != "Attack_Unit" or report.actor is None:
+            return None
+        target = next(
+            (
+                _normalize_tag(value)
+                for value in report.resolved_arguments or report.requested_arguments
+                if isinstance(value, (int, str))
+            ),
+            None,
+        )
+        if target is None:
+            return None
+        key = (report.actor, target)
+        if report.status is ExecutionStatus.SUCCEEDED:
+            self._target_failures.pop(key, None)
+            return {
+                "actor": report.actor,
+                "target_tag": target,
+                "state": "confirmed",
+                "failure_count": 0,
+            }
+        failure_code = report.failure_code or "unknown_failure"
+        immediate = failure_code in {
+            "combat_target_lost",
+            "target_not_visible",
+            "friendly_target",
+        }
+        previous = self._target_failures.get(key)
+        failure_count = 1 if previous is None else previous.failure_count + 1
+        quarantined = immediate or failure_count >= self.target_retry_limit
+        until = (
+            game_loop + self.target_quarantine_game_loops
+            if quarantined
+            else game_loop
+        )
+        self._target_failures[key] = _TargetFailureState(
+            failure_count=failure_count,
+            quarantined_until_game_loop=until,
+            failure_code=failure_code,
+        )
+        if quarantined:
+            self._focus_target_by_actor.pop(report.actor, None)
+        return {
+            "actor": report.actor,
+            "target_tag": target,
+            "state": "quarantined" if quarantined else "retryable",
+            "failure_count": failure_count,
+            "failure_code": failure_code,
+            "quarantined_until_game_loop": until if quarantined else None,
+        }
 
     def _offense_search_intents(
         self,
@@ -468,19 +550,54 @@ class DeterministicTacticalAgent:
         if episode_key == self._episode_key:
             return
         self._episode_key = episode_key
-        self._last_focus_target = None
+        self._focus_target_by_actor.clear()
+        self._target_failures.clear()
         self._retreat_by_actor.clear()
         self._offense_by_actor.clear()
         self._known_enemy_structures.clear()
 
-    def _focus_target(self, enemies: list[UnitState]) -> tuple[UnitState, bool]:
+    def _focus_target(
+        self,
+        actor: str,
+        enemies: list[UnitState],
+    ) -> tuple[UnitState, bool]:
         by_tag = {_normalize_tag(enemy.unit_id): enemy for enemy in enemies}
-        previous = self._last_focus_target
+        previous = self._focus_target_by_actor.get(actor)
         if previous is not None and previous in by_tag:
             return by_tag[previous], False
         target = min(enemies, key=_target_rank)
-        self._last_focus_target = _normalize_tag(target.unit_id)
+        self._focus_target_by_actor[actor] = _normalize_tag(target.unit_id)
         return target, previous is not None
+
+    def _attack_targets_for_actor(
+        self,
+        observation: ObservationEnvelope,
+        actor: str,
+        targets: list[UnitState],
+    ) -> list[UnitState]:
+        candidate_tags = {
+            _normalize_tag(arguments[0])
+            for action in observation.available_actions
+            if action.name == "Attack_Unit" and actor in action.actor_scopes
+            for arguments in action.argument_candidates or ()
+            if arguments and isinstance(arguments[0], (int, str))
+        }
+        targets_by_tag = {_normalize_tag(target.unit_id): target for target in targets}
+        eligible: list[UnitState] = []
+        for tag in sorted(candidate_tags):
+            target = targets_by_tag.get(tag)
+            if target is None:
+                continue
+            failure = self._target_failures.get((actor, tag))
+            if (
+                failure is not None
+                and failure.quarantined_until_game_loop > observation.game_loop
+            ):
+                continue
+            if failure is not None:
+                self._target_failures.pop((actor, tag), None)
+            eligible.append(target)
+        return eligible
 
     def _intent(
         self,

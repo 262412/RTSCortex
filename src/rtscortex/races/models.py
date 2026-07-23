@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from types import MappingProxyType
 from typing import Protocol
@@ -46,6 +46,7 @@ class RaceProfileData:
     action_domains: Mapping[str, ActionDomain]
     action_producers: Mapping[str, tuple[str, ...]]
     hima_vocabulary_version: str
+    structure_saturation_limits: Mapping[str, int] = field(default_factory=dict)
     macro_contract_ready: bool = True
     runtime_mapping_ready: bool = False
     live_worker_ready: bool = False
@@ -80,6 +81,13 @@ class RaceProfileData:
             "action_producers",
             MappingProxyType(dict(self.action_producers)),
         )
+        if any(limit < 1 for limit in self.structure_saturation_limits.values()):
+            raise ValueError("structure saturation limits must be positive")
+        object.__setattr__(
+            self,
+            "structure_saturation_limits",
+            MappingProxyType(dict(self.structure_saturation_limits)),
+        )
 
     def domain_for_action(self, action_name: str) -> ActionDomain | None:
         return self.action_domains.get(action_name)
@@ -97,6 +105,7 @@ class RaceProfileData:
             "effect_verification_kinds": list(self.effect_verification_kinds),
             "controller_capabilities": list(self.controller_capabilities),
             "controller_managed_actions": list(self.controller_managed_actions),
+            "structure_saturation_limits": dict(self.structure_saturation_limits),
             "limitations": list(self.limitations),
         }
 

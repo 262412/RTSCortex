@@ -277,6 +277,7 @@ def _assert_build_order_ids_use_raw_function_domain() -> None:
 
 def _assert_direct_production_contract() -> None:
     expected = {
+        "Train_Probe": (485, 64, "Nexus", "Probe", 50, 0, 1, ("Nexus",)),
         "Train_Zealot": (503, 49, "Gateway", "Zealot", 100, 0, 2, ("Gateway",)),
         "Train_Stalker": (
             493,

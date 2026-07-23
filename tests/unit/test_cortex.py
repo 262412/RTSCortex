@@ -7,6 +7,9 @@ from rtscortex.contracts import (
     ActionSource,
     AvailableAction,
     EconomyState,
+    ExecutionReport,
+    ExecutionStage,
+    ExecutionStatus,
     ObservationEnvelope,
     SC2State,
     UnitState,
@@ -373,6 +376,77 @@ def test_tactical_agent_focuses_one_target_and_reacquires_when_it_disappears() -
     assert second
     assert second[0].target.unit_type == "Zergling"
     assert second[0].objective.startswith("Reacquire")
+
+
+def test_tactical_agent_quarantines_repeated_actor_target_failure() -> None:
+    base = _observation()
+    observation = base.model_copy(
+        update={
+            "available_actions": [
+                AvailableAction(
+                    name="Attack_Unit",
+                    argument_names=["tag"],
+                    argument_types=[ActionArgumentType.TAG],
+                    actor_scopes=["CombatGroup/Army-1"],
+                    argument_candidates=[["0x20"], ["0x21"]],
+                )
+            ],
+            "state": base.state.model_copy(
+                update={
+                    "visible_enemies": [
+                        UnitState(
+                            unit_id="0x20",
+                            unit_type="VoidRay",
+                            alliance="enemy",
+                        ),
+                        UnitState(
+                            unit_id="0x21",
+                            unit_type="Zergling",
+                            alliance="enemy",
+                        ),
+                    ]
+                }
+            ),
+        }
+    )
+    agent = DeterministicTacticalAgent(
+        retreat_health_threshold=0.3,
+        minimum_advance_army_supply=4,
+        target_retry_limit=2,
+        target_quarantine_game_loops=112,
+    )
+    [first] = agent.evaluate(
+        observation,
+        DeterministicSituationAnalyzer().assess(observation),
+    )
+    assert first.target.unit_tag == "0x20"
+    failure = ExecutionReport(
+        run_id=observation.run_id,
+        episode_id=observation.episode_id,
+        step_id=observation.step_id,
+        command_id="attack-1",
+        success=False,
+        action_name="Attack_Unit",
+        actor="CombatGroup/Army-1",
+        source=ActionSource.PLANNER,
+        requested_arguments=["0x20"],
+        resolved_arguments=["0x20"],
+        status=ExecutionStatus.FAILED,
+        execution_stage=ExecutionStage.EFFECT_VERIFICATION,
+        failure_code="combat_effect_not_observed",
+    )
+
+    first_failure = agent.record_execution(failure, game_loop=64)
+    second_failure = agent.record_execution(failure, game_loop=72)
+    next_observation = observation.model_copy(update={"step_id": 5, "game_loop": 80})
+    [next_intent] = agent.evaluate(
+        next_observation,
+        DeterministicSituationAnalyzer().assess(next_observation),
+    )
+
+    assert first_failure is not None and first_failure["state"] == "retryable"
+    assert second_failure is not None and second_failure["state"] == "quarantined"
+    assert next_intent.target.unit_tag == "0x21"
 
 
 def test_tactical_agent_attacks_current_screen_structure_when_units_are_last_known() -> None:
@@ -775,7 +849,7 @@ def test_candidate_compiler_rejects_stale_intent() -> None:
 def test_deterministic_situation_analyzer_reports_explicit_provenance() -> None:
     assessment = DeterministicSituationAnalyzer(valid_for_game_loops=4).assess(_observation())
 
-    assert assessment.phase is GamePhase.COMBAT
+    assert assessment.phase is GamePhase.EARLY
     assert assessment.threat_level is ThreatLevel.LOW
     assert assessment.economy_status is EconomyStatus.STABLE
     assert assessment.threats == ["Zergling"]
@@ -820,3 +894,174 @@ def test_situation_classifies_large_army_and_independent_resource_pressure() -> 
     facts = {fact.name: fact.evidence for fact in assessment.facts}
     assert facts["mineral_pressure"] == ("starved",)
     assert facts["gas_pressure"] == ("floating",)
+
+
+def test_situation_threat_uses_alerts_force_ratio_and_hysteresis() -> None:
+    base = _observation()
+    analyzer = DeterministicSituationAnalyzer(threat_hysteresis_game_loops=32)
+    attacked = base.model_copy(
+        update={
+            "alerts": ["unit_under_attack"],
+            "state": base.state.model_copy(
+                update={
+                    "own_structures": [
+                        UnitState(
+                            unit_id="0xnexus",
+                            unit_type="Nexus",
+                            alliance="self",
+                            position=(10.0, 10.0),
+                        )
+                    ],
+                    "own_units": [],
+                    "visible_enemies": [
+                        UnitState(
+                            unit_id="0xenemy",
+                            unit_type="Roach",
+                            alliance="enemy",
+                            position=(14.0, 10.0),
+                        )
+                    ],
+                }
+            ),
+        }
+    )
+
+    first = analyzer.assess(attacked)
+    persisted = analyzer.assess(
+        attacked.model_copy(
+            update={
+                "step_id": attacked.step_id + 1,
+                "game_loop": attacked.game_loop + 16,
+                "alerts": [],
+                "state": attacked.state.model_copy(
+                    update={
+                        "own_units": [
+                            UnitState(
+                                unit_id=f"0xstalker-{index}",
+                                unit_type="Stalker",
+                                alliance="self",
+                            )
+                            for index in range(5)
+                        ],
+                        "visible_enemies": [
+                            UnitState(
+                                unit_id="0xenemy",
+                                unit_type="Roach",
+                                alliance="enemy",
+                            )
+                        ],
+                    }
+                ),
+            }
+        )
+    )
+    temporarily_unseen = analyzer.assess(
+        attacked.model_copy(
+            update={
+                "step_id": attacked.step_id + 2,
+                "game_loop": attacked.game_loop + 24,
+                "alerts": [],
+                "state": attacked.state.model_copy(update={"visible_enemies": []}),
+            }
+        )
+    )
+    cleared = analyzer.assess(
+        attacked.model_copy(
+            update={
+                "step_id": attacked.step_id + 3,
+                "game_loop": attacked.game_loop + 40,
+                "alerts": [],
+                "state": attacked.state.model_copy(update={"visible_enemies": []}),
+            }
+        )
+    )
+
+    assert first.threat_level is ThreatLevel.CRITICAL
+    assert first.threat_score >= 7.0
+    assert "empty_army_overwhelmed" in first.threat_evidence
+    assert persisted.threat_level is ThreatLevel.CRITICAL
+    assert "hysteresis:critical" in persisted.threat_evidence
+    assert temporarily_unseen.threat_level is ThreatLevel.CRITICAL
+    assert "enemy_temporarily_unseen" in temporarily_unseen.threat_evidence
+    assert cleared.threat_level is ThreatLevel.NONE
+    threat_fact = next(fact for fact in first.facts if fact.name == "threat_level")
+    assert threat_fact.source == "stateful_threat_rules"
+    assert any(item.startswith("score:") for item in threat_fact.evidence)
+
+
+def test_zero_townhalls_with_living_enemy_is_terminal_combat_crisis() -> None:
+    base = _observation()
+    observation = base.model_copy(
+        update={
+            "state": base.state.model_copy(
+                update={
+                    "economy": base.state.economy.model_copy(
+                        update={"army_supply": 0, "workers": 4}
+                    ),
+                    "own_units": [
+                        UnitState(
+                            unit_id="0xprobe",
+                            unit_type="Probe",
+                            alliance="self",
+                        )
+                    ],
+                    "own_structures": [
+                        UnitState(
+                            unit_id="0xcore",
+                            unit_type="CyberneticsCore",
+                            alliance="self",
+                        )
+                    ],
+                }
+            )
+        }
+    )
+
+    assessment = DeterministicSituationAnalyzer().assess(observation)
+
+    assert assessment.phase is GamePhase.COMBAT
+    assert assessment.threat_level is ThreatLevel.CRITICAL
+    phase_fact = next(fact for fact in assessment.facts if fact.name == "game_phase")
+    assert "terminal_collapse:no_surviving_townhall" in phase_fact.evidence
+
+
+def test_situation_threat_records_missing_anti_air_capability() -> None:
+    base = _observation()
+    observation = base.model_copy(
+        update={
+            "state": base.state.model_copy(
+                update={
+                    "own_structures": [
+                        UnitState(
+                            unit_id="0xnexus",
+                            unit_type="Nexus",
+                            alliance="self",
+                            position=(10.0, 10.0),
+                        )
+                    ],
+                    "own_units": [
+                        UnitState(
+                            unit_id=f"0xzealot-{index}",
+                            unit_type="Zealot",
+                            alliance="self",
+                        )
+                        for index in range(2)
+                    ],
+                    "visible_enemies": [
+                        UnitState(
+                            unit_id=f"0xmutalisk-{index}",
+                            unit_type="Mutalisk",
+                            alliance="enemy",
+                            position=(20.0, 10.0),
+                        )
+                        for index in range(2)
+                    ],
+                }
+            )
+        }
+    )
+
+    assessment = DeterministicSituationAnalyzer().assess(observation)
+
+    assert assessment.threat_level is ThreatLevel.CRITICAL
+    assert "capability_mismatch:no_anti_air" in assessment.threat_evidence

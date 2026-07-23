@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
-from rtscortex.contracts import ActionCommand, ActionSource, ObservationEnvelope
+from rtscortex.contracts import (
+    ActionCommand,
+    ActionSource,
+    AvailableAction,
+    ObservationEnvelope,
+)
 from rtscortex.targeting import current_screen_enemy_targets
 
 
@@ -47,8 +52,8 @@ class ReflexEngine:
                 or available.get("Morph_OrbitalCommand")
                 or available.get("Effect_CalldownMULE_Screen")
                 or (
-                    available.get("Train_SCV")
-                    if _automatic_scv_is_needed(observation)
+                    _available_worker_training_action(available)
+                    if _automatic_worker_is_needed(observation)
                     else None
                 )
             )
@@ -146,8 +151,19 @@ class ReflexEngine:
         )
 
 
-def _automatic_scv_is_needed(observation: ObservationEnvelope) -> bool:
-    townhall_types = {"CommandCenter", "OrbitalCommand", "PlanetaryFortress"}
+def _available_worker_training_action(
+    available: dict[str, AvailableAction],
+) -> AvailableAction | None:
+    return available.get("Train_Probe") or available.get("Train_SCV")
+
+
+def _automatic_worker_is_needed(observation: ObservationEnvelope) -> bool:
+    townhall_types = {
+        "Nexus",
+        "CommandCenter",
+        "OrbitalCommand",
+        "PlanetaryFortress",
+    }
     completed_townhalls = sum(
         structure.unit_type in townhall_types and structure.status != "constructing"
         for structure in observation.state.own_structures
@@ -163,6 +179,7 @@ def _controller_priority(action_name: str) -> int:
         "Effect_InjectLarva": 80,
         "Morph_OrbitalCommand": 78,
         "Effect_CalldownMULE_Screen": 75,
+        "Train_Probe": 65,
         "Train_SCV": 65,
         "Build_CreepTumor_Queen_Screen": 45,
         "Build_CreepTumor_Tumor_Screen": 40,

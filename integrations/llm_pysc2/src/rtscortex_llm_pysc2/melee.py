@@ -42,6 +42,7 @@ _ACTION_NAMES = {
     },
     "Developer": {
         "No_Operation",
+        "Train_Probe",
         "Train_Zealot",
         "Train_Stalker",
         "Train_Adept",
@@ -97,6 +98,21 @@ _ACTION_NAMES = {
 }
 
 
+class _TrainProbeQuick:
+    """Lazy feature-function proxy so the core contract tests do not require PySC2."""
+
+    id = 485
+    name = "Train_Probe_quick"
+
+    def __call__(self, *args: Any) -> Any:
+        from pysc2.lib.actions import FUNCTIONS  # type: ignore[import-not-found]
+
+        return FUNCTIONS.Train_Probe_quick(*args)
+
+
+_TRAIN_PROBE_QUICK = _TrainProbeQuick()
+
+
 class RTSCortexMeleeConfig(ProtossAgentConfig):  # type: ignore[misc]
     """Retain the supported Protoss macro chain and its combat groups."""
 
@@ -128,10 +144,28 @@ class RTSCortexMeleeConfig(ProtossAgentConfig):  # type: ignore[misc]
         # keeps the dedicated Builder Probe reserved while ordinary workers are
         # stopped and reassigned deterministically by the Bridge.
         self.ENABLE_AUTO_WORKER_MANAGE = True
-        self.ENABLE_AUTO_WORKER_TRAINING = True
+        # Probe production belongs to the RTSCortex Economy controller so every
+        # attempt has command lineage, producer provenance, and effect evidence.
+        self.ENABLE_AUTO_WORKER_TRAINING = False
+        _ensure_probe_training(self.AGENTS)
         _ensure_assimilator_camera_settlement(self.AGENTS)
         _ensure_attack_target_reacquisition(self.AGENTS)
         _ensure_no_operation(self.AGENTS)
+
+
+def _ensure_probe_training(agents: dict[str, dict[str, Any]]) -> None:
+    """Expose tracked Nexus production through the Developer Empty team."""
+
+    actions = agents["Developer"]["action"]["EmptyGroup"]
+    if any(action["name"] == "Train_Probe" for action in actions):
+        return
+    actions.append(
+        {
+            "name": "Train_Probe",
+            "arg": [],
+            "func": [(485, _TRAIN_PROBE_QUICK, ("queued",))],
+        }
+    )
 
 
 def _ensure_no_operation(agents: dict[str, dict[str, Any]]) -> None:

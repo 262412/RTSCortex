@@ -38,6 +38,7 @@ from rtscortex.cortex.dataset import (
 )
 from rtscortex.cortex.executor import DeterministicCandidateExecutor
 from rtscortex.cortex.interfaces import (
+    ExecutionAwareTacticalPolicyProvider,
     FastExecutor,
     IntentCandidateCompiler,
     SituationAnalyzer,
@@ -142,6 +143,7 @@ __all__ = [
     "DeterministicTacticalAgent",
     "DefenseAgent",
     "EconomyStatus",
+    "ExecutionAwareTacticalPolicyProvider",
     "EconomyAgent",
     "EnsembleSchedule",
     "ExecutableCandidate",

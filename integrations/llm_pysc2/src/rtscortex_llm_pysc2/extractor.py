@@ -532,6 +532,7 @@ class TimeStepExtractor:
         }
         self._known_expansion_resources: dict[int, dict[str, Any]] = {}
         self._suppressed_expansion_anchors: set[int] = set()
+        self._expansion_candidates_exhausted = False
         self._latest_game_loop = 0
 
     @property
@@ -541,6 +542,9 @@ class TimeStepExtractor:
     @property
     def suppressed_expansion_anchors(self) -> frozenset[int]:
         return frozenset(self._suppressed_expansion_anchors)
+
+    def set_expansion_candidates_exhausted(self, exhausted: bool) -> None:
+        self._expansion_candidates_exhausted = bool(exhausted)
 
     def suppress_expansion_anchor(
         self,
@@ -620,7 +624,14 @@ class TimeStepExtractor:
             ],
             "teams": teams,
             "text_observation": text_observation,
-            "alerts": [_alert_name(value) for value in _value(observation, "alerts", ())],
+            "alerts": [
+                *[_alert_name(value) for value in _value(observation, "alerts", ())],
+                *(
+                    ["expansion_candidates_exhausted"]
+                    if self._expansion_candidates_exhausted
+                    else []
+                ),
+            ],
             "image_uri": None,
         }
 

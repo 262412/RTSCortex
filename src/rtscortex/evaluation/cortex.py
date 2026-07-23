@@ -21,7 +21,12 @@ CORTEX_EVENT_TYPES = frozenset(
         "macro_frontier_deferred",
         "macro_frontier_preempted",
         "macro_structure_deferred",
+        "macro_step_deduplicated",
         "macro_step_updated",
+        "expansion_commitment_started",
+        "expansion_anchor_rejected",
+        "expansion_commitment_terminal",
+        "tactical_target_state",
         "intent_emitted",
         "role_intent_emitted",
         "intent_arbitrated",
@@ -93,6 +98,10 @@ class CortexObservabilityMetrics:
     race_brain_degraded_members: int = 0
     race_brain_unique_frontier_contributions: dict[str, int] = field(default_factory=dict)
     race_brain_proposal_diversity: float = 0.0
+    threat_level_counts: dict[str, int] = field(default_factory=dict)
+    threat_evidence_counts: dict[str, int] = field(default_factory=dict)
+    threat_evidence_coverage: float = 0.0
+    max_threat_score: float = 0.0
 
     def as_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -141,13 +150,31 @@ def compute_cortex_observability(
     race_brain_unique_contributions: Counter[str] = Counter()
     race_brain_degraded_members = 0
     race_brain_diversities: list[float] = []
+    threat_levels: Counter[str] = Counter()
+    threat_evidence: Counter[str] = Counter()
+    threat_observations = 0
+    threat_observations_with_evidence = 0
+    max_threat_score = 0.0
 
     for event in cortex_events:
         payload = _object(event.payload)
         if event.event_type == "race_profile_activated":
             race_profile_payload = payload
         elif event.event_type == "situation_assessed":
-            current_phase = _text(payload, "phase", "game_phase") or current_phase
+            assessment = _object(payload.get("assessment")) or payload
+            current_phase = _text(assessment, "phase", "game_phase") or current_phase
+            level = _text(assessment, "threat_level", "threat") or "unknown"
+            threat_levels[level] += 1
+            threat_observations += 1
+            evidence = assessment.get("threat_evidence")
+            if isinstance(evidence, list | tuple):
+                recorded = [item for item in evidence if isinstance(item, str)]
+                if recorded:
+                    threat_observations_with_evidence += 1
+                    threat_evidence.update(recorded)
+            score = assessment.get("threat_score")
+            if isinstance(score, int | float) and not isinstance(score, bool):
+                max_threat_score = max(max_threat_score, float(score))
         elif event.event_type == "race_brain_coordinated":
             selected_member = _text(payload, "selected_member_id")
             if selected_member is not None:
@@ -393,6 +420,14 @@ def compute_cortex_observability(
             if race_brain_diversities
             else 0.0
         ),
+        threat_level_counts=dict(sorted(threat_levels.items())),
+        threat_evidence_counts=dict(sorted(threat_evidence.items())),
+        threat_evidence_coverage=(
+            threat_observations_with_evidence / threat_observations
+            if threat_observations
+            else 0.0
+        ),
+        max_threat_score=max_threat_score,
     )
 
 

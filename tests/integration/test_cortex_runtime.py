@@ -1248,6 +1248,272 @@ def test_saturated_main_base_gas_frontier_expands_instead_of_stalling(
     assert fallback.runtime_action == "Build_Nexus_Near"
 
 
+def test_blocked_expansion_does_not_block_independent_stargate_frontier(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    runtime = CortexRuntimeEngine(
+        config=_config(tmp_path),
+        store=store,
+        provider=FakeProvider(),
+        macro_client=_FakeMacroClient("Actions: ['Nexus', 'Stargate']"),
+    )
+    observation = ObservationEnvelope(
+        run_id="cortex-run",
+        episode_id="episode-1",
+        step_id=0,
+        game_loop=0,
+        state=SC2State(
+            economy=EconomyState(
+                minerals=500,
+                vespene=200,
+                supply_used=20,
+                supply_cap=31,
+                workers=18,
+            ),
+            own_structures=[
+                UnitState(unit_id="0x1", unit_type="Nexus", alliance="self"),
+                UnitState(unit_id="0x2", unit_type="CyberneticsCore", alliance="self"),
+            ],
+        ),
+        available_actions=[
+            AvailableAction(
+                name="Build_Stargate_Screen",
+                argument_names=["screen"],
+                argument_types=[ActionArgumentType.POSITION],
+                actor_scopes=["Builder/Probe-1"],
+                argument_candidates=[[[70, 70]]],
+            )
+        ],
+    )
+
+    async def exercise() -> None:
+        await runtime.start()
+        await runtime.tick(observation)
+        for _ in range(5):
+            await asyncio.sleep(0)
+        batch = await runtime.tick(
+            observation.model_copy(update={"step_id": 1, "game_loop": 1})
+        )
+        assert [command.name for command in batch.commands] == ["Build_Stargate_Screen"]
+        await runtime.close()
+
+    asyncio.run(exercise())
+
+    recovered = _store(tmp_path)
+    decisions = recovered.events_of_type("cortex-run", "episode-1", "decision")
+    assert decisions[-1].payload["batch"]["commands"][0]["name"] == "Build_Stargate_Screen"
+    recovered.close()
+
+
+def test_global_structure_saturation_marks_revised_unique_tech_obsolete(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    runtime = CortexRuntimeEngine(
+        config=_config(tmp_path),
+        store=store,
+        provider=FakeProvider(),
+        macro_client=_FakeMacroClient("Actions: ['CyberneticsCore']"),
+    )
+    observation = ObservationEnvelope(
+        run_id="cortex-run",
+        episode_id="episode-1",
+        step_id=0,
+        game_loop=0,
+        state=SC2State(
+            economy=EconomyState(
+                minerals=500,
+                supply_used=20,
+                supply_cap=31,
+                workers=18,
+            ),
+            own_structures=[
+                UnitState(unit_id="0x1", unit_type="Nexus", alliance="self"),
+                UnitState(unit_id="0x2", unit_type="Pylon", alliance="self"),
+                UnitState(unit_id="0x3", unit_type="Gateway", alliance="self"),
+                UnitState(unit_id="0x4", unit_type="CyberneticsCore", alliance="self"),
+            ],
+        ),
+        available_actions=[
+            AvailableAction(
+                name="Build_CyberneticsCore_Screen",
+                argument_names=["screen"],
+                argument_types=[ActionArgumentType.POSITION],
+                actor_scopes=["Builder/Probe-1"],
+                argument_candidates=[[[70, 70]]],
+            )
+        ],
+    )
+
+    async def exercise() -> None:
+        await runtime.start()
+        await runtime.tick(observation)
+        for _ in range(5):
+            await asyncio.sleep(0)
+        batch = await runtime.tick(
+            observation.model_copy(update={"step_id": 1, "game_loop": 1})
+        )
+        assert batch.commands == []
+        assert runtime._macro_plan is not None
+        assert runtime._macro_plan.steps[0].status.value == "obsolete"
+        await runtime.close()
+
+    asyncio.run(exercise())
+
+    recovered = _store(tmp_path)
+    deduplicated = recovered.events_of_type(
+        "cortex-run", "episode-1", "macro_step_deduplicated"
+    )
+    assert len(deduplicated) == 1
+    assert deduplicated[0].payload["target_structure"] == "CyberneticsCore"
+    recovered.close()
+
+
+def test_invalid_expansion_anchor_keeps_commitment_and_dispatches_next_anchor(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    runtime = CortexRuntimeEngine(
+        config=_config(tmp_path),
+        store=store,
+        provider=FakeProvider(),
+        macro_client=_FakeMacroClient("Actions: ['Nexus']"),
+    )
+
+    def observation(step_id: int, game_loop: int, anchor: str) -> ObservationEnvelope:
+        return ObservationEnvelope(
+            run_id="cortex-run",
+            episode_id="episode-1",
+            step_id=step_id,
+            game_loop=game_loop,
+            state=SC2State(
+                economy=EconomyState(
+                    minerals=500,
+                    supply_used=12,
+                    supply_cap=23,
+                    workers=12,
+                ),
+                own_structures=[
+                    UnitState(unit_id="0x1", unit_type="Nexus", alliance="self")
+                ],
+            ),
+            available_actions=[
+                AvailableAction(
+                    name="Build_Nexus_Near",
+                    argument_names=["tag"],
+                    argument_types=[ActionArgumentType.TAG],
+                    actor_scopes=["Builder/Probe-1"],
+                    argument_candidates=[[anchor]],
+                )
+            ],
+        )
+
+    async def exercise() -> None:
+        await runtime.start()
+        await runtime.tick(observation(0, 0, "0x99"))
+        for _ in range(5):
+            await asyncio.sleep(0)
+        first_batch = await runtime.tick(observation(1, 1, "0x99"))
+        first = first_batch.commands[0]
+        runtime.record_execution(
+            ExecutionReport(
+                run_id=first_batch.run_id,
+                episode_id=first_batch.episode_id,
+                step_id=first_batch.step_id,
+                command_id=first.command_id,
+                success=False,
+                action_name=first.name,
+                actor=first.actor,
+                source=first.source,
+                requested_arguments=first.arguments,
+                resolved_arguments=first.arguments,
+                status=ExecutionStatus.FAILED,
+                execution_stage=ExecutionStage.PRE_DISPATCH,
+                failure_code="invalid_expansion_anchor",
+                failure_reason="persistent anchor no longer resolves to a legal footprint",
+            )
+        )
+
+        assert runtime._macro_plan_frozen is False
+        assert runtime._macro_plan is not None
+        assert runtime._macro_plan.steps[0].status.value == "deferred"
+        second_batch = await runtime.tick(observation(2, 2, "0xaa"))
+        assert [command.name for command in second_batch.commands] == ["Build_Nexus_Near"]
+        assert second_batch.commands[0].arguments == ["0xaa"]
+        await runtime.close()
+
+    asyncio.run(exercise())
+
+    recovered = _store(tmp_path)
+    started = recovered.events_of_type(
+        "cortex-run", "episode-1", "expansion_commitment_started"
+    )
+    rejected = recovered.events_of_type(
+        "cortex-run", "episode-1", "expansion_anchor_rejected"
+    )
+    assert len(started) == 1
+    assert len(rejected) == 1
+    assert rejected[0].payload["anchor"] == "0x99"
+    recovered.close()
+
+
+def test_expansion_candidate_exhaustion_terminalizes_active_commitment(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    runtime = CortexRuntimeEngine(
+        config=_config(tmp_path),
+        store=store,
+        provider=FakeProvider(),
+        macro_client=_FakeMacroClient("Actions: ['Nexus']"),
+    )
+    observation = ObservationEnvelope(
+        run_id="cortex-run",
+        episode_id="episode-1",
+        step_id=0,
+        game_loop=0,
+        state=SC2State(
+            economy=EconomyState(
+                minerals=500,
+                supply_used=12,
+                supply_cap=23,
+                workers=12,
+            ),
+            own_structures=[
+                UnitState(unit_id="0x1", unit_type="Nexus", alliance="self")
+            ],
+        ),
+        available_actions=[],
+    )
+
+    async def exercise() -> None:
+        await runtime.start()
+        await runtime.tick(observation)
+        for _ in range(5):
+            await asyncio.sleep(0)
+        exhausted = observation.model_copy(
+            update={
+                "step_id": 1,
+                "game_loop": 1,
+                "alerts": ["expansion_candidates_exhausted"],
+            }
+        )
+        await runtime.tick(exhausted)
+        assert runtime._expansion_commitment_id is None
+        await runtime.close()
+
+    asyncio.run(exercise())
+
+    recovered = _store(tmp_path)
+    terminal = recovered.events_of_type(
+        "cortex-run", "episode-1", "expansion_commitment_terminal"
+    )
+    assert len(terminal) == 1
+    assert terminal[0].payload["terminal_state"] == "expansion_candidates_exhausted"
+    recovered.close()
+
+
 def test_episode_transition_drains_and_discards_previous_macro_request(
     tmp_path: Path,
 ) -> None:

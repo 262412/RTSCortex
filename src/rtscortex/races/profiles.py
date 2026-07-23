@@ -102,6 +102,13 @@ PROTOSS_PROFILE_DATA = RaceProfileData(
         "Research_WarpGate": ("CyberneticsCore",),
     },
     hima_vocabulary_version="hima-protoss-60-v2",
+    structure_saturation_limits={
+        "CyberneticsCore": 1,
+        "Forge": 1,
+        "Gateway": 4,
+        "Stargate": 2,
+        "ShieldBattery": 4,
+    },
     runtime_mapping_ready=True,
     live_worker_ready=True,
     effect_verification_kinds=("build", "production", "research", "move"),

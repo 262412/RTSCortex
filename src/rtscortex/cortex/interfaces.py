@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
-from rtscortex.contracts import ActionCommand, ObservationEnvelope
+from rtscortex.contracts import ActionCommand, ExecutionReport, ObservationEnvelope
 from rtscortex.cortex.models import (
     CandidateSelection,
     CortexIntent,
@@ -38,6 +38,18 @@ class TacticalPolicyProvider(Protocol):
         observation: ObservationEnvelope,
         situation: SituationAssessment,
     ) -> list[TacticalIntent]: ...
+
+
+@runtime_checkable
+class ExecutionAwareTacticalPolicyProvider(Protocol):
+    """Tactical policy that consumes terminal command evidence."""
+
+    def record_execution(
+        self,
+        report: ExecutionReport,
+        *,
+        game_loop: int,
+    ) -> dict[str, object] | None: ...
 
 
 class IntentCandidateCompiler(Protocol):

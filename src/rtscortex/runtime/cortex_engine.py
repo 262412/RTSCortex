@@ -32,6 +32,7 @@ from rtscortex.cortex import (
     DeterministicCandidateExecutor,
     DeterministicSituationAnalyzer,
     DeterministicTacticalAgent,
+    ExecutionAwareTacticalPolicyProvider,
     FastExecutorContext,
     IntentArbiter,
     MacroIntent,
@@ -101,6 +102,13 @@ from rtscortex.runtime.engine import (
 
 _HIMA_PREVIOUS_ACTION_WINDOW_GAME_LOOPS = int(60 * 22.4)
 _MACRO_REJECTION_RETRY_GAME_LOOPS = 16
+_RECOVERABLE_EXPANSION_FAILURE_CODES = frozenset(
+    {
+        "invalid_expansion_anchor",
+        "no_legal_placement",
+        "target_not_created",
+    }
+)
 
 
 def _macro_frontier_is_usable(frontier: PolicyActionAssessment | None) -> bool:
@@ -224,6 +232,10 @@ class CortexRuntimeEngine(RuntimeEngine):
         self._macro_command_steps: dict[str, tuple[str, str, int | None]] = {}
         self._command_lineages: dict[str, CommandLineage] = {}
         self._previous_hima_actions: list[tuple[int, str]] = []
+        self._expansion_commitment_id: str | None = None
+        self._expansion_commitment_started_game_loop: int | None = None
+        self._expansion_anchor_evaluations: list[dict[str, Any]] = []
+        self._expansion_candidates_exhausted = False
         if config.cortex.situation.kind == "model_active" and situation_provider is None:
             raise ValueError("model_active Situation requires a SituationProvider")
         if config.cortex.situation.kind == "model_shadow" and shadow_situation_provider is None:
@@ -292,6 +304,7 @@ class CortexRuntimeEngine(RuntimeEngine):
         self._announce_specialist_health(observation)
         await self._collect_finished_macro(observation)
         self._note_alerts(observation)
+        self._update_expansion_candidate_state(observation)
 
         assessment = self._situation.assess(observation)
         self._current_situation = assessment
@@ -563,6 +576,10 @@ class CortexRuntimeEngine(RuntimeEngine):
         self._macro_command_steps = {}
         self._command_lineages = {}
         self._previous_hima_actions = []
+        self._expansion_commitment_id = None
+        self._expansion_commitment_started_game_loop = None
+        self._expansion_anchor_evaluations = []
+        self._expansion_candidates_exhausted = False
         self._strategic_agenda = None
         self._strategic_by_legacy_intent = {}
         self._macro_source_observation = None
@@ -644,7 +661,40 @@ class CortexRuntimeEngine(RuntimeEngine):
                     ordinal if isinstance(ordinal, int) else None,
                 )
 
-        recovered_macro_outcomes: list[tuple[str, bool]] = []
+        started_commitment = self.store.last_event(
+            observation.run_id,
+            observation.episode_id,
+            "expansion_commitment_started",
+        )
+        terminal_commitment = self.store.last_event(
+            observation.run_id,
+            observation.episode_id,
+            "expansion_commitment_terminal",
+        )
+        if (
+            started_commitment is not None
+            and (
+                terminal_commitment is None
+                or terminal_commitment.event_id < started_commitment.event_id
+            )
+        ):
+            self._expansion_commitment_id = str(
+                started_commitment.payload["commitment_id"]
+            )
+            self._expansion_commitment_started_game_loop = int(
+                started_commitment.payload["started_game_loop"]
+            )
+            self._expansion_anchor_evaluations = [
+                dict(event.payload)
+                for event in self.store.events_of_type(
+                    observation.run_id,
+                    observation.episode_id,
+                    "expansion_anchor_rejected",
+                )
+                if event.event_id > started_commitment.event_id
+            ]
+
+        recovered_macro_outcomes: list[ExecutionReport] = []
         for event in self.store.events_of_type(
             observation.run_id,
             observation.episode_id,
@@ -662,24 +712,24 @@ class CortexRuntimeEngine(RuntimeEngine):
                 )
                 if token is not None:
                     self._previous_hima_actions.append((loop, token))
-            recovered_macro_outcomes.append(
-                (report.command_id, report.status is ExecutionStatus.SUCCEEDED)
-            )
+            recovered_macro_outcomes.append(report)
 
         if self._macro_plan is not None:
-            for command_id, succeeded in recovered_macro_outcomes:
-                metadata = self._macro_command_steps.get(command_id)
+            for report in recovered_macro_outcomes:
+                metadata = self._macro_command_steps.get(report.command_id)
                 if (
                     metadata is not None
                     and metadata[0] == self._macro_plan.plan_id
                     and metadata[2] is not None
                 ):
+                    succeeded = report.status is ExecutionStatus.SUCCEEDED
                     self._advance_macro_step(
                         metadata[2],
                         succeeded=succeeded,
                         persist=False,
+                        report=report,
                     )
-                    if not succeeded:
+                    if not succeeded and not self._recoverable_expansion_failure(report):
                         self._macro_plan_frozen = True
                         self._urgent_replan_requested = True
 
@@ -1067,6 +1117,7 @@ class CortexRuntimeEngine(RuntimeEngine):
         self._last_planner_failure = None
         self._urgent_replan_requested = False
         self._last_goal_progress_fingerprint = None
+        self._ensure_expansion_commitment(proposal, observation)
         self._record_cortex_event(
             observation,
             "macro_plan_accepted",
@@ -1147,9 +1198,10 @@ class CortexRuntimeEngine(RuntimeEngine):
             for step in self._macro_proposal.steps
             if not self._macro_step_is_complete(step.ordinal)
         ]
-        if not remaining_steps:
-            return None
         remaining_proposal = self._macro_proposal.model_copy(update={"steps": remaining_steps})
+        remaining_proposal = self._proposal_with_expansion_commitment(remaining_proposal)
+        if not remaining_proposal.steps:
+            return None
         frontier = runtime_frontier(
             remaining_proposal,
             observation,
@@ -1233,6 +1285,26 @@ class CortexRuntimeEngine(RuntimeEngine):
                 frontier.reason_code,
             )
             return None
+        saturated_structure = self._saturated_structure_target(frontier, observation)
+        if saturated_structure is not None:
+            self._set_macro_step_status(
+                frontier.ordinal,
+                MacroStepStatus.OBSOLETE,
+                "global_structure_saturation_satisfied",
+            )
+            self._record_cortex_event(
+                observation,
+                "macro_step_deduplicated",
+                {
+                    "plan_id": self._macro_plan.plan_id,
+                    "ordinal": frontier.ordinal,
+                    "semantic_action": frontier.source_action,
+                    "runtime_action": frontier.runtime_action,
+                    "target_structure": saturated_structure,
+                    "reason": "global_structure_saturation_satisfied",
+                },
+            )
+            return self._prepare_macro_command(observation, assessment, goal_progress)
         pending_structure = self._pending_structure_target(frontier, observation)
         if pending_structure is not None:
             step = self._macro_step(frontier.ordinal)
@@ -1290,13 +1362,10 @@ class CortexRuntimeEngine(RuntimeEngine):
             or frontier.runtime_action is None
         ):
             return None
-        advances_plan_step = any(
-            step.ordinal == frontier.ordinal and step.canonical_action == frontier.source_action
-            for step in remaining_proposal.steps
+        step = self._macro_step(frontier.ordinal)
+        advances_plan_step = (
+            step is not None and step.semantic_action == frontier.source_action
         )
-        step = self._macro_step(frontier.ordinal) if advances_plan_step else None
-        if advances_plan_step and step is None:
-            raise RuntimeError("macro frontier has no matching typed plan step")
         step_identity = (
             f"{frontier.ordinal}:{step.completed_repeats}"
             if step is not None
@@ -1328,6 +1397,31 @@ class CortexRuntimeEngine(RuntimeEngine):
             semantic_action=frontier.source_action,
             macro_step_ordinal=(frontier.ordinal if advances_plan_step else None),
         )
+
+    def _proposal_with_expansion_commitment(
+        self,
+        proposal: MacroPolicyProposal,
+    ) -> MacroPolicyProposal:
+        if (
+            self._expansion_commitment_id is None
+            or self._expansion_candidates_exhausted
+        ):
+            return proposal
+        townhall_action = self._semantic_action_for_target(
+            self._race_profile.data.townhall_types[0]
+        )
+        if any(step.canonical_action == townhall_action for step in proposal.steps):
+            return proposal
+        ordinals = [step.ordinal for step in proposal.steps]
+        if self._macro_plan is not None:
+            ordinals.extend(step.ordinal for step in self._macro_plan.steps)
+        commitment_step = MacroActionStep(
+            ordinal=max(ordinals, default=-1) + 1,
+            canonical_action=townhall_action,
+            category="build",
+            raw_token=townhall_action,
+        )
+        return proposal.model_copy(update={"steps": [*proposal.steps, commitment_step]})
 
     def _fallback_frontier(
         self,
@@ -1397,7 +1491,11 @@ class CortexRuntimeEngine(RuntimeEngine):
             blocked_frontier.reason_code != "insufficient_vespene"
             and not gas_saturated_before_expansion
         ):
-            return None
+            return self._legal_independent_frontier(
+                proposal,
+                observation,
+                blocked_frontier,
+            )
         fallback_actions = []
         if gas_saturated_before_expansion or (
             observation.state.economy.minerals >= 800 and townhall_count < 2
@@ -1416,6 +1514,47 @@ class CortexRuntimeEngine(RuntimeEngine):
             )
             if fallback is not None:
                 return fallback
+        return self._legal_independent_frontier(
+            proposal,
+            observation,
+            blocked_frontier,
+        )
+
+    def _legal_independent_frontier(
+        self,
+        proposal: MacroPolicyProposal,
+        observation: ObservationEnvelope,
+        blocked_frontier: PolicyActionAssessment,
+    ) -> PolicyActionAssessment | None:
+        """Find the earliest later step that is legal from current global state."""
+
+        blocked_domain = (
+            None
+            if blocked_frontier.runtime_action is None
+            else self._race_profile.domain_for_action(blocked_frontier.runtime_action)
+        )
+        previous_actions = self._recent_hima_actions(observation.game_loop)
+        for step in sorted(proposal.steps, key=lambda item: item.ordinal):
+            if step.ordinal <= blocked_frontier.ordinal:
+                continue
+            isolated = proposal.model_copy(update={"steps": [step], "diagnostics": []})
+            assessment = runtime_frontier(
+                isolated,
+                observation,
+                previous_actions,
+                self._race_profile.data,
+            )
+            if (
+                assessment is None
+                or assessment.classification
+                is not PolicyActionClassification.MAPPED_LEGAL_NOW
+                or assessment.runtime_action is None
+                or self._race_profile.domain_for_action(assessment.runtime_action)
+                is blocked_domain
+                or self._saturated_structure_target(assessment, observation) is not None
+            ):
+                continue
+            return assessment
         return None
 
     def _prerequisite_resolution(
@@ -1518,6 +1657,10 @@ class CortexRuntimeEngine(RuntimeEngine):
             == self._semantic_action_for_target(self._race_profile.data.gas_structure)
         ):
             return "prerequisite_closure"
+        if blocked.reason_code == "insufficient_vespene":
+            return "resource_fallback"
+        if fallback.ordinal > blocked.ordinal:
+            return "independent_frontier"
         return "resource_fallback"
 
     def _has_gas_infrastructure(self, observation: ObservationEnvelope) -> bool:
@@ -1555,6 +1698,33 @@ class CortexRuntimeEngine(RuntimeEngine):
         step = self._macro_step(frontier.ordinal)
         completed_in_plan = 0 if step is None else step.completed_repeats
         return spec.effect_target if constructing > completed_in_plan else None
+
+    def _saturated_structure_target(
+        self,
+        frontier: PolicyActionAssessment,
+        observation: ObservationEnvelope,
+    ) -> str | None:
+        if frontier.runtime_action is None:
+            return None
+        spec = next(
+            (
+                item
+                for item in self._race_profile.data.progress_action_specs
+                if item.name == frontier.runtime_action
+                and item.effect_kind.value == "structure"
+            ),
+            None,
+        )
+        if spec is None:
+            return None
+        limit = self._race_profile.data.structure_saturation_limits.get(spec.effect_target)
+        if limit is None:
+            return None
+        current = sum(
+            structure.unit_type.casefold() == spec.effect_target.casefold()
+            for structure in observation.state.own_structures
+        )
+        return spec.effect_target if current >= limit else None
 
     def _fallback_unit_macro_action(self) -> str:
         worker = self._race_profile.data.worker_type.casefold()
@@ -1713,8 +1883,9 @@ class CortexRuntimeEngine(RuntimeEngine):
             return "Extend deterministic Zerg creep coverage"
         if action_name == "Build_CreepTumor_Tumor_Screen":
             return "Continue deterministic Zerg creep expansion from a mature tumor"
-        if action_name == "Train_SCV":
-            return "Maintain deterministic Terran worker production"
+        if action_name in {"Train_Probe", "Train_SCV"}:
+            race = "Protoss" if action_name == "Train_Probe" else "Terran"
+            return f"Maintain deterministic {race} worker production"
         if action_name == "Morph_OrbitalCommand":
             return "Upgrade the Terran economy to Orbital Command"
         if action_name == "Effect_CalldownMULE_Screen":
@@ -2032,6 +2203,19 @@ class CortexRuntimeEngine(RuntimeEngine):
         super().record_execution(report)
         if existing is not None:
             return
+        if isinstance(self._tactical, ExecutionAwareTacticalPolicyProvider):
+            transition = self._tactical.record_execution(
+                report,
+                game_loop=self._execution_game_loop(report),
+            )
+            if transition is not None:
+                self.store.append_event(
+                    run_id=report.run_id,
+                    episode_id=report.episode_id,
+                    step_id=report.step_id,
+                    event_type="tactical_target_state",
+                    payload=transition,
+                )
         if metadata is None:
             return
         self._macro_outcome_revision += 1
@@ -2056,9 +2240,22 @@ class CortexRuntimeEngine(RuntimeEngine):
             )
             if token is not None:
                 self._previous_hima_actions.append((self._execution_game_loop(report), token))
+            if report.action_name == self._townhall_runtime_action():
+                self._terminate_expansion_commitment_from_report(
+                    report,
+                    terminal_state=(
+                        "nexus_effect_confirmed"
+                        if report.action_name == "Build_Nexus_Near"
+                        else "townhall_effect_confirmed"
+                    ),
+                )
         else:
-            self._macro_plan_frozen = True
-            self._urgent_replan_requested = True
+            if self._recoverable_expansion_failure(report):
+                self._record_expansion_anchor_rejection(report)
+                self._urgent_replan_requested = False
+            else:
+                self._macro_plan_frozen = True
+                self._urgent_replan_requested = True
 
     def _advance_macro_step(
         self,
@@ -2072,18 +2269,29 @@ class CortexRuntimeEngine(RuntimeEngine):
         if step is None or self._macro_plan is None:
             return
         completed = step.completed_repeats + (1 if succeeded else 0)
+        recoverable_expansion = (
+            report is not None and self._recoverable_expansion_failure(report)
+        )
         status = (
             MacroStepStatus.CONFIRMED
             if succeeded and completed >= step.repeat
             else MacroStepStatus.PENDING
             if succeeded
+            else MacroStepStatus.DEFERRED
+            if recoverable_expansion
             else MacroStepStatus.BLOCKED
         )
         updated = step.model_copy(
             update={
                 "completed_repeats": min(completed, step.repeat),
                 "status": status,
-                "reason": None if succeeded else "execution_failed",
+                "reason": (
+                    None
+                    if succeeded
+                    else report.failure_code
+                    if recoverable_expansion and report is not None
+                    else "execution_failed"
+                ),
             }
         )
         self._replace_macro_step(updated)
@@ -2105,6 +2313,143 @@ class CortexRuntimeEngine(RuntimeEngine):
             for candidate in self._macro_plan.steps
         ):
             self._urgent_replan_requested = True
+
+    def _ensure_expansion_commitment(
+        self,
+        proposal: MacroPolicyProposal,
+        observation: ObservationEnvelope,
+    ) -> None:
+        if self._expansion_commitment_id is not None:
+            return
+        townhall_action = self._semantic_action_for_target(
+            self._race_profile.data.townhall_types[0]
+        )
+        if not any(step.canonical_action == townhall_action for step in proposal.steps):
+            return
+        commitment_id = (
+            f"{observation.run_id}:{observation.episode_id}:"
+            f"expansion:{observation.step_id}"
+        )
+        self._expansion_commitment_id = commitment_id
+        self._expansion_commitment_started_game_loop = observation.game_loop
+        self._expansion_anchor_evaluations = []
+        self._record_cortex_event(
+            observation,
+            "expansion_commitment_started",
+            {
+                "commitment_id": commitment_id,
+                "started_game_loop": observation.game_loop,
+                "semantic_action": townhall_action,
+                "terminal_states": [
+                    (
+                        "nexus_effect_confirmed"
+                        if self._race_profile.race.value == "protoss"
+                        else "townhall_effect_confirmed"
+                    ),
+                    "expansion_candidates_exhausted",
+                    "strategic_cancellation",
+                ],
+            },
+        )
+
+    def _update_expansion_candidate_state(
+        self,
+        observation: ObservationEnvelope,
+    ) -> None:
+        exhausted = "expansion_candidates_exhausted" in {
+            alert.casefold() for alert in observation.alerts
+        }
+        self._expansion_candidates_exhausted = exhausted
+        if exhausted and self._expansion_commitment_id is not None:
+            self._terminate_expansion_commitment(
+                observation,
+                terminal_state="expansion_candidates_exhausted",
+            )
+
+    def _record_expansion_anchor_rejection(self, report: ExecutionReport) -> None:
+        anchor = next(
+            (
+                value
+                for value in (*report.resolved_arguments, *report.requested_arguments)
+                if isinstance(value, (int, str))
+            ),
+            None,
+        )
+        evaluation = {
+            "commitment_id": self._expansion_commitment_id,
+            "command_id": report.command_id,
+            "anchor": anchor,
+            "failure_code": report.failure_code,
+            "game_loop": self._execution_game_loop(report),
+        }
+        self._expansion_anchor_evaluations.append(evaluation)
+        self.store.append_event(
+            run_id=report.run_id,
+            episode_id=report.episode_id,
+            step_id=report.step_id,
+            event_type="expansion_anchor_rejected",
+            payload=evaluation,
+        )
+
+    def _terminate_expansion_commitment(
+        self,
+        observation: ObservationEnvelope,
+        *,
+        terminal_state: str,
+    ) -> None:
+        commitment_id = self._expansion_commitment_id
+        if commitment_id is None:
+            return
+        self._record_cortex_event(
+            observation,
+            "expansion_commitment_terminal",
+            {
+                "commitment_id": commitment_id,
+                "terminal_state": terminal_state,
+                "started_game_loop": self._expansion_commitment_started_game_loop,
+                "terminal_game_loop": observation.game_loop,
+                "evaluated_anchors": list(self._expansion_anchor_evaluations),
+            },
+        )
+        self._expansion_commitment_id = None
+        self._expansion_commitment_started_game_loop = None
+        self._expansion_anchor_evaluations = []
+
+    def _terminate_expansion_commitment_from_report(
+        self,
+        report: ExecutionReport,
+        *,
+        terminal_state: str,
+    ) -> None:
+        commitment_id = self._expansion_commitment_id
+        if commitment_id is None:
+            return
+        self.store.append_event(
+            run_id=report.run_id,
+            episode_id=report.episode_id,
+            step_id=report.step_id,
+            event_type="expansion_commitment_terminal",
+            payload={
+                "commitment_id": commitment_id,
+                "terminal_state": terminal_state,
+                "started_game_loop": self._expansion_commitment_started_game_loop,
+                "terminal_game_loop": self._execution_game_loop(report),
+                "evaluated_anchors": list(self._expansion_anchor_evaluations),
+                "command_id": report.command_id,
+            },
+        )
+        self._expansion_commitment_id = None
+        self._expansion_commitment_started_game_loop = None
+        self._expansion_anchor_evaluations = []
+
+    def _recoverable_expansion_failure(self, report: ExecutionReport) -> bool:
+        return (
+            report.action_name == self._townhall_runtime_action()
+            and report.failure_code in _RECOVERABLE_EXPANSION_FAILURE_CODES
+        )
+
+    def _townhall_runtime_action(self) -> str:
+        return self._runtime_action_for_target(self._race_profile.data.townhall_types[0])
 
     def _set_macro_step_status(
         self,
@@ -2270,6 +2615,24 @@ class CortexRuntimeEngine(RuntimeEngine):
 
     def end_episode(self, result: EpisodeResult) -> None:
         already_recorded = self._episode_result_fingerprint is not None
+        if not already_recorded and self._expansion_commitment_id is not None:
+            self.store.append_event(
+                run_id=result.run_id,
+                episode_id=result.episode_id,
+                step_id=result.steps,
+                event_type="expansion_commitment_terminal",
+                payload={
+                    "commitment_id": self._expansion_commitment_id,
+                    "terminal_state": "strategic_cancellation",
+                    "started_game_loop": self._expansion_commitment_started_game_loop,
+                    "terminal_game_loop": result.steps,
+                    "evaluated_anchors": list(self._expansion_anchor_evaluations),
+                    "reason": "episode_end",
+                },
+            )
+            self._expansion_commitment_id = None
+            self._expansion_commitment_started_game_loop = None
+            self._expansion_anchor_evaluations = []
         super().end_episode(result)
         if already_recorded or self._playbook_reviewer is None:
             return

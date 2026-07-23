@@ -110,6 +110,9 @@ class SituationAssessment(ContractModel):
     valid_until_game_loop: int = Field(ge=0)
     phase: GamePhase
     threat_level: ThreatLevel
+    threat_score: float = Field(default=0.0, ge=0.0)
+    threat_evidence: tuple[str, ...] = ()
+    threat_hysteresis_until_game_loop: int | None = Field(default=None, ge=0)
     economy_status: EconomyStatus
     mineral_pressure: ResourcePressure = ResourcePressure.BALANCED
     gas_pressure: ResourcePressure = ResourcePressure.BALANCED

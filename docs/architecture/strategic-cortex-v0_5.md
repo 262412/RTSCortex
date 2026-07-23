@@ -188,3 +188,12 @@ intent, arbitration decision, Playbook rules, candidate and terminal execution r
 
 This order intentionally keeps “model can produce a proposal” separate from “the race is safe
 to execute in PySC2.”
+
+## Current acceptance issues
+
+The open gameplay-control defects confirmed by the 2026-07-23 Protoss natural-terminal
+regression are tracked in
+[Protoss natural-terminal regression issue register](protoss-natural-terminal-regression-issues.md).
+They cover worker and gas economy, macro-frontier blocking and structure saturation,
+expansion search terminality, combat-target retry quarantine, terminal-crisis phase
+classification, and threat-level escalation/persistence.

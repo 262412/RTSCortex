@@ -35,6 +35,18 @@ class ProductionSpec:
 
 _PRODUCTION_SPECS = (
     ProductionSpec(
+        "Train_Probe",
+        "Nexus",
+        "Probe",
+        485,
+        64,
+        1006,
+        50,
+        0,
+        1,
+        ("Nexus",),
+    ),
+    ProductionSpec(
         "Train_Zealot",
         "Gateway",
         "Zealot",

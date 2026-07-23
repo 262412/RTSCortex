@@ -318,6 +318,8 @@ describe("Chinese event presentation", () => {
       assessment: {
         game_phase: "early",
         threat_level: "low",
+        threat_score: 1.5,
+        threat_evidence: ["visible_enemy_contact"],
         army_readiness: "not_ready",
       },
     });
@@ -375,7 +377,7 @@ describe("Chinese event presentation", () => {
 
     expect(eventTitle(situation)).toBe("战况分析完成");
     expect(eventSummary(situation)).toBe(
-      "来源：确定性规则（deterministic） · 阶段：开局阶段（early） · 威胁：低（low） · 军队：尚未准备（not_ready）",
+      "来源：确定性规则（deterministic） · 阶段：开局阶段（early） · 威胁：低（low） (1.5) · 证据：visible_enemy_contact · 军队：尚未准备（not_ready）",
     );
     expect(eventSummary(macro)).toBe("计划 plan-1 · hima-a · 2 步 · 当前：建造水晶塔");
     expect(eventSummary(intent)).toBe("宏观决策（macro） · 建造水晶塔 · intent-1");

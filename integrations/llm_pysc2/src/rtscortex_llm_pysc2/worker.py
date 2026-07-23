@@ -1739,6 +1739,7 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
             anchor_available=anchor_available,
             blocked=blocked,
         )
+        extractor.set_expansion_candidates_exhausted(self.expansion_scout.exhausted)
         if self.expansion_scout.exhausted and not was_exhausted:
             self.decision_broker.record_expansion_candidate_exhaustion()
         if waypoint is None:

@@ -28,12 +28,17 @@ const EVENT_TITLES: Record<string, string> = {
   situation_assessed: "战况分析完成",
   situation_shadow_assessed: "影子战况模型已完成分析",
   tactical_policy_shadow: "影子战术策略已完成评估",
+  tactical_target_state: "战斗目标状态已更新",
   macro_plan_accepted: "专用宏观计划已采用",
   macro_plan_rejected: "专用宏观计划被拒绝",
   macro_frontier_deferred: "宏观动作正在等待条件",
   macro_frontier_preempted: "阻塞动作已切换到后备方案",
   macro_structure_deferred: "同类建筑在建，动作已延后",
+  macro_step_deduplicated: "饱和宏观步骤已跳过",
   macro_step_updated: "宏观计划步骤已更新",
+  expansion_commitment_started: "扩张承诺已建立",
+  expansion_anchor_rejected: "扩张候选点已排除",
+  expansion_commitment_terminal: "扩张承诺已终结",
   intent_emitted: "决策意图已生成",
   role_intent_emitted: "职责 Agent 已提交意图",
   intent_arbitrated: "战略意图已仲裁",
@@ -121,6 +126,9 @@ const FIELD_LABELS: Record<string, string> = {
   assessment: "战况分析",
   game_phase: "游戏阶段",
   threat_level: "威胁等级",
+  threat_score: "威胁评分",
+  threat_evidence: "威胁证据",
+  threat_hysteresis_until_game_loop: "威胁保持至",
   army_readiness: "军队准备度",
   information_gaps: "信息缺口",
   source_kind: "分析来源",
@@ -780,8 +788,29 @@ export function eventSummary(event: StoredEvent): string {
     const source = readString(payload, "source_kind", "source_id", "source", "model") ?? "unknown";
     const phase = readString(assessment, "game_phase", "phase") ?? "unknown";
     const threat = readString(assessment, "threat_level", "threat") ?? "unknown";
+    const threatScore = readNumber(assessment, "threat_score");
+    const threatEvidence = asArray(assessment.threat_evidence)
+      .filter((item): item is string => typeof item === "string")
+      .slice(0, 2);
     const readiness = readString(assessment, "army_readiness", "readiness") ?? "unknown";
-    return `来源：${semanticScalar(source, "source_kind")} · 阶段：${semanticScalar(phase, "game_phase")} · 威胁：${semanticScalar(threat, "threat_level")} · 军队：${semanticScalar(readiness, "army_readiness")}`;
+    return `来源：${semanticScalar(source, "source_kind")} · 阶段：${semanticScalar(phase, "game_phase")} · 威胁：${semanticScalar(threat, "threat_level")}${threatScore === undefined ? "" : ` (${threatScore.toFixed(1)})`}${threatEvidence.length ? ` · 证据：${threatEvidence.join("、")}` : ""} · 军队：${semanticScalar(readiness, "army_readiness")}`;
+  }
+  if (event.event_type === "tactical_target_state") {
+    const actor = readString(payload, "actor") ?? "未知部队";
+    const target = readString(payload, "target_tag") ?? "未知目标";
+    const transition = readString(payload, "transition") ?? "updated";
+    const failures = readNumber(payload, "failure_count") ?? 0;
+    return `${actor} · 目标 ${target} · ${semanticScalar(transition)}${failures ? ` · 连续失败 ${failures} 次` : ""}`;
+  }
+  if (event.event_type === "expansion_commitment_started") {
+    return `承诺 ${readString(payload, "commitment_id") ?? "unknown"} · 将持续寻找扩张点直至成功、耗尽或明确取消`;
+  }
+  if (event.event_type === "expansion_anchor_rejected") {
+    return `候选 ${readString(payload, "anchor") ?? "unknown"} 已永久排除 · ${semanticScalar(readString(payload, "failure_code") ?? "unknown")}`;
+  }
+  if (event.event_type === "expansion_commitment_terminal") {
+    const state = readString(payload, "terminal_state") ?? "unknown";
+    return `扩张承诺结束：${semanticScalar(state)} · 已评估 ${asArray(payload.evaluated_anchors).length} 个候选`;
   }
   if (event.event_type === "macro_plan_accepted" || event.event_type === "macro_plan_rejected") {
     const plan = asObject(payload.plan) ?? payload;
@@ -1063,6 +1092,9 @@ export function eventSemanticPayload(event: StoredEvent): JsonValue {
       ["source_kind", payload.source_kind ?? payload.source ?? payload.model],
       ["game_phase", assessment.game_phase ?? assessment.phase],
       ["threat_level", assessment.threat_level ?? assessment.threat],
+      ["threat_score", assessment.threat_score],
+      ["threat_evidence", assessment.threat_evidence],
+      ["threat_hysteresis_until_game_loop", assessment.threat_hysteresis_until_game_loop],
       ["army_readiness", assessment.army_readiness ?? assessment.readiness],
       ["information_gaps", assessment.information_gaps],
       ["assessment", payload.assessment],

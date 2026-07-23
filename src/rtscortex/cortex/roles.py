@@ -59,6 +59,7 @@ class _RoutingRoleAgent:
                 return "retreat" in intent.objective.casefold()
             if intent.action_names[0] in {
                 "Effect_InjectLarva",
+                "Train_Probe",
                 "Train_SCV",
                 "Morph_OrbitalCommand",
                 "Effect_CalldownMULE_Screen",

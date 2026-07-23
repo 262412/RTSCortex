@@ -235,7 +235,7 @@ def test_melee_config_enables_gas_management_with_reserved_builder(
 
     assert config.ENABLE_INIT_STEPS is True
     assert config.ENABLE_AUTO_WORKER_MANAGE is True
-    assert config.ENABLE_AUTO_WORKER_TRAINING is True
+    assert config.ENABLE_AUTO_WORKER_TRAINING is False
 
 
 def test_melee_config_moves_camera_before_assimilator_screen_translation(
@@ -304,6 +304,7 @@ def test_melee_config_preserves_build_train_research_and_combat_actions(
     assert "Build_Stargate_Screen" in action_names["Builder"]
     assert "Build_ShieldBattery_Screen" in action_names["Builder"]
     assert {
+        "Train_Probe",
         "Train_Adept",
         "Train_Zealot",
         "Train_Stalker",

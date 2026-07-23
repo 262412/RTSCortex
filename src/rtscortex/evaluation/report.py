@@ -902,9 +902,18 @@ def _render_cortex_event(event: StoredEvent) -> list[str]:
         threat = _payload_text(assessment, "threat_level", "threat") or "unknown"
         readiness = _payload_text(assessment, "army_readiness", "readiness") or "unknown"
         source = _payload_text(payload, "source_kind", "source", "model") or "unknown"
+        score = assessment.get("threat_score")
+        evidence = assessment.get("threat_evidence")
+        evidence_text = (
+            ", ".join(str(item) for item in evidence)
+            if isinstance(evidence, list | tuple) and evidence
+            else "none"
+        )
         return [
             f"- Event {event_id} · Situation assessed by {_code(source)}: phase "
-            f"{_code(phase)}; threat {_code(threat)}; readiness {_code(readiness)}."
+            f"{_code(phase)}; threat {_code(threat)} (score "
+            f"{_code(score if score is not None else 'legacy')}); readiness "
+            f"{_code(readiness)}; evidence {_code(evidence_text)}."
         ]
     if event.event_type in {"macro_plan_accepted", "macro_plan_rejected"}:
         plan = _nested_payload(payload, "plan")
@@ -1395,6 +1404,11 @@ def _render_cortex_metrics(metrics: CortexObservabilityMetrics) -> list[str]:
             f"`{sum(metrics.strategic_consequence_counts.values())}`."
         ),
         (
+            "- Threat assessment: max score "
+            f"`{metrics.max_threat_score:.2f}`, evidence coverage "
+            f"`{metrics.threat_evidence_coverage:.1%}`."
+        ),
+        (
             f"- Command lineage coverage: {coverage}; missing "
             f"`{metrics.missing_lineage_commands}`, orphan `{metrics.orphan_lineage_commands}`, "
             f"duplicates `{metrics.duplicate_lineage_commands}`, integrity violations "
@@ -1420,6 +1434,8 @@ def _render_cortex_metrics(metrics: CortexObservabilityMetrics) -> list[str]:
             "Strategic consequences",
             metrics.strategic_consequence_counts,
         ),
+        *_render_count_table("Threat levels", metrics.threat_level_counts),
+        *_render_count_table("Threat evidence", metrics.threat_evidence_counts),
         *_render_count_table("Cortex selections by executor", metrics.executor_counts),
         *_render_count_table("Specialist failures", metrics.specialist_failure_counts),
         *_render_count_table("Specialists ready", metrics.specialist_ready_counts),

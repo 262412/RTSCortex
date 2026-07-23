@@ -1964,6 +1964,21 @@ def test_timestep_extractor_maps_sc2_attack_alerts() -> None:
     assert snapshot["alerts"] == ["building_under_attack", "unit_under_attack", "alert:3"]
 
 
+def test_timestep_extractor_exposes_expansion_candidate_exhaustion() -> None:
+    agent = FakeAgent("Builder", "Builder-Probe-1", _fake_timestep(), StubBroker())
+    extractor = TimeStepExtractor("run-worker", "episode-worker")
+    extractor.set_expansion_candidates_exhausted(True)
+
+    snapshot = extractor.extract(
+        _fake_timestep(),
+        {"Builder": agent},
+        {"Builder": "no expansion anchor remains"},
+        step_id=1,
+    )
+
+    assert "expansion_candidates_exhausted" in snapshot["alerts"]
+
+
 def test_timestep_extractor_adds_structured_pylon_screen_candidates() -> None:
     timestep = _fake_timestep()
     timestep.observation.feature_screen = SimpleNamespace(
@@ -4785,6 +4800,7 @@ def test_production_source_follows_upstream_raw_order_instead_of_tag_order() -> 
 
 def test_train_registry_pins_multirace_worker_actions_and_raw_orders() -> None:
     assert {action: spec.raw_order_id for action, spec in PRODUCTION_SPECS.items()} == {
+        "Train_Probe": 64,
         "Train_Zealot": 49,
         "Train_Stalker": 50,
         "Train_Adept": 54,
