@@ -292,6 +292,43 @@ def test_prepare_live_worker_builds_official_melee_bot_command(tmp_path: Path) -
     assert console_spec.command[console_spec.command.index("--action_space") + 1] == "FEATURES"
 
 
+def test_prepare_live_worker_omits_step_limits_for_natural_terminal(tmp_path: Path) -> None:
+    base_python = tmp_path / "python3.9"
+    base_python.write_text("#!/bin/sh\necho 'Python 3.9.99'\n", encoding="utf-8")
+    base_python.chmod(base_python.stat().st_mode | stat.S_IXUSR)
+    worker_python = tmp_path / "worker-venv/bin/python"
+    worker_python.parent.mkdir(parents=True)
+    worker_python.symlink_to(base_python)
+
+    sc2_path = tmp_path / "StarCraftII"
+    executable = sc2_path / "Versions/Base92440/SC2_x64"
+    executable.parent.mkdir(parents=True)
+    executable.touch()
+    executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
+    scenario_map = sc2_path / "Maps/Melee/Simple64.SC2Map"
+    scenario_map.parent.mkdir(parents=True)
+    scenario_map.touch()
+    _write_worker_patch_sources(tmp_path)
+
+    config = make_config(tmp_path).model_copy(
+        update={
+            "environment": EnvironmentSettings(
+                adapter="llm_pysc2",
+                scenario="Simple64",
+                sc2_path=sc2_path,
+                worker_python=worker_python,
+                max_steps=None,
+                game_steps_per_episode=None,
+            )
+        }
+    )
+
+    command = prepare_live_worker(config, tmp_path, environment={}).command
+
+    assert "--max_agent_steps" not in command
+    assert "--game_steps_per_episode" not in command
+
+
 def test_worker_entrypoint_forwards_melee_environment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

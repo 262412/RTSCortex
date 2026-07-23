@@ -91,6 +91,7 @@ class UnitState(ContractModel):
     unit_type: str
     alliance: Literal["self", "ally", "enemy", "neutral"]
     position: tuple[float, float] | None = None
+    minimap_position: tuple[float, float] | None = Field(default=None, exclude=True)
     health_fraction: float = Field(default=1.0, ge=0.0, le=1.0)
     energy: float | None = Field(default=None, ge=0.0)
     status: str | None = None

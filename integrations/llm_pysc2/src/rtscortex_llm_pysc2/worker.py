@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import importlib
+import math
 import os
 import time
 from collections.abc import Callable, Collection, Mapping, Sequence
@@ -436,9 +437,19 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
                     "_rtscortex_known_expansion_resources",
                     (),
                 ),
+                excluded_expansion_anchors=getattr(
+                    self,
+                    "_rtscortex_suppressed_expansion_anchors",
+                    (),
+                ),
             )
             if semantic_failure is not None:
                 semantic_failure_code, semantic_failure_reason = semantic_failure
+                _suppress_failed_expansion_anchor(
+                    self,
+                    action,
+                    obs.observation,
+                )
                 dispatch = self.broker.claim_primitive(
                     self.name,
                     _execution_team_name(self),
@@ -473,6 +484,11 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
                 return build_reselection
             if _requires_explicit_production_chain(action_name):
                 self._prime_production_chain(action)
+            elif (
+                (build_spec := BUILD_SPECS.get(action_name)) is not None
+                and build_spec.placement_kind == "expansion"
+            ):
+                _prime_persistent_expansion_chain(self, action)
         if _next_primitive_is_screen_build(semantic_action_name, self.func_list):
             command_id = self.broker.command_id_for(
                 self.name,
@@ -553,6 +569,12 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
         self._rtscortex_translation_attempt = None
         if _is_worker_owned_larva_selection(self, semantic_action_name):
             result = _translate_worker_owned_zero_argument_primitive(self, obs)
+        elif _is_persistent_expansion_camera_primitive(self, semantic_action_name):
+            result = _translate_persistent_expansion_camera_primitive(
+                self,
+                obs,
+                candidate_action,
+            )
         elif _is_worker_owned_near_build_final_primitive(self, semantic_action_name):
             result = _translate_worker_owned_near_build_primitive(self, obs)
         else:
@@ -703,6 +725,11 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
                 failure_reason="translated expansion footprint is not fully visible",
                 game_loop=_observation_game_loop(obs.observation),
             )
+            _suppress_failed_expansion_anchor(
+                self,
+                candidate_action,
+                obs.observation,
+            )
             self.func_list.clear()
             self._rtscortex_semantic_action = None
             return 0, _no_op()
@@ -731,12 +758,18 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
             "_rtscortex_known_expansion_resources",
             (),
         )
+        excluded_expansion_anchors = getattr(
+            self,
+            "_rtscortex_suppressed_expansion_anchors",
+            (),
+        )
         if accepted and dispatch.final_primitive:
             semantic_failure = _semantic_target_failure(
                 candidate_action,
                 obs.observation,
                 self.unit_names,
                 known_expansion_resources=known_expansion_resources,
+                excluded_expansion_anchors=excluded_expansion_anchors,
             )
             if semantic_failure is not None:
                 semantic_failure_code, semantic_failure_reason = semantic_failure
@@ -748,6 +781,11 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
                 )
                 self.func_list.clear()
                 self._rtscortex_semantic_action = None
+                _suppress_failed_expansion_anchor(
+                    self,
+                    candidate_action,
+                    obs.observation,
+                )
                 return 0, _no_op()
         if accepted and dispatch.final_primitive:
             candidate_failure = _candidate_dispatch_failure(
@@ -757,6 +795,7 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
                 final_primitive=dispatch.final_primitive,
                 translated_position=translated_position,
                 known_expansion_resources=known_expansion_resources,
+                excluded_expansion_anchors=excluded_expansion_anchors,
             )
             if candidate_failure is not None:
                 self.broker.reject_candidate_outside_dispatch(
@@ -765,6 +804,11 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
                     game_loop=_observation_game_loop(obs.observation),
                 )
         if not accepted:
+            _suppress_failed_expansion_anchor(
+                self,
+                candidate_action,
+                obs.observation,
+            )
             self.broker.settle_primitive(
                 dispatch,
                 success=False,
@@ -1656,6 +1700,7 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
                 obs.observation,
                 unit_names=extractor.unit_names,
                 known_expansion_resources=extractor.known_expansion_resources,
+                excluded_expansion_anchors=extractor.suppressed_expansion_anchors,
             )
         )
         blocked = (
@@ -2805,6 +2850,128 @@ def _translate_worker_owned_zero_argument_primitive(agent: Any, obs: Any) -> tup
     return emitted_id, function_call
 
 
+def _is_persistent_expansion_camera_primitive(agent: Any, action_name: str) -> bool:
+    spec = BUILD_SPECS.get(action_name)
+    return bool(
+        spec is not None
+        and spec.placement_kind == "expansion"
+        and agent.func_list
+        and int(agent.func_list[0][0]) == 573
+    )
+
+
+def _prime_persistent_expansion_chain(
+    agent: Any,
+    action: Mapping[str, Any],
+) -> None:
+    semantic_action = agent.action_list.pop(0)
+    agent.func_list = list(action.get("func", semantic_action.get("func", ())))
+    agent._rtscortex_translation_ordinal = 0
+    agent._rtscortex_translation_total = len(agent.func_list)
+    agent.curr_action_name = str(action.get("name", ""))
+    agent.curr_action_args = list(action.get("arg", ()))
+
+
+def _translate_persistent_expansion_camera_primitive(
+    agent: Any,
+    obs: Any,
+    action: Mapping[str, Any],
+) -> tuple[int, Any]:
+    """Resolve a scouted expansion anchor after it leaves the raw observation."""
+
+    del obs
+    requested_id, function, arguments = agent.func_list.pop(0)
+    requested_arguments = list(arguments)
+    ordinal = int(agent._rtscortex_translation_ordinal)
+    agent._rtscortex_translation_ordinal += 1
+    total = int(agent._rtscortex_translation_total)
+    target_tag = _tag_argument(action)
+    known_resources = tuple(
+        getattr(agent, "_rtscortex_known_expansion_resources", ())
+    )
+    reason: Optional[str] = None
+    camera_position: Optional[tuple[int, int]] = None
+    if target_tag is None:
+        reason = "expansion camera primitive has no anchor tag"
+    else:
+        anchor = next(
+            (
+                resource
+                for resource in known_resources
+                if int(_observation_value(resource, "tag", 0)) == target_tag
+            ),
+            None,
+        )
+        if anchor is None:
+            reason = f"persistent expansion anchor {hex(target_tag)} is unavailable"
+        else:
+            nearby = [
+                resource
+                for resource in known_resources
+                if math.dist(
+                    (
+                        float(_observation_value(resource, "x", 0.0)),
+                        float(_observation_value(resource, "y", 0.0)),
+                    ),
+                    (
+                        float(_observation_value(anchor, "x", 0.0)),
+                        float(_observation_value(anchor, "y", 0.0)),
+                    ),
+                )
+                < 16.0
+            ]
+            mineral_count = sum(
+                "mineral" in _worker_unit_name(resource, agent.unit_names).casefold()
+                for resource in nearby
+            )
+            if mineral_count < 5:
+                reason = (
+                    f"persistent resource cluster for {hex(target_tag)} "
+                    "has fewer than 5 minerals"
+                )
+            else:
+                center_x = sum(
+                    float(_observation_value(resource, "x", 0.0))
+                    for resource in nearby
+                ) / len(nearby)
+                center_y = sum(
+                    float(_observation_value(resource, "y", 0.0))
+                    for resource in nearby
+                ) / len(nearby)
+                camera_position = (
+                    int(center_x + float(agent.world_x_offset)),
+                    int(
+                        max(
+                            0.0,
+                            float(agent.world_range)
+                            - center_y
+                            + float(agent.world_y_offset),
+                        )
+                    ),
+                )
+    emitted_id = int(requested_id) if reason is None else 0
+    resolved_arguments = [] if camera_position is None else [camera_position]
+    function_call = function(camera_position) if camera_position is not None else _no_op()
+    agent.last_translation_result = {
+        "action_name": agent.curr_action_name,
+        "requested_function_id": int(requested_id),
+        "requested_function_name": str(getattr(function, "name", requested_id)),
+        "emitted_function_id": emitted_id,
+        "emitted_function_name": (
+            str(getattr(function, "name", requested_id))
+            if emitted_id == int(requested_id)
+            else "no_op"
+        ),
+        "ordinal": ordinal,
+        "total": total,
+        "accepted": emitted_id == int(requested_id),
+        "requested_arguments": requested_arguments,
+        "resolved_arguments": resolved_arguments,
+        "reason": reason,
+    }
+    return emitted_id, function_call
+
+
 def _translate_worker_owned_near_build_primitive(agent: Any, obs: Any) -> tuple[int, Any]:
     """Resolve non-Protoss gas and expansion anchors without upstream factories."""
 
@@ -3438,6 +3605,7 @@ def _semantic_target_failure(
     unit_names: Mapping[int, str],
     *,
     known_expansion_resources: Sequence[Any] = (),
+    excluded_expansion_anchors: Collection[int] = (),
 ) -> Optional[tuple[str, str]]:
     action_name = str(action.get("name", ""))
     if action_name not in {
@@ -3453,6 +3621,7 @@ def _semantic_target_failure(
         action_name,
         unit_names=unit_names,
         known_expansion_resources=known_expansion_resources,
+        excluded_expansion_anchors=excluded_expansion_anchors,
     )
     if action_name in BUILD_SPECS and action_name.endswith("_Screen"):
         requested = _screen_argument(action)
@@ -3552,6 +3721,27 @@ def _semantic_target_failure(
     return failure_code, f"semantic target {hex(target_tag)} is no longer legal"
 
 
+def _suppress_failed_expansion_anchor(
+    agent: Any,
+    action: Mapping[str, Any],
+    observation: Any,
+) -> None:
+    spec = BUILD_SPECS.get(str(action.get("name", "")))
+    target_tag = _tag_argument(action)
+    if spec is None or spec.placement_kind != "expansion" or target_tag is None:
+        return
+    extractor = getattr(getattr(agent, "broker", None), "extractor", None)
+    if not isinstance(extractor, TimeStepExtractor):
+        return
+    extractor.suppress_expansion_anchor(
+        target_tag,
+        game_loop=_observation_game_loop(observation),
+    )
+    agent._rtscortex_suppressed_expansion_anchors = (
+        extractor.suppressed_expansion_anchors
+    )
+
+
 def _candidate_dispatch_failure(
     action: Mapping[str, Any],
     observation: Any,
@@ -3560,6 +3750,7 @@ def _candidate_dispatch_failure(
     final_primitive: bool,
     translated_position: Optional[list[int]],
     known_expansion_resources: Sequence[Any] = (),
+    excluded_expansion_anchors: Collection[int] = (),
 ) -> Optional[str]:
     """Return why an accepted primitive is outside its current semantic domain."""
 
@@ -3573,6 +3764,7 @@ def _candidate_dispatch_failure(
         observation,
         unit_names,
         known_expansion_resources=known_expansion_resources,
+        excluded_expansion_anchors=excluded_expansion_anchors,
     )
     if failure is not None:
         return f"{failure[1]}; accepted primitive would leave the current candidate set"

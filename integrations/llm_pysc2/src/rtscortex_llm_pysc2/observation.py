@@ -121,7 +121,17 @@ def _map_unit(unit: Mapping[str, Any]) -> dict[str, Any]:
     position = _list(unit["position"], "unit position")
     if len(position) != 2:
         raise ValueError("unit position must contain exactly two coordinates")
-    return {
+    raw_minimap_position = unit.get("minimap_position")
+    minimap_position = None
+    if raw_minimap_position is not None:
+        mapped_minimap_position = _list(raw_minimap_position, "unit minimap position")
+        if len(mapped_minimap_position) != 2:
+            raise ValueError("unit minimap position must contain exactly two coordinates")
+        minimap_position = [
+            float(mapped_minimap_position[0]),
+            float(mapped_minimap_position[1]),
+        ]
+    mapped = {
         "unit_id": _format_tag(unit["tag"]),
         "unit_type": str(unit["unit_type"]),
         "alliance": str(unit["alliance"]),
@@ -130,6 +140,9 @@ def _map_unit(unit: Mapping[str, Any]) -> dict[str, Any]:
         "energy": None if unit["energy"] is None else float(unit["energy"]),
         "status": None if unit["status"] is None else str(unit["status"]),
     }
+    if minimap_position is not None:
+        mapped["minimap_position"] = minimap_position
+    return mapped
 
 
 def _map_production_item(item: Mapping[str, Any]) -> dict[str, Any]:

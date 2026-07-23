@@ -748,6 +748,160 @@ def test_playbook_promotes_repeated_producer_failure_as_compact_execution_rule(
     playbook.close()
 
 
+def test_shadow_validated_execution_rule_becomes_soft_and_changes_score(
+    tmp_path: Path,
+) -> None:
+    playbook = PlaybookStore(tmp_path / "playbook.sqlite3")
+    reviewer = CortexPlaybookReviewer(playbook, promotion_support=2)
+    for run_index, seed in enumerate((0, 1), start=1):
+        run_id = f"typed-producer-run-{run_index}"
+        store = EventStore(tmp_path / f"{run_id}.sqlite3", tmp_path / f"{run_id}.jsonl")
+        store.append_event(
+            run_id=run_id,
+            episode_id="episode",
+            step_id=0,
+            event_type="situation_assessed",
+            payload={
+                "phase": "production",
+                "threat_level": "none",
+                "economy_status": "stable",
+                "army_readiness": "forming",
+            },
+        )
+        store.append_event(
+            run_id=run_id,
+            episode_id="episode",
+            step_id=1,
+            event_type="command_lineage",
+            payload={
+                "command_id": f"{run_id}:command",
+                "semantic_action": "TRAIN ADEPT",
+                "lineage": {"source_role": "macro"},
+            },
+        )
+        store.append_event(
+            run_id=run_id,
+            episode_id="episode",
+            step_id=2,
+            event_type="execution",
+            payload=ExecutionReport(
+                run_id=run_id,
+                episode_id="episode",
+                step_id=2,
+                command_id=f"{run_id}:command",
+                success=False,
+                action_name="Train_Adept",
+                actor="Developer/Empty",
+                source=ActionSource.PLANNER,
+                status=ExecutionStatus.FAILED,
+                execution_stage=ExecutionStage.TRANSLATION,
+                failure_code="producer_not_observable",
+            ),
+        )
+        reviewer.review_episode(
+            store.events_after(run_id, 0, 100, episode_id="episode"),
+            EpisodeResult(
+                run_id=run_id,
+                episode_id="episode",
+                scenario="Simple64",
+                seed=seed,
+                outcome=EpisodeOutcome.DEFEAT,
+                steps=2,
+            ),
+            agent_race="protoss",
+            opponent_race="zerg",
+        )
+        store.close()
+        if run_index == 1:
+            candidate = next(
+                rule
+                for rule in playbook.rules()
+                if rule.action_names == ("TRAIN ADEPT",)
+            )
+            for state_index in range(48):
+                playbook.record_rule_application(
+                    PlaybookRuleApplication(
+                        application_id=f"typed-shadow:{state_index}",
+                        rule_id=candidate.rule_id,
+                        run_id="shadow-run",
+                        episode_id="shadow-episode",
+                        step_id=state_index,
+                        game_loop=state_index,
+                        target_kind="intent",
+                        target_id=f"intent:{state_index}",
+                        matched=True,
+                        reason="candidate_shadow_match",
+                    )
+                )
+
+    rule = next(
+        rule for rule in playbook.rules() if rule.action_names == ("TRAIN ADEPT",)
+    )
+    assert rule.status is PlaybookRuleStatus.ACTIVE
+    assert rule.strength is PlaybookRuleStrength.SOFT
+    assert set(rule.source_seeds) == {0, 1}
+    assert {(condition.field, condition.value) for condition in rule.conditions} >= {
+        ("threat_level", "none"),
+        ("economy_status", "stable"),
+        ("army_readiness", "forming"),
+    }
+    CortexPlaybookReviewer(playbook)
+    rule = next(
+        candidate
+        for candidate in playbook.rules()
+        if candidate.action_names == ("TRAIN ADEPT",)
+    )
+    assert rule.status is PlaybookRuleStatus.ACTIVE
+    assert rule.strength is PlaybookRuleStrength.SOFT
+    situation = SituationAssessment(
+        assessment_id="assessment:production",
+        run_id="next-run",
+        episode_id="episode",
+        step_id=1,
+        game_loop=100,
+        valid_until_game_loop=101,
+        phase=GamePhase.PRODUCTION,
+        threat_level=ThreatLevel.NONE,
+        economy_status=EconomyStatus.STABLE,
+        army_readiness=ArmyReadiness.FORMING,
+        source_kind="deterministic",
+        source_id="test",
+        source_version="1",
+    )
+    intent = StrategicIntent(
+        intent_id="intent:train-adept",
+        continuity_key="production:train-adept",
+        run_id="next-run",
+        episode_id="episode",
+        step_id=1,
+        created_game_loop=100,
+        role=RoleId.PRODUCTION,
+        objective="train an Adept",
+        desired_effect="increase army",
+        action_names=("TRAIN ADEPT",),
+        resource_claim=ResourceClaim(reservation_game_loops=16),
+        source_id="test",
+        source_version="1",
+    )
+    result = PlaybookIntentGuard().evaluate(
+        intent,
+        context=PlaybookContext(
+            agent_race="protoss",
+            opponent_race="zerg",
+            phase=GamePhase.PRODUCTION,
+            map_name="Simple64",
+        ),
+        situation=situation,
+        rules=playbook.rules_for_guard(),
+        game_loop=100,
+        mode="active",
+    )
+
+    assert result.score_delta == -0.5
+    assert result.rule_ids == (rule.rule_id,)
+    playbook.close()
+
+
 def test_playbook_quarantines_legacy_soft_execution_penalty(tmp_path: Path) -> None:
     playbook = PlaybookStore(tmp_path / "playbook.sqlite3")
     playbook.upsert_rule(

@@ -48,7 +48,7 @@ class RunSettings(SettingsModel):
 class EnvironmentSettings(SettingsModel):
     adapter: Literal["mock", "llm_pysc2"] = "mock"
     scenario: str = "pvz_task1_level1"
-    max_steps: int = Field(default=6, ge=1)
+    max_steps: int | None = Field(default=6, ge=1)
     agent_race: RaceName = "protoss"
     opponent_race: RaceName = "random"
     opponent_difficulty: BotDifficulty = "very_hard"
@@ -75,6 +75,8 @@ class EnvironmentSettings(SettingsModel):
             raise ValueError(
                 "observation_gap_hard_limit_game_loops must exceed the watchdog threshold"
             )
+        if self.adapter == "mock" and self.max_steps is None:
+            raise ValueError("mock environments require a finite max_steps")
         return self
 
 

@@ -15,6 +15,7 @@ from rtscortex.cortex.models import (
     ForceComposition,
     GamePhase,
     KnowledgeStatus,
+    ResourcePressure,
     ScoutingAssessment,
     SituationAssessment,
     SituationFact,
@@ -145,7 +146,7 @@ _ENEMY_TECH_SIGNALS = {
 
 class DeterministicSituationAnalyzer:
     analyzer_id = "deterministic-situation-analyzer"
-    analyzer_version = "2.0.0"
+    analyzer_version = "2.1.0"
 
     def __init__(self, *, valid_for_game_loops: int = 1) -> None:
         if valid_for_game_loops < 1:
@@ -177,10 +178,22 @@ class DeterministicSituationAnalyzer:
         phase = self._phase(observation, enemies=enemies, under_attack=under_attack)
         threat_level = self._threat_level(len(enemies), under_attack=under_attack)
         economy = observation.state.economy
-        if economy.minerals >= 800 or economy.vespene >= 500:
-            economy_status = EconomyStatus.FLOATING
-        elif economy.minerals < 100 and economy.vespene < 100:
+        mineral_pressure = _resource_pressure(
+            economy.minerals,
+            starved_below=100,
+            floating_at=800,
+        )
+        gas_pressure = _resource_pressure(
+            economy.vespene,
+            starved_below=50,
+            floating_at=500,
+        )
+        if mineral_pressure is ResourcePressure.STARVED:
             economy_status = EconomyStatus.CONSTRAINED
+        elif mineral_pressure is ResourcePressure.FLOATING or (
+            gas_pressure is ResourcePressure.FLOATING and economy.minerals >= 400
+        ):
+            economy_status = EconomyStatus.FLOATING
         else:
             economy_status = EconomyStatus.STABLE
         if enemies and army_supply > 0:
@@ -225,6 +238,8 @@ class DeterministicSituationAnalyzer:
             phase=phase,
             threat_level=threat_level,
             economy_status=economy_status,
+            mineral_pressure=mineral_pressure,
+            gas_pressure=gas_pressure,
             army_readiness=readiness,
             own_force=own_force,
             enemy_force=enemy_force,
@@ -254,6 +269,8 @@ class DeterministicSituationAnalyzer:
             phase=phase,
             threat_level=threat_level,
             economy_status=economy_status,
+            mineral_pressure=mineral_pressure,
+            gas_pressure=gas_pressure,
             army_readiness=readiness,
             threats=threats,
             information_gaps=information_gaps,
@@ -290,10 +307,19 @@ class DeterministicSituationAnalyzer:
         state = observation.state
         if under_attack or (enemies and state.economy.army_supply > 0):
             return GamePhase.COMBAT
+        if state.economy.army_supply >= 24:
+            return GamePhase.COMBAT
         structure_types = {structure.unit_type for structure in state.own_structures}
+        if state.production_queue:
+            return GamePhase.PRODUCTION
+        if (
+            state.economy.army_supply >= 8
+            and structure_types.intersection(_PRODUCTION_TYPES - _TOWNHALL_TYPES)
+        ):
+            return GamePhase.PRODUCTION
         if state.upgrades or structure_types.intersection(_TECH_STRUCTURES):
             return GamePhase.TECHNOLOGY
-        if state.production_queue or "Gateway" in structure_types:
+        if structure_types.intersection(_PRODUCTION_TYPES - _TOWNHALL_TYPES):
             return GamePhase.PRODUCTION
         return GamePhase.EARLY
 
@@ -322,6 +348,19 @@ def _force_composition(units: Sequence[UnitState]) -> ForceComposition:
         ),
         unknown_unit_types=unknown,
     )
+
+
+def _resource_pressure(
+    amount: int,
+    *,
+    starved_below: int,
+    floating_at: int,
+) -> ResourcePressure:
+    if amount < starved_below:
+        return ResourcePressure.STARVED
+    if amount >= floating_at:
+        return ResourcePressure.FLOATING
+    return ResourcePressure.BALANCED
 
 
 def _count_types(units: Sequence[UnitState], unit_types: frozenset[str]) -> int:
@@ -369,6 +408,8 @@ def _situation_facts(
     phase: GamePhase,
     threat_level: ThreatLevel,
     economy_status: EconomyStatus,
+    mineral_pressure: ResourcePressure,
+    gas_pressure: ResourcePressure,
     army_readiness: ArmyReadiness,
     own_force: ForceComposition,
     enemy_force: ForceComposition,
@@ -399,6 +440,20 @@ def _situation_facts(
             confidence=1.0,
             source="observed_resources",
             evidence=(economy_status.value,),
+        ),
+        SituationFact(
+            name="mineral_pressure",
+            status=KnowledgeStatus.CONFIRMED,
+            confidence=1.0,
+            source="observed_minerals",
+            evidence=(mineral_pressure.value,),
+        ),
+        SituationFact(
+            name="gas_pressure",
+            status=KnowledgeStatus.CONFIRMED,
+            confidence=1.0,
+            source="observed_vespene",
+            evidence=(gas_pressure.value,),
         ),
         SituationFact(
             name="army_readiness",

@@ -36,6 +36,12 @@ class EconomyStatus(StrEnum):
     FLOATING = "floating"
 
 
+class ResourcePressure(StrEnum):
+    STARVED = "starved"
+    BALANCED = "balanced"
+    FLOATING = "floating"
+
+
 class ArmyReadiness(StrEnum):
     EMPTY = "empty"
     FORMING = "forming"
@@ -105,6 +111,8 @@ class SituationAssessment(ContractModel):
     phase: GamePhase
     threat_level: ThreatLevel
     economy_status: EconomyStatus
+    mineral_pressure: ResourcePressure = ResourcePressure.BALANCED
+    gas_pressure: ResourcePressure = ResourcePressure.BALANCED
     army_readiness: ArmyReadiness
     threats: list[str] = Field(default_factory=list)
     information_gaps: list[str] = Field(default_factory=list)

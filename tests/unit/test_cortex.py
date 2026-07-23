@@ -25,6 +25,7 @@ from rtscortex.cortex import (
     IntentTargetKind,
     MacroIntent,
     ReflexIntent,
+    ResourcePressure,
     TacticalIntent,
     ThreatLevel,
 )
@@ -461,6 +462,132 @@ def test_last_known_enemy_without_screen_target_triggers_reacquire_move() -> Non
     ]
 
 
+def test_offense_navigation_uses_actor_centroid_and_obsoletes_arrived_waypoint() -> None:
+    base = _observation()
+    observation = base.model_copy(
+        update={
+            "state": base.state.model_copy(
+                update={
+                    "own_units": [
+                        UnitState(
+                            unit_id="0x10",
+                            unit_type="Adept",
+                            alliance="self",
+                            minimap_position=(5.0, 5.0),
+                        ),
+                        UnitState(
+                            unit_id="0x11",
+                            unit_type="VoidRay",
+                            alliance="self",
+                            minimap_position=(6.0, 6.0),
+                        ),
+                    ],
+                    "visible_enemies": [],
+                }
+            ),
+            "available_actions": [
+                AvailableAction(
+                    name="Move_Minimap",
+                    argument_names=["minimap"],
+                    argument_types=[ActionArgumentType.POSITION],
+                    actor_scopes=[
+                        "CombatGroup7/Adept-1",
+                        "CombatGroup8/VoidRay-1",
+                    ],
+                    argument_candidates=[[[20, 30]], [[50, 50]], [[10, 10]]],
+                )
+            ],
+        }
+    )
+    agent = DeterministicTacticalAgent(
+        retreat_health_threshold=0.3,
+        minimum_advance_army_supply=4,
+        reacquire_cooldown_game_loops=16,
+    )
+    first = agent.evaluate(
+        observation,
+        DeterministicSituationAnalyzer().assess(observation),
+    )
+    arrived = observation.model_copy(
+        update={
+            "step_id": 5,
+            "game_loop": 80,
+            "state": observation.state.model_copy(
+                update={
+                    "own_units": [
+                        observation.state.own_units[0].model_copy(
+                            update={"minimap_position": (20.0, 30.0)}
+                        ),
+                        observation.state.own_units[1],
+                    ]
+                }
+            ),
+        }
+    )
+    second = agent.evaluate(
+        arrived,
+        DeterministicSituationAnalyzer().assess(arrived),
+    )
+
+    assert {intent.actor_scopes[0] for intent in first} == {
+        "CombatGroup7/Adept-1",
+        "CombatGroup8/VoidRay-1",
+    }
+    assert [(intent.actor_scopes[0], intent.target.position) for intent in second] == [
+        ("CombatGroup7/Adept-1", (50, 50))
+    ]
+
+
+def test_offense_search_prioritizes_last_known_enemy_structure_waypoint() -> None:
+    base = _observation()
+    observation = base.model_copy(
+        update={
+            "state": base.state.model_copy(
+                update={
+                    "own_units": [
+                        UnitState(
+                            unit_id="0x10",
+                            unit_type="Adept",
+                            alliance="self",
+                            minimap_position=(5.0, 5.0),
+                        )
+                    ],
+                    "visible_enemies": [
+                        UnitState(
+                            unit_id="0x30",
+                            unit_type="Hatchery",
+                            alliance="enemy",
+                            position=(90.0, 90.0),
+                            minimap_position=(48.0, 48.0),
+                        )
+                    ],
+                }
+            ),
+            "available_actions": [
+                AvailableAction(
+                    name="Move_Minimap",
+                    argument_names=["minimap"],
+                    argument_types=[ActionArgumentType.POSITION],
+                    actor_scopes=["CombatGroup7/Adept-1"],
+                    argument_candidates=[[[20, 30]], [[50, 50]], [[10, 10]]],
+                )
+            ],
+        }
+    )
+    agent = DeterministicTacticalAgent(
+        retreat_health_threshold=0.3,
+        minimum_advance_army_supply=4,
+    )
+
+    [intent] = agent.evaluate(
+        observation,
+        DeterministicSituationAnalyzer().assess(observation),
+    )
+
+    assert intent.target.position == (50, 50)
+    assert "last-known enemy structure" in intent.objective
+
+
 def test_tactical_retreat_selects_reserved_home_minimap_candidate() -> None:
     observation = _observation().model_copy(
         update={
@@ -535,7 +662,7 @@ def test_tactical_reacquire_move_is_suppressed_until_cooldown_expires() -> None:
 
     assert len(first) == 1
     assert second == []
-    assert len(third) == 1
+    assert third == []
 
 
 def test_executor_prefers_goal_advancing_candidate_and_materializes_wire_command() -> None:
@@ -654,3 +781,42 @@ def test_deterministic_situation_analyzer_reports_explicit_provenance() -> None:
     assert assessment.threats == ["Zergling"]
     assert assessment.valid_until_game_loop == 68
     assert assessment.source_kind == "deterministic"
+
+
+def test_situation_classifies_large_army_and_independent_resource_pressure() -> None:
+    base = _observation()
+    observation = base.model_copy(
+        update={
+            "state": base.state.model_copy(
+                update={
+                    "economy": EconomyState(
+                        minerals=20,
+                        vespene=817,
+                        supply_used=104,
+                        supply_cap=120,
+                        workers=24,
+                        army_supply=80,
+                    ),
+                    "visible_enemies": [],
+                    "own_structures": [
+                        UnitState(
+                            unit_id="0x50",
+                            unit_type="Stargate",
+                            alliance="self",
+                        )
+                    ],
+                    "production_queue": [],
+                }
+            )
+        }
+    )
+
+    assessment = DeterministicSituationAnalyzer().assess(observation)
+
+    assert assessment.phase is GamePhase.COMBAT
+    assert assessment.economy_status is EconomyStatus.CONSTRAINED
+    assert assessment.mineral_pressure is ResourcePressure.STARVED
+    assert assessment.gas_pressure is ResourcePressure.FLOATING
+    facts = {fact.name: fact.evidence for fact in assessment.facts}
+    assert facts["mineral_pressure"] == ("starved",)
+    assert facts["gas_pressure"] == ("floating",)

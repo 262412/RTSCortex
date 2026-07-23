@@ -37,14 +37,17 @@ async def run_mock_episode(
     seed: int,
 ) -> EpisodeResult:
     await runtime.start()
+    max_steps = config.environment.max_steps
+    if max_steps is None:
+        raise ValueError("mock evaluation requires a finite environment.max_steps")
     adapter = MockSC2Adapter(
         scenario=config.environment.scenario,
-        max_steps=config.environment.max_steps,
+        max_steps=max_steps,
     )
     observation = await adapter.reset(run_id=run_id, episode_id=episode_id, seed=seed)
     steps = 0
     try:
-        while not adapter.done and steps < config.environment.max_steps:
+        while not adapter.done and steps < max_steps:
             batch = await runtime.tick(observation)
             observation, reports = await adapter.step(batch)
             for report in reports:

@@ -303,12 +303,11 @@ def prepare_live_worker(
             "1",
             "--render=false",
             "--save_replay=false",
-            "--max_agent_steps",
-            str(config.environment.max_steps),
-            "--random_seed",
-            str(config.run.seed),
         ]
     )
+    if config.environment.max_steps is not None:
+        command.extend(["--max_agent_steps", str(config.environment.max_steps)])
+    command.extend(["--random_seed", str(config.run.seed)])
     return LiveWorkerSpec(command=tuple(command), sc2_path=sc2_path)
 
 

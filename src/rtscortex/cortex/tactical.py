@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 from rtscortex.contracts import ObservationEnvelope, UnitState
@@ -66,13 +66,16 @@ class _ActorOffenseState:
     waypoint: tuple[int, int] | None = None
     waypoint_index: int = -1
     target_tag: str | None = None
+    best_distance: float | None = None
+    last_progress_game_loop: int = 0
+    obsolete_waypoints: dict[tuple[int, int], int] = field(default_factory=dict)
 
 
 class DeterministicTacticalAgent:
     """Turn a current situation into exact, candidate-bound combat intents."""
 
     agent_id = "deterministic-tactical-agent"
-    agent_version = "0.2.0"
+    agent_version = "0.3.0"
     provider_id = agent_id
     provider_version = agent_version
 
@@ -85,6 +88,9 @@ class DeterministicTacticalAgent:
         retreat_cooldown_game_loops: int = 112,
         retreat_hysteresis: float = 0.2,
         retreat_home_radius: float = 12.0,
+        offense_arrival_radius: float = 4.0,
+        offense_stall_game_loops: int = 112,
+        offense_waypoint_retry_game_loops: int = 336,
     ) -> None:
         self.retreat_health_threshold = retreat_health_threshold
         self.minimum_advance_army_supply = minimum_advance_army_supply
@@ -95,10 +101,14 @@ class DeterministicTacticalAgent:
             retreat_health_threshold + retreat_hysteresis,
         )
         self.retreat_home_radius = retreat_home_radius
+        self.offense_arrival_radius = offense_arrival_radius
+        self.offense_stall_game_loops = offense_stall_game_loops
+        self.offense_waypoint_retry_game_loops = offense_waypoint_retry_game_loops
         self._episode_key: tuple[str, str] | None = None
         self._last_focus_target: str | None = None
         self._retreat_by_actor: dict[str, _ActorRetreatState] = {}
         self._offense_by_actor: dict[str, _ActorOffenseState] = {}
+        self._known_enemy_structures: dict[str, tuple[float, float]] = {}
 
     def evaluate(
         self,
@@ -106,6 +116,7 @@ class DeterministicTacticalAgent:
         assessment: SituationAssessment,
     ) -> list[TacticalIntent]:
         self._activate_episode(observation)
+        self._remember_enemy_structures(observation)
         attack_actors = _actors_for(observation, "Attack_Unit")
         move_actors = _actors_for(observation, "Move_Minimap")
         enemies = living_targetable_enemies(observation.state.visible_enemies)
@@ -198,23 +209,76 @@ class DeterministicTacticalAgent:
                 self._offense_by_actor.pop(actor, None)
                 continue
             state = self._offense_by_actor.get(actor)
+            centroid = _actor_minimap_centroid(observation, actor)
+            if state is not None:
+                state.obsolete_waypoints = {
+                    waypoint: retry_after
+                    for waypoint, retry_after in state.obsolete_waypoints.items()
+                    if retry_after > observation.game_loop
+                }
             if state is not None and state.waypoint not in candidates:
-                # The exact candidate disappeared from the unexplored frontier.
-                # Treat it as arrived/obsolete instead of dispatching it forever.
+                if state.waypoint is not None:
+                    state.obsolete_waypoints[state.waypoint] = (
+                        observation.game_loop + self.offense_waypoint_retry_game_loops
+                    )
                 state.phase = "arrived"
                 state.waypoint = None
+            if state is not None and state.waypoint is not None:
+                should_switch = False
+                if centroid is not None:
+                    distance = math.dist(centroid, state.waypoint)
+                    if distance <= self.offense_arrival_radius:
+                        state.phase = "arrived"
+                        should_switch = True
+                        self._forget_searched_enemy_structures(state.waypoint)
+                    elif (
+                        state.best_distance is None
+                        or distance < state.best_distance - 0.5
+                    ):
+                        state.best_distance = distance
+                        state.last_progress_game_loop = observation.game_loop
+                    elif (
+                        observation.game_loop - state.last_progress_game_loop
+                        >= self.offense_stall_game_loops
+                    ):
+                        should_switch = True
+                elif observation.game_loop >= state.cooldown_until_game_loop:
+                    should_switch = True
+                if should_switch:
+                    state.obsolete_waypoints[state.waypoint] = (
+                        observation.game_loop + self.offense_waypoint_retry_game_loops
+                    )
+                    state.waypoint = None
+                    state.best_distance = None
+                else:
+                    continue
             if (
                 state is not None
                 and observation.game_loop < state.cooldown_until_game_loop
             ):
                 continue
 
-            previous_index = -1 if state is None else state.waypoint_index
-            next_index = (previous_index + 1) % len(candidates)
-            waypoint = candidates[next_index]
+            available = [
+                candidate
+                for candidate in candidates
+                if state is None or candidate not in state.obsolete_waypoints
+            ]
+            if not available:
+                continue
+            waypoint = self._select_offense_waypoint(
+                available,
+            )
+            next_index = candidates.index(waypoint)
+            waypoint_distance = (
+                None if centroid is None else math.dist(centroid, waypoint)
+            )
             if state is None:
                 state = _ActorOffenseState(
-                    phase="searching" if last_known_targets else "advancing",
+                    phase=(
+                        "searching"
+                        if last_known_targets or self._known_enemy_structures
+                        else "advancing"
+                    ),
                     entered_game_loop=observation.game_loop,
                     last_command_game_loop=observation.game_loop,
                     cooldown_until_game_loop=(
@@ -222,10 +286,16 @@ class DeterministicTacticalAgent:
                     ),
                     waypoint=waypoint,
                     waypoint_index=next_index,
+                    best_distance=waypoint_distance,
+                    last_progress_game_loop=observation.game_loop,
                 )
                 self._offense_by_actor[actor] = state
             else:
-                state.phase = "searching" if last_known_targets else "advancing"
+                state.phase = (
+                    "searching"
+                    if last_known_targets or self._known_enemy_structures
+                    else "advancing"
+                )
                 state.last_command_game_loop = observation.game_loop
                 state.cooldown_until_game_loop = (
                     observation.game_loop + self.reacquire_cooldown_game_loops
@@ -233,9 +303,13 @@ class DeterministicTacticalAgent:
                 state.waypoint = waypoint
                 state.waypoint_index = next_index
                 state.target_tag = None
+                state.best_distance = waypoint_distance
+                state.last_progress_game_loop = observation.game_loop
 
             objective = (
-                "Reacquire the last-known enemy and search for surviving structures"
+                "Search the last-known enemy structure location and reacquire targets"
+                if self._known_enemy_structures
+                else "Reacquire the last-known enemy and search for surviving structures"
                 if last_known_targets
                 else "Search unexplored map sectors for enemy units and structures"
             )
@@ -256,6 +330,41 @@ class DeterministicTacticalAgent:
                 )
             )
         return intents
+
+    def _select_offense_waypoint(
+        self,
+        candidates: list[tuple[int, int]],
+    ) -> tuple[int, int]:
+        structure_positions = tuple(self._known_enemy_structures.values())
+        if structure_positions:
+            return min(
+                candidates,
+                key=lambda candidate: (
+                    min(math.dist(candidate, position) for position in structure_positions),
+                    candidate,
+                ),
+            )
+        return candidates[0]
+
+    def _remember_enemy_structures(self, observation: ObservationEnvelope) -> None:
+        for enemy in observation.state.visible_enemies:
+            tag = _normalize_tag(enemy.unit_id)
+            if enemy.unit_type not in ENEMY_STRUCTURE_TYPES:
+                continue
+            if enemy.health_fraction <= 0.0:
+                self._known_enemy_structures.pop(tag, None)
+            elif enemy.minimap_position is not None:
+                self._known_enemy_structures[tag] = enemy.minimap_position
+
+    def _forget_searched_enemy_structures(
+        self,
+        waypoint: tuple[int, int],
+    ) -> None:
+        self._known_enemy_structures = {
+            tag: position
+            for tag, position in self._known_enemy_structures.items()
+            if math.dist(position, waypoint) > self.offense_arrival_radius * 2.0
+        }
 
     def _retreat_intents(
         self,
@@ -362,6 +471,7 @@ class DeterministicTacticalAgent:
         self._last_focus_target = None
         self._retreat_by_actor.clear()
         self._offense_by_actor.clear()
+        self._known_enemy_structures.clear()
 
     def _focus_target(self, enemies: list[UnitState]) -> tuple[UnitState, bool]:
         by_tag = {_normalize_tag(enemy.unit_id): enemy for enemy in enemies}
@@ -461,6 +571,23 @@ def _units_for_actor(
     if unit_type.casefold() in {"army", "combat", "all"}:
         return combat_units
     return [unit for unit in combat_units if unit.unit_type == unit_type]
+
+
+def _actor_minimap_centroid(
+    observation: ObservationEnvelope,
+    actor: str,
+) -> tuple[float, float] | None:
+    positions = [
+        unit.minimap_position
+        for unit in _units_for_actor(observation, actor)
+        if unit.minimap_position is not None
+    ]
+    if not positions:
+        return None
+    return (
+        sum(position[0] for position in positions) / len(positions),
+        sum(position[1] for position in positions) / len(positions),
+    )
 
 
 def _units_at_home(

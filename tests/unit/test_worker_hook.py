@@ -63,6 +63,7 @@ from rtscortex_llm_pysc2.worker import (
     _semantic_target_failure,
     _should_block_gas_rebalance,
     _suppress_pending_build_control_action,
+    _translate_persistent_expansion_camera_primitive,
     _translate_worker_owned_zero_argument_primitive,
     _translated_build_position,
     _translation_failure_code,
@@ -121,6 +122,31 @@ def test_timestep_extractor_produces_json_safe_five_part_snapshot() -> None:
     assert envelope.available_actions[1].argument_names == ["tag"]
     assert envelope.available_actions[1].argument_types == ["tag"]
     assert "Unsupported" not in {action.name for action in envelope.available_actions}
+
+
+def test_timestep_extractor_projects_world_positions_to_minimap() -> None:
+    timestep = _fake_timestep()
+    agent = cast(Any, FakeAgent("CombatGroup7", "Adept-1", timestep, StubBroker()))
+    agent.world_range = 128
+    agent.world_x_offset = 0
+    agent.world_y_offset = 0
+    agent.size_minimap = 64
+
+    snapshot = TimeStepExtractor(
+        "run-worker",
+        "episode-worker",
+        unit_names={311: "Adept", 59: "Nexus", 104: "Drone"},
+        building_types=(59,),
+    ).extract(
+        timestep,
+        {"CombatGroup7": agent},
+        {"CombatGroup7": "ready"},
+        step_id=3,
+    )
+    envelope = ObservationEnvelope.model_validate(ObservationMapper().map(snapshot))
+
+    assert envelope.state.own_units[0].minimap_position == (21.0, 45.0)
+    assert envelope.state.visible_enemies[0].minimap_position == (26.0, 48.0)
 
 
 @pytest.mark.parametrize(
@@ -3596,6 +3622,106 @@ def test_nexus_candidate_survives_camera_move_via_persistent_world_anchor() -> N
         )
         is None
     )
+
+
+def test_persistent_nexus_anchor_drives_camera_after_leaving_raw_observation() -> None:
+    observation, feature_resources, _ = _nexus_candidate_observation()
+    known_resources = tuple(
+        {
+            "tag": unit.tag,
+            "unit_type": "MineralField",
+            "alliance": 3,
+            "x": raw.x,
+            "y": raw.y,
+        }
+        for unit, raw in zip(
+            feature_resources,
+            observation.raw_units[-len(feature_resources) :],
+            strict=True,
+        )
+    )
+    calls: list[tuple[int, int]] = []
+
+    def move_camera(position: tuple[int, int]) -> object:
+        calls.append(position)
+        return SimpleNamespace(function=573, arguments=[list(position)])
+
+    move_camera.name = "llm_pysc2_move_camera"  # type: ignore[attr-defined]
+    agent = SimpleNamespace(
+        func_list=[(573, move_camera, (101,)), (0, object(), ())],
+        curr_action_name="Build_Nexus_Near",
+        _rtscortex_translation_ordinal=0,
+        _rtscortex_translation_total=3,
+        _rtscortex_known_expansion_resources=known_resources,
+        unit_names={341: "MineralField"},
+        world_x_offset=4,
+        world_y_offset=6,
+        world_range=128,
+        last_translation_result=None,
+    )
+
+    function_id, _ = _translate_persistent_expansion_camera_primitive(
+        agent,
+        SimpleNamespace(observation=SimpleNamespace(raw_units=[])),
+        {"name": "Build_Nexus_Near", "arg": [101]},
+    )
+
+    assert function_id == 573
+    assert calls == [(54, 84)]
+    assert agent.last_translation_result["accepted"] is True
+    assert agent.last_translation_result["resolved_arguments"] == [(54, 84)]
+
+
+def test_failed_expansion_anchor_is_suppressed_until_cooldown_expires() -> None:
+    observation, feature_resources, _ = _nexus_candidate_observation()
+    observation.game_loop = [100]
+    extractor = TimeStepExtractor(
+        "run",
+        "episode",
+        unit_names={59: "Nexus", 341: "MineralField"},
+    )
+    extractor._remember_expansion_resources(  # noqa: SLF001
+        observation.raw_units,
+        feature_resources,
+    )
+    extractor.suppress_expansion_anchor(101, game_loop=100, cooldown_game_loops=32)
+
+    assert semantic_argument_candidates(
+        observation,
+        "Build_Nexus_Near",
+        unit_names={59: "Nexus", 341: "MineralField"},
+        known_expansion_resources=extractor.known_expansion_resources,
+        excluded_expansion_anchors=extractor.suppressed_expansion_anchors,
+    ) == []
+
+    observation.game_loop = [132]
+    extractor.observe_expansion_resources(observation, {})
+    assert semantic_argument_candidates(
+        observation,
+        "Build_Nexus_Near",
+        unit_names={59: "Nexus", 341: "MineralField"},
+        known_expansion_resources=extractor.known_expansion_resources,
+        excluded_expansion_anchors=extractor.suppressed_expansion_anchors,
+    ) == [[101]]
+
+
+def test_failed_expansion_effect_suppresses_command_anchor() -> None:
+    extractor = TimeStepExtractor("run", "episode")
+    coordinator = SimpleNamespace(
+        observe_effects=lambda _observation: [
+            {
+                "command_id": "command-expand",
+                "status": "failed",
+                "failure_code": "target_not_created",
+            }
+        ]
+    )
+    broker = SharedDecisionBroker(cast(Any, coordinator), extractor)
+    broker._expansion_anchor_by_command["command-expand"] = 101  # noqa: SLF001
+
+    broker.observe_effects(SimpleNamespace(game_loop=[224]))
+
+    assert extractor.suppressed_expansion_anchors == frozenset({101})
 
 
 def test_nexus_candidate_requires_the_exact_anchor_to_be_currently_visible() -> None:

@@ -434,7 +434,7 @@ def _candidate_rule(lesson: PlaybookLesson, source_case: DecisionCase) -> Playbo
         PlaybookCondition(field="map_name", value=lesson.context.map_name),
     )
     condition_values = source_case.evidence.get("condition_values")
-    if isinstance(condition_values, dict) and source_case.consequence_type is not None:
+    if isinstance(condition_values, dict):
         conditions = (
             *conditions,
             *tuple(

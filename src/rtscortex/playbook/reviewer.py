@@ -84,6 +84,11 @@ class CortexPlaybookReviewer:
                 rule.category is not PlaybookRuleCategory.EXECUTION_GUARD
                 or rule.status is not PlaybookRuleStatus.ACTIVE
                 or rule.strength is PlaybookRuleStrength.ADVISORY
+                or {
+                    "threat_level",
+                    "economy_status",
+                    "army_readiness",
+                }.intersection(condition.field for condition in rule.conditions)
             ):
                 continue
             evidence = dict(rule.evidence)
@@ -135,6 +140,7 @@ class CortexPlaybookReviewer:
             and _source_role(event.payload) in {"macro", "tactical"}
         }
         phases = _phase_timeline(events)
+        situations = _situation_timeline(events)
         cases: list[DecisionCase] = []
         lessons: list[PlaybookLesson] = []
         for consequence in self.last_consequences:
@@ -180,6 +186,7 @@ class CortexPlaybookReviewer:
                 lineage_event.payload.get("semantic_action") or report.action_name or "unknown"
             )
             quality, owner, confidence, consequence_text = _assess(report)
+            condition_values = _condition_values_at(situations, event.event_id)
             context = PlaybookContext(
                 agent_race=agent_race,
                 opponent_race=opponent_race,
@@ -214,6 +221,7 @@ class CortexPlaybookReviewer:
                         if report.effect_evidence is None
                         else report.effect_evidence.model_dump(mode="json")
                     ),
+                    "condition_values": condition_values,
                 },
                 episode_outcome=result.outcome.value,
                 confidence=confidence,
@@ -225,6 +233,7 @@ class CortexPlaybookReviewer:
             if lesson is not None:
                 lessons.append(lesson)
         self._record_contradictions(cases, seed=result.seed)
+        self._promote_eligible_rules()
         self.last_rule_updates = tuple(
             rule
             for rule in self.store.rules()
@@ -234,6 +243,16 @@ class CortexPlaybookReviewer:
             (lesson.signature, result.episode_id): lesson for lesson in lessons
         }
         return cases, list(deduplicated_lessons.values())
+
+    def _promote_eligible_rules(self) -> None:
+        for rule in self.store.rules():
+            if rule.status is not PlaybookRuleStatus.CANDIDATE:
+                continue
+            try:
+                promoted = self._rule_lifecycle.promote_to_soft(rule)
+            except ValueError:
+                continue
+            self.store.upsert_rule(promoted)
 
     def _record_contradictions(
         self,
@@ -595,6 +614,31 @@ def _phase_timeline(events: Sequence[StoredEvent]) -> list[tuple[int, GamePhase]
         if isinstance(phase, str):
             timeline.append((event.event_id, GamePhase(phase)))
     return timeline
+
+
+def _situation_timeline(
+    events: Sequence[StoredEvent],
+) -> list[tuple[int, dict[str, object]]]:
+    return [
+        (event.event_id, event.payload)
+        for event in events
+        if event.event_type == "situation_assessed"
+    ]
+
+
+def _condition_values_at(
+    timeline: list[tuple[int, dict[str, object]]],
+    event_id: int,
+) -> dict[str, str]:
+    payload = next(
+        (payload for source_id, payload in reversed(timeline) if source_id <= event_id),
+        {},
+    )
+    return {
+        field: value
+        for field in ("threat_level", "economy_status", "army_readiness")
+        if isinstance((value := payload.get(field)), str)
+    }
 
 
 def _phase_at(timeline: list[tuple[int, GamePhase]], event_id: int) -> GamePhase:

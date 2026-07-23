@@ -289,6 +289,7 @@ MINIMAP_POINT_ACTIONS = frozenset({"Move_Minimap"})
 SELECT_BLINK_ACTION = "Select_Unit_Blink_Screen"
 PRODUCTION_ACTION_PREFIXES = ("Train_",)
 MIN_PRODUCTION_SOURCE_HEALTH_FRACTION = 0.2
+EXPANSION_ANCHOR_RETRY_COOLDOWN_GAME_LOOPS = 672
 
 
 def semantic_argument_candidates(
@@ -298,6 +299,7 @@ def semantic_argument_candidates(
     unit_names: Mapping[int, str],
     builder_tags: Optional[Collection[int]] = None,
     known_expansion_resources: Sequence[Any] = (),
+    excluded_expansion_anchors: Collection[int] = (),
 ) -> Optional[list[list[Any]]]:
     """Return the single semantic candidate domain used at observe and dispatch time."""
 
@@ -308,6 +310,7 @@ def semantic_argument_candidates(
         include_home_minimap=True,
         builder_tags=builder_tags,
         known_expansion_resources=known_expansion_resources,
+        excluded_expansion_anchors=excluded_expansion_anchors,
     )
 
 
@@ -322,6 +325,7 @@ def expansion_anchor_candidates(
     *,
     unit_names: Mapping[int, str],
     known_expansion_resources: Sequence[Any],
+    excluded_expansion_anchors: Collection[int] = (),
 ) -> list[int]:
     """Return persistent resource-cluster anchors independent of current camera position."""
 
@@ -329,6 +333,7 @@ def expansion_anchor_candidates(
         observation,
         unit_names,
         known_resources=known_expansion_resources,
+        excluded_anchors=excluded_expansion_anchors,
     )
 
 
@@ -527,10 +532,32 @@ class TimeStepExtractor:
             for function_id, unit_type in (action_source_types or {}).items()
         }
         self._known_expansion_resources: dict[int, dict[str, Any]] = {}
+        self._suppressed_expansion_anchors: dict[int, int] = {}
+        self._latest_game_loop = 0
 
     @property
     def known_expansion_resources(self) -> tuple[dict[str, Any], ...]:
         return tuple(self._known_expansion_resources.values())
+
+    @property
+    def suppressed_expansion_anchors(self) -> frozenset[int]:
+        return frozenset(
+            tag
+            for tag, retry_after in self._suppressed_expansion_anchors.items()
+            if retry_after > self._latest_game_loop
+        )
+
+    def suppress_expansion_anchor(
+        self,
+        tag: int,
+        *,
+        game_loop: int,
+        cooldown_game_loops: int = EXPANSION_ANCHOR_RETRY_COOLDOWN_GAME_LOOPS,
+    ) -> None:
+        self._latest_game_loop = max(self._latest_game_loop, int(game_loop))
+        self._suppressed_expansion_anchors[int(tag)] = (
+            int(game_loop) + int(cooldown_game_loops)
+        )
 
     def observe_expansion_resources(
         self,
@@ -543,9 +570,17 @@ class TimeStepExtractor:
             list(_value(observation, "raw_units", ())),
             _value(observation, "feature_units", ()),
         )
+        self._latest_game_loop = int(_scalar(_value(observation, "game_loop", 0)))
+        self._suppressed_expansion_anchors = {
+            tag: retry_after
+            for tag, retry_after in self._suppressed_expansion_anchors.items()
+            if retry_after > self._latest_game_loop
+        }
         known = self.known_expansion_resources
+        suppressed = self.suppressed_expansion_anchors
         for agent in agents.values():
             agent._rtscortex_known_expansion_resources = known
+            agent._rtscortex_suppressed_expansion_anchors = suppressed
 
     def extract(
         self,
@@ -562,6 +597,7 @@ class TimeStepExtractor:
 
         raw_units = list(_value(observation, "raw_units", ()))
         self.observe_expansion_resources(observation, agents)
+        minimap_transform = _world_to_minimap_transform(agents)
         teams = _extract_team_actions(
             agents,
             fallback_observation=observation,
@@ -587,7 +623,10 @@ class TimeStepExtractor:
                 observation,
                 unit_names=self.unit_names,
             ),
-            "units": [self._extract_unit(unit) for unit in raw_units],
+            "units": [
+                self._extract_unit(unit, minimap_transform=minimap_transform)
+                for unit in raw_units
+            ],
             "upgrades": [
                 self.upgrade_names.get(int(value), f"upgrade:{int(value)}")
                 for value in _value(observation, "upgrades", ())
@@ -632,7 +671,12 @@ class TimeStepExtractor:
                 "display_type": 1,
             }
 
-    def _extract_unit(self, unit: Any) -> dict[str, Any]:
+    def _extract_unit(
+        self,
+        unit: Any,
+        *,
+        minimap_transform: Optional[tuple[float, float, float, float, float]],
+    ) -> dict[str, Any]:
         unit_type = int(_value(unit, "unit_type", 0))
         is_structure = unit_type in self.building_types
         health = float(_value(unit, "health", 0.0))
@@ -649,12 +693,32 @@ class TimeStepExtractor:
                 normalized_progress /= 100.0
             if normalized_progress < 1.0:
                 status = "constructing"
+        minimap_position = None
+        if minimap_transform is not None:
+            scale, x_offset, y_offset, world_range, maximum = minimap_transform
+            minimap_position = [
+                max(
+                    0.0,
+                    min(
+                        maximum,
+                        (float(_value(unit, "x", 0.0)) + x_offset) * scale,
+                    ),
+                ),
+                max(
+                    0.0,
+                    min(
+                        maximum,
+                        (world_range - float(_value(unit, "y", 0.0)) + y_offset) * scale,
+                    ),
+                ),
+            ]
         return {
             "tag": int(_value(unit, "tag", 0)),
             "unit_type": self.unit_names.get(unit_type, f"unit:{unit_type}"),
             "alliance": ALLIANCES.get(int(_value(unit, "alliance", 0)), "neutral"),
             "is_structure": is_structure,
             "position": [float(_value(unit, "x", 0.0)), float(_value(unit, "y", 0.0))],
+            "minimap_position": minimap_position,
             "health": health,
             "health_max": health_max,
             "energy": float(_value(unit, "energy", 0.0)),
@@ -974,6 +1038,11 @@ def _available_team_actions(
                 "_rtscortex_known_expansion_resources",
                 (),
             ),
+            excluded_expansion_anchors=getattr(
+                agent,
+                "_rtscortex_suppressed_expansion_anchors",
+                (),
+            ),
         )
         if (
             agent.name == "Builder"
@@ -1117,6 +1186,7 @@ def _argument_candidates(
     include_home_minimap: bool,
     builder_tags: Optional[Collection[int]] = None,
     known_expansion_resources: Sequence[Any] = (),
+    excluded_expansion_anchors: Collection[int] = (),
 ) -> Optional[list[list[Any]]]:
     if action_name == INJECT_ACTION:
         return [
@@ -1209,6 +1279,7 @@ def _argument_candidates(
             observation,
             unit_names,
             known_resources=known_expansion_resources,
+            excluded_anchors=excluded_expansion_anchors,
         )
     ]
 
@@ -1522,6 +1593,7 @@ def _expansion_anchor_candidates(
     unit_names: Mapping[int, str],
     *,
     known_resources: Sequence[Any] = (),
+    excluded_anchors: Collection[int] = (),
 ) -> list[int]:
     raw_units = list(_value(observation, "raw_units", ()))
     visible_resource_tags = {
@@ -1588,6 +1660,8 @@ def _expansion_anchor_candidates(
             ),
         )
         anchor_tag = int(_value(anchor, "tag", 0))
+        if anchor_tag in excluded_anchors:
+            continue
         if anchor_tag not in visible_resource_tags | known_resource_tags:
             continue
         if anchor_tag in visible_resource_tags and not _nexus_anchor_has_legal_screen_placement(
@@ -2683,6 +2757,24 @@ def _scalar(value: Any) -> Any:
     except (TypeError, IndexError):
         pass
     return value
+
+
+def _world_to_minimap_transform(
+    agents: Mapping[str, Any],
+) -> Optional[tuple[float, float, float, float, float]]:
+    for agent in agents.values():
+        world_range = float(getattr(agent, "world_range", 0.0))
+        size_minimap = float(getattr(agent, "size_minimap", 0.0))
+        if world_range <= 0 or size_minimap <= 0:
+            continue
+        return (
+            size_minimap / world_range,
+            float(getattr(agent, "world_x_offset", 0.0)),
+            float(getattr(agent, "world_y_offset", 0.0)),
+            world_range,
+            size_minimap - 1.0,
+        )
+    return None
 
 
 def _alert_name(value: Any) -> str:

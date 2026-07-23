@@ -83,6 +83,7 @@ class SharedDecisionBroker:
         self._command_queues: dict[tuple[str, str, str], deque[str]] = defaultdict(deque)
         self._active_commands: dict[tuple[str, str], _ActiveCommand] = {}
         self._screen_route_provenance: dict[str, ScreenRouteProvenance] = {}
+        self._expansion_anchor_by_command: dict[str, int] = {}
         self._planner_pending = False
         self._last_decision_game_loop: Optional[int] = None
         self._initial_decision_started = False
@@ -652,11 +653,21 @@ class SharedDecisionBroker:
         )
 
     def observe_effects(self, observation: Any) -> None:
-        self.coordinator.observe_effects(observation)
+        reports = self.coordinator.observe_effects(observation)
+        for report in reports:
+            command_id = str(report.get("command_id", ""))
+            anchor_tag = self._expansion_anchor_by_command.pop(command_id, None)
+            if anchor_tag is None or str(report.get("status")) == "succeeded":
+                continue
+            self.extractor.suppress_expansion_anchor(
+                anchor_tag,
+                game_loop=_observation_game_loop(observation),
+            )
 
     def end_episode(self, result: dict[str, Any]) -> None:
         self.coordinator.end_episode(result)
         self._screen_route_provenance.clear()
+        self._expansion_anchor_by_command.clear()
 
     def _command_id_for_actor(
         self,
@@ -776,4 +787,24 @@ class SharedDecisionBroker:
                             world_target=command.screen_world_target,
                             anchor_tag=command.screen_anchor_tag,
                         )
+                    if (
+                        command.name == "Build_Nexus_Near"
+                        and command.requested_arguments
+                    ):
+                        anchor = command.requested_arguments[0]
+                        self._expansion_anchor_by_command[command.command_id] = (
+                            int(anchor, 0) if isinstance(anchor, str) else int(anchor)
+                        )
             self._condition.notify_all()
+
+
+def _observation_game_loop(observation: Any) -> int:
+    value: Any = (
+        observation.get("game_loop", 0)
+        if isinstance(observation, dict)
+        else getattr(observation, "game_loop", 0)
+    )
+    try:
+        return int(value[0]) if len(value) == 1 else int(value)
+    except (TypeError, IndexError):
+        return int(value)

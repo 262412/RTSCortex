@@ -52,6 +52,22 @@ def test_environment_settings_accept_melee_runtime_controls() -> None:
     assert settings.expansion_scout_interval_game_loops == 96
 
 
+def test_live_environment_accepts_natural_terminal_without_step_limits() -> None:
+    settings = EnvironmentSettings(
+        adapter="llm_pysc2",
+        max_steps=None,
+        game_steps_per_episode=None,
+    )
+
+    assert settings.max_steps is None
+    assert settings.game_steps_per_episode is None
+
+
+def test_mock_environment_requires_finite_step_limit() -> None:
+    with pytest.raises(ValidationError, match="finite max_steps"):
+        EnvironmentSettings(adapter="mock", max_steps=None)
+
+
 @pytest.mark.parametrize("multiplier", [0.0, -0.1, 1.01])
 def test_environment_settings_reject_invalid_simulation_speed(multiplier: float) -> None:
     with pytest.raises(ValidationError):
