@@ -102,7 +102,13 @@ with httpx.Client(transport=transport, base_url="http://rtscortex") as client:
             "state": {
                 "economy": {},
                 "production_queue": [],
-                "own_units": [],
+                "own_units": [
+                    {
+                        "unit_id": "0x2",
+                        "unit_type": "Stalker",
+                        "alliance": "self",
+                    }
+                ],
                 "own_structures": [],
                 "visible_enemies": [
                     {

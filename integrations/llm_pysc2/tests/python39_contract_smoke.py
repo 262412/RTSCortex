@@ -24,6 +24,7 @@ from rtscortex_llm_pysc2.melee import RTSCortexMeleeConfig
 from rtscortex_llm_pysc2.observation import _map_argument_candidates
 from rtscortex_llm_pysc2.production import PRODUCTION_SPECS
 from rtscortex_llm_pysc2.terran_melee import RTSCortexTerranMeleeConfig
+from rtscortex_llm_pysc2.worker import _pysc2_action_argument_failure
 from rtscortex_llm_pysc2.zerg_melee import (
     QUEEN_CONTROLLER_ACTIONS,
     RTSCortexZergMeleeConfig,
@@ -116,6 +117,44 @@ def _assert_gather_target_is_visible_and_in_bounds() -> None:
     assert "_rtscortex_validate_gather_target" in source
     assert "0 <= unit.x < self.size_screen" in source
     assert "0 <= unit.y < self.size_screen" in source
+
+
+def _assert_stop_worker_selection_uses_clamped_coordinate() -> None:
+    source = inspect.getsource(main_agent_func2)
+    assert "min(max(0, unit.x), self.size_screen - 1)" in source
+    assert "select_point('select', (x, y))" in source
+
+
+def _assert_outbound_primitive_validator_runs_on_python39() -> None:
+    specification = SimpleNamespace(
+        args=(
+            SimpleNamespace(name="select_point_act", sizes=(4,)),
+            SimpleNamespace(name="screen", sizes=(128, 128)),
+        )
+    )
+    valid = SimpleNamespace(function=2, arguments=((0,), (127, 0)))
+    negative = SimpleNamespace(function=2, arguments=((0,), (2, -85)))
+    upper_edge = SimpleNamespace(function=2, arguments=((0,), (128, 64)))
+
+    assert (
+        _pysc2_action_argument_failure(
+            valid,
+            function_specification=specification,
+        )
+        is None
+    )
+    assert "outside [0, 128)" in str(
+        _pysc2_action_argument_failure(
+            negative,
+            function_specification=specification,
+        )
+    )
+    assert "outside [0, 128)" in str(
+        _pysc2_action_argument_failure(
+            upper_edge,
+            function_specification=specification,
+        )
+    )
 
 
 def _assert_single_unit_selection_uses_exact_point() -> None:
@@ -966,6 +1005,8 @@ def main() -> None:
     _assert_gas_rebalance_uses_worker_management_flag()
     _assert_observation_gap_watchdog_preempts_optional_gathering()
     _assert_gather_target_is_visible_and_in_bounds()
+    _assert_stop_worker_selection_uses_clamped_coordinate()
+    _assert_outbound_primitive_validator_runs_on_python39()
     _assert_single_unit_selection_uses_exact_point()
     _assert_visible_team_unit_bypasses_camera_recentering()
     _assert_zerg_queen_uses_exact_single_actor_selection()

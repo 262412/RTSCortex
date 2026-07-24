@@ -5,6 +5,13 @@ from rtscortex.playbook.guards import (
     GuardResult,
     PlaybookCandidateGuard,
     PlaybookIntentGuard,
+    RecentTerminalFeedback,
+    candidate_signature,
+)
+from rtscortex.playbook.learning import (
+    LearnedEpisode,
+    PlaybookLearningResult,
+    PlaybookRunLearner,
 )
 from rtscortex.playbook.lifecycle import PlaybookRuleLifecycle, StrategicABEvidence
 from rtscortex.playbook.models import (
@@ -40,11 +47,15 @@ __all__ = [
     "DecisionQuality",
     "FailureOwner",
     "LessonStatus",
+    "LearnedEpisode",
     "PlaybookContext",
     "PlaybookCondition",
     "PlaybookConditionOperator",
     "PlaybookCandidateGuard",
     "PlaybookIntentGuard",
+    "PlaybookLearningResult",
+    "PlaybookRunLearner",
+    "RecentTerminalFeedback",
     "GuardResult",
     "PlaybookHit",
     "PlaybookLesson",
@@ -66,4 +77,5 @@ __all__ = [
     "StrategicConsequenceType",
     "PlaybookSelection",
     "PlaybookStore",
+    "candidate_signature",
 ]

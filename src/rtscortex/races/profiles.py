@@ -12,6 +12,7 @@ from rtscortex.progress import (
 )
 from rtscortex.races.models import (
     ActionDomain,
+    CombatTargetDomain,
     MacroActionMapping,
     RaceId,
     RaceProfileData,
@@ -100,6 +101,15 @@ PROTOSS_PROFILE_DATA = RaceProfileData(
         "Train_VoidRay": ("Stargate",),
         "Train_Oracle": ("Stargate",),
         "Research_WarpGate": ("CyberneticsCore",),
+    },
+    combat_target_domains={
+        "Zealot": CombatTargetDomain.GROUND,
+        "Stalker": CombatTargetDomain.BOTH,
+        "Adept": CombatTargetDomain.GROUND,
+        "DarkTemplar": CombatTargetDomain.GROUND,
+        "Phoenix": CombatTargetDomain.AIR,
+        "VoidRay": CombatTargetDomain.BOTH,
+        "Oracle": CombatTargetDomain.GROUND,
     },
     hima_vocabulary_version="hima-protoss-60-v2",
     structure_saturation_limits={
@@ -395,6 +405,16 @@ TERRAN_PROFILE_DATA = RaceProfileData(
         "Morph_OrbitalCommand": ("CommandCenter",),
         "Effect_CalldownMULE_Screen": ("OrbitalCommand",),
     },
+    combat_target_domains={
+        "Marine": CombatTargetDomain.BOTH,
+        "Marauder": CombatTargetDomain.GROUND,
+        "Hellion": CombatTargetDomain.GROUND,
+        "SiegeTank": CombatTargetDomain.GROUND,
+        "SiegeTankSieged": CombatTargetDomain.GROUND,
+        "Medivac": CombatTargetDomain.NONE,
+        "VikingFighter": CombatTargetDomain.AIR,
+        "VikingAssault": CombatTargetDomain.GROUND,
+    },
     hima_vocabulary_version="hima-terran-69-v1",
     runtime_mapping_ready=True,
     live_worker_ready=True,
@@ -602,6 +622,12 @@ ZERG_PROFILE_DATA = RaceProfileData(
             "CreepTumorQueen",
         ),
     },
+    combat_target_domains={
+        "Queen": CombatTargetDomain.BOTH,
+        "Zergling": CombatTargetDomain.GROUND,
+        "Roach": CombatTargetDomain.GROUND,
+        "Hydralisk": CombatTargetDomain.BOTH,
+    },
     hima_vocabulary_version="hima-zerg-63-v1",
     runtime_mapping_ready=True,
     live_worker_ready=True,
@@ -650,3 +676,48 @@ def race_profile(race: RaceId | str) -> BuiltinRaceProfile:
 
 def built_in_race_profiles() -> tuple[BuiltinRaceProfile, ...]:
     return tuple(_RACE_PROFILES[race] for race in RaceId)
+
+
+def combat_target_domain(unit_type: str) -> CombatTargetDomain:
+    """Return the weapon target domain declared by the owning race profile."""
+
+    domains = {
+        data.combat_target_domains[unit_type]
+        for data in (PROTOSS_PROFILE_DATA, TERRAN_PROFILE_DATA, ZERG_PROFILE_DATA)
+        if unit_type in data.combat_target_domains
+    }
+    if not domains:
+        return CombatTargetDomain.NONE
+    if len(domains) != 1:
+        raise ValueError(f"conflicting combat target domains for {unit_type!r}")
+    return domains.pop()
+
+
+_AIRBORNE_UNIT_TYPES = frozenset(
+    {
+        "Banshee",
+        "Battlecruiser",
+        "BroodLord",
+        "Carrier",
+        "Corruptor",
+        "Liberator",
+        "Medivac",
+        "Mothership",
+        "Mutalisk",
+        "Observer",
+        "Oracle",
+        "Overlord",
+        "Overseer",
+        "Phoenix",
+        "Raven",
+        "Tempest",
+        "VikingFighter",
+        "VoidRay",
+    }
+)
+
+
+def is_flying_unit(unit_type: str) -> bool:
+    """Return flight state from race semantics without changing protocol v1.1."""
+
+    return unit_type in _AIRBORNE_UNIT_TYPES

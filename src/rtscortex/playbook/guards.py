@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -28,6 +29,17 @@ class GuardResult:
     score_delta: float
     rule_ids: tuple[str, ...]
     applications: tuple[PlaybookRuleApplication, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class RecentTerminalFeedback:
+    signature: str
+    action_name: str
+    actor: str
+    failure_code: str
+    command_id: str
+    expires_game_loop: int
+    hard_suppression: bool
 
 
 class PlaybookIntentGuard:
@@ -80,6 +92,7 @@ class PlaybookCandidateGuard:
         step_id: int,
         game_loop: int,
         mode: Literal["shadow", "active"] = "shadow",
+        recent_feedback: Sequence[RecentTerminalFeedback] = (),
     ) -> GuardResult:
         values = _values(
             context,
@@ -87,7 +100,7 @@ class PlaybookCandidateGuard:
             action_name=candidate.action_name,
             role=role,
         )
-        return _evaluate(
+        rules_result = _evaluate(
             rules,
             values,
             run_id=run_id,
@@ -100,6 +113,74 @@ class PlaybookCandidateGuard:
             role=role,
             mode=mode,
         )
+        signature = candidate_signature(
+            candidate.action_name,
+            candidate.actor,
+            candidate.arguments,
+        )
+        feedback = next(
+            (
+                item
+                for item in recent_feedback
+                if item.signature == signature
+                and item.expires_game_loop >= game_loop
+            ),
+            None,
+        )
+        if feedback is None:
+            return rules_result
+        blocked = mode == "active"
+        score_delta = -2.0
+        application = PlaybookRuleApplication(
+            application_id=(
+                "rule-application:"
+                + hashlib.sha256(
+                    f"{feedback.command_id}|{candidate.candidate_id}|{game_loop}".encode()
+                ).hexdigest()
+            ),
+            rule_id=f"terminal-feedback:{feedback.command_id}",
+            run_id=run_id,
+            episode_id=episode_id,
+            step_id=step_id,
+            game_loop=game_loop,
+            target_kind="candidate",
+            target_id=candidate.candidate_id,
+            matched=True,
+            blocked=blocked,
+            score_delta=score_delta,
+            reason=(
+                "recent_terminal_failure_block"
+                if feedback.hard_suppression
+                else "recent_terminal_failure_cooldown"
+            ),
+        )
+        return GuardResult(
+            blocked=rules_result.blocked or blocked,
+            score_delta=(
+                rules_result.score_delta + score_delta
+                if mode == "active"
+                else 0.0
+            ),
+            rule_ids=(*rules_result.rule_ids, application.rule_id),
+            applications=(*rules_result.applications, application),
+        )
+
+
+def candidate_signature(
+    action_name: str,
+    actor: str,
+    arguments: Sequence[object],
+) -> str:
+    payload = json.dumps(
+        {
+            "action_name": action_name,
+            "actor": actor,
+            "arguments": list(arguments),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode()).hexdigest()
 
 
 def _values(

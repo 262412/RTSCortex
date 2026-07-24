@@ -362,7 +362,20 @@ def _extract_nonstandard_action_items(
             break
         match = _NONSTANDARD_ACTION_ITEM_RE.fullmatch(item)
         if match is None:
-            return None
+            if not tokens:
+                return None
+            diagnostics.append(
+                ParseDiagnostic(
+                    code="malformed_action_tail_ignored",
+                    message=(
+                        "Retained the valid cumulative Actions prefix and ignored "
+                        "the malformed tail."
+                    ),
+                    raw_token=item.strip(),
+                    ordinal=ordinal,
+                )
+            )
+            break
         counted_token = match.group("token")
         raw_token = (counted_token or match.group("bare_token")).strip()
         target_count = int(match.group("repeat")) if counted_token is not None else None

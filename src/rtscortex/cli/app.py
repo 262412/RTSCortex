@@ -35,7 +35,11 @@ from rtscortex.evaluation import (
 )
 from rtscortex.evaluation.replay import replay_event_log
 from rtscortex.memory import EventStore, read_event_log
-from rtscortex.playbook import PlaybookPromotionSweep, PlaybookStore
+from rtscortex.playbook import (
+    PlaybookPromotionSweep,
+    PlaybookRunLearner,
+    PlaybookStore,
+)
 from rtscortex.policy import (
     LLMPlanningPolicySubagent,
     PolicyShadowComparison,
@@ -226,6 +230,56 @@ def playbook_promote(
     store = PlaybookStore(path)
     try:
         result = PlaybookPromotionSweep(store, run_root=resolved_run_root).run()
+    finally:
+        store.close()
+    typer.echo(json.dumps(asdict(result), ensure_ascii=False, indent=2, sort_keys=True))
+
+
+@playbook_app.command("learn")
+def playbook_learn(
+    run_directories: Annotated[
+        list[Path],
+        typer.Option(
+            "--run-dir",
+            file_okay=False,
+            help="Completed run directory. Repeat the option to aggregate multiple seeds.",
+        ),
+    ],
+    database: Annotated[
+        Path,
+        typer.Option(
+            "--database",
+            dir_okay=False,
+            help="Separate writable CortexPlaybook learning-store path.",
+        ),
+    ] = Path("~/scratch/outputs/RTSCortex/cortex-playbook-learning.sqlite3"),
+    agent_race: Annotated[
+        str,
+        typer.Option("--agent-race", help="Player race required in every run config."),
+    ] = "protoss",
+    opponent_race: Annotated[
+        str,
+        typer.Option("--opponent-race", help="Opponent race required in every run config."),
+    ] = "zerg",
+) -> None:
+    """Review completed runs into one learning store and run soft promotion gates."""
+
+    if not run_directories:
+        raise typer.BadParameter(
+            "at least one --run-dir is required",
+            param_hint="--run-dir",
+        )
+    path = database.expanduser()
+    store = PlaybookStore(path)
+    try:
+        try:
+            result = PlaybookRunLearner(store).learn(
+                tuple(run_directories),
+                agent_race=agent_race,
+                opponent_race=opponent_race,
+            )
+        except ValueError as error:
+            raise typer.BadParameter(str(error), param_hint="--run-dir") from error
     finally:
         store.close()
     typer.echo(json.dumps(asdict(result), ensure_ascii=False, indent=2, sort_keys=True))

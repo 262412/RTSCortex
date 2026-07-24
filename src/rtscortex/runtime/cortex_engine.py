@@ -70,11 +70,14 @@ from rtscortex.playbook import (
     PlaybookCandidateGuard,
     PlaybookContext,
     PlaybookIntentGuard,
+    PlaybookPromotionSweep,
     PlaybookQuery,
     PlaybookRule,
     PlaybookRuleApplication,
     PlaybookSelection,
     PlaybookStore,
+    RecentTerminalFeedback,
+    candidate_signature,
 )
 from rtscortex.policy.hima import (
     HIMAInputContext,
@@ -223,8 +226,10 @@ class CortexRuntimeEngine(RuntimeEngine):
         self._playbook_selection: PlaybookSelection | None = None
         self._playbook_selection_fingerprint: tuple[str, ...] | None = None
         self._playbook_rules: tuple[PlaybookRule, ...] = ()
+        self._playbook_promotion_sweep_done = False
         self._playbook_intent_guard = PlaybookIntentGuard()
         self._playbook_candidate_guard = PlaybookCandidateGuard()
+        self._recent_terminal_feedback: dict[str, RecentTerminalFeedback] = {}
         self._current_situation: SituationAssessment | None = None
         self._macro_goal: GoalSpec | None = None
         self._macro_plan_frozen = False
@@ -569,6 +574,7 @@ class CortexRuntimeEngine(RuntimeEngine):
         self._playbook_selection = None
         self._playbook_selection_fingerprint = None
         self._playbook_rules = ()
+        self._recent_terminal_feedback = {}
         self._current_situation = None
         self._macro_goal = None
         self._macro_plan_frozen = False
@@ -1457,7 +1463,7 @@ class CortexRuntimeEngine(RuntimeEngine):
                 return emergency
         if (
             blocked_frontier.reason_code == "insufficient_vespene"
-            and not self._has_gas_infrastructure(observation)
+            and self._needs_more_gas_infrastructure(observation)
         ):
             gas_closure = self._legal_synthetic_action(
                 proposal,
@@ -1669,6 +1675,23 @@ class CortexRuntimeEngine(RuntimeEngine):
             structure.unit_type.casefold() == gas_structure
             for structure in observation.state.own_structures
         )
+
+    def _needs_more_gas_infrastructure(self, observation: ObservationEnvelope) -> bool:
+        """Return whether gas-starved macro should close gas infrastructure first."""
+
+        gas_structure = self._race_profile.data.gas_structure.casefold()
+        completed_townhalls = sum(
+            structure.unit_type in self._race_profile.data.townhall_types
+            and structure.status != "constructing"
+            for structure in observation.state.own_structures
+        )
+        if completed_townhalls <= 0:
+            return False
+        gas_structures = sum(
+            structure.unit_type.casefold() == gas_structure
+            for structure in observation.state.own_structures
+        )
+        return gas_structures < completed_townhalls * 2
 
     def _supply_macro_action(self) -> str:
         return self._semantic_action_for_target(self._race_profile.data.supply_provider)
@@ -2131,7 +2154,15 @@ class CortexRuntimeEngine(RuntimeEngine):
     ) -> FastExecutorContext:
         mode = self.config.cortex.playbook.rule_mode
         assessment = self._current_situation
-        if mode == "disabled" or assessment is None or not self._playbook_rules:
+        for signature, feedback in tuple(self._recent_terminal_feedback.items()):
+            if feedback.expires_game_loop < observation.game_loop:
+                del self._recent_terminal_feedback[signature]
+        recent_feedback = tuple(self._recent_terminal_feedback.values())
+        if (
+            mode == "disabled"
+            or assessment is None
+            or (not self._playbook_rules and not recent_feedback)
+        ):
             return context
         playbook_context = self._playbook_context(assessment)
         candidates = []
@@ -2147,6 +2178,7 @@ class CortexRuntimeEngine(RuntimeEngine):
                 step_id=observation.step_id,
                 game_loop=observation.game_loop,
                 mode=mode,
+                recent_feedback=recent_feedback,
             )
             self._record_playbook_applications(observation, result.applications)
             if result.blocked:
@@ -2203,6 +2235,7 @@ class CortexRuntimeEngine(RuntimeEngine):
         super().record_execution(report)
         if existing is not None:
             return
+        self._remember_terminal_feedback(report)
         if isinstance(self._tactical, ExecutionAwareTacticalPolicyProvider):
             transition = self._tactical.record_execution(
                 report,
@@ -2213,7 +2246,11 @@ class CortexRuntimeEngine(RuntimeEngine):
                     run_id=report.run_id,
                     episode_id=report.episode_id,
                     step_id=report.step_id,
-                    event_type="tactical_target_state",
+                    event_type=(
+                        "tactical_actor_state"
+                        if "target_tag" not in transition
+                        else "tactical_target_state"
+                    ),
                     payload=transition,
                 )
         if metadata is None:
@@ -2256,6 +2293,39 @@ class CortexRuntimeEngine(RuntimeEngine):
             else:
                 self._macro_plan_frozen = True
                 self._urgent_replan_requested = True
+
+    def _remember_terminal_feedback(self, report: ExecutionReport) -> None:
+        if report.action_name is None or report.actor is None:
+            return
+        arguments = report.requested_arguments or report.resolved_arguments
+        signature = candidate_signature(
+            report.action_name,
+            report.actor,
+            arguments,
+        )
+        if report.status is ExecutionStatus.SUCCEEDED:
+            self._recent_terminal_feedback.pop(signature, None)
+            return
+        if report.status is not ExecutionStatus.FAILED:
+            return
+        hard_failure_codes = {
+            "bridge_integrity_error",
+            "candidate_outside_dispatch",
+            "friendly_target",
+            "primitive_argument_out_of_range",
+            "target_not_attackable_by_actor",
+        }
+        hard_suppression = (report.failure_code or "") in hard_failure_codes
+        cooldown = 336 if hard_suppression else 112
+        self._recent_terminal_feedback[signature] = RecentTerminalFeedback(
+            signature=signature,
+            action_name=report.action_name,
+            actor=report.actor,
+            failure_code=report.failure_code or "unknown_failure",
+            command_id=report.command_id,
+            expires_game_loop=self._execution_game_loop(report) + cooldown,
+            hard_suppression=hard_suppression,
+        )
 
     def _advance_macro_step(
         self,
@@ -2319,7 +2389,10 @@ class CortexRuntimeEngine(RuntimeEngine):
         proposal: MacroPolicyProposal,
         observation: ObservationEnvelope,
     ) -> None:
-        if self._expansion_commitment_id is not None:
+        if (
+            self._expansion_commitment_id is not None
+            or self._expansion_candidates_exhausted
+        ):
             return
         townhall_action = self._semantic_action_for_target(
             self._race_profile.data.townhall_types[0]
@@ -2356,11 +2429,26 @@ class CortexRuntimeEngine(RuntimeEngine):
         self,
         observation: ObservationEnvelope,
     ) -> None:
-        exhausted = "expansion_candidates_exhausted" in {
+        townhall_action = self._townhall_runtime_action()
+        candidate_available = any(
+            action.name == townhall_action and bool(action.argument_candidates)
+            for action in observation.available_actions
+        )
+        reported_exhausted = "expansion_candidates_exhausted" in {
             alert.casefold() for alert in observation.alerts
         }
-        self._expansion_candidates_exhausted = exhausted
-        if exhausted and self._expansion_commitment_id is not None:
+        if candidate_available:
+            # A newly discovered persistent cluster is stronger evidence than
+            # an older Worker exhaustion alert.
+            self._expansion_candidates_exhausted = False
+            return
+        if self._expansion_commitment_id is None:
+            # Scouting before HIMA requests an expansion cannot terminalize a
+            # commitment that does not exist yet.
+            self._expansion_candidates_exhausted = False
+            return
+        self._expansion_candidates_exhausted = reported_exhausted
+        if reported_exhausted:
             self._terminate_expansion_commitment(
                 observation,
                 terminal_state="expansion_candidates_exhausted",
@@ -2574,6 +2662,17 @@ class CortexRuntimeEngine(RuntimeEngine):
             self._playbook_selection = None
             self._playbook_rules = ()
             return
+        if (
+            not self._playbook_promotion_sweep_done
+            and self.config.cortex.playbook.rule_mode == "active"
+        ):
+            self._playbook_promotion_sweep_done = True
+            sweep = PlaybookPromotionSweep(self._playbook_store).run()
+            self._record_cortex_event(
+                observation,
+                "playbook_promotion_sweep",
+                asdict(sweep),
+            )
         context = self._playbook_context(assessment)
         self._playbook_rules = self._playbook_store.rules_for_guard(
             context=context,
@@ -2616,6 +2715,16 @@ class CortexRuntimeEngine(RuntimeEngine):
     def end_episode(self, result: EpisodeResult) -> None:
         already_recorded = self._episode_result_fingerprint is not None
         if not already_recorded and self._expansion_commitment_id is not None:
+            if not self._expansion_anchor_evaluations:
+                self._expansion_anchor_evaluations.append(
+                    {
+                        "commitment_id": self._expansion_commitment_id,
+                        "command_id": None,
+                        "anchor": None,
+                        "failure_code": "no_expansion_anchor_evaluated",
+                        "game_loop": result.steps,
+                    }
+                )
             self.store.append_event(
                 run_id=result.run_id,
                 episode_id=result.episode_id,

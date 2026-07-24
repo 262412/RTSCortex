@@ -14,7 +14,9 @@ from rtscortex.contracts import (
 )
 from rtscortex.cortex import (
     ArmyReadiness,
+    CandidateFeatures,
     EconomyStatus,
+    ExecutableCandidate,
     GamePhase,
     ResourceClaim,
     RoleId,
@@ -27,7 +29,9 @@ from rtscortex.playbook import (
     CortexPlaybookReviewer,
     DecisionQuality,
     LessonStatus,
+    PlaybookCandidateGuard,
     PlaybookCondition,
+    PlaybookConditionOperator,
     PlaybookContext,
     PlaybookIntentGuard,
     PlaybookPromotionSweep,
@@ -39,7 +43,10 @@ from rtscortex.playbook import (
     PlaybookRuleKind,
     PlaybookRuleStatus,
     PlaybookRuleStrength,
+    PlaybookRunLearner,
     PlaybookStore,
+    RecentTerminalFeedback,
+    candidate_signature,
 )
 
 
@@ -52,6 +59,74 @@ def test_playbook_public_import_succeeds_in_cold_interpreter() -> None:
     )
 
     assert completed.returncode == 0, completed.stderr
+
+
+def test_recent_terminal_feedback_blocks_exact_candidate_during_cooldown() -> None:
+    candidate = ExecutableCandidate(
+        candidate_id=f"candidate:{'a' * 64}",
+        observation_fingerprint="b" * 64,
+        intent_id="intent:production",
+        action_name="Build_Gateway_Screen",
+        actor="Builder/Probe-1",
+        arguments=[[64, 64]],
+        features=CandidateFeatures(
+            action_rank=0,
+            actor_rank=0,
+            argument_rank=0,
+            compile_ordinal=0,
+        ),
+    )
+    situation = SituationAssessment(
+        assessment_id="assessment:terminal-feedback",
+        run_id="run",
+        episode_id="episode",
+        step_id=2,
+        game_loop=128,
+        valid_until_game_loop=144,
+        phase=GamePhase.PRODUCTION,
+        threat_level=ThreatLevel.LOW,
+        economy_status=EconomyStatus.STABLE,
+        army_readiness=ArmyReadiness.FORMING,
+        source_kind="deterministic",
+        source_id="test",
+        source_version="1",
+    )
+    feedback = RecentTerminalFeedback(
+        signature=candidate_signature(
+            candidate.action_name,
+            candidate.actor,
+            candidate.arguments,
+        ),
+        action_name=candidate.action_name,
+        actor=candidate.actor,
+        failure_code="translator_rejected",
+        command_id="command:failed-gateway",
+        expires_game_loop=224,
+        hard_suppression=False,
+    )
+
+    result = PlaybookCandidateGuard().evaluate(
+        candidate,
+        role="production",
+        context=PlaybookContext(
+            agent_race="protoss",
+            opponent_race="zerg",
+            phase=GamePhase.PRODUCTION,
+            map_name="Simple64",
+        ),
+        situation=situation,
+        rules=(),
+        run_id="run",
+        episode_id="episode",
+        step_id=2,
+        game_loop=128,
+        mode="active",
+        recent_feedback=(feedback,),
+    )
+
+    assert result.blocked is True
+    assert result.score_delta == -2.0
+    assert result.applications[0].reason == "recent_terminal_failure_cooldown"
 
 
 def _episode_events(
@@ -138,6 +213,23 @@ def _episode_events(
         outcome=EpisodeOutcome.VICTORY,
         steps=620,
     )
+
+
+def _completed_run_directory(root: Path, run_id: str, *, seed: int) -> Path:
+    event_store, result = _episode_events(root, run_id, seed=seed)
+    event_store.record_episode(result)
+    event_store.close()
+    run_directory = root / run_id
+    run_directory.mkdir()
+    (root / f"{run_id}.sqlite3").rename(run_directory / "events.sqlite3")
+    (root / f"{run_id}.jsonl").rename(run_directory / "events.jsonl")
+    (run_directory / "config.yaml").write_text(
+        "environment:\n"
+        "  agent_race: protoss\n"
+        "  opponent_race: zerg\n",
+        encoding="utf-8",
+    )
+    return run_directory
 
 
 def test_playbook_promotes_only_repeated_outcome_backed_experience(tmp_path: Path) -> None:
@@ -1004,6 +1096,153 @@ def test_promotion_sweep_replays_multi_seed_states_and_activates_soft_rule(
 
     assert guard_result.score_delta == 0.5
     assert guard_result.rule_ids == (rule.rule_id,)
+    playbook.close()
+
+
+def test_promotion_sweep_consolidates_fragmented_typed_strategy_evidence(
+    tmp_path: Path,
+) -> None:
+    playbook = PlaybookStore(tmp_path / "cortex-playbook-v2.sqlite3")
+    for seed, threat in ((0, "high"), (1, "critical")):
+        run_id = f"fragmented-seed-{seed}"
+        conditions = (
+            PlaybookCondition(field="agent_race", value="protoss"),
+            PlaybookCondition(field="opponent_race", value="zerg"),
+            PlaybookCondition(field="phase", value="combat"),
+            PlaybookCondition(field="map_name", value="Simple64"),
+            PlaybookCondition(field="threat_level", value=threat),
+            PlaybookCondition(field="economy_status", value="floating"),
+            PlaybookCondition(field="army_readiness", value="engaged"),
+        )
+        playbook.upsert_rule(
+            PlaybookRule(
+                rule_id=f"rule:fragmented:{seed}",
+                canonical_key=f"fragmented:{seed}",
+                category=PlaybookRuleCategory.TACTICAL_RESPONSE,
+                conditions=conditions,
+                effect=PlaybookRuleEffect.PREFER,
+                strength=PlaybookRuleStrength.ADVISORY,
+                status=PlaybookRuleStatus.CANDIDATE,
+                role_ids=("defense",),
+                confidence=0.85,
+                source_run_ids=(run_id,),
+                source_seeds=(seed,),
+            )
+        )
+        run_dir = tmp_path / run_id
+        event_store = EventStore(run_dir / "events.sqlite3", run_dir / "events.jsonl")
+        for index in range(30):
+            event_store.append_event(
+                run_id=run_id,
+                episode_id="episode",
+                step_id=index,
+                event_type="situation_assessed",
+                payload={
+                    "phase": "combat",
+                    "threat_level": threat,
+                    "economy_status": "floating",
+                    "army_readiness": "engaged",
+                },
+            )
+        event_store.close()
+
+    sweep = PlaybookPromotionSweep(playbook, run_root=tmp_path).run()
+
+    assert len(sweep.consolidated_rule_ids) == 1
+    consolidated = next(
+        rule
+        for rule in playbook.rules()
+        if rule.rule_id in sweep.consolidated_rule_ids
+    )
+    assert consolidated.status is PlaybookRuleStatus.ACTIVE
+    assert consolidated.strength is PlaybookRuleStrength.SOFT
+    threat_condition = next(
+        condition
+        for condition in consolidated.conditions
+        if condition.field == "threat_level"
+    )
+    assert threat_condition.operator is PlaybookConditionOperator.IN
+    assert threat_condition.value == ("high", "critical")
+    assert consolidated.shadow_state_count == 60
+    situation = SituationAssessment(
+        assessment_id="assessment:consolidated",
+        run_id="next-run",
+        episode_id="episode",
+        step_id=1,
+        game_loop=100,
+        valid_until_game_loop=101,
+        phase=GamePhase.COMBAT,
+        threat_level=ThreatLevel.HIGH,
+        economy_status=EconomyStatus.FLOATING,
+        army_readiness=ArmyReadiness.ENGAGED,
+        source_kind="deterministic",
+        source_id="test",
+        source_version="1",
+    )
+    intent = StrategicIntent(
+        intent_id="intent:defense",
+        continuity_key="defense:protect-base",
+        run_id="next-run",
+        episode_id="episode",
+        step_id=1,
+        created_game_loop=100,
+        role=RoleId.DEFENSE,
+        objective="protect the threatened base",
+        desired_effect="remove the local threat",
+        action_names=("Attack_Unit",),
+        resource_claim=ResourceClaim(reservation_game_loops=16),
+        source_id="test",
+        source_version="1",
+    )
+    guard_result = PlaybookIntentGuard().evaluate(
+        intent,
+        context=PlaybookContext(
+            agent_race="protoss",
+            opponent_race="zerg",
+            phase=GamePhase.COMBAT,
+            map_name="Simple64",
+        ),
+        situation=situation,
+        rules=playbook.rules_for_guard(),
+        game_loop=100,
+        mode="active",
+    )
+    assert guard_result.score_delta == 0.5
+    assert consolidated.rule_id in guard_result.rule_ids
+    playbook.close()
+
+
+def test_playbook_run_learner_combines_frozen_runs_in_separate_store(
+    tmp_path: Path,
+) -> None:
+    run_directories = tuple(
+        _completed_run_directory(tmp_path, f"frozen-seed-{seed}", seed=seed)
+        for seed in (0, 1)
+    )
+    learning_path = tmp_path / "learning" / "cortex-playbook.sqlite3"
+    playbook = PlaybookStore(learning_path)
+    learner = PlaybookRunLearner(playbook)
+
+    first = learner.learn(
+        run_directories,
+        agent_race="protoss",
+        opponent_race="zerg",
+    )
+    second = learner.learn(
+        run_directories,
+        agent_race="protoss",
+        opponent_race="zerg",
+    )
+
+    assert len(first.learned_episodes) == 2
+    assert sum(item.case_count for item in first.learned_episodes) > 0
+    assert sum(item.case_count for item in second.learned_episodes) == 0
+    assert {case.run_id for case in playbook.cases()} == {
+        "frozen-seed-0",
+        "frozen-seed-1",
+    }
+    assert learning_path.is_file()
+    assert all((run_directory / "events.jsonl").is_file() for run_directory in run_directories)
     playbook.close()
 
 

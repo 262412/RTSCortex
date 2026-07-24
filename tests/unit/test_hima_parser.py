@@ -151,6 +151,25 @@ def test_parser_reads_hima_mixed_counted_and_bare_actions_list() -> None:
     assert proposal.diagnostics == []
 
 
+def test_parser_retains_valid_counted_prefix_before_malformed_tail() -> None:
+    proposal = HIMAProposalParser().parse(
+        'Actions: ["Pylon": 3, "Gateway": 2, "Probe", 1, "VoidRay"]'
+    )
+
+    assert [step.canonical_action for step in proposal.steps] == [
+        "BUILD PYLON",
+        "BUILD GATEWAY",
+        "TRAIN PROBE",
+    ]
+    assert [step.target_count for step in proposal.steps] == [3, 2, None]
+    assert [step.ordinal for step in proposal.steps] == [0, 1, 2]
+    assert [item.code for item in proposal.diagnostics] == [
+        "malformed_action_tail_ignored"
+    ]
+    assert proposal.diagnostics[0].ordinal == 3
+    assert proposal.diagnostics[0].raw_token == "1"
+
+
 def test_parser_reports_invalid_counted_actions_repeat() -> None:
     proposal = HIMAProposalParser().parse('Actions: ["Pylon": 0, "VoidRay": 33]')
 

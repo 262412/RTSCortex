@@ -27,6 +27,13 @@ class ActionDomain(StrEnum):
     RETREAT = "retreat"
 
 
+class CombatTargetDomain(StrEnum):
+    GROUND = "ground"
+    AIR = "air"
+    BOTH = "both"
+    NONE = "none"
+
+
 @dataclass(frozen=True, slots=True)
 class MacroActionMapping:
     semantic_action: str
@@ -45,6 +52,7 @@ class RaceProfileData:
     macro_action_mappings: tuple[MacroActionMapping, ...]
     action_domains: Mapping[str, ActionDomain]
     action_producers: Mapping[str, tuple[str, ...]]
+    combat_target_domains: Mapping[str, CombatTargetDomain]
     hima_vocabulary_version: str
     structure_saturation_limits: Mapping[str, int] = field(default_factory=dict)
     macro_contract_ready: bool = True
@@ -80,6 +88,11 @@ class RaceProfileData:
             self,
             "action_producers",
             MappingProxyType(dict(self.action_producers)),
+        )
+        object.__setattr__(
+            self,
+            "combat_target_domains",
+            MappingProxyType(dict(self.combat_target_domains)),
         )
         if any(limit < 1 for limit in self.structure_saturation_limits.values()):
             raise ValueError("structure saturation limits must be positive")

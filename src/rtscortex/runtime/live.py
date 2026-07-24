@@ -254,6 +254,11 @@ def prepare_live_worker(
             "the LLM-PySC2 gather-target validation patch is not applied; see "
             "integrations/llm_pysc2/patches/README.md"
         )
+    if not gas_stop_selection_patch_is_applied(project_root):
+        errors.append(
+            "the LLM-PySC2 gas stop-worker selection patch is not applied; see "
+            "integrations/llm_pysc2/patches/README.md"
+        )
 
     if errors:
         raise LiveEnvironmentError("Live environment validation failed:\n- " + "\n- ".join(errors))
@@ -1082,6 +1087,19 @@ def gather_screen_target_patch_is_applied(project_root: Path) -> bool:
     if not source.is_file():
         return False
     return "_rtscortex_validate_gather_target" in source.read_text(encoding="utf-8")
+
+
+def gas_stop_selection_patch_is_applied(project_root: Path) -> bool:
+    """Return whether stop-worker selection uses a clamped feature coordinate."""
+
+    source = project_root / "third_party/LLM-PySC2/llm_pysc2/agents/main_agent_funcs.py"
+    if not source.is_file():
+        return False
+    text = source.read_text(encoding="utf-8")
+    return (
+        "min(max(0, unit.x), self.size_screen - 1)" in text
+        and "select_point('select', (x, y))" in text
+    )
 
 
 def _signal_process(worker: asyncio.subprocess.Process, sig: signal.Signals) -> None:

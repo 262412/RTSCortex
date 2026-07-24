@@ -393,7 +393,9 @@ def _legacy_rule(lesson: PlaybookLesson) -> PlaybookRule:
         else PlaybookRuleEffect.AVOID
     )
     actions = tuple(
-        action for action in (lesson.recommended_action, lesson.avoid_action) if action is not None
+        action
+        for action in (lesson.recommended_action, lesson.avoid_action)
+        if action is not None and action.strip().casefold() not in {"", "unknown"}
     )
     roles = tuple(
         role for role in (lesson.recommended_role, lesson.avoid_role) if role is not None
@@ -449,7 +451,9 @@ def _candidate_rule(lesson: PlaybookLesson, source_case: DecisionCase) -> Playbo
         else PlaybookRuleEffect.AVOID
     )
     actions = tuple(
-        action for action in (lesson.recommended_action, lesson.avoid_action) if action is not None
+        action
+        for action in (lesson.recommended_action, lesson.avoid_action)
+        if action is not None and action.strip().casefold() not in {"", "unknown"}
     )
     roles = tuple(
         role for role in (lesson.recommended_role, lesson.avoid_role) if role is not None

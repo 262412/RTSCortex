@@ -15,6 +15,10 @@ working_playbook="/mnt/scratch/users/tbczhang/outputs/RTSCortex/cortex-playbook-
 mkdir -p "${run_set_dir}"
 cd "${repo_dir}"
 
+overall_status=0
+status_file="${run_set_dir}/seed-status.tsv"
+printf "seed\texit_code\n" > "${status_file}"
+
 for seed in 0 1 2; do
   rm -f \
     "${working_playbook}" \
@@ -34,8 +38,11 @@ for seed in 0 1 2; do
   run_status=${PIPESTATUS[0]}
   set -e
   echo "seed=${seed} status=finished exit_code=${run_status} utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-
+  printf "%s\t%s\n" "${seed}" "${run_status}" >> "${status_file}"
   if [[ ${run_status} -ne 0 ]]; then
-    exit "${run_status}"
+    overall_status=1
   fi
 done
+
+echo "run_set status=finished exit_code=${overall_status} status_file=${status_file}"
+exit "${overall_status}"

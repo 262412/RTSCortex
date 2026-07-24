@@ -32,12 +32,14 @@ from rtscortex_llm_pysc2.production import PRODUCTION_SPECS
 from rtscortex_llm_pysc2.routing import RoutedActionBatch, RoutedCommand
 from rtscortex_llm_pysc2.worker import (
     ExpansionScoutController,
+    GasWorkerController,
     RTSCortexLLMAgent,
     RTSCortexMainAgent,
     WorkerSettings,
     _abort_stalled_actor_selection,
     _apply_scenario_bootstrap,
     _available_addon_function_id,
+    _builder_selection_lease_active,
     _candidate_dispatch_failure,
     _canonical_pysc2_arguments,
     _enforce_orchestration_primitive_budget,
@@ -50,6 +52,7 @@ from rtscortex_llm_pysc2.worker import (
     _prime_deterministic_gas_rebalance,
     _producer_is_visible,
     _production_source_invalid_reason,
+    _pysc2_action_argument_failure,
     _rebind_builder_to_selected_worker,
     _recover_observation_gap,
     _refresh_build_action_position,
@@ -76,6 +79,77 @@ from rtscortex_llm_pysc2.worker import (
 )
 
 from rtscortex.contracts import ObservationEnvelope
+
+
+def test_outbound_primitive_argument_validator_uses_half_open_bounds() -> None:
+    specification = SimpleNamespace(
+        args=(
+            SimpleNamespace(name="select_point_act", sizes=(4,)),
+            SimpleNamespace(name="screen", sizes=(128, 128)),
+        )
+    )
+
+    valid = SimpleNamespace(function=2, arguments=((0,), (127, 0)))
+    negative = SimpleNamespace(function=2, arguments=((0,), (2, -85)))
+    upper_edge = SimpleNamespace(function=2, arguments=((0,), (128, 64)))
+
+    assert (
+        _pysc2_action_argument_failure(
+            valid,
+            function_specification=specification,
+        )
+        is None
+    )
+    assert "outside [0, 128)" in str(
+        _pysc2_action_argument_failure(
+            negative,
+            function_specification=specification,
+        )
+    )
+    assert "outside [0, 128)" in str(
+        _pysc2_action_argument_failure(
+            upper_edge,
+            function_specification=specification,
+        )
+    )
+
+
+def test_outbound_primitive_validator_uses_live_action_specification() -> None:
+    specification = SimpleNamespace(
+        args=(
+            SimpleNamespace(name="select_point_act", sizes=(4,)),
+            SimpleNamespace(name="screen", sizes=(128, 128)),
+        )
+    )
+    agent = object.__new__(RTSCortexMainAgent)
+    agent.action_spec = SimpleNamespace(functions={2: specification})
+    action = SimpleNamespace(function=2, arguments=((0,), (127, 0)))
+
+    validated, rejected = agent._validated_outbound_action(
+        action,
+        SimpleNamespace(observation=SimpleNamespace()),
+        source="test",
+    )
+
+    assert validated is action
+    assert rejected is False
+
+
+def test_builder_selection_lease_blocks_optional_selection_changes() -> None:
+    builder = SimpleNamespace(
+        curr_action_name="Build_Gateway_Screen",
+        func_list=[(70, None, ())],
+        action_list=[],
+        _rtscortex_semantic_action={"name": "Build_Gateway_Screen"},
+    )
+    main_agent = SimpleNamespace(agents={"Builder": builder})
+
+    assert _builder_selection_lease_active(main_agent) is True
+
+    builder.func_list.clear()
+    builder._rtscortex_semantic_action = None
+    builder.curr_action_name = ""
+    assert _builder_selection_lease_active(main_agent) is False
 
 
 def _combat_observation(
@@ -264,12 +338,18 @@ def test_query_mixin_delegates_to_upstream_base_methods() -> None:
     assert agent.action_lists == [[{"name": "translated"}]]
 
 
-def test_broker_times_out_if_an_enabled_agent_never_submits() -> None:
+def test_broker_uses_partial_snapshot_and_late_agent_gets_transport_noop() -> None:
     runtime = FakeRuntime()
     broker = SharedDecisionBroker(
         BridgeCoordinator(runtime),
-        TimeStepExtractor("run-worker", "episode-worker"),
-        decision_timeout_seconds=0.01,
+        TimeStepExtractor(
+            "run-worker",
+            "episode-worker",
+            unit_names={311: "Adept", 59: "Nexus", 104: "Drone"},
+            building_types=(59,),
+        ),
+        decision_timeout_seconds=1.0,
+        participant_grace_seconds=0.001,
     )
     timestep = _fake_timestep()
     first = FakeAgent("AgentA", "A", timestep, broker)
@@ -277,10 +357,14 @@ def test_broker_times_out_if_an_enabled_agent_never_submits() -> None:
     broker.register(first)
     broker.register(second)
 
-    with pytest.raises(RuntimeError, match="shared runtime decision failed"):
-        broker.submit(first, timestep, "only one submission")
+    first_result = broker.submit(first, timestep, "only one submission")
+    late_result = broker.submit(second, timestep, "late submission")
 
-    assert runtime.tick_calls == 0
+    assert runtime.tick_calls == 1
+    assert "<Attack_Unit(0x101480001)>" in first_result
+    assert late_result == "Actions:\n    Team B:\n        <No_Operation()>"
+    assert broker.metrics()["partial_runtime_decisions"] == 1
+    assert broker.metrics()["skipped_runtime_participants"] == 1
 
 
 def test_broker_releases_barrier_when_missing_combat_agent_is_disabled() -> None:
@@ -371,11 +455,13 @@ def test_worker_error_episode_preserves_bridge_counters() -> None:
             "metrics": {
                 "transport_noop_primitives": 4,
                 "unattributed_primitives": 1,
-                "candidate_outside_pysc2_dispatches": 0,
-                "observation_gap_watchdog_triggers": 0,
-                "orchestration_recoveries": 0,
-                "expansion_scout_camera_moves": 0,
-                "expansion_candidate_exhaustions": 0,
+                    "candidate_outside_pysc2_dispatches": 0,
+                    "observation_gap_watchdog_triggers": 0,
+                    "orchestration_recoveries": 0,
+                    "partial_runtime_decisions": 0,
+                    "skipped_runtime_participants": 0,
+                    "expansion_scout_camera_moves": 0,
+                    "expansion_candidate_exhaustions": 0,
             },
             "failure_reason": "RuntimeError: bridge failed",
         }
@@ -420,11 +506,13 @@ def test_worker_max_frame_hook_reports_explicit_truncation() -> None:
             "metrics": {
                 "transport_noop_primitives": 4,
                 "unattributed_primitives": 0,
-                "candidate_outside_pysc2_dispatches": 0,
-                "observation_gap_watchdog_triggers": 0,
-                "orchestration_recoveries": 0,
-                "expansion_scout_camera_moves": 0,
-                "expansion_candidate_exhaustions": 0,
+                    "candidate_outside_pysc2_dispatches": 0,
+                    "observation_gap_watchdog_triggers": 0,
+                    "orchestration_recoveries": 0,
+                    "partial_runtime_decisions": 0,
+                    "skipped_runtime_participants": 0,
+                    "expansion_scout_camera_moves": 0,
+                    "expansion_candidate_exhaustions": 0,
             },
             "failure_reason": "max_agent_steps_reached",
         }
@@ -789,10 +877,18 @@ def test_unavailable_screen_build_reselects_exact_builder(
     assert function_id == 2
     assert function_call.arguments[1] == [45, 52]
     assert agent._rtscortex_build_selection_retries == 1
+    assert agent._rtscortex_build_selection_loop == 224
+    assert agent._wait_for_build_selection(timestep) is True
+
+    next_timestep = _fake_timestep()
+    next_timestep.observation.game_loop = [225]
+    assert agent._wait_for_build_selection(next_timestep) is False
 
     timestep.observation.available_actions.append(57)
+    builder.is_selected = True
     assert agent._reselect_builder_for_unavailable_build(action, timestep) is None
     assert agent._rtscortex_build_selection_retries == 0
+    assert agent._rtscortex_build_selection_loop is None
 
 
 def test_observation_gap_watchdog_latches_lightweight_observations_after_recovery() -> None:
@@ -931,6 +1027,42 @@ def test_observation_gap_watchdog_releases_optional_team_selection_barrier() -> 
     assert grouped.team_unit_tag_list == [0xC]
     assert grouped.team_unit_team_list == ["Zealot-1"]
     assert busy.team_unit_tag_list == []
+
+
+def test_forced_runtime_observation_releases_builder_query_without_faking_selection() -> None:
+    builder_team = {
+        "name": "Probe-1",
+        "select_type": "select",
+        "unit_tags": [0xA],
+        "unit_tags_selected": [],
+    }
+    builder = SimpleNamespace(
+        enable=True,
+        teams=[builder_team],
+        team_unit_tag_list=[],
+        team_unit_team_list=[],
+        _is_waiting_query=lambda: True,
+    )
+    broker = SimpleNamespace(orchestration_recoveries=0)
+    broker.record_orchestration_recovery = lambda: setattr(
+        broker,
+        "orchestration_recoveries",
+        broker.orchestration_recoveries + 1,
+    )
+    main_agent = SimpleNamespace(
+        agents={"Builder": builder},
+        unit_uid_disappear=set(),
+        decision_broker=broker,
+    )
+
+    assert _release_runtime_observation_barrier(
+        main_agent,
+        include_builder=True,
+    ) is True
+    assert builder.team_unit_tag_list == [0xA]
+    assert builder.team_unit_team_list == ["Probe-1"]
+    assert builder_team["unit_tags_selected"] == []
+    assert broker.orchestration_recoveries == 1
 
 
 def test_shared_broker_exposes_pending_planner_state() -> None:
@@ -1139,6 +1271,150 @@ def test_deterministic_gas_rebalance_excludes_reserved_builder_worker() -> None:
     assert selected is True
     assert agent.stop_worker.tag == 20
     assert agent._rtscortex_reserved_worker_tags == {10}
+
+
+def test_gas_worker_controller_executes_bounded_exact_assignment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    functions = SimpleNamespace(
+        llm_pysc2_move_camera=lambda position: SimpleNamespace(
+            function=573,
+            arguments=[position],
+        ),
+        select_point=lambda mode, position: SimpleNamespace(
+            function=2,
+            arguments=[mode, position],
+        ),
+        Harvest_Gather_screen=lambda mode, position: SimpleNamespace(
+            function=264,
+            arguments=[mode, position],
+        ),
+    )
+    real_import = importlib.import_module
+    monkeypatch.setattr(
+        "rtscortex_llm_pysc2.worker.importlib.import_module",
+        lambda name: (
+            SimpleNamespace(FUNCTIONS=functions)
+            if name == "pysc2.lib.actions"
+            else real_import(name)
+        ),
+    )
+    worker_raw = SimpleNamespace(
+        tag=20,
+        x=19.0,
+        y=19.0,
+        alliance=1,
+        is_selected=False,
+        buff_id_0=0,
+    )
+    gas_raw = SimpleNamespace(
+        tag=500,
+        x=20.0,
+        y=20.0,
+        alliance=1,
+        build_progress=100,
+    )
+    builder = SimpleNamespace(
+        unit_tag_list=[10],
+        team_unit_tag_list=[],
+        team_unit_tag_curr=None,
+        teams=[{"unit_tags": [10]}],
+    )
+    main_agent = SimpleNamespace(
+        config=SimpleNamespace(ENABLE_AUTO_WORKER_MANAGE=True),
+        agents={"Builder": builder},
+        nexus_info_dict={
+            "100": {
+                "nexus": SimpleNamespace(tag=100),
+                "gas_building_1": gas_raw,
+                "gas_building_2": None,
+                "worker_g1_tag_list": [],
+                "worker_g2_tag_list": [],
+                "worker_m_tag_list": [10, 20],
+            }
+        },
+        world_x_offset=0,
+        world_y_offset=0,
+        world_range=64,
+    )
+    controller = GasWorkerController(timeout_game_loops=112, primitive_budget=8)
+
+    camera = controller.next_action(
+        main_agent,
+        SimpleNamespace(
+            raw_units=[worker_raw, gas_raw],
+            feature_units=[],
+            available_actions=[2, 264],
+        ),
+        game_loop=100,
+        blocked=False,
+    )
+    assert camera is not None
+    assert camera.function == 573
+    assert controller.assignment is not None
+    assert controller.assignment.worker_tag == 20
+
+    worker_feature = SimpleNamespace(
+        tag=20,
+        x=32,
+        y=32,
+        alliance=1,
+        is_on_screen=True,
+        is_selected=False,
+    )
+    select = controller.next_action(
+        main_agent,
+        SimpleNamespace(
+            raw_units=[worker_raw, gas_raw],
+            feature_units=[worker_feature],
+            available_actions=[2, 264],
+        ),
+        game_loop=108,
+        blocked=False,
+    )
+    assert select is not None
+    assert select.function == 2
+
+    worker_raw.is_selected = True
+    worker_feature.is_selected = True
+    gas_feature = SimpleNamespace(
+        tag=500,
+        x=40,
+        y=40,
+        alliance=1,
+        is_on_screen=True,
+        is_selected=False,
+    )
+    gather = controller.next_action(
+        main_agent,
+        SimpleNamespace(
+            raw_units=[worker_raw, gas_raw],
+            feature_units=[worker_feature, gas_feature],
+            available_actions=[2, 264],
+        ),
+        game_loop=116,
+        blocked=False,
+    )
+    assert gather is not None
+    assert gather.function == 264
+    assert controller.assignment is not None
+    assert controller.assignment.gas_tag == 500
+
+    main_agent.nexus_info_dict["100"]["worker_g1_tag_list"] = [20]
+    assert (
+        controller.next_action(
+            main_agent,
+            SimpleNamespace(
+                raw_units=[worker_raw, gas_raw],
+                feature_units=[worker_feature, gas_feature],
+                available_actions=[2, 264],
+            ),
+            game_loop=124,
+            blocked=False,
+        )
+        is None
+    )
+    assert controller.assignment is None
 
 
 def test_deterministic_gas_rebalance_evicts_builder_already_on_gas() -> None:
@@ -1551,6 +1827,52 @@ def test_actor_selection_retries_abort_only_the_stalled_command() -> None:
     assert agent._rtscortex_semantic_action is None
 
 
+def test_failed_control_group_recall_switches_to_exact_selection_route() -> None:
+    team = {
+        "name": "Zealot-1",
+        "select_type": "group",
+        "game_group": 1,
+        "unit_tags": [0x101],
+        "unit_tags_selected": [0x101],
+        "obs": [object()],
+        "pos": [[1, 1]],
+        "minimap_pos": [[1, 1]],
+    }
+    agent = SimpleNamespace(
+        name="CombatGroup0",
+        teams=[team],
+        team_unit_team_curr="Zealot-1",
+        team_unit_tag_curr=0x101,
+        curr_action_name="Move_Minimap",
+        func_list=[object()],
+        action_list=[object()],
+        last_execution_abort=None,
+        _rtscortex_semantic_action={"name": "Move_Minimap"},
+    )
+    main_agent = SimpleNamespace(
+        _pending_primitive=PrimitiveDispatch(
+            command_id="command-move",
+            function_name="select_control_group",
+            final_primitive=False,
+            origin="orchestration",
+            requested_function_id=4,
+            emitted_function_id=4,
+        ),
+        _pending_primitive_agent=agent,
+        _actor_selection_retry_key=None,
+        _actor_selection_attempts=0,
+    )
+
+    assert _abort_stalled_actor_selection(main_agent) is False
+    assert _abort_stalled_actor_selection(main_agent) is False
+
+    assert team["select_type"] == "select"
+    assert team["_rtscortex_original_select_type"] == "group"
+    assert team["unit_tags_selected"] == []
+    assert team["obs"] == []
+    assert agent.last_execution_abort is None
+
+
 def test_actor_selection_retry_counter_resets_after_translator_primitive() -> None:
     main_agent = SimpleNamespace(
         _pending_primitive=PrimitiveDispatch(
@@ -1847,6 +2169,76 @@ def test_expansion_scout_controller_reports_exhaustion_without_repeating_waypoin
         anchor_available=False,
         blocked=False,
     ) is None
+
+
+def test_expansion_scout_empty_opening_domain_is_not_final_exhaustion() -> None:
+    observation = SimpleNamespace(feature_minimap=SimpleNamespace())
+    controller = ExpansionScoutController(interval_game_loops=16)
+
+    assert controller.next_waypoint(
+        observation,
+        game_loop=0,
+        anchor_available=False,
+        blocked=False,
+    ) is None
+    assert controller.exhausted is False
+    assert controller.visited_waypoints == set()
+
+
+def test_expansion_scout_rejected_camera_keeps_waypoint_eligible() -> None:
+    controller = ExpansionScoutController(interval_game_loops=16)
+    controller.waypoint_queue = ((4, 6),)
+    controller.pending_waypoint = (4, 6)
+    controller.pending_game_loop = 32
+    controller.last_scout_game_loop = 32
+
+    controller.reject_pending_waypoint()
+
+    assert controller.pending_waypoint is None
+    assert controller.pending_game_loop is None
+    assert controller.last_scout_game_loop is None
+    assert controller.visited_waypoints == set()
+
+
+def test_expansion_scout_controller_forces_progress_after_soft_block_deadline() -> None:
+    class Plane(list[list[int]]):
+        @property
+        def shape(self) -> tuple[int, int]:
+            return len(self), len(self[0])
+
+    size = 16
+    observation = SimpleNamespace(
+        feature_minimap=SimpleNamespace(
+            pathable=Plane([[1] * size for _ in range(size)]),
+            player_relative=Plane([[0] * size for _ in range(size)]),
+            visibility_map=Plane([[0] * size for _ in range(size)]),
+        )
+    )
+    controller = ExpansionScoutController(interval_game_loops=16)
+
+    assert controller.next_waypoint(
+        observation,
+        game_loop=100,
+        anchor_available=False,
+        blocked=False,
+        soft_blocked=True,
+    ) is None
+    assert controller.next_waypoint(
+        observation,
+        game_loop=115,
+        anchor_available=False,
+        blocked=False,
+        soft_blocked=True,
+    ) is None
+    forced = controller.next_waypoint(
+        observation,
+        game_loop=116,
+        anchor_available=False,
+        blocked=False,
+        soft_blocked=True,
+    )
+
+    assert forced is not None
 
 
 def test_deterministic_gas_rebalance_respects_effect_and_main_loop_guards() -> None:
@@ -4245,11 +4637,13 @@ def test_candidate_outside_dispatch_counter_is_persisted_and_fails_command(
     assert broker.metrics()["candidate_outside_pysc2_dispatches"] == 0
     assert json.loads(metrics_path.read_text(encoding="utf-8")) == {
         "unattributed_primitives": 0,
-        "candidate_outside_pysc2_dispatches": 0,
-        "observation_gap_watchdog_triggers": 0,
-        "orchestration_recoveries": 0,
-        "expansion_scout_camera_moves": 0,
-        "expansion_candidate_exhaustions": 0,
+            "candidate_outside_pysc2_dispatches": 0,
+            "observation_gap_watchdog_triggers": 0,
+            "orchestration_recoveries": 0,
+            "partial_runtime_decisions": 0,
+            "skipped_runtime_participants": 0,
+            "expansion_scout_camera_moves": 0,
+            "expansion_candidate_exhaustions": 0,
     }
 
     with pytest.raises(RuntimeError, match="outside the current candidate set"):

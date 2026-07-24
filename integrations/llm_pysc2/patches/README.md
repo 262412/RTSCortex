@@ -84,12 +84,20 @@ git -C third_party/LLM-PySC2 apply --check \
   ../../integrations/llm_pysc2/patches/0020-validate-gather-screen-target.patch
 git -C third_party/LLM-PySC2 apply \
   ../../integrations/llm_pysc2/patches/0020-validate-gather-screen-target.patch
+git -C third_party/LLM-PySC2 apply --check \
+  ../../integrations/llm_pysc2/patches/0021-use-clamped-stop-worker-selection.patch
+git -C third_party/LLM-PySC2 apply \
+  ../../integrations/llm_pysc2/patches/0021-use-clamped-stop-worker-selection.patch
 ```
 
 After the live run, restore the clean pinned checkout by reversing exactly these reviewed
 patches in reverse order:
 
 ```bash
+git -C third_party/LLM-PySC2 apply --reverse --check \
+  ../../integrations/llm_pysc2/patches/0021-use-clamped-stop-worker-selection.patch
+git -C third_party/LLM-PySC2 apply --reverse \
+  ../../integrations/llm_pysc2/patches/0021-use-clamped-stop-worker-selection.patch
 git -C third_party/LLM-PySC2 apply --reverse --check \
   ../../integrations/llm_pysc2/patches/0020-validate-gather-screen-target.patch
 git -C third_party/LLM-PySC2 apply --reverse \
@@ -293,7 +301,11 @@ coordinates before upstream automatic team gathering emits `Move_screen`. New un
 join their logical team, but orchestration cannot terminate SC2 with a negative or edge-overflow
 screen target.
 
-CI applies all twenty patches in order under Python 3.9, compiles and imports both projects, and
+`0021-use-clamped-stop-worker-selection.patch` fixes the upstream gas-worker stop chain so the
+clamped feature-screen coordinate is the value passed to `select_point`. Its upper bound is
+`size_screen - 1`, matching PySC2's half-open action-space range.
+
+CI applies all twenty-one patches in order under Python 3.9, compiles and imports both projects, and
 runs `integrations/llm_pysc2/tests/python39_contract_smoke.py`. The smoke locks the v1.1
 candidate mapping, multi-argument translator rejection, Nexus camera-settlement primitive,
 exact Nexus anchor, floating-point resource clearance, visible complete-footprint behavior,

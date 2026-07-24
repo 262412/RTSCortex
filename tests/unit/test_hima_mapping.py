@@ -160,6 +160,7 @@ def test_hima_protoss_a_fixed_outputs_have_expanded_mapping_golden() -> None:
     parser = HIMAProposalParser()
     mapper = HIMAMacroActionMapper()
     effective_counts: Counter[str] = Counter()
+    parser_diagnostics: Counter[str] = Counter()
     evaluated_fixture_ids: list[str] = []
 
     for line in HIMA_PROTOSS_A_OUTPUTS.read_text(encoding="utf-8").splitlines():
@@ -167,17 +168,18 @@ def test_hima_protoss_a_fixed_outputs_have_expanded_mapping_golden() -> None:
         fixture_id = item["fixture_id"]
         evaluated_fixture_ids.append(fixture_id)
         proposal = parser.parse(item["raw_output"])
+        parser_diagnostics.update(diagnostic.code for diagnostic in proposal.diagnostics)
         for assessment in mapper.assess(proposal, fixtures[fixture_id]):
             effective_counts[assessment.classification.value] += assessment.repeat
 
     assert evaluated_fixture_ids == list(fixtures)
     assert effective_counts == {
-        "parse_error": 1,
-        "unsupported_by_runtime": 981,
-        "mapped_future": 587,
+        "unsupported_by_runtime": 985,
+        "mapped_future": 588,
         "mapped_legal_now": 14,
-        "mapped_deferred": 97,
+        "mapped_deferred": 102,
     }
+    assert parser_diagnostics["malformed_action_tail_ignored"] == 1
     assert (
         sum(
             effective_counts[classification]
@@ -189,9 +191,9 @@ def test_hima_protoss_a_fixed_outputs_have_expanded_mapping_golden() -> None:
                 "obsolete",
             )
         )
-        == 698
+        == 704
     )
-    assert sum(effective_counts.values()) == 1_680
+    assert sum(effective_counts.values()) == 1_689
 
 
 def test_mapper_binds_frontier_actor_and_candidate_from_observation() -> None:

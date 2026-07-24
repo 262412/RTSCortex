@@ -26,7 +26,7 @@ from rtscortex.cortex.models import (
     TacticalIntent,
 )
 from rtscortex.progress import GoalProgressReport
-from rtscortex.targeting import living_targetable_enemies
+from rtscortex.targeting import attackable_enemies_for_actor
 
 
 class CandidateCompilationError(ValueError):
@@ -60,10 +60,15 @@ class CandidateCompiler:
             ]
             for action in matching_actions:
                 actors = _candidate_actors(action, intent.actor_scopes)
-                arguments = _candidate_arguments(action, intent, observation)
                 for actor_rank, actor in enumerate(actors):
                     if actor in busy_set:
                         continue
+                    arguments = _candidate_arguments(
+                        action,
+                        intent,
+                        observation,
+                        actor=actor,
+                    )
                     for argument_rank, argument_set in enumerate(arguments):
                         candidate = _build_candidate(
                             observation,
@@ -170,6 +175,8 @@ def _candidate_arguments(
     action: AvailableAction,
     intent: CortexIntent,
     observation: ObservationEnvelope,
+    *,
+    actor: str,
 ) -> list[list[Any]]:
     if not action.argument_names:
         return [[]]
@@ -197,7 +204,7 @@ def _candidate_arguments(
         return candidates
     enemy_by_tag = {
         _normalize_tag(enemy.unit_id): enemy
-        for enemy in living_targetable_enemies(observation.state.visible_enemies)
+        for enemy in attackable_enemies_for_actor(observation, actor)
         if (
             intent.target.unit_type is None
             or enemy.unit_type == intent.target.unit_type
@@ -275,7 +282,7 @@ def _candidate_is_semantically_valid(
     target = _normalize_tag(candidate.arguments[0])
     return target in {
         _normalize_tag(enemy.unit_id)
-        for enemy in living_targetable_enemies(observation.state.visible_enemies)
+        for enemy in attackable_enemies_for_actor(observation, candidate.actor)
     }
 
 

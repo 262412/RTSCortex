@@ -83,7 +83,9 @@ def test_prepare_live_worker_builds_fixed_pysc2_command(tmp_path: Path) -> None:
         "if len(working_place_unit_list) == 0:\n"
         "_rtscortex_force_runtime_decision\n"
         "_rtscortex_accept_visible_team_unit\n"
-        "_rtscortex_validate_gather_target\n",
+        "_rtscortex_validate_gather_target\n"
+        "min(max(0, unit.x), self.size_screen - 1)\n"
+        "select_point('select', (x, y))\n",
         encoding="utf-8",
     )
 
@@ -433,7 +435,9 @@ def _write_worker_patch_sources(project_root: Path) -> None:
         "if len(working_place_unit_list) == 0:\n"
         "_rtscortex_force_runtime_decision\n"
         "_rtscortex_accept_visible_team_unit\n"
-        "_rtscortex_validate_gather_target\n",
+        "_rtscortex_validate_gather_target\n"
+        "min(max(0, unit.x), self.size_screen - 1)\n"
+        "select_point('select', (x, y))\n",
         encoding="utf-8",
     )
 

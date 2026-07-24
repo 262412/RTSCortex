@@ -2,17 +2,24 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
+from collections import defaultdict
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal, cast
 
 from rtscortex.playbook.lifecycle import PlaybookRuleLifecycle
 from rtscortex.playbook.models import (
     PlaybookCondition,
     PlaybookConditionOperator,
     PlaybookRule,
+    PlaybookRuleCategory,
+    PlaybookRuleEffect,
     PlaybookRuleStatus,
+    PlaybookRuleStrength,
 )
 from rtscortex.playbook.store import PlaybookStore
 
@@ -28,6 +35,19 @@ _CONTEXTUAL_FIELDS = {
     "army_readiness",
     "alert",
 }
+_CONSOLIDATION_CONTEXT_FIELDS: tuple[
+    Literal["threat_level", "economy_status", "army_readiness"], ...
+] = ("threat_level", "economy_status", "army_readiness")
+_ConsolidationKey = tuple[
+    PlaybookRuleCategory,
+    PlaybookRuleEffect,
+    tuple[str, ...],
+    tuple[str, ...],
+    str,
+    str,
+    str,
+    str,
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,19 +58,31 @@ class PromotionSweepResult:
     unavailable_run_ids: tuple[str, ...]
     matched_state_count_by_rule: dict[str, int]
     rejected_reason_by_rule: dict[str, str]
+    consolidated_rule_ids: tuple[str, ...] = ()
 
 
 class PlaybookPromotionSweep:
     """Reconstruct exact shadow matches from each rule's own source runs."""
 
-    def __init__(self, store: PlaybookStore, *, run_root: Path | None = None) -> None:
+    def __init__(
+        self,
+        store: PlaybookStore,
+        *,
+        run_root: Path | None = None,
+        run_directories: Mapping[str, Path] | None = None,
+    ) -> None:
         self.store = store
         self.run_root = (
             store.database_path.parent if run_root is None else run_root.expanduser()
         )
+        self.run_directories = {
+            run_id: path.expanduser()
+            for run_id, path in ({} if run_directories is None else run_directories).items()
+        }
         self.lifecycle = PlaybookRuleLifecycle()
 
     def run(self) -> PromotionSweepResult:
+        consolidated = self._consolidate_compatible_candidates()
         candidates = [
             rule
             for rule in self.store.rules()
@@ -113,10 +145,132 @@ class PlaybookPromotionSweep:
             unavailable_run_ids=tuple(sorted(unavailable_runs)),
             matched_state_count_by_rule=matched_counts,
             rejected_reason_by_rule=rejected,
+            consolidated_rule_ids=consolidated,
         )
 
+    def _consolidate_compatible_candidates(self) -> tuple[str, ...]:
+        """Merge fragmented strategic evidence without broadening execution guards."""
+
+        groups: dict[_ConsolidationKey, list[PlaybookRule]] = defaultdict(list)
+        for rule in self.store.rules():
+            if (
+                rule.status is not PlaybookRuleStatus.CANDIDATE
+                or rule.category
+                in {
+                    PlaybookRuleCategory.ENGINE_INVARIANT,
+                    PlaybookRuleCategory.EXECUTION_GUARD,
+                }
+                or rule.contradiction_count
+            ):
+                continue
+            actions = tuple(
+                action
+                for action in rule.action_names
+                if action.strip().casefold() not in {"", "unknown"}
+            )
+            if not actions and not rule.role_ids:
+                continue
+            core = _core_condition_values(rule)
+            if core is None:
+                continue
+            groups[
+                (
+                    rule.category,
+                    rule.effect,
+                    actions,
+                    rule.role_ids,
+                    *core,
+                )
+            ].append(rule)
+
+        consolidated: list[str] = []
+        for key, rules in groups.items():
+            if len(rules) < 2:
+                continue
+            run_ids = tuple(
+                dict.fromkeys(
+                    run_id
+                    for rule in rules
+                    for run_id in rule.source_run_ids
+                )
+            )
+            seeds = tuple(
+                dict.fromkeys(seed for rule in rules for seed in rule.source_seeds)
+            )
+            if len(set(run_ids)) < 2 or len(set(seeds)) < 2:
+                continue
+            contextual_conditions = _consolidated_contextual_conditions(rules)
+            if not contextual_conditions:
+                continue
+            category, effect, actions, roles, agent_race, opponent_race, phase, map_name = key
+            conditions = (
+                PlaybookCondition(field="agent_race", value=str(agent_race)),
+                PlaybookCondition(field="opponent_race", value=str(opponent_race)),
+                PlaybookCondition(field="phase", value=str(phase)),
+                PlaybookCondition(field="map_name", value=str(map_name)),
+                *contextual_conditions,
+            )
+            canonical_payload = "|".join(
+                (
+                    str(category),
+                    str(effect),
+                    *(
+                        f"{condition.field}:{condition.operator.value}:{condition.value}"
+                        for condition in conditions
+                    ),
+                    *(str(action) for action in actions),
+                    *(str(role) for role in roles),
+                )
+            )
+            canonical = hashlib.sha256(canonical_payload.encode()).hexdigest()
+            rule = self.store.upsert_rule(
+                PlaybookRule(
+                    rule_id=f"playbook-rule:{canonical}",
+                    canonical_key=canonical,
+                    category=category,
+                    conditions=conditions,
+                    effect=effect,
+                    strength=PlaybookRuleStrength.ADVISORY,
+                    status=PlaybookRuleStatus.CANDIDATE,
+                    action_names=actions,
+                    role_ids=roles,
+                    confidence=min(rule.confidence for rule in rules),
+                    support_count=len(run_ids),
+                    source_case_ids=tuple(
+                        dict.fromkeys(
+                            case_id
+                            for rule in rules
+                            for case_id in rule.source_case_ids
+                        )
+                    ),
+                    source_run_ids=run_ids,
+                    source_seeds=seeds,
+                    censored_source_run_ids=tuple(
+                        dict.fromkeys(
+                            run_id
+                            for rule in rules
+                            for run_id in rule.censored_source_run_ids
+                        )
+                    ),
+                    censored_source_seeds=tuple(
+                        dict.fromkeys(
+                            seed
+                            for rule in rules
+                            for seed in rule.censored_source_seeds
+                        )
+                    ),
+                    evidence={
+                        "consolidation": "typed_multi_run_strategy",
+                        "source_rule_ids": [rule.rule_id for rule in rules],
+                    },
+                )
+            )
+            consolidated.append(rule.rule_id)
+        return tuple(dict.fromkeys(consolidated))
+
     def _load_situations(self, run_id: str) -> tuple[dict[str, object], ...] | None:
-        database_path = self.run_root / run_id / "events.sqlite3"
+        run_directory = self.run_directories.get(run_id, self.run_root / run_id)
+        database_path = run_directory / "events.sqlite3"
         if not database_path.is_file():
             sibling_path = self.run_root / f"{run_id}.sqlite3"
             if not sibling_path.is_file():
@@ -189,3 +343,51 @@ def _matches(condition: PlaybookCondition, state: dict[str, object]) -> bool:
             and actual <= expected
         )
     return False
+
+
+def _core_condition_values(
+    rule: PlaybookRule,
+) -> tuple[str, str, str, str] | None:
+    values: dict[str, object] = {
+        condition.field: condition.value
+        for condition in rule.conditions
+        if condition.operator is PlaybookConditionOperator.EQ
+    }
+    core = tuple(
+        values.get(field)
+        for field in ("agent_race", "opponent_race", "phase", "map_name")
+    )
+    if not all(isinstance(value, str) for value in core):
+        return None
+    return cast(tuple[str, str, str, str], core)
+
+
+def _consolidated_contextual_conditions(
+    rules: list[PlaybookRule],
+) -> tuple[PlaybookCondition, ...]:
+    conditions: list[PlaybookCondition] = []
+    for field in _CONSOLIDATION_CONTEXT_FIELDS:
+        values = tuple(
+            dict.fromkeys(
+                str(condition.value)
+                for rule in rules
+                for condition in rule.conditions
+                if condition.field == field
+                and condition.operator is PlaybookConditionOperator.EQ
+                and isinstance(condition.value, str)
+            )
+        )
+        if not values:
+            continue
+        conditions.append(
+            PlaybookCondition(
+                field=field,
+                operator=(
+                    PlaybookConditionOperator.EQ
+                    if len(values) == 1
+                    else PlaybookConditionOperator.IN
+                ),
+                value=values[0] if len(values) == 1 else values,
+            )
+        )
+    return tuple(conditions)

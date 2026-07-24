@@ -1,0 +1,13 @@
+diff --git a/llm_pysc2/agents/main_agent_funcs.py b/llm_pysc2/agents/main_agent_funcs.py
+--- a/llm_pysc2/agents/main_agent_funcs.py
++++ b/llm_pysc2/agents/main_agent_funcs.py
+@@ -1014,7 +1014,7 @@ def main_agent_func2(self, obs):
+               for unit in get_feature_unit_list_of_tags(obs, self.stop_worker.tag):
+                 if unit.tag == self.stop_worker.tag:
+-                  x, y = min(max(0, unit.x), self.size_screen), min(max(0, unit.y), self.size_screen)
+-                  func_id, func_call = (2, actions.FUNCTIONS.select_point('select', (unit.x, unit.y)))
++                  x, y = min(max(0, unit.x), self.size_screen - 1), min(max(0, unit.y), self.size_screen - 1)
++                  func_id, func_call = (2, actions.FUNCTIONS.select_point('select', (x, y)))
+                   logger.info(f"[ID {self.log_id}] 4.2.4 Func Call: {func_call}, stop worker at {self.stop_worker_at}")
+                   self.func_id_history.append(func_id)
+                   return func_call

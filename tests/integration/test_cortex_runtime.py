@@ -1061,6 +1061,68 @@ def test_gas_blocked_stargate_uses_legal_zealot_fallback(tmp_path: Path) -> None
     asyncio.run(exercise())
 
 
+def test_gas_blocked_stargate_builds_second_assimilator_before_unit_fallback(
+    tmp_path: Path,
+) -> None:
+    runtime = CortexRuntimeEngine(
+        config=_config(tmp_path),
+        store=_store(tmp_path),
+        provider=FakeProvider(),
+        macro_client=_FakeMacroClient("Actions: ['Stargate', 'Zealot']"),
+    )
+    observation = ObservationEnvelope(
+        run_id="cortex-run",
+        episode_id="episode-1",
+        step_id=0,
+        game_loop=0,
+        state=SC2State(
+            economy=EconomyState(
+                minerals=500,
+                vespene=0,
+                supply_used=20,
+                supply_cap=31,
+                workers=22,
+            ),
+            own_structures=[
+                UnitState(unit_id="0x1", unit_type="Nexus", alliance="self"),
+                UnitState(unit_id="0x2", unit_type="Assimilator", alliance="self"),
+                UnitState(unit_id="0x3", unit_type="CyberneticsCore", alliance="self"),
+            ],
+        ),
+        available_actions=[
+            AvailableAction(
+                name="Build_Assimilator_Near",
+                argument_names=["tag"],
+                argument_types=[ActionArgumentType.TAG],
+                actor_scopes=["Builder/Probe-1"],
+                argument_candidates=[["0x99"]],
+            ),
+            AvailableAction(
+                name="Train_Zealot",
+                actor_scopes=["Developer/Empty"],
+                argument_candidates=None,
+            ),
+        ],
+    )
+
+    async def exercise() -> None:
+        await runtime.start()
+        await runtime.tick(observation)
+        for _ in range(5):
+            await asyncio.sleep(0)
+        batch = await runtime.tick(observation.model_copy(update={"step_id": 1, "game_loop": 1}))
+
+        assert [command.name for command in batch.commands] == ["Build_Assimilator_Near"]
+        preemptions = runtime.store.events_of_type(
+            "cortex-run", "episode-1", "macro_frontier_preempted"
+        )
+        assert preemptions[-1].payload["reason"] == "prerequisite_closure"
+        assert preemptions[-1].payload["blocked_reason"] == "insufficient_vespene"
+        await runtime.close()
+
+    asyncio.run(exercise())
+
+
 def test_terran_gas_blocked_addon_builds_first_refinery(tmp_path: Path) -> None:
     base = _config(tmp_path)
     config = base.model_copy(
@@ -1501,6 +1563,9 @@ def test_expansion_candidate_exhaustion_terminalizes_active_commitment(
         )
         await runtime.tick(exhausted)
         assert runtime._expansion_commitment_id is None
+        assert runtime._macro_proposal is not None
+        runtime._ensure_expansion_commitment(runtime._macro_proposal, exhausted)
+        assert runtime._expansion_commitment_id is None
         await runtime.close()
 
     asyncio.run(exercise())
@@ -1511,6 +1576,72 @@ def test_expansion_candidate_exhaustion_terminalizes_active_commitment(
     )
     assert len(terminal) == 1
     assert terminal[0].payload["terminal_state"] == "expansion_candidates_exhausted"
+    recovered.close()
+
+
+def test_episode_end_records_unattempted_expansion_commitment_root_cause(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    runtime = CortexRuntimeEngine(
+        config=_config(tmp_path),
+        store=store,
+        provider=FakeProvider(),
+        macro_client=_FakeMacroClient("Actions: ['Nexus']"),
+    )
+    observation = ObservationEnvelope(
+        run_id="cortex-run",
+        episode_id="episode-1",
+        step_id=0,
+        game_loop=0,
+        state=SC2State(
+            economy=EconomyState(
+                minerals=500,
+                supply_used=12,
+                supply_cap=23,
+                workers=12,
+            ),
+            own_structures=[UnitState(unit_id="0x1", unit_type="Nexus", alliance="self")],
+        ),
+        available_actions=[],
+    )
+
+    async def exercise() -> None:
+        await runtime.start()
+        await runtime.tick(observation)
+        for _ in range(5):
+            await asyncio.sleep(0)
+        await runtime.tick(observation.model_copy(update={"step_id": 1, "game_loop": 1}))
+        assert runtime._expansion_commitment_id is not None
+        runtime.end_episode(
+            EpisodeResult(
+                run_id=observation.run_id,
+                episode_id=observation.episode_id,
+                scenario="Simple64",
+                seed=0,
+                outcome=EpisodeOutcome.TRUNCATED,
+                steps=100,
+                failure_reason="test terminal",
+            )
+        )
+        await runtime.close()
+
+    asyncio.run(exercise())
+
+    recovered = _store(tmp_path)
+    terminal = recovered.events_of_type(
+        "cortex-run", "episode-1", "expansion_commitment_terminal"
+    )
+    assert terminal[-1].payload["terminal_state"] == "strategic_cancellation"
+    assert terminal[-1].payload["evaluated_anchors"] == [
+        {
+            "commitment_id": terminal[-1].payload["commitment_id"],
+            "command_id": None,
+            "anchor": None,
+            "failure_code": "no_expansion_anchor_evaluated",
+            "game_loop": 100,
+        }
+    ]
     recovered.close()
 
 

@@ -13,7 +13,10 @@ from rtscortex.contracts import (
     AvailableAction,
     ObservationEnvelope,
 )
-from rtscortex.targeting import current_screen_enemy_targets, living_targetable_enemies
+from rtscortex.targeting import (
+    attackable_enemies_for_actor,
+    living_targetable_enemies,
+)
 
 
 class ActionArbiter:
@@ -269,7 +272,11 @@ def _attack_invariant_failure(
     target = _normalize_tag(command.arguments[0])
     enemy_ids = {
         _normalize_tag(enemy.unit_id)
-        for enemy in current_screen_enemy_targets(observation)
+        for enemy in attackable_enemies_for_actor(
+            observation,
+            command.actor,
+            current_screen_only=False,
+        )
     }
     if target in enemy_ids:
         return None
@@ -277,7 +284,19 @@ def _attack_invariant_failure(
         _normalize_tag(unit.unit_id)
         for unit in [*observation.state.own_units, *observation.state.own_structures]
     }
-    reason = "friendly_target" if target in own_ids else "target_not_visible"
+    visible_enemy_ids = {
+        _normalize_tag(enemy.unit_id)
+        for enemy in living_targetable_enemies(observation.state.visible_enemies)
+    }
+    reason = (
+        "friendly_target"
+        if target in own_ids
+        else (
+            "target_not_attackable_by_actor"
+            if target in visible_enemy_ids
+            else "target_not_visible"
+        )
+    )
     return _ActionFailure(reason)
 
 

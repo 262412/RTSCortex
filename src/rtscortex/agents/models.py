@@ -17,6 +17,7 @@ from pydantic import (
 )
 
 from rtscortex.contracts import ActionArgumentType, AvailableAction, ObservationEnvelope
+from rtscortex.targeting import attackable_enemies_for_actor
 
 
 class AgentOutput(BaseModel):
@@ -64,32 +65,32 @@ def project_planning_observation(observation: ObservationEnvelope) -> Observatio
         for structure in state.own_structures
     )
 
-    enemy_ids = list(
-        dict.fromkeys(_normalize_tag(enemy.unit_id) for enemy in state.visible_enemies)
-    )[:8]
     available_actions: list[AvailableAction] = []
     for action in observation.available_actions:
         if action.name == "No_Operation":
             continue
         if action.name == "Attack_Unit":
             actor_scopes = [actor for actor in action.actor_scopes if _is_combat_actor(actor)]
-            if not enemy_ids or not actor_scopes:
-                continue
-            enemy_id_set = set(enemy_ids)
-            candidates = action.argument_candidates or []
-            candidates = [
-                candidate
-                for candidate in candidates
-                if candidate and _normalize_tag(candidate[0]) in enemy_id_set
-            ][:8]
-            if not candidates:
-                continue
-            action = action.model_copy(
-                update={
-                    "actor_scopes": actor_scopes,
-                    "argument_candidates": candidates,
+            for actor in actor_scopes:
+                enemy_ids = {
+                    _normalize_tag(enemy.unit_id)
+                    for enemy in attackable_enemies_for_actor(observation, actor)
                 }
-            )
+                candidates = [
+                    candidate
+                    for candidate in action.argument_candidates or []
+                    if candidate and _normalize_tag(candidate[0]) in enemy_ids
+                ][:8]
+                if candidates:
+                    available_actions.append(
+                        action.model_copy(
+                            update={
+                                "actor_scopes": [actor],
+                                "argument_candidates": candidates,
+                            }
+                        )
+                    )
+            continue
         elif _requires_argument_candidates(action) and not action.argument_candidates:
             continue
         if (

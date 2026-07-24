@@ -1,334 +1,315 @@
 # Protoss natural-terminal regression issue register
 
-Status date: 2026-07-23
+Status date: 2026-07-24
 
-This register captures the open issues confirmed by the active Arbiter and active
-CortexPlaybook Protoss natural-terminal regression on `Simple64`, Protoss versus
-VeryEasy Zerg, seeds `0`, `1`, and `2`.
+This register contains only defects that remain open after the Slurm L40S
+regression:
 
-The three reference runs are:
+`protoss-fixed-natural-terminal-slurm-20260724T132144Z`
 
-| Seed | Run | Outcome | Steps |
-|---|---|---|---:|
-| 0 | `cortex-20260723T124530418998Z-1a0f8182` | draw | 39,599 |
-| 1 | `cortex-20260723T140755995764Z-a0f2f53e` | defeat | 36,146 |
-| 2 | `cortex-20260723T151245469240Z-6001d742` | defeat | 31,749 |
+The run used the active Arbiter, an identical frozen Playbook baseline for each
+seed, the HIMA Protoss a/b/c Ensemble, and `Simple64` Protoss versus VeryEasy
+Zerg. There was no step limit.
 
-All three runs reached a natural SC2 terminal result without a Runtime crash.
-Command lineage, terminal-report conservation, build verification, and production
-verification remained intact. The issues below are therefore open gameplay-control
-and strategic-control defects, not a claim that the Bridge is generally unstable.
+| Seed | Run | Outcome | Steps | Meaningful success | Decisive observation |
+|---|---|---|---:|---:|---|
+| 0 | `cortex-20260724T132440635925Z-558d83b0` | defeat | 18,302 | 56/76, 73.7% | no expansion; only one attack produced damage |
+| 1 | `cortex-20260724T140514321274Z-7c0d4a6f` | error | 197 | 39/42, 92.9% | out-of-range `select_point [2, -85]` terminated PySC2 |
+| 2 | `cortex-20260724T141454658563Z-a693a4f7` | defeat | 26,938 | 96/128, 75.0% | 38 peak army supply, but 21 of 23 attacks failed |
+
+The two valid natural-terminal episodes produced 152 successes from 204
+meaningful commands (74.5%). Both were defeats.
 
 ## Open issues
 
-### SCX-PT-001: Protoss worker production and gas economy do not sustain growth
+### SCX-PT-014: orchestration can emit an out-of-range feature action and crash the episode
 
 - **Priority:** P0
-- **Status:** implemented; natural-terminal acceptance pending
-- **Components:** EconomyAgent, Protoss economy controller, Worker integration
-- **Observed behavior:** all three runs reached a maximum of only 13 workers.
-  The upstream automatic worker-training path emitted only one
-  `Train_Probe_quick` action per run. Maximum stored vespene was only 48, 104,
-  and 36 for seeds 0, 1, and 2.
-- **Impact:** HIMA marks `TRAIN PROBE` as `managed_automatically`, but the
-  automatic path does not provide the economy assumed by the Race Brain.
-  Stargate requires 150 vespene, so no run built a Stargate or produced an
-  anti-air Stargate unit.
-- **Root-cause hypothesis:** RTSCortex delegates worker production to an
-  opportunistic upstream automation path that has no persistent target, command
-  lifecycle, or production-effect contract. Gas assignment also cannot overcome
-  the resulting worker shortage.
-- **Required correction:** make worker production and mineral/gas saturation an
-  RTSCortex-owned EconomyAgent controller with tracked commands and effect
-  verification. `managed_automatically` must mean managed by this controller,
-  not silently delegated to an unverified side path.
-- **Acceptance criteria:**
-  - every worker-production attempt has command lineage and one terminal effect;
-  - all three seeds reach at least 28 workers by 10 game minutes when a base is
-    alive and worker production is not under an emergency hold;
-  - completed Assimilators converge toward their configured worker saturation;
-  - a committed Stargate plan can reserve and accumulate at least 150 vespene
-    instead of having its gas consumed by lower-priority fallback actions.
+- **Status:** implementation complete; live three-seed verification pending
+- **Components:** automatic worker management, Worker primitive safety,
+  PySC2 boundary
+- **Evidence:**
+  - seed 1 terminated at step 197 with:
 
-### SCX-PT-002: Strict macro frontier blocks tech and permits structure oversaturation
+    ```text
+    ValueError: Argument is out of range for 2/select_point
+    got: [[SelectPointAct.select], [2, -85]]
+    ```
+
+  - the action was not a Runtime candidate and therefore did not increment
+    `candidate_outside_pysc2_dispatches`;
+  - immediately before termination the Worker was still producing valid
+    Runtime decisions and execution reports;
+  - upstream `main_agent_funcs.py` computes bounded `x, y` for `stop_worker`
+    selection but calls `select_point` with the original `unit.x, unit.y`.
+- **Impact:** a single optional automatic-worker orchestration primitive can
+  bypass the Candidate/Validator boundary and terminate an otherwise healthy
+  SC2 process.
+- **Confirmed root cause:** Runtime semantic actions are validated before
+  dispatch, but orchestration actions returned by upstream `main_agent_func*`
+  do not pass through one final feature-action argument validator. The
+  `stop_worker` path contains a direct variable-use defect: its clamped
+  coordinates are discarded. PySC2 detects the invalid coordinate only inside
+  `features.transform_action()`, where recovery is no longer possible.
+- **Required correction:**
+  1. fix the `stop_worker` selection patch to use the bounded coordinate;
+  2. add one Worker-owned final primitive validator for every origin,
+     including translator, orchestration, gas management, expansion scouting,
+     camera, and automatic worker management;
+  3. validate every point/rectangle/minimap coordinate and discrete enum
+     against the active action specification;
+  4. replace an invalid orchestration primitive with transport NoOp, clear its
+     bounded chain, and record a structured recovery;
+  5. keep an invalid translator primitive as a terminal command failure rather
+     than silently clamping semantic intent.
+- **Acceptance criteria:**
+  - negative, NaN, and over-bound screen/minimap coordinates never reach
+    `SC2Env.step()`;
+  - the recorded seed 1 `[2, -85]` fixture produces recovery without process
+    exit;
+  - orchestration recovery cannot claim or complete a Runtime command;
+  - seeds `[0,1,2]` have zero feature-action range exceptions.
+
+### SCX-PT-015: targetability is not actor-specific, so ground units attack air units
 
 - **Priority:** P0
-- **Status:** implemented; natural-terminal acceptance pending
-- **Components:** HIMA MacroPlan compiler, GoalProgress, Economy/Technology/Production roles
-- **Observed behavior:** HIMA repeatedly proposed Stargate and air-unit
-  transitions, but all three runs built zero Stargates. Seed 0 successfully
-  issued eight Cybernetics Core builds, fourteen Shield Battery builds, and
-  fourteen Pylon builds while still ending with one Nexus and two Gateways.
-- **Impact:** model knowledge does not become a viable composition. A blocked
-  expansion or gas-dependent frontier can hold back independent technology,
-  while newly accepted plans can restart already-satisfied structure goals.
-- **Root-cause hypothesis:** the current ordered frontier behaves too much like
-  a strict sequence. It lacks a partial dependency graph, durable strategic
-  commitments, and global structure-saturation/obsolete checks across plans.
-- **Required correction:** compile macro proposals into partially ordered
-  economy, supply, technology, production, and expansion commitments. A blocked
-  Nexus must not block an independently legal Cybernetics Core or Stargate.
-  Global state, rather than the current plan instance, must determine whether a
-  tech or production structure is already sufficient.
+- **Status:** implementation complete; live three-seed verification pending
+- **Components:** Situation target facts, Tactical Agent, Candidate generation,
+  Validator, CombatEffectVerifier
+- **Evidence:**
+  - seed 2 dispatched 23 `Attack_Unit` commands but only one damaged a target;
+  - Adepts repeatedly targeted an Overseer and Mutalisks;
+  - Zealots also targeted a Mutalisk and an Overseer;
+  - seed 2 recorded 16 `combat_effect_not_observed` and five
+    `combat_target_lost` failures;
+  - seed 0 repeated the same defect against an Overseer.
+- **Impact:** the Tactical layer can spend most combat windows issuing
+  mechanically impossible attacks while a large army remains ineffective.
+- **Confirmed root cause:** `living_targetable_enemies` currently means
+  living, enemy, and feature-visible. It does not include the selected actor's
+  weapon target domain. Candidate and Validator share the same enemy tag set,
+  so neither distinguishes `ground`, `air`, and `both`. The final upstream
+  alliance check prevents friendly fire but cannot reject a legal enemy that
+  the actor cannot damage.
+- **Required correction:**
+  1. add RaceProfile combat capability metadata for each controlled unit type;
+  2. derive `attackable_enemies_for_actor(actor)` from living enemy movement
+     domain and actor weapon domain;
+  3. use this exact set in Tactical selection, `argument_candidates`, dynamic
+     schema, Candidate compilation, and Runtime validation;
+  4. reject stale or domain-incompatible targets as
+     `target_not_attackable_by_actor` before Bridge dispatch;
+  5. keep CombatEffectVerifier as a final effect check, not the first place an
+     impossible pairing is detected.
 - **Acceptance criteria:**
-  - an invalid expansion candidate cannot block an otherwise viable tech path;
-  - unique or saturation-limited structures are marked obsolete across plan
-    revisions when their global target is already satisfied;
-  - repeated HIMA plans do not produce redundant Cybernetics Core construction
-    without an explicit validated capacity reason;
-  - every committed tech transition records why it completed, remained
-    deferred, was superseded, or was abandoned.
+  - Zealot and Adept candidates contain no flying unit tags;
+  - Phoenix or other anti-air actors can receive air targets when enabled;
+  - actor-domain validation is identical for Planner, Tactical, Reflex, and
+    replay;
+  - domain-incompatible attacks entering Bridge equal zero.
 
-### SCX-PT-003: Expansion fallback suppresses a bad anchor but does not close the search
+### SCX-PT-016: offense navigation never closes into enemy-structure destruction
 
 - **Priority:** P0
-- **Status:** implemented; natural-terminal acceptance pending
-- **Components:** expansion scouting controller, persistent world anchors, Builder
-- **Observed behavior:** seed 0 tried one persistent expansion anchor, received
-  `invalid_expansion_anchor`, and did not retry that same anchor. It also did not
-  build a Nexus or emit expansion-candidate exhaustion. Seed 1 built one Nexus;
-  seed 2 did not dispatch an expansion. Each run recorded only two expansion
-  scout camera moves.
-- **Impact:** permanent bad-anchor suppression works, but the expansion
-  commitment can disappear without either success or a structured terminal
-  explanation.
-- **Root-cause hypothesis:** invalidation advances local anchor state, but no
-  controller-owned state machine keeps the expansion objective alive while it
-  scouts and evaluates the remaining resource clusters.
-- **Required correction:** persist expansion commitments and iterate stable
-  resource-cluster candidates until a Nexus is confirmed or the candidate set
-  is explicitly exhausted.
+- **Status:** implementation complete; live three-seed verification pending
+- **Components:** Offense Agent, actor-local navigation, enemy memory,
+  structure targeting
+- **Evidence:**
+  - neither valid long episode confirmed damage to an enemy structure;
+  - seed 2 reached 38 peak army supply but still lost without converting that
+    army into base damage;
+  - successful movements repeatedly targeted the same nearby minimap points,
+    especially `[39,47]` and `[41,46]`;
+  - after unit targets disappeared, the agent alternated between waypoint
+    movement and reacquisition instead of selecting an enemy building;
+  - the post-game attributor recorded `advantage_not_converted` in seed 2.
+- **Impact:** production can succeed and an army can cross the map, yet the
+  system cannot complete the objective that ends a melee game.
+- **Confirmed root cause:** the actor-local state machine tracks movement and
+  current unit targets, but `last-known enemy structure` is used primarily as a
+  navigation point. Arrival does not create a structure-search substate with a
+  bounded camera sweep, target selection, attack confirmation, and waypoint
+  retirement. Repeated waypoints remain eligible because successful one-tile
+  displacement is treated as progress even when the group has not closed on
+  the strategic target.
+- **Required correction:**
+  1. calculate navigation from the complete combat-group centroid;
+  2. add explicit `travelling -> arrived -> searching -> attacking_structure
+     -> cleared/failed` states per actor;
+  3. retire a waypoint on arrival, repeated no-progress, timeout, or confirmed
+     absence;
+  4. preserve last-known living enemy structures separately from transient
+     enemy units;
+  5. after arrival, perform a bounded local search and emit an actor-compatible
+     structure attack;
+  6. use CombatEffectVerifier evidence to mark the structure damaged,
+     destroyed, lost, or stale before selecting the next waypoint.
 - **Acceptance criteria:**
-  - one expansion commitment terminates in exactly one of
-    `nexus_effect_confirmed`, `expansion_candidates_exhausted`, or an explicit
-    strategic cancellation;
-  - an invalid anchor is never dispatched again in the same episode;
-  - the next untried cluster is actively scouted without requiring it to be
-    accidentally visible;
-  - exhaustion records every evaluated anchor and rejection reason.
+  - repeated no-progress waypoint loops are zero;
+  - an army with no living unit target searches for and attacks a reachable
+    enemy structure;
+  - each waypoint reaches one explicit terminal state;
+  - a deterministic structure-search fixture produces a confirmed building
+    attack lifecycle.
 
-### SCX-PT-004: Combat target failures are retried without actor-local quarantine
+### SCX-PT-017: expansion commitment terminates before scouting can populate its anchor queue
 
 - **Priority:** P0
-- **Status:** implemented; natural-terminal acceptance pending
-- **Components:** FocusFireAgent, CombatEffectVerifier, PlaybookCandidateGuard
-- **Observed behavior:** seed 2 dispatched 92 `Attack_Unit` commands: 8
-  succeeded, 55 ended with `combat_effect_not_observed`, 26 with
-  `combat_target_lost`, 2 with `target_not_visible`, and 1 was cancelled at
-  episode end. Target `0x100940002` was selected 29 times, including 28
-  `combat_effect_not_observed` results.
-- **Impact:** the effect verifier correctly rejects unproven attacks, but the
-  tactical controller converts those failures into a retry storm instead of
-  learning that the actor/target pairing is temporarily ineffective.
-- **Root-cause hypothesis:** target reacquisition does not maintain an
-  actor-local negative cache keyed by target, failure class, and observation
-  time. A soft Playbook delta of `-0.5` is also too small to displace the only
-  available focus-fire candidate.
-- **Required correction:** add failure-counted target quarantine, cooldown,
-  capability checks, and forced reacquisition. Playbook rules should refine
-  this deterministic state machine, not compensate for its absence.
+- **Status:** implementation complete; live three-seed verification pending
+- **Components:** ExpansionScoutController, persistent world anchors, Runtime
+  expansion commitment, Nexus translator
+- **Evidence:**
+  - seeds 0 and 2 never exceeded one Nexus;
+  - each commitment terminated near the opening with
+    `expansion_candidates_exhausted` and `evaluated_anchors=[]`;
+  - later in both games, two anchors were attempted outside the original
+    commitment;
+  - one anchor had no complete footprint with resource clearance and the next
+    could not be found on the current screen;
+  - the Worker reported seven/eight exhaustion alerts despite only three scout
+    camera moves.
+- **Impact:** the HIMA expansion objective is declared exhausted before active
+  scouting has discovered and evaluated the map's candidate resource clusters.
+- **Confirmed root cause:** the Runtime commitment and Worker scout have
+  separate lifecycles. An empty initial persistent-anchor cache is interpreted
+  as final exhaustion, while later discoveries can still be surfaced as
+  stateless `Build_Nexus_Near` candidates. The episode exhaustion latch then
+  prevents a coherent commitment from reopening. Anchor identity is also
+  resource-unit based, while final Nexus placement requires a persistent world
+  cluster plus a legal 5x5 center.
+- **Required correction:**
+  1. make the commitment own the scout waypoint queue, discovered resource
+     clusters, rejected anchors, and placement candidates;
+  2. distinguish `not_discovered_yet`, `search_in_progress`, and
+     `all_candidates_exhausted`;
+  3. persist cluster world bounds and ideal Nexus center, not only a currently
+     visible resource tag;
+  4. after invalidation, permanently suppress that candidate and immediately
+     advance to the next unseen cluster;
+  5. terminate only after all bounded scout waypoints have been visited and
+     every discovered cluster has a terminal placement result.
 - **Acceptance criteria:**
-  - the same actor/target pair cannot receive more than the configured bounded
-    retries during one cooldown window;
-  - `combat_effect_not_observed`, lost visibility, death, and attackability
-    changes produce distinct target-state transitions;
-  - when no current unit target is viable, Offense searches a structure or
-    requests a composition capable of attacking the remaining enemy;
-  - deterministic replay produces no unbounded repeated-target sequence.
+  - an empty opening cache cannot produce final exhaustion;
+  - every expansion attempt is represented inside one commitment;
+  - an invalid candidate is dispatched at most once;
+  - the commitment ends with a confirmed Nexus or proof that all scout
+    waypoints and clusters were exhausted;
+  - at least one of seeds `[0,1,2]` builds a second Nexus on Simple64.
 
-### SCX-PT-005: Terminal collapse is misclassified as technology or production
+### SCX-PT-018: Builder selection drifts between observation and translator execution
 
 - **Priority:** P1
-- **Status:** implemented and covered by deterministic regression
-- **Components:** Situation Intelligence v2, phase classifier
-- **Observed behavior:** seed 1 ended with zero bases, zero army supply, and four
-  Probes but was classified as `technology`. Seed 2 ended with zero bases, zero
-  army supply, and six Probes but was classified as `production`.
-- **Impact:** role agents and Playbook conditions receive a normal macro phase
-  while the player is in a last-stand or elimination state.
-- **Root-cause hypothesis:** phase selection is primarily driven by surviving
-  production/tech structure types and does not give terminal military/economic
-  collapse precedence.
-- **Required correction:** introduce a deterministic crisis/last-stand override,
-  or map the same evidence to a combat emergency, before normal early,
-  technology, and production classification.
+- **Status:** implementation complete; live three-seed verification pending
+- **Components:** Builder ownership, action availability, translator chain,
+  build effect verification
+- **Evidence:**
+  - seed 0 emitted six consecutive Gateway failures at the same screen
+    coordinate with `function Build_Gateway_screen is not available`;
+  - the immediately preceding Runtime observations exposed
+    `Build_Gateway_Screen` as available for the Builder;
+  - seed 2 had one accepted Pylon whose expected target was not created and two
+    accepted Assimilator actions with no observed build order;
+  - seed 0 build pre-dispatch rejection was 10.5%; seed 2 was 7.4%.
+- **Impact:** valid macro objectives are repeatedly lost to selection-state
+  races, and the same failed signature can consume consecutive planning
+  windows.
+- **Confirmed root cause:** candidate availability is sampled from a fresh
+  selected-Builder observation, but upstream automatic management and
+  multi-agent orchestration can change feature selection before the final
+  build primitive. The current bounded reselection is not an ownership lease:
+  it does not prove that the exact Builder remains selected immediately before
+  the final primitive. Failure deduplication is command-ID based, so a new plan
+  can recreate the same action, coordinate, and failure.
+- **Required correction:**
+  1. create a Builder selection lease keyed by builder tag, semantic action,
+     target, and observation loop;
+  2. block optional selection-changing orchestration while the lease is active;
+  3. require exact selected-tag evidence on the observation immediately before
+     the build primitive;
+  4. revalidate function availability and placement after that evidence;
+  5. on failure, clear the chain and apply signature-scoped backoff until state
+     or candidate changes;
+  6. keep resource/order changes as diagnostics only.
 - **Acceptance criteria:**
-  - zero town halls plus a visible living enemy can never be classified as a
-    normal technology or production phase;
-  - the phase fact records the collapse evidence and confidence;
-  - Defense, Retreat, Economy, and Arbiter behavior for the crisis state has
-    deterministic tests.
+  - `observation available -> translator unavailable` mismatches equal zero;
+  - the same failed build signature is not dispatched repeatedly without state
+    change;
+  - build pre-dispatch rejection is at most 5%;
+  - build effect confirmed rate is at least 90%.
 
-### SCX-PT-006: Threat level remains low through most active combat
+### SCX-PT-019: active Playbook scoring ignores recent terminal failure
 
-- **Priority:** P0
-- **Status:** implemented and reference-journal replay validated; live acceptance pending
-- **Components:** Situation Intelligence v2, threat classifier, Live Console
-- **Observed behavior:** no run emitted a `high` threat assessment. The
-  distributions were:
-
-  | Seed | none | low | high | critical |
-  |---|---:|---:|---:|---:|
-  | 0 | 225 | 1,449 | 0 | 2 |
-  | 1 | 263 | 1,272 | 0 | 1 |
-  | 2 | 370 | 988 | 0 | 6 |
-
-  The rare `critical` values coincide with sparse `unit_under_attack` or
-  `building_under_attack` alerts. The next observations fall back to `low` even
-  while contact or base destruction continues.
-- **Impact:** Defense, Retreat, Race Brain coordination, Arbiter emergency
-  preemption, Playbook matching, post-game threat attribution, and the Live
-  Console all receive a systematically understated battle state.
-- **Confirmed root cause:** `_threat_level()` currently uses only the count of
-  visible living enemies and a one-observation `under_attack` boolean. Without
-  an alert, every non-empty enemy force is `low`, regardless of distance, army
-  value, base proximity, damage, losses, attackability, or ongoing combat.
-  There is no hysteresis or persistent threat episode.
-- **Required correction:** replace the count-only rule with a stateful,
-  evidence-based threat assessment. Inputs must include:
-  - explicit attack alerts and recent damage/loss deltas;
-  - nearest threat distance/ETA and proximity to bases, workers, and production;
-  - enemy-versus-own combat value and air/ground capability mismatch;
-  - army engagement/readiness and base/army collapse;
-  - last positive threat evidence with hysteresis and a clear-resolution rule.
+- **Priority:** P1
+- **Status:** implementation complete; live three-seed verification pending
+- **Components:** PlaybookIntentGuard, PlaybookCandidateGuard, terminal
+  feedback, rule specificity
+- **Evidence:**
+  - seed 0 recorded 73 non-zero rule applications and seed 2 recorded eight;
+  - one soft role rule rewarded production candidates 62 times in seed 0,
+    including `Build_Gateway_Screen` 48 times;
+  - six identical Gateway translator failures occurred while that broad rule
+    continued to add `+0.5`;
+  - no Playbook application blocked a candidate;
+  - seed 0 still ended with `production_imbalance`.
+- **Impact:** CortexPlaybook now changes decisions, but it can reinforce a
+  repeatedly failing action because its strategic preference is not combined
+  with recent execution evidence.
+- **Confirmed root cause:** soft rules are matched against Situation and
+  candidate/role fields only. The Guard has no typed recent-terminal context
+  keyed by action, actor, target, failure stage, and failure code. Role-only
+  `prefer production` rules are consequently applied to every production
+  candidate, even when the exact candidate just failed mechanically.
+- **Required correction:**
+  1. maintain a bounded recent-terminal feedback index by canonical action
+     signature;
+  2. apply deterministic cooldown/negative delta after retryable failure and a
+     hard temporary suppression after non-retryable failure;
+  3. release suppression only after relevant state, candidate, actor, or target
+     changes;
+  4. cap broad role-only bonuses so they cannot override a specific execution
+     failure;
+  5. record the failure evidence and final score components in lineage;
+  6. do not promote episode-error or censored evidence directly to hard.
 - **Acceptance criteria:**
-  - an attack alert with a living enemy raises threat to at least `high` on the
-    same observation;
-  - an enemy force attacking a base, or a visible force overwhelming an empty
-    army, is `critical`;
-  - active contact with a comparable force is at least `high`, even after the
-    one-frame alert disappears;
-  - `high`/`critical` persists for a tested hysteresis window and clears only
-    after the threat is dead, departed, or contradicted by newer evidence;
-  - threat facts expose the score components and evidence in events, reports,
-    and the Live Console;
-  - replay fixtures from all three reference runs cover low, high, critical,
-    escalation, persistence, and de-escalation.
+  - a repeated unchanged translator failure is dispatched at most once during
+    its cooldown;
+  - a specific failure penalty dominates a broad role preference;
+  - every non-zero Playbook delta identifies the applied rule or terminal
+    feedback record;
+  - false blocks remain below 5% and all temporary suppressions expire on
+    relevant state change.
 
-## Implementation order
+## Repair order
 
-1. Fix SCX-PT-006 threat assessment and SCX-PT-001 worker/gas economy first;
-   both feed every downstream strategic decision.
-2. Replace the strict macro frontier and add global saturation checks
-   (SCX-PT-002).
-3. Close the expansion state machine (SCX-PT-003).
-4. Add combat target quarantine and capability-aware reacquisition
-   (SCX-PT-004).
-5. Add the terminal-crisis phase override (SCX-PT-005).
-6. Re-run the same three seeds from a frozen Playbook snapshot, then run a
-   separate sequential shared-Playbook series to evaluate self-iteration.
+1. Add the universal primitive boundary and repair `stop_worker`
+   (`SCX-PT-014`).
+2. Add actor-specific target domains before generating any combat candidate
+   (`SCX-PT-015`).
+3. Close offense navigation into enemy-structure attack
+   (`SCX-PT-016`).
+4. Merge scouting and expansion commitment state (`SCX-PT-017`).
+5. Add Builder selection lease and failure-signature backoff
+   (`SCX-PT-018`).
+6. Feed terminal outcomes back into active Playbook scoring
+   (`SCX-PT-019`).
+7. Run focused tests, all quality gates, then a new three-seed natural-terminal
+   regression.
 
-## Implementation update: 2026-07-23
+## Required engineering gates
 
-The code corrections in this register are now implemented. The issue statuses
-remain explicit about natural-terminal acceptance because the fixes have not yet
-been judged against a new three-seed full-match result.
+```text
+uv run pytest
+uv run ruff check src tests integrations/llm_pysc2/src
+uv run mypy
+```
 
-### SCX-PT-001
+Worker Python 3.9 contract checks must additionally cover:
 
-- `Train_Probe` is now an RTSCortex action exposed by the Protoss melee profile.
-- The Economy reflex controller continuously targets 22 workers per completed
-  Nexus, capped at 80 workers.
-- Probe commands use the normal command lifecycle and ProductionEffectVerifier;
-  upstream opportunistic Probe training is disabled.
-- Deterministic gas rebalance remains enabled, excludes the reserved Builder,
-  and fills completed Assimilators to three workers while yielding to Runtime
-  observations and effect verification.
+- out-of-range orchestration primitives;
+- ground/air target compatibility;
+- direct selection recovery and Builder selection leases;
+- persistent expansion state;
+- structure-search primitive attribution.
 
-### SCX-PT-002
-
-- RaceProfile owns global structure saturation limits.
-- Unique/saturation-limited structures are marked `obsolete` from global SC2
-  state, including across revised HIMA plans.
-- A deferred frontier can yield to a later legal action in a different
-  economy/technology/production/defense domain without bypassing
-  `runtime_frontier`, Candidate validation, or the Validator.
-- Supply and resource fallbacks retain priority over generic independent work.
-
-### SCX-PT-003
-
-- An expansion proposal establishes a persistent Runtime commitment.
-- `invalid_expansion_anchor`, `no_legal_placement`, and
-  `target_not_created` are recoverable expansion failures: the macro step
-  returns to `deferred` instead of freezing the entire plan.
-- The Worker publishes `expansion_candidates_exhausted` through the next
-  ObservationEnvelope.
-- Each commitment emits `expansion_commitment_started`, zero or more
-  `expansion_anchor_rejected` events, and exactly one
-  `expansion_commitment_terminal` event.
-- A commitment survives later macro-plan revisions by adding a synthetic
-  town-hall frontier that still passes the normal legality checks.
-
-### SCX-PT-004
-
-- Focus-fire state is keyed by actor and target.
-- Target failures have bounded retry counts and a 112-loop quarantine.
-- Visibility loss, friendly/stale targets, and repeated unconfirmed effects
-  have distinct transitions.
-- Every transition is persisted as `tactical_target_state`; actors without a
-  valid current-screen target fall back to search/navigation instead of
-  repeating the quarantined pair.
-
-### SCX-PT-005 and SCX-PT-006
-
-- Situation Intelligence is stateful for each episode.
-- Zero town halls plus a living enemy overrides normal technology/production
-  classification with combat crisis.
-- Threat scoring now incorporates attack alerts, recent damage and losses,
-  base proximity, enemy/own combat value, empty-army collapse, missing anti-air,
-  and town-hall loss.
-- High/critical assessments persist through a 32-loop hysteresis window,
-  including short observation gaps.
-- Situation events, Markdown reports, and Live Console show the numeric score,
-  evidence list, and hysteresis expiry.
-
-Read-only reclassification of every stored protocol-v1.1 observation from the
-three reference runs produced:
-
-| Seed | none | low | high | critical | final phase | final threat |
-|---|---:|---:|---:|---:|---|---|
-| 0 | 222 | 953 | 487 | 14 | combat | low |
-| 1 | 261 | 869 | 350 | 56 | combat | critical |
-| 2 | 370 | 258 | 291 | 445 | combat | critical |
-
-The replay did not mutate the historical journals. Unlike the original
-classification, all three runs now contain sustained `high` evidence, and the
-two destroyed-base terminal states end as combat/critical rather than normal
-technology or production.
-
-### Deterministic verification added
-
-- Probe production is generated only below race-specific worker saturation.
-- Builder-reserved workers cannot be selected for gas rebalance.
-- A blocked expansion does not prevent an independently legal Stargate.
-- An existing Cybernetics Core makes a revised redundant Core step obsolete.
-- A failed expansion anchor is not retried and the next anchor is dispatched.
-- Expansion-candidate exhaustion produces an explicit terminal state.
-- Actor-local combat target quarantine prevents unbounded repeat selection.
-- Threat escalation, unseen-target hysteresis, de-escalation, air-capability
-  mismatch inputs, and terminal collapse are covered by unit tests.
-
-The remaining acceptance action is a frozen-Playbook Protoss natural-terminal
-regression on seeds `0`, `1`, and `2`, followed by comparison against the three
-reference runs at the top of this file.
-
-### Real Worker smoke
-
-A 2,000-loop Simple64 seed-0 smoke completed through the real Python 3.9 Worker
-and SC2 Base75689:
-
-- run: `cortex-20260723T171015013124Z-85fadca6`;
-- Runtime crash, unattributed primitive, and candidate-domain violation: zero;
-- seven `Train_Probe` commands succeeded and were confirmed by exact Nexus
-  production orders;
-- workers increased to 18 within the bounded smoke;
-- 11 of 12 meaningful commands succeeded; the final in-progress Gateway was
-  correctly classified `unconfirmed` at truncation;
-- one expansion commitment produced exactly one terminal state,
-  `strategic_cancellation`, because the smoke deliberately ended at 2,000
-  steps;
-- all 74 threat assessments were `none`, consistent with no enemy contact in
-  this short window.
-
-This smoke validates the live execution path but does not replace the
-natural-terminal three-seed acceptance thresholds.
+An item is not removed merely because unit tests pass. P0 live issues require a
+new three-seed natural-terminal run to satisfy their acceptance criteria.

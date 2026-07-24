@@ -315,6 +315,13 @@ def test_tactical_agent_focuses_one_target_and_reacquires_when_it_disappears() -
         update={
             "state": _observation().state.model_copy(
                 update={
+                    "own_units": [
+                        UnitState(
+                            unit_id="0x10",
+                            unit_type="Stalker",
+                            alliance="self",
+                        )
+                    ],
                     "visible_enemies": [
                         UnitState(
                             unit_id="0x20",
@@ -393,6 +400,13 @@ def test_tactical_agent_quarantines_repeated_actor_target_failure() -> None:
             ],
             "state": base.state.model_copy(
                 update={
+                    "own_units": [
+                        UnitState(
+                            unit_id="0x10",
+                            unit_type="Stalker",
+                            alliance="self",
+                        )
+                    ],
                     "visible_enemies": [
                         UnitState(
                             unit_id="0x20",
@@ -447,6 +461,141 @@ def test_tactical_agent_quarantines_repeated_actor_target_failure() -> None:
     assert first_failure is not None and first_failure["state"] == "retryable"
     assert second_failure is not None and second_failure["state"] == "quarantined"
     assert next_intent.target.unit_tag == "0x21"
+
+
+def test_tactical_agent_preserves_retry_count_across_candidate_generation() -> None:
+    base = _observation()
+    observation = base.model_copy(
+        update={
+            "available_actions": [
+                AvailableAction(
+                    name="Attack_Unit",
+                    argument_names=["tag"],
+                    argument_types=[ActionArgumentType.TAG],
+                    actor_scopes=["CombatGroup/Army-1"],
+                    argument_candidates=[["0x20"], ["0x21"]],
+                )
+            ],
+            "state": base.state.model_copy(
+                update={
+                    "own_units": [
+                        UnitState(
+                            unit_id="0x10",
+                            unit_type="Stalker",
+                            alliance="self",
+                        )
+                    ],
+                    "visible_enemies": [
+                        UnitState(unit_id="0x20", unit_type="VoidRay", alliance="enemy"),
+                        UnitState(unit_id="0x21", unit_type="Zergling", alliance="enemy"),
+                    ]
+                }
+            ),
+        }
+    )
+    agent = DeterministicTacticalAgent(
+        retreat_health_threshold=0.3,
+        minimum_advance_army_supply=4,
+        target_retry_limit=2,
+        target_quarantine_game_loops=112,
+    )
+    [first] = agent.evaluate(
+        observation,
+        DeterministicSituationAnalyzer().assess(observation),
+    )
+    failure = ExecutionReport(
+        run_id=observation.run_id,
+        episode_id=observation.episode_id,
+        step_id=observation.step_id,
+        command_id="attack-1",
+        success=False,
+        action_name="Attack_Unit",
+        actor="CombatGroup/Army-1",
+        source=ActionSource.PLANNER,
+        requested_arguments=["0x20"],
+        resolved_arguments=["0x20"],
+        status=ExecutionStatus.FAILED,
+        execution_stage=ExecutionStage.EFFECT_VERIFICATION,
+        failure_code="combat_effect_not_observed",
+    )
+
+    first_failure = agent.record_execution(failure, game_loop=64)
+    retry_observation = observation.model_copy(update={"step_id": 5, "game_loop": 80})
+    [retry] = agent.evaluate(
+        retry_observation,
+        DeterministicSituationAnalyzer().assess(retry_observation),
+    )
+    second_failure = agent.record_execution(failure, game_loop=96)
+    quarantined_observation = observation.model_copy(update={"step_id": 6, "game_loop": 104})
+    [fallback] = agent.evaluate(
+        quarantined_observation,
+        DeterministicSituationAnalyzer().assess(quarantined_observation),
+    )
+
+    assert first.target.unit_tag == "0x20"
+    assert first_failure is not None and first_failure["state"] == "retryable"
+    assert retry.target.unit_tag == "0x20"
+    assert second_failure is not None and second_failure["state"] == "quarantined"
+    assert fallback.target.unit_tag == "0x21"
+
+
+def test_tactical_agent_quarantines_only_the_unselectable_actor() -> None:
+    base = _observation()
+    actors = ["CombatGroup/Army-1", "CombatGroup/Army-2"]
+    observation = base.model_copy(
+        update={
+            "available_actions": [
+                AvailableAction(
+                    name="Attack_Unit",
+                    argument_names=["tag"],
+                    argument_types=[ActionArgumentType.TAG],
+                    actor_scopes=actors,
+                    argument_candidates=[["0x20"]],
+                )
+            ]
+        }
+    )
+    agent = DeterministicTacticalAgent(
+        retreat_health_threshold=0.3,
+        minimum_advance_army_supply=4,
+        actor_quarantine_game_loops=112,
+    )
+    failure = ExecutionReport(
+        run_id=observation.run_id,
+        episode_id=observation.episode_id,
+        step_id=observation.step_id,
+        command_id="attack-unselectable",
+        success=False,
+        action_name="Attack_Unit",
+        actor=actors[0],
+        source=ActionSource.PLANNER,
+        requested_arguments=["0x20"],
+        resolved_arguments=["0x20"],
+        status=ExecutionStatus.FAILED,
+        execution_stage=ExecutionStage.TRANSLATION,
+        failure_code="actor_selection_timeout",
+    )
+
+    agent.evaluate(
+        observation,
+        DeterministicSituationAnalyzer().assess(observation),
+    )
+    transition = agent.record_execution(failure, game_loop=64)
+    during_cooldown = observation.model_copy(update={"step_id": 5, "game_loop": 80})
+    active = agent.evaluate(
+        during_cooldown,
+        DeterministicSituationAnalyzer().assess(during_cooldown),
+    )
+    after_cooldown = observation.model_copy(update={"step_id": 6, "game_loop": 176})
+    recovered = agent.evaluate(
+        after_cooldown,
+        DeterministicSituationAnalyzer().assess(after_cooldown),
+    )
+
+    assert transition is not None
+    assert transition["state"] == "actor_quarantined"
+    assert [intent.actor_scopes[0] for intent in active] == [actors[1]]
+    assert {intent.actor_scopes[0] for intent in recovered} == set(actors)
 
 
 def test_tactical_agent_attacks_current_screen_structure_when_units_are_last_known() -> None:
@@ -602,12 +751,18 @@ def test_offense_navigation_uses_actor_centroid_and_obsoletes_arrived_waypoint()
         arrived,
         DeterministicSituationAnalyzer().assess(arrived),
     )
+    after_search_window = arrived.model_copy(update={"step_id": 6, "game_loop": 96})
+    third = agent.evaluate(
+        after_search_window,
+        DeterministicSituationAnalyzer().assess(after_search_window),
+    )
 
     assert {intent.actor_scopes[0] for intent in first} == {
         "CombatGroup7/Adept-1",
         "CombatGroup8/VoidRay-1",
     }
-    assert [(intent.actor_scopes[0], intent.target.position) for intent in second] == [
+    assert second == []
+    assert [(intent.actor_scopes[0], intent.target.position) for intent in third] == [
         ("CombatGroup7/Adept-1", (50, 50))
     ]
 

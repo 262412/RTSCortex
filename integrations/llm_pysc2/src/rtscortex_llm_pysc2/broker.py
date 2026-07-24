@@ -32,6 +32,8 @@ class _DecisionState:
     error: Optional[Exception] = None
     in_flight: bool = False
     consumed: set[str] = field(default_factory=set)
+    participants: set[str] = field(default_factory=set)
+    opened_at: float = field(default_factory=monotonic)
 
 
 @dataclass(frozen=True)
@@ -70,16 +72,24 @@ class SharedDecisionBroker:
         extractor: TimeStepExtractor,
         *,
         decision_timeout_seconds: float = 60.0,
+        participant_grace_seconds: float = 0.25,
         metrics_path: Optional[str] = None,
     ) -> None:
         if decision_timeout_seconds <= 0:
             raise ValueError("decision_timeout_seconds must be positive")
+        if participant_grace_seconds < 0:
+            raise ValueError("participant_grace_seconds cannot be negative")
         self.coordinator = coordinator
         self.extractor = extractor
         self.decision_timeout_seconds = decision_timeout_seconds
+        self.participant_grace_seconds = min(
+            participant_grace_seconds,
+            decision_timeout_seconds,
+        )
         self._condition = Condition()
         self._agents: dict[str, Any] = {}
         self._states: dict[int, _DecisionState] = {}
+        self._partial_steps: dict[int, frozenset[str]] = {}
         self._command_queues: dict[tuple[str, str, str], deque[str]] = defaultdict(deque)
         self._active_commands: dict[tuple[str, str], _ActiveCommand] = {}
         self._screen_route_provenance: dict[str, ScreenRouteProvenance] = {}
@@ -93,6 +103,8 @@ class SharedDecisionBroker:
         self.candidate_outside_pysc2_dispatches = 0
         self.observation_gap_watchdog_triggers = 0
         self.orchestration_recoveries = 0
+        self.partial_runtime_decisions = 0
+        self.skipped_runtime_participants = 0
         self.expansion_scout_camera_moves = 0
         self.expansion_candidate_exhaustions = 0
         self._metrics_path = None if metrics_path is None else Path(metrics_path)
@@ -108,6 +120,8 @@ class SharedDecisionBroker:
                 "candidate_outside_pysc2_dispatches": (self.candidate_outside_pysc2_dispatches),
                 "observation_gap_watchdog_triggers": self.observation_gap_watchdog_triggers,
                 "orchestration_recoveries": self.orchestration_recoveries,
+                "partial_runtime_decisions": self.partial_runtime_decisions,
+                "skipped_runtime_participants": self.skipped_runtime_participants,
                 "expansion_scout_camera_moves": self.expansion_scout_camera_moves,
                 "expansion_candidate_exhaustions": self.expansion_candidate_exhaustions,
             }
@@ -274,6 +288,10 @@ class SharedDecisionBroker:
     def submit(self, agent: Any, timestep: Any, text_observation: str) -> str:
         step_id = int(agent.main_loop_step)
         with self._condition:
+            self._prune_partial_steps_locked(step_id)
+            late_skipped = self._partial_steps.get(step_id, frozenset())
+            if agent.name in late_skipped:
+                return _transport_noop_action_text(agent)
             state = self._states.setdefault(step_id, _DecisionState())
             if state.error is not None:
                 raise RuntimeError(
@@ -287,6 +305,7 @@ class SharedDecisionBroker:
         deadline = monotonic() + self.decision_timeout_seconds
         while state.decision is None and state.error is None:
             leader = False
+            participants: set[str] = set()
             with self._condition:
                 expected = {name for name, value in self._agents.items() if value.enable}
                 # Combat agents can be disabled after losing their final unit while
@@ -294,8 +313,26 @@ class SharedDecisionBroker:
                 # Re-evaluate the live participant set instead of retaining a stale
                 # name until the full decision timeout expires. Submitted agents are
                 # still included in the snapshot even if they become disabled later.
-                if not state.in_flight and expected.issubset(state.submissions):
+                collection_complete = expected.issubset(state.submissions)
+                grace_elapsed = (
+                    monotonic() - state.opened_at >= self.participant_grace_seconds
+                )
+                if (
+                    not state.in_flight
+                    and state.submissions
+                    and (collection_complete or grace_elapsed)
+                ):
                     state.in_flight = True
+                    participants = set(state.submissions).intersection(expected)
+                    if not participants:
+                        participants = set(state.submissions)
+                    state.participants = participants
+                    missing_participants = expected.difference(participants)
+                    if missing_participants:
+                        self.partial_runtime_decisions += 1
+                        self.skipped_runtime_participants += len(missing_participants)
+                        self._partial_steps[step_id] = frozenset(missing_participants)
+                        self._persist_metrics_locked()
                     leader = True
                     if not self._initial_decision_started:
                         self._initial_decision_started = True
@@ -315,7 +352,7 @@ class SharedDecisionBroker:
                     else:
                         self._condition.wait(timeout=min(0.05, remaining))
             if leader:
-                self._decide(step_id)
+                self._decide(step_id, participants)
 
         with self._condition:
             if state.error is not None:
@@ -323,11 +360,15 @@ class SharedDecisionBroker:
                     f"shared runtime decision failed at step {step_id}"
                 ) from state.error
             assert state.decision is not None
-            route = state.decision.routes[agent.name]
+            route = state.decision.routes.get(agent.name)
             state.consumed.add(agent.name)
-            if state.consumed == set(state.submissions):
+            if state.participants.issubset(state.consumed):
                 self._states.pop(step_id, None)
-            return route.action_text
+            return (
+                _transport_noop_action_text(agent)
+                if route is None
+                else route.action_text
+            )
 
     def claim_primitive(
         self,
@@ -744,6 +785,8 @@ class SharedDecisionBroker:
                     "candidate_outside_pysc2_dispatches": (self.candidate_outside_pysc2_dispatches),
                     "observation_gap_watchdog_triggers": (self.observation_gap_watchdog_triggers),
                     "orchestration_recoveries": self.orchestration_recoveries,
+                    "partial_runtime_decisions": self.partial_runtime_decisions,
+                    "skipped_runtime_participants": self.skipped_runtime_participants,
                     "expansion_scout_camera_moves": self.expansion_scout_camera_moves,
                     "expansion_candidate_exhaustions": (
                         self.expansion_candidate_exhaustions
@@ -754,10 +797,14 @@ class SharedDecisionBroker:
         )
         temporary.replace(self._metrics_path)
 
-    def _decide(self, step_id: int) -> None:
+    def _decide(self, step_id: int, participants: set[str]) -> None:
         with self._condition:
             state = self._states[step_id]
-            submissions = dict(state.submissions)
+            submissions = {
+                name: submission
+                for name, submission in state.submissions.items()
+                if name in participants
+            }
         try:
             first = next(iter(submissions.values()))
             agents = {name: item.agent for name, item in submissions.items()}
@@ -806,6 +853,27 @@ class SharedDecisionBroker:
                             int(anchor, 0) if isinstance(anchor, str) else int(anchor)
                         )
             self._condition.notify_all()
+
+    def _prune_partial_steps_locked(self, current_step_id: int) -> None:
+        stale = [
+            step_id
+            for step_id in self._partial_steps
+            if step_id < current_step_id - 4
+        ]
+        for step_id in stale:
+            del self._partial_steps[step_id]
+
+
+def _transport_noop_action_text(agent: Any) -> str:
+    lines = ["Actions:"]
+    for team_name in current_team_order(agent):
+        lines.extend(
+            (
+                f"    Team {team_name}:",
+                "        <No_Operation()>",
+            )
+        )
+    return "\n".join(lines)
 
 
 def _observation_game_loop(observation: Any) -> int:

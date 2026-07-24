@@ -170,7 +170,9 @@ def _automatic_worker_is_needed(observation: ObservationEnvelope) -> bool:
     )
     if completed_townhalls <= 0:
         return False
-    target_workers = min(80, completed_townhalls * 22)
+    # Keep a strategic worker buffer above one-base mineral saturation so gas
+    # staffing, scouting/builders, and replacement production do not starve tech.
+    target_workers = min(80, completed_townhalls * 28)
     return observation.state.economy.workers < target_workers
 
 
