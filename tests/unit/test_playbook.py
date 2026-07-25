@@ -224,9 +224,7 @@ def _completed_run_directory(root: Path, run_id: str, *, seed: int) -> Path:
     (root / f"{run_id}.sqlite3").rename(run_directory / "events.sqlite3")
     (root / f"{run_id}.jsonl").rename(run_directory / "events.jsonl")
     (run_directory / "config.yaml").write_text(
-        "environment:\n"
-        "  agent_race: protoss\n"
-        "  opponent_race: zerg\n",
+        "environment:\n  agent_race: protoss\n  opponent_race: zerg\n",
         encoding="utf-8",
     )
     return run_directory
@@ -841,6 +839,78 @@ def test_playbook_promotes_repeated_producer_failure_as_compact_execution_rule(
     playbook.close()
 
 
+def test_error_episode_cases_remain_diagnostic_but_do_not_update_rules(
+    tmp_path: Path,
+) -> None:
+    playbook = PlaybookStore(tmp_path / "playbook.sqlite3")
+    reviewer = CortexPlaybookReviewer(playbook, promotion_support=1)
+    store = EventStore(tmp_path / "error.sqlite3", tmp_path / "error.jsonl")
+    store.append_event(
+        run_id="error-run",
+        episode_id="episode",
+        step_id=1,
+        event_type="situation_assessed",
+        payload={
+            "phase": "production",
+            "threat_level": "low",
+            "economy_status": "stable",
+            "army_readiness": "forming",
+        },
+    )
+    store.append_event(
+        run_id="error-run",
+        episode_id="episode",
+        step_id=2,
+        event_type="command_lineage",
+        payload={
+            "command_id": "error-command",
+            "semantic_action": "MOVE MINIMAP",
+            "lineage": {"source_role": "tactical"},
+        },
+    )
+    store.append_event(
+        run_id="error-run",
+        episode_id="episode",
+        step_id=3,
+        event_type="execution",
+        payload=ExecutionReport(
+            run_id="error-run",
+            episode_id="episode",
+            step_id=3,
+            command_id="error-command",
+            success=False,
+            action_name="Move_Minimap",
+            actor="CombatGroup3/VoidRay-1",
+            source=ActionSource.PLANNER,
+            status=ExecutionStatus.FAILED,
+            execution_stage=ExecutionStage.EFFECT_VERIFICATION,
+            failure_code="observation_gap_watchdog_recovery",
+        ),
+    )
+
+    cases, _lessons = reviewer.review_episode(
+        store.events_after("error-run", 0, 100, episode_id="episode"),
+        EpisodeResult(
+            run_id="error-run",
+            episode_id="episode",
+            scenario="Simple64",
+            seed=0,
+            outcome=EpisodeOutcome.ERROR,
+            steps=3,
+            failure_reason="observation_gap_watchdog_timeout",
+        ),
+        agent_race="protoss",
+        opponent_race="zerg",
+    )
+
+    case = next(case for case in cases if case.command_id == "error-command")
+    assert case.evidence["promotion_eligible"] is False
+    assert case.evidence["promotion_exclusion_reason"] == "episode_outcome_error"
+    assert playbook.rules() == []
+    store.close()
+    playbook.close()
+
+
 def test_shadow_validated_execution_rule_becomes_soft_and_changes_score(
     tmp_path: Path,
 ) -> None:
@@ -907,9 +977,7 @@ def test_shadow_validated_execution_rule_becomes_soft_and_changes_score(
         store.close()
         if run_index == 1:
             candidate = next(
-                rule
-                for rule in playbook.rules()
-                if rule.action_names == ("TRAIN ADEPT",)
+                rule for rule in playbook.rules() if rule.action_names == ("TRAIN ADEPT",)
             )
             for state_index in range(48):
                 playbook.record_rule_application(
@@ -927,9 +995,7 @@ def test_shadow_validated_execution_rule_becomes_soft_and_changes_score(
                     )
                 )
 
-    rule = next(
-        rule for rule in playbook.rules() if rule.action_names == ("TRAIN ADEPT",)
-    )
+    rule = next(rule for rule in playbook.rules() if rule.action_names == ("TRAIN ADEPT",))
     assert rule.status is PlaybookRuleStatus.ACTIVE
     assert rule.strength is PlaybookRuleStrength.SOFT
     assert set(rule.source_seeds) == {0, 1}
@@ -940,9 +1006,7 @@ def test_shadow_validated_execution_rule_becomes_soft_and_changes_score(
     }
     CortexPlaybookReviewer(playbook)
     rule = next(
-        candidate
-        for candidate in playbook.rules()
-        if candidate.action_names == ("TRAIN ADEPT",)
+        candidate for candidate in playbook.rules() if candidate.action_names == ("TRAIN ADEPT",)
     )
     assert rule.status is PlaybookRuleStatus.ACTIVE
     assert rule.strength is PlaybookRuleStrength.SOFT
@@ -1150,16 +1214,12 @@ def test_promotion_sweep_consolidates_fragmented_typed_strategy_evidence(
 
     assert len(sweep.consolidated_rule_ids) == 1
     consolidated = next(
-        rule
-        for rule in playbook.rules()
-        if rule.rule_id in sweep.consolidated_rule_ids
+        rule for rule in playbook.rules() if rule.rule_id in sweep.consolidated_rule_ids
     )
     assert consolidated.status is PlaybookRuleStatus.ACTIVE
     assert consolidated.strength is PlaybookRuleStrength.SOFT
     threat_condition = next(
-        condition
-        for condition in consolidated.conditions
-        if condition.field == "threat_level"
+        condition for condition in consolidated.conditions if condition.field == "threat_level"
     )
     assert threat_condition.operator is PlaybookConditionOperator.IN
     assert threat_condition.value == ("high", "critical")
@@ -1216,8 +1276,7 @@ def test_playbook_run_learner_combines_frozen_runs_in_separate_store(
     tmp_path: Path,
 ) -> None:
     run_directories = tuple(
-        _completed_run_directory(tmp_path, f"frozen-seed-{seed}", seed=seed)
-        for seed in (0, 1)
+        _completed_run_directory(tmp_path, f"frozen-seed-{seed}", seed=seed) for seed in (0, 1)
     )
     learning_path = tmp_path / "learning" / "cortex-playbook.sqlite3"
     playbook = PlaybookStore(learning_path)
@@ -1265,9 +1324,7 @@ def test_playbook_quarantines_legacy_soft_execution_penalty(tmp_path: Path) -> N
     CortexPlaybookReviewer(playbook)
 
     rule = next(
-        rule
-        for rule in playbook.rules()
-        if rule.canonical_key == "unsafe-execution-penalty"
+        rule for rule in playbook.rules() if rule.canonical_key == "unsafe-execution-penalty"
     )
     assert rule.status is PlaybookRuleStatus.SUSPENDED
     assert rule.strength is PlaybookRuleStrength.ADVISORY

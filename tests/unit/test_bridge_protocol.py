@@ -314,10 +314,24 @@ def test_coordinator_defers_move_minimap_until_builder_starts_moving() -> None:
     assert coordinator.complete_command("command-move", game_loop=225) is None
     assert coordinator.effect_verifier.blocks_auto_worker_management is False
     assert runtime.execution_reports == []
-    assert coordinator.observe_effects(_raw_move_observation(game_loop=300, center=(48, 48))) == []
+    assert (
+        coordinator.observe_effects(
+            _raw_move_observation(
+                game_loop=300,
+                center=(48, 48),
+                builder_orders=[13],
+            )
+        )
+        == []
+    )
 
     reports = coordinator.observe_effects(
-        _raw_move_observation(game_loop=320, center=(8, 8), builder_position=(48, 16))
+        _raw_move_observation(
+            game_loop=320,
+            center=(8, 8),
+            builder_position=(48, 16),
+            builder_orders=[13],
+        )
     )
 
     assert len(reports) == 1

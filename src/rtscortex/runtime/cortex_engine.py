@@ -242,6 +242,9 @@ class CortexRuntimeEngine(RuntimeEngine):
         self._expansion_anchor_evaluations: list[dict[str, Any]] = []
         self._expansion_candidates_exhausted = False
         self._expansion_scout_state = "not_discovered_yet"
+        self._expansion_scout_generation = 0
+        self._expansion_commitment_generation: int | None = None
+        self._expansion_exhausted_generation: int | None = None
         self._expansion_scout_visited_waypoints = 0
         self._expansion_scout_total_waypoints = 0
         if config.cortex.situation.kind == "model_active" and situation_provider is None:
@@ -600,6 +603,9 @@ class CortexRuntimeEngine(RuntimeEngine):
         self._expansion_anchor_evaluations = []
         self._expansion_candidates_exhausted = False
         self._expansion_scout_state = "not_discovered_yet"
+        self._expansion_scout_generation = 0
+        self._expansion_commitment_generation = None
+        self._expansion_exhausted_generation = None
         self._expansion_scout_visited_waypoints = 0
         self._expansion_scout_total_waypoints = 0
         self._strategic_agenda = None
@@ -693,18 +699,17 @@ class CortexRuntimeEngine(RuntimeEngine):
             observation.episode_id,
             "expansion_commitment_terminal",
         )
-        if (
-            started_commitment is not None
-            and (
-                terminal_commitment is None
-                or terminal_commitment.event_id < started_commitment.event_id
-            )
+        if started_commitment is not None and (
+            terminal_commitment is None
+            or terminal_commitment.event_id < started_commitment.event_id
         ):
-            self._expansion_commitment_id = str(
-                started_commitment.payload["commitment_id"]
-            )
+            self._expansion_commitment_id = str(started_commitment.payload["commitment_id"])
             self._expansion_commitment_started_game_loop = int(
                 started_commitment.payload["started_game_loop"]
+            )
+            generation = started_commitment.payload.get("generation_id")
+            self._expansion_commitment_generation = (
+                int(generation) if isinstance(generation, int) else None
             )
             self._expansion_anchor_evaluations = [
                 dict(event.payload)
@@ -715,6 +720,13 @@ class CortexRuntimeEngine(RuntimeEngine):
                 )
                 if event.event_id > started_commitment.event_id
             ]
+        if terminal_commitment is not None and (
+            terminal_commitment.payload.get("terminal_state") == "expansion_candidates_exhausted"
+        ):
+            generation = terminal_commitment.payload.get("generation_id")
+            if isinstance(generation, int):
+                self._expansion_exhausted_generation = generation
+                self._expansion_candidates_exhausted = True
 
         recovered_macro_outcomes: list[ExecutionReport] = []
         for event in self.store.events_of_type(
@@ -1172,8 +1184,7 @@ class CortexRuntimeEngine(RuntimeEngine):
         )
         if (
             frontier_assessment is not None
-            and frontier_assessment.classification
-            is PolicyActionClassification.MAPPED_DEFERRED
+            and frontier_assessment.classification is PolicyActionClassification.MAPPED_DEFERRED
         ):
             self._record_cortex_event(
                 observation,
@@ -1385,9 +1396,7 @@ class CortexRuntimeEngine(RuntimeEngine):
         ):
             return None
         step = self._macro_step(frontier.ordinal)
-        advances_plan_step = (
-            step is not None and step.semantic_action == frontier.source_action
-        )
+        advances_plan_step = step is not None and step.semantic_action == frontier.source_action
         step_identity = (
             f"{frontier.ordinal}:{step.completed_repeats}"
             if step is not None
@@ -1424,10 +1433,7 @@ class CortexRuntimeEngine(RuntimeEngine):
         self,
         proposal: MacroPolicyProposal,
     ) -> MacroPolicyProposal:
-        if (
-            self._expansion_commitment_id is None
-            or self._expansion_candidates_exhausted
-        ):
+        if self._expansion_commitment_id is None or self._expansion_candidates_exhausted:
             return proposal
         townhall_action = self._semantic_action_for_target(
             self._race_profile.data.townhall_types[0]
@@ -1568,11 +1574,9 @@ class CortexRuntimeEngine(RuntimeEngine):
             )
             if (
                 assessment is None
-                or assessment.classification
-                is not PolicyActionClassification.MAPPED_LEGAL_NOW
+                or assessment.classification is not PolicyActionClassification.MAPPED_LEGAL_NOW
                 or assessment.runtime_action is None
-                or self._race_profile.domain_for_action(assessment.runtime_action)
-                is blocked_domain
+                or self._race_profile.domain_for_action(assessment.runtime_action) is blocked_domain
                 or self._saturated_structure_target(assessment, observation) is not None
             ):
                 continue
@@ -1749,8 +1753,7 @@ class CortexRuntimeEngine(RuntimeEngine):
             (
                 item
                 for item in self._race_profile.data.progress_action_specs
-                if item.name == frontier.runtime_action
-                and item.effect_kind.value == "structure"
+                if item.name == frontier.runtime_action and item.effect_kind.value == "structure"
             ),
             None,
         )
@@ -2269,6 +2272,20 @@ class CortexRuntimeEngine(RuntimeEngine):
                     ),
                     payload=transition,
                 )
+        lineage = self._command_lineages.get(report.command_id)
+        defense_transition = self._role_agents.record_execution(
+            report,
+            responsibility=None if lineage is None else lineage.responsibility,
+            game_loop=self._execution_game_loop(report),
+        )
+        if defense_transition is not None:
+            self.store.append_event(
+                run_id=report.run_id,
+                episode_id=report.episode_id,
+                step_id=report.step_id,
+                event_type="defense_actor_state",
+                payload=defense_transition,
+            )
         if metadata is None:
             return
         self._macro_outcome_revision += 1
@@ -2355,9 +2372,7 @@ class CortexRuntimeEngine(RuntimeEngine):
         if step is None or self._macro_plan is None:
             return
         completed = step.completed_repeats + (1 if succeeded else 0)
-        recoverable_expansion = (
-            report is not None and self._recoverable_expansion_failure(report)
-        )
+        recoverable_expansion = report is not None and self._recoverable_expansion_failure(report)
         status = (
             MacroStepStatus.CONFIRMED
             if succeeded and completed >= step.repeat
@@ -2405,9 +2420,9 @@ class CortexRuntimeEngine(RuntimeEngine):
         proposal: MacroPolicyProposal,
         observation: ObservationEnvelope,
     ) -> None:
-        if (
-            self._expansion_commitment_id is not None
-            or self._expansion_candidates_exhausted
+        if self._expansion_commitment_id is not None or (
+            self._expansion_exhausted_generation is not None
+            and self._expansion_exhausted_generation == self._expansion_scout_generation
         ):
             return
         townhall_action = self._semantic_action_for_target(
@@ -2417,9 +2432,10 @@ class CortexRuntimeEngine(RuntimeEngine):
             return
         commitment_id = (
             f"{observation.run_id}:{observation.episode_id}:"
-            f"expansion:{observation.step_id}"
+            f"expansion:g{self._expansion_scout_generation}:{observation.step_id}"
         )
         self._expansion_commitment_id = commitment_id
+        self._expansion_commitment_generation = self._expansion_scout_generation
         self._expansion_commitment_started_game_loop = observation.game_loop
         self._expansion_anchor_evaluations = []
         self._record_cortex_event(
@@ -2429,6 +2445,7 @@ class CortexRuntimeEngine(RuntimeEngine):
                 "commitment_id": commitment_id,
                 "started_game_loop": observation.game_loop,
                 "semantic_action": townhall_action,
+                "generation_id": self._expansion_commitment_generation,
                 "terminal_states": [
                     (
                         "nexus_effect_confirmed"
@@ -2454,6 +2471,14 @@ class CortexRuntimeEngine(RuntimeEngine):
             ),
             None,
         )
+        generation_text = next(
+            (
+                alert.split("=", 1)[1]
+                for alert in observation.alerts
+                if alert.casefold().startswith("expansion_scout_generation=")
+            ),
+            None,
+        )
         progress = next(
             (
                 alert.split("=", 1)[1]
@@ -2464,6 +2489,19 @@ class CortexRuntimeEngine(RuntimeEngine):
         )
         if structured_state is not None:
             self._expansion_scout_state = structured_state.casefold()
+        if generation_text is not None:
+            try:
+                generation = max(1, int(generation_text))
+            except ValueError:
+                generation = self._expansion_scout_generation
+            if generation > self._expansion_scout_generation:
+                self._expansion_scout_generation = generation
+                if (
+                    self._expansion_commitment_id is not None
+                    and self._expansion_commitment_generation in {None, 0}
+                ):
+                    self._expansion_commitment_generation = generation
+                self._expansion_candidates_exhausted = False
         if progress is not None:
             try:
                 visited, total = progress.split("/", 1)
@@ -2479,6 +2517,7 @@ class CortexRuntimeEngine(RuntimeEngine):
                 {
                     "previous_state": previous_state,
                     "state": self._expansion_scout_state,
+                    "generation_id": self._expansion_scout_generation,
                     "visited_waypoints": self._expansion_scout_visited_waypoints,
                     "total_waypoints": self._expansion_scout_total_waypoints,
                     "commitment_id": self._expansion_commitment_id,
@@ -2495,14 +2534,13 @@ class CortexRuntimeEngine(RuntimeEngine):
         reported_exhausted = (
             self._expansion_scout_state == "all_candidates_exhausted"
             and self._expansion_scout_total_waypoints > 0
-            and self._expansion_scout_visited_waypoints
-            >= self._expansion_scout_total_waypoints
+            and self._expansion_scout_visited_waypoints >= self._expansion_scout_total_waypoints
         )
         if structured_state is None:
             reported_exhausted = legacy_exhausted
-        if candidate_available:
-            # A newly discovered persistent cluster is stronger evidence than
-            # an older Worker exhaustion alert.
+        if candidate_available and (
+            self._expansion_exhausted_generation != self._expansion_scout_generation
+        ):
             self._expansion_candidates_exhausted = False
             return
         if self._expansion_commitment_id is None:
@@ -2512,6 +2550,7 @@ class CortexRuntimeEngine(RuntimeEngine):
             return
         self._expansion_candidates_exhausted = reported_exhausted
         if reported_exhausted:
+            self._expansion_exhausted_generation = self._expansion_scout_generation
             self._terminate_expansion_commitment(
                 observation,
                 terminal_state="expansion_candidates_exhausted",
@@ -2560,6 +2599,7 @@ class CortexRuntimeEngine(RuntimeEngine):
                 "started_game_loop": self._expansion_commitment_started_game_loop,
                 "terminal_game_loop": observation.game_loop,
                 "evaluated_anchors": list(self._expansion_anchor_evaluations),
+                "generation_id": self._expansion_commitment_generation,
                 "scout_state": self._expansion_scout_state,
                 "visited_waypoints": self._expansion_scout_visited_waypoints,
                 "total_waypoints": self._expansion_scout_total_waypoints,
@@ -2567,6 +2607,7 @@ class CortexRuntimeEngine(RuntimeEngine):
         )
         self._expansion_commitment_id = None
         self._expansion_commitment_started_game_loop = None
+        self._expansion_commitment_generation = None
         self._expansion_anchor_evaluations = []
 
     def _terminate_expansion_commitment_from_report(
@@ -2589,6 +2630,7 @@ class CortexRuntimeEngine(RuntimeEngine):
                 "started_game_loop": self._expansion_commitment_started_game_loop,
                 "terminal_game_loop": self._execution_game_loop(report),
                 "evaluated_anchors": list(self._expansion_anchor_evaluations),
+                "generation_id": self._expansion_commitment_generation,
                 "scout_state": self._expansion_scout_state,
                 "visited_waypoints": self._expansion_scout_visited_waypoints,
                 "total_waypoints": self._expansion_scout_total_waypoints,
@@ -2597,6 +2639,7 @@ class CortexRuntimeEngine(RuntimeEngine):
         )
         self._expansion_commitment_id = None
         self._expansion_commitment_started_game_loop = None
+        self._expansion_commitment_generation = None
         self._expansion_anchor_evaluations = []
 
     def _recoverable_expansion_failure(self, report: ExecutionReport) -> bool:
@@ -2805,11 +2848,13 @@ class CortexRuntimeEngine(RuntimeEngine):
                     "started_game_loop": self._expansion_commitment_started_game_loop,
                     "terminal_game_loop": result.steps,
                     "evaluated_anchors": list(self._expansion_anchor_evaluations),
+                    "generation_id": self._expansion_commitment_generation,
                     "reason": "episode_end",
                 },
             )
             self._expansion_commitment_id = None
             self._expansion_commitment_started_game_loop = None
+            self._expansion_commitment_generation = None
             self._expansion_anchor_evaluations = []
         super().end_episode(result)
         if already_recorded or self._playbook_reviewer is None:
@@ -2878,9 +2923,7 @@ class CortexRuntimeEngine(RuntimeEngine):
             payload={
                 "case_count": len(cases),
                 "lesson_update_count": len(lessons),
-                "strategic_consequence_count": len(
-                    self._playbook_reviewer.last_consequences
-                ),
+                "strategic_consequence_count": len(self._playbook_reviewer.last_consequences),
                 "strategic_consequence_counts": dict(sorted(consequence_counts.items())),
                 "playbook_path": str(self._playbook_reviewer.store.database_path),
             },

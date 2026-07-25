@@ -7,8 +7,12 @@ import pytest
 
 from rtscortex.contracts import (
     ActionArgumentType,
+    ActionSource,
     AvailableAction,
     EconomyState,
+    ExecutionReport,
+    ExecutionStage,
+    ExecutionStatus,
     ObservationEnvelope,
     SC2State,
     UnitState,
@@ -268,8 +272,10 @@ def test_defense_agent_independently_responds_to_a_critical_threat() -> None:
             ],
         }
     )
-    assessment = DeterministicSituationAnalyzer().assess(observation).model_copy(
-        update={"threat_level": ThreatLevel.CRITICAL, "threat_score": 12.0}
+    assessment = (
+        DeterministicSituationAnalyzer()
+        .assess(observation)
+        .model_copy(update={"threat_level": ThreatLevel.CRITICAL, "threat_score": 12.0})
     )
     coordinator = RoleAgentCoordinator(
         race_profile("protoss"),
@@ -297,6 +303,97 @@ def test_defense_agent_independently_responds_to_a_critical_threat() -> None:
     assert strategic.role is RoleId.DEFENSE
     assert strategic.emergency is True
     assert strategic.urgency == 1.0
+
+
+def test_defense_agent_deduplicates_active_response_and_cools_down_after_failure() -> None:
+    base = _observation()
+    observation = base.model_copy(
+        update={
+            "state": base.state.model_copy(
+                update={
+                    "visible_enemies": [
+                        UnitState(
+                            unit_id="0xe1",
+                            unit_type="Drone",
+                            alliance="enemy",
+                            position=(12, 10),
+                        )
+                    ]
+                }
+            ),
+            "available_actions": [
+                AvailableAction(
+                    name="Attack_Unit",
+                    argument_names=["tag"],
+                    argument_types=[ActionArgumentType.TAG],
+                    actor_scopes=["CombatGroup0/Zealot-1"],
+                    argument_candidates=[["0xe1"]],
+                )
+            ],
+        }
+    )
+    assessment = (
+        DeterministicSituationAnalyzer()
+        .assess(observation)
+        .model_copy(update={"threat_level": ThreatLevel.CRITICAL, "threat_score": 12.0})
+    )
+    profile = race_profile("protoss")
+    coordinator = RoleAgentCoordinator(profile, StrategicIntentAdapter(profile))
+
+    first = coordinator.propose_defense_intents(RoleAgentContext(observation, assessment, ()))
+    assert len(first) == 1
+    assert (
+        coordinator.propose_defense_intents(
+            RoleAgentContext(
+                observation.model_copy(update={"step_id": 2, "game_loop": 33}),
+                assessment,
+                (),
+            )
+        )
+        == ()
+    )
+
+    transition = coordinator.record_execution(
+        ExecutionReport(
+            run_id=observation.run_id,
+            episode_id=observation.episode_id,
+            step_id=3,
+            command_id="defense-command",
+            success=False,
+            action_name="Attack_Unit",
+            actor="CombatGroup0/Zealot-1",
+            source=ActionSource.REFLEX,
+            status=ExecutionStatus.FAILED,
+            execution_stage=ExecutionStage.EFFECT_VERIFICATION,
+            failure_code="effect_timeout",
+        ),
+        responsibility="defense",
+        game_loop=40,
+    )
+    assert transition is not None
+    assert transition["state"] == "defense_response_cooldown"
+    assert (
+        coordinator.propose_defense_intents(
+            RoleAgentContext(
+                observation.model_copy(update={"step_id": 4, "game_loop": 71}),
+                assessment,
+                (),
+            )
+        )
+        == ()
+    )
+    assert (
+        len(
+            coordinator.propose_defense_intents(
+                RoleAgentContext(
+                    observation.model_copy(update={"step_id": 5, "game_loop": 72}),
+                    assessment,
+                    (),
+                )
+            )
+        )
+        == 1
+    )
 
 
 def test_zerg_queen_controller_routes_inject_to_economy_and_creep_to_defense() -> None:

@@ -6,7 +6,7 @@ import hashlib
 from collections.abc import Sequence
 from typing import cast
 
-from rtscortex.contracts import EpisodeResult, ExecutionReport
+from rtscortex.contracts import EpisodeOutcome, EpisodeResult, ExecutionReport
 from rtscortex.game_phase import GamePhase
 from rtscortex.memory import StoredEvent
 from rtscortex.playbook.attribution import StrategicConsequenceAttributor
@@ -129,6 +129,7 @@ class CortexPlaybookReviewer:
         opponent_race: str,
     ) -> tuple[list[DecisionCase], list[PlaybookLesson]]:
         self.last_rule_updates = ()
+        promotion_eligible = result.outcome is not EpisodeOutcome.ERROR
         self.last_consequences = self._attributor.attribute(
             events,
             result,
@@ -157,7 +158,10 @@ class CortexPlaybookReviewer:
             if not self.store.add_case(case):
                 continue
             cases.append(case)
-            lesson = self._consolidate(case, update_executable_rule=True)
+            lesson = self._consolidate(
+                case,
+                update_executable_rule=promotion_eligible,
+            )
             if lesson is not None:
                 lessons.append(lesson)
         for event in events:
@@ -165,16 +169,22 @@ class CortexPlaybookReviewer:
                 continue
             if event.payload.get("classification") not in {"illegal_action", "parse_error"}:
                 continue
-            rejected = _rejected_proposal_case(
-                event,
+            rejected = _mark_case_episode_eligibility(
+                _rejected_proposal_case(
+                    event,
+                    result,
+                    phase=_phase_at(phases, event.event_id),
+                    agent_race=agent_race,
+                    opponent_race=opponent_race,
+                ),
                 result,
-                phase=_phase_at(phases, event.event_id),
-                agent_race=agent_race,
-                opponent_race=opponent_race,
             )
             if self.store.add_case(rejected):
                 cases.append(rejected)
-                lesson = self._consolidate(rejected, update_executable_rule=True)
+                lesson = self._consolidate(
+                    rejected,
+                    update_executable_rule=promotion_eligible,
+                )
                 if lesson is not None:
                     lessons.append(lesson)
         for event in events:
@@ -197,54 +207,59 @@ class CortexPlaybookReviewer:
                 map_name=result.scenario,
                 tags=(semantic_action.lower().replace(" ", "_"),),
             )
-            case = DecisionCase(
-                case_id=_stable_id("case", result.run_id, result.episode_id, report.command_id),
-                run_id=result.run_id,
-                episode_id=result.episode_id,
-                source_event_id=event.event_id,
-                source_step_id=event.step_id,
-                command_id=report.command_id,
-                macro_plan_id=_macro_plan_id(lineage_event.payload),
-                semantic_action=semantic_action,
-                objective=None,
-                context=context,
-                quality=quality,
-                failure_owner=owner,
-                consequence=consequence_text,
-                evidence={
-                    "seed": result.seed,
-                    "execution_status": report.status.value,
-                    "execution_stage": (
-                        None if report.execution_stage is None else report.execution_stage.value
-                    ),
-                    "failure_code": report.failure_code,
-                    "failure_reason": report.failure_reason,
-                    "effect_evidence": (
-                        None
-                        if report.effect_evidence is None
-                        else report.effect_evidence.model_dump(mode="json")
-                    ),
-                    "condition_values": condition_values,
-                },
-                episode_outcome=result.outcome.value,
-                confidence=confidence,
+            case = _mark_case_episode_eligibility(
+                DecisionCase(
+                    case_id=_stable_id("case", result.run_id, result.episode_id, report.command_id),
+                    run_id=result.run_id,
+                    episode_id=result.episode_id,
+                    source_event_id=event.event_id,
+                    source_step_id=event.step_id,
+                    command_id=report.command_id,
+                    macro_plan_id=_macro_plan_id(lineage_event.payload),
+                    semantic_action=semantic_action,
+                    objective=None,
+                    context=context,
+                    quality=quality,
+                    failure_owner=owner,
+                    consequence=consequence_text,
+                    evidence={
+                        "seed": result.seed,
+                        "execution_status": report.status.value,
+                        "execution_stage": (
+                            None if report.execution_stage is None else report.execution_stage.value
+                        ),
+                        "failure_code": report.failure_code,
+                        "failure_reason": report.failure_reason,
+                        "effect_evidence": (
+                            None
+                            if report.effect_evidence is None
+                            else report.effect_evidence.model_dump(mode="json")
+                        ),
+                        "condition_values": condition_values,
+                    },
+                    episode_outcome=result.outcome.value,
+                    confidence=confidence,
+                ),
+                result,
             )
             if not self.store.add_case(case):
                 continue
             cases.append(case)
-            lesson = self._consolidate(case, update_executable_rule=True)
+            lesson = self._consolidate(
+                case,
+                update_executable_rule=promotion_eligible,
+            )
             if lesson is not None:
                 lessons.append(lesson)
-        self._record_contradictions(cases, seed=result.seed)
+        if promotion_eligible:
+            self._record_contradictions(cases, seed=result.seed)
         self._promote_eligible_rules()
         self.last_rule_updates = tuple(
             rule
             for rule in self.store.rules()
             if rules_before.get(rule.canonical_key) != rule.model_dump_json()
         )
-        deduplicated_lessons = {
-            (lesson.signature, result.episode_id): lesson for lesson in lessons
-        }
+        deduplicated_lessons = {(lesson.signature, result.episode_id): lesson for lesson in lessons}
         return cases, list(deduplicated_lessons.values())
 
     def _promote_eligible_rules(self) -> None:
@@ -605,6 +620,25 @@ def _rejected_proposal_case(
         evidence={"classification": classification, "reason": reason, "seed": result.seed},
         episode_outcome=result.outcome.value,
         confidence=0.95,
+    )
+
+
+def _mark_case_episode_eligibility(
+    case: DecisionCase,
+    result: EpisodeResult,
+) -> DecisionCase:
+    if result.outcome is not EpisodeOutcome.ERROR:
+        return case
+    return case.model_copy(
+        update={
+            "evidence": {
+                **case.evidence,
+                "censored": True,
+                "promotion_eligible": False,
+                "promotion_exclusion_reason": "episode_outcome_error",
+                "episode_failure_reason": result.failure_reason,
+            }
+        }
     )
 
 

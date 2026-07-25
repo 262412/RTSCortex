@@ -179,18 +179,14 @@ class DeterministicTacticalAgent:
                 self._offense_by_actor[actor] = _ActorOffenseState(
                     phase="engaged",
                     entered_game_loop=(
-                        observation.game_loop
-                        if previous is None
-                        else previous.entered_game_loop
+                        observation.game_loop if previous is None else previous.entered_game_loop
                     ),
                     last_command_game_loop=observation.game_loop,
                     cooldown_until_game_loop=observation.game_loop,
                     target_tag=target_tag,
                 )
                 target_kind = (
-                    "enemy structure"
-                    if target.unit_type in ENEMY_STRUCTURE_TYPES
-                    else "enemy unit"
+                    "enemy structure" if target.unit_type in ENEMY_STRUCTURE_TYPES else "enemy unit"
                 )
                 objective = (
                     f"Reacquire and focus fire {target_kind} {target.unit_type}"
@@ -236,10 +232,7 @@ class DeterministicTacticalAgent:
         *,
         game_loop: int,
     ) -> dict[str, object] | None:
-        if (
-            report.action_name not in {"Attack_Unit", "Move_Minimap"}
-            or report.actor is None
-        ):
+        if report.action_name not in {"Attack_Unit", "Move_Minimap"} or report.actor is None:
             return None
         actor_failure_codes = {
             "actor_not_available",
@@ -247,15 +240,10 @@ class DeterministicTacticalAgent:
             "actor_selection_timeout",
         }
         failure_code = report.failure_code or "unknown_failure"
-        if (
-            report.status is not ExecutionStatus.SUCCEEDED
-            and failure_code in actor_failure_codes
-        ):
+        if report.status is not ExecutionStatus.SUCCEEDED and failure_code in actor_failure_codes:
             previous_actor_failure = self._actor_failures.get(report.actor)
             failure_count = (
-                1
-                if previous_actor_failure is None
-                else previous_actor_failure.failure_count + 1
+                1 if previous_actor_failure is None else previous_actor_failure.failure_count + 1
             )
             until = game_loop + self.actor_quarantine_game_loops
             self._actor_failures[report.actor] = _ActorFailureState(
@@ -275,6 +263,12 @@ class DeterministicTacticalAgent:
             }
         if report.status is ExecutionStatus.SUCCEEDED:
             self._actor_failures.pop(report.actor, None)
+        if report.action_name == "Move_Minimap":
+            return self._record_move_execution(
+                report,
+                actor=report.actor,
+                game_loop=game_loop,
+            )
         if report.action_name != "Attack_Unit":
             return None
         target = next(
@@ -291,10 +285,7 @@ class DeterministicTacticalAgent:
         if report.status is ExecutionStatus.SUCCEEDED:
             self._target_failures.pop(key, None)
             evidence = report.effect_evidence
-            if (
-                evidence is not None
-                and evidence.confirmation_kind == "target_removed"
-            ):
+            if evidence is not None and evidence.confirmation_kind == "target_removed":
                 self._known_enemy_structures.pop(target, None)
             return {
                 "actor": report.actor,
@@ -310,11 +301,7 @@ class DeterministicTacticalAgent:
         previous = self._target_failures.get(key)
         failure_count = 1 if previous is None else previous.failure_count + 1
         quarantined = immediate or failure_count >= self.target_retry_limit
-        until = (
-            game_loop + self.target_quarantine_game_loops
-            if quarantined
-            else game_loop
-        )
+        until = game_loop + self.target_quarantine_game_loops if quarantined else game_loop
         self._target_failures[key] = _TargetFailureState(
             failure_count=failure_count,
             quarantined_until_game_loop=until,
@@ -329,6 +316,74 @@ class DeterministicTacticalAgent:
             "failure_count": failure_count,
             "failure_code": failure_code,
             "quarantined_until_game_loop": until if quarantined else None,
+        }
+
+    def _record_move_execution(
+        self,
+        report: ExecutionReport,
+        *,
+        actor: str,
+        game_loop: int,
+    ) -> dict[str, object] | None:
+        offense = self._offense_by_actor.get(actor)
+        retreat = self._retreat_by_actor.get(actor)
+        if offense is None and retreat is None:
+            return None
+        if report.status is ExecutionStatus.SUCCEEDED:
+            if retreat is not None:
+                retreat.phase = "arrived"
+                retreat.cooldown_until_game_loop = max(
+                    retreat.cooldown_until_game_loop,
+                    game_loop + self.retreat_cooldown_game_loops,
+                )
+                return {
+                    "actor": actor,
+                    "state": "retreat_arrived",
+                    "game_loop": game_loop,
+                }
+            assert offense is not None
+            if offense.waypoint is not None:
+                offense.obsolete_waypoints[offense.waypoint] = _PERMANENT_WAYPOINT_OBSOLETE_LOOP
+            offense.phase = "searching"
+            offense.waypoint = None
+            offense.best_distance = None
+            offense.last_progress_game_loop = game_loop
+            offense.cooldown_until_game_loop = game_loop + self.reacquire_cooldown_game_loops
+            return {
+                "actor": actor,
+                "state": "offense_arrived",
+                "game_loop": game_loop,
+            }
+
+        if report.status is not ExecutionStatus.FAILED:
+            return None
+        failure_code = report.failure_code or "unknown_failure"
+        if retreat is not None:
+            retreat.cooldown_until_game_loop = max(
+                retreat.cooldown_until_game_loop,
+                game_loop + self.retreat_cooldown_game_loops,
+            )
+            return {
+                "actor": actor,
+                "state": "retreat_cooldown",
+                "failure_code": failure_code,
+                "cooldown_until_game_loop": retreat.cooldown_until_game_loop,
+            }
+        assert offense is not None
+        if offense.waypoint is not None:
+            offense.obsolete_waypoints[offense.waypoint] = (
+                game_loop + self.offense_waypoint_retry_game_loops
+            )
+        offense.phase = "arrived"
+        offense.waypoint = None
+        offense.best_distance = None
+        offense.last_progress_game_loop = game_loop
+        offense.cooldown_until_game_loop = game_loop + self.reacquire_cooldown_game_loops
+        return {
+            "actor": actor,
+            "state": "offense_waypoint_failed",
+            "failure_code": failure_code,
+            "cooldown_until_game_loop": offense.cooldown_until_game_loop,
         }
 
     def _offense_search_intents(
@@ -371,9 +426,7 @@ class DeterministicTacticalAgent:
                     distance = math.dist(centroid, state.waypoint)
                     if distance <= self.offense_arrival_radius:
                         state.phase = "searching"
-                        state.obsolete_waypoints[state.waypoint] = (
-                            _PERMANENT_WAYPOINT_OBSOLETE_LOOP
-                        )
+                        state.obsolete_waypoints[state.waypoint] = _PERMANENT_WAYPOINT_OBSOLETE_LOOP
                         state.waypoint = None
                         state.best_distance = None
                         state.cooldown_until_game_loop = (
@@ -383,10 +436,7 @@ class DeterministicTacticalAgent:
                         # The next feature observation can expose a structure
                         # Attack_Unit candidate before this actor moves again.
                         continue
-                    elif (
-                        state.best_distance is None
-                        or distance < state.best_distance - 0.5
-                    ):
+                    elif state.best_distance is None or distance < state.best_distance - 0.5:
                         state.best_distance = distance
                         state.last_progress_game_loop = observation.game_loop
                     elif (
@@ -404,10 +454,7 @@ class DeterministicTacticalAgent:
                     state.best_distance = None
                 else:
                     continue
-            if (
-                state is not None
-                and observation.game_loop < state.cooldown_until_game_loop
-            ):
+            if state is not None and observation.game_loop < state.cooldown_until_game_loop:
                 continue
 
             available = [
@@ -421,9 +468,7 @@ class DeterministicTacticalAgent:
                 available,
             )
             next_index = candidates.index(waypoint)
-            waypoint_distance = (
-                None if centroid is None else math.dist(centroid, waypoint)
-            )
+            waypoint_distance = None if centroid is None else math.dist(centroid, waypoint)
             if state is None:
                 state = _ActorOffenseState(
                     phase=(
@@ -548,9 +593,8 @@ class DeterministicTacticalAgent:
                     observation.game_loop + self.retreat_cooldown_game_loops,
                 )
 
-            overwhelmed = (
-                assessment.threat_level is ThreatLevel.CRITICAL
-                and len(enemies) > len(units)
+            overwhelmed = assessment.threat_level is ThreatLevel.CRITICAL and len(enemies) > len(
+                units
             )
             should_retreat = minimum_health <= self.retreat_health_threshold or overwhelmed
             if not should_retreat:
@@ -567,10 +611,7 @@ class DeterministicTacticalAgent:
                         ),
                     )
                 continue
-            if (
-                state is not None
-                and observation.game_loop < state.cooldown_until_game_loop
-            ):
+            if state is not None and observation.game_loop < state.cooldown_until_game_loop:
                 continue
             if state is None:
                 state = _ActorRetreatState(
@@ -664,10 +705,7 @@ class DeterministicTacticalAgent:
             if target is None:
                 continue
             failure = self._target_failures.get((actor, tag))
-            if (
-                failure is not None
-                and failure.quarantined_until_game_loop > observation.game_loop
-            ):
+            if failure is not None and failure.quarantined_until_game_loop > observation.game_loop:
                 continue
             if (
                 failure is not None

@@ -258,6 +258,7 @@ class EffectEvidence(ContractModel):
     target_position: tuple[float, float] | None = None
     target_tag: str | None = None
     actor_tag: str | None = None
+    actor_tags: list[str] = Field(default_factory=list)
     builder_tag: str | None = None
     requested_producer_tag: str | None = None
     producer_tag: str | None = None

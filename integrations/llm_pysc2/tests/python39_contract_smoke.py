@@ -110,6 +110,9 @@ def _assert_gas_rebalance_uses_worker_management_flag() -> None:
 
 def _assert_observation_gap_watchdog_preempts_optional_gathering() -> None:
     assert "_rtscortex_force_runtime_decision" in inspect.getsource(main_agent_func4)
+    main_step = inspect.getsource(MainAgent.step)
+    frequency_guard = main_step[main_step.index("# LLM decision frequency control") :]
+    assert "not getattr(self, '_rtscortex_force_runtime_decision', False)" in frequency_guard
 
 
 def _assert_gather_target_is_visible_and_in_bounds() -> None:

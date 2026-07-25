@@ -316,7 +316,11 @@ def semantic_argument_candidates(
 def minimap_scout_candidates(observation: Any) -> list[list[int]]:
     """Return unexplored pathable minimap points for camera scouting."""
 
-    return _movement_minimap_candidates(observation, include_home=False)
+    return _movement_minimap_candidates(
+        observation,
+        include_home=False,
+        fill_map=True,
+    )
 
 
 def expansion_anchor_candidates(
@@ -401,9 +405,7 @@ def production_source_tag(
         return None
     research = research_spec(action_name)
     if research is not None:
-        if research.upgrade_id in {
-            int(value) for value in _value(observation, "upgrades", ())
-        }:
+        if research.upgrade_id in {int(value) for value in _value(observation, "upgrades", ())}:
             return None
         if any(
             (active_spec := research_spec_for_order(order_id)) is not None
@@ -619,8 +621,7 @@ class TimeStepExtractor:
                 unit_names=self.unit_names,
             ),
             "units": [
-                self._extract_unit(unit, minimap_transform=minimap_transform)
-                for unit in raw_units
+                self._extract_unit(unit, minimap_transform=minimap_transform) for unit in raw_units
             ],
             "upgrades": [
                 self.upgrade_names.get(int(value), f"upgrade:{int(value)}")
@@ -1032,9 +1033,7 @@ def _available_team_actions(
             unit_names=unit_names,
             include_home_minimap=agent.name.startswith("CombatGroup"),
             builder_tags=(
-                actor_tags
-                if agent.name == "Builder" and build_spec is not None
-                else None
+                actor_tags if agent.name == "Builder" and build_spec is not None else None
             ),
             known_expansion_resources=getattr(
                 agent,
@@ -1359,6 +1358,7 @@ def _movement_minimap_candidates(
     *,
     limit: int = 8,
     include_home: bool = False,
+    fill_map: bool = False,
 ) -> list[list[int]]:
     """Return stable pathable scouting targets across the minimap.
 
@@ -1406,7 +1406,7 @@ def _movement_minimap_candidates(
     resource_targets.sort()
     desired = [(x, y) for _, y, x in resource_targets]
 
-    if not desired:
+    if fill_map or not desired:
         last_x, last_y = width - 1, height - 1
         desired.extend(
             (round(last_x * x_fraction / 8), round(last_y * y_fraction / 8))
@@ -1606,9 +1606,7 @@ def _expansion_anchor_candidates(
         and bool(_value(unit, "is_on_screen", True))
         and int(_value(unit, "display_type", 1)) == 1
     }
-    known_resource_tags = {
-        int(_value(unit, "tag", 0)) for unit in known_resources
-    }
+    known_resource_tags = {int(_value(unit, "tag", 0)) for unit in known_resources}
     resources_by_tag = {
         int(_value(unit, "tag", 0)): unit
         for unit in (*known_resources, *raw_units)
@@ -2046,12 +2044,16 @@ def resolve_screen_point_world_target(
     if not (0 <= projected[0] < width and 0 <= projected[1] < height):
         return None
     candidates = (
-        [candidate[0] for candidate in _argument_candidates(
-            observation,
-            MULE_ACTION,
-            unit_names=unit_names or {},
-            include_home_minimap=False,
-        ) or []]
+        [
+            candidate[0]
+            for candidate in _argument_candidates(
+                observation,
+                MULE_ACTION,
+                unit_names=unit_names or {},
+                include_home_minimap=False,
+            )
+            or []
+        ]
         if action_name == MULE_ACTION
         else _movement_screen_candidates(
             observation,

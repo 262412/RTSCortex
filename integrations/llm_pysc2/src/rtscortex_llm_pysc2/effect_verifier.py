@@ -25,6 +25,7 @@ MOVE_RAW_FUNCTION_ID = 13
 MOVE_MINIMAP_ARRIVAL_RADIUS = 4.0
 MOVE_GAME_LOOPS_PER_MINIMAP_UNIT = 10.0
 MOVE_SETTLEMENT_GRACE_GAME_LOOPS = 32
+MOVE_ORDER_ACQUISITION_TIMEOUT_GAME_LOOPS = 16
 POST_ORDER_EFFECT_GRACE_GAME_LOOPS = 32
 
 
@@ -226,9 +227,7 @@ class ActionEffectVerifier:
         *,
         producer_tag: Optional[int] = None,
         actor_tags: Sequence[int] = (),
-        minimap_transform: Optional[
-            tuple[float, float, float, float, float]
-        ] = None,
+        minimap_transform: Optional[tuple[float, float, float, float, float]] = None,
     ) -> None:
         """Capture state immediately before the final effectful primitive."""
 
@@ -258,10 +257,7 @@ class ActionEffectVerifier:
             normalized_tags = tuple(
                 dict.fromkeys(
                     int(tag)
-                    for tag in (
-                        actor_tags
-                        or (() if builder_tag is None else (int(builder_tag),))
-                    )
+                    for tag in (actor_tags or (() if builder_tag is None else (int(builder_tag),)))
                     if int(tag) > 0
                 )
             )
@@ -436,10 +432,7 @@ class ActionEffectVerifier:
                 pending.latest_actor_position,
                 pending.target_position,
             )
-            if (
-                distance_to_target is not None
-                and distance_to_target <= MOVE_MINIMAP_ARRIVAL_RADIUS
-            ):
+            if distance_to_target is not None and distance_to_target <= MOVE_MINIMAP_ARRIVAL_RADIUS:
                 verdicts.append(
                     EffectVerdict(
                         command_id,
@@ -451,6 +444,38 @@ class ActionEffectVerifier:
                 del self._pending_moves[command_id]
                 continue
             elapsed = game_loop - pending.accepted_game_loop
+            if not actors and elapsed >= self.timeout_game_loops:
+                verdicts.append(
+                    EffectVerdict(
+                        command_id,
+                        False,
+                        (
+                            "Move_Minimap did not arrive after "
+                            f"{elapsed} game loops (actor is not observable)"
+                        ),
+                        status="failed",
+                        failure_code="actor_not_observable",
+                        evidence=self._move_effect_evidence(pending, confirmed=False),
+                    )
+                )
+                del self._pending_moves[command_id]
+                continue
+            if not pending.move_order_seen and elapsed >= MOVE_ORDER_ACQUISITION_TIMEOUT_GAME_LOOPS:
+                verdicts.append(
+                    EffectVerdict(
+                        command_id,
+                        False,
+                        (
+                            "Move_Minimap was accepted but no bound actor received "
+                            f"raw move order {MOVE_RAW_FUNCTION_ID}"
+                        ),
+                        status="failed",
+                        failure_code="move_order_not_observed",
+                        evidence=self._move_effect_evidence(pending, confirmed=False),
+                    )
+                )
+                del self._pending_moves[command_id]
+                continue
             effective_timeout = self._move_effective_timeout(pending)
             if elapsed < effective_timeout:
                 continue
@@ -539,6 +564,7 @@ class ActionEffectVerifier:
             "target_position": pending.target_position,
             "target_tag": None,
             "actor_tag": None if pending.actor_tag is None else hex(pending.actor_tag),
+            "actor_tags": [hex(tag) for tag in pending.actor_tags],
             "builder_tag": None if pending.actor_tag is None else hex(pending.actor_tag),
             "baseline_structure_tags": [],
             "observed_structure_tag": None,
@@ -578,8 +604,7 @@ class ActionEffectVerifier:
         if distance is None:
             return self.timeout_game_loops
         travel_budget = math.ceil(
-            distance * MOVE_GAME_LOOPS_PER_MINIMAP_UNIT
-            + MOVE_SETTLEMENT_GRACE_GAME_LOOPS
+            distance * MOVE_GAME_LOOPS_PER_MINIMAP_UNIT + MOVE_SETTLEMENT_GRACE_GAME_LOOPS
         )
         return max(self.timeout_game_loops, travel_budget)
 
@@ -914,29 +939,19 @@ def _units_by_tags(observation: Any, tags: Sequence[int]) -> tuple[Any, ...]:
     return tuple(
         unit
         for unit in _value(observation, "raw_units", ())
-        if int(_value(unit, "tag", -1)) in wanted
-        and int(_value(unit, "alliance", 1)) == 1
+        if int(_value(unit, "tag", -1)) in wanted and int(_value(unit, "alliance", 1)) == 1
     )
 
 
 def _combined_unit_orders(units: Sequence[Any]) -> tuple[int, ...]:
-    return tuple(
-        dict.fromkeys(
-            order
-            for unit in units
-            for order in _unit_orders(unit)
-        )
-    )
+    return tuple(dict.fromkeys(order for unit in units for order in _unit_orders(unit)))
 
 
 def _minimap_centroid(
     units: Sequence[Any],
     transform: tuple[float, float, float, float, float],
 ) -> Optional[tuple[float, float]]:
-    positions = [
-        _world_to_minimap_position(_unit_position(unit), transform)
-        for unit in units
-    ]
+    positions = [_world_to_minimap_position(_unit_position(unit), transform) for unit in units]
     present = [position for position in positions if position is not None]
     if not present:
         return None

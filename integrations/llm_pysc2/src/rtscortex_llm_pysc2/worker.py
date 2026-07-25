@@ -172,9 +172,7 @@ class WorkerSettings:
             )
         )
         if expansion_scout_interval_game_loops < 16:
-            raise RuntimeError(
-                "RTSCORTEX_EXPANSION_SCOUT_INTERVAL_GAME_LOOPS must be at least 16"
-            )
+            raise RuntimeError("RTSCORTEX_EXPANSION_SCOUT_INTERVAL_GAME_LOOPS must be at least 16")
         pause_until_first_plan = _environment_bool("RTSCORTEX_PAUSE_UNTIL_FIRST_PLAN", False)
         console_enabled = _environment_bool("RTSCORTEX_CONSOLE_ENABLED", False)
         console_frame_fps = float(os.environ.get("RTSCORTEX_CONSOLE_FRAME_FPS", "2"))
@@ -218,6 +216,7 @@ class ExpansionScoutController:
 
     def __init__(self, *, interval_game_loops: int) -> None:
         self.interval_game_loops = int(interval_game_loops)
+        self.generation_id = 1
         self.last_scout_game_loop: Optional[int] = None
         self.soft_blocked_since_game_loop: Optional[int] = None
         self.visited_waypoints: set[tuple[int, int]] = set()
@@ -226,14 +225,26 @@ class ExpansionScoutController:
         self.pending_game_loop: int | None = None
         self.exhausted = False
         self.state = "not_discovered_yet"
+        self.available_anchors: tuple[int, ...] = ()
+        self.rejected_anchors: set[int] = set()
 
     def request_immediate_progress(self, *, game_loop: int) -> None:
         """Resume the bounded sweep immediately after an anchor is invalidated."""
 
-        self.exhausted = False
+        if self.exhausted:
+            return
         self.state = "search_in_progress"
         self.last_scout_game_loop = None
         self.soft_blocked_since_game_loop = int(game_loop) - self.interval_game_loops
+
+    def observe_anchors(
+        self,
+        *,
+        available: Collection[int],
+        rejected: Collection[int],
+    ) -> None:
+        self.available_anchors = tuple(sorted({int(tag) for tag in available}))
+        self.rejected_anchors.update(int(tag) for tag in rejected)
 
     def reject_pending_waypoint(self) -> None:
         """Keep a waypoint eligible when its camera primitive never reached SC2."""
@@ -301,10 +312,7 @@ class ExpansionScoutController:
             if self.soft_blocked_since_game_loop is None:
                 self.soft_blocked_since_game_loop = int(game_loop)
                 return None
-            if (
-                game_loop - self.soft_blocked_since_game_loop
-                < self.interval_game_loops
-            ):
+            if game_loop - self.soft_blocked_since_game_loop < self.interval_game_loops:
                 return None
         else:
             self.soft_blocked_since_game_loop = None
@@ -321,13 +329,15 @@ class ExpansionScoutController:
         return waypoint
 
     @property
-    def progress_alerts(self) -> tuple[str, str]:
+    def progress_alerts(self) -> tuple[str, ...]:
+        available = ",".join(hex(tag) for tag in self.available_anchors) or "none"
+        rejected = ",".join(hex(tag) for tag in sorted(self.rejected_anchors)) or "none"
         return (
             f"expansion_scout_state={self.state}",
-            (
-                "expansion_scout_waypoints="
-                f"{len(self.visited_waypoints)}/{len(self.waypoint_queue)}"
-            ),
+            f"expansion_scout_generation={self.generation_id}",
+            (f"expansion_scout_waypoints={len(self.visited_waypoints)}/{len(self.waypoint_queue)}"),
+            f"expansion_scout_available_anchors={available}",
+            f"expansion_scout_rejected_anchors={rejected}",
         )
 
 
@@ -413,9 +423,7 @@ class GasWorkerController:
         if gas_position is None:
             assignment.phase = "target_gas"
             assignment.primitive_count += 1
-            return actions.FUNCTIONS.llm_pysc2_move_camera(
-                _worker_camera_position(main_agent, gas)
-            )
+            return actions.FUNCTIONS.llm_pysc2_move_camera(_worker_camera_position(main_agent, gas))
         if 264 not in available:
             return None
         assignment.phase = "confirm"
@@ -658,9 +666,8 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
             if _requires_explicit_production_chain(action_name):
                 self._prime_production_chain(action)
             elif (
-                (build_spec := BUILD_SPECS.get(action_name)) is not None
-                and build_spec.placement_kind == "expansion"
-            ):
+                build_spec := BUILD_SPECS.get(action_name)
+            ) is not None and build_spec.placement_kind == "expansion":
                 _prime_persistent_expansion_chain(self, action)
         if _next_primitive_is_screen_build(semantic_action_name, self.func_list):
             command_id = self.broker.command_id_for(
@@ -1561,6 +1568,7 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
             obs.observation,
         )
         _normalize_new_unit_queue(self)
+        _refresh_combat_team_membership(self, obs.observation)
         _abort_stalled_actor_selection(self)
         _enforce_orchestration_primitive_budget(self, obs.observation)
         self._settle_previous_primitive(obs)
@@ -1638,8 +1646,7 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
                 or getattr(self, "_pending_primitive", None) is not None
                 or bool(getattr(self, "unit_uid_appear", ()))
                 or any(
-                    bool(getattr(agent, "func_list", ()))
-                    or bool(getattr(agent, "action_list", ()))
+                    bool(getattr(agent, "func_list", ())) or bool(getattr(agent, "action_list", ()))
                     for agent in getattr(self, "agents", {}).values()
                 )
             ),
@@ -2037,27 +2044,26 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
         if not suppressed_anchors.issubset(self._last_suppressed_expansion_anchors):
             self.expansion_scout.request_immediate_progress(game_loop=game_loop)
         self._last_suppressed_expansion_anchors = suppressed_anchors
-        anchor_available = bool(
-            expansion_anchor_candidates(
-                obs.observation,
-                unit_names=extractor.unit_names,
-                known_expansion_resources=extractor.known_expansion_resources,
-                excluded_expansion_anchors=suppressed_anchors,
-            )
+        anchor_candidates = expansion_anchor_candidates(
+            obs.observation,
+            unit_names=extractor.unit_names,
+            known_expansion_resources=extractor.known_expansion_resources,
+            excluded_expansion_anchors=suppressed_anchors,
         )
+        self.expansion_scout.observe_anchors(
+            available=anchor_candidates,
+            rejected=suppressed_anchors,
+        )
+        anchor_available = bool(anchor_candidates)
         hard_blocked = (
             blocked
             or self.decision_broker.last_decision_game_loop is None
             or bool(getattr(self, "unit_uid_appear", ()))
             or getattr(self, "_pending_primitive", None) is not None
         )
-        soft_blocked = (
-            bool(getattr(self, "main_loop_lock", False))
-            or any(
-                bool(getattr(agent, "func_list", ()))
-                or bool(getattr(agent, "action_list", ()))
-                for agent in getattr(self, "agents", {}).values()
-            )
+        soft_blocked = bool(getattr(self, "main_loop_lock", False)) or any(
+            bool(getattr(agent, "func_list", ())) or bool(getattr(agent, "action_list", ()))
+            for agent in getattr(self, "agents", {}).values()
         )
         was_exhausted = self.expansion_scout.exhausted
         waypoint = self.expansion_scout.next_waypoint(
@@ -2448,9 +2454,7 @@ def _gas_assignment_choice(
         )
         for gas, gas_workers in gas_slots:
             assigned_non_builders = {
-                int(tag)
-                for tag in (gas_workers or ())
-                if int(tag) not in reserved_builder_tags
+                int(tag) for tag in (gas_workers or ()) if int(tag) not in reserved_builder_tags
             }
             if gas is None or len(assigned_non_builders) >= 3:
                 continue
@@ -2460,9 +2464,7 @@ def _gas_assignment_choice(
             current_gas = raw_by_tag.get(gas_tag)
             if progress < 1.0 or current_gas is None:
                 continue
-            for worker_tag in sorted(
-                set(int(tag) for tag in info.get("worker_m_tag_list", ()))
-            ):
+            for worker_tag in sorted(set(int(tag) for tag in info.get("worker_m_tag_list", ()))):
                 if worker_tag in reserved_builder_tags:
                     continue
                 worker = raw_by_tag.get(worker_tag)
@@ -2516,23 +2518,24 @@ def _gas_assignment_is_confirmed(
                 if (
                     candidate_gas is not None
                     and int(_observation_value(candidate_gas, "tag", 0)) == gas_tag
-                    and worker_tag in {
-                        int(tag) for tag in info.get(worker_key, ())
-                    }
+                    and worker_tag in {int(tag) for tag in info.get(worker_key, ())}
                 ):
                     return True
     if int(_observation_value(worker, "buff_id_0", 0)) != 274:
         return False
-    return math.dist(
-        (
-            float(_observation_value(worker, "x", 0.0)),
-            float(_observation_value(worker, "y", 0.0)),
-        ),
-        (
-            float(_observation_value(gas, "x", 0.0)),
-            float(_observation_value(gas, "y", 0.0)),
-        ),
-    ) <= 10.0
+    return (
+        math.dist(
+            (
+                float(_observation_value(worker, "x", 0.0)),
+                float(_observation_value(worker, "y", 0.0)),
+            ),
+            (
+                float(_observation_value(gas, "x", 0.0)),
+                float(_observation_value(gas, "y", 0.0)),
+            ),
+        )
+        <= 10.0
+    )
 
 
 def _prime_deterministic_gas_rebalance(
@@ -3062,9 +3065,7 @@ def _enforce_orchestration_primitive_budget(
         agent,
         team_name=team_name,
         failure_code="orchestration_budget_exceeded",
-        failure_reason=(
-            f"camera/selection chain exceeded its {budget}-primitive budget"
-        ),
+        failure_reason=(f"camera/selection chain exceeded its {budget}-primitive budget"),
     )
     _force_group_stalled_new_unit(main_agent, observation)
     main_agent._orchestration_budget_key = None
@@ -3086,6 +3087,9 @@ def _recover_observation_gap(main_agent: Any, observation: Any) -> bool:
         and str(getattr(dispatch, "origin", "")) == "orchestration"
         and not isinstance(getattr(agent, "last_execution_abort", None), Mapping)
     ):
+        actor_tag = _execution_unit_tag(agent)
+        if actor_tag is not None and not _own_unit_is_living(observation, actor_tag):
+            _quarantine_unit_tag(main_agent, actor_tag)
         _abort_orchestration_chain(
             main_agent,
             agent,
@@ -3101,6 +3105,124 @@ def _recover_observation_gap(main_agent: Any, observation: Any) -> bool:
     return recovered
 
 
+def _refresh_combat_team_membership(main_agent: Any, observation: Any) -> int:
+    """Prune confirmed-dead combat tags and deterministically rebind active heads."""
+
+    agents = getattr(main_agent, "agents", {})
+    if not isinstance(agents, Mapping):
+        return 0
+    living_by_tag = {
+        int(_observation_value(unit, "tag", 0)): unit
+        for unit in _observation_value(observation, "raw_units", ())
+        if int(_observation_value(unit, "tag", 0)) > 0
+        and int(_observation_value(unit, "alliance", 0)) == 1
+        and float(_observation_value(unit, "build_progress", 0.0)) in {1.0, 100.0}
+    }
+    changed = 0
+    for agent_name, agent in sorted(agents.items()):
+        if not str(agent_name).startswith("CombatGroup"):
+            continue
+        teams = [team for team in getattr(agent, "teams", ()) if isinstance(team, dict)]
+        team_by_name = {str(team.get("name", "")): team for team in teams}
+        for team in teams:
+            allowed_types = {int(value) for value in team.get("unit_type", ())}
+            configured = [int(tag) for tag in team.get("unit_tags", ()) if int(tag) > 0]
+            living = [
+                tag
+                for tag in configured
+                if tag in living_by_tag
+                and (
+                    not allowed_types
+                    or int(_observation_value(living_by_tag[tag], "unit_type", -1)) in allowed_types
+                )
+            ]
+            removed = set(configured) - set(living)
+            if not removed:
+                continue
+            for tag in removed:
+                _quarantine_unit_tag(main_agent, tag)
+            team["unit_tags"] = living
+            team["unit_tags_selected"] = [
+                int(tag) for tag in team.get("unit_tags_selected", ()) if int(tag) in living
+            ]
+            team["obs"] = []
+            team["pos"] = []
+            team["minimap_pos"] = []
+            changed += len(removed)
+
+        living_agent_tags = {
+            int(tag)
+            for team in teams
+            for tag in team.get("unit_tags", ())
+            if int(tag) in living_by_tag
+        }
+        agent.unit_tag_list = [
+            int(tag) for tag in getattr(agent, "unit_tag_list", ()) if int(tag) in living_agent_tags
+        ]
+        agent.unit_raw_list = [
+            living_by_tag[tag] for tag in agent.unit_tag_list if tag in living_by_tag
+        ]
+        queued_tags = list(getattr(agent, "team_unit_tag_list", ()))
+        queued_teams = list(getattr(agent, "team_unit_team_list", ()))
+        queued_pairs = []
+        for index in range(min(len(queued_tags), len(queued_teams))):
+            tag = int(queued_tags[index])
+            team_name = str(queued_teams[index])
+            team_tags = {
+                int(value) for value in team_by_name.get(team_name, {}).get("unit_tags", ())
+            }
+            if tag in living_agent_tags and tag in team_tags:
+                queued_pairs.append((tag, team_name))
+        agent.team_unit_tag_list = [tag for tag, _team_name in queued_pairs]
+        agent.team_unit_team_list = [team_name for _tag, team_name in queued_pairs]
+
+        current_tag = _execution_unit_tag(agent)
+        current_team_name = _execution_team_name(agent)
+        if current_tag is None or current_tag in living_agent_tags:
+            continue
+        current_team = team_by_name.get(str(current_team_name or ""))
+        replacements = (
+            []
+            if current_team is None
+            else sorted(
+                int(tag)
+                for tag in current_team.get("unit_tags", ())
+                if int(tag) in living_agent_tags
+            )
+        )
+        if replacements:
+            agent.team_unit_tag_curr = replacements[0]
+            agent._rtscortex_last_combat_rebind = (current_tag, replacements[0])
+            continue
+        action_name = str(getattr(agent, "curr_action_name", "") or "")
+        if action_name and action_name != "No_Operation" and agent._is_executing_actions():
+            _abort_orchestration_chain(
+                main_agent,
+                agent,
+                team_name=str(current_team_name or ""),
+                failure_code="actor_not_available",
+                failure_reason="combat team head disappeared from the raw observation",
+            )
+    return changed
+
+
+def _own_unit_is_living(observation: Any, tag: int) -> bool:
+    return any(
+        int(_observation_value(unit, "tag", 0)) == int(tag)
+        and int(_observation_value(unit, "alliance", 0)) == 1
+        and float(_observation_value(unit, "build_progress", 0.0)) in {1.0, 100.0}
+        for unit in _observation_value(observation, "raw_units", ())
+    )
+
+
+def _quarantine_unit_tag(main_agent: Any, tag: int) -> None:
+    quarantine = getattr(main_agent, "_rtscortex_unit_quarantine", None)
+    if not isinstance(quarantine, set):
+        quarantine = set()
+        main_agent._rtscortex_unit_quarantine = quarantine
+    quarantine.add(int(tag))
+
+
 def _builder_selection_lease_active(main_agent: Any) -> bool:
     """Keep optional automation from changing selection during a build chain."""
 
@@ -3113,13 +3235,10 @@ def _builder_selection_lease_active(main_agent: Any) -> bool:
         if isinstance(semantic_action, Mapping)
         else str(getattr(builder, "curr_action_name", "") or "")
     )
-    return (
-        action_name.startswith("Build_")
-        and (
-            bool(getattr(builder, "func_list", ()))
-            or bool(getattr(builder, "action_list", ()))
-            or semantic_action is not None
-        )
+    return action_name.startswith("Build_") and (
+        bool(getattr(builder, "func_list", ()))
+        or bool(getattr(builder, "action_list", ()))
+        or semantic_action is not None
     )
 
 
@@ -3142,6 +3261,8 @@ def _abort_orchestration_chain(
     agent.func_list.clear()
     agent.action_list.clear()
     agent._rtscortex_semantic_action = None
+    agent.team_unit_tag_curr = None
+    agent.team_unit_team_curr = None
     main_agent._actor_selection_retry_key = None
     main_agent._actor_selection_attempts = 0
 
@@ -3357,8 +3478,7 @@ def _translated_build_position(
     """Return the actual final screen target emitted by an upstream build translator."""
 
     if (
-        not action_name.startswith("Build_")
-        and action_name != "Effect_CalldownMULE_Screen"
+        not action_name.startswith("Build_") and action_name != "Effect_CalldownMULE_Screen"
     ) or not isinstance(arguments, (list, tuple)):
         return None
     for value in reversed(arguments):
@@ -3393,22 +3513,19 @@ def _execution_unit_tag(agent: Any) -> Optional[int]:
 
 
 def _execution_unit_tags(agent: Any, observation: Any) -> tuple[int, ...]:
-    """Return the living raw tags owned by the currently routed actor team."""
+    """Return the living tags actually selected for the routed actor command."""
 
     team_name = _execution_team_name(agent)
     team = next(
         (
             value
             for value in getattr(agent, "teams", ())
-            if isinstance(value, Mapping)
-            and str(value.get("name", "")) == str(team_name or "")
+            if isinstance(value, Mapping) and str(value.get("name", "")) == str(team_name or "")
         ),
         None,
     )
     configured = (
-        ()
-        if team is None
-        else tuple(int(tag) for tag in team.get("unit_tags", ()) if int(tag) > 0)
+        () if team is None else tuple(int(tag) for tag in team.get("unit_tags", ()) if int(tag) > 0)
     )
     current = _execution_unit_tag(agent)
     wanted = set(configured)
@@ -3419,7 +3536,18 @@ def _execution_unit_tags(agent: Any, observation: Any) -> tuple[int, ...]:
         for unit in _observation_value(observation, "raw_units", ())
         if int(_observation_value(unit, "alliance", 0)) == 1
     }
-    return tuple(sorted(wanted & living))
+    selected = {
+        int(_observation_value(unit, "tag", 0))
+        for unit in _observation_value(observation, "feature_units", ())
+        if int(_observation_value(unit, "alliance", 0)) == 1
+        and bool(_observation_value(unit, "is_selected", False))
+        and int(_observation_value(unit, "tag", 0)) in wanted & living
+    }
+    if selected:
+        return tuple(sorted(selected))
+    if current is not None and current in living:
+        return (current,)
+    return ()
 
 
 def _agent_world_to_minimap_transform(
@@ -3569,9 +3697,7 @@ def _translate_persistent_expansion_camera_primitive(
     agent._rtscortex_translation_ordinal += 1
     total = int(agent._rtscortex_translation_total)
     target_tag = _tag_argument(action)
-    known_resources = tuple(
-        getattr(agent, "_rtscortex_known_expansion_resources", ())
-    )
+    known_resources = tuple(getattr(agent, "_rtscortex_known_expansion_resources", ()))
     reason: Optional[str] = None
     camera_position: Optional[tuple[int, int]] = None
     if target_tag is None:
@@ -3609,26 +3735,21 @@ def _translate_persistent_expansion_camera_primitive(
             )
             if mineral_count < 5:
                 reason = (
-                    f"persistent resource cluster for {hex(target_tag)} "
-                    "has fewer than 5 minerals"
+                    f"persistent resource cluster for {hex(target_tag)} has fewer than 5 minerals"
                 )
             else:
                 center_x = sum(
-                    float(_observation_value(resource, "x", 0.0))
-                    for resource in nearby
+                    float(_observation_value(resource, "x", 0.0)) for resource in nearby
                 ) / len(nearby)
                 center_y = sum(
-                    float(_observation_value(resource, "y", 0.0))
-                    for resource in nearby
+                    float(_observation_value(resource, "y", 0.0)) for resource in nearby
                 ) / len(nearby)
                 camera_position = (
                     int(center_x + float(agent.world_x_offset)),
                     int(
                         max(
                             0.0,
-                            float(agent.world_range)
-                            - center_y
-                            + float(agent.world_y_offset),
+                            float(agent.world_range) - center_y + float(agent.world_y_offset),
                         )
                     ),
                 )
@@ -3770,8 +3891,7 @@ def _production_source_invalid_reason(
     minimum_energy = float(getattr(spec, "minimum_energy", 0.0))
     if float(value("energy", 0.0)) < minimum_energy:
         return (
-            f"{spec.action_name} producer {hex(source_tag)} has less than "
-            f"{minimum_energy:g} energy"
+            f"{spec.action_name} producer {hex(source_tag)} has less than {minimum_energy:g} energy"
         )
     required_addon = getattr(spec, "required_addon_type", None)
     if required_addon is not None:
@@ -3781,9 +3901,7 @@ def _production_source_invalid_reason(
                 unit
                 for unit in raw_units
                 if int(
-                    unit.get("tag", -1)
-                    if isinstance(unit, Mapping)
-                    else getattr(unit, "tag", -1)
+                    unit.get("tag", -1) if isinstance(unit, Mapping) else getattr(unit, "tag", -1)
                 )
                 == addon_tag
             ),
@@ -3791,10 +3909,7 @@ def _production_source_invalid_reason(
         )
         addon_type = None if addon is None else _worker_unit_name(addon, unit_names)
         if addon_type != required_addon:
-            return (
-                f"{spec.action_name} producer {hex(source_tag)} no longer has "
-                f"{required_addon}"
-            )
+            return f"{spec.action_name} producer {hex(source_tag)} no longer has {required_addon}"
     if bool(getattr(spec, "requires_idle", True)) and (
         int(value("active", 0)) != 0 or int(value("order_length", 0)) != 0
     ):
@@ -4421,9 +4536,7 @@ def _suppress_failed_expansion_anchor(
         target_tag,
         game_loop=_observation_game_loop(observation),
     )
-    agent._rtscortex_suppressed_expansion_anchors = (
-        extractor.suppressed_expansion_anchors
-    )
+    agent._rtscortex_suppressed_expansion_anchors = extractor.suppressed_expansion_anchors
 
 
 def _candidate_dispatch_failure(

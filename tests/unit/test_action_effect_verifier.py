@@ -75,9 +75,7 @@ def test_attack_effect_times_out_when_target_health_does_not_change() -> None:
 
     verdicts = verifier.observe(_attack_observation(120, health=150))
 
-    assert [verdict.failure_code for verdict in verdicts] == [
-        "combat_effect_not_observed"
-    ]
+    assert [verdict.failure_code for verdict in verdicts] == ["combat_effect_not_observed"]
 
 
 def test_stimpack_research_is_confirmed_by_exact_barracks_order() -> None:
@@ -728,12 +726,22 @@ def test_move_minimap_derives_timeout_from_initial_target_distance() -> None:
 
     assert (
         verifier.observe(
-            _move_observation(game_loop=361, center=(48, 48), builder_position=(30, 30))
+            _move_observation(
+                game_loop=361,
+                center=(48, 48),
+                builder_position=(30, 30),
+                builder_orders=[13],
+            )
         )
         == []
     )
     verdict = verifier.observe(
-        _move_observation(game_loop=362, center=(48, 48), builder_position=(30, 30))
+        _move_observation(
+            game_loop=362,
+            center=(48, 48),
+            builder_position=(30, 30),
+            builder_orders=[13],
+        )
     )[0]
 
     assert verdict.success is False
@@ -744,6 +752,33 @@ def test_move_minimap_derives_timeout_from_initial_target_distance() -> None:
     assert verdict.evidence["confirmed_loop"] is None
     assert verdict.evidence["elapsed_game_loops"] == 261
     assert verdict.evidence["effective_timeout_game_loops"] == 261
+
+
+def test_move_minimap_rejects_acceptance_without_actor_move_order() -> None:
+    verifier = ActionEffectVerifier(timeout_game_loops=112)
+    command = _move_command()
+    verifier.track(command)
+    verifier.prepare(
+        command.command_id,
+        _move_observation(game_loop=100, center=(8, 8), builder_position=(30, 30)),
+        0xABC,
+        actor_tags=(0xABC,),
+        minimap_transform=(1.0, 0.0, 0.0, 64.0, 63.0),
+    )
+    verifier.accept_primitive(command.command_id, game_loop=101)
+
+    verdict = verifier.observe(
+        _move_observation(
+            game_loop=117,
+            center=(8, 8),
+            builder_position=(30, 30),
+        )
+    )[0]
+
+    assert verdict.success is False
+    assert verdict.failure_code == "move_order_not_observed"
+    assert verdict.evidence is not None
+    assert verdict.evidence["actor_tags"] == ["0xabc"]
 
 
 def test_move_minimap_uses_actor_semantics_when_the_unit_disappears() -> None:
@@ -1019,9 +1054,7 @@ def test_chained_creep_tumor_accepts_the_burrowed_target_form() -> None:
     )
     current["raw_units"][0]["unit_type"] = "CreepTumorBurrowed"
     tumor = next(
-        unit
-        for unit in current["raw_units"][1:]
-        if unit["unit_type"] == "CreepTumorBurrowed"
+        unit for unit in current["raw_units"][1:] if unit["unit_type"] == "CreepTumorBurrowed"
     )
     tumor["x"] = 31.875
     tumor["y"] = 30

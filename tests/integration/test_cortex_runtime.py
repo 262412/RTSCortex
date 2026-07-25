@@ -604,9 +604,7 @@ def test_missing_prerequisite_plan_is_retained_without_hot_loop(
         assert not store.events_of_type("cortex-run", "episode-1", "macro_plan_rejected")
         accepted = store.events_of_type("cortex-run", "episode-1", "macro_plan_accepted")
         assert accepted[-1].payload["runtime_frontier"] == "Build_Gateway_Screen"
-        deferred_events = store.events_of_type(
-            "cortex-run", "episode-1", "macro_frontier_deferred"
-        )
+        deferred_events = store.events_of_type("cortex-run", "episode-1", "macro_frontier_deferred")
         assert len(deferred_events) == 1
         assert deferred_events[0].payload["reason"] == "missing_prerequisite_pylon"
         assert not store.events_of_type("cortex-run", "episode-1", "specialist_failed")
@@ -863,16 +861,12 @@ def test_macro_defers_duplicate_supply_provider_while_one_is_constructing(
         await runtime.tick(observation)
         for _ in range(5):
             await asyncio.sleep(0)
-        batch = await runtime.tick(
-            observation.model_copy(update={"step_id": 1, "game_loop": 1})
-        )
+        batch = await runtime.tick(observation.model_copy(update={"step_id": 1, "game_loop": 1}))
 
         assert batch.commands == []
         assert runtime._macro_plan is not None
         assert runtime._macro_plan.steps[0].status.value == "deferred"
-        events = runtime.store.events_of_type(
-            "cortex-run", "episode-1", "macro_structure_deferred"
-        )
+        events = runtime.store.events_of_type("cortex-run", "episode-1", "macro_structure_deferred")
         assert len(events) == 1
         assert events[0].payload["reason"] == "same_structure_in_progress"
         assert events[0].payload["target_structure"] == "Pylon"
@@ -928,14 +922,10 @@ def test_macro_defers_duplicate_tech_structure_while_one_is_constructing(
         await runtime.tick(observation)
         for _ in range(5):
             await asyncio.sleep(0)
-        batch = await runtime.tick(
-            observation.model_copy(update={"step_id": 1, "game_loop": 1})
-        )
+        batch = await runtime.tick(observation.model_copy(update={"step_id": 1, "game_loop": 1}))
 
         assert batch.commands == []
-        events = runtime.store.events_of_type(
-            "cortex-run", "episode-1", "macro_structure_deferred"
-        )
+        events = runtime.store.events_of_type("cortex-run", "episode-1", "macro_structure_deferred")
         assert len(events) == 1
         assert events[0].payload["target_structure"] == "Gateway"
         await runtime.close()
@@ -1354,9 +1344,7 @@ def test_blocked_expansion_does_not_block_independent_stargate_frontier(
         await runtime.tick(observation)
         for _ in range(5):
             await asyncio.sleep(0)
-        batch = await runtime.tick(
-            observation.model_copy(update={"step_id": 1, "game_loop": 1})
-        )
+        batch = await runtime.tick(observation.model_copy(update={"step_id": 1, "game_loop": 1}))
         assert [command.name for command in batch.commands] == ["Build_Stargate_Screen"]
         await runtime.close()
 
@@ -1413,9 +1401,7 @@ def test_global_structure_saturation_marks_revised_unique_tech_obsolete(
         await runtime.tick(observation)
         for _ in range(5):
             await asyncio.sleep(0)
-        batch = await runtime.tick(
-            observation.model_copy(update={"step_id": 1, "game_loop": 1})
-        )
+        batch = await runtime.tick(observation.model_copy(update={"step_id": 1, "game_loop": 1}))
         assert batch.commands == []
         assert runtime._macro_plan is not None
         assert runtime._macro_plan.steps[0].status.value == "obsolete"
@@ -1424,9 +1410,7 @@ def test_global_structure_saturation_marks_revised_unique_tech_obsolete(
     asyncio.run(exercise())
 
     recovered = _store(tmp_path)
-    deduplicated = recovered.events_of_type(
-        "cortex-run", "episode-1", "macro_step_deduplicated"
-    )
+    deduplicated = recovered.events_of_type("cortex-run", "episode-1", "macro_step_deduplicated")
     assert len(deduplicated) == 1
     assert deduplicated[0].payload["target_structure"] == "CyberneticsCore"
     recovered.close()
@@ -1456,9 +1440,7 @@ def test_invalid_expansion_anchor_keeps_commitment_and_dispatches_next_anchor(
                     supply_cap=23,
                     workers=12,
                 ),
-                own_structures=[
-                    UnitState(unit_id="0x1", unit_type="Nexus", alliance="self")
-                ],
+                own_structures=[UnitState(unit_id="0x1", unit_type="Nexus", alliance="self")],
             ),
             available_actions=[
                 AvailableAction(
@@ -1508,12 +1490,8 @@ def test_invalid_expansion_anchor_keeps_commitment_and_dispatches_next_anchor(
     asyncio.run(exercise())
 
     recovered = _store(tmp_path)
-    started = recovered.events_of_type(
-        "cortex-run", "episode-1", "expansion_commitment_started"
-    )
-    rejected = recovered.events_of_type(
-        "cortex-run", "episode-1", "expansion_anchor_rejected"
-    )
+    started = recovered.events_of_type("cortex-run", "episode-1", "expansion_commitment_started")
+    rejected = recovered.events_of_type("cortex-run", "episode-1", "expansion_anchor_rejected")
     assert len(started) == 1
     assert len(rejected) == 1
     assert rejected[0].payload["anchor"] == "0x99"
@@ -1542,9 +1520,7 @@ def test_expansion_candidate_exhaustion_terminalizes_active_commitment(
                 supply_cap=23,
                 workers=12,
             ),
-            own_structures=[
-                UnitState(unit_id="0x1", unit_type="Nexus", alliance="self")
-            ],
+            own_structures=[UnitState(unit_id="0x1", unit_type="Nexus", alliance="self")],
         ),
         available_actions=[],
     )
@@ -1558,24 +1534,52 @@ def test_expansion_candidate_exhaustion_terminalizes_active_commitment(
             update={
                 "step_id": 1,
                 "game_loop": 1,
-                "alerts": ["expansion_candidates_exhausted"],
+                "alerts": [
+                    "expansion_candidates_exhausted",
+                    "expansion_scout_state=all_candidates_exhausted",
+                    "expansion_scout_generation=1",
+                    "expansion_scout_waypoints=8/8",
+                ],
             }
         )
         await runtime.tick(exhausted)
         assert runtime._expansion_commitment_id is None
         assert runtime._macro_proposal is not None
-        runtime._ensure_expansion_commitment(runtime._macro_proposal, exhausted)
+        same_generation_candidate = exhausted.model_copy(
+            update={
+                "step_id": 2,
+                "game_loop": 2,
+                "alerts": [
+                    "expansion_scout_state=candidate_available",
+                    "expansion_scout_generation=1",
+                    "expansion_scout_waypoints=8/8",
+                ],
+                "available_actions": [
+                    AvailableAction(
+                        name="Build_Nexus_Near",
+                        argument_names=["tag"],
+                        argument_types=[ActionArgumentType.TAG],
+                        actor_scopes=["Builder/Probe-1"],
+                        argument_candidates=[["0x99"]],
+                    )
+                ],
+            }
+        )
+        runtime._update_expansion_candidate_state(same_generation_candidate)
+        runtime._ensure_expansion_commitment(
+            runtime._macro_proposal,
+            same_generation_candidate,
+        )
         assert runtime._expansion_commitment_id is None
         await runtime.close()
 
     asyncio.run(exercise())
 
     recovered = _store(tmp_path)
-    terminal = recovered.events_of_type(
-        "cortex-run", "episode-1", "expansion_commitment_terminal"
-    )
+    terminal = recovered.events_of_type("cortex-run", "episode-1", "expansion_commitment_terminal")
     assert len(terminal) == 1
     assert terminal[0].payload["terminal_state"] == "expansion_candidates_exhausted"
+    assert terminal[0].payload["generation_id"] == 1
     recovered.close()
 
 
@@ -1601,9 +1605,7 @@ def test_expansion_commitment_ignores_incomplete_structured_scout_exhaustion(
                 supply_cap=23,
                 workers=12,
             ),
-            own_structures=[
-                UnitState(unit_id="0x1", unit_type="Nexus", alliance="self")
-            ],
+            own_structures=[UnitState(unit_id="0x1", unit_type="Nexus", alliance="self")],
         ),
         available_actions=[],
     )
@@ -1627,9 +1629,7 @@ def test_expansion_commitment_ignores_incomplete_structured_scout_exhaustion(
         await runtime.tick(incomplete)
         assert runtime._expansion_commitment_id is not None
         assert runtime._expansion_candidates_exhausted is False
-        assert not store.events_of_type(
-            "cortex-run", "episode-1", "expansion_commitment_terminal"
-        )
+        assert not store.events_of_type("cortex-run", "episode-1", "expansion_commitment_terminal")
         await runtime.close()
 
     asyncio.run(exercise())
@@ -1686,9 +1686,7 @@ def test_episode_end_records_unattempted_expansion_commitment_root_cause(
     asyncio.run(exercise())
 
     recovered = _store(tmp_path)
-    terminal = recovered.events_of_type(
-        "cortex-run", "episode-1", "expansion_commitment_terminal"
-    )
+    terminal = recovered.events_of_type("cortex-run", "episode-1", "expansion_commitment_terminal")
     assert terminal[-1].payload["terminal_state"] == "strategic_cancellation"
     assert terminal[-1].payload["evaluated_anchors"] == [
         {
@@ -1866,9 +1864,7 @@ def test_completed_episode_emits_strategic_consequence_and_review_summary(
     assert len(consequences) == 1
     assert consequences[0].payload["consequence_type"] == "threat_unanswered"
     assert reviews[0].payload["strategic_consequence_count"] == 1
-    assert reviews[0].payload["strategic_consequence_counts"] == {
-        "threat_unanswered": 1
-    }
+    assert reviews[0].payload["strategic_consequence_counts"] == {"threat_unanswered": 1}
     asyncio.run(runtime.close())
 
 

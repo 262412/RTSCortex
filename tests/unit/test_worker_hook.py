@@ -44,6 +44,7 @@ from rtscortex_llm_pysc2.worker import (
     _canonical_pysc2_arguments,
     _enforce_orchestration_primitive_budget,
     _execution_team_name,
+    _execution_unit_tags,
     _finish_terminal,
     _isolate_next_action,
     _normalize_new_unit_queue,
@@ -56,6 +57,7 @@ from rtscortex_llm_pysc2.worker import (
     _rebind_builder_to_selected_worker,
     _recover_observation_gap,
     _refresh_build_action_position,
+    _refresh_combat_team_membership,
     _refresh_consumed_zerg_builder,
     _refresh_zerg_morphed_combat_teams,
     _release_runtime_observation_barrier,
@@ -455,13 +457,13 @@ def test_worker_error_episode_preserves_bridge_counters() -> None:
             "metrics": {
                 "transport_noop_primitives": 4,
                 "unattributed_primitives": 1,
-                    "candidate_outside_pysc2_dispatches": 0,
-                    "observation_gap_watchdog_triggers": 0,
-                    "orchestration_recoveries": 0,
-                    "partial_runtime_decisions": 0,
-                    "skipped_runtime_participants": 0,
-                    "expansion_scout_camera_moves": 0,
-                    "expansion_candidate_exhaustions": 0,
+                "candidate_outside_pysc2_dispatches": 0,
+                "observation_gap_watchdog_triggers": 0,
+                "orchestration_recoveries": 0,
+                "partial_runtime_decisions": 0,
+                "skipped_runtime_participants": 0,
+                "expansion_scout_camera_moves": 0,
+                "expansion_candidate_exhaustions": 0,
             },
             "failure_reason": "RuntimeError: bridge failed",
         }
@@ -506,13 +508,13 @@ def test_worker_max_frame_hook_reports_explicit_truncation() -> None:
             "metrics": {
                 "transport_noop_primitives": 4,
                 "unattributed_primitives": 0,
-                    "candidate_outside_pysc2_dispatches": 0,
-                    "observation_gap_watchdog_triggers": 0,
-                    "orchestration_recoveries": 0,
-                    "partial_runtime_decisions": 0,
-                    "skipped_runtime_participants": 0,
-                    "expansion_scout_camera_moves": 0,
-                    "expansion_candidate_exhaustions": 0,
+                "candidate_outside_pysc2_dispatches": 0,
+                "observation_gap_watchdog_triggers": 0,
+                "orchestration_recoveries": 0,
+                "partial_runtime_decisions": 0,
+                "skipped_runtime_participants": 0,
+                "expansion_scout_camera_moves": 0,
+                "expansion_candidate_exhaustions": 0,
             },
             "failure_reason": "max_agent_steps_reached",
         }
@@ -1055,10 +1057,13 @@ def test_forced_runtime_observation_releases_builder_query_without_faking_select
         decision_broker=broker,
     )
 
-    assert _release_runtime_observation_barrier(
-        main_agent,
-        include_builder=True,
-    ) is True
+    assert (
+        _release_runtime_observation_barrier(
+            main_agent,
+            include_builder=True,
+        )
+        is True
+    )
     assert builder.team_unit_tag_list == [0xA]
     assert builder.team_unit_team_list == ["Probe-1"]
     assert builder_team["unit_tags_selected"] == []
@@ -1983,8 +1988,81 @@ def test_watchdog_recovery_clears_camera_chain_before_hard_timeout() -> None:
 
     assert _recover_observation_gap(main_agent, SimpleNamespace(raw_units=[unit])) is True
     assert agent.last_execution_abort["failure_code"] == "observation_gap_watchdog_recovery"
+    assert agent.team_unit_tag_curr is None
+    assert agent.team_unit_team_curr is None
     assert main_agent.main_loop_lock is False
     assert main_agent.unit_uid_appear == []
+
+
+def test_move_provenance_uses_only_selected_living_actor_tags() -> None:
+    team = {
+        "name": "Adept-1",
+        "unit_tags": [0x10, 0x11, 0x12],
+    }
+    agent = SimpleNamespace(
+        teams=[team],
+        team_unit_team_curr="Adept-1",
+        team_unit_tag_curr=0x10,
+    )
+    observation = SimpleNamespace(
+        raw_units=[
+            SimpleNamespace(tag=0x10, alliance=1),
+            SimpleNamespace(tag=0x11, alliance=1),
+            SimpleNamespace(tag=0x12, alliance=1),
+        ],
+        feature_units=[
+            SimpleNamespace(tag=0x10, alliance=1, is_selected=False),
+            SimpleNamespace(tag=0x11, alliance=1, is_selected=True),
+            SimpleNamespace(tag=0x12, alliance=1, is_selected=True),
+        ],
+    )
+
+    assert _execution_unit_tags(agent, observation) == (0x11, 0x12)
+
+
+def test_combat_membership_prunes_dead_head_and_rebinds_living_tag() -> None:
+    team = {
+        "name": "VoidRay-1",
+        "unit_type": [80],
+        "unit_tags": [0x20, 0x21],
+        "unit_tags_selected": [0x20],
+        "obs": [object()],
+        "pos": [[1, 1]],
+        "minimap_pos": [[1, 1]],
+    }
+    living = SimpleNamespace(
+        tag=0x21,
+        unit_type=80,
+        alliance=1,
+        build_progress=100,
+    )
+    agent = SimpleNamespace(
+        teams=[team],
+        unit_tag_list=[0x20, 0x21],
+        unit_raw_list=[],
+        team_unit_tag_list=[0x20],
+        team_unit_team_list=["VoidRay-1"],
+        team_unit_tag_curr=0x20,
+        team_unit_team_curr="VoidRay-1",
+        curr_action_name="Move_Minimap",
+        _is_executing_actions=lambda: True,
+    )
+    main_agent = SimpleNamespace(
+        agents={"CombatGroup3": agent},
+        _rtscortex_unit_quarantine=set(),
+    )
+
+    assert (
+        _refresh_combat_team_membership(
+            main_agent,
+            SimpleNamespace(raw_units=[living]),
+        )
+        == 1
+    )
+    assert team["unit_tags"] == [0x21]
+    assert agent.team_unit_tag_curr == 0x21
+    assert agent.team_unit_tag_list == []
+    assert main_agent._rtscortex_unit_quarantine == {0x20}
 
 
 def test_unclaimed_new_unit_camera_loop_is_also_bounded() -> None:
@@ -2125,12 +2203,15 @@ def test_expansion_scout_controller_rotates_unexplored_camera_waypoints() -> Non
     assert controller.progress_alerts[0] == "expansion_scout_state=search_in_progress"
     assert too_soon is None
     assert second is not None and second != first
-    assert controller.next_waypoint(
-        observation,
-        game_loop=132,
-        anchor_available=True,
-        blocked=False,
-    ) is None
+    assert (
+        controller.next_waypoint(
+            observation,
+            game_loop=132,
+            anchor_available=True,
+            blocked=False,
+        )
+        is None
+    )
 
 
 def test_expansion_scout_controller_reports_exhaustion_without_repeating_waypoints() -> None:
@@ -2166,28 +2247,37 @@ def test_expansion_scout_controller_reports_exhaustion_without_repeating_waypoin
     assert controller.state == "all_candidates_exhausted"
     assert controller.progress_alerts == (
         "expansion_scout_state=all_candidates_exhausted",
+        "expansion_scout_generation=1",
         f"expansion_scout_waypoints={len(visited)}/{len(visited)}",
+        "expansion_scout_available_anchors=none",
+        "expansion_scout_rejected_anchors=none",
     )
     assert visited
     assert len(visited) == len(set(visited))
-    assert controller.next_waypoint(
-        observation,
-        game_loop=game_loop + 16,
-        anchor_available=False,
-        blocked=False,
-    ) is None
+    assert (
+        controller.next_waypoint(
+            observation,
+            game_loop=game_loop + 16,
+            anchor_available=False,
+            blocked=False,
+        )
+        is None
+    )
 
 
 def test_expansion_scout_empty_opening_domain_is_not_final_exhaustion() -> None:
     observation = SimpleNamespace(feature_minimap=SimpleNamespace())
     controller = ExpansionScoutController(interval_game_loops=16)
 
-    assert controller.next_waypoint(
-        observation,
-        game_loop=0,
-        anchor_available=False,
-        blocked=False,
-    ) is None
+    assert (
+        controller.next_waypoint(
+            observation,
+            game_loop=0,
+            anchor_available=False,
+            blocked=False,
+        )
+        is None
+    )
     assert controller.exhausted is False
     assert controller.visited_waypoints == set()
 
@@ -2223,20 +2313,26 @@ def test_expansion_scout_controller_forces_progress_after_soft_block_deadline() 
     )
     controller = ExpansionScoutController(interval_game_loops=16)
 
-    assert controller.next_waypoint(
-        observation,
-        game_loop=100,
-        anchor_available=False,
-        blocked=False,
-        soft_blocked=True,
-    ) is None
-    assert controller.next_waypoint(
-        observation,
-        game_loop=115,
-        anchor_available=False,
-        blocked=False,
-        soft_blocked=True,
-    ) is None
+    assert (
+        controller.next_waypoint(
+            observation,
+            game_loop=100,
+            anchor_available=False,
+            blocked=False,
+            soft_blocked=True,
+        )
+        is None
+    )
+    assert (
+        controller.next_waypoint(
+            observation,
+            game_loop=115,
+            anchor_available=False,
+            blocked=False,
+            soft_blocked=True,
+        )
+        is None
+    )
     forced = controller.next_waypoint(
         observation,
         game_loop=116,
@@ -3674,8 +3770,7 @@ def test_chained_creep_candidates_require_one_selected_mature_tumor_and_cast_ran
 
     assert candidates
     assert all(
-        128 / 6 <= ((x - 64) ** 2 + (y - 64) ** 2) ** 0.5 <= 128 * 9.5 / 24
-        for x, y in candidates
+        128 / 6 <= ((x - 64) ** 2 + (y - 64) ** 2) ** 0.5 <= 128 * 9.5 / 24 for x, y in candidates
     )
     observation.feature_units[0].is_selected = False
     assert (
@@ -4644,13 +4739,13 @@ def test_candidate_outside_dispatch_counter_is_persisted_and_fails_command(
     assert broker.metrics()["candidate_outside_pysc2_dispatches"] == 0
     assert json.loads(metrics_path.read_text(encoding="utf-8")) == {
         "unattributed_primitives": 0,
-            "candidate_outside_pysc2_dispatches": 0,
-            "observation_gap_watchdog_triggers": 0,
-            "orchestration_recoveries": 0,
-            "partial_runtime_decisions": 0,
-            "skipped_runtime_participants": 0,
-            "expansion_scout_camera_moves": 0,
-            "expansion_candidate_exhaustions": 0,
+        "candidate_outside_pysc2_dispatches": 0,
+        "observation_gap_watchdog_triggers": 0,
+        "orchestration_recoveries": 0,
+        "partial_runtime_decisions": 0,
+        "skipped_runtime_participants": 0,
+        "expansion_scout_camera_moves": 0,
+        "expansion_candidate_exhaustions": 0,
     }
 
     with pytest.raises(RuntimeError, match="outside the current candidate set"):
@@ -5107,47 +5202,65 @@ def test_terran_economy_sources_cover_scv_orbital_mule_and_stimpack() -> None:
         132: "OrbitalCommand",
     }
 
-    assert production_source_tag(
-        timestep.observation,
-        {"name": "Train_SCV", "func": [(490, None, ())]},
-        unit_names=names,
-        action_source_types={490: 18},
-    ) == 0xC00
-    assert production_source_tag(
-        timestep.observation,
-        {"name": "Morph_OrbitalCommand", "func": [(309, None, ())]},
-        unit_names=names,
-        action_source_types={309: 18},
-    ) == 0xC00
-    assert production_source_tag(
-        timestep.observation,
-        {"name": "Effect_CalldownMULE_Screen", "func": [(183, None, ())]},
-        unit_names=names,
-        action_source_types={183: 132},
-    ) == 0xC01
-    assert production_source_tag(
-        timestep.observation,
-        {"name": "Research_Stimpack", "func": [(405, None, ())]},
-        unit_names=names,
-        action_source_types={405: 21},
-    ) == 0xB00
+    assert (
+        production_source_tag(
+            timestep.observation,
+            {"name": "Train_SCV", "func": [(490, None, ())]},
+            unit_names=names,
+            action_source_types={490: 18},
+        )
+        == 0xC00
+    )
+    assert (
+        production_source_tag(
+            timestep.observation,
+            {"name": "Morph_OrbitalCommand", "func": [(309, None, ())]},
+            unit_names=names,
+            action_source_types={309: 18},
+        )
+        == 0xC00
+    )
+    assert (
+        production_source_tag(
+            timestep.observation,
+            {"name": "Effect_CalldownMULE_Screen", "func": [(183, None, ())]},
+            unit_names=names,
+            action_source_types={183: 132},
+        )
+        == 0xC01
+    )
+    assert (
+        production_source_tag(
+            timestep.observation,
+            {"name": "Research_Stimpack", "func": [(405, None, ())]},
+            unit_names=names,
+            action_source_types={405: 21},
+        )
+        == 0xB00
+    )
 
     orbital.active = 1
     orbital.order_length = 1
     orbital.order_id_0 = 520
-    assert production_source_tag(
-        timestep.observation,
-        {"name": "Effect_CalldownMULE_Screen", "func": [(183, None, ())]},
-        unit_names=names,
-        action_source_types={183: 132},
-    ) == 0xC01
+    assert (
+        production_source_tag(
+            timestep.observation,
+            {"name": "Effect_CalldownMULE_Screen", "func": [(183, None, ())]},
+            unit_names=names,
+            action_source_types={183: 132},
+        )
+        == 0xC01
+    )
     orbital.energy = 49
-    assert production_source_tag(
-        timestep.observation,
-        {"name": "Effect_CalldownMULE_Screen", "func": [(183, None, ())]},
-        unit_names=names,
-        action_source_types={183: 132},
-    ) is None
+    assert (
+        production_source_tag(
+            timestep.observation,
+            {"name": "Effect_CalldownMULE_Screen", "func": [(183, None, ())]},
+            unit_names=names,
+            action_source_types={183: 132},
+        )
+        is None
+    )
 
 
 def test_stimpack_source_requires_the_exact_barracks_techlab() -> None:
@@ -5161,23 +5274,29 @@ def test_stimpack_source_requires_the_exact_barracks_techlab() -> None:
     action = {"name": "Research_Stimpack", "func": [(405, None, ())]}
     names = {21: "Barracks", 37: "BarracksTechLab"}
 
-    assert production_source_tag(
-        timestep.observation,
-        action,
-        unit_names=names,
-        action_source_types={405: 21},
-    ) is None
+    assert (
+        production_source_tag(
+            timestep.observation,
+            action,
+            unit_names=names,
+            action_source_types={405: 21},
+        )
+        is None
+    )
 
     tech_lab = _unit(0xB01, 37, 1, 32, 30, 400, 255)
     tech_lab.build_progress = 100
     barracks.add_on_tag = 0xB01
     timestep.observation.raw_units.append(tech_lab)
-    assert production_source_tag(
-        timestep.observation,
-        action,
-        unit_names=names,
-        action_source_types={405: 21},
-    ) == 0xB00
+    assert (
+        production_source_tag(
+            timestep.observation,
+            action,
+            unit_names=names,
+            action_source_types={405: 21},
+        )
+        == 0xB00
+    )
 
 
 def test_production_source_follows_upstream_raw_order_instead_of_tag_order() -> None:
@@ -6224,9 +6343,7 @@ def test_broker_keeps_same_attack_action_isolated_by_explicit_team() -> None:
     )
     broker.settle_primitive(beta, success=True, game_loop=900)
     broker.settle_primitive(alpha, success=True, game_loop=900)
-    broker.observe_effects(
-        _combat_observation(904, {0xAAA: 80.0, 0xBBB: 70.0})
-    )
+    broker.observe_effects(_combat_observation(904, {0xAAA: 80.0, 0xBBB: 70.0}))
 
     reports = {report["command_id"]: report for report in runtime.execution_reports}
     assert reports["attack-alpha"]["actor"] == "Combat/Alpha"

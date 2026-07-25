@@ -37,9 +37,11 @@ class PlaybookRuleLifecycle:
     def promote_to_soft(self, rule: PlaybookRule) -> PlaybookRule:
         if rule.status is not PlaybookRuleStatus.CANDIDATE:
             raise ValueError("only candidate rules can be promoted to soft")
-        if len(set(rule.source_run_ids)) < 2:
+        uncensored_runs = set(rule.source_run_ids) - set(rule.censored_source_run_ids)
+        uncensored_seeds = set(rule.source_seeds) - set(rule.censored_source_seeds)
+        if len(uncensored_runs) < 2:
             raise ValueError("soft promotion requires evidence from two runs")
-        if len(set(rule.source_seeds)) < 2:
+        if len(uncensored_seeds) < 2:
             raise ValueError("soft promotion requires evidence from two seeds")
         if rule.confidence < 0.75 or rule.contradiction_count:
             raise ValueError("soft promotion confidence or contradiction gate failed")
@@ -158,7 +160,8 @@ def _is_specific_rule(rule: PlaybookRule) -> bool:
     contextual_fields = {
         condition.field
         for condition in rule.conditions
-        if condition.field in {
+        if condition.field
+        in {
             "threat_level",
             "economy_status",
             "army_readiness",

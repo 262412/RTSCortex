@@ -305,7 +305,12 @@ screen target.
 clamped feature-screen coordinate is the value passed to `select_point`. Its upper bound is
 `size_screen - 1`, matching PySC2's half-open action-space range.
 
-CI applies all twenty-one patches in order under Python 3.9, compiles and imports both projects, and
+`0022-bypass-frequency-for-forced-runtime-decision.patch` lets the explicit RTSCortex watchdog
+force flag bypass only the upstream LLM decision-frequency throttle. Normal main-loop cadence is
+unchanged, while a recovery observation can reach Runtime in the tick that preempts a stalled
+camera or selection chain.
+
+CI applies all twenty-two patches in order under Python 3.9, compiles and imports both projects, and
 runs `integrations/llm_pysc2/tests/python39_contract_smoke.py`. The smoke locks the v1.1
 candidate mapping, multi-argument translator rejection, Nexus camera-settlement primitive,
 exact Nexus anchor, floating-point resource clearance, visible complete-footprint behavior,

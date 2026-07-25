@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Protocol
 
-from rtscortex.contracts import ObservationEnvelope
+from rtscortex.contracts import ExecutionReport, ExecutionStatus, ObservationEnvelope
 from rtscortex.cortex.models import (
     CortexIntent,
     IntentTarget,
@@ -21,6 +21,15 @@ from rtscortex.races import ActionDomain, RaceProfile
 from rtscortex.targeting import attackable_enemies_for_actor
 
 _DEFENSE_AGENT_ID = "deterministic-defense-agent"
+_DEFENSE_COMMITMENT_GAME_LOOPS = 112
+_DEFENSE_RETRY_COOLDOWN_GAME_LOOPS = 32
+
+
+@dataclass(slots=True)
+class _DefenseActorState:
+    signature: str
+    active_until_game_loop: int
+    cooldown_until_game_loop: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,7 +119,7 @@ class DefenseAgent(_RoutingRoleAgent):
     def __init__(self, profile: RaceProfile, adapter: StrategicIntentAdapter) -> None:
         super().__init__(RoleId.DEFENSE, profile, adapter)
         self._episode_key: tuple[str, str] | None = None
-        self._committed_until_game_loop = 0
+        self._actor_states: dict[str, _DefenseActorState] = {}
 
     def evaluate(self, context: RoleAgentContext) -> list[StrategicIntent]:
         return [
@@ -142,18 +151,19 @@ class DefenseAgent(_RoutingRoleAgent):
         episode_key = (observation.run_id, observation.episode_id)
         if episode_key != self._episode_key:
             self._episode_key = episode_key
-            self._committed_until_game_loop = 0
+            self._actor_states.clear()
         threatened = context.situation.threat_level in {
             ThreatLevel.HIGH,
             ThreatLevel.CRITICAL,
         }
-        if not threatened and observation.game_loop >= self._committed_until_game_loop:
+        if not threatened and not any(
+            observation.game_loop < state.active_until_game_loop
+            for state in self._actor_states.values()
+        ):
             return ()
 
         attack_actions = [
-            action
-            for action in observation.available_actions
-            if action.name == "Attack_Unit"
+            action for action in observation.available_actions if action.name == "Attack_Unit"
         ]
         base_positions = [
             structure.position
@@ -175,7 +185,18 @@ class DefenseAgent(_RoutingRoleAgent):
                         enemy.unit_id,
                     ),
                 )
-                self._committed_until_game_loop = observation.game_loop + 16
+                signature = f"Attack_Unit:{target.unit_id}"
+                if not self._may_emit(
+                    actor,
+                    signature,
+                    game_loop=observation.game_loop,
+                ):
+                    continue
+                self._activate_actor(
+                    actor,
+                    signature,
+                    game_loop=observation.game_loop,
+                )
                 return (
                     self._source_intent(
                         context,
@@ -202,7 +223,18 @@ class DefenseAgent(_RoutingRoleAgent):
                 )
                 if position is None:
                     continue
-                self._committed_until_game_loop = observation.game_loop + 16
+                signature = f"Move_Minimap:{position[0]},{position[1]}"
+                if not self._may_emit(
+                    actor,
+                    signature,
+                    game_loop=observation.game_loop,
+                ):
+                    continue
+                self._activate_actor(
+                    actor,
+                    signature,
+                    game_loop=observation.game_loop,
+                )
                 return (
                     self._source_intent(
                         context,
@@ -217,6 +249,70 @@ class DefenseAgent(_RoutingRoleAgent):
                     ),
                 )
         return ()
+
+    def record_execution(
+        self,
+        report: ExecutionReport,
+        *,
+        game_loop: int,
+    ) -> dict[str, object] | None:
+        actor = report.actor
+        if actor is None:
+            return None
+        state = self._actor_states.get(actor)
+        if state is None:
+            return None
+        if report.status is ExecutionStatus.SUCCEEDED:
+            del self._actor_states[actor]
+            return {
+                "actor": actor,
+                "state": "defense_response_terminal",
+                "status": "succeeded",
+                "game_loop": game_loop,
+            }
+        if report.status is not ExecutionStatus.FAILED:
+            return None
+        state.active_until_game_loop = game_loop
+        state.cooldown_until_game_loop = game_loop + _DEFENSE_RETRY_COOLDOWN_GAME_LOOPS
+        return {
+            "actor": actor,
+            "state": "defense_response_cooldown",
+            "status": "failed",
+            "failure_code": report.failure_code,
+            "cooldown_until_game_loop": state.cooldown_until_game_loop,
+        }
+
+    def _may_emit(
+        self,
+        actor: str,
+        signature: str,
+        *,
+        game_loop: int,
+    ) -> bool:
+        state = self._actor_states.get(actor)
+        if state is None:
+            return True
+        if game_loop < state.cooldown_until_game_loop:
+            return False
+        if game_loop < state.active_until_game_loop:
+            may_replace_rally = state.signature.startswith(
+                "Move_Minimap:"
+            ) and signature.startswith("Attack_Unit:")
+            if not may_replace_rally:
+                return False
+        return True
+
+    def _activate_actor(
+        self,
+        actor: str,
+        signature: str,
+        *,
+        game_loop: int,
+    ) -> None:
+        self._actor_states[actor] = _DefenseActorState(
+            signature=signature,
+            active_until_game_loop=(game_loop + _DEFENSE_COMMITMENT_GAME_LOOPS),
+        )
 
     def _source_intent(
         self,
@@ -305,6 +401,17 @@ class RoleAgentCoordinator:
             claimed_actor_scopes=claimed_actor_scopes,
         )
 
+    def record_execution(
+        self,
+        report: ExecutionReport,
+        *,
+        responsibility: str | None,
+        game_loop: int,
+    ) -> dict[str, object] | None:
+        if responsibility != RoleId.DEFENSE.value:
+            return None
+        return self.defense_agent.record_execution(report, game_loop=game_loop)
+
 
 def _source_intent_id(intent: StrategicIntent) -> str:
     source = intent.source_intent_id
@@ -331,8 +438,7 @@ def _nearest_position_distance(
     if position is None or not targets:
         return float("inf")
     return min(
-        (position[0] - target[0]) ** 2 + (position[1] - target[1]) ** 2
-        for target in targets
+        (position[0] - target[0]) ** 2 + (position[1] - target[1]) ** 2 for target in targets
     )
 
 
@@ -343,11 +449,7 @@ def _defensive_minimap_position(
     available = [
         (int(arguments[0][0]), int(arguments[0][1]))
         for arguments in argument_candidates
-        if (
-            arguments
-            and isinstance(arguments[0], (list, tuple))
-            and len(arguments[0]) == 2
-        )
+        if (arguments and isinstance(arguments[0], (list, tuple)) and len(arguments[0]) == 2)
     ]
     if not available:
         return None
@@ -361,7 +463,6 @@ def _defensive_minimap_position(
     return min(
         available,
         key=lambda candidate: min(
-            (candidate[0] - base[0]) ** 2 + (candidate[1] - base[1]) ** 2
-            for base in base_positions
+            (candidate[0] - base[0]) ** 2 + (candidate[1] - base[1]) ** 2 for base in base_positions
         ),
     )

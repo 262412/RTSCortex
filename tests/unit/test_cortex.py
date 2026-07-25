@@ -284,9 +284,7 @@ def test_retreat_state_is_actor_local_and_cools_down_after_arrival() -> None:
             "state": next_tick.state.model_copy(
                 update={
                     "own_units": [
-                        next_tick.state.own_units[0].model_copy(
-                            update={"position": (12.0, 12.0)}
-                        ),
+                        next_tick.state.own_units[0].model_copy(update={"position": (12.0, 12.0)}),
                         next_tick.state.own_units[1],
                     ]
                 }
@@ -334,7 +332,7 @@ def test_tactical_agent_focuses_one_target_and_reacquires_when_it_disappears() -
                             unit_type="VoidRay",
                             alliance="enemy",
                         ),
-                    ]
+                    ],
                 }
             ),
             "available_actions": [
@@ -418,7 +416,7 @@ def test_tactical_agent_quarantines_repeated_actor_target_failure() -> None:
                             unit_type="Zergling",
                             alliance="enemy",
                         ),
-                    ]
+                    ],
                 }
             ),
         }
@@ -488,7 +486,7 @@ def test_tactical_agent_preserves_retry_count_across_candidate_generation() -> N
                     "visible_enemies": [
                         UnitState(unit_id="0x20", unit_type="VoidRay", alliance="enemy"),
                         UnitState(unit_id="0x21", unit_type="Zergling", alliance="enemy"),
-                    ]
+                    ],
                 }
             ),
         }
@@ -680,9 +678,7 @@ def test_last_known_enemy_without_screen_target_triggers_reacquire_move() -> Non
     assert first.target.region == "reacquire"
     assert first.target.position == (20, 30)
     assert second.target.position == (50, 50)
-    assert CandidateCompiler().compile(later, second).candidates[0].arguments == [
-        [50, 50]
-    ]
+    assert CandidateCompiler().compile(later, second).candidates[0].arguments == [[50, 50]]
 
 
 def test_offense_navigation_uses_actor_centroid_and_obsoletes_arrived_waypoint() -> None:
@@ -765,6 +761,68 @@ def test_offense_navigation_uses_actor_centroid_and_obsoletes_arrived_waypoint()
     assert [(intent.actor_scopes[0], intent.target.position) for intent in third] == [
         ("CombatGroup7/Adept-1", (50, 50))
     ]
+
+
+def test_offense_move_failure_obsoletes_waypoint_until_actor_cooldown() -> None:
+    base = _observation()
+    actor = "CombatGroup7/Adept-1"
+    observation = base.model_copy(
+        update={
+            "state": base.state.model_copy(update={"visible_enemies": []}),
+            "available_actions": [
+                AvailableAction(
+                    name="Move_Minimap",
+                    argument_names=["minimap"],
+                    argument_types=[ActionArgumentType.POSITION],
+                    actor_scopes=[actor],
+                    argument_candidates=[[[20, 30]], [[50, 50]], [[10, 10]]],
+                )
+            ],
+        }
+    )
+    agent = DeterministicTacticalAgent(
+        retreat_health_threshold=0.3,
+        minimum_advance_army_supply=4,
+        reacquire_cooldown_game_loops=16,
+    )
+    first = agent.evaluate(
+        observation,
+        DeterministicSituationAnalyzer().assess(observation),
+    )[0]
+    transition = agent.record_execution(
+        ExecutionReport(
+            run_id=observation.run_id,
+            episode_id=observation.episode_id,
+            step_id=5,
+            command_id="failed-move",
+            success=False,
+            action_name="Move_Minimap",
+            actor=actor,
+            source=ActionSource.PLANNER,
+            status=ExecutionStatus.FAILED,
+            execution_stage=ExecutionStage.EFFECT_VERIFICATION,
+            failure_code="move_order_not_observed",
+        ),
+        game_loop=70,
+    )
+
+    assert transition is not None
+    assert transition["state"] == "offense_waypoint_failed"
+    during_cooldown = observation.model_copy(update={"step_id": 6, "game_loop": 85})
+    assert (
+        agent.evaluate(
+            during_cooldown,
+            DeterministicSituationAnalyzer().assess(during_cooldown),
+        )
+        == []
+    )
+    after_cooldown = observation.model_copy(update={"step_id": 7, "game_loop": 86})
+    retried = agent.evaluate(
+        after_cooldown,
+        DeterministicSituationAnalyzer().assess(after_cooldown),
+    )
+    assert len(retried) == 1
+    assert retried[0].target.position != first.target.position
 
 
 def test_offense_search_prioritizes_last_known_enemy_structure_waypoint() -> None:
