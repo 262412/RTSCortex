@@ -2,298 +2,324 @@
 
 Status date: 2026-07-24
 
-This register contains only defects that remain open after the Slurm L40S
-regression:
+This register contains only defects that remain open after the A100 regression:
 
-`protoss-fixed-natural-terminal-slurm-20260724T132144Z`
+`protoss-natural-terminal-py39fix-a100-20260724T171326Z`
 
 The run used the active Arbiter, an identical frozen Playbook baseline for each
-seed, the HIMA Protoss a/b/c Ensemble, and `Simple64` Protoss versus VeryEasy
-Zerg. There was no step limit.
+seed, and the HIMA Protoss a/b/c Ensemble on `Simple64` against VeryEasy Zerg.
 
 | Seed | Run | Outcome | Steps | Meaningful success | Decisive observation |
 |---|---|---|---:|---:|---|
-| 0 | `cortex-20260724T132440635925Z-558d83b0` | defeat | 18,302 | 56/76, 73.7% | no expansion; only one attack produced damage |
-| 1 | `cortex-20260724T140514321274Z-7c0d4a6f` | error | 197 | 39/42, 92.9% | out-of-range `select_point [2, -85]` terminated PySC2 |
-| 2 | `cortex-20260724T141454658563Z-a693a4f7` | defeat | 26,938 | 96/128, 75.0% | 38 peak army supply, but 21 of 23 attacks failed |
+| 0 | `cortex-20260724T171445861289Z-b77b61b6` | draw | 39,566 | 217/324, 67.0% | 86 peak army, one Nexus, map not closed |
+| 1 | `cortex-20260724T183550105631Z-52be80c0` | draw | 39,566 | 192/262, 73.3% | 88 peak army, one Nexus, map not closed |
+| 2 | `cortex-20260724T194708477833Z-6bc3aab6` | defeat | 17,982 | 49/52, 94.2% | critical threats, no Defense role intent |
 
-The two valid natural-terminal episodes produced 152 successes from 204
-meaningful commands (74.5%). Both were defeats.
+The three episodes produced 458 successes from 638 meaningful commands
+(71.8%). Build effects were confirmed 80/80 and production effects 111/111.
+There were no candidate-domain, duplicate-dispatch, friendly-target, target
+domain, or primitive-attribution violations.
+
+The earlier out-of-range primitive defect and ground-unit-versus-air target
+defect are therefore closed and have been removed from this register. Ordinary
+Protoss build/producer provenance is also closed; the remaining Nexus failure is
+tracked under the expansion lifecycle issue.
 
 ## Open issues
-
-### SCX-PT-014: orchestration can emit an out-of-range feature action and crash the episode
-
-- **Priority:** P0
-- **Status:** implementation complete; live three-seed verification pending
-- **Components:** automatic worker management, Worker primitive safety,
-  PySC2 boundary
-- **Evidence:**
-  - seed 1 terminated at step 197 with:
-
-    ```text
-    ValueError: Argument is out of range for 2/select_point
-    got: [[SelectPointAct.select], [2, -85]]
-    ```
-
-  - the action was not a Runtime candidate and therefore did not increment
-    `candidate_outside_pysc2_dispatches`;
-  - immediately before termination the Worker was still producing valid
-    Runtime decisions and execution reports;
-  - upstream `main_agent_funcs.py` computes bounded `x, y` for `stop_worker`
-    selection but calls `select_point` with the original `unit.x, unit.y`.
-- **Impact:** a single optional automatic-worker orchestration primitive can
-  bypass the Candidate/Validator boundary and terminate an otherwise healthy
-  SC2 process.
-- **Confirmed root cause:** Runtime semantic actions are validated before
-  dispatch, but orchestration actions returned by upstream `main_agent_func*`
-  do not pass through one final feature-action argument validator. The
-  `stop_worker` path contains a direct variable-use defect: its clamped
-  coordinates are discarded. PySC2 detects the invalid coordinate only inside
-  `features.transform_action()`, where recovery is no longer possible.
-- **Required correction:**
-  1. fix the `stop_worker` selection patch to use the bounded coordinate;
-  2. add one Worker-owned final primitive validator for every origin,
-     including translator, orchestration, gas management, expansion scouting,
-     camera, and automatic worker management;
-  3. validate every point/rectangle/minimap coordinate and discrete enum
-     against the active action specification;
-  4. replace an invalid orchestration primitive with transport NoOp, clear its
-     bounded chain, and record a structured recovery;
-  5. keep an invalid translator primitive as a terminal command failure rather
-     than silently clamping semantic intent.
-- **Acceptance criteria:**
-  - negative, NaN, and over-bound screen/minimap coordinates never reach
-    `SC2Env.step()`;
-  - the recorded seed 1 `[2, -85]` fixture produces recovery without process
-    exit;
-  - orchestration recovery cannot claim or complete a Runtime command;
-  - seeds `[0,1,2]` have zero feature-action range exceptions.
-
-### SCX-PT-015: targetability is not actor-specific, so ground units attack air units
-
-- **Priority:** P0
-- **Status:** implementation complete; live three-seed verification pending
-- **Components:** Situation target facts, Tactical Agent, Candidate generation,
-  Validator, CombatEffectVerifier
-- **Evidence:**
-  - seed 2 dispatched 23 `Attack_Unit` commands but only one damaged a target;
-  - Adepts repeatedly targeted an Overseer and Mutalisks;
-  - Zealots also targeted a Mutalisk and an Overseer;
-  - seed 2 recorded 16 `combat_effect_not_observed` and five
-    `combat_target_lost` failures;
-  - seed 0 repeated the same defect against an Overseer.
-- **Impact:** the Tactical layer can spend most combat windows issuing
-  mechanically impossible attacks while a large army remains ineffective.
-- **Confirmed root cause:** `living_targetable_enemies` currently means
-  living, enemy, and feature-visible. It does not include the selected actor's
-  weapon target domain. Candidate and Validator share the same enemy tag set,
-  so neither distinguishes `ground`, `air`, and `both`. The final upstream
-  alliance check prevents friendly fire but cannot reject a legal enemy that
-  the actor cannot damage.
-- **Required correction:**
-  1. add RaceProfile combat capability metadata for each controlled unit type;
-  2. derive `attackable_enemies_for_actor(actor)` from living enemy movement
-     domain and actor weapon domain;
-  3. use this exact set in Tactical selection, `argument_candidates`, dynamic
-     schema, Candidate compilation, and Runtime validation;
-  4. reject stale or domain-incompatible targets as
-     `target_not_attackable_by_actor` before Bridge dispatch;
-  5. keep CombatEffectVerifier as a final effect check, not the first place an
-     impossible pairing is detected.
-- **Acceptance criteria:**
-  - Zealot and Adept candidates contain no flying unit tags;
-  - Phoenix or other anti-air actors can receive air targets when enabled;
-  - actor-domain validation is identical for Planner, Tactical, Reflex, and
-    replay;
-  - domain-incompatible attacks entering Bridge equal zero.
 
 ### SCX-PT-016: offense navigation never closes into enemy-structure destruction
 
 - **Priority:** P0
-- **Status:** implementation complete; live three-seed verification pending
+- **Status:** partially implemented; awaiting natural-terminal live verification
 - **Components:** Offense Agent, actor-local navigation, enemy memory,
   structure targeting
 - **Evidence:**
-  - neither valid long episode confirmed damage to an enemy structure;
-  - seed 2 reached 38 peak army supply but still lost without converting that
-    army into base damage;
-  - successful movements repeatedly targeted the same nearby minimap points,
-    especially `[39,47]` and `[41,46]`;
-  - after unit targets disappeared, the agent alternated between waypoint
-    movement and reacquisition instead of selecting an enemy building;
-  - the post-game attributor recorded `advantage_not_converted` in seed 2.
-- **Impact:** production can succeed and an army can cross the map, yet the
-  system cannot complete the objective that ends a melee game.
-- **Confirmed root cause:** the actor-local state machine tracks movement and
-  current unit targets, but `last-known enemy structure` is used primarily as a
-  navigation point. Arrival does not create a structure-search substate with a
-  bounded camera sweep, target selection, attack confirmation, and waypoint
-  retirement. Repeated waypoints remain eligible because successful one-tile
-  displacement is treated as progress even when the group has not closed on
-  the strategic target.
+  - seeds 0 and 1 reached 86/88 peak army supply but ended as draws;
+  - 82/102 `Attack_Unit` commands confirmed damage, all against units;
+  - neither episode produced an explicit enemy-structure attack lifecycle;
+  - the army remained alive after the opponent's mobile force disappeared.
+- **Impact:** a large army can win local fights but cannot destroy the final
+  structures required to end a melee game.
+- **Confirmed root cause:** current-screen unit targets and last-known
+  navigation targets are implemented, but arrival at a strategic waypoint does
+  not reliably transition into a bounded structure-search and structure-attack
+  lifecycle. A movement command is also currently considered successful after
+  observing any movement or a move order, so the Tactical state machine can
+  retire or replace a waypoint without proving that the group arrived.
 - **Required correction:**
-  1. calculate navigation from the complete combat-group centroid;
-  2. add explicit `travelling -> arrived -> searching -> attacking_structure
-     -> cleared/failed` states per actor;
-  3. retire a waypoint on arrival, repeated no-progress, timeout, or confirmed
-     absence;
-  4. preserve last-known living enemy structures separately from transient
-     enemy units;
-  5. after arrival, perform a bounded local search and emit an actor-compatible
-     structure attack;
-  6. use CombatEffectVerifier evidence to mark the structure damaged,
-     destroyed, lost, or stale before selecting the next waypoint.
+  1. make movement completion mean actor-group arrival, not command start;
+  2. retain `travelling -> arrived -> searching -> attacking_structure ->
+     cleared/failed` per actor;
+  3. retire a waypoint only on arrival, confirmed absence, or bounded timeout;
+  4. preserve last-known enemy structures separately from transient units;
+  5. require CombatEffectVerifier evidence to terminalize a structure target.
 - **Acceptance criteria:**
-  - repeated no-progress waypoint loops are zero;
+  - one-tile displacement cannot confirm a remote `Move_Minimap`;
+  - every offense waypoint reaches one explicit terminal state;
   - an army with no living unit target searches for and attacks a reachable
     enemy structure;
-  - each waypoint reaches one explicit terminal state;
-  - a deterministic structure-search fixture produces a confirmed building
-    attack lifecycle.
+  - at least one deterministic fixture and one live episode confirm enemy
+    structure damage.
+- **Implemented on 2026-07-24:** movement is no longer terminalized by an
+  order or partial displacement. The verifier snapshots the living actor tags,
+  projects their centroid into minimap space, and waits for arrival. The
+  existing actor-local offense/structure-search state machine will be
+  re-evaluated against these corrected terminal reports in the paired live run.
 
-### SCX-PT-017: expansion commitment terminates before scouting can populate its anchor queue
+### SCX-PT-020: natural-terminal configuration still inherits the map time limit
 
 - **Priority:** P0
-- **Status:** implementation complete; live three-seed verification pending
+- **Status:** implemented; awaiting natural-terminal live verification
+- **Components:** experiment configuration, PySC2 launch contract
+- **Evidence:**
+  - seeds 0 and 1 both ended at 39,566 agent steps with `draw`;
+  - the natural-terminal config uses `game_steps_per_episode: null`;
+  - Runtime omits the PySC2 flag for `null`;
+  - the pinned `Simple64` map class defaults to `22 * 60 * 30 = 39,600`
+    game loops.
+- **Impact:** a time-limit draw is incorrectly interpreted as a natural SC2
+  terminal, invalidating map-closure and paired Playbook conclusions.
+- **Confirmed root cause:** `null` means “do not pass the override”, not
+  “unlimited”. PySC2 uses `0` as the explicit no-limit sentinel.
+- **Required correction:** set `game_steps_per_episode: 0` in every
+  natural-terminal Protoss config and pin the resulting CLI flag in tests.
+- **Acceptance criteria:**
+  - launch command contains `--game_steps_per_episode 0`;
+  - no natural-terminal result ends merely because game loop 39,600 was
+    reached;
+  - terminal outcomes come from SC2 victory/defeat or an explicit external
+    failure.
+- **Implemented on 2026-07-24:** both Protoss natural-terminal configurations
+  now use `game_steps_per_episode: 0`; the config model accepts zero but rejects
+  negative values, and the launch contract pins
+  `--game_steps_per_episode 0`.
+
+### SCX-PT-021: combat control-group selection and MoveVerifier use the wrong identity semantics
+
+- **Priority:** P0
+- **Status:** implemented; awaiting three-seed live verification
+- **Components:** Protoss melee team configuration, Worker selection,
+  movement effect verification
+- **Evidence:**
+  - the regression emitted 379 `cannot find unit` messages;
+  - `Move_Minimap` succeeded only 185/339 times and 140 commands timed out;
+  - the verifier currently succeeds when raw order 13 appears or when one
+    representative unit moves at least one world unit;
+  - the target is a minimap coordinate while the observed representative is a
+    world coordinate;
+  - Zealot/Stalker teams inherit upstream `select_type=group`, although
+    RTSCortex does not own a durable create/update control-group lifecycle.
+- **Impact:** selection can repeatedly recall stale groups, and “movement
+  started” is reported as “destination reached”. Actor-local offense state is
+  consequently driven by false terminal reports.
+- **Confirmed root cause:** the Bridge binds a combat command to one historical
+  head tag and the effect verifier observes that tag only. It neither snapshots
+  the living tags in the routed actor nor projects their centroid into minimap
+  space. The inherited control-group ID is mutable SC2 UI state outside
+  RTSCortex provenance, so it cannot serve as an actor identity invariant.
+- **Required correction:**
+  1. use RTSCortex-owned exact-type/direct selection for controlled combat
+     teams instead of unowned control-group recall;
+  2. prune dead tags and deterministically rebind the team head before
+     translation;
+  3. snapshot all living actor tags and the world-to-minimap transform at
+     dispatch;
+  4. confirm movement only when the surviving group centroid is within the
+     arrival radius of the requested minimap target;
+  5. treat a move order and partial displacement as diagnostic progress only;
+  6. derive an effective timeout from the initial target distance.
+- **Acceptance criteria:**
+  - stale control-group recalls equal zero;
+  - a move order alone never produces `succeeded`;
+  - a one-unit displacement toward a remote target remains pending;
+  - group arrival within the configured radius succeeds;
+  - `cannot find unit` and Move timeout rates both fall by at least 80% in the
+    next three-seed regression.
+- **Implemented on 2026-07-24:** controlled single-team combat actors no longer
+  depend on unowned SC2 UI control groups. Effect preparation now carries all
+  living routed tags plus the exact world-to-minimap transform; MoveVerifier
+  uses surviving-group centroid arrival and a distance-derived timeout.
+
+### SCX-PT-022: expansion commitment and background scouting have separate terminal states
+
+- **Priority:** P0
+- **Status:** implemented; awaiting three-seed live verification
 - **Components:** ExpansionScoutController, persistent world anchors, Runtime
   expansion commitment, Nexus translator
 - **Evidence:**
-  - seeds 0 and 2 never exceeded one Nexus;
-  - each commitment terminated near the opening with
-    `expansion_candidates_exhausted` and `evaluated_anchors=[]`;
-  - later in both games, two anchors were attempted outside the original
-    commitment;
-  - one anchor had no complete footprint with resource clearance and the next
-    could not be found on the current screen;
-  - the Worker reported seven/eight exhaustion alerts despite only three scout
-    camera moves.
-- **Impact:** the HIMA expansion objective is declared exhausted before active
-  scouting has discovered and evaluated the map's candidate resource clusters.
-- **Confirmed root cause:** the Runtime commitment and Worker scout have
-  separate lifecycles. An empty initial persistent-anchor cache is interpreted
-  as final exhaustion, while later discoveries can still be surfaced as
-  stateless `Build_Nexus_Near` candidates. The episode exhaustion latch then
-  prevents a coherent commitment from reopening. Anchor identity is also
-  resource-unit based, while final Nexus placement requires a persistent world
-  cluster plus a legal 5x5 center.
+  - all three seeds ended with one Nexus;
+  - 248 commitment terminal events were recorded, 246 with
+    `evaluated_anchors=[]`;
+  - only three expansion scout camera moves were recorded per seed;
+  - a rejected anchor can reset Worker exhaustion without adding a new
+    Runtime-owned commitment state;
+  - seed 1 had one `Build_Nexus_Near` translator rejection.
+- **Impact:** the Runtime can declare the strategic expansion attempt exhausted
+  without proving that its bounded map search and all discovered clusters were
+  evaluated.
+- **Confirmed root cause:** Runtime owns commitment/evaluation events while the
+  Worker independently owns waypoint, discovery, suppression, and exhaustion
+  state. The only cross-process signal is a boolean exhaustion alert, which
+  loses `not_discovered_yet`, `search_in_progress`, candidate identity, and
+  sweep completion. Repeated exhaustion transitions therefore appear as many
+  separate commitment terminals.
 - **Required correction:**
-  1. make the commitment own the scout waypoint queue, discovered resource
-     clusters, rejected anchors, and placement candidates;
-  2. distinguish `not_discovered_yet`, `search_in_progress`, and
-     `all_candidates_exhausted`;
-  3. persist cluster world bounds and ideal Nexus center, not only a currently
-     visible resource tag;
-  4. after invalidation, permanently suppress that candidate and immediately
-     advance to the next unseen cluster;
-  5. terminate only after all bounded scout waypoints have been visited and
-     every discovered cluster has a terminal placement result.
+  1. define one explicit scouting lifecycle:
+     `not_discovered_yet -> search_in_progress -> candidate_available ->
+     candidate_rejected/confirmed -> all_candidates_exhausted`;
+  2. expose the lifecycle state and visited/total waypoint counts in every
+     Worker observation;
+  3. let one Runtime commitment persist across plans and anchor failures;
+  4. keep rejected anchor tags permanently suppressed for the episode;
+  5. terminalize only on confirmed townhall effect, strategic cancellation, or
+     a completed sweep with every discovered candidate terminal.
 - **Acceptance criteria:**
-  - an empty opening cache cannot produce final exhaustion;
-  - every expansion attempt is represented inside one commitment;
-  - an invalid candidate is dispatched at most once;
-  - the commitment ends with a confirmed Nexus or proof that all scout
-    waypoints and clusters were exhausted;
-  - at least one of seeds `[0,1,2]` builds a second Nexus on Simple64.
+  - one HIMA expansion objective creates one commitment;
+  - empty opening discovery cannot be final exhaustion;
+  - each anchor is dispatched at most once;
+  - `evaluated_anchors=[]` cannot accompany an exhausted commitment unless a
+    complete zero-candidate sweep is recorded;
+  - at least one of seeds `[0,1,2]` builds a second Nexus.
+- **Implemented on 2026-07-24:** Worker observations now expose
+  `not_discovered_yet`, `search_in_progress`, `candidate_available`, and
+  `all_candidates_exhausted` together with visited/total waypoint counts.
+  Runtime keeps a commitment through partial sweeps and refuses to accept the
+  old boolean exhaustion alert when structured progress is incomplete.
 
-### SCX-PT-018: Builder selection drifts between observation and translator execution
+### SCX-PT-023: DefenseAgent is a label router rather than a situation-response agent
+
+- **Priority:** P0
+- **Status:** implemented; awaiting three-seed live verification
+- **Components:** Situation v2, RoleAgentCoordinator, DefenseAgent,
+  Strategic Intent Arbiter
+- **Evidence:**
+  - seed 2 recorded 171 critical and 21 high-threat assessments;
+  - seed 2 emitted zero Defense role intents;
+  - all seven classes in `cortex/roles.py` currently inherit the same routing
+    implementation;
+  - Defense receives only an already-existing Reflex intent or a static-defense
+    macro action.
+- **Impact:** the Arbiter cannot select an emergency defense that no upstream
+  producer proposed. High-quality threat detection therefore has no guaranteed
+  path to unit response.
+- **Confirmed root cause:** role ownership was implemented as post-hoc
+  relabeling of Macro/Tactical/Reflex output. DefenseAgent has no state
+  evaluation, no actor selection, no defensive target/region, and no
+  hysteresis or commitment of its own.
+- **Required correction:**
+  1. make DefenseAgent independently inspect threat level, damage evidence,
+     enemy proximity, and actor-compatible targets every observation tick;
+  2. emit bounded emergency defense intents for available combat actors;
+  3. prefer exact attackable threats; otherwise rally toward the threatened
+     base region;
+  4. add threat hysteresis and a short defense commitment to prevent flapping;
+  5. retain routing only for legacy source intents and record independent
+     Defense lineage distinctly.
+- **Acceptance criteria:**
+  - every high/critical fixture with an executable combat response emits at
+    least one Defense intent;
+  - incompatible actors/targets are never paired;
+  - Defense wins actor conflicts against non-emergency Offense within 8 loops;
+  - high/critical live intervals no longer have zero Defense role activity.
+- **Implemented on 2026-07-24:** DefenseAgent now evaluates every current
+  Situation, emits an emergency exact-target response or a threatened-base
+  rally, and holds a short commitment. Immediate Reflex claims are passed into
+  Defense so the two layers do not duplicate the same actor, while legacy
+  creep/static-defense routing retains its non-emergency semantics.
+
+### SCX-PT-024: a truncated HIMA cumulative action list discards an otherwise usable plan
 
 - **Priority:** P1
-- **Status:** implementation complete; live three-seed verification pending
-- **Components:** Builder ownership, action availability, translator chain,
-  build effect verification
+- **Status:** implemented; awaiting live ensemble verification
+- **Components:** HIMA generation contract, cumulative parser, Ensemble health
 - **Evidence:**
-  - seed 0 emitted six consecutive Gateway failures at the same screen
-    coordinate with `function Build_Gateway_screen is not available`;
-  - the immediately preceding Runtime observations exposed
-    `Build_Gateway_Screen` as available for the Builder;
-  - seed 2 had one accepted Pylon whose expected target was not created and two
-    accepted Assimilator actions with no observed build order;
-  - seed 0 build pre-dispatch rejection was 10.5%; seed 2 was 7.4%.
-- **Impact:** valid macro objectives are repeatedly lost to selection-state
-  races, and the same failed signature can consume consecutive planning
-  windows.
-- **Confirmed root cause:** candidate availability is sampled from a fresh
-  selected-Builder observation, but upstream automatic management and
-  multi-agent orchestration can change feature selection before the final
-  build primitive. The current bounded reselection is not an ownership lease:
-  it does not prove that the exact Builder remains selected immediately before
-  the final primitive. Failure deduplication is command-ID based, so a new plan
-  can recreate the same action, coordinate, and failure.
+  - seed 0 recorded 58 degraded coordination events;
+  - Protoss-a emitted cumulative syntax such as `["Pylon": 3, ...]`;
+  - generation reached `max_new_tokens=512` without EOS;
+  - parser diagnostics were `output_truncated` and
+    `action_section_missing`, even when complete counted entries existed before
+    the cut.
+- **Impact:** one ensemble member becomes unavailable during long games and the
+  plan acceptance p95 grows to 207 loops.
+- **Confirmed root cause:** complete cumulative lists are supported, and
+  truncated ordinary string lists have prefix recovery, but truncated
+  cumulative `"<token>": <count>` lists do not. The parser therefore cannot
+  prove which prefix is complete and currently rejects the whole action
+  section.
 - **Required correction:**
-  1. create a Builder selection lease keyed by builder tag, semantic action,
-     target, and observation loop;
-  2. block optional selection-changing orchestration while the lease is active;
-  3. require exact selected-tag evidence on the observation immediately before
-     the build primitive;
-  4. revalidate function availability and placement after that evidence;
-  5. on failure, clear the chain and apply signature-scoped backoff until state
-     or candidate changes;
-  6. keep resource/order changes as diagnostics only.
+  1. impose a bounded logical/effective action budget on cumulative output;
+  2. recover only fully matched counted or bare entries before the truncated
+     tail;
+  3. reject an ambiguous/incomplete final entry;
+  4. emit diagnostics that distinguish safe prefix recovery from unusable
+     truncation;
+  5. allow mapping only when the recovered prefix passes vocabulary and count
+     conservation checks.
 - **Acceptance criteria:**
-  - `observation available -> translator unavailable` mismatches equal zero;
-  - the same failed build signature is not dispatched repeatedly without state
-    change;
-  - build pre-dispatch rejection is at most 5%;
-  - build effect confirmed rate is at least 90%.
+  - a truncated cumulative list with at least one complete item yields a
+    bounded proposal and `truncated_counted_prefix_recovered`;
+  - the partial tail never becomes an action;
+  - unknown tokens and invalid counts remain explicit parse errors;
+  - recovered logical/effective counts conserve exactly;
+  - a recoverable member is not marked degraded.
+- **Implemented on 2026-07-24:** truncated-prefix recovery accepts only fully
+  parsed bare or counted entries, drops an incomplete tail, and applies both
+  logical-item and effective cumulative-count budgets. Mapping and ensemble
+  health recognize `truncated_counted_prefix_recovered` as bounded recovery
+  rather than member failure.
 
-### SCX-PT-019: active Playbook scoring ignores recent terminal failure
+### SCX-PT-025: CortexPlaybook self-iteration has not been isolated from a frozen baseline
 
 - **Priority:** P1
-- **Status:** implementation complete; live three-seed verification pending
-- **Components:** PlaybookIntentGuard, PlaybookCandidateGuard, terminal
-  feedback, rule specificity
+- **Status:** paired runner implemented; experiment pending
+- **Components:** Playbook persistence, promotion sweep, paired evaluation
 - **Evidence:**
-  - seed 0 recorded 73 non-zero rule applications and seed 2 recorded eight;
-  - one soft role rule rewarded production candidates 62 times in seed 0,
-    including `Build_Gateway_Screen` 48 times;
-  - six identical Gateway translator failures occurred while that broad rule
-    continued to add `+0.5`;
-  - no Playbook application blocked a candidate;
-  - seed 0 still ended with `production_imbalance`.
-- **Impact:** CortexPlaybook now changes decisions, but it can reinforce a
-  repeatedly failing action because its strategic preference is not combined
-  with recent execution evidence.
-- **Confirmed root cause:** soft rules are matched against Situation and
-  candidate/role fields only. The Guard has no typed recent-terminal context
-  keyed by action, actor, target, failure stage, and failure code. Role-only
-  `prefer production` rules are consequently applied to every production
-  candidate, even when the exact candidate just failed mechanically.
+  - non-zero Playbook deltas and terminal-feedback blocking occurred in the
+    latest run;
+  - the regression reset the same frozen database before every seed;
+  - cross-game rule accumulation and its causal effect were therefore not
+    tested.
+- **Impact:** current evidence proves that active rules can affect a decision,
+  but not that experience from one game improves a later matched game without
+  increasing false blocks.
+- **Confirmed root cause:** the experiment controls persistence for engineering
+  reproducibility, while self-iteration requires a deliberately evolving
+  database. No paired runner currently holds code/config/model/seeds constant
+  while varying only Playbook persistence.
 - **Required correction:**
-  1. maintain a bounded recent-terminal feedback index by canonical action
-     signature;
-  2. apply deterministic cooldown/negative delta after retryable failure and a
-     hard temporary suppression after non-retryable failure;
-  3. release suppression only after relevant state, candidate, actor, or target
-     changes;
-  4. cap broad role-only bonuses so they cannot override a specific execution
-     failure;
-  5. record the failure evidence and final score components in lineage;
-  6. do not promote episode-error or censored evidence directly to hard.
+  1. build paired `frozen` and `evolving` experiment arms from the same baseline;
+  2. use identical seeds, model revisions, opponent, and natural-terminal
+     settings;
+  3. reset frozen before every game and carry evolving state across games;
+  4. compare repeated-error signatures, false blocks, rule applications,
+     promotions, score deltas, and outcomes;
+  5. keep censored/error evidence ineligible for direct hard promotion.
 - **Acceptance criteria:**
-  - a repeated unchanged translator failure is dispatched at most once during
-    its cooldown;
-  - a specific failure penalty dominates a broad role preference;
-  - every non-zero Playbook delta identifies the applied rule or terminal
-    feedback record;
-  - false blocks remain below 5% and all temporary suppressions expire on
-    relevant state change.
+  - paired run metadata proves all non-Playbook variables are identical;
+  - evolving state persists across seeds while frozen state does not;
+  - classification and application counts conserve;
+  - false-block rate remains below 5%;
+  - repeated eligible error signatures decrease by at least 50%, or the result
+    is explicitly reported as a failed Playbook-quality gate.
+- **Implemented on 2026-07-24:** the paired runner alternates frozen/evolving
+  arms for seeds `[0,1,2]`, restores frozen state before every episode, carries
+  evolving state across episodes, snapshots both databases, and records source,
+  config, baseline, run-directory, and before/after database hashes. The
+  resulting six natural-terminal episodes are the remaining evidence gate.
+- **Evidence run:** Slurm job `9917203` was submitted to
+  `gpu-a100-lowbig` with two A100 GPUs. Its artifacts are rooted at
+  `protoss-playbook-paired-natural-terminal-20260724T213200Z`.
 
 ## Repair order
 
-1. Add the universal primitive boundary and repair `stop_worker`
-   (`SCX-PT-014`).
-2. Add actor-specific target domains before generating any combat candidate
-   (`SCX-PT-015`).
-3. Close offense navigation into enemy-structure attack
-   (`SCX-PT-016`).
-4. Merge scouting and expansion commitment state (`SCX-PT-017`).
-5. Add Builder selection lease and failure-signature backoff
-   (`SCX-PT-018`).
-6. Feed terminal outcomes back into active Playbook scoring
-   (`SCX-PT-019`).
-7. Run focused tests, all quality gates, then a new three-seed natural-terminal
-   regression.
+1. Set the explicit unlimited PySC2 sentinel (`SCX-PT-020`).
+2. Repair actor selection and true movement arrival (`SCX-PT-021`), which is
+   also a prerequisite for offense closure (`SCX-PT-016`).
+3. Merge expansion scouting and commitment state (`SCX-PT-022`).
+4. Implement independent Defense response (`SCX-PT-023`).
+5. Add bounded HIMA cumulative-prefix recovery (`SCX-PT-024`).
+6. Run all engineering gates and a focused smoke.
+7. Run the frozen/evolving paired Playbook experiment (`SCX-PT-025`).
 
 ## Required engineering gates
 
@@ -305,11 +331,11 @@ uv run mypy
 
 Worker Python 3.9 contract checks must additionally cover:
 
-- out-of-range orchestration primitives;
-- ground/air target compatibility;
-- direct selection recovery and Builder selection leases;
-- persistent expansion state;
-- structure-search primitive attribution.
+- exact-type combat selection without unowned control-group state;
+- group-centroid minimap arrival;
+- expansion lifecycle transitions and commitment conservation;
+- independent Defense intent generation;
+- truncated cumulative HIMA prefix recovery.
 
 An item is not removed merely because unit tests pass. P0 live issues require a
 new three-seed natural-terminal run to satisfy their acceptance criteria.

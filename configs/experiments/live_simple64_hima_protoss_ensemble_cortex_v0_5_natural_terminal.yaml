@@ -11,7 +11,9 @@ environment:
   opponent_difficulty: very_easy
   opponent_build: macro
   step_mul: 1
-  game_steps_per_episode: null
+  # PySC2 uses 0 as the explicit no-limit sentinel. Null would inherit the
+  # Simple64 map default of 39,600 game loops.
+  game_steps_per_episode: 0
   simulation_speed_multiplier: 0.5
   pause_until_first_plan: true
   sc2_path: ~/scratch/StarCraftII
@@ -66,7 +68,9 @@ cortex:
     resource_fallback_pylon_free_supply: 4
   playbook:
     enabled: true
-    database_path: ~/scratch/outputs/RTSCortex/cortex-playbook-v2.sqlite3
+    # The paired runner initializes this database once, then preserves all
+    # episode review and promotion state across seeds.
+    database_path: ~/scratch/outputs/RTSCortex/cortex-playbook-evolving-working.sqlite3
     top_k: 6
     min_confidence: 0.6
     promotion_support: 2

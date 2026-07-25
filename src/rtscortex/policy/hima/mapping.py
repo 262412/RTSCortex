@@ -93,7 +93,11 @@ class HIMAMacroActionMapper:
         fixture: PolicyObservationFixture,
     ) -> list[PolicyActionAssessment]:
         recovered_truncated_prefix = any(
-            diagnostic.code == "truncated_action_prefix_recovered"
+            diagnostic.code
+            in {
+                "truncated_action_prefix_recovered",
+                "truncated_counted_prefix_recovered",
+            }
             for diagnostic in proposal.diagnostics
         )
         parse_errors = [

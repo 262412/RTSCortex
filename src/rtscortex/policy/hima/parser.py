@@ -32,9 +32,6 @@ _ACTIONS_LIST_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 _ACTIONS_LIST_START_RE = re.compile(r"\bactions\s*:\s*\[", re.IGNORECASE)
-_TRUNCATED_ACTION_ITEM_RE = re.compile(
-    r"\s*(?P<quote>['\"])(?P<token>[^'\"]+)(?P=quote)\s*(?P<separator>,|$)"
-)
 _NONSTANDARD_ACTION_ITEM_RE = re.compile(
     r"\s*(?P<quote>['\"])(?P<token>[^'\"]+)(?P=quote)\s*:\s*"
     r"(?P<repeat>[+-]?\d+)\s*|"
@@ -84,11 +81,19 @@ class HIMAProposalParser:
         rationale = _parse_rationale(bounded_output)
         tokens, extraction_diagnostics = _extract_tokens(bounded_output)
         if truncated and tokens is None and not extraction_diagnostics:
-            tokens = _extract_truncated_action_prefix(bounded_output)
+            recovered = _extract_truncated_action_prefix(bounded_output)
+            if recovered is not None:
+                tokens, recovery_diagnostics = recovered
+                diagnostics.extend(recovery_diagnostics)
             if tokens:
+                counted = any(target_count is not None for _, _, _, target_count in tokens)
                 extraction_diagnostics.append(
                     ParseDiagnostic(
-                        code="truncated_action_prefix_recovered",
+                        code=(
+                            "truncated_counted_prefix_recovered"
+                            if counted
+                            else "truncated_action_prefix_recovered"
+                        ),
                         message=("Recovered complete action items before the truncated list tail."),
                     )
                 )
@@ -128,7 +133,8 @@ class HIMAProposalParser:
                         )
                     )
                     continue
-                if expanded_count + repeat > MAX_EXPANDED_ACTIONS:
+                effective_count = target_count if target_count is not None else repeat
+                if expanded_count + effective_count > MAX_EXPANDED_ACTIONS:
                     diagnostics.append(
                         ParseDiagnostic(
                             code="expanded_action_limit_exceeded",
@@ -139,7 +145,7 @@ class HIMAProposalParser:
                         )
                     )
                     continue
-                expanded_count += repeat
+                expanded_count += effective_count
                 steps.append(
                     MacroActionStep(
                         ordinal=ordinal,
@@ -319,24 +325,29 @@ def _extract_action_list(
 
 def _extract_truncated_action_prefix(
     raw_output: str,
-) -> list[tuple[int, str, int, int | None]] | None:
-    """Recover only fully quoted items from an unterminated official Actions list."""
+) -> (
+    tuple[
+        list[tuple[int, str, int, int | None]],
+        list[ParseDiagnostic],
+    ]
+    | None
+):
+    """Recover complete ordinary or cumulative items before an unterminated tail."""
 
     match = _ACTIONS_LIST_START_RE.search(raw_output)
     if match is None:
         return None
     candidate = raw_output[match.end() :]
-    tokens: list[tuple[int, str, int, int | None]] = []
-    position = 0
-    while len(tokens) < MAX_ACTION_ITEMS:
-        item = _TRUNCATED_ACTION_ITEM_RE.match(candidate, position)
-        if item is None:
-            break
-        tokens.append((len(tokens), item.group("token").strip(), 1, None))
-        position = item.end()
-        if item.group("separator") != ",":
-            break
-    return tokens or None
+    recovered = _extract_nonstandard_action_items(f"[{candidate}]")
+    if recovered is None:
+        return None
+    tokens, diagnostics = recovered
+    diagnostics = [
+        diagnostic
+        for diagnostic in diagnostics
+        if diagnostic.code != "malformed_action_tail_ignored"
+    ]
+    return (tokens, diagnostics) if tokens else None
 
 
 def _extract_nonstandard_action_items(

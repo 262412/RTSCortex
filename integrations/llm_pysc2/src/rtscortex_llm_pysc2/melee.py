@@ -131,6 +131,13 @@ class RTSCortexMeleeConfig(ProtossAgentConfig):  # type: ignore[misc]
         }
         for agent_name in _SINGLE_TEAM_AGENTS:
             self.AGENTS[agent_name]["team"] = self.AGENTS[agent_name]["team"][:1]
+            team = self.AGENTS[agent_name]["team"][0]
+            # RTSCortex owns actor membership by raw unit tag but does not own a
+            # durable create/update lifecycle for SC2 UI control groups.  Recall
+            # would therefore depend on stale external UI state.  Select all
+            # living units of the actor's exact type from its current viewport.
+            team["game_group"] = -1
+            team["select_type"] = "select_all_type"
         for agent_name, agent in self.AGENTS.items():
             allowed = _ACTION_NAMES[agent_name]
             for unit_type, actions in agent["action"].items():

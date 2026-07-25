@@ -224,6 +224,10 @@ def test_melee_config_keeps_only_the_minimum_protoss_chain(
         "Oracle-1",
         "Phoenix-1",
     ]
+    for agent_name in ("CombatGroup0", "CombatGroup1", "CombatGroup3", "CombatGroup7"):
+        team = config.AGENTS[agent_name]["team"][0]
+        assert team["select_type"] == "select_all_type"
+        assert team["game_group"] == -1
 
 
 def test_melee_config_enables_gas_management_with_reserved_builder(

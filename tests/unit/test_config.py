@@ -63,6 +63,24 @@ def test_live_environment_accepts_natural_terminal_without_step_limits() -> None
     assert settings.game_steps_per_episode is None
 
 
+def test_live_environment_accepts_explicit_pysc2_no_limit_sentinel() -> None:
+    settings = EnvironmentSettings(
+        adapter="llm_pysc2",
+        max_steps=None,
+        game_steps_per_episode=0,
+    )
+
+    assert settings.game_steps_per_episode == 0
+
+
+def test_live_environment_rejects_negative_pysc2_step_limit() -> None:
+    with pytest.raises(ValidationError):
+        EnvironmentSettings(
+            adapter="llm_pysc2",
+            game_steps_per_episode=-1,
+        )
+
+
 def test_mock_environment_requires_finite_step_limit() -> None:
     with pytest.raises(ValidationError, match="finite max_steps"):
         EnvironmentSettings(adapter="mock", max_steps=None)

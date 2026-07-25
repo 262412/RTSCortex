@@ -291,6 +291,36 @@ def test_parser_does_not_recover_an_incomplete_first_action() -> None:
     ]
 
 
+def test_parser_recovers_bounded_counted_prefix_from_truncated_hima_output() -> None:
+    proposal = HIMAProposalParser().parse(
+        'Reason: expand. Actions: ["Pylon": 3, "Probe": 18, "Gate',
+        truncated=True,
+    )
+
+    assert [step.canonical_action for step in proposal.steps] == [
+        "BUILD PYLON",
+        "TRAIN PROBE",
+    ]
+    assert [step.target_count for step in proposal.steps] == [3, 18]
+    assert [item.code for item in proposal.diagnostics] == [
+        "output_truncated",
+        "truncated_counted_prefix_recovered",
+    ]
+
+
+def test_parser_does_not_recover_partial_counted_first_item() -> None:
+    proposal = HIMAProposalParser().parse(
+        'Reason: expand. Actions: ["Pylon": ',
+        truncated=True,
+    )
+
+    assert proposal.steps == []
+    assert [item.code for item in proposal.diagnostics] == [
+        "output_truncated",
+        "action_section_missing",
+    ]
+
+
 def test_parser_reports_missing_and_empty_action_sections() -> None:
     missing = HIMAProposalParser().parse("Reason: Add more production.")
     empty = HIMAProposalParser().parse("Actions: []")

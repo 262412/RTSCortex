@@ -533,6 +533,7 @@ class TimeStepExtractor:
         self._known_expansion_resources: dict[int, dict[str, Any]] = {}
         self._suppressed_expansion_anchors: set[int] = set()
         self._expansion_candidates_exhausted = False
+        self._expansion_scout_alerts: tuple[str, ...] = ()
         self._latest_game_loop = 0
 
     @property
@@ -545,6 +546,9 @@ class TimeStepExtractor:
 
     def set_expansion_candidates_exhausted(self, exhausted: bool) -> None:
         self._expansion_candidates_exhausted = bool(exhausted)
+
+    def set_expansion_scout_alerts(self, alerts: Sequence[str]) -> None:
+        self._expansion_scout_alerts = tuple(str(alert) for alert in alerts)
 
     def suppress_expansion_anchor(
         self,
@@ -626,6 +630,7 @@ class TimeStepExtractor:
             "text_observation": text_observation,
             "alerts": [
                 *[_alert_name(value) for value in _value(observation, "alerts", ())],
+                *self._expansion_scout_alerts,
                 *(
                     ["expansion_candidates_exhausted"]
                     if self._expansion_candidates_exhausted

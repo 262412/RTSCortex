@@ -634,6 +634,8 @@ def test_move_minimap_uses_builder_motion_instead_of_global_camera_position() ->
         command.command_id,
         _move_observation(game_loop=100, center=(8, 8), builder_position=(30, 30)),
         0xABC,
+        actor_tags=(0xABC,),
+        minimap_transform=(1.0, 0.0, 0.0, 64.0, 63.0),
     )
     verifier.accept_primitive(command.command_id, game_loop=101)
 
@@ -644,8 +646,14 @@ def test_move_minimap_uses_builder_motion_instead_of_global_camera_position() ->
         == []
     )
     assert verifier.blocks_auto_worker_management is False
+    assert (
+        verifier.observe(
+            _move_observation(game_loop=103, center=(8, 8), builder_position=(31.5, 30))
+        )
+        == []
+    )
     verdict = verifier.observe(
-        _move_observation(game_loop=103, center=(8, 8), builder_position=(31.5, 30))
+        _move_observation(game_loop=200, center=(8, 8), builder_position=(48, 16))
     )[0]
 
     assert verdict.success is True
@@ -657,16 +665,16 @@ def test_move_minimap_uses_builder_motion_instead_of_global_camera_position() ->
     assert verdict.evidence["builder_tag"] == "0xabc"
     assert verdict.evidence["dispatched_loop"] == 100
     assert verdict.evidence["accepted_loop"] == 101
-    assert verdict.evidence["confirmed_loop"] == 103
-    assert verdict.evidence["baseline_builder_position"] == (30.0, 30.0)
-    assert verdict.evidence["observed_builder_position"] == (31.5, 30.0)
-    assert verdict.evidence["builder_displacement"] == 1.5
+    assert verdict.evidence["confirmed_loop"] == 200
+    assert verdict.evidence["baseline_builder_position"] == (30.0, 34.0)
+    assert verdict.evidence["observed_builder_position"] == (48.0, 48.0)
+    assert verdict.evidence["builder_displacement"] > 22
     assert verdict.evidence["move_order_seen"] is False
-    assert verdict.evidence["effective_timeout_game_loops"] == 10
+    assert verdict.evidence["effective_timeout_game_loops"] == 261
     assert verifier.is_tracked(command.command_id) is False
 
 
-def test_move_minimap_accepts_raw_move_order_before_position_changes() -> None:
+def test_move_minimap_treats_raw_move_order_as_progress_not_arrival() -> None:
     verifier = ActionEffectVerifier(timeout_game_loops=10)
     command = _move_command()
     verifier.track(command)
@@ -674,14 +682,27 @@ def test_move_minimap_accepts_raw_move_order_before_position_changes() -> None:
         command.command_id,
         _move_observation(game_loop=100, center=(8, 8), builder_position=(30, 30)),
         0xABC,
+        actor_tags=(0xABC,),
+        minimap_transform=(1.0, 0.0, 0.0, 64.0, 63.0),
     )
     verifier.accept_primitive(command.command_id, game_loop=101)
 
+    assert (
+        verifier.observe(
+            _move_observation(
+                game_loop=102,
+                center=(8, 8),
+                builder_position=(30, 30),
+                builder_orders=[13],
+            )
+        )
+        == []
+    )
     verdict = verifier.observe(
         _move_observation(
-            game_loop=102,
+            game_loop=200,
             center=(8, 8),
-            builder_position=(30, 30),
+            builder_position=(48, 16),
             builder_orders=[13],
         )
     )[0]
@@ -689,10 +710,10 @@ def test_move_minimap_accepts_raw_move_order_before_position_changes() -> None:
     assert verdict.success is True
     assert verdict.evidence is not None
     assert verdict.evidence["move_order_seen"] is True
-    assert verdict.evidence["builder_displacement"] == 0.0
+    assert verdict.evidence["builder_displacement"] > 20.0
 
 
-def test_move_minimap_times_out_after_one_base_window_without_unit_effect() -> None:
+def test_move_minimap_derives_timeout_from_initial_target_distance() -> None:
     verifier = ActionEffectVerifier(timeout_game_loops=10)
     command = _move_command()
     verifier.track(command)
@@ -700,27 +721,29 @@ def test_move_minimap_times_out_after_one_base_window_without_unit_effect() -> N
         command.command_id,
         _move_observation(game_loop=100, center=(8, 8), builder_position=(30, 30)),
         0xABC,
+        actor_tags=(0xABC,),
+        minimap_transform=(1.0, 0.0, 0.0, 64.0, 63.0),
     )
     verifier.accept_primitive(command.command_id, game_loop=101)
 
     assert (
         verifier.observe(
-            _move_observation(game_loop=110, center=(48, 48), builder_position=(30, 30))
+            _move_observation(game_loop=361, center=(48, 48), builder_position=(30, 30))
         )
         == []
     )
     verdict = verifier.observe(
-        _move_observation(game_loop=111, center=(48, 48), builder_position=(30, 30))
+        _move_observation(game_loop=362, center=(48, 48), builder_position=(30, 30))
     )[0]
 
     assert verdict.success is False
     assert verdict.status == "failed"
     assert verdict.failure_code == "effect_timeout"
-    assert "did not start after 10 game loops" in (verdict.failure_reason or "")
+    assert "did not arrive after 261 game loops" in (verdict.failure_reason or "")
     assert verdict.evidence is not None
     assert verdict.evidence["confirmed_loop"] is None
-    assert verdict.evidence["elapsed_game_loops"] == 10
-    assert verdict.evidence["effective_timeout_game_loops"] == 10
+    assert verdict.evidence["elapsed_game_loops"] == 261
+    assert verdict.evidence["effective_timeout_game_loops"] == 261
 
 
 def test_move_minimap_uses_actor_semantics_when_the_unit_disappears() -> None:
@@ -731,10 +754,12 @@ def test_move_minimap_uses_actor_semantics_when_the_unit_disappears() -> None:
         command.command_id,
         _move_observation(game_loop=100, center=(8, 8), builder_position=(30, 30)),
         0xABC,
+        actor_tags=(0xABC,),
+        minimap_transform=(1.0, 0.0, 0.0, 64.0, 63.0),
     )
     verifier.accept_primitive(command.command_id, game_loop=101)
     missing_actor = _move_observation(
-        game_loop=111,
+        game_loop=362,
         center=(48, 48),
         builder_position=(30, 30),
     )
@@ -749,7 +774,7 @@ def test_move_minimap_uses_actor_semantics_when_the_unit_disappears() -> None:
     assert "actor is not observable" in (verdict.failure_reason or "")
     assert verdict.evidence is not None
     assert verdict.evidence["actor_tag"] == "0xabc"
-    assert verdict.evidence["baseline_actor_position"] == (30.0, 30.0)
+    assert verdict.evidence["baseline_actor_position"] == (30.0, 34.0)
     assert verdict.evidence["observed_actor_position"] is None
 
 
@@ -761,6 +786,8 @@ def test_move_minimap_is_unconfirmed_when_episode_ends_in_transit() -> None:
         command.command_id,
         _move_observation(game_loop=100, center=(8, 8), builder_position=(30, 30)),
         0xABC,
+        actor_tags=(0xABC,),
+        minimap_transform=(1.0, 0.0, 0.0, 64.0, 63.0),
     )
     verifier.accept_primitive(command.command_id, game_loop=101)
     assert (

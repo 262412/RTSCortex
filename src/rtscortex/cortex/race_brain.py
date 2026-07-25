@@ -423,7 +423,11 @@ def _proposal_score(
         score += min(len(response.proposal.steps), 10) * 0.1
         reasons.append("ordered plan depth")
     if any(
-        diagnostic.code == "truncated_action_prefix_recovered"
+        diagnostic.code
+        in {
+            "truncated_action_prefix_recovered",
+            "truncated_counted_prefix_recovered",
+        }
         for diagnostic in response.proposal.diagnostics
     ):
         score -= 10.0

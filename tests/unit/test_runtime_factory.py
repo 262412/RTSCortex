@@ -304,6 +304,28 @@ def test_live_hima_cortex_regression_uses_long_multi_seed_window() -> None:
     assert config.provider.kind == "fake"
 
 
+def test_protoss_playbook_paired_configs_differ_only_by_database_path() -> None:
+    frozen = load_config(
+        PROJECT_ROOT
+        / "configs/experiments/"
+        "live_simple64_hima_protoss_ensemble_cortex_v0_5_"
+        "frozen_playbook_natural_terminal.yaml"
+    )
+    evolving = load_config(
+        PROJECT_ROOT
+        / "configs/experiments/"
+        "live_simple64_hima_protoss_ensemble_cortex_v0_5_natural_terminal.yaml"
+    )
+
+    assert frozen.environment.game_steps_per_episode == 0
+    assert evolving.environment.game_steps_per_episode == 0
+    frozen_payload = frozen.model_dump(mode="json")
+    evolving_payload = evolving.model_dump(mode="json")
+    frozen_payload["cortex"]["playbook"]["database_path"] = "<arm-playbook>"
+    evolving_payload["cortex"]["playbook"]["database_path"] = "<arm-playbook>"
+    assert frozen_payload == evolving_payload
+
+
 def test_live_hima_ensemble_v0_4_enables_cross_run_playbook() -> None:
     config = load_config(
         PROJECT_ROOT / "configs/experiments/live_simple64_hima_ensemble_cortex_v0_4.yaml"

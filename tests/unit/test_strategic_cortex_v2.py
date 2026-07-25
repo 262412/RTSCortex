@@ -5,7 +5,14 @@ from pathlib import Path
 
 import pytest
 
-from rtscortex.contracts import EconomyState, ObservationEnvelope, SC2State, UnitState
+from rtscortex.contracts import (
+    ActionArgumentType,
+    AvailableAction,
+    EconomyState,
+    ObservationEnvelope,
+    SC2State,
+    UnitState,
+)
 from rtscortex.cortex import (
     CandidateFeatures,
     DeterministicSituationAnalyzer,
@@ -19,6 +26,7 @@ from rtscortex.cortex import (
     RoleId,
     StrategicIntent,
     StrategicIntentAdapter,
+    ThreatLevel,
 )
 from rtscortex.cortex.models import IntentTarget, MacroIntent, ReflexIntent
 from rtscortex.playbook import (
@@ -231,6 +239,64 @@ def test_only_actual_defense_reflex_is_an_emergency() -> None:
     assert static_defense.emergency is False
     assert defense_reflex.role is RoleId.DEFENSE
     assert defense_reflex.emergency is True
+
+
+def test_defense_agent_independently_responds_to_a_critical_threat() -> None:
+    base = _observation()
+    observation = base.model_copy(
+        update={
+            "state": base.state.model_copy(
+                update={
+                    "visible_enemies": [
+                        UnitState(
+                            unit_id="0xe1",
+                            unit_type="Drone",
+                            alliance="enemy",
+                            position=(12, 10),
+                        )
+                    ]
+                }
+            ),
+            "available_actions": [
+                AvailableAction(
+                    name="Attack_Unit",
+                    argument_names=["tag"],
+                    argument_types=[ActionArgumentType.TAG],
+                    actor_scopes=["CombatGroup0/Zealot-1"],
+                    argument_candidates=[["0xe1"]],
+                )
+            ],
+        }
+    )
+    assessment = DeterministicSituationAnalyzer().assess(observation).model_copy(
+        update={"threat_level": ThreatLevel.CRITICAL, "threat_score": 12.0}
+    )
+    coordinator = RoleAgentCoordinator(
+        race_profile("protoss"),
+        StrategicIntentAdapter(race_profile("protoss")),
+    )
+    context = RoleAgentContext(
+        observation=observation,
+        situation=assessment,
+        source_intents=(),
+    )
+
+    source_intents = coordinator.propose_defense_intents(context)
+    assert len(source_intents) == 1
+    assert source_intents[0].action_names == ["Attack_Unit"]
+    assert source_intents[0].target.unit_tag == "0xe1"
+
+    routed = coordinator.evaluate(
+        RoleAgentContext(
+            observation=observation,
+            situation=assessment,
+            source_intents=source_intents,
+        )
+    )
+    strategic = routed[source_intents[0].intent_id]
+    assert strategic.role is RoleId.DEFENSE
+    assert strategic.emergency is True
+    assert strategic.urgency == 1.0
 
 
 def test_zerg_queen_controller_routes_inject_to_economy_and_creep_to_defense() -> None:

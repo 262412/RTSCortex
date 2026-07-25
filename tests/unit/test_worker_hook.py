@@ -2121,6 +2121,8 @@ def test_expansion_scout_controller_rotates_unexplored_camera_waypoints() -> Non
     )
 
     assert first is not None
+    assert controller.state == "search_in_progress"
+    assert controller.progress_alerts[0] == "expansion_scout_state=search_in_progress"
     assert too_soon is None
     assert second is not None and second != first
     assert controller.next_waypoint(
@@ -2161,6 +2163,11 @@ def test_expansion_scout_controller_reports_exhaustion_without_repeating_waypoin
             break
 
     assert controller.exhausted is True
+    assert controller.state == "all_candidates_exhausted"
+    assert controller.progress_alerts == (
+        "expansion_scout_state=all_candidates_exhausted",
+        f"expansion_scout_waypoints={len(visited)}/{len(visited)}",
+    )
     assert visited
     assert len(visited) == len(set(visited))
     assert controller.next_waypoint(
@@ -6674,7 +6681,7 @@ def test_broker_forwards_raw_observations_for_deferred_effect_verification() -> 
     broker.observe_effects(observation)
 
     assert coordinator.calls == [
-        ("prepare", "command-pylon", observation, 0xABC, None),
+        ("prepare", "command-pylon", observation, 0xABC, None, (), None),
         ("primitive", "command-pylon", "Build_Pylon_screen", True),
         ("complete", "command-pylon", 225),
         ("observe", observation),
@@ -7032,8 +7039,20 @@ class EffectRecordingCoordinator:
         *,
         builder_tag: int | None,
         producer_tag: int | None = None,
+        actor_tags: tuple[int, ...] = (),
+        minimap_transform: tuple[float, float, float, float, float] | None = None,
     ) -> None:
-        self.calls.append(("prepare", command_id, observation, builder_tag, producer_tag))
+        self.calls.append(
+            (
+                "prepare",
+                command_id,
+                observation,
+                builder_tag,
+                producer_tag,
+                actor_tags,
+                minimap_transform,
+            )
+        )
 
     def record_primitive(
         self,

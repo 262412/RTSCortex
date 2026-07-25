@@ -692,12 +692,18 @@ class SharedDecisionBroker:
         *,
         builder_tag: Optional[int],
         producer_tag: Optional[int] = None,
+        actor_tags: tuple[int, ...] = (),
+        minimap_transform: Optional[
+            tuple[float, float, float, float, float]
+        ] = None,
     ) -> None:
         self.coordinator.prepare_effect(
             dispatch.command_id,
             observation,
             builder_tag=builder_tag,
             producer_tag=producer_tag,
+            actor_tags=actor_tags,
+            minimap_transform=minimap_transform,
         )
 
     def observe_effects(self, observation: Any) -> None:

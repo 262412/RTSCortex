@@ -54,7 +54,8 @@ class EnvironmentSettings(SettingsModel):
     opponent_difficulty: BotDifficulty = "very_hard"
     opponent_build: BotBuild = "random"
     step_mul: int = Field(default=1, ge=1)
-    game_steps_per_episode: int | None = Field(default=None, ge=1)
+    # PySC2 uses zero as the explicit "no episode step limit" sentinel.
+    game_steps_per_episode: int | None = Field(default=None, ge=0)
     simulation_speed_multiplier: float | None = Field(default=None, gt=0.0, le=1.0)
     pause_until_first_plan: bool = False
     sc2_path: Path | None = None

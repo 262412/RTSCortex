@@ -225,11 +225,13 @@ class ExpansionScoutController:
         self.pending_waypoint: tuple[int, int] | None = None
         self.pending_game_loop: int | None = None
         self.exhausted = False
+        self.state = "not_discovered_yet"
 
     def request_immediate_progress(self, *, game_loop: int) -> None:
         """Resume the bounded sweep immediately after an anchor is invalidated."""
 
         self.exhausted = False
+        self.state = "search_in_progress"
         self.last_scout_game_loop = None
         self.soft_blocked_since_game_loop = int(game_loop) - self.interval_game_loops
 
@@ -239,6 +241,7 @@ class ExpansionScoutController:
         self.pending_waypoint = None
         self.pending_game_loop = None
         self.last_scout_game_loop = None
+        self.state = "search_in_progress"
 
     def next_waypoint(
         self,
@@ -259,9 +262,11 @@ class ExpansionScoutController:
             self.pending_game_loop = None
         if anchor_available:
             self.exhausted = False
+            self.state = "candidate_available"
             self.soft_blocked_since_game_loop = None
             return None
         if self.exhausted:
+            self.state = "all_candidates_exhausted"
             return None
         if self.pending_waypoint is not None:
             return None
@@ -274,7 +279,9 @@ class ExpansionScoutController:
         if not self.waypoint_queue:
             # Missing minimap candidates is not proof that the bounded search
             # completed. The feature planes may not be ready yet.
+            self.state = "not_discovered_yet"
             return None
+        self.state = "search_in_progress"
         waypoint = next(
             (
                 candidate
@@ -285,6 +292,7 @@ class ExpansionScoutController:
         )
         if waypoint is None:
             self.exhausted = True
+            self.state = "all_candidates_exhausted"
             self.soft_blocked_since_game_loop = None
             return None
         if blocked:
@@ -309,7 +317,18 @@ class ExpansionScoutController:
         self.pending_game_loop = int(game_loop)
         self.last_scout_game_loop = int(game_loop)
         self.soft_blocked_since_game_loop = None
+        self.state = "search_in_progress"
         return waypoint
+
+    @property
+    def progress_alerts(self) -> tuple[str, str]:
+        return (
+            f"expansion_scout_state={self.state}",
+            (
+                "expansion_scout_waypoints="
+                f"{len(self.visited_waypoints)}/{len(self.waypoint_queue)}"
+            ),
+        )
 
 
 @dataclass
@@ -1932,6 +1951,8 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
                     obs.observation,
                     builder_tag=_execution_unit_tag(agent),
                     producer_tag=attempt.get("producer_tag"),
+                    actor_tags=_execution_unit_tags(agent, obs.observation),
+                    minimap_transform=_agent_world_to_minimap_transform(agent),
                 )
             self._pending_primitive = dispatch
             self._pending_primitive_agent = agent
@@ -2047,6 +2068,7 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
             soft_blocked=soft_blocked,
         )
         extractor.set_expansion_candidates_exhausted(self.expansion_scout.exhausted)
+        extractor.set_expansion_scout_alerts(self.expansion_scout.progress_alerts)
         if self.expansion_scout.exhausted and not was_exhausted:
             self.decision_broker.record_expansion_candidate_exhaustion()
         if waypoint is None:
@@ -3368,6 +3390,52 @@ def _execution_team_name(agent: Any) -> Optional[str]:
 def _execution_unit_tag(agent: Any) -> Optional[int]:
     value = getattr(agent, "team_unit_tag_curr", None)
     return None if value is None else int(value)
+
+
+def _execution_unit_tags(agent: Any, observation: Any) -> tuple[int, ...]:
+    """Return the living raw tags owned by the currently routed actor team."""
+
+    team_name = _execution_team_name(agent)
+    team = next(
+        (
+            value
+            for value in getattr(agent, "teams", ())
+            if isinstance(value, Mapping)
+            and str(value.get("name", "")) == str(team_name or "")
+        ),
+        None,
+    )
+    configured = (
+        ()
+        if team is None
+        else tuple(int(tag) for tag in team.get("unit_tags", ()) if int(tag) > 0)
+    )
+    current = _execution_unit_tag(agent)
+    wanted = set(configured)
+    if current is not None:
+        wanted.add(current)
+    living = {
+        int(_observation_value(unit, "tag", 0))
+        for unit in _observation_value(observation, "raw_units", ())
+        if int(_observation_value(unit, "alliance", 0)) == 1
+    }
+    return tuple(sorted(wanted & living))
+
+
+def _agent_world_to_minimap_transform(
+    agent: Any,
+) -> Optional[tuple[float, float, float, float, float]]:
+    world_range = float(getattr(agent, "world_range", 0.0))
+    size_minimap = float(getattr(agent, "size_minimap", 0.0))
+    if world_range <= 0 or size_minimap <= 0:
+        return None
+    return (
+        size_minimap / world_range,
+        float(getattr(agent, "world_x_offset", 0.0)),
+        float(getattr(agent, "world_y_offset", 0.0)),
+        world_range,
+        size_minimap - 1.0,
+    )
 
 
 def _worker_unit_name(unit: Any, unit_names: Mapping[int, str]) -> str:

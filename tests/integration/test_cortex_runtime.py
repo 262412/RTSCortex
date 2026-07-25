@@ -1579,6 +1579,63 @@ def test_expansion_candidate_exhaustion_terminalizes_active_commitment(
     recovered.close()
 
 
+def test_expansion_commitment_ignores_incomplete_structured_scout_exhaustion(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    runtime = CortexRuntimeEngine(
+        config=_config(tmp_path),
+        store=store,
+        provider=FakeProvider(),
+        macro_client=_FakeMacroClient("Actions: ['Nexus']"),
+    )
+    observation = ObservationEnvelope(
+        run_id="cortex-run",
+        episode_id="episode-1",
+        step_id=0,
+        game_loop=0,
+        state=SC2State(
+            economy=EconomyState(
+                minerals=500,
+                supply_used=12,
+                supply_cap=23,
+                workers=12,
+            ),
+            own_structures=[
+                UnitState(unit_id="0x1", unit_type="Nexus", alliance="self")
+            ],
+        ),
+        available_actions=[],
+    )
+
+    async def exercise() -> None:
+        await runtime.start()
+        await runtime.tick(observation)
+        for _ in range(5):
+            await asyncio.sleep(0)
+        incomplete = observation.model_copy(
+            update={
+                "step_id": 1,
+                "game_loop": 1,
+                "alerts": [
+                    "expansion_candidates_exhausted",
+                    "expansion_scout_state=all_candidates_exhausted",
+                    "expansion_scout_waypoints=3/8",
+                ],
+            }
+        )
+        await runtime.tick(incomplete)
+        assert runtime._expansion_commitment_id is not None
+        assert runtime._expansion_candidates_exhausted is False
+        assert not store.events_of_type(
+            "cortex-run", "episode-1", "expansion_commitment_terminal"
+        )
+        await runtime.close()
+
+    asyncio.run(exercise())
+    store.close()
+
+
 def test_episode_end_records_unattempted_expansion_commitment_root_cause(
     tmp_path: Path,
 ) -> None:

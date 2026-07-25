@@ -241,6 +241,9 @@ class CortexRuntimeEngine(RuntimeEngine):
         self._expansion_commitment_started_game_loop: int | None = None
         self._expansion_anchor_evaluations: list[dict[str, Any]] = []
         self._expansion_candidates_exhausted = False
+        self._expansion_scout_state = "not_discovered_yet"
+        self._expansion_scout_visited_waypoints = 0
+        self._expansion_scout_total_waypoints = 0
         if config.cortex.situation.kind == "model_active" and situation_provider is None:
             raise ValueError("model_active Situation requires a SituationProvider")
         if config.cortex.situation.kind == "model_shadow" and shadow_situation_provider is None:
@@ -349,7 +352,23 @@ class CortexRuntimeEngine(RuntimeEngine):
         if macro_prepared is not None:
             prepared.append(macro_prepared)
 
+        reflex_started = time.perf_counter()
+        raw_reflex = [
+            command
+            for command in self.reflex.evaluate(observation)
+            if command.command_id not in self._command_states
+        ]
+        claimed_reflex_actors = frozenset(command.actor for command in raw_reflex)
+
         tactical_intents = self._tactical.evaluate(observation, assessment)
+        defense_intents = self._role_agents.propose_defense_intents(
+            RoleAgentContext(
+                observation=observation,
+                situation=assessment,
+                source_intents=tuple(tactical_intents),
+            ),
+            claimed_actor_scopes=claimed_reflex_actors,
+        )
         if self._shadow_tactical is not None:
             shadow_started = time.perf_counter()
             shadow_intents = self._shadow_tactical.evaluate(observation, assessment)
@@ -366,17 +385,11 @@ class CortexRuntimeEngine(RuntimeEngine):
             )
         tactical_prepared = [
             item
-            for intent in tactical_intents
+            for intent in (*defense_intents, *tactical_intents)
             if (item := self._compile_intent(observation, intent)) is not None
         ]
         prepared.extend(tactical_prepared)
 
-        reflex_started = time.perf_counter()
-        raw_reflex = [
-            command
-            for command in self.reflex.evaluate(observation)
-            if command.command_id not in self._command_states
-        ]
         reflex_prepared = [
             item
             for command in raw_reflex
@@ -586,6 +599,9 @@ class CortexRuntimeEngine(RuntimeEngine):
         self._expansion_commitment_started_game_loop = None
         self._expansion_anchor_evaluations = []
         self._expansion_candidates_exhausted = False
+        self._expansion_scout_state = "not_discovered_yet"
+        self._expansion_scout_visited_waypoints = 0
+        self._expansion_scout_total_waypoints = 0
         self._strategic_agenda = None
         self._strategic_by_legacy_intent = {}
         self._macro_source_observation = None
@@ -2429,14 +2445,61 @@ class CortexRuntimeEngine(RuntimeEngine):
         self,
         observation: ObservationEnvelope,
     ) -> None:
+        previous_state = self._expansion_scout_state
+        structured_state = next(
+            (
+                alert.split("=", 1)[1]
+                for alert in observation.alerts
+                if alert.casefold().startswith("expansion_scout_state=")
+            ),
+            None,
+        )
+        progress = next(
+            (
+                alert.split("=", 1)[1]
+                for alert in observation.alerts
+                if alert.casefold().startswith("expansion_scout_waypoints=")
+            ),
+            None,
+        )
+        if structured_state is not None:
+            self._expansion_scout_state = structured_state.casefold()
+        if progress is not None:
+            try:
+                visited, total = progress.split("/", 1)
+                self._expansion_scout_visited_waypoints = max(0, int(visited))
+                self._expansion_scout_total_waypoints = max(0, int(total))
+            except ValueError:
+                self._expansion_scout_visited_waypoints = 0
+                self._expansion_scout_total_waypoints = 0
+        if self._expansion_scout_state != previous_state:
+            self._record_cortex_event(
+                observation,
+                "expansion_scout_state_changed",
+                {
+                    "previous_state": previous_state,
+                    "state": self._expansion_scout_state,
+                    "visited_waypoints": self._expansion_scout_visited_waypoints,
+                    "total_waypoints": self._expansion_scout_total_waypoints,
+                    "commitment_id": self._expansion_commitment_id,
+                },
+            )
         townhall_action = self._townhall_runtime_action()
         candidate_available = any(
             action.name == townhall_action and bool(action.argument_candidates)
             for action in observation.available_actions
         )
-        reported_exhausted = "expansion_candidates_exhausted" in {
+        legacy_exhausted = "expansion_candidates_exhausted" in {
             alert.casefold() for alert in observation.alerts
         }
+        reported_exhausted = (
+            self._expansion_scout_state == "all_candidates_exhausted"
+            and self._expansion_scout_total_waypoints > 0
+            and self._expansion_scout_visited_waypoints
+            >= self._expansion_scout_total_waypoints
+        )
+        if structured_state is None:
+            reported_exhausted = legacy_exhausted
         if candidate_available:
             # A newly discovered persistent cluster is stronger evidence than
             # an older Worker exhaustion alert.
@@ -2497,6 +2560,9 @@ class CortexRuntimeEngine(RuntimeEngine):
                 "started_game_loop": self._expansion_commitment_started_game_loop,
                 "terminal_game_loop": observation.game_loop,
                 "evaluated_anchors": list(self._expansion_anchor_evaluations),
+                "scout_state": self._expansion_scout_state,
+                "visited_waypoints": self._expansion_scout_visited_waypoints,
+                "total_waypoints": self._expansion_scout_total_waypoints,
             },
         )
         self._expansion_commitment_id = None
@@ -2523,6 +2589,9 @@ class CortexRuntimeEngine(RuntimeEngine):
                 "started_game_loop": self._expansion_commitment_started_game_loop,
                 "terminal_game_loop": self._execution_game_loop(report),
                 "evaluated_anchors": list(self._expansion_anchor_evaluations),
+                "scout_state": self._expansion_scout_state,
+                "visited_waypoints": self._expansion_scout_visited_waypoints,
+                "total_waypoints": self._expansion_scout_total_waypoints,
                 "command_id": report.command_id,
             },
         )

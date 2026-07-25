@@ -306,6 +306,8 @@ def test_coordinator_defers_move_minimap_until_builder_starts_moving() -> None:
         "command-move",
         _raw_move_observation(game_loop=224, center=(8, 8)),
         builder_tag=0xABC,
+        actor_tags=(0xABC,),
+        minimap_transform=(1.0, 0.0, 0.0, 64.0, 63.0),
     )
     coordinator.record_primitive("command-move", "Move_minimap", success=True)
 
@@ -315,7 +317,7 @@ def test_coordinator_defers_move_minimap_until_builder_starts_moving() -> None:
     assert coordinator.observe_effects(_raw_move_observation(game_loop=300, center=(48, 48))) == []
 
     reports = coordinator.observe_effects(
-        _raw_move_observation(game_loop=320, center=(8, 8), builder_position=(31.5, 30))
+        _raw_move_observation(game_loop=320, center=(8, 8), builder_position=(48, 16))
     )
 
     assert len(reports) == 1
@@ -327,9 +329,10 @@ def test_coordinator_defers_move_minimap_until_builder_starts_moving() -> None:
     assert report.effect_evidence.target_type == "Move_Minimap"
     assert report.effect_evidence.target_position == (48.0, 48.0)
     assert report.effect_evidence.confirmed_game_loop == 320
-    assert report.effect_evidence.baseline_builder_position == (30.0, 30.0)
-    assert report.effect_evidence.observed_builder_position == (31.5, 30.0)
-    assert report.effect_evidence.builder_displacement == 1.5
+    assert report.effect_evidence.baseline_builder_position == (30.0, 34.0)
+    assert report.effect_evidence.observed_builder_position == (48.0, 48.0)
+    assert report.effect_evidence.builder_displacement is not None
+    assert report.effect_evidence.builder_displacement > 22
 
 
 def test_coordinator_reports_in_transit_move_as_unconfirmed_at_episode_end() -> None:
@@ -340,6 +343,8 @@ def test_coordinator_reports_in_transit_move_as_unconfirmed_at_episode_end() -> 
         "command-move",
         _raw_move_observation(game_loop=224, center=(8, 8)),
         builder_tag=0xABC,
+        actor_tags=(0xABC,),
+        minimap_transform=(1.0, 0.0, 0.0, 64.0, 63.0),
     )
     coordinator.record_primitive("command-move", "Move_minimap", success=True)
     assert coordinator.complete_command("command-move", game_loop=225) is None
