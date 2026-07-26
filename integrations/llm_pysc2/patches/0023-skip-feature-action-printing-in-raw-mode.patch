@@ -1,0 +1,15 @@
+diff --git a/pysc2/env/available_actions_printer.py b/pysc2/env/available_actions_printer.py
+--- a/pysc2/env/available_actions_printer.py
++++ b/pysc2/env/available_actions_printer.py
+@@ -25,7 +25,10 @@ class AvailableActionsPrinter(base_env_wrapper.BaseEnvWrapper):
+   def step(self, *args, **kwargs):
+     all_obs = super(AvailableActionsPrinter, self).step(*args, **kwargs)
+     for obs in all_obs:
+-      for avail in obs.observation["available_actions"]:
++      available_actions = obs.observation.get("available_actions")
++      if available_actions is None:
++        continue
++      for avail in available_actions:
+         if avail not in self._seen:
+           self._seen.add(avail)
+           self._print(self._action_spec.functions[avail].str(True))

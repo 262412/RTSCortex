@@ -711,6 +711,32 @@ def test_move_minimap_treats_raw_move_order_as_progress_not_arrival() -> None:
     assert verdict.evidence["builder_displacement"] > 20.0
 
 
+def test_move_minimap_recognizes_concrete_raw_move_order_547() -> None:
+    verifier = ActionEffectVerifier(timeout_game_loops=10)
+    command = _move_command()
+    verifier.track(command)
+    verifier.prepare(
+        command.command_id,
+        _move_observation(game_loop=100, center=(8, 8), builder_position=(30, 30)),
+        0xABC,
+        actor_tags=(0xABC,),
+        minimap_transform=None,
+    )
+    verifier.accept_primitive(command.command_id, game_loop=101)
+
+    assert (
+        verifier.observe(
+            _move_observation(
+                game_loop=102,
+                center=(8, 8),
+                builder_position=(31, 30),
+                builder_orders=[547],
+            )
+        )
+        == []
+    )
+
+
 def test_move_minimap_derives_timeout_from_initial_target_distance() -> None:
     verifier = ActionEffectVerifier(timeout_game_loops=10)
     command = _move_command()

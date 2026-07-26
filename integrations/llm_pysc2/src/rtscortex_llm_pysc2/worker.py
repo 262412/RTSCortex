@@ -48,6 +48,7 @@ from rtscortex_llm_pysc2.production import (
     production_spec,
 )
 from rtscortex_llm_pysc2.protocol import RuntimeClient
+from rtscortex_llm_pysc2.raw_executor import RawActionExecutor, RawDispatch
 from rtscortex_llm_pysc2.research import RESEARCH_SPECS, research_spec
 
 PRODUCTION_CAMERA_SETTLE_MAX_OBSERVATIONS = 4
@@ -94,6 +95,7 @@ class WorkerSettings:
     socket_path: Optional[str]
     runtime_url: str
     seed: int
+    execution_action_space: str = "features"
     agent_race: str = "protoss"
     scenario: str = "pvz_task1_level1"
     pending_plan_step_delay_seconds: float = 0.0
@@ -184,6 +186,11 @@ class WorkerSettings:
         agent_race = os.environ.get("RTSCORTEX_AGENT_RACE", "protoss").strip().casefold()
         if agent_race not in {"protoss", "terran", "zerg"}:
             raise RuntimeError(f"unsupported RTSCORTEX_AGENT_RACE {agent_race!r}")
+        execution_action_space = (
+            os.environ.get("RTSCORTEX_EXECUTION_ACTION_SPACE", "features").strip().casefold()
+        )
+        if execution_action_space not in {"features", "raw"}:
+            raise RuntimeError("RTSCORTEX_EXECUTION_ACTION_SPACE must be 'features' or 'raw'")
         return cls(
             run_id=run_id,
             episode_id=episode_id,
@@ -191,6 +198,7 @@ class WorkerSettings:
             or os.environ.get("RTSCORTEX_SOCKET"),
             runtime_url=os.environ.get("RTSCORTEX_RUNTIME_URL", "http://127.0.0.1:8765"),
             seed=int(os.environ.get("RTSCORTEX_SEED", "0")),
+            execution_action_space=execution_action_space,
             agent_race=agent_race,
             scenario=os.environ.get("RTSCORTEX_SCENARIO", "pvz_task1_level1"),
             pending_plan_step_delay_seconds=pending_plan_step_delay_seconds,
@@ -429,6 +437,58 @@ class GasWorkerController:
         assignment.phase = "confirm"
         assignment.primitive_count += 1
         return actions.FUNCTIONS.Harvest_Gather_screen("now", gas_position)
+
+    def next_raw_action(
+        self,
+        main_agent: Any,
+        observation: Any,
+        *,
+        game_loop: int,
+    ) -> Optional[Any]:
+        """Assign gas with one exact-tag raw primitive and no UI selection."""
+
+        assignment = self.assignment
+        if assignment is not None:
+            raw_by_tag = {
+                int(_observation_value(unit, "tag", 0)): unit
+                for unit in _observation_value(observation, "raw_units", ())
+            }
+            worker = raw_by_tag.get(assignment.worker_tag)
+            gas = raw_by_tag.get(assignment.gas_tag)
+            if (
+                worker is None
+                or gas is None
+                or _raw_gas_assignment_is_confirmed(worker, gas)
+                or game_loop - assignment.started_game_loop > self.timeout_game_loops
+            ):
+                self.assignment = None
+            return None
+
+        choice = _raw_gas_assignment_choice(main_agent, observation)
+        actions = importlib.import_module("pysc2.lib.actions")
+        if choice is None:
+            mineral_choice = _raw_mineral_assignment_choice(main_agent, observation)
+            if mineral_choice is None:
+                return None
+            worker_tag, mineral_tag = mineral_choice
+            return actions.RAW_FUNCTIONS.Harvest_Gather_Probe_unit(
+                "now",
+                [worker_tag],
+                mineral_tag,
+            )
+        worker_tag, gas_tag = choice
+        self.assignment = _GasAssignment(
+            worker_tag=worker_tag,
+            gas_tag=gas_tag,
+            started_game_loop=int(game_loop),
+            phase="confirm",
+            primitive_count=1,
+        )
+        return actions.RAW_FUNCTIONS.Harvest_Gather_Probe_unit(
+            "now",
+            [worker_tag],
+            gas_tag,
+        )
 
 
 class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
@@ -1489,6 +1549,7 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
             upgrade_names=upgrade_names,
             building_types=building_types,
             action_source_types=_production_action_source_types(self.worker_settings.agent_race),
+            raw_action_mode=self.worker_settings.execution_action_space == "raw",
         )
         self.decision_broker = SharedDecisionBroker(
             coordinator,
@@ -1497,6 +1558,7 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
         )
         self._pending_primitive: Optional[PrimitiveDispatch] = None
         self._pending_primitive_agent: Optional[Any] = None
+        self._pending_raw_dispatch: Optional[RawDispatch] = None
         self._actor_selection_retry_key: Optional[tuple[str, str]] = None
         self._actor_selection_attempts = 0
         self._orchestration_budget_key: Optional[tuple[str, str]] = None
@@ -1533,6 +1595,10 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
             player_race=self.worker_settings.agent_race,
         )
         super().__init__(config, subagent)
+        self.raw_executor = RawActionExecutor(
+            self.decision_broker,
+            unit_names=unit_names,
+        )
         self._rtscortex_accept_visible_team_unit = True
         self._rtscortex_exact_single_unit_selection = True
         self._rtscortex_transport_noop_without_actor_selection = True
@@ -1561,6 +1627,8 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
             raise
 
     def _step(self, obs: Any) -> Any:
+        if self.worker_settings.execution_action_space == "raw":
+            return self._raw_step(obs)
         self._submit_console_frame(obs)
         observation_loop = _observation_game_loop(obs.observation)
         watchdog_preempted = self._update_observation_gap_watchdog(
@@ -1714,6 +1782,76 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
             self.game_clock.wait_for_step()
         elif delay:
             time.sleep(delay)
+        return action
+
+    def _raw_step(self, obs: Any) -> Any:
+        """Run the RTSCortex-owned raw path without upstream action orchestration."""
+
+        self._submit_console_frame(obs)
+        self._settle_previous_primitive(obs)
+        effect_reports = self.decision_broker.observe_effects(obs.observation)
+        self.raw_executor.observe_reports(
+            effect_reports,
+            self.agents,
+            game_loop=_observation_game_loop(obs.observation),
+        )
+        if _is_terminal(obs):
+            return _finish_terminal(self, obs, _base_agent_step, _raw_no_op)
+
+        _base_agent_step(self, obs)
+        game_loop = _observation_game_loop(obs.observation)
+        _sync_raw_team_membership(self, obs.observation)
+        self.decision_broker.extractor.observe_expansion_resources(
+            obs.observation,
+            self.agents,
+        )
+
+        if self.raw_executor.pending_commands == 0:
+            decision = self.decision_broker.decide_direct(
+                obs,
+                self.agents,
+                step_id=int(self.steps),
+            )
+            self.raw_executor.enqueue(decision)
+
+        dispatch = self.raw_executor.next_dispatch(obs.observation, self.agents)
+        if dispatch is not None:
+            resolved = list(dispatch.resolved_arguments)
+            if resolved:
+                self.decision_broker.resolve_arguments(
+                    dispatch.command.command_id,
+                    resolved,
+                )
+            self.decision_broker.prepare_effect(
+                dispatch.primitive,
+                obs.observation,
+                builder_tag=dispatch.builder_tag,
+                producer_tag=dispatch.producer_tag,
+                actor_tags=dispatch.actor_tags,
+                minimap_transform=None,
+            )
+            self._pending_primitive = dispatch.primitive
+            self._pending_primitive_agent = None
+            self._pending_raw_dispatch = dispatch
+            action = dispatch.action
+        else:
+            gas_action = self.gas_worker_controller.next_raw_action(
+                self,
+                obs.observation,
+                game_loop=game_loop,
+            )
+            if gas_action is None:
+                action = _raw_no_op()
+                self.transport_noop_primitives += 1
+            else:
+                action = gas_action
+
+        if self.initial_planning_barrier.blocks_steps:
+            self.initial_planning_barrier.release()
+            if self.game_clock is not None:
+                self.game_clock.reset()
+        if self.game_clock is not None:
+            self.game_clock.wait_for_step()
         return action
 
     def _validated_outbound_action(
@@ -1880,6 +2018,13 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
                             self._pending_primitive_agent._rtscortex_rejected_build_targets.setdefault(
                                 action_name, set()
                             ).add(world_target)
+                pending_raw_dispatch = getattr(self, "_pending_raw_dispatch", None)
+                if pending_raw_dispatch is not None:
+                    self.raw_executor.record_rejection(
+                        pending_raw_dispatch,
+                        self.agents,
+                        game_loop=settlement_loop,
+                    )
         elif (
             dispatch.origin in {"translator", "orchestration"}
             and not dispatch.final_primitive
@@ -1905,6 +2050,7 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
             game_loop=settlement_loop,
         )
         self._pending_primitive = None
+        self._pending_raw_dispatch = None
         if self._pending_primitive_agent is not None:
             self._pending_primitive_agent._rtscortex_active_build_route = None
         self._pending_primitive_agent = None
@@ -2482,6 +2628,146 @@ def _gas_assignment_choice(
         return None
     _, worker_tag, gas_tag = min(choices)
     return worker_tag, gas_tag
+
+
+def _raw_gas_assignment_choice(
+    main_agent: Any,
+    observation: Any,
+) -> Optional[tuple[int, int]]:
+    """Choose a non-Builder Probe and undersaturated completed Assimilator."""
+
+    unit_names = main_agent.decision_broker.extractor.unit_names
+    reserved = _reserved_builder_worker_tags(main_agent)
+    raw_units = list(_observation_value(observation, "raw_units", ()))
+    gases = [
+        unit
+        for unit in raw_units
+        if int(_observation_value(unit, "alliance", 0)) == 1
+        and _worker_unit_name(unit, unit_names) == "Assimilator"
+        and _normalized_worker_build_progress(unit) >= 1.0
+        and int(_observation_value(unit, "assigned_harvesters", 0)) < 3
+    ]
+    workers = [
+        unit
+        for unit in raw_units
+        if int(_observation_value(unit, "alliance", 0)) == 1
+        and _worker_unit_name(unit, unit_names) == "Probe"
+        and int(_observation_value(unit, "tag", 0)) not in reserved
+        and int(_observation_value(unit, "buff_id_0", 0)) != 274
+    ]
+    choices = [
+        (
+            math.dist(
+                (
+                    float(_observation_value(worker, "x", 0.0)),
+                    float(_observation_value(worker, "y", 0.0)),
+                ),
+                (
+                    float(_observation_value(gas, "x", 0.0)),
+                    float(_observation_value(gas, "y", 0.0)),
+                ),
+            ),
+            int(_observation_value(worker, "tag", 0)),
+            int(_observation_value(gas, "tag", 0)),
+        )
+        for gas in gases
+        for worker in workers
+    ]
+    if not choices:
+        return None
+    _, worker_tag, gas_tag = min(choices)
+    return worker_tag, gas_tag
+
+
+def _raw_gas_assignment_is_confirmed(worker: Any, gas: Any) -> bool:
+    return (
+        int(_observation_value(worker, "buff_id_0", 0)) == 274
+        and math.dist(
+            (
+                float(_observation_value(worker, "x", 0.0)),
+                float(_observation_value(worker, "y", 0.0)),
+            ),
+            (
+                float(_observation_value(gas, "x", 0.0)),
+                float(_observation_value(gas, "y", 0.0)),
+            ),
+        )
+        <= 10.0
+    )
+
+
+def _raw_mineral_assignment_choice(
+    main_agent: Any,
+    observation: Any,
+) -> Optional[tuple[int, int]]:
+    """Assign one idle non-Builder Probe to a mineral near an own Nexus."""
+
+    unit_names = main_agent.decision_broker.extractor.unit_names
+    reserved = _reserved_builder_worker_tags(main_agent)
+    raw_units = list(_observation_value(observation, "raw_units", ()))
+    nexuses = [
+        unit
+        for unit in raw_units
+        if int(_observation_value(unit, "alliance", 0)) == 1
+        and _worker_unit_name(unit, unit_names) == "Nexus"
+        and _normalized_worker_build_progress(unit) >= 1.0
+    ]
+    workers = [
+        unit
+        for unit in raw_units
+        if int(_observation_value(unit, "alliance", 0)) == 1
+        and _worker_unit_name(unit, unit_names) == "Probe"
+        and int(_observation_value(unit, "tag", 0)) not in reserved
+        and int(_observation_value(unit, "order_length", 0)) == 0
+        and int(_observation_value(unit, "buff_id_0", 0)) != 274
+    ]
+    minerals = [
+        unit
+        for unit in raw_units
+        if int(_observation_value(unit, "alliance", 0)) == 3
+        and "mineral" in _worker_unit_name(unit, unit_names).casefold()
+        and any(
+            math.dist(
+                (
+                    float(_observation_value(unit, "x", 0.0)),
+                    float(_observation_value(unit, "y", 0.0)),
+                ),
+                (
+                    float(_observation_value(nexus, "x", 0.0)),
+                    float(_observation_value(nexus, "y", 0.0)),
+                ),
+            )
+            <= 12.0
+            for nexus in nexuses
+        )
+    ]
+    choices = [
+        (
+            math.dist(
+                (
+                    float(_observation_value(worker, "x", 0.0)),
+                    float(_observation_value(worker, "y", 0.0)),
+                ),
+                (
+                    float(_observation_value(mineral, "x", 0.0)),
+                    float(_observation_value(mineral, "y", 0.0)),
+                ),
+            ),
+            int(_observation_value(worker, "tag", 0)),
+            int(_observation_value(mineral, "tag", 0)),
+        )
+        for worker in workers
+        for mineral in minerals
+    ]
+    if not choices:
+        return None
+    _, worker_tag, mineral_tag = min(choices)
+    return worker_tag, mineral_tag
+
+
+def _normalized_worker_build_progress(unit: Any) -> float:
+    value = float(_observation_value(unit, "build_progress", 0.0))
+    return value / 100.0 if value > 1.0 else value
 
 
 def _worker_camera_position(main_agent: Any, unit: Any) -> tuple[int, int]:
@@ -4761,9 +5047,77 @@ def _base_agent_step(agent: Any, obs: Any) -> None:
     module.BaseAgent.step(agent, obs)
 
 
+def _sync_raw_team_membership(main_agent: Any, observation: Any) -> None:
+    """Project living raw tags into logical teams without UI control groups."""
+
+    raw_units = [
+        unit
+        for unit in _observation_value(observation, "raw_units", ())
+        if int(_observation_value(unit, "alliance", 0)) == 1
+        and int(_observation_value(unit, "tag", 0)) > 0
+        and _normalized_worker_build_progress(unit) >= 1.0
+    ]
+    by_type: dict[int, list[int]] = {}
+    for unit in raw_units:
+        by_type.setdefault(int(_observation_value(unit, "unit_type", 0)), []).append(
+            int(_observation_value(unit, "tag", 0))
+        )
+    gas_worker_tags = {
+        int(_observation_value(unit, "tag", 0))
+        for unit in raw_units
+        if int(_observation_value(unit, "buff_id_0", 0)) == 274
+    }
+    on_screen_tags = {
+        int(_observation_value(unit, "tag", 0))
+        for unit in _observation_value(observation, "feature_units", ())
+        if int(_observation_value(unit, "alliance", 0)) == 1
+        and bool(_observation_value(unit, "is_on_screen", True))
+    }
+
+    for agent_name, agent in getattr(main_agent, "agents", {}).items():
+        observed_tags: list[int] = []
+        observed_teams: list[str] = []
+        has_actor = False
+        for team in getattr(agent, "teams", ()):
+            if not isinstance(team, dict):
+                continue
+            team_name = str(team.get("name", ""))
+            unit_types = [int(value) for value in team.get("unit_type", ())]
+            candidates = sorted(
+                {tag for unit_type in unit_types for tag in by_type.get(unit_type, ())}
+            )
+            existing = [int(tag) for tag in (team.get("unit_tags") or ()) if int(tag) in candidates]
+            if agent_name == "Builder":
+                eligible = [tag for tag in candidates if tag not in gas_worker_tags]
+                visible = [tag for tag in eligible if tag in on_screen_tags]
+                retained = [tag for tag in existing if tag in visible]
+                candidates = retained[:1] or visible[:1] or eligible[:1]
+            team["unit_tags"] = candidates
+            team["unit_tags_selected"] = list(candidates)
+            if candidates:
+                observed_tags.append(candidates[0])
+                observed_teams.append(team_name)
+                has_actor = True
+            elif team_name == "Empty":
+                observed_tags.append(0)
+                observed_teams.append(team_name)
+                has_actor = True
+        agent.team_unit_tag_list = observed_tags
+        agent.team_unit_team_list = observed_teams
+        agent.team_unit_obs_list = []
+        agent.team_unit_tag_curr = None
+        agent.team_unit_team_curr = None
+        agent.enable = has_actor
+
+
 def _no_op() -> Any:
     actions = importlib.import_module("pysc2.lib.actions")
     return actions.FUNCTIONS.no_op()
+
+
+def _raw_no_op() -> Any:
+    actions = importlib.import_module("pysc2.lib.actions")
+    return actions.RAW_FUNCTIONS.no_op()
 
 
 def _is_terminal(obs: Any) -> bool:

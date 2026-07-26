@@ -259,6 +259,14 @@ def prepare_live_worker(
             "the LLM-PySC2 gas stop-worker selection patch is not applied; see "
             "integrations/llm_pysc2/patches/README.md"
         )
+    if (
+        config.environment.execution_action_space == "raw"
+        and not raw_available_actions_printer_patch_is_applied(project_root)
+    ):
+        errors.append(
+            "the PySC2 RAW observation printer patch is not applied; see "
+            "integrations/llm_pysc2/patches/README.md"
+        )
 
     if errors:
         raise LiveEnvironmentError("Live environment validation failed:\n- " + "\n- ".join(errors))
@@ -283,6 +291,8 @@ def prepare_live_worker(
         config.environment.opponent_build,
         "--step_mul",
         str(config.environment.step_mul),
+        "--action_space",
+        config.environment.execution_action_space.upper(),
     ]
     if config.environment.game_steps_per_episode is not None:
         command.extend(
@@ -298,8 +308,6 @@ def prepare_live_worker(
                 str(config.console.rgb_screen_size),
                 "--rgb_minimap_size",
                 str(config.console.rgb_minimap_size),
-                "--action_space",
-                "FEATURES",
             ]
         )
     command.extend(
@@ -1099,6 +1107,22 @@ def gas_stop_selection_patch_is_applied(project_root: Path) -> bool:
     return (
         "min(max(0, unit.x), self.size_screen - 1)" in text
         and "select_point('select', (x, y))" in text
+    )
+
+
+def raw_available_actions_printer_patch_is_applied(project_root: Path) -> bool:
+    """Return whether the PySC2 diagnostic wrapper accepts RAW observations."""
+
+    source = project_root / "third_party/LLM-PySC2/pysc2/env/available_actions_printer.py"
+    if not source.is_file():
+        return False
+    text = source.read_text(encoding="utf-8")
+    return all(
+        marker in text
+        for marker in (
+            'available_actions = obs.observation.get("available_actions")',
+            "if available_actions is None:",
+        )
     )
 
 

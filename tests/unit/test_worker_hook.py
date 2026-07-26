@@ -1422,6 +1422,91 @@ def test_gas_worker_controller_executes_bounded_exact_assignment(
     assert controller.assignment is None
 
 
+def test_raw_worker_controller_assigns_idle_probe_to_nearby_mineral(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw_functions = SimpleNamespace(
+        Harvest_Gather_Probe_unit=lambda mode, tags, target: SimpleNamespace(
+            function=264,
+            arguments=[mode, tags, target],
+        )
+    )
+    real_import = importlib.import_module
+    monkeypatch.setattr(
+        "rtscortex_llm_pysc2.worker.importlib.import_module",
+        lambda name: (
+            SimpleNamespace(RAW_FUNCTIONS=raw_functions)
+            if name == "pysc2.lib.actions"
+            else real_import(name)
+        ),
+    )
+    builder = SimpleNamespace(
+        unit_tag_list=[10],
+        team_unit_tag_list=[],
+        team_unit_tag_curr=None,
+        teams=[{"unit_tags": [10]}],
+    )
+    main_agent = SimpleNamespace(
+        agents={"Builder": builder},
+        decision_broker=SimpleNamespace(
+            extractor=SimpleNamespace(unit_names={59: "Nexus", 84: "Probe", 341: "MineralField"})
+        ),
+    )
+    observation = SimpleNamespace(
+        raw_units=[
+            SimpleNamespace(
+                tag=100,
+                unit_type=59,
+                alliance=1,
+                x=20.0,
+                y=20.0,
+                build_progress=100,
+                order_length=0,
+                buff_id_0=0,
+            ),
+            SimpleNamespace(
+                tag=10,
+                unit_type=84,
+                alliance=1,
+                x=21.0,
+                y=20.0,
+                build_progress=100,
+                order_length=0,
+                buff_id_0=0,
+            ),
+            SimpleNamespace(
+                tag=20,
+                unit_type=84,
+                alliance=1,
+                x=22.0,
+                y=20.0,
+                build_progress=100,
+                order_length=0,
+                buff_id_0=0,
+            ),
+            SimpleNamespace(
+                tag=500,
+                unit_type=341,
+                alliance=3,
+                x=25.0,
+                y=20.0,
+                build_progress=100,
+                order_length=0,
+                buff_id_0=0,
+            ),
+        ]
+    )
+
+    action = GasWorkerController().next_raw_action(
+        main_agent,
+        observation,
+        game_loop=100,
+    )
+
+    assert action is not None
+    assert action.arguments == ["now", [20], 500]
+
+
 def test_deterministic_gas_rebalance_evicts_builder_already_on_gas() -> None:
     assimilator = SimpleNamespace(tag=500, x=20.0, y=20.0, build_progress=100)
     builder_worker = SimpleNamespace(tag=10, x=20.0, y=20.0)
@@ -4344,6 +4429,32 @@ def test_failed_expansion_anchor_is_permanently_suppressed_and_next_cluster_surv
         known_expansion_resources=extractor.known_expansion_resources,
         excluded_expansion_anchors=extractor.suppressed_expansion_anchors,
     ) == [[201]]
+
+
+def test_raw_expansion_state_opens_new_generation_for_later_anchor() -> None:
+    observation, _, _ = _nexus_candidate_observation()
+    extractor = TimeStepExtractor(
+        "run",
+        "episode",
+        unit_names={59: "Nexus", 341: "MineralField"},
+        raw_action_mode=True,
+    )
+    extractor.observe_expansion_resources(
+        SimpleNamespace(raw_units=[], feature_units=[], game_loop=[1]),
+        {},
+    )
+    assert "expansion_scout_generation=1" in extractor._expansion_scout_alerts  # noqa: SLF001
+    assert "expansion_scout_state=not_discovered_yet" in (  # noqa: SLF001
+        extractor._expansion_scout_alerts
+    )
+
+    observation.game_loop = [224]
+    extractor.observe_expansion_resources(observation, {})
+
+    assert "expansion_scout_generation=2" in extractor._expansion_scout_alerts  # noqa: SLF001
+    assert "expansion_scout_state=candidate_available" in (  # noqa: SLF001
+        extractor._expansion_scout_alerts
+    )
 
 
 def test_failed_expansion_effect_suppresses_command_anchor() -> None:

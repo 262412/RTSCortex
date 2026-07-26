@@ -4,6 +4,7 @@ run:
   seed: 0
 environment:
   adapter: llm_pysc2
+  execution_action_space: raw
   scenario: Simple64
   max_steps: 2000
   agent_race: protoss

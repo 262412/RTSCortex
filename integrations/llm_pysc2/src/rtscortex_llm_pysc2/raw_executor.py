@@ -1,0 +1,616 @@
+"""Direct PySC2 Raw Action execution for RTSCortex-owned commands."""
+
+from __future__ import annotations
+
+import importlib
+import math
+from collections import deque
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from typing import Any, Optional
+
+from rtscortex_llm_pysc2.broker import PrimitiveDispatch, SharedDecisionBroker
+from rtscortex_llm_pysc2.coordinator import BridgeDecision
+from rtscortex_llm_pysc2.observation import split_actor
+from rtscortex_llm_pysc2.production import production_spec
+from rtscortex_llm_pysc2.research import research_spec
+from rtscortex_llm_pysc2.routing import RoutedCommand
+
+_BUILD_RAW_FUNCTIONS = {
+    "Build_Pylon_Screen": "Build_Pylon_pt",
+    "Build_Gateway_Screen": "Build_Gateway_pt",
+    "Build_Forge_Screen": "Build_Forge_pt",
+    "Build_CyberneticsCore_Screen": "Build_CyberneticsCore_pt",
+    "Build_ShieldBattery_Screen": "Build_ShieldBattery_pt",
+    "Build_Stargate_Screen": "Build_Stargate_pt",
+    "Build_Nexus_Near": "Build_Nexus_pt",
+    "Build_Assimilator_Near": "Build_Assimilator_unit",
+}
+_CONTROL_RAW_FUNCTIONS = {
+    "Stop": "Stop_quick",
+    "Hold_Position": "HoldPosition_quick",
+}
+_WARP_RAW_FUNCTIONS = {
+    "Warp_Zealot_Near": "TrainWarp_Zealot_pt",
+    "Warp_Stalker_Near": "TrainWarp_Stalker_pt",
+}
+
+
+@dataclass(frozen=True)
+class RawDispatch:
+    """One exact command-to-raw-primitive transition."""
+
+    command: RoutedCommand
+    primitive: PrimitiveDispatch
+    action: Any
+    actor_tags: tuple[int, ...]
+    builder_tag: Optional[int] = None
+    producer_tag: Optional[int] = None
+    resolved_arguments: tuple[Any, ...] = ()
+
+
+class RawActionExecutor:
+    """Translate validated RTSCortex commands without UI selection or camera state."""
+
+    def __init__(
+        self,
+        broker: SharedDecisionBroker,
+        *,
+        unit_names: Mapping[int, str],
+    ) -> None:
+        self.broker = broker
+        self.unit_names = {int(key): str(value) for key, value in unit_names.items()}
+        self._commands: deque[RoutedCommand] = deque()
+        self._inflight: dict[str, RawDispatch] = {}
+
+    @property
+    def pending_commands(self) -> int:
+        return len(self._commands)
+
+    def enqueue(self, decision: BridgeDecision) -> None:
+        """Preserve Runtime ActionBatch order across per-agent routes."""
+
+        routed = {
+            command.command_id: command
+            for route in decision.routes.values()
+            for command in route.commands
+        }
+        for value in decision.action_batch.get("commands", ()):
+            command_id = str(value["command_id"])
+            command = routed.get(command_id)
+            if command is None:
+                raise RuntimeError(
+                    f"raw_action_integrity_error: command {command_id!r} has no route"
+                )
+            self._commands.append(command)
+
+    def record_rejection(
+        self,
+        dispatch: RawDispatch,
+        agents: Mapping[str, Any],
+        *,
+        game_loop: int,
+    ) -> None:
+        """Quarantine an exact build candidate after SC2 rejects it."""
+
+        self._inflight.pop(dispatch.command.command_id, None)
+        self._quarantine_failed_build(dispatch, agents, game_loop=game_loop)
+
+    def observe_reports(
+        self,
+        reports: Sequence[Mapping[str, Any]],
+        agents: Mapping[str, Any],
+        *,
+        game_loop: int,
+    ) -> None:
+        """Apply effect-terminal feedback to raw placement memory."""
+
+        for report in reports:
+            command_id = str(report.get("command_id", ""))
+            dispatch = self._inflight.pop(command_id, None)
+            if dispatch is None or str(report.get("status", "")) != "failed":
+                continue
+            self._quarantine_failed_build(dispatch, agents, game_loop=game_loop)
+
+    def _quarantine_failed_build(
+        self,
+        dispatch: RawDispatch,
+        agents: Mapping[str, Any],
+        *,
+        game_loop: int,
+    ) -> None:
+        if dispatch.command.name not in _BUILD_RAW_FUNCTIONS:
+            return
+        agent_name, _ = split_actor(dispatch.command.actor)
+        agent = agents.get(agent_name)
+        arguments = dispatch.command.requested_arguments
+        if (
+            agent is not None
+            and dispatch.command.name.endswith("_Screen")
+            and arguments
+            and isinstance(arguments[0], (list, tuple))
+            and len(arguments[0]) == 2
+        ):
+            rejected = getattr(agent, "_rtscortex_rejected_build_positions", None)
+            if not isinstance(rejected, dict):
+                rejected = {}
+                agent._rtscortex_rejected_build_positions = rejected
+            rejected.setdefault(dispatch.command.name, set()).add(
+                (int(arguments[0][0]), int(arguments[0][1]))
+            )
+        if (
+            dispatch.command.name.endswith("_Screen")
+            and dispatch.command.screen_world_target is not None
+        ):
+            self.broker.extractor.suppress_build_world_target(
+                dispatch.command.name,
+                dispatch.command.screen_world_target,
+            )
+        if dispatch.command.name == "Build_Nexus_Near" and arguments:
+            try:
+                anchor = (
+                    int(arguments[0], 0) if isinstance(arguments[0], str) else int(arguments[0])
+                )
+            except (TypeError, ValueError):
+                return
+            self.broker.extractor.suppress_expansion_anchor(
+                anchor,
+                game_loop=game_loop,
+            )
+
+    def next_dispatch(
+        self,
+        observation: Any,
+        agents: Mapping[str, Any],
+    ) -> Optional[RawDispatch]:
+        """Return the next executable raw action, terminalizing invalid commands."""
+
+        while self._commands:
+            command = self._commands.popleft()
+            try:
+                dispatch = self._translate(command, observation, agents)
+                self._inflight[command.command_id] = dispatch
+                return dispatch
+            except _RawDispatchFailure as error:
+                failure_dispatch = PrimitiveDispatch(
+                    command.command_id,
+                    "raw_pre_dispatch",
+                    True,
+                    origin="translator",
+                    ordinal=0,
+                    total=1,
+                    failure_code=error.code,
+                    requested_function_id=0,
+                    emitted_function_id=0,
+                )
+                self.broker.settle_primitive(
+                    failure_dispatch,
+                    success=False,
+                    failure_reason=str(error),
+                    game_loop=_game_loop(observation),
+                )
+        return None
+
+    def _translate(
+        self,
+        command: RoutedCommand,
+        observation: Any,
+        agents: Mapping[str, Any],
+    ) -> RawDispatch:
+        actions = importlib.import_module("pysc2.lib.actions")
+        actor_tags = _actor_tags(command.actor, observation, agents)
+        name = command.name
+        arguments = command.resolved_arguments or command.requested_arguments
+        builder_tag: Optional[int] = None
+        producer_tag: Optional[int] = None
+        resolved_arguments = tuple(arguments)
+
+        if name == "No_Operation":
+            function = actions.RAW_FUNCTIONS.no_op
+            action = function()
+        elif name in {"Move_Minimap", "Move_Screen"}:
+            _require_actor_tags(name, actor_tags)
+            target = (
+                command.screen_world_target
+                if name == "Move_Screen"
+                else _position(arguments, action_name=name)
+            )
+            if target is None:
+                raise _RawDispatchFailure(
+                    "candidate_invalidated",
+                    f"{name} has no validated raw target",
+                )
+            function = actions.RAW_FUNCTIONS.Move_Move_pt
+            action = function("now", list(actor_tags), _raw_point(target))
+            resolved_arguments = (_raw_point(target),)
+        elif name == "Attack_Unit":
+            _require_actor_tags(name, actor_tags)
+            target_tag = _tag_argument(arguments, action_name=name)
+            target = _unit_by_tag(observation, target_tag)
+            if target is None or int(_value(target, "alliance", 0)) != 4:
+                raise _RawDispatchFailure(
+                    "target_not_visible",
+                    f"{name} target {hex(target_tag)} is not a living visible enemy",
+                )
+            function = actions.RAW_FUNCTIONS.Attack_Attack_unit
+            action = function("now", list(actor_tags), target_tag)
+        elif name in _CONTROL_RAW_FUNCTIONS:
+            _require_actor_tags(name, actor_tags)
+            function = getattr(actions.RAW_FUNCTIONS, _CONTROL_RAW_FUNCTIONS[name])
+            action = function("now", list(actor_tags))
+        elif name in _BUILD_RAW_FUNCTIONS:
+            _require_actor_tags(name, actor_tags)
+            builder_tag = actor_tags[0]
+            function = getattr(actions.RAW_FUNCTIONS, _BUILD_RAW_FUNCTIONS[name])
+            if name == "Build_Assimilator_Near":
+                target_tag = _tag_argument(arguments, action_name=name)
+                target = _unit_by_tag(observation, target_tag)
+                if target is None or int(_value(target, "alliance", 0)) != 3:
+                    raise _RawDispatchFailure(
+                        "invalid_geyser_tag",
+                        f"{name} target {hex(target_tag)} is not a visible neutral geyser",
+                    )
+                action = function("now", [builder_tag], target_tag)
+            else:
+                target = (
+                    _expansion_target(
+                        observation,
+                        _tag_argument(arguments, action_name=name),
+                        self.unit_names,
+                    )
+                    if name == "Build_Nexus_Near"
+                    else command.screen_world_target
+                )
+                if target is None:
+                    raise _RawDispatchFailure(
+                        "no_legal_placement",
+                        f"{name} has no validated raw placement target",
+                    )
+                raw_target = _raw_point(target)
+                action = function("now", [builder_tag], raw_target)
+                resolved_arguments = (raw_target,)
+        elif (production := production_spec(name)) is not None:
+            producer_tag = _source_tag(
+                observation,
+                self.unit_names,
+                producer_types=(
+                    production.producer_type,
+                    *production.alternate_producer_types,
+                ),
+            )
+            if producer_tag is None:
+                raise _RawDispatchFailure(
+                    "production_source_unavailable",
+                    f"{name} has no completed idle {production.producer_type}",
+                )
+            function = getattr(
+                actions.RAW_FUNCTIONS,
+                f"Train_{production.unit_type}_quick",
+            )
+            action = function("now", [producer_tag])
+        elif (research := research_spec(name)) is not None:
+            producer_tag = _source_tag(
+                observation,
+                self.unit_names,
+                producer_types=(research.producer_type,),
+            )
+            if producer_tag is None:
+                raise _RawDispatchFailure(
+                    "production_source_unavailable",
+                    f"{name} has no completed idle {research.producer_type}",
+                )
+            function = getattr(
+                actions.RAW_FUNCTIONS,
+                f"Research_{research.upgrade_name.removesuffix('Research')}_quick",
+            )
+            action = function("now", [producer_tag])
+        elif name in _WARP_RAW_FUNCTIONS:
+            producer_tag = _source_tag(
+                observation,
+                self.unit_names,
+                producer_types=("WarpGate",),
+            )
+            if producer_tag is None:
+                raise _RawDispatchFailure(
+                    "production_source_unavailable",
+                    f"{name} has no completed idle WarpGate",
+                )
+            target_tag = _tag_argument(arguments, action_name=name)
+            target_unit = _unit_by_tag(observation, target_tag)
+            if target_unit is None:
+                raise _RawDispatchFailure(
+                    "target_not_visible",
+                    f"{name} anchor {hex(target_tag)} is not observable",
+                )
+            target = (
+                float(_value(target_unit, "x", 0.0)),
+                float(_value(target_unit, "y", 0.0)),
+            )
+            function = getattr(actions.RAW_FUNCTIONS, _WARP_RAW_FUNCTIONS[name])
+            action = function("now", [producer_tag], _raw_point(target))
+            resolved_arguments = (_raw_point(target),)
+        elif name == "Ability_Blink_Screen":
+            _require_actor_tags(name, actor_tags)
+            if command.screen_world_target is None:
+                raise _RawDispatchFailure(
+                    "target_not_visible",
+                    "Ability_Blink_Screen has no raw target",
+                )
+            function = actions.RAW_FUNCTIONS.Effect_Blink_Stalker_pt
+            action = function("now", list(actor_tags), _raw_point(command.screen_world_target))
+            resolved_arguments = (_raw_point(command.screen_world_target),)
+        else:
+            raise _RawDispatchFailure(
+                "raw_action_unsupported",
+                f"{name} is not implemented by the Protoss raw executor",
+            )
+
+        function_id = int(function.id)
+        primitive = PrimitiveDispatch(
+            command.command_id,
+            str(function.name),
+            True,
+            origin="translator",
+            ordinal=0,
+            total=1,
+            requested_function_id=function_id,
+            emitted_function_id=function_id,
+        )
+        return RawDispatch(
+            command=command,
+            primitive=primitive,
+            action=action,
+            actor_tags=actor_tags,
+            builder_tag=builder_tag,
+            producer_tag=producer_tag,
+            resolved_arguments=resolved_arguments,
+        )
+
+
+class _RawDispatchFailure(RuntimeError):
+    def __init__(self, code: str, reason: str) -> None:
+        super().__init__(reason)
+        self.code = code
+
+
+def _actor_tags(
+    actor: str,
+    observation: Any,
+    agents: Mapping[str, Any],
+) -> tuple[int, ...]:
+    agent_name, team_name = split_actor(actor)
+    agent = agents.get(agent_name)
+    if agent is None:
+        return ()
+    team = next(
+        (
+            value
+            for value in getattr(agent, "teams", ())
+            if isinstance(value, Mapping) and str(value.get("name", "")) == team_name
+        ),
+        None,
+    )
+    if team is None:
+        return ()
+    living = {
+        int(_value(unit, "tag", 0))
+        for unit in _value(observation, "raw_units", ())
+        if int(_value(unit, "alliance", 0)) == 1
+        and int(_value(unit, "tag", 0)) > 0
+        and _build_progress(unit) >= 1.0
+    }
+    return tuple(
+        sorted(
+            {int(tag) for tag in team.get("unit_tags", ()) if int(tag) > 0 and int(tag) in living}
+        )
+    )
+
+
+def _source_tag(
+    observation: Any,
+    unit_names: Mapping[int, str],
+    *,
+    producer_types: Sequence[str],
+) -> Optional[int]:
+    wanted = set(producer_types)
+    for unit in _value(observation, "raw_units", ()):
+        if int(_value(unit, "alliance", 0)) != 1:
+            continue
+        name = _unit_name(unit, unit_names)
+        if name not in wanted or _build_progress(unit) < 1.0:
+            continue
+        if int(_value(unit, "order_length", 0)) != 0:
+            continue
+        tag = int(_value(unit, "tag", 0))
+        if tag > 0:
+            return tag
+    return None
+
+
+def _expansion_target(
+    observation: Any,
+    anchor_tag: int,
+    unit_names: Mapping[int, str],
+) -> Optional[tuple[float, float]]:
+    anchor = _unit_by_tag(observation, anchor_tag)
+    if anchor is None or int(_value(anchor, "alliance", 0)) != 3:
+        return None
+    all_resources = [
+        unit
+        for unit in _value(observation, "raw_units", ())
+        if int(_value(unit, "alliance", 0)) == 3 and _is_resource(_unit_name(unit, unit_names))
+    ]
+    resources = [anchor]
+    resource_tags = {anchor_tag}
+    while True:
+        connected = [
+            unit
+            for unit in all_resources
+            if int(_value(unit, "tag", 0)) not in resource_tags
+            and any(
+                math.dist(
+                    (
+                        float(_value(unit, "x", 0.0)),
+                        float(_value(unit, "y", 0.0)),
+                    ),
+                    (
+                        float(_value(existing, "x", 0.0)),
+                        float(_value(existing, "y", 0.0)),
+                    ),
+                )
+                <= 12.0
+                for existing in resources
+            )
+        ]
+        if not connected:
+            break
+        resources.extend(connected)
+        resource_tags.update(int(_value(unit, "tag", 0)) for unit in connected)
+    if sum("mineral" in _unit_name(unit, unit_names).casefold() for unit in resources) < 5:
+        return None
+    center = (
+        sum(float(_value(unit, "x", 0.0)) for unit in resources) / len(resources),
+        sum(float(_value(unit, "y", 0.0)) for unit in resources) / len(resources),
+    )
+    occupied = [
+        unit
+        for unit in _value(observation, "raw_units", ())
+        if int(_value(unit, "alliance", 0)) in {1, 2, 4} and _build_progress(unit) > 0.0
+    ]
+    candidates: list[tuple[float, float, int, int]] = []
+    for y in range(math.floor(center[1] - 12), math.ceil(center[1] + 12) + 1):
+        for x in range(math.floor(center[0] - 12), math.ceil(center[0] + 12) + 1):
+            point = (float(x), float(y))
+            if any(
+                math.dist(
+                    point,
+                    (
+                        float(_value(unit, "x", 0.0)),
+                        float(_value(unit, "y", 0.0)),
+                    ),
+                )
+                < 4.0
+                for unit in occupied
+            ):
+                continue
+            clearance_error = 0.0
+            legal = True
+            for resource in resources:
+                resource_name = _unit_name(resource, unit_names).casefold()
+                distance = math.dist(
+                    point,
+                    (
+                        float(_value(resource, "x", 0.0)),
+                        float(_value(resource, "y", 0.0)),
+                    ),
+                )
+                minimum, ideal, maximum = (
+                    (7.0, 8.5, 10.0)
+                    if "geyser" in resource_name or "vespene" in resource_name
+                    else (6.0, 7.5, 9.0)
+                )
+                if not minimum < distance < maximum:
+                    legal = False
+                    break
+                clearance_error += abs(distance - ideal)
+            if legal:
+                candidates.append(
+                    (
+                        clearance_error,
+                        math.dist(point, center),
+                        x,
+                        y,
+                    )
+                )
+    if not candidates:
+        return None
+    _, _, x, y = min(candidates)
+    return float(x), float(y)
+
+
+def _require_actor_tags(action_name: str, actor_tags: Sequence[int]) -> None:
+    if not actor_tags:
+        raise _RawDispatchFailure(
+            "actor_not_available",
+            f"{action_name} has no living raw actor tags",
+        )
+
+
+def _position(arguments: Sequence[Any], *, action_name: str) -> tuple[float, float]:
+    if not arguments:
+        raise _RawDispatchFailure("candidate_invalidated", f"{action_name} has no target")
+    value = arguments[0]
+    if (
+        not isinstance(value, (list, tuple))
+        or len(value) != 2
+        or not all(isinstance(item, (int, float)) and not isinstance(item, bool) for item in value)
+    ):
+        raise _RawDispatchFailure(
+            "candidate_invalidated",
+            f"{action_name} target is not a two-coordinate point",
+        )
+    return float(value[0]), float(value[1])
+
+
+def _tag_argument(arguments: Sequence[Any], *, action_name: str) -> int:
+    if not arguments:
+        raise _RawDispatchFailure("candidate_invalidated", f"{action_name} has no target tag")
+    try:
+        value = int(arguments[0], 0) if isinstance(arguments[0], str) else int(arguments[0])
+    except (TypeError, ValueError) as error:
+        raise _RawDispatchFailure(
+            "candidate_invalidated",
+            f"{action_name} target is not a tag",
+        ) from error
+    if value <= 0:
+        raise _RawDispatchFailure("candidate_invalidated", f"{action_name} tag must be positive")
+    return value
+
+
+def _raw_point(position: Sequence[float]) -> list[int]:
+    return [max(0, int(round(float(position[0])))), max(0, int(round(float(position[1]))))]
+
+
+def _unit_by_tag(observation: Any, tag: int) -> Optional[Any]:
+    return next(
+        (
+            unit
+            for unit in _value(observation, "raw_units", ())
+            if int(_value(unit, "tag", -1)) == int(tag)
+        ),
+        None,
+    )
+
+
+def _unit_name(unit: Any, unit_names: Mapping[int, str]) -> str:
+    value = _value(unit, "unit_type", "")
+    if isinstance(value, str):
+        return value
+    return unit_names.get(int(value), f"unit:{int(value)}")
+
+
+def _is_resource(name: str) -> bool:
+    normalized = name.casefold()
+    return "mineral" in normalized or "vespene" in normalized or "geyser" in normalized
+
+
+def _build_progress(unit: Any) -> float:
+    value = float(_value(unit, "build_progress", 0.0))
+    return value / 100.0 if value > 1.0 else value
+
+
+def _game_loop(observation: Any) -> int:
+    value = _value(observation, "game_loop", 0)
+    try:
+        return int(value[0]) if len(value) == 1 else int(value)
+    except (TypeError, IndexError):
+        return int(value)
+
+
+def _value(value: Any, name: str, default: Any) -> Any:
+    if isinstance(value, Mapping):
+        return value.get(name, default)
+    return getattr(value, name, default)
+
+
+__all__ = ["RawActionExecutor", "RawDispatch"]

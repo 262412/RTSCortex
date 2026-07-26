@@ -28,6 +28,8 @@ def main() -> None:
         os.environ.get("RTSCORTEX_OPPONENT_BUILD", "random"),
         "--step_mul",
         os.environ.get("RTSCORTEX_STEP_MUL", "1"),
+        "--action_space",
+        os.environ.get("RTSCORTEX_EXECUTION_ACTION_SPACE", "features").upper(),
         "--parallel",
         "1",
         "--render=false",
@@ -47,8 +49,6 @@ def main() -> None:
                 os.environ.get("RTSCORTEX_CONSOLE_RGB_SCREEN_SIZE", "256"),
                 "--rgb_minimap_size",
                 os.environ.get("RTSCORTEX_CONSOLE_RGB_MINIMAP_SIZE", "128"),
-                "--action_space",
-                "FEATURES",
             ]
         )
     subprocess.run(command, check=True)

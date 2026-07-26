@@ -129,7 +129,10 @@ class CortexPlaybookReviewer:
         opponent_race: str,
     ) -> tuple[list[DecisionCase], list[PlaybookLesson]]:
         self.last_rule_updates = ()
-        promotion_eligible = result.outcome is not EpisodeOutcome.ERROR
+        promotion_eligible = result.outcome not in {
+            EpisodeOutcome.ERROR,
+            EpisodeOutcome.TRUNCATED,
+        }
         self.last_consequences = self._attributor.attribute(
             events,
             result,
@@ -158,9 +161,8 @@ class CortexPlaybookReviewer:
             if not self.store.add_case(case):
                 continue
             cases.append(case)
-            lesson = self._consolidate(
-                case,
-                update_executable_rule=promotion_eligible,
+            lesson = (
+                self._consolidate(case, update_executable_rule=True) if promotion_eligible else None
             )
             if lesson is not None:
                 lessons.append(lesson)
@@ -181,9 +183,10 @@ class CortexPlaybookReviewer:
             )
             if self.store.add_case(rejected):
                 cases.append(rejected)
-                lesson = self._consolidate(
-                    rejected,
-                    update_executable_rule=promotion_eligible,
+                lesson = (
+                    self._consolidate(rejected, update_executable_rule=True)
+                    if promotion_eligible
+                    else None
                 )
                 if lesson is not None:
                     lessons.append(lesson)
@@ -245,15 +248,15 @@ class CortexPlaybookReviewer:
             if not self.store.add_case(case):
                 continue
             cases.append(case)
-            lesson = self._consolidate(
-                case,
-                update_executable_rule=promotion_eligible,
+            lesson = (
+                self._consolidate(case, update_executable_rule=True) if promotion_eligible else None
             )
             if lesson is not None:
                 lessons.append(lesson)
         if promotion_eligible:
             self._record_contradictions(cases, seed=result.seed)
-        self._promote_eligible_rules()
+        if promotion_eligible:
+            self._promote_eligible_rules()
         self.last_rule_updates = tuple(
             rule
             for rule in self.store.rules()
@@ -627,15 +630,20 @@ def _mark_case_episode_eligibility(
     case: DecisionCase,
     result: EpisodeResult,
 ) -> DecisionCase:
-    if result.outcome is not EpisodeOutcome.ERROR:
+    if result.outcome not in {EpisodeOutcome.ERROR, EpisodeOutcome.TRUNCATED}:
         return case
+    reason = (
+        "episode_outcome_error"
+        if result.outcome is EpisodeOutcome.ERROR
+        else "episode_outcome_truncated"
+    )
     return case.model_copy(
         update={
             "evidence": {
                 **case.evidence,
                 "censored": True,
                 "promotion_eligible": False,
-                "promotion_exclusion_reason": "episode_outcome_error",
+                "promotion_exclusion_reason": reason,
                 "episode_failure_reason": result.failure_reason,
             }
         }

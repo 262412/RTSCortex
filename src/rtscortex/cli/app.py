@@ -113,6 +113,7 @@ def _live_worker_environment(
     environment = {
         "SC2PATH": str(live_worker.sc2_path),
         "RTSCORTEX_AGENT_RACE": config.environment.agent_race,
+        "RTSCORTEX_EXECUTION_ACTION_SPACE": config.environment.execution_action_space,
         "RTSCORTEX_PENDING_PLAN_STEP_DELAY_SECONDS": str(
             config.environment.pending_plan_step_delay_seconds
         ),

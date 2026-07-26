@@ -888,7 +888,7 @@ def test_error_episode_cases_remain_diagnostic_but_do_not_update_rules(
         ),
     )
 
-    cases, _lessons = reviewer.review_episode(
+    cases, lessons = reviewer.review_episode(
         store.events_after("error-run", 0, 100, episode_id="episode"),
         EpisodeResult(
             run_id="error-run",
@@ -906,6 +906,7 @@ def test_error_episode_cases_remain_diagnostic_but_do_not_update_rules(
     case = next(case for case in cases if case.command_id == "error-command")
     assert case.evidence["promotion_eligible"] is False
     assert case.evidence["promotion_exclusion_reason"] == "episode_outcome_error"
+    assert lessons == []
     assert playbook.rules() == []
     store.close()
     playbook.close()

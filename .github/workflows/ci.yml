@@ -112,6 +112,7 @@ jobs:
             ../../integrations/llm_pysc2/patches/0020-validate-gather-screen-target.patch
             ../../integrations/llm_pysc2/patches/0021-use-clamped-stop-worker-selection.patch
             ../../integrations/llm_pysc2/patches/0022-bypass-frequency-for-forced-runtime-decision.patch
+            ../../integrations/llm_pysc2/patches/0023-skip-feature-action-printing-in-raw-mode.patch
           )
           applied=()
           cleanup() {

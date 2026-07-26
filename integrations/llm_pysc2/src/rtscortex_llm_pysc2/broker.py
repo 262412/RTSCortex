@@ -314,9 +314,7 @@ class SharedDecisionBroker:
                 # name until the full decision timeout expires. Submitted agents are
                 # still included in the snapshot even if they become disabled later.
                 collection_complete = expected.issubset(state.submissions)
-                grace_elapsed = (
-                    monotonic() - state.opened_at >= self.participant_grace_seconds
-                )
+                grace_elapsed = monotonic() - state.opened_at >= self.participant_grace_seconds
                 if (
                     not state.in_flight
                     and state.submissions
@@ -364,11 +362,38 @@ class SharedDecisionBroker:
             state.consumed.add(agent.name)
             if state.participants.issubset(state.consumed):
                 self._states.pop(step_id, None)
-            return (
-                _transport_noop_action_text(agent)
-                if route is None
-                else route.action_text
-            )
+            return _transport_noop_action_text(agent) if route is None else route.action_text
+
+    def decide_direct(
+        self,
+        timestep: Any,
+        agents: dict[str, Any],
+        *,
+        step_id: int,
+    ) -> BridgeDecision:
+        """Run one Runtime tick without the upstream LLMAgent query barrier.
+
+        Raw-action mode still reuses the upstream agent configuration as the
+        actor/action catalogue, but RTSCortex owns the observation cadence and
+        final dispatch. No camera, selection or translator queue participates.
+        """
+
+        snapshot = self.extractor.extract(
+            timestep,
+            agents,
+            {name: "RTSCortex raw-action observation" for name in agents},
+            step_id=step_id,
+        )
+        team_order = {name: current_team_order(agent) for name, agent in agents.items()}
+        decision = self.coordinator.decide(snapshot, team_order)
+        with self._condition:
+            self._last_decision_game_loop = int(snapshot["game_loop"])
+            self._initial_decision_started = True
+            self._initial_decision_complete = True
+            self._planner_pending = bool(decision.action_batch.get("planner_pending", False))
+            self._remember_decision_provenance(decision)
+            self._condition.notify_all()
+        return decision
 
     def claim_primitive(
         self,
@@ -693,9 +718,7 @@ class SharedDecisionBroker:
         builder_tag: Optional[int],
         producer_tag: Optional[int] = None,
         actor_tags: tuple[int, ...] = (),
-        minimap_transform: Optional[
-            tuple[float, float, float, float, float]
-        ] = None,
+        minimap_transform: Optional[tuple[float, float, float, float, float]] = None,
     ) -> None:
         self.coordinator.prepare_effect(
             dispatch.command_id,
@@ -706,7 +729,7 @@ class SharedDecisionBroker:
             minimap_transform=minimap_transform,
         )
 
-    def observe_effects(self, observation: Any) -> None:
+    def observe_effects(self, observation: Any) -> list[dict[str, Any]]:
         reports = self.coordinator.observe_effects(observation)
         for report in reports:
             command_id = str(report.get("command_id", ""))
@@ -717,6 +740,7 @@ class SharedDecisionBroker:
                 anchor_tag,
                 game_loop=_observation_game_loop(observation),
             )
+        return reports
 
     def end_episode(self, result: dict[str, Any]) -> None:
         self.coordinator.end_episode(result)
@@ -794,9 +818,7 @@ class SharedDecisionBroker:
                     "partial_runtime_decisions": self.partial_runtime_decisions,
                     "skipped_runtime_participants": self.skipped_runtime_participants,
                     "expansion_scout_camera_moves": self.expansion_scout_camera_moves,
-                    "expansion_candidate_exhaustions": (
-                        self.expansion_candidate_exhaustions
-                    ),
+                    "expansion_candidate_exhaustions": (self.expansion_candidate_exhaustions),
                 }
             ),
             encoding="utf-8",
@@ -838,34 +860,36 @@ class SharedDecisionBroker:
             self._last_decision_game_loop = int(snapshot["game_loop"])
             self._initial_decision_complete = True
             self._planner_pending = bool(decision.action_batch.get("planner_pending", False))
-            for route in decision.routes.values():
-                for command in route.commands:
-                    key = (route.agent_name, command.team_name, command.name)
-                    self._command_queues[key].append(command.command_id)
-                    if (
-                        command.screen_world_target is not None
-                        and command.screen_anchor_tag is not None
-                    ):
-                        self._screen_route_provenance[command.command_id] = ScreenRouteProvenance(
-                            world_target=command.screen_world_target,
-                            anchor_tag=command.screen_anchor_tag,
-                        )
-                    if (
-                        command.name == "Build_Nexus_Near"
-                        and command.requested_arguments
-                    ):
-                        anchor = command.requested_arguments[0]
-                        self._expansion_anchor_by_command[command.command_id] = (
-                            int(anchor, 0) if isinstance(anchor, str) else int(anchor)
-                        )
+            self._remember_decision_provenance(decision, enqueue_commands=True)
             self._condition.notify_all()
 
+    def _remember_decision_provenance(
+        self,
+        decision: BridgeDecision,
+        *,
+        enqueue_commands: bool = False,
+    ) -> None:
+        for route in decision.routes.values():
+            for command in route.commands:
+                if enqueue_commands:
+                    key = (route.agent_name, command.team_name, command.name)
+                    self._command_queues[key].append(command.command_id)
+                if (
+                    command.screen_world_target is not None
+                    and command.screen_anchor_tag is not None
+                ):
+                    self._screen_route_provenance[command.command_id] = ScreenRouteProvenance(
+                        world_target=command.screen_world_target,
+                        anchor_tag=command.screen_anchor_tag,
+                    )
+                if command.name == "Build_Nexus_Near" and command.requested_arguments:
+                    anchor = command.requested_arguments[0]
+                    self._expansion_anchor_by_command[command.command_id] = (
+                        int(anchor, 0) if isinstance(anchor, str) else int(anchor)
+                    )
+
     def _prune_partial_steps_locked(self, current_step_id: int) -> None:
-        stale = [
-            step_id
-            for step_id in self._partial_steps
-            if step_id < current_step_id - 4
-        ]
+        stale = [step_id for step_id in self._partial_steps if step_id < current_step_id - 4]
         for step_id in stale:
             del self._partial_steps[step_id]
 

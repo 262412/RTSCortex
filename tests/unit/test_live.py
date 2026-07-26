@@ -57,6 +57,14 @@ def test_prepare_live_worker_builds_fixed_pysc2_command(tmp_path: Path) -> None:
         'flags.DEFINE_integer("random_seed", None, "Random seed")\nrandom_seed=FLAGS.random_seed\n',
         encoding="utf-8",
     )
+    printer_source = tmp_path / "third_party/LLM-PySC2/pysc2/env/available_actions_printer.py"
+    printer_source.parent.mkdir(parents=True, exist_ok=True)
+    printer_source.write_text(
+        'available_actions = obs.observation.get("available_actions")\n'
+        "if available_actions is None:\n"
+        "    continue\n",
+        encoding="utf-8",
+    )
     run_loop_source = tmp_path / "third_party/LLM-PySC2/pysc2/env/run_loop.py"
     run_loop_source.parent.mkdir(parents=True, exist_ok=True)
     run_loop_source.write_text(
@@ -123,6 +131,8 @@ def test_prepare_live_worker_builds_fixed_pysc2_command(tmp_path: Path) -> None:
         "random",
         "--step_mul",
         "1",
+        "--action_space",
+        "FEATURES",
         "--parallel",
         "1",
         "--render=false",
@@ -267,6 +277,8 @@ def test_prepare_live_worker_builds_official_melee_bot_command(tmp_path: Path) -
         "macro",
         "--step_mul",
         "1",
+        "--action_space",
+        "FEATURES",
         "--game_steps_per_episode",
         "28800",
         "--parallel",
@@ -292,6 +304,18 @@ def test_prepare_live_worker_builds_official_melee_bot_command(tmp_path: Path) -
     assert console_spec.command[console_spec.command.index("--rgb_screen_size") + 1] == "320"
     assert console_spec.command[console_spec.command.index("--rgb_minimap_size") + 1] == "160"
     assert console_spec.command[console_spec.command.index("--action_space") + 1] == "FEATURES"
+
+    raw_config = console_config.model_copy(
+        update={
+            "environment": console_config.environment.model_copy(
+                update={"execution_action_space": "raw"}
+            )
+        }
+    )
+    raw_spec = prepare_live_worker(raw_config, tmp_path, environment={})
+    assert raw_spec.command[raw_spec.command.index("--action_space") + 1] == "RAW"
+    assert "--rgb_screen_size" in raw_spec.command
+    assert "--rgb_minimap_size" in raw_spec.command
 
 
 def test_prepare_live_worker_omits_step_limits_for_natural_terminal(tmp_path: Path) -> None:
@@ -446,6 +470,14 @@ def _write_worker_patch_sources(project_root: Path) -> None:
     runner_source.parent.mkdir(parents=True)
     runner_source.write_text(
         'flags.DEFINE_integer("random_seed", None, "Random seed")\nrandom_seed=FLAGS.random_seed\n',
+        encoding="utf-8",
+    )
+    printer_source = project_root / "third_party/LLM-PySC2/pysc2/env/available_actions_printer.py"
+    printer_source.parent.mkdir(parents=True, exist_ok=True)
+    printer_source.write_text(
+        'available_actions = obs.observation.get("available_actions")\n'
+        "if available_actions is None:\n"
+        "    continue\n",
         encoding="utf-8",
     )
     run_loop_source = project_root / "third_party/LLM-PySC2/pysc2/env/run_loop.py"

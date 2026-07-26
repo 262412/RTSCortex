@@ -136,6 +136,13 @@ def test_worker_patch_is_required_only_for_live_runs(tmp_path: Path) -> None:
         "on_episode_truncated(total_frames)\n",
         encoding="utf-8",
     )
+    printer_source = tmp_path / "third_party/LLM-PySC2/pysc2/env/available_actions_printer.py"
+    printer_source.write_text(
+        'available_actions = obs.observation.get("available_actions")\n'
+        "if available_actions is None:\n"
+        "    continue\n",
+        encoding="utf-8",
+    )
 
     action_source = tmp_path / "third_party/LLM-PySC2/llm_pysc2/lib/llm_action.py"
     action_source.parent.mkdir(parents=True)

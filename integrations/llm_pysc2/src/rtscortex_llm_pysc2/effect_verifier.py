@@ -21,7 +21,11 @@ from rtscortex_llm_pysc2.routing import RoutedCommand
 DEFAULT_ACTION_EFFECT_TIMEOUT_GAME_LOOPS = 112
 ACTIVE_BUILD_ORDER_TIMEOUT_MULTIPLIER = 4
 NEXUS_ACTIVE_BUILD_ORDER_TIMEOUT_MULTIPLIER = 12
-MOVE_RAW_FUNCTION_ID = 13
+# PySC2 projects SC2's concrete Move ability (16) to Move_Move_pt. The generic
+# smart-move function 13 represents a different ability and never appears in
+# the raw unit order stream for normal movement.
+MOVE_RAW_FUNCTION_ID = 547
+MOVE_RAW_FUNCTION_IDS = frozenset({13, MOVE_RAW_FUNCTION_ID})
 MOVE_MINIMAP_ARRIVAL_RADIUS = 4.0
 MOVE_GAME_LOOPS_PER_MINIMAP_UNIT = 10.0
 MOVE_SETTLEMENT_GRACE_GAME_LOOPS = 32
@@ -261,18 +265,13 @@ class ActionEffectVerifier:
                     if int(tag) > 0
                 )
             )
-            if minimap_transform is None:
-                raise ValueError("Move_Minimap requires a world-to-minimap transform")
             pending_move.actor_tags = normalized_tags
             pending_move.actor_tag = normalized_tags[0] if normalized_tags else None
             pending_move.minimap_transform = minimap_transform
             pending_move.dispatched_game_loop = _game_loop(observation)
             pending_move.latest_game_loop = pending_move.dispatched_game_loop
             actors = _units_by_tags(observation, pending_move.actor_tags)
-            pending_move.baseline_actor_position = _minimap_centroid(
-                actors,
-                minimap_transform,
-            )
+            pending_move.baseline_actor_position = _movement_centroid(actors, minimap_transform)
             pending_move.latest_actor_position = pending_move.baseline_actor_position
             pending_move.latest_actor_orders = _combined_unit_orders(actors)
             return
@@ -420,13 +419,9 @@ class ActionEffectVerifier:
                 continue
             pending.latest_game_loop = game_loop
             actors = _units_by_tags(observation, pending.actor_tags)
-            pending.latest_actor_position = (
-                None
-                if pending.minimap_transform is None
-                else _minimap_centroid(actors, pending.minimap_transform)
-            )
+            pending.latest_actor_position = _movement_centroid(actors, pending.minimap_transform)
             pending.latest_actor_orders = _combined_unit_orders(actors)
-            if MOVE_RAW_FUNCTION_ID in pending.latest_actor_orders:
+            if MOVE_RAW_FUNCTION_IDS.intersection(pending.latest_actor_orders):
                 pending.move_order_seen = True
             distance_to_target = _optional_position_distance(
                 pending.latest_actor_position,
@@ -665,6 +660,13 @@ class ActionEffectVerifier:
         return self.unit_names.get(int(value), f"unit:{int(value)}")
 
     def _resolve_target(self, pending: _PendingBuild, observation: Any) -> None:
+        if pending.command.screen_world_target is not None:
+            pending.target_position = (
+                float(pending.command.screen_world_target[0]),
+                float(pending.command.screen_world_target[1]),
+            )
+            pending.coordinate_space = "world"
+            return
         if not pending.resolved_arguments:
             return
         raw_units = list(_value(observation, "raw_units", ()))
@@ -959,6 +961,24 @@ def _minimap_centroid(
         sum(position[0] for position in present) / len(present),
         sum(position[1] for position in present) / len(present),
     )
+
+
+def _movement_centroid(
+    units: Sequence[Any],
+    transform: Optional[tuple[float, float, float, float, float]],
+) -> Optional[tuple[float, float]]:
+    """Use raw-grid positions directly in raw mode, transform legacy world data."""
+
+    if transform is None:
+        positions = [_unit_position(unit) for unit in units]
+        present = [position for position in positions if position is not None]
+        if not present:
+            return None
+        return (
+            sum(position[0] for position in present) / len(present),
+            sum(position[1] for position in present) / len(present),
+        )
+    return _minimap_centroid(units, transform)
 
 
 def _world_to_minimap_position(

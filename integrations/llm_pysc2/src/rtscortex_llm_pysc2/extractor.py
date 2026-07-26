@@ -520,6 +520,7 @@ class TimeStepExtractor:
         upgrade_names: Optional[Mapping[int, str]] = None,
         building_types: Sequence[int] = (),
         action_source_types: Optional[Mapping[int, int]] = None,
+        raw_action_mode: bool = False,
     ) -> None:
         self.run_id = run_id
         self.episode_id = episode_id
@@ -532,10 +533,15 @@ class TimeStepExtractor:
             int(function_id): int(unit_type)
             for function_id, unit_type in (action_source_types or {}).items()
         }
+        self.raw_action_mode = bool(raw_action_mode)
         self._known_expansion_resources: dict[int, dict[str, Any]] = {}
         self._suppressed_expansion_anchors: set[int] = set()
+        self._rejected_build_world_targets: dict[str, list[tuple[float, float]]] = {}
         self._expansion_candidates_exhausted = False
         self._expansion_scout_alerts: tuple[str, ...] = ()
+        self._raw_expansion_generation = 1
+        self._raw_known_candidate_tags: set[int] = set()
+        self._raw_expansion_initialized = False
         self._latest_game_loop = 0
 
     @property
@@ -561,6 +567,20 @@ class TimeStepExtractor:
         self._latest_game_loop = max(self._latest_game_loop, int(game_loop))
         self._suppressed_expansion_anchors.add(int(tag))
 
+    def suppress_build_world_target(
+        self,
+        action_name: str,
+        target: Sequence[int | float],
+    ) -> None:
+        """Permanently quarantine one failed world-space build region."""
+
+        if len(target) != 2:
+            return
+        point = (float(target[0]), float(target[1]))
+        targets = self._rejected_build_world_targets.setdefault(str(action_name), [])
+        if not any(math.dist(point, existing) < 0.25 for existing in targets):
+            targets.append(point)
+
     def observe_expansion_resources(
         self,
         observation: Any,
@@ -573,11 +593,48 @@ class TimeStepExtractor:
             _value(observation, "feature_units", ()),
         )
         self._latest_game_loop = int(_scalar(_value(observation, "game_loop", 0)))
+        if self.raw_action_mode:
+            self._update_raw_expansion_state(observation)
         known = self.known_expansion_resources
         suppressed = self.suppressed_expansion_anchors
         for agent in agents.values():
             agent._rtscortex_known_expansion_resources = known
             agent._rtscortex_suppressed_expansion_anchors = suppressed
+
+    def _update_raw_expansion_state(self, observation: Any) -> None:
+        all_candidates = set(
+            _expansion_anchor_candidates(
+                observation,
+                self.unit_names,
+                known_resources=self.known_expansion_resources,
+                excluded_anchors=(),
+            )
+        )
+        newly_discovered = all_candidates - self._raw_known_candidate_tags
+        if self._raw_expansion_initialized and newly_discovered:
+            self._raw_expansion_generation += 1
+        self._raw_known_candidate_tags.update(all_candidates)
+        self._raw_expansion_initialized = True
+        available = sorted(all_candidates - self._suppressed_expansion_anchors)
+        if available:
+            state = "candidate_available"
+        elif all_candidates and self._suppressed_expansion_anchors.intersection(all_candidates):
+            state = "all_candidates_exhausted"
+        else:
+            state = "not_discovered_yet"
+        self._expansion_candidates_exhausted = state == "all_candidates_exhausted"
+        available_text = ",".join(hex(tag) for tag in available) or "none"
+        rejected_text = (
+            ",".join(hex(tag) for tag in sorted(self._suppressed_expansion_anchors)) or "none"
+        )
+        evaluated = len(all_candidates.intersection(self._suppressed_expansion_anchors))
+        self._expansion_scout_alerts = (
+            f"expansion_scout_state={state}",
+            f"expansion_scout_generation={self._raw_expansion_generation}",
+            f"expansion_scout_waypoints={evaluated}/{len(all_candidates)}",
+            f"expansion_scout_available_anchors={available_text}",
+            f"expansion_scout_rejected_anchors={rejected_text}",
+        )
 
     def extract(
         self,
@@ -605,6 +662,8 @@ class TimeStepExtractor:
                 if int(_value(unit, "alliance", 0)) == 1
             },
             action_source_types=self.action_source_types,
+            rejected_build_world_targets=self._rejected_build_world_targets,
+            raw_action_mode=self.raw_action_mode,
         )
         text_observation = "\n\n".join(
             f"[{name}]\n{text_observations[name]}" for name in sorted(text_observations)
@@ -660,7 +719,7 @@ class TimeStepExtractor:
             name = _unit_name(unit, self.unit_names)
             if (
                 tag <= 0
-                or tag not in scouted_tags
+                or (not self.raw_action_mode and tag not in scouted_tags)
                 or int(_value(unit, "alliance", 0)) != 3
                 or not (_is_gas(name) or _is_mineral(name))
                 or int(_value(unit, "display_type", 1)) != 1
@@ -698,7 +757,12 @@ class TimeStepExtractor:
             if normalized_progress < 1.0:
                 status = "constructing"
         minimap_position = None
-        if minimap_transform is not None:
+        if self.raw_action_mode:
+            minimap_position = [
+                float(_value(unit, "x", 0.0)),
+                float(_value(unit, "y", 0.0)),
+            ]
+        elif minimap_transform is not None:
             scale, x_offset, y_offset, world_range, maximum = minimap_transform
             minimap_position = [
                 max(
@@ -840,6 +904,8 @@ def _extract_team_actions(
     unit_names: Mapping[int, str],
     owned_unit_types: set[int],
     action_source_types: Mapping[int, int],
+    rejected_build_world_targets: Mapping[str, Sequence[tuple[float, float]]],
+    raw_action_mode: bool = False,
 ) -> list[dict[str, Any]]:
     teams = []
     for agent_name in sorted(agents):
@@ -869,6 +935,8 @@ def _extract_team_actions(
                 unit_names=unit_names,
                 owned_unit_types=owned_unit_types,
                 action_source_types=action_source_types,
+                rejected_build_world_targets=rejected_build_world_targets,
+                raw_action_mode=raw_action_mode,
                 actor_tags=(
                     (int(agent.team_unit_tag_list[index]),)
                     if index < len(getattr(agent, "team_unit_tag_list", ()))
@@ -954,7 +1022,9 @@ def _available_team_actions(
     unit_names: Mapping[int, str],
     owned_unit_types: set[int],
     action_source_types: Mapping[int, int],
+    rejected_build_world_targets: Mapping[str, Sequence[tuple[float, float]]],
     actor_tags: Collection[int],
+    raw_action_mode: bool = False,
 ) -> list[dict[str, Any]]:
     action_space = agent.config.AGENTS[agent.name]["action"]
     unit_types = list(team.get("unit_type", ())) or ["EmptyGroup"]
@@ -1045,7 +1115,25 @@ def _available_team_actions(
                 "_rtscortex_suppressed_expansion_anchors",
                 (),
             ),
+            raw_action_mode=raw_action_mode,
         )
+        if (
+            raw_action_mode
+            and agent.name == "Builder"
+            and build_spec is not None
+            and build_spec.placement_kind == "screen"
+            and argument_candidates
+        ):
+            rejected = getattr(agent, "_rtscortex_rejected_build_positions", {}).get(
+                action_name, set()
+            )
+            argument_candidates = [
+                values
+                for values in argument_candidates
+                if values
+                and isinstance(values[0], (list, tuple))
+                and tuple(int(coordinate) for coordinate in values[0]) not in rejected
+            ]
         if (
             agent.name == "Builder"
             and action_name == "Move_Screen"
@@ -1070,6 +1158,24 @@ def _available_team_actions(
             if needs_screen_provenance
             else []
         )
+        if (
+            raw_action_mode
+            and build_spec is not None
+            and build_spec.placement_kind == "screen"
+            and screen_provenance
+        ):
+            rejected_world = rejected_build_world_targets.get(action_name, ())
+            quarantine_radius = max(1.5, build_spec.footprint * 0.75)
+            kept = [
+                (candidate, screen_provenance[index])
+                for index, candidate in enumerate(argument_candidates or ())
+                if all(
+                    math.dist(screen_provenance[index].world_target, rejected) > quarantine_radius
+                    for rejected in rejected_world
+                )
+            ]
+            argument_candidates = [candidate for candidate, _ in kept]
+            screen_provenance = [provenance for _, provenance in kept]
         if argument_candidates and needs_screen_provenance and not screen_provenance:
             continue
         if (
@@ -1189,6 +1295,7 @@ def _argument_candidates(
     builder_tags: Optional[Collection[int]] = None,
     known_expansion_resources: Sequence[Any] = (),
     excluded_expansion_anchors: Collection[int] = (),
+    raw_action_mode: bool = False,
 ) -> Optional[list[list[Any]]]:
     if action_name == INJECT_ACTION:
         return [
@@ -1214,11 +1321,18 @@ def _argument_candidates(
             and _is_mineral(_unit_name(unit, unit_names))
         ][:8]
     if action_name == "Attack_Unit":
+        units = (
+            _value(observation, "raw_units", ())
+            if raw_action_mode
+            else _value(observation, "feature_units", ())
+        )
         return [
             [int(_value(unit, "tag", 0))]
-            for unit in _value(observation, "feature_units", ())
+            for unit in units
             if int(_value(unit, "alliance", 0)) == 4
-            and bool(_value(unit, "is_on_screen", True))
+            and (raw_action_mode or bool(_value(unit, "is_on_screen", True)))
+            and int(_value(unit, "display_type", 1)) == 1
+            and (not raw_action_mode or float(_value(unit, "health", 0.0)) > 0)
             and int(_value(unit, "tag", 0)) > 0
         ]
     if action_name in SCREEN_POINT_ACTIONS:

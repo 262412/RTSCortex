@@ -11,6 +11,7 @@ config_path="${repo_dir}/configs/experiments/live_simple64_hima_protoss_ensemble
 frozen_playbook="$1"
 run_set_dir="$2"
 working_playbook="/mnt/scratch/users/tbczhang/outputs/RTSCortex/cortex-playbook-frozen-working.sqlite3"
+console_port="${RTSCORTEX_CONSOLE_PORT:-8765}"
 
 mkdir -p "${run_set_dir}"
 cd "${repo_dir}"
@@ -33,7 +34,7 @@ for seed in 0 1 2; do
       --config "${config_path}" \
       --seed "${seed}" \
       --console \
-      --console-port 8765 \
+      --console-port "${console_port}" \
     2>&1 | tee "${run_set_dir}/seed-${seed}.log"
   run_status=${PIPESTATUS[0]}
   set -e

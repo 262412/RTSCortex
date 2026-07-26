@@ -47,6 +47,7 @@ class RunSettings(SettingsModel):
 
 class EnvironmentSettings(SettingsModel):
     adapter: Literal["mock", "llm_pysc2"] = "mock"
+    execution_action_space: Literal["features", "raw"] = "features"
     scenario: str = "pvz_task1_level1"
     max_steps: int | None = Field(default=6, ge=1)
     agent_race: RaceName = "protoss"

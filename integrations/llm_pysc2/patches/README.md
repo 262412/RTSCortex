@@ -88,12 +88,28 @@ git -C third_party/LLM-PySC2 apply --check \
   ../../integrations/llm_pysc2/patches/0021-use-clamped-stop-worker-selection.patch
 git -C third_party/LLM-PySC2 apply \
   ../../integrations/llm_pysc2/patches/0021-use-clamped-stop-worker-selection.patch
+git -C third_party/LLM-PySC2 apply --check \
+  ../../integrations/llm_pysc2/patches/0022-bypass-frequency-for-forced-runtime-decision.patch
+git -C third_party/LLM-PySC2 apply \
+  ../../integrations/llm_pysc2/patches/0022-bypass-frequency-for-forced-runtime-decision.patch
+git -C third_party/LLM-PySC2 apply --check \
+  ../../integrations/llm_pysc2/patches/0023-skip-feature-action-printing-in-raw-mode.patch
+git -C third_party/LLM-PySC2 apply \
+  ../../integrations/llm_pysc2/patches/0023-skip-feature-action-printing-in-raw-mode.patch
 ```
 
 After the live run, restore the clean pinned checkout by reversing exactly these reviewed
 patches in reverse order:
 
 ```bash
+git -C third_party/LLM-PySC2 apply --reverse --check \
+  ../../integrations/llm_pysc2/patches/0023-skip-feature-action-printing-in-raw-mode.patch
+git -C third_party/LLM-PySC2 apply --reverse \
+  ../../integrations/llm_pysc2/patches/0023-skip-feature-action-printing-in-raw-mode.patch
+git -C third_party/LLM-PySC2 apply --reverse --check \
+  ../../integrations/llm_pysc2/patches/0022-bypass-frequency-for-forced-runtime-decision.patch
+git -C third_party/LLM-PySC2 apply --reverse \
+  ../../integrations/llm_pysc2/patches/0022-bypass-frequency-for-forced-runtime-decision.patch
 git -C third_party/LLM-PySC2 apply --reverse --check \
   ../../integrations/llm_pysc2/patches/0021-use-clamped-stop-worker-selection.patch
 git -C third_party/LLM-PySC2 apply --reverse \
@@ -310,7 +326,11 @@ force flag bypass only the upstream LLM decision-frequency throttle. Normal main
 unchanged, while a recovery observation can reach Runtime in the tick that preempts a stalled
 camera or selection chain.
 
-CI applies all twenty-two patches in order under Python 3.9, compiles and imports both projects, and
+`0023-skip-feature-action-printing-in-raw-mode.patch` makes PySC2's optional diagnostic wrapper
+ignore the feature-only `available_actions` field when the environment is configured for RAW
+actions. Feature-action runs retain the original printing behavior.
+
+CI applies all twenty-three patches in order under Python 3.9, compiles and imports both projects, and
 runs `integrations/llm_pysc2/tests/python39_contract_smoke.py`. The smoke locks the v1.1
 candidate mapping, multi-argument translator rejection, Nexus camera-settlement primitive,
 exact Nexus anchor, floating-point resource clearance, visible complete-footprint behavior,
