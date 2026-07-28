@@ -1,27 +1,43 @@
 # Protoss natural-terminal regression issue register
 
-Status date: 2026-07-25
+Status date: 2026-07-26
 
-This register contains only issues that remain open after:
+This register contains only issues that remain open after the latest raw-action
+natural-terminal regression:
 
 ```text
-protoss-frozen-natural-terminal-postfix-20260725T103903Z
+protoss-raw-frozen-natural-terminal-20260725T231010Z
 ```
 
-The run used HIMA Protoss a/b/c, active Strategic Intent Arbiter, a frozen
-active Playbook, `Simple64`, Protoss versus VeryEasy Zerg, and
-`game_steps_per_episode: 0`.
+It used HIMA Protoss a/b/c, active Strategic Intent Arbiter, a frozen active
+Playbook, `Simple64`, Protoss versus VeryEasy Zerg,
+`execution_action_space: raw`, and `game_steps_per_episode: 0`.
 
 | Seed | Outcome | Steps | Meaningful success | Build | Production |
 |---|---:|---:|---:|---:|---:|
-| 0 | defeat | 16,490 | 47/75 | 9/14 | 25/25 |
-| 1 | defeat | 15,814 | 25/59 | 7/37 | 18/18 |
-| 2 | error | 9,060 | 53/92 | 11/12 | 28/28 |
+| 0 | draw | 69,378 | 88.3% | 34/56 | 56/56 |
+| 1 | defeat | 18,653 | 60.0% | 16/32 | 29/29 |
+| 2 | defeat | 19,186 | 87.2% | 20/31 | 28/28 |
 
 Production provenance, terminal-report exactly-once, duplicate-dispatch
-protection, candidate-domain validation, friendly-target safety and threat
-classification remained healthy. Resolved issues are not retained in this
-active register.
+protection, candidate-domain validation, friendly-target safety, raw movement
+settlement and threat classification remained healthy. The remaining failures
+were above the raw transport boundary:
+
+- Defense emitted no production, anti-air or static-defense response before
+  Nexus loss;
+- expansion and ordinary build placement still had separate candidate,
+  dispatch and effect target interpretations;
+- a damaged member from another same-type control group could trigger or retain
+  retreat state;
+- HIMA emitted `Void Ray`, while the pinned vocabulary accepted only
+  `VoidRay`.
+
+The 2026-07-26 architecture repair adds a RaceProfile-driven emergency compiler,
+single-owner tactical role lineage, `RawPlacementService`, actor membership plus
+shield durability, and the explicit `Void Ray` alias. These changes are
+deterministically tested but are not called live-accepted until another
+natural-terminal seeds `[0,1,2]` run passes the criteria below.
 
 The architecture migration was then exercised in two bounded live canaries. The
 second run includes world quarantine, raw expansion generations and deterministic
@@ -57,8 +73,8 @@ register until their own long-run acceptance criteria are observed.
 
 ## Architecture decision: RTSCortex owns execution through PySC2 Raw Actions
 
-The repeated failures have one common architectural cause. The current live
-path contains two runtimes:
+The repeated feature-action failures had one common architectural cause. The
+former live path contained two runtimes:
 
 ```text
 RTSCortex Runtime
@@ -102,96 +118,10 @@ Terran and Zerg have separate raw-action acceptance runs.
 
 ## Open issues
 
-### SCX-PT-026: dual execution ownership causes non-local failures
+### SCX-PT-027: build placement had multiple semantic owners
 
 - **Priority:** P0
-- **Status:** implemented; bounded live canary passed, natural-terminal acceptance pending
-- **Components:** Worker, Fast Executor, Bridge, PySC2 action space
-- **Evidence:**
-  - seed 2 ended with
-    `BridgeIntegrityError: upstream aborted an action with no unique command:
-    CombatGroup7/Adept-1/Attack_Unit`;
-  - previous runs alternated between camera budget exhaustion, stale selection,
-    producer provenance loss, `cannot find unit on screen`, and unattributed
-    aborts although the Runtime command was valid;
-  - the current Worker calls `MainAgent.step()` after RTSCortex validation, so
-    an independent mutable state machine still decides the final primitive.
-- **Impact:** execution correctness depends on UI state that is unrelated to
-  semantic legality. One stale upstream queue can terminate a natural-terminal
-  episode and can contaminate Playbook evidence.
-- **Root cause:** RTSCortex owns command intent and tracking while LLM-PySC2
-  owns actor resolution and final dispatch. There is no single authoritative
-  command-to-SC2 transition.
-- **Required correction:**
-  1. add an explicit `raw` execution action-space setting;
-  2. keep feature/RGB/raw observations enabled;
-  3. bind commands to living raw unit tags after Runtime validation;
-  4. translate supported Protoss semantic actions to exactly one raw primitive;
-  5. record that primitive directly under the command ID;
-  6. settle PySC2 acceptance on the following observation;
-  7. bypass `MainAgent.step()`, camera, selection and upstream translator in raw
-     mode;
-  8. retain feature mode only as an explicit compatibility path.
-- **Implemented evidence:**
-  - `execution_action_space: raw` starts SC2 with both raw and feature/RGB
-    interfaces;
-  - `RawActionExecutor` binds the exact actor, builder or producer tags and emits
-    one final raw primitive per command;
-  - raw Worker ticks call the RTSCortex decision broker directly and never call
-    `MainAgent.step()`;
-  - patch `0023` makes PySC2's diagnostic action printer tolerate the absence of
-    feature-only `available_actions`;
-  - the bounded canary completed 2,000 observations and 14/14 meaningful
-    commands without an upstream action abort.
-- **Acceptance criteria:**
-  - raw mode emits no orchestration camera or selection primitives;
-  - upstream aborts and `cannot find unit on screen` cannot terminate raw runs;
-  - every raw primitive has exactly one command ID;
-  - actor tags in effect evidence equal the tags sent to PySC2;
-  - supported Protoss actions have 100% raw mapping coverage;
-  - feature/RGB Live Console observations remain available.
-
-### SCX-PT-016: movement was executed but falsely classified as failed
-
-- **Priority:** P0
-- **Status:** implementation complete; long-run combat evidence pending
-- **Components:** RawActionBridge, MoveVerifier, Offense/Defense navigation
-- **Evidence:**
-  - the three runs produced 44 meaningful Move commands but only one success;
-  - 40 failures were `move_order_not_observed`;
-  - failed evidence repeatedly contained `worker_orders=["547"]` and observable
-    displacement while the verifier required order `13`.
-- **Impact:** real movement is reported as failure, causing actor-local
-  navigation, Defense cooldown, Arbiter feedback and Playbook learning to
-  re-arm or punish actions that SC2 actually executed.
-- **Root cause:** PySC2 raw order projection generalizes SC2 ability 16 to
-  `RAW_FUNCTIONS.Move_Move_pt` function ID 547. The verifier used the generic
-  smart-move function ID 13 (`Move_pt`, ability 3794). In feature mode, selected
-  actor identity could also differ from configured team identity.
-- **Required correction:**
-  1. dispatch `Move_Move_pt` with the exact living actor tags;
-  2. verify raw order 547, not 13;
-  3. compute arrival from those same surviving tags;
-  4. keep one actor-local waypoint lifecycle until effect terminal;
-  5. distinguish order acquisition, travel, arrival, actor loss and timeout.
-- **Implemented evidence:**
-  - raw movement emits `Move_Move_pt` function/order 547 with the exact living
-    team tag set;
-  - MoveVerifier accepts both legacy feature evidence and raw order 547, and raw
-    mode measures the same world-coordinate actor centroid used at dispatch;
-  - deterministic verifier and RawActionExecutor contracts pass. The bounded
-    canary did not reach combat movement, so this issue is not closed yet.
-- **Acceptance criteria:**
-  - order 547 is recognized on deterministic and live observations;
-  - unrelated movement orders cannot confirm the command;
-  - actor tags are identical at dispatch and verification;
-  - accepted movement with real displacement is not failed at 16 loops;
-  - true-arrival rate is at least 80% in deterministic contracts.
-
-### SCX-PT-027: build placement retries are screen-local, not world-stable
-
-- **Priority:** P0
-- **Status:** implemented; failure-path live evidence pending
+- **Status:** architecture implementation complete; natural-terminal acceptance pending
 - **Components:** build candidate generation, RawActionBridge, BuildVerifier
 - **Evidence:**
   - seed 1 confirmed only 7 of 37 build commands;
@@ -201,10 +131,12 @@ Terran and Zerg have separate raw-action acceptance runs.
     `target_not_created`.
 - **Impact:** a bad location can be retried indefinitely under different camera
   projections, consuming the Builder, resources and strategic frontier.
-- **Root cause:** rejection memory is keyed primarily by feature-screen
-  position. Camera reprojection makes one world location appear as multiple
-  screen positions, and the translator performs another placement decision
-  after Runtime candidate validation.
+- **Root cause:** candidate generation lived in `TimeStepExtractor`, expansion
+  target search lived in `RawActionExecutor`, and target recovery lived in
+  `ActionEffectVerifier`. The same command could therefore have a valid screen
+  candidate, a different raw expansion point and a third effect target.
+  Rejection memory was additionally split between agent screen coordinates,
+  extractor world coordinates and expansion-anchor state.
 - **Required correction:**
   1. make raw/world target the canonical placement identity;
   2. emit the validated raw target directly without translator resampling;
@@ -213,19 +145,25 @@ Terran and Zerg have separate raw-action acceptance runs.
   5. separate PySC2 rejection, missing builder order and missing structure
      effect.
 - **Implemented evidence:**
-  - `screen_world_target` is now sent directly to the raw build function;
-  - immediate PySC2 rejection and later EffectVerifier failure both quarantine
-    the world target;
-  - future candidate projection filters a footprint-sized radius around that
-    world target, so camera-relative coordinates cannot evade deduplication;
-  - bounded canary build confirmation was 6/6 and produced no retries. A live
-    intentional-failure case or natural-terminal failure is still required to
-    close the rejection-path criterion.
+  - one episode-scoped `RawPlacementService` is injected into the extractor,
+    raw executor and effect verifier;
+  - the service owns persistent resource observations, candidate projection,
+    expansion target resolution, command-to-world-target binding and permanent
+    quarantine;
+  - raw pre-dispatch failure now quarantines the coordinate or anchor before
+    the command is terminalized;
+  - EffectVerifier reads the exact placement bound by raw dispatch rather than
+    reconstructing it from screen coordinates;
+  - deterministic contracts cover pre-dispatch world quarantine, permanent
+    expansion-anchor suppression and effect confirmation from the shared
+    target.
 - **Acceptance criteria:**
   - one quarantined region is never dispatched again for that action;
   - a raw command contains requested and resolved target provenance;
   - screen reprojection cannot bypass world-space deduplication;
   - build-failure stage/code coverage remains 100%.
+  - candidate, dispatched and effect-evidence world targets are identical for
+    100% of tracked builds.
 
 ### SCX-PT-022: exhausted expansion search cannot discover later anchors
 
@@ -273,31 +211,86 @@ Terran and Zerg have separate raw-action acceptance runs.
   - at least one of seeds `[0,1,2]` builds a second Nexus or reports finite
     full-candidate exhaustion.
 
-### SCX-PT-023: Defense retries are amplified by false movement feedback
+### SCX-PT-023: Defense was a combat router, not a defensive strategy Agent
 
 - **Priority:** P1
-- **Status:** raw feedback dependency fixed; long-run Defense behavior pending
-- **Components:** DefenseAgent, actor-local state, MoveVerifier, Arbiter
+- **Status:** architecture implementation complete; live emergency response pending
+- **Components:** DefenseAgent, RaceProfile, Role Agents, Intent Arbiter
 - **Evidence:**
-  - Defense intent volume fell to 26/2/52 after actor-local hysteresis;
-  - most remaining failed responses were movement failures;
-  - the same observations contain move order 547, proving that false verifier
-    feedback can still trigger cooldown/retry behavior.
-- **Impact:** Defense can occupy the agenda or back off from a valid response
-  based on incorrect execution feedback.
-- **Root cause:** the Agent state machine is now actor-local, but its terminal
-  input still comes from the incorrect Move order contract.
-- **Required correction:** complete SCX-PT-016, then tune Defense only from raw
-  dispatch/effect evidence.
-- **Implemented evidence:** raw commands can no longer receive feature-selection
-  feedback, and raw movement uses the same actor tags in dispatch and effect
-  preparation. No threat occurred in the bounded canary, so retry/hysteresis
-  behavior remains a natural-terminal gate.
+  - all three raw natural-terminal games lost their original Nexus;
+  - seed 2 faced Mutalisks without an anti-air production response;
+  - the final 500-loop windows contained no Defense Intent despite sufficient
+    banked resources in at least one terminal state.
+- **Impact:** the system can classify a threat as critical while continuing the
+  macro frontier unchanged, so correct Situation analysis does not become an
+  executable defensive agenda.
+- **Root cause:** `DefenseAgent` only routed an already available
+  `Attack_Unit` or `Move_Minimap`. It could not derive race-specific production,
+  static defense, anti-air prerequisite closure, resource preemption or
+  last-resort worker defense. Offense, FocusFire and Retreat also inherited a
+  shared Tactical source ID, so their apparent role separation did not identify
+  the actual responsible Agent.
+- **Required correction:** compile bounded emergency options from a typed
+  RaceProfile doctrine, emit emergency resource claims before Fast Executor,
+  and give every tactical proposal one concrete role-Agent owner.
+- **Implemented evidence:**
+  - Protoss, Terran and Zerg RaceProfiles now declare ground production,
+    anti-air production, static/anti-air defense, prerequisites and worker
+    defense actions;
+  - Defense compiles candidate-bound emergency Intents with a common exclusion
+    group, maximum urgency and real mineral/gas/supply claims;
+  - emergency claims can preempt non-emergency agenda commitments in the
+    existing Intent Arbiter;
+  - worker defense is considered only at critical threat and only when no
+    combat response exists;
+  - Offense, FocusFire and Retreat now stamp distinct Agent provenance before
+    strategic adaptation.
 - **Acceptance criteria:**
-  - one actor/target signature has no overlapping active response;
-  - valid movement does not enter failure cooldown;
-  - emergency response remains within 8 loops;
-  - retries are bounded by real terminals, not observation count.
+  - critical air threat produces a legal anti-air production, prerequisite or
+    anti-air static-defense Intent within 8 loops;
+  - critical ground threat produces production/static/combat response within
+    8 loops;
+  - emergency resource claims preempt a conflicting non-emergency reservation;
+  - worker defense is never emitted while a viable combat response exists;
+  - role-to-intent-to-command lineage names one of the seven concrete Agents for
+    100% of commands.
+
+### SCX-PT-028: retreat durability and membership were not actor-local
+
+- **Priority:** P1
+- **Status:** implementation complete; natural-terminal acceptance pending
+- **Components:** Observation contract, Tactical role Agents, RetreatAgent
+- **Evidence:**
+  - seed 0 repeatedly re-entered `retreat_arrived` for a Void Ray group after
+    global threat had fallen;
+  - `_units_for_actor()` selected all units with the same type suffix, and
+    `_retreat_intents()` used the minimum `health_fraction` of that global set;
+  - Protoss shield was absent from `UnitState`.
+- **Impact:** one damaged Void Ray can keep another logical actor in retreat,
+  block Offense target search and prevent a large surviving army from converting
+  an advantage.
+- **Root cause:** logical control-group identity was reconstructed from a team
+  name rather than the exact raw tag membership. Durability was hull-only and
+  reduced by global minimum, which is incorrect for shielded multi-unit groups.
+- **Required correction:** project exact actor scopes from team raw tags, carry
+  shield and combined durability, and evaluate retreat hysteresis on only the
+  owning actor's members.
+- **Implemented evidence:**
+  - Worker snapshots include non-empty team `unit_tags`;
+  - Observation mapping attaches `actor_scopes`, `shield_fraction` and
+    `(health + shield) / (health_max + shield_max)` durability;
+  - actor lookup prefers exact membership and only falls back to the historical
+    type name when reading old journals;
+  - retreat uses the actor-local median durability, preserving single-unit
+    behavior without allowing one unrelated straggler to poison another actor;
+  - new optional fields are omitted from legacy serialization when absent, so
+    all pinned policy-corpus hashes remain unchanged.
+- **Acceptance criteria:**
+  - units from a different same-type actor cannot trigger retreat;
+  - a shielded Protoss actor does not retreat solely because hull health is low;
+  - a genuinely low-durability actor still retreats within 8 loops;
+  - Retreat state becomes obsolete after recovery/arrival and does not block
+    later Offense search.
 
 ### SCX-PT-025: censored episodes still influence lesson promotion
 
@@ -346,7 +339,12 @@ Terran and Zerg have separate raw-action acceptance runs.
    driven.
 7. **Done:** exclude censored lessons at the promotion boundary.
 8. **Done:** run deterministic contracts and a bounded live canary.
-9. **Pending:** run Protoss seeds `[0,1,2]` to natural terminal with active
+9. **Done:** add RaceProfile emergency doctrine and concrete tactical Agent
+   ownership.
+10. **Done:** make `RawPlacementService` the sole world-placement authority.
+11. **Done:** add shield-aware exact actor membership and the `Void Ray` parser
+   alias.
+12. **Pending:** run Protoss seeds `[0,1,2]` to natural terminal with active
    Arbiter and frozen Playbook, then close only the issues whose long-run
    criteria are observed.
 

@@ -574,9 +574,9 @@ class DeterministicTacticalAgent:
             if not units:
                 self._retreat_by_actor.pop(actor, None)
                 continue
-            minimum_health = min(unit.health_fraction for unit in units)
+            actor_durability = _actor_durability(units)
             state = self._retreat_by_actor.get(actor)
-            recovered = minimum_health >= self.retreat_exit_health_threshold
+            recovered = actor_durability >= self.retreat_exit_health_threshold
             if state is not None and recovered:
                 del self._retreat_by_actor[actor]
                 state = None
@@ -596,7 +596,7 @@ class DeterministicTacticalAgent:
             overwhelmed = assessment.threat_level is ThreatLevel.CRITICAL and len(enemies) > len(
                 units
             )
-            should_retreat = minimum_health <= self.retreat_health_threshold or overwhelmed
+            should_retreat = actor_durability <= self.retreat_health_threshold or overwhelmed
             if not should_retreat:
                 continue
             retreating.add(actor)
@@ -800,11 +800,32 @@ def _units_for_actor(
     ]
     if "/" not in actor:
         return combat_units
+    exact_members = [unit for unit in combat_units if actor in unit.actor_scopes]
+    if exact_members:
+        return exact_members
     actor_token = actor.rsplit("/", 1)[-1]
     unit_type = actor_token.rsplit("-", 1)[0]
     if unit_type.casefold() in {"army", "combat", "all"}:
         return combat_units
     return [unit for unit in combat_units if unit.unit_type == unit_type]
+
+
+def _actor_durability(units: list[UnitState]) -> float:
+    """Return group durability without letting one straggler poison another actor.
+
+    Exact actor membership is applied before this function.  The median keeps a
+    multi-unit logical group stable while a single-unit actor still retreats on
+    its own effective health plus shields.
+    """
+
+    values = sorted(
+        (unit.health_fraction if unit.durability_fraction is None else unit.durability_fraction)
+        for unit in units
+    )
+    middle = len(values) // 2
+    if len(values) % 2:
+        return values[middle]
+    return (values[middle - 1] + values[middle]) / 2
 
 
 def _actor_minimap_centroid(

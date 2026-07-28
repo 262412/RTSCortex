@@ -49,6 +49,7 @@ from rtscortex_llm_pysc2.production import (
 )
 from rtscortex_llm_pysc2.protocol import RuntimeClient
 from rtscortex_llm_pysc2.raw_executor import RawActionExecutor, RawDispatch
+from rtscortex_llm_pysc2.raw_placement import RawPlacementService
 from rtscortex_llm_pysc2.research import RESEARCH_SPECS, research_spec
 
 PRODUCTION_CAMERA_SETTLE_MAX_OBSERVATIONS = 4
@@ -1535,11 +1536,13 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
         self.runtime_client.health()
         unit_names, building_types = _unit_metadata()
         upgrade_names = _upgrade_metadata()
+        placement_service = RawPlacementService(unit_names=unit_names)
         coordinator = BridgeCoordinator(
             self.runtime_client,
             effect_verifier=ActionEffectVerifier(
                 timeout_game_loops=self.worker_settings.action_effect_timeout_game_loops,
                 unit_names=unit_names,
+                placement_service=placement_service,
             ),
         )
         extractor = TimeStepExtractor(
@@ -1550,6 +1553,7 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
             building_types=building_types,
             action_source_types=_production_action_source_types(self.worker_settings.agent_race),
             raw_action_mode=self.worker_settings.execution_action_space == "raw",
+            placement_service=placement_service,
         )
         self.decision_broker = SharedDecisionBroker(
             coordinator,
@@ -1598,6 +1602,7 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
         self.raw_executor = RawActionExecutor(
             self.decision_broker,
             unit_names=unit_names,
+            placement_service=placement_service,
         )
         self._rtscortex_accept_visible_team_unit = True
         self._rtscortex_exact_single_unit_selection = True

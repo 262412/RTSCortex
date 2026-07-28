@@ -74,6 +74,7 @@ _UPSTREAM_ACTIONS: tuple[tuple[int, str, str], ...] = (
 # Older HIMA prompt examples use these explicit long-form tokens.  They remain
 # accepted aliases, but never alter the pinned IDs or official short names.
 _PAPER_ALIASES: dict[str, tuple[str, ...]] = {
+    "VoidRay": ("Void Ray",),
     "WarpGateResearch": ("RESEARCH WARPGATE", "RESEARCH WARPGATE_RESEARCH"),
     "ProtossAirWeaponsLevel1": ("RESEARCH AIRWEAPONS_LEVEL1",),
     "ProtossAirWeaponsLevel2": ("RESEARCH AIRWEAPONS_LEVEL2",),

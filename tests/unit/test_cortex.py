@@ -308,6 +308,82 @@ def test_retreat_state_is_actor_local_and_cools_down_after_arrival() -> None:
     ]
 
 
+def test_retreat_uses_exact_actor_membership_and_shield_aware_durability() -> None:
+    base = _observation()
+    adept_actor = "CombatGroup7/Adept-1"
+    void_actor = "CombatGroup8/VoidRay-1"
+    observation = base.model_copy(
+        update={
+            "state": base.state.model_copy(
+                update={
+                    "own_units": [
+                        UnitState(
+                            unit_id="0x10",
+                            unit_type="Adept",
+                            alliance="self",
+                            position=(50.0, 50.0),
+                            health_fraction=0.15,
+                            durability_fraction=0.15,
+                            actor_scopes=(adept_actor,),
+                        ),
+                        UnitState(
+                            unit_id="0x11",
+                            unit_type="VoidRay",
+                            alliance="self",
+                            position=(48.0, 50.0),
+                            health_fraction=0.1,
+                            shield_fraction=1.0,
+                            durability_fraction=0.7,
+                            actor_scopes=(void_actor,),
+                        ),
+                        UnitState(
+                            unit_id="0x12",
+                            unit_type="VoidRay",
+                            alliance="self",
+                            position=(49.0, 50.0),
+                            health_fraction=0.1,
+                            shield_fraction=0.0,
+                            durability_fraction=0.1,
+                            actor_scopes=("CombatGroup9/VoidRay-2",),
+                        ),
+                    ],
+                    "own_structures": [
+                        UnitState(
+                            unit_id="0x13",
+                            unit_type="Nexus",
+                            alliance="self",
+                            position=(10.0, 10.0),
+                        )
+                    ],
+                }
+            ),
+            "available_actions": [
+                AvailableAction(
+                    name="Move_Minimap",
+                    argument_names=["minimap"],
+                    argument_types=[ActionArgumentType.POSITION],
+                    actor_scopes=[adept_actor, void_actor],
+                    argument_candidates=[[[90, 90]], [[12, 12]]],
+                )
+            ],
+        }
+    )
+    agent = DeterministicTacticalAgent(
+        retreat_health_threshold=0.3,
+        minimum_advance_army_supply=4,
+    )
+
+    intents = agent.evaluate(
+        observation,
+        DeterministicSituationAnalyzer().assess(observation),
+    )
+
+    retreat_actors = {
+        intent.actor_scopes[0] for intent in intents if "retreat" in intent.objective.casefold()
+    }
+    assert retreat_actors == {adept_actor}
+
+
 def test_tactical_agent_focuses_one_target_and_reacquires_when_it_disappears() -> None:
     observation = _observation().model_copy(
         update={

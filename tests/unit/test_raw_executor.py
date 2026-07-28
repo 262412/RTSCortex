@@ -199,6 +199,32 @@ def test_raw_executor_rejects_missing_actor_without_emitting_action() -> None:
     assert broker.settled == [("missing-actor", False)]
 
 
+def test_raw_executor_permanently_quarantines_build_on_pre_dispatch_failure() -> None:
+    broker = _Broker()
+    executor = RawActionExecutor(cast(Any, broker), unit_names={2: "Probe"})
+    command = RoutedCommand(
+        command_id="missing-builder",
+        actor="Builder/Builder-Probe-1",
+        team_name="Builder-Probe-1",
+        name="Build_Pylon_Screen",
+        rendered_action="",
+        requested_arguments=([65, 65],),
+        screen_world_target=(22.25, 24.5),
+        screen_anchor_tag=0xB1,
+    )
+    executor.enqueue(_decision(command))
+
+    assert (
+        executor.next_dispatch(
+            SimpleNamespace(raw_units=[], game_loop=[100]),
+            {"Builder": _agent("Builder-Probe-1", [0xB1])},
+        )
+        is None
+    )
+    assert broker.settled == [("missing-builder", False)]
+    assert executor.placement_service.quarantined_targets == {"Build_Pylon_Screen": [(22.25, 24.5)]}
+
+
 def test_failed_build_effect_quarantines_exact_world_target() -> None:
     broker = _Broker()
     executor = RawActionExecutor(cast(Any, broker), unit_names={2: "Probe"})
@@ -234,10 +260,7 @@ def test_failed_build_effect_quarantines_exact_world_target() -> None:
         game_loop=212,
     )
 
-    assert broker.rejected_world_targets == [("Build_Pylon_Screen", (22.25, 24.5))]
-    assert agents["Builder"]._rtscortex_rejected_build_positions == {
-        "Build_Pylon_Screen": {(65, 65)}
-    }
+    assert executor.placement_service.quarantined_targets == {"Build_Pylon_Screen": [(22.25, 24.5)]}
 
 
 def test_raw_nexus_uses_resource_clearance_position_not_resource_centroid() -> None:

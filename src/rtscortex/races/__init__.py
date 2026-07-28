@@ -3,6 +3,7 @@
 from rtscortex.races.models import (
     ActionDomain,
     CombatTargetDomain,
+    DefenseDoctrine,
     MacroActionMapping,
     RaceId,
     RaceProfile,
@@ -25,6 +26,7 @@ __all__ = [
     "ActionDomain",
     "BuiltinRaceProfile",
     "CombatTargetDomain",
+    "DefenseDoctrine",
     "MacroActionMapping",
     "PROTOSS_PROFILE_DATA",
     "RaceId",

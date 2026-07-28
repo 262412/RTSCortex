@@ -21,6 +21,7 @@ from rtscortex_llm_pysc2.production import (
     production_spec,
     production_spec_for_order,
 )
+from rtscortex_llm_pysc2.raw_placement import RawPlacementService
 from rtscortex_llm_pysc2.research import research_spec, research_spec_for_order
 
 SUPPORTED_ARGUMENTS = frozenset({"minimap", "screen", "tag"})
@@ -521,6 +522,7 @@ class TimeStepExtractor:
         building_types: Sequence[int] = (),
         action_source_types: Optional[Mapping[int, int]] = None,
         raw_action_mode: bool = False,
+        placement_service: Optional[RawPlacementService] = None,
     ) -> None:
         self.run_id = run_id
         self.episode_id = episode_id
@@ -534,9 +536,9 @@ class TimeStepExtractor:
             for function_id, unit_type in (action_source_types or {}).items()
         }
         self.raw_action_mode = bool(raw_action_mode)
-        self._known_expansion_resources: dict[int, dict[str, Any]] = {}
-        self._suppressed_expansion_anchors: set[int] = set()
-        self._rejected_build_world_targets: dict[str, list[tuple[float, float]]] = {}
+        self.placement_service = placement_service or RawPlacementService(
+            unit_names=self.unit_names
+        )
         self._expansion_candidates_exhausted = False
         self._expansion_scout_alerts: tuple[str, ...] = ()
         self._raw_expansion_generation = 1
@@ -546,11 +548,17 @@ class TimeStepExtractor:
 
     @property
     def known_expansion_resources(self) -> tuple[dict[str, Any], ...]:
-        return tuple(self._known_expansion_resources.values())
+        return self.placement_service.known_resources
+
+    @property
+    def _known_expansion_resources(self) -> dict[int, dict[str, Any]]:
+        """Compatibility view backed by the single placement-service store."""
+
+        return self.placement_service._known_resources  # noqa: SLF001
 
     @property
     def suppressed_expansion_anchors(self) -> frozenset[int]:
-        return frozenset(self._suppressed_expansion_anchors)
+        return self.placement_service.suppressed_anchors
 
     def set_expansion_candidates_exhausted(self, exhausted: bool) -> None:
         self._expansion_candidates_exhausted = bool(exhausted)
@@ -565,7 +573,7 @@ class TimeStepExtractor:
         game_loop: int,
     ) -> None:
         self._latest_game_loop = max(self._latest_game_loop, int(game_loop))
-        self._suppressed_expansion_anchors.add(int(tag))
+        self.placement_service.suppress_anchor(int(tag))
 
     def suppress_build_world_target(
         self,
@@ -574,12 +582,7 @@ class TimeStepExtractor:
     ) -> None:
         """Permanently quarantine one failed world-space build region."""
 
-        if len(target) != 2:
-            return
-        point = (float(target[0]), float(target[1]))
-        targets = self._rejected_build_world_targets.setdefault(str(action_name), [])
-        if not any(math.dist(point, existing) < 0.25 for existing in targets):
-            targets.append(point)
+        self.placement_service.suppress_world_target(action_name, target)
 
     def observe_expansion_resources(
         self,
@@ -588,9 +591,9 @@ class TimeStepExtractor:
     ) -> None:
         """Update persistent anchors on every Worker frame, not only Runtime ticks."""
 
-        self._remember_expansion_resources(
-            list(_value(observation, "raw_units", ())),
-            _value(observation, "feature_units", ()),
+        self.placement_service.observe(
+            observation,
+            require_feature_visibility=not self.raw_action_mode,
         )
         self._latest_game_loop = int(_scalar(_value(observation, "game_loop", 0)))
         if self.raw_action_mode:
@@ -600,6 +603,7 @@ class TimeStepExtractor:
         for agent in agents.values():
             agent._rtscortex_known_expansion_resources = known
             agent._rtscortex_suppressed_expansion_anchors = suppressed
+            agent._rtscortex_raw_placement_service = self.placement_service
 
     def _update_raw_expansion_state(self, observation: Any) -> None:
         all_candidates = set(
@@ -615,19 +619,19 @@ class TimeStepExtractor:
             self._raw_expansion_generation += 1
         self._raw_known_candidate_tags.update(all_candidates)
         self._raw_expansion_initialized = True
-        available = sorted(all_candidates - self._suppressed_expansion_anchors)
+        available = sorted(all_candidates - self.suppressed_expansion_anchors)
         if available:
             state = "candidate_available"
-        elif all_candidates and self._suppressed_expansion_anchors.intersection(all_candidates):
+        elif all_candidates and self.suppressed_expansion_anchors.intersection(all_candidates):
             state = "all_candidates_exhausted"
         else:
             state = "not_discovered_yet"
         self._expansion_candidates_exhausted = state == "all_candidates_exhausted"
         available_text = ",".join(hex(tag) for tag in available) or "none"
         rejected_text = (
-            ",".join(hex(tag) for tag in sorted(self._suppressed_expansion_anchors)) or "none"
+            ",".join(hex(tag) for tag in sorted(self.suppressed_expansion_anchors)) or "none"
         )
-        evaluated = len(all_candidates.intersection(self._suppressed_expansion_anchors))
+        evaluated = len(all_candidates.intersection(self.suppressed_expansion_anchors))
         self._expansion_scout_alerts = (
             f"expansion_scout_state={state}",
             f"expansion_scout_generation={self._raw_expansion_generation}",
@@ -662,7 +666,7 @@ class TimeStepExtractor:
                 if int(_value(unit, "alliance", 0)) == 1
             },
             action_source_types=self.action_source_types,
-            rejected_build_world_targets=self._rejected_build_world_targets,
+            rejected_build_world_targets=self.placement_service.quarantined_targets,
             raw_action_mode=self.raw_action_mode,
         )
         text_observation = "\n\n".join(
@@ -705,34 +709,13 @@ class TimeStepExtractor:
         raw_units: Sequence[Any],
         feature_units: Sequence[Any],
     ) -> None:
-        """Persist scouted neutral resource anchors in world coordinates."""
+        """Compatibility seam backed by the placement service's single store."""
 
-        scouted_tags = {
-            int(_value(unit, "tag", 0))
-            for unit in feature_units
-            if int(_value(unit, "alliance", 0)) == 3
-            and bool(_value(unit, "is_on_screen", True))
-            and int(_value(unit, "display_type", 1)) == 1
-        }
-        for unit in raw_units:
-            tag = int(_value(unit, "tag", 0))
-            name = _unit_name(unit, self.unit_names)
-            if (
-                tag <= 0
-                or (not self.raw_action_mode and tag not in scouted_tags)
-                or int(_value(unit, "alliance", 0)) != 3
-                or not (_is_gas(name) or _is_mineral(name))
-                or int(_value(unit, "display_type", 1)) != 1
-            ):
-                continue
-            self._known_expansion_resources[tag] = {
-                "tag": tag,
-                "unit_type": name,
-                "alliance": 3,
-                "x": float(_value(unit, "x", 0.0)),
-                "y": float(_value(unit, "y", 0.0)),
-                "display_type": 1,
-            }
+        self.placement_service.observe_units(
+            raw_units,
+            feature_units,
+            require_feature_visibility=not self.raw_action_mode,
+        )
 
     def _extract_unit(
         self,
@@ -747,6 +730,8 @@ class TimeStepExtractor:
         health_max = float(_value(unit, "health_max", 0.0))
         if health_max <= 0:
             health_max = health / health_ratio if health_ratio > 0 else max(health, 1.0)
+        shield = float(_value(unit, "shield", 0.0))
+        shield_max = float(_value(unit, "shield_max", 0.0))
         order_length = int(_value(unit, "order_length", 0))
         status = "idle" if order_length == 0 else "active"
         build_progress = _value(unit, "build_progress", None)
@@ -789,6 +774,8 @@ class TimeStepExtractor:
             "minimap_position": minimap_position,
             "health": health,
             "health_max": health_max,
+            "shield": shield,
+            "shield_max": shield_max,
             "energy": float(_value(unit, "energy", 0.0)),
             "status": status,
         }
@@ -927,6 +914,12 @@ def _extract_team_actions(
                 if index >= len(team_observations)
                 else team_observations[index].observation
             )
+            actor_tags = (
+                (int(agent.team_unit_tag_list[index]),)
+                if index < len(getattr(agent, "team_unit_tag_list", ()))
+                and int(agent.team_unit_tag_list[index]) > 0
+                else tuple(int(tag) for tag in team.get("unit_tags", ()) if int(tag) > 0)
+            )
             actions = _available_team_actions(
                 agent,
                 team,
@@ -937,20 +930,16 @@ def _extract_team_actions(
                 action_source_types=action_source_types,
                 rejected_build_world_targets=rejected_build_world_targets,
                 raw_action_mode=raw_action_mode,
-                actor_tags=(
-                    (int(agent.team_unit_tag_list[index]),)
-                    if index < len(getattr(agent, "team_unit_tag_list", ()))
-                    and int(agent.team_unit_tag_list[index]) > 0
-                    else tuple(int(tag) for tag in team.get("unit_tags", ()) if int(tag) > 0)
-                ),
+                actor_tags=actor_tags,
             )
-            teams.append(
-                {
-                    "agent_name": agent_name,
-                    "team_name": str(team_name),
-                    "available_actions": actions,
-                }
-            )
+            team_snapshot: dict[str, Any] = {
+                "agent_name": agent_name,
+                "team_name": str(team_name),
+                "available_actions": actions,
+            }
+            if actor_tags:
+                team_snapshot["unit_tags"] = sorted(set(actor_tags))
+            teams.append(team_snapshot)
     return teams
 
 
@@ -1097,43 +1086,43 @@ def _available_team_actions(
                 continue
         elif required_sources and not required_sources.issubset(owned_unit_types):
             continue
-        argument_candidates = _argument_candidates(
-            observation,
-            action_name,
-            unit_names=unit_names,
-            include_home_minimap=agent.name.startswith("CombatGroup"),
-            builder_tags=(
-                actor_tags if agent.name == "Builder" and build_spec is not None else None
-            ),
-            known_expansion_resources=getattr(
-                agent,
-                "_rtscortex_known_expansion_resources",
-                (),
-            ),
-            excluded_expansion_anchors=getattr(
-                agent,
-                "_rtscortex_suppressed_expansion_anchors",
-                (),
-            ),
-            raw_action_mode=raw_action_mode,
+        argument_candidates: Optional[list[list[Any]]]
+        screen_provenance: list[Any]
+        raw_placement = (
+            getattr(agent, "_rtscortex_raw_placement_service", None)
+            if raw_action_mode and build_spec is not None
+            else None
         )
-        if (
-            raw_action_mode
-            and agent.name == "Builder"
-            and build_spec is not None
-            and build_spec.placement_kind == "screen"
-            and argument_candidates
-        ):
-            rejected = getattr(agent, "_rtscortex_rejected_build_positions", {}).get(
-                action_name, set()
+        if isinstance(raw_placement, RawPlacementService):
+            placement_candidates = raw_placement.candidates(
+                observation,
+                action_name,
+                builder_tags=actor_tags if agent.name == "Builder" else (),
             )
-            argument_candidates = [
-                values
-                for values in argument_candidates
-                if values
-                and isinstance(values[0], (list, tuple))
-                and tuple(int(coordinate) for coordinate in values[0]) not in rejected
-            ]
+            argument_candidates = placement_candidates.argument_candidates
+            screen_provenance = placement_candidates.screen_provenance
+        else:
+            argument_candidates = _argument_candidates(
+                observation,
+                action_name,
+                unit_names=unit_names,
+                include_home_minimap=agent.name.startswith("CombatGroup"),
+                builder_tags=(
+                    actor_tags if agent.name == "Builder" and build_spec is not None else None
+                ),
+                known_expansion_resources=getattr(
+                    agent,
+                    "_rtscortex_known_expansion_resources",
+                    (),
+                ),
+                excluded_expansion_anchors=getattr(
+                    agent,
+                    "_rtscortex_suppressed_expansion_anchors",
+                    (),
+                ),
+                raw_action_mode=raw_action_mode,
+            )
+            screen_provenance = []
         if (
             agent.name == "Builder"
             and action_name == "Move_Screen"
@@ -1150,32 +1139,11 @@ def _available_team_actions(
         needs_screen_provenance = action_name in SCREEN_POINT_ACTIONS or (
             build_spec is not None and build_spec.placement_kind == "screen"
         )
-        screen_provenance = (
-            screen_candidate_provenance(
+        if needs_screen_provenance and not screen_provenance:
+            screen_provenance = screen_candidate_provenance(
                 observation,
                 [candidate[0] for candidate in argument_candidates or []],
             )
-            if needs_screen_provenance
-            else []
-        )
-        if (
-            raw_action_mode
-            and build_spec is not None
-            and build_spec.placement_kind == "screen"
-            and screen_provenance
-        ):
-            rejected_world = rejected_build_world_targets.get(action_name, ())
-            quarantine_radius = max(1.5, build_spec.footprint * 0.75)
-            kept = [
-                (candidate, screen_provenance[index])
-                for index, candidate in enumerate(argument_candidates or ())
-                if all(
-                    math.dist(screen_provenance[index].world_target, rejected) > quarantine_radius
-                    for rejected in rejected_world
-                )
-            ]
-            argument_candidates = [candidate for candidate, _ in kept]
-            screen_provenance = [provenance for _, provenance in kept]
         if argument_candidates and needs_screen_provenance and not screen_provenance:
             continue
         if (

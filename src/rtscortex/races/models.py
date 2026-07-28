@@ -35,6 +35,18 @@ class CombatTargetDomain(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class DefenseDoctrine:
+    """Race-specific actions an emergency DefenseAgent may compile."""
+
+    ground_production_actions: tuple[str, ...] = ()
+    anti_air_production_actions: tuple[str, ...] = ()
+    static_defense_actions: tuple[str, ...] = ()
+    anti_air_defense_actions: tuple[str, ...] = ()
+    prerequisite_actions: tuple[str, ...] = ()
+    worker_defense_actions: tuple[str, ...] = ("Attack_Unit",)
+
+
+@dataclass(frozen=True, slots=True)
 class MacroActionMapping:
     semantic_action: str
     runtime_actions: tuple[str, ...]
@@ -54,6 +66,7 @@ class RaceProfileData:
     action_producers: Mapping[str, tuple[str, ...]]
     combat_target_domains: Mapping[str, CombatTargetDomain]
     hima_vocabulary_version: str
+    defense_doctrine: DefenseDoctrine = field(default_factory=DefenseDoctrine)
     structure_saturation_limits: Mapping[str, int] = field(default_factory=dict)
     macro_contract_ready: bool = True
     runtime_mapping_ready: bool = False
@@ -73,9 +86,7 @@ class RaceProfileData:
         if len(self.controller_managed_actions) != len(set(self.controller_managed_actions)):
             raise ValueError(f"{self.race.value} controller-managed actions must be unique")
         mapped_runtime_actions = {
-            action
-            for mapping in self.macro_action_mappings
-            for action in mapping.runtime_actions
+            action for mapping in self.macro_action_mappings for action in mapping.runtime_actions
         }
         unknown_managed_actions = set(self.controller_managed_actions) - mapped_runtime_actions
         if unknown_managed_actions:

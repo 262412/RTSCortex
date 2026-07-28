@@ -10,6 +10,7 @@ from rtscortex_llm_pysc2.inject_effect_verifier import (
 )
 from rtscortex_llm_pysc2.morph import MORPH_SPECS, MorphSpec
 from rtscortex_llm_pysc2.production import PRODUCTION_SPECS, ProductionSpec
+from rtscortex_llm_pysc2.raw_placement import RawPlacementService
 from rtscortex_llm_pysc2.routing import RoutedCommand
 
 from rtscortex.contracts import EffectEvidence
@@ -182,6 +183,38 @@ def test_tracked_build_blocks_auto_worker_management_until_terminal() -> None:
     )
 
     assert verifier.blocks_auto_worker_management is False
+
+
+def test_build_effect_uses_raw_placement_service_target_as_single_authority() -> None:
+    placement_service = RawPlacementService(unit_names={})
+    verifier = ActionEffectVerifier(
+        timeout_game_loops=112,
+        placement_service=placement_service,
+    )
+    command = _build_command()
+    baseline = _observation(game_loop=100, minerals=250)
+    placement_service.resolve(
+        command_id=command.command_id,
+        action_name=command.name,
+        requested_arguments=command.requested_arguments,
+        observation=baseline,
+        world_target=(31.875, 30.0),
+    )
+    verifier.track(command)
+    verifier.prepare(command.command_id, baseline, 0xABC)
+    verifier.accept_primitive(command.command_id, game_loop=104)
+
+    verdicts = verifier.observe(
+        _observation(
+            game_loop=126,
+            minerals=150,
+            structures=["Nexus", "Pylon"],
+        )
+    )
+
+    assert [verdict.success for verdict in verdicts] == [True]
+    assert verdicts[0].evidence is not None
+    assert verdicts[0].evidence["target_position"] == (31.875, 30.0)
 
 
 def test_build_effect_uses_world_target_after_camera_moves() -> None:

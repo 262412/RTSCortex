@@ -363,7 +363,8 @@ class CortexRuntimeEngine(RuntimeEngine):
         ]
         claimed_reflex_actors = frozenset(command.actor for command in raw_reflex)
 
-        tactical_intents = self._tactical.evaluate(observation, assessment)
+        raw_tactical_intents = self._tactical.evaluate(observation, assessment)
+        tactical_intents = self._role_agents.own_tactical_intents(tuple(raw_tactical_intents))
         defense_intents = self._role_agents.propose_defense_intents(
             RoleAgentContext(
                 observation=observation,

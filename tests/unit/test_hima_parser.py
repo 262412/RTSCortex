@@ -73,6 +73,16 @@ def test_parser_reads_official_python_actions_list_and_short_aliases() -> None:
     assert proposal.diagnostics == []
 
 
+def test_parser_normalizes_void_ray_spelling_without_semantic_loss() -> None:
+    proposal = HIMAProposalParser().parse('Actions: ["Void Ray", "VoidRay"]')
+
+    assert [step.canonical_action for step in proposal.steps] == [
+        "TRAIN VOIDRAY",
+        "TRAIN VOIDRAY",
+    ]
+    assert proposal.diagnostics == []
+
+
 def test_parser_reads_official_advice_sequence_without_polluting_rationale() -> None:
     raw = (
         "Reason: **Immediate Steps:** Keep producing workers. "
@@ -163,9 +173,7 @@ def test_parser_retains_valid_counted_prefix_before_malformed_tail() -> None:
     ]
     assert [step.target_count for step in proposal.steps] == [3, 2, None]
     assert [step.ordinal for step in proposal.steps] == [0, 1, 2]
-    assert [item.code for item in proposal.diagnostics] == [
-        "malformed_action_tail_ignored"
-    ]
+    assert [item.code for item in proposal.diagnostics] == ["malformed_action_tail_ignored"]
     assert proposal.diagnostics[0].ordinal == 3
     assert proposal.diagnostics[0].raw_token == "1"
 
@@ -188,9 +196,7 @@ def test_parser_recovers_hima_counted_list_with_object_closer() -> None:
         "TRAIN VOIDRAY",
     ]
     assert [step.target_count for step in proposal.steps] == [3, 8]
-    assert [item.code for item in proposal.diagnostics] == [
-        "malformed_actions_closer_recovered"
-    ]
+    assert [item.code for item in proposal.diagnostics] == ["malformed_actions_closer_recovered"]
 
 
 def test_parser_retains_unknown_token_diagnostic_and_source_ordinal() -> None:

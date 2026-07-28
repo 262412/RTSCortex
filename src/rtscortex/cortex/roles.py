@@ -27,6 +27,8 @@ _DEFENSE_RETRY_COOLDOWN_GAME_LOOPS = 32
 
 @dataclass(slots=True)
 class _DefenseActorState:
+    actor: str
+    action_name: str
     signature: str
     active_until_game_loop: int
     cooldown_until_game_loop: int = 0
@@ -48,6 +50,8 @@ class RoleAgent(Protocol):
 
 class _RoutingRoleAgent:
     provider_mode = "deterministic"
+    agent_id = "routing-role-agent"
+    agent_version = "2.0.0"
 
     def __init__(
         self,
@@ -69,6 +73,13 @@ class _RoutingRoleAgent:
     def accepts(self, intent: CortexIntent) -> bool:
         if intent.source_id == _DEFENSE_AGENT_ID:
             return self.role_id is RoleId.DEFENSE
+        tactical_owner = {
+            OffenseAgent.agent_id: RoleId.OFFENSE,
+            FocusFireAgent.agent_id: RoleId.FOCUS_FIRE,
+            RetreatAgent.agent_id: RoleId.RETREAT,
+        }.get(intent.source_id)
+        if tactical_owner is not None:
+            return self.role_id is tactical_owner
         if isinstance(intent, MacroIntent):
             return self.profile.domain_for_action(intent.action_names[0]) is _domain(self.role_id)
         if isinstance(intent, ReflexIntent):
@@ -98,23 +109,29 @@ class _RoutingRoleAgent:
 
 
 class EconomyAgent(_RoutingRoleAgent):
+    agent_id = "race-brain-economy-agent"
+
     def __init__(self, profile: RaceProfile, adapter: StrategicIntentAdapter) -> None:
         super().__init__(RoleId.ECONOMY, profile, adapter)
 
 
 class TechnologyAgent(_RoutingRoleAgent):
+    agent_id = "race-brain-technology-agent"
+
     def __init__(self, profile: RaceProfile, adapter: StrategicIntentAdapter) -> None:
         super().__init__(RoleId.TECHNOLOGY, profile, adapter)
 
 
 class ProductionAgent(_RoutingRoleAgent):
+    agent_id = "race-brain-production-agent"
+
     def __init__(self, profile: RaceProfile, adapter: StrategicIntentAdapter) -> None:
         super().__init__(RoleId.PRODUCTION, profile, adapter)
 
 
 class DefenseAgent(_RoutingRoleAgent):
     agent_id = _DEFENSE_AGENT_ID
-    agent_version = "1.0.0"
+    agent_version = "2.0.0"
 
     def __init__(self, profile: RaceProfile, adapter: StrategicIntentAdapter) -> None:
         super().__init__(RoleId.DEFENSE, profile, adapter)
@@ -133,6 +150,7 @@ class DefenseAgent(_RoutingRoleAgent):
                         "strategic_alignment": 1.0,
                         "risk": 0.05,
                         "horizon_game_loops": 16,
+                        "mutually_exclusive_groups": ("defense-emergency-response",),
                     }
                 )
                 if intent.source_id == self.agent_id
@@ -162,6 +180,8 @@ class DefenseAgent(_RoutingRoleAgent):
         ):
             return ()
 
+        proposals: list[TacticalIntent] = []
+        claimed = set(claimed_actor_scopes)
         attack_actions = [
             action for action in observation.available_actions if action.name == "Attack_Unit"
         ]
@@ -172,7 +192,7 @@ class DefenseAgent(_RoutingRoleAgent):
         ]
         for action in attack_actions:
             for actor in action.actor_scopes:
-                if actor in claimed_actor_scopes:
+                if actor in claimed:
                     continue
                 targets = attackable_enemies_for_actor(observation, actor)
                 if not targets:
@@ -189,15 +209,17 @@ class DefenseAgent(_RoutingRoleAgent):
                 if not self._may_emit(
                     actor,
                     signature,
+                    action_name="Attack_Unit",
                     game_loop=observation.game_loop,
                 ):
                     continue
                 self._activate_actor(
                     actor,
                     signature,
+                    action_name="Attack_Unit",
                     game_loop=observation.game_loop,
                 )
-                return (
+                proposals.append(
                     self._source_intent(
                         context,
                         actor=actor,
@@ -208,14 +230,15 @@ class DefenseAgent(_RoutingRoleAgent):
                             unit_tag=target.unit_id,
                             unit_type=target.unit_type,
                         ),
-                    ),
+                    )
                 )
+                claimed.add(actor)
 
         for action in observation.available_actions:
             if action.name != "Move_Minimap" or not action.argument_candidates:
                 continue
             for actor in action.actor_scopes:
-                if actor in claimed_actor_scopes:
+                if actor in claimed:
                     continue
                 position = _defensive_minimap_position(
                     observation,
@@ -227,15 +250,17 @@ class DefenseAgent(_RoutingRoleAgent):
                 if not self._may_emit(
                     actor,
                     signature,
+                    action_name="Move_Minimap",
                     game_loop=observation.game_loop,
                 ):
                     continue
                 self._activate_actor(
                     actor,
                     signature,
+                    action_name="Move_Minimap",
                     game_loop=observation.game_loop,
                 )
-                return (
+                proposals.append(
                     self._source_intent(
                         context,
                         actor=actor,
@@ -246,9 +271,163 @@ class DefenseAgent(_RoutingRoleAgent):
                             region="owned_base",
                             position=position,
                         ),
-                    ),
+                    )
                 )
-        return ()
+                claimed.add(actor)
+
+        proposals.extend(
+            self._compile_emergency_strategy(
+                context,
+                claimed_actor_scopes=frozenset(claimed),
+                combat_response_exists=any(
+                    intent.action_names[0] in {"Attack_Unit", "Move_Minimap"}
+                    and not _is_worker_actor(intent.actor_scopes[0], self.profile)
+                    for intent in proposals
+                ),
+            )
+        )
+        return tuple(proposals)
+
+    def _compile_emergency_strategy(
+        self,
+        context: RoleAgentContext,
+        *,
+        claimed_actor_scopes: frozenset[str],
+        combat_response_exists: bool,
+    ) -> list[TacticalIntent]:
+        observation = context.observation
+        doctrine = self.profile.data.defense_doctrine
+        available = {action.name: action for action in observation.available_actions}
+        air_threat = context.situation.visible_enemy_force.air_units > 0
+        production = (
+            doctrine.anti_air_production_actions
+            if air_threat
+            else doctrine.ground_production_actions
+        )
+        static_defense = list(doctrine.static_defense_actions)
+        if air_threat:
+            static_defense = list(
+                dict.fromkeys((*doctrine.anti_air_defense_actions, *static_defense))
+            )
+        categories = (
+            (
+                production,
+                "Produce an immediate anti-air response"
+                if air_threat
+                else "Produce an immediate defensive combat response",
+                IntentTargetKind.PRODUCTION,
+            ),
+            (
+                tuple(static_defense),
+                "Fortify the threatened owned base",
+                IntentTargetKind.DEFENSIVE_REGION,
+            ),
+        )
+        proposals: list[TacticalIntent] = []
+        immediate_action_available = False
+        for action_names, objective, target_kind in categories:
+            for action_name in action_names:
+                action = available.get(action_name)
+                if action is None:
+                    continue
+                actor = next(
+                    (value for value in action.actor_scopes if value not in claimed_actor_scopes),
+                    None,
+                )
+                if actor is None:
+                    continue
+                immediate_action_available = True
+                proposals.append(
+                    self._source_intent(
+                        context,
+                        actor=actor,
+                        action_name=action_name,
+                        objective=objective,
+                        target=IntentTarget(
+                            kind=target_kind,
+                            region="owned_base",
+                            structure_type=(
+                                action_name.removeprefix("Build_").removesuffix("_Screen")
+                                if action_name.startswith("Build_")
+                                else None
+                            ),
+                        ),
+                    )
+                )
+
+        if not immediate_action_available:
+            for action_name in doctrine.prerequisite_actions:
+                action = available.get(action_name)
+                if action is None or not action.actor_scopes:
+                    continue
+                proposals.append(
+                    self._source_intent(
+                        context,
+                        actor=action.actor_scopes[0],
+                        action_name=action_name,
+                        objective=(
+                            "Emergency prerequisite closure for anti-air defense"
+                            if air_threat
+                            else "Emergency prerequisite closure for base defense"
+                        ),
+                        target=IntentTarget(
+                            kind=IntentTargetKind.DEFENSIVE_REGION,
+                            region="owned_base",
+                        ),
+                    )
+                )
+                break
+
+        if context.situation.threat_level is ThreatLevel.CRITICAL and not combat_response_exists:
+            for action_name in doctrine.worker_defense_actions:
+                action = available.get(action_name)
+                if action is None:
+                    continue
+                for actor in action.actor_scopes:
+                    if not _is_worker_actor(actor, self.profile):
+                        continue
+                    candidate_tags = {
+                        str(arguments[0]).casefold()
+                        for arguments in action.argument_candidates or ()
+                        if arguments
+                    }
+                    targets = [
+                        enemy
+                        for enemy in observation.state.visible_enemies
+                        if enemy.health_fraction > 0
+                        and (
+                            enemy.unit_id.casefold() in candidate_tags
+                            or _normalized_tag(enemy.unit_id) in candidate_tags
+                        )
+                    ]
+                    if not targets:
+                        continue
+                    target = min(
+                        targets,
+                        key=lambda enemy: (
+                            _nearest_position_distance(
+                                enemy.position,
+                                _owned_base_positions(observation),
+                            ),
+                            enemy.health_fraction,
+                            enemy.unit_id,
+                        ),
+                    )
+                    proposals.append(
+                        self._source_intent(
+                            context,
+                            actor=actor,
+                            action_name=action_name,
+                            objective="Last-resort worker defense at the threatened mineral line",
+                            target=IntentTarget(
+                                kind=IntentTargetKind.ENEMY,
+                                unit_tag=target.unit_id,
+                                unit_type=target.unit_type,
+                            ),
+                        )
+                    )
+                    return proposals
+        return proposals
 
     def record_execution(
         self,
@@ -259,11 +438,20 @@ class DefenseAgent(_RoutingRoleAgent):
         actor = report.actor
         if actor is None:
             return None
-        state = self._actor_states.get(actor)
+        state_key = next(
+            (
+                key
+                for key, value in self._actor_states.items()
+                if value.actor == actor and value.action_name == report.action_name
+            ),
+            None,
+        )
+        state = None if state_key is None else self._actor_states[state_key]
         if state is None:
             return None
         if report.status is ExecutionStatus.SUCCEEDED:
-            del self._actor_states[actor]
+            assert state_key is not None
+            del self._actor_states[state_key]
             return {
                 "actor": actor,
                 "state": "defense_response_terminal",
@@ -287,9 +475,10 @@ class DefenseAgent(_RoutingRoleAgent):
         actor: str,
         signature: str,
         *,
+        action_name: str,
         game_loop: int,
     ) -> bool:
-        state = self._actor_states.get(actor)
+        state = self._actor_states.get(f"{actor}|{action_name}|{signature}")
         if state is None:
             return True
         if game_loop < state.cooldown_until_game_loop:
@@ -307,9 +496,12 @@ class DefenseAgent(_RoutingRoleAgent):
         actor: str,
         signature: str,
         *,
+        action_name: str,
         game_loop: int,
     ) -> None:
-        self._actor_states[actor] = _DefenseActorState(
+        self._actor_states[f"{actor}|{action_name}|{signature}"] = _DefenseActorState(
+            actor=actor,
+            action_name=action_name,
             signature=signature,
             active_until_game_loop=(game_loop + _DEFENSE_COMMITMENT_GAME_LOOPS),
         )
@@ -347,18 +539,37 @@ class DefenseAgent(_RoutingRoleAgent):
 
 
 class OffenseAgent(_RoutingRoleAgent):
+    agent_id = "deterministic-offense-agent"
+
     def __init__(self, profile: RaceProfile, adapter: StrategicIntentAdapter) -> None:
         super().__init__(RoleId.OFFENSE, profile, adapter)
 
+    def owns(self, intent: TacticalIntent) -> bool:
+        return (
+            "retreat" not in intent.objective.casefold() and intent.action_names[0] != "Attack_Unit"
+        )
+
 
 class FocusFireAgent(_RoutingRoleAgent):
+    agent_id = "deterministic-focus-fire-agent"
+
     def __init__(self, profile: RaceProfile, adapter: StrategicIntentAdapter) -> None:
         super().__init__(RoleId.FOCUS_FIRE, profile, adapter)
 
+    def owns(self, intent: TacticalIntent) -> bool:
+        return (
+            "retreat" not in intent.objective.casefold() and intent.action_names[0] == "Attack_Unit"
+        )
+
 
 class RetreatAgent(_RoutingRoleAgent):
+    agent_id = "deterministic-retreat-agent"
+
     def __init__(self, profile: RaceProfile, adapter: StrategicIntentAdapter) -> None:
         super().__init__(RoleId.RETREAT, profile, adapter)
+
+    def owns(self, intent: TacticalIntent) -> bool:
+        return "retreat" in intent.objective.casefold()
 
 
 class RoleAgentCoordinator:
@@ -366,14 +577,17 @@ class RoleAgentCoordinator:
 
     def __init__(self, profile: RaceProfile, adapter: StrategicIntentAdapter) -> None:
         self.defense_agent = DefenseAgent(profile, adapter)
-        self.agents: tuple[_RoutingRoleAgent, ...] = (
+        self.offense_agent = OffenseAgent(profile, adapter)
+        self.focus_fire_agent = FocusFireAgent(profile, adapter)
+        self.retreat_agent = RetreatAgent(profile, adapter)
+        self.agents: tuple[RoleAgent, ...] = (
             EconomyAgent(profile, adapter),
             TechnologyAgent(profile, adapter),
             ProductionAgent(profile, adapter),
             self.defense_agent,
-            OffenseAgent(profile, adapter),
-            FocusFireAgent(profile, adapter),
-            RetreatAgent(profile, adapter),
+            self.offense_agent,
+            self.focus_fire_agent,
+            self.retreat_agent,
         )
 
     def evaluate(self, context: RoleAgentContext) -> dict[str, StrategicIntent]:
@@ -400,6 +614,35 @@ class RoleAgentCoordinator:
             context,
             claimed_actor_scopes=claimed_actor_scopes,
         )
+
+    def own_tactical_intents(
+        self,
+        intents: tuple[TacticalIntent, ...],
+    ) -> tuple[TacticalIntent, ...]:
+        """Give every tactical proposal one concrete agent owner and lineage."""
+
+        owners = (
+            self.offense_agent,
+            self.focus_fire_agent,
+            self.retreat_agent,
+        )
+        result: list[TacticalIntent] = []
+        for intent in intents:
+            matched = [agent for agent in owners if agent.owns(intent)]
+            if len(matched) != 1:
+                raise RuntimeError(
+                    f"tactical intent requires exactly one role agent owner: {intent.intent_id}"
+                )
+            owner = matched[0]
+            result.append(
+                intent.model_copy(
+                    update={
+                        "source_id": owner.agent_id,
+                        "source_version": owner.agent_version,
+                    }
+                )
+            )
+        return tuple(result)
 
     def record_execution(
         self,
@@ -440,6 +683,27 @@ def _nearest_position_distance(
     return min(
         (position[0] - target[0]) ** 2 + (position[1] - target[1]) ** 2 for target in targets
     )
+
+
+def _owned_base_positions(observation: ObservationEnvelope) -> list[tuple[float, float]]:
+    return [
+        structure.position
+        for structure in observation.state.own_structures
+        if structure.position is not None
+    ]
+
+
+def _is_worker_actor(actor: str, profile: RaceProfile) -> bool:
+    worker = profile.data.worker_type.casefold()
+    normalized = actor.casefold()
+    return normalized.startswith("builder/") or worker in normalized
+
+
+def _normalized_tag(value: str) -> str:
+    try:
+        return hex(int(value, 0))
+    except ValueError:
+        return value.casefold()
 
 
 def _defensive_minimap_position(

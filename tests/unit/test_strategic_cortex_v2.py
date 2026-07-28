@@ -32,7 +32,7 @@ from rtscortex.cortex import (
     StrategicIntentAdapter,
     ThreatLevel,
 )
-from rtscortex.cortex.models import IntentTarget, MacroIntent, ReflexIntent
+from rtscortex.cortex.models import IntentTarget, MacroIntent, ReflexIntent, TacticalIntent
 from rtscortex.playbook import (
     LessonStatus,
     PlaybookCandidateGuard,
@@ -266,7 +266,10 @@ def test_defense_agent_independently_responds_to_a_critical_threat() -> None:
                     name="Attack_Unit",
                     argument_names=["tag"],
                     argument_types=[ActionArgumentType.TAG],
-                    actor_scopes=["CombatGroup0/Zealot-1"],
+                    actor_scopes=[
+                        "CombatGroup0/Zealot-1",
+                        "Builder/Builder-Probe-1",
+                    ],
                     argument_candidates=[["0xe1"]],
                 )
             ],
@@ -303,6 +306,74 @@ def test_defense_agent_independently_responds_to_a_critical_threat() -> None:
     assert strategic.role is RoleId.DEFENSE
     assert strategic.emergency is True
     assert strategic.urgency == 1.0
+
+
+def test_defense_agent_compiles_race_profile_emergency_options_and_resource_claims() -> None:
+    base = _observation(minerals=500, vespene=300)
+    observation = base.model_copy(
+        update={
+            "state": base.state.model_copy(
+                update={
+                    "visible_enemies": [
+                        UnitState(
+                            unit_id="0xe1",
+                            unit_type="Mutalisk",
+                            alliance="enemy",
+                            position=(12, 10),
+                        )
+                    ]
+                }
+            ),
+            "available_actions": [
+                AvailableAction(
+                    name="Train_Phoenix",
+                    actor_scopes=["Developer/Empty"],
+                ),
+                AvailableAction(
+                    name="Train_Stalker",
+                    actor_scopes=["Developer/Empty"],
+                ),
+                AvailableAction(
+                    name="Build_ShieldBattery_Screen",
+                    argument_names=["screen"],
+                    argument_types=[ActionArgumentType.POSITION],
+                    actor_scopes=["Builder/Builder-Probe-1"],
+                    argument_candidates=[[[64, 64]]],
+                ),
+                AvailableAction(
+                    name="Attack_Unit",
+                    argument_names=["tag"],
+                    argument_types=[ActionArgumentType.TAG],
+                    actor_scopes=["Builder/Builder-Probe-1"],
+                    argument_candidates=[["0xe1"]],
+                ),
+            ],
+        }
+    )
+    assessment = (
+        DeterministicSituationAnalyzer()
+        .assess(observation)
+        .model_copy(update={"threat_level": ThreatLevel.CRITICAL, "threat_score": 20.0})
+    )
+    profile = race_profile("protoss")
+    coordinator = RoleAgentCoordinator(profile, StrategicIntentAdapter(profile))
+
+    source_intents = coordinator.propose_defense_intents(
+        RoleAgentContext(observation, assessment, ())
+    )
+    routed = coordinator.evaluate(RoleAgentContext(observation, assessment, source_intents))
+    actions = {intent.action_names[0] for intent in routed.values()}
+
+    assert {"Train_Phoenix", "Train_Stalker", "Build_ShieldBattery_Screen"} <= actions
+    assert "Attack_Unit" in actions
+    phoenix = next(
+        intent for intent in routed.values() if intent.action_names == ("Train_Phoenix",)
+    )
+    assert phoenix.role is RoleId.DEFENSE
+    assert phoenix.emergency is True
+    assert phoenix.resource_claim.minerals == 150
+    assert phoenix.resource_claim.vespene == 100
+    assert phoenix.mutually_exclusive_groups == ("defense-emergency-response",)
 
 
 def test_defense_agent_deduplicates_active_response_and_cools_down_after_failure() -> None:
@@ -437,11 +508,62 @@ def test_zerg_queen_controller_routes_inject_to_economy_and_creep_to_defense() -
             source_intents=intents,
         )
     )
-
     assert routed["inject"].role is RoleId.ECONOMY
     assert routed["creep"].role is RoleId.DEFENSE
     assert routed["inject"].emergency is False
     assert routed["creep"].emergency is False
+
+
+def test_tactical_role_agents_take_single_owner_lineage() -> None:
+    observation = _observation()
+    profile = race_profile("protoss")
+    coordinator = RoleAgentCoordinator(profile, StrategicIntentAdapter(profile))
+    intents = (
+        TacticalIntent(
+            intent_id="attack",
+            run_id=observation.run_id,
+            episode_id=observation.episode_id,
+            step_id=observation.step_id,
+            created_game_loop=observation.game_loop,
+            objective="Focus fire the visible enemy",
+            action_names=["Attack_Unit"],
+            actor_scopes=["CombatGroup0/Zealot-1"],
+            source_id="combined-tactical-policy",
+            source_version="1",
+        ),
+        TacticalIntent(
+            intent_id="advance",
+            run_id=observation.run_id,
+            episode_id=observation.episode_id,
+            step_id=observation.step_id,
+            created_game_loop=observation.game_loop,
+            objective="Advance to the enemy base",
+            action_names=["Move_Minimap"],
+            actor_scopes=["CombatGroup0/Zealot-1"],
+            source_id="combined-tactical-policy",
+            source_version="1",
+        ),
+        TacticalIntent(
+            intent_id="retreat",
+            run_id=observation.run_id,
+            episode_id=observation.episode_id,
+            step_id=observation.step_id,
+            created_game_loop=observation.game_loop,
+            objective="Retreat this actor to safety",
+            action_names=["Move_Minimap"],
+            actor_scopes=["CombatGroup0/Zealot-1"],
+            source_id="combined-tactical-policy",
+            source_version="1",
+        ),
+    )
+
+    owned = coordinator.own_tactical_intents(intents)
+
+    assert [intent.source_id for intent in owned] == [
+        "deterministic-focus-fire-agent",
+        "deterministic-offense-agent",
+        "deterministic-retreat-agent",
+    ]
 
 
 def test_legacy_playbook_migration_is_advisory_and_non_blocking(tmp_path: Path) -> None:

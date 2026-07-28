@@ -94,6 +94,7 @@ def test_vocabulary_resolves_canonical_and_official_short_names() -> None:
     expected = {
         "TRAIN PROBE": "TRAIN PROBE",
         "Probe": "TRAIN PROBE",
+        "Void Ray": "TRAIN VOIDRAY",
         "TRAIN ARCHON": "TRAIN ARCHON",
         "Archon": "TRAIN ARCHON",
         "CyberneticsCore": "BUILD CYBERNETICSCORE",

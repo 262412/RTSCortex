@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import importlib
-import math
 from collections import deque
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -13,6 +12,7 @@ from rtscortex_llm_pysc2.broker import PrimitiveDispatch, SharedDecisionBroker
 from rtscortex_llm_pysc2.coordinator import BridgeDecision
 from rtscortex_llm_pysc2.observation import split_actor
 from rtscortex_llm_pysc2.production import production_spec
+from rtscortex_llm_pysc2.raw_placement import RawPlacementFailure, RawPlacementService
 from rtscortex_llm_pysc2.research import research_spec
 from rtscortex_llm_pysc2.routing import RoutedCommand
 
@@ -57,9 +57,13 @@ class RawActionExecutor:
         broker: SharedDecisionBroker,
         *,
         unit_names: Mapping[int, str],
+        placement_service: Optional[RawPlacementService] = None,
     ) -> None:
         self.broker = broker
         self.unit_names = {int(key): str(value) for key, value in unit_names.items()}
+        self.placement_service = placement_service or RawPlacementService(
+            unit_names=self.unit_names
+        )
         self._commands: deque[RoutedCommand] = deque()
         self._inflight: dict[str, RawDispatch] = {}
 
@@ -119,44 +123,17 @@ class RawActionExecutor:
         *,
         game_loop: int,
     ) -> None:
-        if dispatch.command.name not in _BUILD_RAW_FUNCTIONS:
-            return
-        agent_name, _ = split_actor(dispatch.command.actor)
-        agent = agents.get(agent_name)
-        arguments = dispatch.command.requested_arguments
-        if (
-            agent is not None
-            and dispatch.command.name.endswith("_Screen")
-            and arguments
-            and isinstance(arguments[0], (list, tuple))
-            and len(arguments[0]) == 2
-        ):
-            rejected = getattr(agent, "_rtscortex_rejected_build_positions", None)
-            if not isinstance(rejected, dict):
-                rejected = {}
-                agent._rtscortex_rejected_build_positions = rejected
-            rejected.setdefault(dispatch.command.name, set()).add(
-                (int(arguments[0][0]), int(arguments[0][1]))
-            )
-        if (
-            dispatch.command.name.endswith("_Screen")
-            and dispatch.command.screen_world_target is not None
-        ):
-            self.broker.extractor.suppress_build_world_target(
-                dispatch.command.name,
-                dispatch.command.screen_world_target,
-            )
-        if dispatch.command.name == "Build_Nexus_Near" and arguments:
-            try:
-                anchor = (
-                    int(arguments[0], 0) if isinstance(arguments[0], str) else int(arguments[0])
-                )
-            except (TypeError, ValueError):
-                return
-            self.broker.extractor.suppress_expansion_anchor(
-                anchor,
-                game_loop=game_loop,
-            )
+        del agents, game_loop
+        if dispatch.command.name in _BUILD_RAW_FUNCTIONS:
+            self._quarantine_command(dispatch.command)
+
+    def _quarantine_command(self, command: RoutedCommand) -> None:
+        self.placement_service.quarantine_command(
+            command_id=command.command_id,
+            action_name=command.name,
+            requested_arguments=command.requested_arguments,
+            world_target=command.screen_world_target,
+        )
 
     def next_dispatch(
         self,
@@ -165,6 +142,10 @@ class RawActionExecutor:
     ) -> Optional[RawDispatch]:
         """Return the next executable raw action, terminalizing invalid commands."""
 
+        self.placement_service.observe(
+            observation,
+            require_feature_visibility=False,
+        )
         while self._commands:
             command = self._commands.popleft()
             try:
@@ -172,6 +153,8 @@ class RawActionExecutor:
                 self._inflight[command.command_id] = dispatch
                 return dispatch
             except _RawDispatchFailure as error:
+                if command.name in _BUILD_RAW_FUNCTIONS:
+                    self._quarantine_command(command)
                 failure_dispatch = PrimitiveDispatch(
                     command.command_id,
                     "raw_pre_dispatch",
@@ -242,31 +225,23 @@ class RawActionExecutor:
             _require_actor_tags(name, actor_tags)
             builder_tag = actor_tags[0]
             function = getattr(actions.RAW_FUNCTIONS, _BUILD_RAW_FUNCTIONS[name])
-            if name == "Build_Assimilator_Near":
-                target_tag = _tag_argument(arguments, action_name=name)
-                target = _unit_by_tag(observation, target_tag)
-                if target is None or int(_value(target, "alliance", 0)) != 3:
-                    raise _RawDispatchFailure(
-                        "invalid_geyser_tag",
-                        f"{name} target {hex(target_tag)} is not a visible neutral geyser",
-                    )
-                action = function("now", [builder_tag], target_tag)
-            else:
-                target = (
-                    _expansion_target(
-                        observation,
-                        _tag_argument(arguments, action_name=name),
-                        self.unit_names,
-                    )
-                    if name == "Build_Nexus_Near"
-                    else command.screen_world_target
+            try:
+                placement = self.placement_service.resolve(
+                    command_id=command.command_id,
+                    action_name=name,
+                    requested_arguments=arguments,
+                    observation=observation,
+                    world_target=command.screen_world_target,
+                    preferred_anchor_tag=command.screen_anchor_tag,
+                    builder_tags=actor_tags,
                 )
-                if target is None:
-                    raise _RawDispatchFailure(
-                        "no_legal_placement",
-                        f"{name} has no validated raw placement target",
-                    )
-                raw_target = _raw_point(target)
+            except RawPlacementFailure as error:
+                raise _RawDispatchFailure(error.code, str(error)) from error
+            if name == "Build_Assimilator_Near":
+                assert placement.anchor_tag is not None
+                action = function("now", [builder_tag], placement.anchor_tag)
+            else:
+                raw_target = _raw_point(placement.world_target)
                 action = function("now", [builder_tag], raw_target)
                 resolved_arguments = (raw_target,)
         elif (production := production_spec(name)) is not None:
@@ -427,107 +402,6 @@ def _source_tag(
     return None
 
 
-def _expansion_target(
-    observation: Any,
-    anchor_tag: int,
-    unit_names: Mapping[int, str],
-) -> Optional[tuple[float, float]]:
-    anchor = _unit_by_tag(observation, anchor_tag)
-    if anchor is None or int(_value(anchor, "alliance", 0)) != 3:
-        return None
-    all_resources = [
-        unit
-        for unit in _value(observation, "raw_units", ())
-        if int(_value(unit, "alliance", 0)) == 3 and _is_resource(_unit_name(unit, unit_names))
-    ]
-    resources = [anchor]
-    resource_tags = {anchor_tag}
-    while True:
-        connected = [
-            unit
-            for unit in all_resources
-            if int(_value(unit, "tag", 0)) not in resource_tags
-            and any(
-                math.dist(
-                    (
-                        float(_value(unit, "x", 0.0)),
-                        float(_value(unit, "y", 0.0)),
-                    ),
-                    (
-                        float(_value(existing, "x", 0.0)),
-                        float(_value(existing, "y", 0.0)),
-                    ),
-                )
-                <= 12.0
-                for existing in resources
-            )
-        ]
-        if not connected:
-            break
-        resources.extend(connected)
-        resource_tags.update(int(_value(unit, "tag", 0)) for unit in connected)
-    if sum("mineral" in _unit_name(unit, unit_names).casefold() for unit in resources) < 5:
-        return None
-    center = (
-        sum(float(_value(unit, "x", 0.0)) for unit in resources) / len(resources),
-        sum(float(_value(unit, "y", 0.0)) for unit in resources) / len(resources),
-    )
-    occupied = [
-        unit
-        for unit in _value(observation, "raw_units", ())
-        if int(_value(unit, "alliance", 0)) in {1, 2, 4} and _build_progress(unit) > 0.0
-    ]
-    candidates: list[tuple[float, float, int, int]] = []
-    for y in range(math.floor(center[1] - 12), math.ceil(center[1] + 12) + 1):
-        for x in range(math.floor(center[0] - 12), math.ceil(center[0] + 12) + 1):
-            point = (float(x), float(y))
-            if any(
-                math.dist(
-                    point,
-                    (
-                        float(_value(unit, "x", 0.0)),
-                        float(_value(unit, "y", 0.0)),
-                    ),
-                )
-                < 4.0
-                for unit in occupied
-            ):
-                continue
-            clearance_error = 0.0
-            legal = True
-            for resource in resources:
-                resource_name = _unit_name(resource, unit_names).casefold()
-                distance = math.dist(
-                    point,
-                    (
-                        float(_value(resource, "x", 0.0)),
-                        float(_value(resource, "y", 0.0)),
-                    ),
-                )
-                minimum, ideal, maximum = (
-                    (7.0, 8.5, 10.0)
-                    if "geyser" in resource_name or "vespene" in resource_name
-                    else (6.0, 7.5, 9.0)
-                )
-                if not minimum < distance < maximum:
-                    legal = False
-                    break
-                clearance_error += abs(distance - ideal)
-            if legal:
-                candidates.append(
-                    (
-                        clearance_error,
-                        math.dist(point, center),
-                        x,
-                        y,
-                    )
-                )
-    if not candidates:
-        return None
-    _, _, x, y = min(candidates)
-    return float(x), float(y)
-
-
 def _require_actor_tags(action_name: str, actor_tags: Sequence[int]) -> None:
     if not actor_tags:
         raise _RawDispatchFailure(
@@ -587,11 +461,6 @@ def _unit_name(unit: Any, unit_names: Mapping[int, str]) -> str:
     if isinstance(value, str):
         return value
     return unit_names.get(int(value), f"unit:{int(value)}")
-
-
-def _is_resource(name: str) -> bool:
-    normalized = name.casefold()
-    return "mineral" in normalized or "vespene" in normalized or "geyser" in normalized
 
 
 def _build_progress(unit: Any) -> float:

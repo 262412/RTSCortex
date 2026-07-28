@@ -15,6 +15,7 @@ from rtscortex_llm_pysc2.inject_effect_verifier import InjectEffectVerifier
 from rtscortex_llm_pysc2.morph_effect_verifier import MorphEffectVerifier
 from rtscortex_llm_pysc2.mule_effect_verifier import MuleEffectVerifier
 from rtscortex_llm_pysc2.production_effect_verifier import ProductionEffectVerifier
+from rtscortex_llm_pysc2.raw_placement import RawPlacementService
 from rtscortex_llm_pysc2.research_effect_verifier import ResearchEffectVerifier
 from rtscortex_llm_pysc2.routing import RoutedCommand
 
@@ -99,11 +100,13 @@ class ActionEffectVerifier:
         *,
         timeout_game_loops: int = DEFAULT_ACTION_EFFECT_TIMEOUT_GAME_LOOPS,
         unit_names: Optional[Mapping[int, str]] = None,
+        placement_service: Optional[RawPlacementService] = None,
     ) -> None:
         if timeout_game_loops <= 0:
             raise ValueError("timeout_game_loops must be positive")
         self.timeout_game_loops = timeout_game_loops
         self.unit_names = {int(key): str(value) for key, value in (unit_names or {}).items()}
+        self.placement_service = placement_service
         self._pending: dict[str, _PendingBuild] = {}
         self._pending_moves: dict[str, _PendingMove] = {}
         self._claimed_structure_tags: set[int] = set()
@@ -660,6 +663,13 @@ class ActionEffectVerifier:
         return self.unit_names.get(int(value), f"unit:{int(value)}")
 
     def _resolve_target(self, pending: _PendingBuild, observation: Any) -> None:
+        if self.placement_service is not None:
+            placement = self.placement_service.command_target(pending.command.command_id)
+            if placement is not None:
+                pending.target_position = placement.world_target
+                pending.target_tag = placement.anchor_tag
+                pending.coordinate_space = "world"
+                return
         if pending.command.screen_world_target is not None:
             pending.target_position = (
                 float(pending.command.screen_world_target[0]),
