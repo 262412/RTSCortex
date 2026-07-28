@@ -181,6 +181,10 @@ class MacroPlan(ContractModel):
     adapter_version: str = Field(min_length=1)
     parser_version: str = Field(min_length=1)
     vocabulary_version: str = Field(min_length=1)
+    desired_counts: dict[str, int] = Field(default_factory=dict)
+    strategic_constraints: list[str] = Field(default_factory=list)
+    opaque_future_actions: list[str] = Field(default_factory=list)
+    raw_response_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     raw_proposal: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")
@@ -360,6 +364,8 @@ class CommandLineage(ContractModel):
     """Trace one wire command back to its specialist intent and motor selection."""
 
     command_id: str = Field(min_length=1)
+    operation_id: str | None = Field(default=None, pattern=r"^operation:[0-9a-f]{64}$")
+    attempt_id: str | None = Field(default=None, pattern=r"^attempt:[0-9a-f]{64}$")
     intent_id: str = Field(min_length=1)
     candidate_id: str = Field(pattern=r"^candidate:[0-9a-f]{64}$")
     selection_id: str = Field(pattern=r"^selection:[0-9a-f]{64}$")

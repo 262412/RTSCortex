@@ -25,6 +25,7 @@ from rtscortex.contracts import (
 )
 from rtscortex.contracts.interfaces import LLMProvider
 from rtscortex.cortex import (
+    AttemptKey,
     CandidateCompiler,
     CandidateSelectionStatus,
     CommandLineage,
@@ -33,6 +34,8 @@ from rtscortex.cortex import (
     DeterministicSituationAnalyzer,
     DeterministicTacticalAgent,
     ExecutionAwareTacticalPolicyProvider,
+    ExpansionGoalKey,
+    ExpansionGoalState,
     FastExecutorContext,
     IntentArbiter,
     MacroIntent,
@@ -64,7 +67,7 @@ from rtscortex.cortex.race_brain import (
     RaceBrainStrategicContext,
     selected_hima_response,
 )
-from rtscortex.memory import EventStore
+from rtscortex.memory import EventStore, StoredEvent
 from rtscortex.playbook import (
     CortexPlaybookReviewer,
     LessonStatus,
@@ -103,9 +106,15 @@ from rtscortex.runtime.engine import (
     CommandStatus,
     RuntimeEngine,
 )
+from rtscortex.runtime.validation import (
+    ValidationDisposition,
+    ValidationFailure,
+    ValidationOutcome,
+)
 
 _HIMA_PREVIOUS_ACTION_WINDOW_GAME_LOOPS = int(60 * 22.4)
 _MACRO_REJECTION_RETRY_GAME_LOOPS = 16
+_CORTEX_SNAPSHOT_TYPE = "cortex-engine-v1"
 _RECOVERABLE_EXPANSION_FAILURE_CODES = frozenset(
     {
         "invalid_expansion_anchor",
@@ -248,6 +257,7 @@ class CortexRuntimeEngine(RuntimeEngine):
         self._expansion_exhausted_generation: int | None = None
         self._expansion_scout_visited_waypoints = 0
         self._expansion_scout_total_waypoints = 0
+        self._expansion_goal: ExpansionGoalState | None = None
         if config.cortex.situation.kind == "model_active" and situation_provider is None:
             raise ValueError("model_active Situation requires a SituationProvider")
         if config.cortex.situation.kind == "model_shadow" and shadow_situation_provider is None:
@@ -425,14 +435,31 @@ class CortexRuntimeEngine(RuntimeEngine):
             [*guarded_macro.failures, *guarded_reflex.failures],
             observation,
         )
+        structure_budget = self._apply_structure_budget_guard(
+            [*guarded_macro.accepted, *guarded_reflex.accepted],
+            observation,
+        )
+        rejected_commands.extend(
+            self._apply_validation_failures(structure_budget.failures, observation)
+        )
+        budgeted_macro = [
+            command
+            for command in structure_budget.accepted
+            if command.source is ActionSource.PLANNER
+        ]
+        budgeted_reflex = [
+            command
+            for command in structure_budget.accepted
+            if command.source is ActionSource.REFLEX
+        ]
         (
             available_macro,
             available_reflex,
             busy_actor_rejections,
             busy_actor_candidates,
         ) = self._defer_busy_actor_commands(
-            guarded_macro.accepted,
-            guarded_reflex.accepted,
+            budgeted_macro,
+            budgeted_reflex,
             observation,
         )
         rejected_commands.extend(busy_actor_rejections)
@@ -479,6 +506,11 @@ class CortexRuntimeEngine(RuntimeEngine):
         for command in accepted_commands:
             prepared_command = prepared_by_id[command.command_id]
             self._record_command_lineage(observation, prepared_command)
+            self._role_agents.record_dispatch(
+                command,
+                responsibility=prepared_command.lineage.responsibility,
+                game_loop=observation.game_loop,
+            )
             self._transition_command(command, CommandStatus.DISPATCHED, observation)
             if prepared_command.lineage.source_role is CortexRole.MACRO:
                 plan_id = prepared_command.lineage.macro_plan_id
@@ -552,7 +584,78 @@ class CortexRuntimeEngine(RuntimeEngine):
         for command in batch.commands:
             self._decision_by_command_id[command.command_id] = batch
         self._request_macro_if_exhausted()
+        if self._record_runtime_checkpoint_if_due(observation):
+            self._record_cortex_checkpoint(observation)
         return batch
+
+    def _apply_structure_budget_guard(
+        self,
+        commands: list[ActionCommand],
+        observation: ObservationEnvelope,
+    ) -> ValidationOutcome:
+        accepted: list[ActionCommand] = []
+        failures: list[ValidationFailure] = []
+        current_ids = {command.command_id for command in commands}
+        reserved_by_structure: dict[str, int] = {}
+        for lifecycle in self._command_states.values():
+            if lifecycle.command.command_id in current_ids or lifecycle.status not in {
+                CommandStatus.PENDING,
+                CommandStatus.DEFERRED,
+                CommandStatus.DISPATCHED,
+            }:
+                continue
+            target = self._structure_target_for_action(lifecycle.command.name)
+            if target is not None:
+                reserved_by_structure[target] = reserved_by_structure.get(target, 0) + 1
+        completed_or_constructing: dict[str, int] = {}
+        for structure in observation.state.own_structures:
+            key = structure.unit_type.casefold()
+            completed_or_constructing[key] = completed_or_constructing.get(key, 0) + 1
+        selected_by_structure: dict[str, int] = {}
+        for command in sorted(commands, key=lambda item: (-item.priority, item.command_id)):
+            target = self._structure_target_for_action(command.name)
+            limit = (
+                None
+                if target is None
+                else self._race_profile.data.structure_saturation_limits.get(target)
+            )
+            if target is None or limit is None:
+                accepted.append(command)
+                continue
+            key = target.casefold()
+            effective_count = (
+                completed_or_constructing.get(key, 0)
+                + reserved_by_structure.get(target, 0)
+                + selected_by_structure.get(target, 0)
+            )
+            if effective_count >= limit:
+                failures.append(
+                    ValidationFailure(
+                        command=command,
+                        reason=(
+                            f"global_structure_saturation_limit:{target}:{effective_count}/{limit}"
+                        ),
+                        disposition=ValidationDisposition.OBSOLETE,
+                    )
+                )
+                continue
+            selected_by_structure[target] = selected_by_structure.get(target, 0) + 1
+            accepted.append(command)
+        return ValidationOutcome(
+            accepted=accepted,
+            rejected=[f"{failure.command.command_id}: {failure.reason}" for failure in failures],
+            failures=failures,
+        )
+
+    def _structure_target_for_action(self, action_name: str) -> str | None:
+        return next(
+            (
+                spec.effect_target
+                for spec in self._race_profile.data.progress_action_specs
+                if spec.name == action_name and spec.effect_kind.value == "structure"
+            ),
+            None,
+        )
 
     async def _activate_episode(self, observation: ObservationEnvelope) -> None:
         episode_key = (observation.run_id, observation.episode_id)
@@ -610,6 +713,7 @@ class CortexRuntimeEngine(RuntimeEngine):
         self._expansion_exhausted_generation = None
         self._expansion_scout_visited_waypoints = 0
         self._expansion_scout_total_waypoints = 0
+        self._expansion_goal = None
         self._strategic_agenda = None
         self._strategic_by_legacy_intent = {}
         self._macro_source_observation = None
@@ -633,17 +737,32 @@ class CortexRuntimeEngine(RuntimeEngine):
             )
 
     def _recover_cortex_episode(self, observation: ObservationEnvelope) -> None:
+        checkpoint = self.store.latest_snapshot(
+            observation.run_id,
+            observation.episode_id,
+            _CORTEX_SNAPSHOT_TYPE,
+        )
+        checkpoint_event_id = 0
+        if checkpoint is not None:
+            self._restore_cortex_checkpoint(checkpoint.payload)
+            checkpoint_event_id = checkpoint.through_event_id
+
         plan_event = self.store.last_event(
             observation.run_id,
             observation.episode_id,
             "macro_plan_accepted",
+            after_event_id=checkpoint_event_id,
         )
         if plan_event is not None:
             plan_payload = plan_event.payload.get("plan", plan_event.payload)
             self._macro_plan = MacroPlan.model_validate(plan_payload)
             raw_response = self._macro_plan.raw_proposal
             if raw_response:
-                if "selected" in raw_response:
+                if isinstance(raw_response.get("proposal"), dict):
+                    self._macro_proposal = MacroPolicyProposal.model_validate(
+                        raw_response["proposal"]
+                    )
+                elif "selected" in raw_response:
                     coordinated = RaceBrainProposalResponse.model_validate(raw_response)
                     self._macro_proposal = coordinated.selected.proposal
                 else:
@@ -663,6 +782,7 @@ class CortexRuntimeEngine(RuntimeEngine):
             observation.run_id,
             observation.episode_id,
             "intent_arbitrated",
+            after_event_id=checkpoint_event_id,
         )
         if arbitration_event is not None:
             arbitration_payload = arbitration_event.payload.get("arbitration")
@@ -678,6 +798,7 @@ class CortexRuntimeEngine(RuntimeEngine):
             observation.run_id,
             observation.episode_id,
             "command_lineage",
+            after_event_id=checkpoint_event_id,
         ):
             payload = event.payload
             lineage = CommandLineage.model_validate(payload.get("lineage", payload))
@@ -695,12 +816,34 @@ class CortexRuntimeEngine(RuntimeEngine):
             observation.run_id,
             observation.episode_id,
             "expansion_commitment_started",
+            after_event_id=checkpoint_event_id,
         )
         terminal_commitment = self.store.last_event(
             observation.run_id,
             observation.episode_id,
             "expansion_commitment_terminal",
+            after_event_id=checkpoint_event_id,
         )
+        goal_started = self.store.last_event(
+            observation.run_id,
+            observation.episode_id,
+            "expansion_goal_started",
+            after_event_id=checkpoint_event_id,
+        )
+        goal_terminal = self.store.last_event(
+            observation.run_id,
+            observation.episode_id,
+            "expansion_goal_terminal",
+            after_event_id=checkpoint_event_id,
+        )
+        latest_goal = (
+            goal_terminal
+            if goal_terminal is not None
+            and (goal_started is None or goal_terminal.event_id > goal_started.event_id)
+            else goal_started
+        )
+        if latest_goal is not None:
+            self._expansion_goal = ExpansionGoalState.model_validate(latest_goal.payload)
         if started_commitment is not None and (
             terminal_commitment is None
             or terminal_commitment.event_id < started_commitment.event_id
@@ -719,9 +862,17 @@ class CortexRuntimeEngine(RuntimeEngine):
                     observation.run_id,
                     observation.episode_id,
                     "expansion_anchor_rejected",
+                    after_event_id=max(
+                        checkpoint_event_id,
+                        started_commitment.event_id,
+                    ),
                 )
-                if event.event_id > started_commitment.event_id
             ]
+        elif terminal_commitment is not None:
+            self._expansion_commitment_id = None
+            self._expansion_commitment_started_game_loop = None
+            self._expansion_commitment_generation = None
+            self._expansion_anchor_evaluations = []
         if terminal_commitment is not None and (
             terminal_commitment.payload.get("terminal_state") == "expansion_candidates_exhausted"
         ):
@@ -735,6 +886,7 @@ class CortexRuntimeEngine(RuntimeEngine):
             observation.run_id,
             observation.episode_id,
             "execution",
+            after_event_id=checkpoint_event_id,
         ):
             report = ExecutionReport.model_validate(event.payload)
             recovered_lineage = self._command_lineages.get(report.command_id)
@@ -792,6 +944,138 @@ class CortexRuntimeEngine(RuntimeEngine):
                     MacroStepStatus.DISPATCHED,
                     None,
                 )
+
+    def _record_cortex_checkpoint(self, observation: ObservationEnvelope) -> None:
+        self.store.record_snapshot(
+            run_id=observation.run_id,
+            episode_id=observation.episode_id,
+            snapshot_type=_CORTEX_SNAPSHOT_TYPE,
+            step_id=observation.step_id,
+            payload=self._cortex_checkpoint_payload(observation.game_loop),
+        )
+
+    def _cortex_checkpoint_payload(self, game_loop: int) -> dict[str, Any]:
+        return {
+            "format_version": "1",
+            "game_loop": game_loop,
+            "macro_plan": (
+                None if self._macro_plan is None else self._macro_plan.model_dump(mode="json")
+            ),
+            "macro_proposal": (
+                None
+                if self._macro_proposal is None
+                else self._macro_proposal.model_dump(mode="json")
+            ),
+            "macro_goal": (
+                None if self._macro_goal is None else self._macro_goal.model_dump(mode="json")
+            ),
+            "macro_plan_frozen": self._macro_plan_frozen,
+            "macro_inflight_command_id": self._macro_inflight_command_id,
+            "macro_command_steps": {
+                command_id: [plan_id, semantic_action, ordinal]
+                for command_id, (
+                    plan_id,
+                    semantic_action,
+                    ordinal,
+                ) in self._macro_command_steps.items()
+            },
+            "command_lineages": {
+                command_id: lineage.model_dump(mode="json")
+                for command_id, lineage in self._command_lineages.items()
+            },
+            "previous_hima_actions": [
+                [game_loop, token] for game_loop, token in self._previous_hima_actions
+            ],
+            "expansion": {
+                "commitment_id": self._expansion_commitment_id,
+                "commitment_started_game_loop": (self._expansion_commitment_started_game_loop),
+                "anchor_evaluations": list(self._expansion_anchor_evaluations),
+                "candidates_exhausted": self._expansion_candidates_exhausted,
+                "scout_state": self._expansion_scout_state,
+                "scout_generation": self._expansion_scout_generation,
+                "commitment_generation": self._expansion_commitment_generation,
+                "exhausted_generation": self._expansion_exhausted_generation,
+                "visited_waypoints": self._expansion_scout_visited_waypoints,
+                "total_waypoints": self._expansion_scout_total_waypoints,
+                "goal": (
+                    None
+                    if self._expansion_goal is None
+                    else self._expansion_goal.model_dump(mode="json")
+                ),
+            },
+            "strategic_agenda": (
+                None
+                if self._strategic_agenda is None
+                else self._strategic_agenda.model_dump(mode="json")
+            ),
+            "last_plan_accepted_game_loop": self._last_plan_accepted_game_loop,
+            "macro_outcome_revision": self._macro_outcome_revision,
+            "next_macro_retry_game_loop": self._next_macro_retry_game_loop,
+        }
+
+    def _restore_cortex_checkpoint(self, payload: dict[str, Any]) -> None:
+        if payload.get("format_version") != "1":
+            raise RuntimeError("unsupported Cortex recovery snapshot version")
+        macro_plan = payload.get("macro_plan")
+        self._macro_plan = None if macro_plan is None else MacroPlan.model_validate(macro_plan)
+        macro_proposal = payload.get("macro_proposal")
+        self._macro_proposal = (
+            None if macro_proposal is None else MacroPolicyProposal.model_validate(macro_proposal)
+        )
+        macro_goal = payload.get("macro_goal")
+        self._macro_goal = None if macro_goal is None else GoalSpec.model_validate(macro_goal)
+        self._macro_plan_frozen = bool(payload.get("macro_plan_frozen"))
+        inflight = payload.get("macro_inflight_command_id")
+        self._macro_inflight_command_id = None if inflight is None else str(inflight)
+        self._macro_command_steps = {
+            str(command_id): (
+                str(values[0]),
+                str(values[1]),
+                None if values[2] is None else int(values[2]),
+            )
+            for command_id, values in dict(payload.get("macro_command_steps", {})).items()
+        }
+        self._command_lineages = {
+            str(command_id): CommandLineage.model_validate(lineage)
+            for command_id, lineage in dict(payload.get("command_lineages", {})).items()
+        }
+        self._previous_hima_actions = [
+            (int(item[0]), str(item[1])) for item in payload.get("previous_hima_actions", ())
+        ]
+        expansion = dict(payload.get("expansion", {}))
+        commitment_id = expansion.get("commitment_id")
+        self._expansion_commitment_id = None if commitment_id is None else str(commitment_id)
+        started_loop = expansion.get("commitment_started_game_loop")
+        self._expansion_commitment_started_game_loop = (
+            None if started_loop is None else int(started_loop)
+        )
+        self._expansion_anchor_evaluations = [
+            dict(item) for item in expansion.get("anchor_evaluations", ())
+        ]
+        self._expansion_candidates_exhausted = bool(expansion.get("candidates_exhausted"))
+        self._expansion_scout_state = str(expansion.get("scout_state", "not_discovered_yet"))
+        self._expansion_scout_generation = int(expansion.get("scout_generation", 0))
+        commitment_generation = expansion.get("commitment_generation")
+        self._expansion_commitment_generation = (
+            None if commitment_generation is None else int(commitment_generation)
+        )
+        exhausted_generation = expansion.get("exhausted_generation")
+        self._expansion_exhausted_generation = (
+            None if exhausted_generation is None else int(exhausted_generation)
+        )
+        self._expansion_scout_visited_waypoints = int(expansion.get("visited_waypoints", 0))
+        self._expansion_scout_total_waypoints = int(expansion.get("total_waypoints", 0))
+        expansion_goal = expansion.get("goal")
+        self._expansion_goal = (
+            None if expansion_goal is None else ExpansionGoalState.model_validate(expansion_goal)
+        )
+        agenda = payload.get("strategic_agenda")
+        self._strategic_agenda = None if agenda is None else StrategicAgenda.model_validate(agenda)
+        accepted_loop = payload.get("last_plan_accepted_game_loop")
+        self._last_plan_accepted_game_loop = None if accepted_loop is None else int(accepted_loop)
+        self._macro_outcome_revision = int(payload.get("macro_outcome_revision", 0))
+        retry_loop = payload.get("next_macro_retry_game_loop")
+        self._next_macro_retry_game_loop = None if retry_loop is None else int(retry_loop)
 
     def _announce_specialist_health(self, observation: ObservationEnvelope) -> None:
         episode_key = (observation.run_id, observation.episode_id)
@@ -972,7 +1256,7 @@ class CortexRuntimeEngine(RuntimeEngine):
                             if isinstance(self._macro_health, RaceBrainHealth)
                             else "member_revisions_in_raw_proposal"
                         ),
-                        "raw_proposal": raw,
+                        "raw_response_hash": plan_digest,
                     }
                 )
                 self._record_cortex_event(
@@ -980,14 +1264,15 @@ class CortexRuntimeEngine(RuntimeEngine):
                     "race_brain_coordinated",
                     policy_response,
                 )
+            compact_proposal = MacroPolicyProposal.model_validate(plan.raw_proposal["proposal"])
             frontier = runtime_frontier(
-                response.proposal,
+                compact_proposal,
                 observation,
                 self._recent_hima_actions(observation.game_loop),
                 self._race_profile.data,
             )
             fallback = self._fallback_frontier(
-                response.proposal,
+                compact_proposal,
                 observation,
                 frontier,
             )
@@ -1037,7 +1322,7 @@ class CortexRuntimeEngine(RuntimeEngine):
             )
             self._accept_macro_plan(
                 plan,
-                response.proposal,
+                compact_proposal,
                 goal,
                 observation,
                 latency_ms=latency_ms,
@@ -1435,7 +1720,13 @@ class CortexRuntimeEngine(RuntimeEngine):
         self,
         proposal: MacroPolicyProposal,
     ) -> MacroPolicyProposal:
-        if self._expansion_commitment_id is None or self._expansion_candidates_exhausted:
+        if (
+            self._expansion_commitment_id is None
+            or self._expansion_candidates_exhausted
+            or self._expansion_goal is None
+            or self._expansion_goal.observed_base_count >= self._expansion_goal.desired_base_count
+            or self._expansion_goal.terminal_state is not None
+        ):
             return proposal
         townhall_action = self._semantic_action_for_target(
             self._race_profile.data.townhall_types[0]
@@ -2031,9 +2322,23 @@ class CortexRuntimeEngine(RuntimeEngine):
             selection,
             command_id=resolved_command_id,
         )
+        attempt_id = None
+        if strategic_intent.operation_id is not None:
+            attempt_id = AttemptKey(
+                operation_id=strategic_intent.operation_id,
+                command_id=resolved_command_id,
+            ).attempt_id
+            command = command.model_copy(
+                update={
+                    "operation_id": strategic_intent.operation_id,
+                    "attempt_id": attempt_id,
+                }
+            )
         assert selection.candidate_id is not None
         lineage = CommandLineage(
             command_id=command.command_id,
+            operation_id=strategic_intent.operation_id,
+            attempt_id=attempt_id,
             intent_id=intent.intent_id,
             candidate_id=selection.candidate_id,
             selection_id=selection.selection_id,
@@ -2264,9 +2569,8 @@ class CortexRuntimeEngine(RuntimeEngine):
             RoleId.FOCUS_FIRE.value,
             RoleId.RETREAT.value,
         }
-        if (
-            responsibility in tactical_responsibilities
-            and isinstance(self._tactical, ExecutionAwareTacticalPolicyProvider)
+        if responsibility in tactical_responsibilities and isinstance(
+            self._tactical, ExecutionAwareTacticalPolicyProvider
         ):
             transition = self._tactical.record_execution(
                 report,
@@ -2431,20 +2735,35 @@ class CortexRuntimeEngine(RuntimeEngine):
         proposal: MacroPolicyProposal,
         observation: ObservationEnvelope,
     ) -> None:
+        townhall_action = self._semantic_action_for_target(
+            self._race_profile.data.townhall_types[0]
+        )
+        expansion_steps = [
+            step for step in proposal.steps if step.canonical_action == townhall_action
+        ]
+        if not expansion_steps:
+            return
+        observed_base_count = self._observed_townhall_count(observation)
+        desired_base_count = max(2, max(step.repeat for step in expansion_steps))
+        self._ensure_expansion_goal(
+            observation,
+            desired_base_count=desired_base_count,
+            observed_base_count=observed_base_count,
+        )
+        goal = self._expansion_goal
+        if (
+            goal is None
+            or goal.terminal_state is not None
+            or goal.observed_base_count >= goal.desired_base_count
+            or observation.game_loop < goal.cooldown_until_game_loop
+        ):
+            return
         if self._expansion_commitment_id is not None or (
             self._expansion_exhausted_generation is not None
             and self._expansion_exhausted_generation == self._expansion_scout_generation
         ):
             return
-        townhall_action = self._semantic_action_for_target(
-            self._race_profile.data.townhall_types[0]
-        )
-        if not any(step.canonical_action == townhall_action for step in proposal.steps):
-            return
-        commitment_id = (
-            f"{observation.run_id}:{observation.episode_id}:"
-            f"expansion:g{self._expansion_scout_generation}:{observation.step_id}"
-        )
+        commitment_id = f"{goal.goal_id}:candidate-epoch:{self._expansion_scout_generation}"
         self._expansion_commitment_id = commitment_id
         self._expansion_commitment_generation = self._expansion_scout_generation
         self._expansion_commitment_started_game_loop = observation.game_loop
@@ -2457,6 +2776,7 @@ class CortexRuntimeEngine(RuntimeEngine):
                 "started_game_loop": observation.game_loop,
                 "semantic_action": townhall_action,
                 "generation_id": self._expansion_commitment_generation,
+                "goal": goal.model_dump(mode="json"),
                 "terminal_states": [
                     (
                         "nexus_effect_confirmed"
@@ -2469,10 +2789,97 @@ class CortexRuntimeEngine(RuntimeEngine):
             },
         )
 
+    def _ensure_expansion_goal(
+        self,
+        observation: ObservationEnvelope,
+        *,
+        desired_base_count: int,
+        observed_base_count: int,
+    ) -> None:
+        current = self._expansion_goal
+        if current is not None:
+            current = current.model_copy(update={"observed_base_count": observed_base_count})
+            self._expansion_goal = current
+            if observed_base_count >= current.desired_base_count:
+                self._terminalize_expansion_goal(
+                    observation,
+                    terminal_state="desired_base_count_satisfied",
+                )
+                return
+            if desired_base_count <= current.desired_base_count:
+                return
+            strategic_revision = current.strategic_revision + 1
+        else:
+            strategic_revision = 0
+        key = ExpansionGoalKey(
+            run_id=observation.run_id,
+            episode_id=observation.episode_id,
+            race=self._race_profile.race.value,
+            desired_base_count=desired_base_count,
+            strategic_revision=strategic_revision,
+        )
+        self._expansion_goal = ExpansionGoalState(
+            goal_id=key.goal_id,
+            baseline_base_count=observed_base_count,
+            desired_base_count=desired_base_count,
+            observed_base_count=observed_base_count,
+            strategic_revision=strategic_revision,
+            current_candidate_epoch=self._expansion_scout_generation,
+        )
+        self._record_cortex_event(
+            observation,
+            "expansion_goal_started",
+            self._expansion_goal,
+        )
+
+    def _observed_townhall_count(self, observation: ObservationEnvelope) -> int:
+        townhall_types = set(self._race_profile.data.townhall_types)
+        return sum(
+            structure.unit_type in townhall_types and structure.health_fraction > 0.0
+            for structure in observation.state.own_structures
+        )
+
+    def _terminalize_expansion_goal(
+        self,
+        observation: ObservationEnvelope,
+        *,
+        terminal_state: str,
+    ) -> None:
+        goal = self._expansion_goal
+        if goal is None or goal.terminal_state is not None:
+            return
+        self._expansion_goal = goal.model_copy(update={"terminal_state": terminal_state})
+        self._record_cortex_event(
+            observation,
+            "expansion_goal_terminal",
+            self._expansion_goal,
+        )
+
     def _update_expansion_candidate_state(
         self,
         observation: ObservationEnvelope,
     ) -> None:
+        if self._expansion_goal is not None:
+            observed_base_count = self._observed_townhall_count(observation)
+            self._expansion_goal = self._expansion_goal.model_copy(
+                update={
+                    "observed_base_count": observed_base_count,
+                    "current_candidate_epoch": self._expansion_scout_generation,
+                }
+            )
+            if (
+                observed_base_count >= self._expansion_goal.desired_base_count
+                and self._expansion_goal.terminal_state is None
+            ):
+                if self._expansion_commitment_id is not None:
+                    self._terminate_expansion_commitment(
+                        observation,
+                        terminal_state="desired_base_count_satisfied",
+                    )
+                self._terminalize_expansion_goal(
+                    observation,
+                    terminal_state="desired_base_count_satisfied",
+                )
         previous_state = self._expansion_scout_state
         structured_state = next(
             (
@@ -2566,6 +2973,22 @@ class CortexRuntimeEngine(RuntimeEngine):
                 observation,
                 terminal_state="expansion_candidates_exhausted",
             )
+            if self._expansion_goal is not None:
+                exhausted = tuple(
+                    sorted(
+                        {
+                            *self._expansion_goal.exhausted_candidate_epochs,
+                            self._expansion_scout_generation,
+                        }
+                    )
+                )
+                self._expansion_goal = self._expansion_goal.model_copy(
+                    update={"exhausted_candidate_epochs": exhausted}
+                )
+                self._terminalize_expansion_goal(
+                    observation,
+                    terminal_state="expansion_candidates_exhausted",
+                )
 
     def _record_expansion_anchor_rejection(self, report: ExecutionReport) -> None:
         anchor = next(
@@ -2652,6 +3075,25 @@ class CortexRuntimeEngine(RuntimeEngine):
         self._expansion_commitment_started_game_loop = None
         self._expansion_commitment_generation = None
         self._expansion_anchor_evaluations = []
+        if self._expansion_goal is not None:
+            observed = min(
+                self._expansion_goal.desired_base_count,
+                self._expansion_goal.observed_base_count + 1,
+            )
+            self._expansion_goal = self._expansion_goal.model_copy(
+                update={"observed_base_count": observed}
+            )
+            if observed >= self._expansion_goal.desired_base_count:
+                self._expansion_goal = self._expansion_goal.model_copy(
+                    update={"terminal_state": "desired_base_count_satisfied"}
+                )
+                self.store.append_event(
+                    run_id=report.run_id,
+                    episode_id=report.episode_id,
+                    step_id=report.step_id,
+                    event_type="expansion_goal_terminal",
+                    payload=self._expansion_goal,
+                )
 
     def _recoverable_expansion_failure(self, report: ExecutionReport) -> bool:
         return (
@@ -2869,14 +3311,17 @@ class CortexRuntimeEngine(RuntimeEngine):
             self._expansion_commitment_generation = None
             self._expansion_anchor_evaluations = []
         super().end_episode(result)
-        if already_recorded or self._playbook_reviewer is None:
-            return
-        events = self.store.events_after(
-            result.run_id,
-            0,
-            100_000,
+        self.store.record_snapshot(
+            run_id=result.run_id,
             episode_id=result.episode_id,
+            snapshot_type=_CORTEX_SNAPSHOT_TYPE,
+            step_id=result.steps,
+            payload=self._cortex_checkpoint_payload(result.steps),
         )
+        if already_recorded or self._playbook_reviewer is None:
+            self.store.flush()
+            return
+        events = self._all_episode_events(result.run_id, result.episode_id)
         cases, lessons = self._playbook_reviewer.review_episode(
             events,
             result,
@@ -2940,6 +3385,30 @@ class CortexRuntimeEngine(RuntimeEngine):
                 "playbook_path": str(self._playbook_reviewer.store.database_path),
             },
         )
+        self.store.flush()
+
+    def _all_episode_events(
+        self,
+        run_id: str,
+        episode_id: str,
+        *,
+        page_size: int = 10_000,
+    ) -> list[StoredEvent]:
+        events: list[StoredEvent] = []
+        after_event_id = 0
+        while True:
+            page = self.store.events_after(
+                run_id,
+                after_event_id,
+                page_size,
+                episode_id=episode_id,
+            )
+            if not page:
+                return events
+            events.extend(page)
+            after_event_id = page[-1].event_id
+            if len(page) < page_size:
+                return events
 
     @staticmethod
     def _intent_id(

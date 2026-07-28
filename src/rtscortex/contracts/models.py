@@ -203,6 +203,8 @@ class ObservationEnvelope(ContractModel):
 
 class ActionCommand(ContractModel):
     command_id: str
+    operation_id: str | None = Field(default=None, pattern=r"^operation:[0-9a-f]{64}$")
+    attempt_id: str | None = Field(default=None, pattern=r"^attempt:[0-9a-f]{64}$")
     actor: str
     name: str
     arguments: list[Any] = Field(default_factory=list)
@@ -272,10 +274,16 @@ class EffectEvidence(ContractModel):
     ) = None
     target_type: str | None = None
     target_position: tuple[float, float] | None = None
+    validated_target_position: tuple[float, float] | None = None
+    emitted_target_position: tuple[float, float] | None = None
     target_tag: str | None = None
     actor_tag: str | None = None
     actor_tags: list[str] = Field(default_factory=list)
+    actor_order_bound: bool = False
     builder_tag: str | None = None
+    reservation_id: str | None = None
+    placement_revision: str | None = None
+    baseline_builder_orders: list[int] = Field(default_factory=list)
     requested_producer_tag: str | None = None
     producer_tag: str | None = None
     producer_type: str | None = None
@@ -369,6 +377,8 @@ class ExecutionReport(ContractModel):
     episode_id: str
     step_id: int = Field(ge=0)
     command_id: str
+    operation_id: str | None = Field(default=None, pattern=r"^operation:[0-9a-f]{64}$")
+    attempt_id: str | None = Field(default=None, pattern=r"^attempt:[0-9a-f]{64}$")
     success: bool
     action_name: str | None = None
     actor: str | None = None

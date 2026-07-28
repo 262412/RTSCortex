@@ -21,6 +21,8 @@ class RoutedCommand:
     team_name: str
     name: str
     rendered_action: str
+    operation_id: str | None = None
+    attempt_id: str | None = None
     source: str = "planner"
     requested_arguments: tuple[Any, ...] = ()
     resolved_arguments: tuple[Any, ...] = ()
@@ -28,7 +30,7 @@ class RoutedCommand:
     screen_anchor_tag: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "command_id": self.command_id,
             "actor": self.actor,
             "team_name": self.team_name,
@@ -38,6 +40,15 @@ class RoutedCommand:
             "resolved_arguments": list(self.resolved_arguments),
             "rendered_action": self.rendered_action,
         }
+        if self.operation_id is not None:
+            payload["operation_id"] = self.operation_id
+        if self.attempt_id is not None:
+            payload["attempt_id"] = self.attempt_id
+        if self.screen_world_target is not None:
+            payload["screen_world_target"] = list(self.screen_world_target)
+        if self.screen_anchor_tag is not None:
+            payload["screen_anchor_tag"] = self.screen_anchor_tag
+        return payload
 
 
 @dataclass(frozen=True)
@@ -112,6 +123,14 @@ class ActionRouter:
             commands_by_team[team_name].append(
                 RoutedCommand(
                     command_id=str(command["command_id"]),
+                    operation_id=(
+                        None
+                        if command.get("operation_id") is None
+                        else str(command["operation_id"])
+                    ),
+                    attempt_id=(
+                        None if command.get("attempt_id") is None else str(command["attempt_id"])
+                    ),
                     actor=actor,
                     team_name=team_name,
                     name=name,

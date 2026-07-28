@@ -214,8 +214,9 @@ def test_unsupported_frontier_is_a_runtime_gap_not_a_degraded_member() -> None:
     )
 
     unsupported = next(member for member in response.members if member.cluster == "a")
-    assert unsupported.frontier is not None
-    assert unsupported.frontier.classification.value == "unsupported_by_runtime"
+    assert unsupported.frontier is None
+    assert "no runtime frontier" in unsupported.score_reasons
+    assert unsupported.response.proposal.steps[0].canonical_action == "BUILD ROBOTICSFACILITY"
     assert response.valid_member_count == 3
     assert response.degraded_member_ids == ()
 

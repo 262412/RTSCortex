@@ -287,7 +287,7 @@ def test_transformers_generator_is_lazy_local_only_user_only_and_deterministic(
     assert model.device == "cuda:1"
     assert tokenizer.encoded.device == "cuda:1"
     assert model.generate_kwargs["do_sample"] is False
-    assert model.generate_kwargs["max_new_tokens"] == 2048
+    assert model.generate_kwargs["max_new_tokens"] == 512
     assert generator.model_revision == HIMA_PINNED_REVISIONS["SNUMPR/Protoss-b"]
     assert generator.last_generation_metadata == PolicyGenerationMetadata(
         provider_kind=PolicyProviderKind.HUGGING_FACE_TRANSFORMERS,
@@ -297,7 +297,7 @@ def test_transformers_generator_is_lazy_local_only_user_only_and_deterministic(
         checkpoint_verified=True,
         license_acknowledged=True,
         deterministic=True,
-        max_new_tokens=2048,
+        max_new_tokens=512,
         prompt_token_count=3,
         completion_token_count=2,
         eos_reached=True,

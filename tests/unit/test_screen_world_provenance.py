@@ -125,7 +125,7 @@ def test_screen_movement_relocation_rejects_world_target_outside_current_window(
     assert resolved is None
 
 
-def test_screen_world_target_stays_private_while_route_keeps_provenance() -> None:
+def test_screen_world_target_round_trips_through_route_serialization() -> None:
     snapshot = {
         "run_id": "run",
         "episode_id": "episode",
@@ -222,7 +222,11 @@ def test_screen_world_target_stays_private_while_route_keeps_provenance() -> Non
     assert len(route.commands) == 2
     assert all(command.screen_world_target == (103.0, 53.0) for command in route.commands)
     assert all(command.screen_anchor_tag == 1 for command in route.commands)
-    assert all("screen_world_target" not in command.to_dict() for command in route.commands)
+    assert all(
+        command.to_dict()["screen_world_target"] == [103.0, 53.0]
+        for command in route.commands
+    )
+    assert all(command.to_dict()["screen_anchor_tag"] == 1 for command in route.commands)
 
 
 def test_agent_reprojects_before_current_candidate_domain_check(

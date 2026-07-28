@@ -265,7 +265,11 @@ class ActionEffectVerifier:
             self.mules.prepare(command_id, observation, producer_tag)
             return
         if self.combat.is_tracked(command_id):
-            self.combat.prepare(command_id, observation)
+            self.combat.prepare(
+                command_id,
+                observation,
+                tuple(int(tag) for tag in actor_tags),
+            )
             return
         pending_move = self._pending_moves.get(command_id)
         if pending_move is not None:
@@ -332,6 +336,8 @@ class ActionEffectVerifier:
     def cancel(self, command_id: str) -> None:
         self._pending.pop(command_id, None)
         self._pending_moves.pop(command_id, None)
+        if self.placement_service is not None:
+            self.placement_service.release_command(command_id)
         self.production.cancel(command_id)
         self.addons.cancel(command_id)
         self.morphs.cancel(command_id)
@@ -387,6 +393,7 @@ class ActionEffectVerifier:
                 current,
                 confirmation_kind="new_structure",
             )
+            evidence = self._effect_evidence(pending, current, structure)
             if self.placement_service is not None:
                 self.placement_service.confirm_command(command_id)
             verdicts.append(
@@ -394,7 +401,7 @@ class ActionEffectVerifier:
                     command_id,
                     True,
                     status="succeeded",
-                    evidence=self._effect_evidence(pending, current, structure),
+                    evidence=evidence,
                 )
             )
 
@@ -874,12 +881,30 @@ class ActionEffectVerifier:
         structure: Optional[_StructureEvidence],
     ) -> dict[str, Any]:
         baseline = pending.baseline
+        reservation = (
+            None
+            if self.placement_service is None
+            else self.placement_service.command_target(pending.command.command_id)
+        )
         return {
             "effect_kind": "build",
             "target_type": pending.target_structure,
             "target_position": pending.target_position,
+            "validated_target_position": (
+                None if reservation is None else reservation.world_target
+            ),
+            "emitted_target_position": (
+                None if reservation is None else reservation.world_target
+            ),
             "target_tag": None if pending.target_tag is None else hex(pending.target_tag),
             "builder_tag": None if pending.builder_tag is None else hex(pending.builder_tag),
+            "reservation_id": None if reservation is None else reservation.reservation_id,
+            "placement_revision": (
+                None if reservation is None else reservation.placement_revision
+            ),
+            "baseline_builder_orders": (
+                [] if reservation is None else list(reservation.baseline_builder_orders)
+            ),
             "baseline_structure_tags": (
                 [] if baseline is None else [hex(item.tag) for item in baseline.structures]
             ),

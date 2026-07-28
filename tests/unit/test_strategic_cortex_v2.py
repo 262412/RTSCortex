@@ -18,12 +18,14 @@ from rtscortex.contracts import (
     UnitState,
 )
 from rtscortex.cortex import (
+    AttemptKey,
     CandidateFeatures,
     DeterministicSituationAnalyzer,
     ExecutableCandidate,
     GamePhase,
     IntentArbiter,
     IntentDecisionStatus,
+    OperationKey,
     ResourceClaim,
     RoleAgentContext,
     RoleAgentCoordinator,
@@ -184,6 +186,29 @@ def test_situation_v2_keeps_unobserved_map_facts_unknown() -> None:
     assert assessment.scouting.enemy_visible is False
     assert assessment.information_gaps == ["enemy_force_not_visible"]
     assert all(fact.source and 0 <= fact.confidence <= 1 for fact in assessment.facts)
+
+
+def test_operation_identity_survives_ticks_while_attempt_identity_remains_unique() -> None:
+    operation = OperationKey(
+        run_id="run",
+        episode_id="episode",
+        role="offense",
+        action_family="Attack_Unit",
+        semantic_actor="CombatGroup1/Zealot-1",
+        target_key="enemy:0xbeef",
+    )
+
+    first_attempt = AttemptKey(
+        operation_id=operation.operation_id,
+        command_id="command-at-step-10",
+    )
+    second_attempt = AttemptKey(
+        operation_id=operation.operation_id,
+        command_id="command-at-step-11",
+    )
+
+    assert first_attempt.operation_id == second_attempt.operation_id
+    assert first_attempt.attempt_id != second_attempt.attempt_id
 
 
 def test_intent_arbiter_conserves_decisions_and_resources() -> None:
@@ -431,10 +456,11 @@ def test_defense_agent_deduplicates_active_response_and_cools_down_after_failure
             step_id=3,
             command_id="defense-command",
             success=False,
-            action_name="Attack_Unit",
-            actor="CombatGroup0/Zealot-1",
-            source=ActionSource.REFLEX,
-            status=ExecutionStatus.FAILED,
+                action_name="Attack_Unit",
+                actor="CombatGroup0/Zealot-1",
+                source=ActionSource.REFLEX,
+                requested_arguments=["0xe1"],
+                status=ExecutionStatus.FAILED,
             execution_stage=ExecutionStage.EFFECT_VERIFICATION,
             failure_code="effect_timeout",
         ),
@@ -513,10 +539,11 @@ def test_defense_agent_keeps_successful_response_holding_until_threat_clears() -
             step_id=2,
             command_id="successful-defense-move",
             success=True,
-            action_name="Move_Minimap",
-            actor=actor,
-            source=ActionSource.REFLEX,
-            status=ExecutionStatus.SUCCEEDED,
+                action_name="Move_Minimap",
+                actor=actor,
+                source=ActionSource.REFLEX,
+                requested_arguments=[[12, 12]],
+                status=ExecutionStatus.SUCCEEDED,
             execution_stage=ExecutionStage.EFFECT_VERIFICATION,
         ),
         responsibility="defense",

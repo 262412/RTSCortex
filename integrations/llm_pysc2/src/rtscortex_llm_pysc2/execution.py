@@ -208,6 +208,8 @@ class ExecutionTracker:
             "episode_id": tracked.route.episode_id,
             "step_id": tracked.route.step_id,
             "command_id": tracked.command.command_id,
+            "operation_id": tracked.command.operation_id,
+            "attempt_id": tracked.command.attempt_id,
             "action_name": tracked.command.name,
             "actor": tracked.command.actor,
             "source": tracked.command.source,

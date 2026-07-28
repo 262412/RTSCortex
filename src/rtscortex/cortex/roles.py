@@ -5,7 +5,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
-from rtscortex.contracts import ExecutionReport, ExecutionStatus, ObservationEnvelope
+from rtscortex.contracts import (
+    ActionCommand,
+    ExecutionReport,
+    ExecutionStatus,
+    ObservationEnvelope,
+)
 from rtscortex.cortex.models import (
     CortexIntent,
     IntentTarget,
@@ -33,6 +38,8 @@ class _DefenseActorState:
     phase: Literal["responding", "holding", "cooldown"]
     active_until_game_loop: int
     cooldown_until_game_loop: int = 0
+    command_id: str | None = None
+    operation_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -308,6 +315,14 @@ class DefenseAgent(_RoutingRoleAgent):
             static_defense = list(
                 dict.fromkeys((*doctrine.anti_air_defense_actions, *static_defense))
             )
+            has_anti_air_source = any(
+                self.profile.data.combat_target_domains.get(unit.unit_type)
+                and self.profile.data.combat_target_domains[unit.unit_type].value
+                in {"air", "both"}
+                for unit in observation.state.own_units
+            ) or any(action_name in available for action_name in production)
+            if not has_anti_air_source:
+                static_defense = []
         categories = (
             (
                 production,
@@ -335,6 +350,14 @@ class DefenseAgent(_RoutingRoleAgent):
                 )
                 if actor is None:
                     continue
+                signature = action_name
+                if not self._may_emit(
+                    actor,
+                    signature,
+                    action_name=action_name,
+                    game_loop=observation.game_loop,
+                ):
+                    continue
                 immediate_action_available = True
                 proposals.append(
                     self._source_intent(
@@ -359,10 +382,18 @@ class DefenseAgent(_RoutingRoleAgent):
                 action = available.get(action_name)
                 if action is None or not action.actor_scopes:
                     continue
+                actor = action.actor_scopes[0]
+                if not self._may_emit(
+                    actor,
+                    action_name,
+                    action_name=action_name,
+                    game_loop=observation.game_loop,
+                ):
+                    continue
                 proposals.append(
                     self._source_intent(
                         context,
-                        actor=action.actor_scopes[0],
+                        actor=actor,
                         action_name=action_name,
                         objective=(
                             "Emergency prerequisite closure for anti-air defense"
@@ -412,6 +443,14 @@ class DefenseAgent(_RoutingRoleAgent):
                             enemy.unit_id,
                         ),
                     )
+                    signature = f"{action_name}:{target.unit_id}"
+                    if not self._may_emit(
+                        actor,
+                        signature,
+                        action_name=action_name,
+                        game_loop=observation.game_loop,
+                    ):
+                        continue
                     proposals.append(
                         self._source_intent(
                             context,
@@ -428,6 +467,23 @@ class DefenseAgent(_RoutingRoleAgent):
                     return proposals
         return proposals
 
+    def record_dispatch(
+        self,
+        command: ActionCommand,
+        *,
+        game_loop: int,
+    ) -> None:
+        signature = _command_signature(command.name, command.arguments)
+        self._activate_actor(
+            command.actor,
+            signature,
+            action_name=command.name,
+            game_loop=game_loop,
+        )
+        state = self._actor_states[f"{command.actor}|{command.name}|{signature}"]
+        state.command_id = command.command_id
+        state.operation_id = command.operation_id
+
     def record_execution(
         self,
         report: ExecutionReport,
@@ -441,7 +497,17 @@ class DefenseAgent(_RoutingRoleAgent):
             (
                 key
                 for key, value in self._actor_states.items()
-                if value.actor == actor and value.action_name == report.action_name
+                if value.command_id == report.command_id
+                or (
+                    value.command_id is None
+                    and value.actor == actor
+                    and value.action_name == report.action_name
+                    and value.signature
+                    == _command_signature(
+                        report.action_name or "",
+                        report.resolved_arguments or report.requested_arguments,
+                    )
+                )
             ),
             None,
         )
@@ -662,6 +728,16 @@ class RoleAgentCoordinator:
             return None
         return self.defense_agent.record_execution(report, game_loop=game_loop)
 
+    def record_dispatch(
+        self,
+        command: ActionCommand,
+        *,
+        responsibility: str | None,
+        game_loop: int,
+    ) -> None:
+        if responsibility == RoleId.DEFENSE.value:
+            self.defense_agent.record_dispatch(command, game_loop=game_loop)
+
 
 def _source_intent_id(intent: StrategicIntent) -> str:
     source = intent.source_intent_id
@@ -715,6 +791,16 @@ def _normalized_tag(value: str) -> str:
         return hex(int(value, 0))
     except ValueError:
         return value.casefold()
+
+
+def _command_signature(action_name: str, arguments: list[object]) -> str:
+    if action_name == "Attack_Unit" and arguments:
+        return f"{action_name}:{arguments[0]}"
+    if action_name == "Move_Minimap" and arguments:
+        position = arguments[0]
+        if isinstance(position, (list, tuple)) and len(position) == 2:
+            return f"{action_name}:{int(position[0])},{int(position[1])}"
+    return action_name
 
 
 def _defensive_minimap_position(

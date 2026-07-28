@@ -57,6 +57,20 @@ class _ActorRetreatState:
     entered_game_loop: int
     last_command_game_loop: int
     cooldown_until_game_loop: int
+    actor_tags: tuple[str, ...]
+    threat_signature: str
+    destination: str = "home"
+    missing_since_game_loop: int | None = None
+    arrival_emitted: bool = False
+
+
+@dataclass(slots=True)
+class _ActorEngagementState:
+    target_tag: str
+    actor_tags: tuple[str, ...]
+    entered_game_loop: int
+    last_command_game_loop: int
+    last_confirmed_game_loop: int | None = None
 
 
 @dataclass(slots=True)
@@ -110,6 +124,7 @@ class DeterministicTacticalAgent:
         target_retry_limit: int = 2,
         target_quarantine_game_loops: int = 112,
         actor_quarantine_game_loops: int = 336,
+        actor_state_grace_game_loops: int = 32,
     ) -> None:
         if target_retry_limit < 1:
             raise ValueError("target_retry_limit must be positive")
@@ -132,8 +147,10 @@ class DeterministicTacticalAgent:
         self.target_retry_limit = target_retry_limit
         self.target_quarantine_game_loops = target_quarantine_game_loops
         self.actor_quarantine_game_loops = actor_quarantine_game_loops
+        self.actor_state_grace_game_loops = actor_state_grace_game_loops
         self._episode_key: tuple[str, str] | None = None
         self._focus_target_by_actor: dict[str, str] = {}
+        self._engagement_by_actor: dict[str, _ActorEngagementState] = {}
         self._target_failures: dict[tuple[str, str], _TargetFailureState] = {}
         self._actor_failures: dict[str, _ActorFailureState] = {}
         self._retreat_by_actor: dict[str, _ActorRetreatState] = {}
@@ -154,6 +171,10 @@ class DeterministicTacticalAgent:
         enemies = living_targetable_enemies(observation.state.visible_enemies)
         current_targets = current_screen_enemy_targets(observation)
         last_known_targets = last_known_enemy_targets(observation)
+        current_target_tags = {_normalize_tag(target.unit_id) for target in current_targets}
+        for actor, active_engagement in tuple(self._engagement_by_actor.items()):
+            if active_engagement.target_tag not in current_target_tags:
+                self._engagement_by_actor.pop(actor, None)
         retreat_intents, retreating_actors = self._retreat_intents(
             observation,
             assessment,
@@ -175,6 +196,23 @@ class DeterministicTacticalAgent:
                     continue
                 target, reacquired = self._focus_target(actor, actor_targets)
                 target_tag = _normalize_tag(target.unit_id)
+                actor_tags = _actor_tags(observation, actor)
+                engagement: _ActorEngagementState | None = self._engagement_by_actor.get(actor)
+                if (
+                    engagement is not None
+                    and engagement.target_tag == target_tag
+                    and engagement.actor_tags == actor_tags
+                ):
+                    # The equivalent RAW attack order remains authoritative until
+                    # the target changes, disappears or execution reports failure.
+                    engaged_actors.add(actor)
+                    continue
+                self._engagement_by_actor[actor] = _ActorEngagementState(
+                    target_tag=target_tag,
+                    actor_tags=actor_tags,
+                    entered_game_loop=observation.game_loop,
+                    last_command_game_loop=observation.game_loop,
+                )
                 previous = self._offense_by_actor.get(actor)
                 self._offense_by_actor[actor] = _ActorOffenseState(
                     phase="engaged",
@@ -252,6 +290,7 @@ class DeterministicTacticalAgent:
                 failure_code=failure_code,
             )
             self._focus_target_by_actor.pop(report.actor, None)
+            self._engagement_by_actor.pop(report.actor, None)
             self._retreat_by_actor.pop(report.actor, None)
             self._offense_by_actor.pop(report.actor, None)
             return {
@@ -284,6 +323,9 @@ class DeterministicTacticalAgent:
         key = (report.actor, target)
         if report.status is ExecutionStatus.SUCCEEDED:
             self._target_failures.pop(key, None)
+            engagement = self._engagement_by_actor.get(report.actor)
+            if engagement is not None and engagement.target_tag == target:
+                engagement.last_confirmed_game_loop = game_loop
             evidence = report.effect_evidence
             if evidence is not None and evidence.confirmation_kind == "target_removed":
                 self._known_enemy_structures.pop(target, None)
@@ -307,6 +349,7 @@ class DeterministicTacticalAgent:
             quarantined_until_game_loop=until,
             failure_code=failure_code,
         )
+        self._engagement_by_actor.pop(report.actor, None)
         if quarantined:
             self._focus_target_by_actor.pop(report.actor, None)
         return {
@@ -331,7 +374,10 @@ class DeterministicTacticalAgent:
             return None
         if report.status is ExecutionStatus.SUCCEEDED:
             if retreat is not None:
+                if retreat.phase == "arrived" and retreat.arrival_emitted:
+                    return None
                 retreat.phase = "arrived"
+                retreat.arrival_emitted = True
                 retreat.cooldown_until_game_loop = max(
                     retreat.cooldown_until_game_loop,
                     game_loop + self.retreat_cooldown_game_loops,
@@ -563,21 +609,32 @@ class DeterministicTacticalAgent:
         available = set(move_actors)
         for actor in tuple(self._retreat_by_actor):
             if actor not in available:
-                # The actor vanished or its move action is no longer available;
-                # its old retreat objective is now obsolete.
-                del self._retreat_by_actor[actor]
+                missing_state = self._retreat_by_actor[actor]
+                if missing_state.missing_since_game_loop is None:
+                    missing_state.missing_since_game_loop = observation.game_loop
+                elif (
+                    observation.game_loop - missing_state.missing_since_game_loop
+                    >= self.actor_state_grace_game_loops
+                ):
+                    del self._retreat_by_actor[actor]
+            else:
+                self._retreat_by_actor[actor].missing_since_game_loop = None
 
         intents: list[TacticalIntent] = []
         retreating: set[str] = set()
         for actor in move_actors:
             units = _units_for_actor(observation, actor)
             if not units:
-                self._retreat_by_actor.pop(actor, None)
                 continue
             actor_durability = _actor_durability(units)
-            state = self._retreat_by_actor.get(actor)
+            state: _ActorRetreatState | None = self._retreat_by_actor.get(actor)
+            actor_tags = _actor_tags(observation, actor)
+            overwhelmed = assessment.threat_level is ThreatLevel.CRITICAL and len(enemies) > len(
+                units
+            )
+            threat_signature = _threat_signature(assessment, enemies)
             recovered = actor_durability >= self.retreat_exit_health_threshold
-            if state is not None and recovered:
+            if state is not None and recovered and not overwhelmed:
                 del self._retreat_by_actor[actor]
                 state = None
 
@@ -587,15 +644,14 @@ class DeterministicTacticalAgent:
                 radius=self.retreat_home_radius,
             )
             if state is not None and at_home:
-                state.phase = "arrived"
+                if state.phase != "arrived":
+                    state.phase = "arrived"
+                    state.arrival_emitted = False
                 state.cooldown_until_game_loop = max(
                     state.cooldown_until_game_loop,
                     observation.game_loop + self.retreat_cooldown_game_loops,
                 )
 
-            overwhelmed = assessment.threat_level is ThreatLevel.CRITICAL and len(enemies) > len(
-                units
-            )
             should_retreat = actor_durability <= self.retreat_health_threshold or overwhelmed
             if not should_retreat:
                 continue
@@ -609,9 +665,21 @@ class DeterministicTacticalAgent:
                         cooldown_until_game_loop=(
                             observation.game_loop + self.retreat_cooldown_game_loops
                         ),
+                        actor_tags=actor_tags,
+                        threat_signature=threat_signature,
                     )
                 continue
-            if state is not None and observation.game_loop < state.cooldown_until_game_loop:
+            same_operation = (
+                state is not None
+                and state.actor_tags == actor_tags
+                and state.threat_signature == threat_signature
+                and state.destination == "home"
+            )
+            if (
+                same_operation
+                and state is not None
+                and observation.game_loop < state.cooldown_until_game_loop
+            ):
                 continue
             if state is None:
                 state = _ActorRetreatState(
@@ -621,11 +689,16 @@ class DeterministicTacticalAgent:
                     cooldown_until_game_loop=(
                         observation.game_loop + self.retreat_cooldown_game_loops
                     ),
+                    actor_tags=actor_tags,
+                    threat_signature=threat_signature,
                 )
                 self._retreat_by_actor[actor] = state
             else:
                 state.phase = "retreating"
                 state.last_command_game_loop = observation.game_loop
+                state.actor_tags = actor_tags
+                state.threat_signature = threat_signature
+                state.arrival_emitted = False
                 state.cooldown_until_game_loop = (
                     observation.game_loop + self.retreat_cooldown_game_loops
                 )
@@ -652,6 +725,7 @@ class DeterministicTacticalAgent:
             return
         self._episode_key = episode_key
         self._focus_target_by_actor.clear()
+        self._engagement_by_actor.clear()
         self._target_failures.clear()
         self._actor_failures.clear()
         self._retreat_by_actor.clear()
@@ -808,6 +882,31 @@ def _units_for_actor(
     if unit_type.casefold() in {"army", "combat", "all"}:
         return combat_units
     return [unit for unit in combat_units if unit.unit_type == unit_type]
+
+
+def _actor_tags(
+    observation: ObservationEnvelope,
+    actor: str,
+) -> tuple[str, ...]:
+    return tuple(
+        sorted({_normalize_tag(unit.unit_id) for unit in _units_for_actor(observation, actor)})
+    )
+
+
+def _threat_signature(
+    assessment: SituationAssessment,
+    enemies: list[UnitState],
+) -> str:
+    payload = "|".join(
+        (
+            assessment.threat_level.value,
+            *sorted(
+                f"{_normalize_tag(enemy.unit_id)}:{enemy.unit_type}"
+                for enemy in enemies
+            ),
+        )
+    )
+    return hashlib.sha256(payload.encode()).hexdigest()
 
 
 def _actor_durability(units: list[UnitState]) -> float:

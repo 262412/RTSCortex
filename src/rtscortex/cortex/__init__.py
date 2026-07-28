@@ -82,6 +82,15 @@ from rtscortex.cortex.models import (
     TacticalIntent,
     ThreatLevel,
 )
+from rtscortex.cortex.operations import (
+    AttemptKey,
+    EngagementKey,
+    ExpansionGoalKey,
+    ExpansionGoalState,
+    OperationKey,
+    PlacementReservationKey,
+    RetreatCommitmentKey,
+)
 from rtscortex.cortex.race_brain import (
     EnsembleSchedule,
     HIMAEnsemblePolicyClient,
@@ -126,6 +135,7 @@ from rtscortex.cortex.tactical import DeterministicTacticalAgent
 
 __all__ = [
     "ArmyReadiness",
+    "AttemptKey",
     "BaseAssessment",
     "CandidateCompilationError",
     "CandidateCompiler",
@@ -145,6 +155,7 @@ __all__ = [
     "EconomyStatus",
     "ExecutionAwareTacticalPolicyProvider",
     "EconomyAgent",
+    "EngagementKey",
     "EnsembleSchedule",
     "ExecutableCandidate",
     "ExecutorCandidateSample",
@@ -160,6 +171,8 @@ __all__ = [
     "ExecutorCorpusSource",
     "ExecutorCorpusVerification",
     "ExecutorSelectionLabel",
+    "ExpansionGoalKey",
+    "ExpansionGoalState",
     "ExecutorSplit",
     "ExecutorTerminalOutcome",
     "FastExecutor",
@@ -188,13 +201,16 @@ __all__ = [
     "ReflexIntent",
     "ResourcePressure",
     "OffenseAgent",
+    "OperationKey",
     "ProductionAgent",
+    "PlacementReservationKey",
     "ResourceClaim",
     "RoleId",
     "RoleAgent",
     "RoleAgentContext",
     "RoleAgentCoordinator",
     "RetreatAgent",
+    "RetreatCommitmentKey",
     "RaceBrainHealth",
     "RaceBrainMemberHealth",
     "RaceBrainMemberProposal",

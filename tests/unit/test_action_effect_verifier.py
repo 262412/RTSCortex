@@ -79,6 +79,36 @@ def test_attack_effect_times_out_when_target_health_does_not_change() -> None:
     assert [verdict.failure_code for verdict in verdicts] == ["combat_effect_not_observed"]
 
 
+def test_one_health_delta_confirms_at_most_one_combat_engagement() -> None:
+    verifier = ActionEffectVerifier(timeout_game_loops=32)
+    first = _attack_command()
+    second = RoutedCommand(
+        command_id="command-attack-2",
+        actor="CombatGroup1/Stalker-1",
+        team_name="Stalker-1",
+        name="Attack_Unit",
+        source="planner",
+        requested_arguments=("0xdef",),
+        resolved_arguments=("0xdef",),
+        rendered_action="<Attack_Unit(0xdef)>",
+    )
+    for command, actor_tag in ((first, 0xA01), (second, 0xA02)):
+        verifier.track(command)
+        verifier.prepare(
+            command.command_id,
+            _attack_observation(100, health=150),
+            None,
+            actor_tags=(actor_tag,),
+        )
+        verifier.accept_primitive(command.command_id, game_loop=104)
+
+    verdicts = verifier.observe(_attack_observation(112, health=125))
+
+    assert [verdict.command_id for verdict in verdicts] == ["command-attack"]
+    assert verifier.is_tracked("command-attack-2") is True
+    assert verifier.observe(_attack_observation(116, health=125)) == []
+
+
 def test_stimpack_research_is_confirmed_by_exact_barracks_order() -> None:
     verifier = ActionEffectVerifier(timeout_game_loops=112)
     command = RoutedCommand(
@@ -214,7 +244,9 @@ def test_build_effect_uses_raw_placement_service_target_as_single_authority() ->
 
     assert [verdict.success for verdict in verdicts] == [True]
     assert verdicts[0].evidence is not None
-    assert verdicts[0].evidence["target_position"] == (31.875, 30.0)
+    assert verdicts[0].evidence["target_position"] == (32.0, 30.0)
+    assert verdicts[0].evidence["validated_target_position"] == (32.0, 30.0)
+    assert verdicts[0].evidence["emitted_target_position"] == (32.0, 30.0)
 
 
 def test_build_effect_uses_world_target_after_camera_moves() -> None:

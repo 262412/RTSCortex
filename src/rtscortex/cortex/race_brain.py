@@ -463,7 +463,10 @@ def _playbook_avoid_actions(
 
 def _member_proposal_is_valid(member: RaceBrainMemberProposal) -> bool:
     if member.frontier is None:
-        return False
+        # A recognized plan can contain only future capabilities that this
+        # Runtime does not own. That is a capability gap, not a degraded model
+        # member. Empty/unparseable proposals remain invalid.
+        return bool(member.response.proposal.steps)
     return member.frontier.classification not in {
         PolicyActionClassification.PARSE_ERROR,
         PolicyActionClassification.ILLEGAL_ACTION,

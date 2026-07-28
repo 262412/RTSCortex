@@ -183,3 +183,55 @@ def test_raw_placement_service_rejects_dispatch_time_relocation(
             preferred_anchor_tag=0xB1,
             builder_tags=(0xB1,),
         )
+
+
+def test_builder_lease_is_exact_and_released_at_terminal() -> None:
+    service = RawPlacementService(unit_names={2: "Probe"})
+    observation = SimpleNamespace(
+        raw_units=[_unit(0xB1, 2, alliance=1, x=20, y=20)],
+        feature_units=[],
+        feature_screen=None,
+        game_loop=[100],
+    )
+
+    first = service.resolve(
+        command_id="build-one",
+        action_name="Build_Pylon_Screen",
+        requested_arguments=([64, 64],),
+        observation=observation,
+        world_target=(22.25, 24.5),
+        builder_tag=0xB1,
+        ability_name="Build_Pylon_pt",
+    )
+
+    assert first.world_target == (22.0, 24.0)
+    assert service.leased_builder_tags == frozenset({0xB1})
+    with pytest.raises(RawPlacementFailure, match="leased"):
+        service.resolve(
+            command_id="build-two",
+            action_name="Build_Pylon_Screen",
+            requested_arguments=([66, 66],),
+            observation=observation,
+            world_target=(24.0, 26.0),
+            builder_tag=0xB1,
+            ability_name="Build_Pylon_pt",
+        )
+
+    service.release_command("build-one")
+
+    assert service.leased_builder_tags == frozenset()
+
+
+def test_permanent_spatial_exclusion_applies_across_building_types() -> None:
+    service = RawPlacementService(unit_names={})
+    service.suppress_world_target(
+        "Build_Pylon_Screen",
+        (22.0, 24.0),
+        reason="not_pathable",
+    )
+
+    assert service.is_quarantined(
+        "Build_Gateway_Screen",
+        (22.0, 24.0),
+        radius=2.0,
+    )

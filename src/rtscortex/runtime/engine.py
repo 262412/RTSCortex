@@ -128,6 +128,16 @@ _ALLOWED_COMMAND_TRANSITIONS = {
 }
 
 _PROGRESS_ACTION_NAMES = frozenset(action.name for action in PROTOSS_SIMPLE64_ACTION_SPECS)
+_RUNTIME_CHECKPOINT_INTERVAL_GAME_LOOPS = 224
+_RUNTIME_SNAPSHOT_TYPE = "runtime-engine-v1"
+
+
+def _optional_int(value: object) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, int | str):
+        return int(value)
+    raise TypeError(f"expected integer-compatible checkpoint value, got {type(value).__name__}")
 
 
 class RuntimeEngine:
@@ -185,6 +195,7 @@ class RuntimeEngine:
         self._last_execution: ExecutionReport | None = None
         self._episode_key: tuple[str, str] | None = None
         self._last_goal_progress_fingerprint: str | None = None
+        self._last_runtime_checkpoint_game_loop: int | None = None
 
     async def start(self) -> None:
         """Prepare optional runtime resources before an episode starts.
@@ -354,6 +365,7 @@ class RuntimeEngine:
         for command in batch.commands:
             self._decision_by_command_id[command.command_id] = batch
         self._request_replan_if_exhausted()
+        self._record_runtime_checkpoint_if_due(observation)
         return batch
 
     def _agent_context(
@@ -646,11 +658,24 @@ class RuntimeEngine:
         self._decision_by_command_id = {}
         self._last_execution = None
         self._last_goal_progress_fingerprint = None
+        self._last_runtime_checkpoint_game_loop = None
+
+        checkpoint = self.store.latest_snapshot(
+            observation.run_id,
+            observation.episode_id,
+            _RUNTIME_SNAPSHOT_TYPE,
+        )
+        checkpoint_event_id = 0
+        if checkpoint is not None:
+            self._restore_runtime_checkpoint(checkpoint.payload)
+            self._last_runtime_checkpoint_game_loop = int(checkpoint.payload["game_loop"])
+            checkpoint_event_id = checkpoint.through_event_id
 
         decision_events = self.store.events_of_type(
             observation.run_id,
             observation.episode_id,
             "decision",
+            after_event_id=checkpoint_event_id,
         )
         for decision_event in decision_events:
             decision = ActionBatch.model_validate(decision_event.payload["batch"])
@@ -661,6 +686,7 @@ class RuntimeEngine:
             observation.run_id,
             observation.episode_id,
             "execution",
+            after_event_id=checkpoint_event_id,
         )
         if execution_event is not None:
             self._last_execution = ExecutionReport.model_validate(execution_event.payload)
@@ -668,6 +694,7 @@ class RuntimeEngine:
             observation.run_id,
             observation.episode_id,
             "episode_result",
+            after_event_id=checkpoint_event_id,
         )
         if episode_result_event is not None:
             recovered_result = EpisodeResult.model_validate(episode_result_event.payload)
@@ -677,6 +704,7 @@ class RuntimeEngine:
             observation.run_id,
             observation.episode_id,
             "planner_started",
+            after_event_id=checkpoint_event_id,
         )
         if planner_started_event is not None:
             self._last_planner_started_game_loop = int(
@@ -687,8 +715,9 @@ class RuntimeEngine:
             observation.run_id,
             observation.episode_id,
             "plan_accepted",
+            after_event_id=checkpoint_event_id,
         )
-        plan_uses_lifecycle_protocol = False
+        plan_uses_lifecycle_protocol = checkpoint is not None
         if plan_event is not None:
             plan_uses_lifecycle_protocol = (
                 plan_event.payload.get("lifecycle_protocol") == CURRENT_PROTOCOL_VERSION
@@ -715,6 +744,7 @@ class RuntimeEngine:
             observation.run_id,
             observation.episode_id,
             "command_lifecycle",
+            after_event_id=checkpoint_event_id,
         )
         for event in lifecycle_events:
             command = ActionCommand.model_validate(event.payload["command"])
@@ -731,6 +761,7 @@ class RuntimeEngine:
             observation.run_id,
             observation.episode_id,
             "execution",
+            after_event_id=checkpoint_event_id,
         ):
             report = ExecutionReport.model_validate(event.payload)
             fingerprint = self._execution_fingerprint(report)
@@ -799,6 +830,160 @@ class RuntimeEngine:
                     reason="legacy runtime state cannot prove command was not dispatched",
                 )
                 self._urgent_replan_requested = True
+
+    def _record_runtime_checkpoint_if_due(
+        self,
+        observation: ObservationEnvelope,
+        *,
+        force: bool = False,
+    ) -> bool:
+        previous = self._last_runtime_checkpoint_game_loop
+        if (
+            not force
+            and previous is not None
+            and observation.game_loop - previous < _RUNTIME_CHECKPOINT_INTERVAL_GAME_LOOPS
+        ):
+            return False
+        self.store.record_snapshot(
+            run_id=observation.run_id,
+            episode_id=observation.episode_id,
+            snapshot_type=_RUNTIME_SNAPSHOT_TYPE,
+            step_id=observation.step_id,
+            payload=self._runtime_checkpoint_payload(observation.game_loop),
+        )
+        self._last_runtime_checkpoint_game_loop = observation.game_loop
+        return True
+
+    def _runtime_checkpoint_payload(self, game_loop: int) -> dict[str, Any]:
+        active_decisions = {
+            command_id: decision.model_dump(mode="json")
+            for command_id, decision in self._decision_by_command_id.items()
+            if (lifecycle := self._command_states.get(command_id)) is not None
+            and lifecycle.status
+            in {
+                CommandStatus.PENDING,
+                CommandStatus.DEFERRED,
+                CommandStatus.DISPATCHED,
+            }
+        }
+        return {
+            "format_version": "1",
+            "game_loop": game_loop,
+            "cached_plan": (
+                None
+                if self._cached_plan is None
+                else {
+                    "strategic_goal": self._cached_plan.strategic_goal,
+                    "summary": self._cached_plan.summary,
+                    "commands": [
+                        command.model_dump(mode="json") for command in self._cached_plan.commands
+                    ],
+                    "source_step_id": self._cached_plan.source_step_id,
+                    "created_game_loop": self._cached_plan.created_game_loop,
+                    "goal_spec": (
+                        None
+                        if self._cached_plan.goal_spec is None
+                        else self._cached_plan.goal_spec.model_dump(mode="json")
+                    ),
+                }
+            ),
+            "last_planner_started_game_loop": self._last_planner_started_game_loop,
+            "last_plan_accepted_game_loop": self._last_plan_accepted_game_loop,
+            "urgent_replan_requested": self._urgent_replan_requested,
+            "last_alerts": list(self._last_alerts),
+            "last_planner_failure": (
+                None if self._last_planner_failure is None else self._last_planner_failure.value
+            ),
+            "command_states": [
+                {
+                    "command": lifecycle.command.model_dump(mode="json"),
+                    "status": lifecycle.status.value,
+                    "reason": lifecycle.reason,
+                }
+                for lifecycle in self._command_states.values()
+            ],
+            "reported_command_reasons": [
+                list(item) for item in sorted(self._reported_command_reasons)
+            ],
+            "terminal_execution_fingerprints": dict(self._terminal_execution_fingerprints),
+            "episode_result_fingerprint": self._episode_result_fingerprint,
+            "last_decision": (
+                None if self._last_decision is None else self._last_decision.model_dump(mode="json")
+            ),
+            "active_decisions": active_decisions,
+            "last_execution": (
+                None
+                if self._last_execution is None
+                else self._last_execution.model_dump(mode="json")
+            ),
+            "last_goal_progress_fingerprint": self._last_goal_progress_fingerprint,
+        }
+
+    def _restore_runtime_checkpoint(self, payload: dict[str, Any]) -> None:
+        if payload.get("format_version") != "1":
+            raise RuntimeError("unsupported Runtime recovery snapshot version")
+        cached_plan = payload.get("cached_plan")
+        if isinstance(cached_plan, dict):
+            goal_payload = cached_plan.get("goal_spec")
+            self._cached_plan = PlanState(
+                strategic_goal=str(cached_plan["strategic_goal"]),
+                summary=str(cached_plan["summary"]),
+                commands=[
+                    ActionCommand.model_validate(command) for command in cached_plan["commands"]
+                ],
+                source_step_id=int(cached_plan["source_step_id"]),
+                created_game_loop=int(cached_plan["created_game_loop"]),
+                goal_spec=(None if goal_payload is None else GoalSpec.model_validate(goal_payload)),
+            )
+        self._last_planner_started_game_loop = _optional_int(
+            payload.get("last_planner_started_game_loop")
+        )
+        self._last_plan_accepted_game_loop = _optional_int(
+            payload.get("last_plan_accepted_game_loop")
+        )
+        self._urgent_replan_requested = bool(payload.get("urgent_replan_requested"))
+        self._last_alerts = tuple(str(alert) for alert in payload.get("last_alerts", ()))
+        planner_failure = payload.get("last_planner_failure")
+        self._last_planner_failure = (
+            None if planner_failure is None else IdleReason(str(planner_failure))
+        )
+        for item in payload.get("command_states", ()):
+            command = ActionCommand.model_validate(item["command"])
+            reason = item.get("reason")
+            self._command_states[command.command_id] = CommandLifecycle(
+                command=command,
+                status=CommandStatus(str(item["status"])),
+                reason=None if reason is None else str(reason),
+            )
+        self._reported_command_reasons = {
+            (str(item[0]), str(item[1])) for item in payload.get("reported_command_reasons", ())
+        }
+        self._terminal_execution_fingerprints = {
+            str(command_id): str(fingerprint)
+            for command_id, fingerprint in dict(
+                payload.get("terminal_execution_fingerprints", {})
+            ).items()
+        }
+        result_fingerprint = payload.get("episode_result_fingerprint")
+        self._episode_result_fingerprint = (
+            None if result_fingerprint is None else str(result_fingerprint)
+        )
+        last_decision = payload.get("last_decision")
+        self._last_decision = (
+            None if last_decision is None else ActionBatch.model_validate(last_decision)
+        )
+        self._decision_by_command_id = {
+            str(command_id): ActionBatch.model_validate(decision)
+            for command_id, decision in dict(payload.get("active_decisions", {})).items()
+        }
+        last_execution = payload.get("last_execution")
+        self._last_execution = (
+            None if last_execution is None else ExecutionReport.model_validate(last_execution)
+        )
+        progress_fingerprint = payload.get("last_goal_progress_fingerprint")
+        self._last_goal_progress_fingerprint = (
+            None if progress_fingerprint is None else str(progress_fingerprint)
+        )
 
     def _accept_plan(self, plan: PlanState, observation: ObservationEnvelope) -> None:
         command_ids = [command.command_id for command in plan.commands]
@@ -1406,6 +1591,16 @@ class RuntimeEngine:
             )
         )
         self._episode_result_fingerprint = fingerprint
+        self.store.record_snapshot(
+            run_id=result.run_id,
+            episode_id=result.episode_id,
+            snapshot_type=_RUNTIME_SNAPSHOT_TYPE,
+            step_id=result.steps,
+            payload=self._runtime_checkpoint_payload(result.steps),
+        )
+        # Episode terminal state is a durability boundary: callers may inspect
+        # or restart immediately after this synchronous method returns.
+        self.store.flush()
 
     @staticmethod
     def _episode_fingerprint(result: EpisodeResult) -> str:

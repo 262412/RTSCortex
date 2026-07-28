@@ -19,10 +19,10 @@ from rtscortex.policy.models import (
     TacticalRationale,
 )
 
-MAX_RAW_OUTPUT_CHARS = 32_768
-MAX_ACTION_ITEMS = 128
+MAX_RAW_OUTPUT_CHARS = 16_384
+MAX_ACTION_ITEMS = 64
 MAX_ACTION_REPEAT = 32
-MAX_EXPANDED_ACTIONS = 256
+MAX_EXPANDED_ACTIONS = 128
 
 _FINAL_SUMMARY_RE = re.compile(r"final\s+actions\s+summary\s*:?", re.IGNORECASE)
 _ADVICE_RE = re.compile(r"so\s+my\s+advice\s+is\s*:?\s*", re.IGNORECASE)

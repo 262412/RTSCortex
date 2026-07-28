@@ -120,7 +120,8 @@ PROTOSS_PROFILE_DATA = RaceProfileData(
             "Train_Stalker",
         ),
         static_defense_actions=("Build_ShieldBattery_Screen",),
-        anti_air_defense_actions=("Build_ShieldBattery_Screen",),
+        # Shield Batteries sustain nearby anti-air units but do not deal damage.
+        anti_air_defense_actions=(),
         prerequisite_actions=(
             "Build_Pylon_Screen",
             "Build_Gateway_Screen",

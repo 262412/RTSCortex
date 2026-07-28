@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from pathlib import Path
 
 from rtscortex.contracts import EpisodeOutcome, EpisodeResult, EpisodeSummary
@@ -115,4 +116,74 @@ def test_event_store_pages_events_and_notifies_best_effort_subscribers(tmp_path:
         payload={},
     )
     assert len(seen) == 4
+    store.close()
+
+
+def test_event_subscriber_can_cross_a_durability_barrier_without_locking_append(
+    tmp_path: Path,
+) -> None:
+    store = EventStore(tmp_path / "events.sqlite3", tmp_path / "events.jsonl")
+    completed = threading.Event()
+
+    def subscriber(event: object) -> None:
+        del event
+        store.flush()
+        completed.set()
+
+    store.subscribe(subscriber)
+    store.append_event(
+        run_id="run",
+        episode_id="episode",
+        step_id=0,
+        event_type="semantic",
+        payload={"value": 1},
+    )
+
+    assert completed.wait(timeout=1)
+    metrics = store.performance_snapshot()
+    assert metrics.enqueued_events == 1
+    assert metrics.written_events == 1
+    store.close()
+
+
+def test_runtime_snapshot_is_ordered_after_events_and_replaced_monotonically(
+    tmp_path: Path,
+) -> None:
+    store = EventStore(tmp_path / "events.sqlite3", tmp_path / "events.jsonl")
+    first = store.append_event(
+        run_id="run",
+        episode_id="episode",
+        step_id=1,
+        event_type="command_lifecycle",
+        payload={"status": "pending"},
+    )
+    snapshot = store.record_snapshot(
+        run_id="run",
+        episode_id="episode",
+        snapshot_type="runtime-test-v1",
+        step_id=1,
+        payload={"state": "pending"},
+    )
+    tail = store.append_event(
+        run_id="run",
+        episode_id="episode",
+        step_id=2,
+        event_type="command_lifecycle",
+        payload={"status": "dispatched"},
+    )
+    store.flush()
+
+    recovered = store.latest_snapshot("run", "episode", "runtime-test-v1")
+    assert recovered == snapshot
+    assert recovered is not None
+    assert recovered.through_event_id == first.event_id
+    assert [
+        event.event_id
+        for event in store.events_of_type(
+            "run",
+            "episode",
+            "command_lifecycle",
+            after_event_id=recovered.through_event_id,
+        )
+    ] == [tail.event_id]
     store.close()

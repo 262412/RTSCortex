@@ -199,7 +199,7 @@ def test_raw_executor_rejects_missing_actor_without_emitting_action() -> None:
     assert broker.settled == [("missing-actor", False)]
 
 
-def test_raw_executor_permanently_quarantines_build_on_pre_dispatch_failure() -> None:
+def test_raw_executor_does_not_quarantine_build_when_builder_is_missing() -> None:
     broker = _Broker()
     executor = RawActionExecutor(cast(Any, broker), unit_names={2: "Probe"})
     command = RoutedCommand(
@@ -222,10 +222,11 @@ def test_raw_executor_permanently_quarantines_build_on_pre_dispatch_failure() ->
         is None
     )
     assert broker.settled == [("missing-builder", False)]
-    assert executor.placement_service.quarantined_targets == {"Build_Pylon_Screen": [(22.25, 24.5)]}
+    assert executor.placement_service.quarantined_targets == {}
+    assert executor.placement_service.active_reservation_count == 0
 
 
-def test_failed_build_effect_quarantines_exact_world_target() -> None:
+def test_failed_build_effect_temporarily_suppresses_emitted_world_target() -> None:
     broker = _Broker()
     executor = RawActionExecutor(cast(Any, broker), unit_names={2: "Probe"})
     command = RoutedCommand(
@@ -253,14 +254,25 @@ def test_failed_build_effect_quarantines_exact_world_target() -> None:
             {
                 "command_id": "build-failed",
                 "status": "failed",
-                "failure_code": "target_not_created",
+                "failure_code": "no_build_start_evidence",
             }
         ],
         agents,
         game_loop=212,
     )
 
-    assert executor.placement_service.quarantined_targets == {"Build_Pylon_Screen": [(22.25, 24.5)]}
+    assert executor.placement_service.is_quarantined(
+        "Build_Pylon_Screen",
+        (22.0, 24.0),
+        radius=1.5,
+        game_loop=212,
+    )
+    assert not executor.placement_service.is_quarantined(
+        "Build_Pylon_Screen",
+        (22.0, 24.0),
+        radius=1.5,
+        game_loop=325,
+    )
 
 
 def test_raw_nexus_uses_resource_clearance_position_not_resource_centroid() -> None:

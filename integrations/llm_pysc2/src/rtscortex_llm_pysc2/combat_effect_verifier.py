@@ -19,6 +19,8 @@ class _PendingCombat:
     latest_game_loop: Optional[int] = None
     baseline_health: Optional[float] = None
     observed_health: Optional[float] = None
+    actor_tags: tuple[int, ...] = ()
+    actor_order_bound: bool = False
 
 
 class CombatEffectVerifier:
@@ -56,8 +58,14 @@ class CombatEffectVerifier:
             raise ValueError("Attack_Unit target must remain an exact tag")
         pending.target_tag = target_tag
 
-    def prepare(self, command_id: str, observation: Any) -> None:
+    def prepare(
+        self,
+        command_id: str,
+        observation: Any,
+        actor_tags: tuple[int, ...] = (),
+    ) -> None:
         pending = self._pending[command_id]
+        pending.actor_tags = tuple(dict.fromkeys(int(tag) for tag in actor_tags if int(tag) > 0))
         target = _unit_by_tag(observation, pending.target_tag)
         pending.dispatched_game_loop = _game_loop(observation)
         pending.latest_game_loop = pending.dispatched_game_loop
@@ -76,28 +84,60 @@ class CombatEffectVerifier:
     def observe(self, observation: Any) -> list[EffectVerdict]:
         game_loop = _game_loop(observation)
         verdicts: list[EffectVerdict] = []
-        for command_id, pending in list(self._pending.items()):
+        claimed_damage_targets: set[int] = set()
+        dead_tags = _dead_unit_tags(observation)
+        ordered_pending = sorted(
+            self._pending.items(),
+            key=lambda item: (
+                item[1].accepted_game_loop
+                if item[1].accepted_game_loop is not None
+                else 2**63 - 1,
+                item[0],
+            ),
+        )
+        for command_id, pending in ordered_pending:
+            if command_id not in self._pending:
+                continue
             if pending.accepted_game_loop is None:
                 continue
             pending.latest_game_loop = game_loop
             target = _unit_by_tag(observation, pending.target_tag)
+            actors = tuple(
+                unit
+                for tag in pending.actor_tags
+                if (unit := _unit_by_tag(observation, tag)) is not None
+            )
+            pending.actor_order_bound = pending.actor_order_bound or any(
+                _unit_targets_tag(actor, pending.target_tag) for actor in actors
+            )
             if target is not None:
                 pending.target_type = pending.target_type or _unit_name(target, self.unit_names)
                 pending.observed_health = _health_pool(target)
-            if (
+            target_removed = pending.target_tag in dead_tags
+            damage_observed = (
                 pending.baseline_health is not None
                 and pending.observed_health is not None
                 and pending.observed_health < pending.baseline_health
+            )
+            if (
+                (target_removed or damage_observed)
+                and pending.target_tag not in claimed_damage_targets
             ):
+                confirmation_kind = "target_removed" if target_removed else "target_damaged"
                 verdicts.append(
                     EffectVerdict(
                         command_id,
                         True,
                         status="succeeded",
-                        evidence=self._evidence(pending, "target_damaged"),
+                        evidence=self._evidence(pending, confirmation_kind),
                     )
                 )
+                claimed_damage_targets.add(pending.target_tag)
                 del self._pending[command_id]
+                if damage_observed and pending.observed_health is not None:
+                    for other in self._pending.values():
+                        if other.target_tag == pending.target_tag:
+                            other.baseline_health = pending.observed_health
                 continue
             elapsed = game_loop - pending.accepted_game_loop
             if elapsed < self.timeout_game_loops:
@@ -181,6 +221,8 @@ class CombatEffectVerifier:
             "baseline_target_health": pending.baseline_health,
             "observed_target_health": pending.observed_health,
             "target_health_delta": delta,
+            "actor_tags": [hex(tag) for tag in pending.actor_tags],
+            "actor_order_bound": pending.actor_order_bound,
             "elapsed_game_loops": elapsed,
             "base_timeout_game_loops": self.timeout_game_loops,
             "effective_timeout_game_loops": self.timeout_game_loops,
@@ -224,6 +266,24 @@ def _unit_name(unit: Any, unit_names: dict[int, str]) -> str:
     if isinstance(value, str):
         return value
     return unit_names.get(int(value), f"unit:{int(value)}")
+
+
+def _unit_targets_tag(unit: Any, target_tag: int) -> bool:
+    for order in _value(unit, "orders", ()):
+        if int(_value(order, "target_unit_tag", 0)) == target_tag:
+            return True
+    for index in range(4):
+        if int(_value(unit, f"order_id_{index}_target_unit_tag", 0)) == target_tag:
+            return True
+    return False
+
+
+def _dead_unit_tags(observation: Any) -> set[int]:
+    direct = _value(observation, "dead_units", ())
+    raw_data = _value(observation, "raw_data", None)
+    event = None if raw_data is None else _value(raw_data, "event", None)
+    values = direct or (() if event is None else _value(event, "dead_units", ()))
+    return {int(tag) for tag in values}
 
 
 def _game_loop(observation: Any) -> int:

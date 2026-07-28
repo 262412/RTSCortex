@@ -80,7 +80,9 @@ def test_macro_plan_projection_is_deterministic_and_preserves_step_semantics() -
     assert first.expires_game_loop == 672
     assert first.source_model_id == "hima-live"
     assert first.source_model_revision == "not_recorded"
-    assert first.raw_proposal["request_id"] == "request-1"
+    assert first.raw_response_hash is not None
+    assert first.raw_proposal["raw_response_hash"] == first.raw_response_hash
+    assert first.raw_proposal["proposal"]["raw_output"] == ""
     assert [step.semantic_action for step in first.steps] == [
         "TRAIN PROBE",
         "BUILD PYLON",
@@ -195,6 +197,26 @@ def test_macro_plan_bounds_long_hima_objective_before_goal_projection() -> None:
     assert goal.strategic_goal == plan.strategic_objective
 
 
+def test_macro_plan_horizon_seconds_bounds_the_executable_prefix() -> None:
+    observation = _pylon_observation()
+    response = _response(
+        "Actions: ['Pylon', 'Gateway', 'Assimilator', 'CyberneticsCore', 'Stargate']"
+    )
+    response = response.model_copy(
+        update={"proposal": response.proposal.model_copy(update={"horizon_seconds": 30})}
+    )
+
+    plan = macro_plan_from_hima(response, observation, ttl_game_loops=448)
+
+    assert [step.semantic_action for step in plan.steps] == ["BUILD PYLON"]
+    assert plan.opaque_future_actions == [
+        "BUILD GATEWAY",
+        "BUILD ASSIMILATOR",
+        "BUILD CYBERNETICSCORE",
+        "BUILD STARGATE",
+    ]
+
+
 def test_runtime_frontier_skips_managed_probe() -> None:
     proposal = _response("Actions: ['Probe', 'Pylon']").proposal
 
@@ -211,16 +233,15 @@ def test_runtime_frontier_skips_managed_probe() -> None:
     assert frontier.is_runtime_frontier
 
 
-def test_runtime_frontier_does_not_skip_unsupported_dependency() -> None:
+def test_runtime_frontier_skips_an_unrelated_unsupported_future_node() -> None:
     proposal = _response("Actions: ['Probe', 'Sentry', 'Pylon']").proposal
 
     frontier = runtime_frontier(proposal, _pylon_observation())
 
     assert frontier is not None
-    assert frontier.source_action == "TRAIN SENTRY"
-    assert frontier.classification is PolicyActionClassification.UNSUPPORTED_BY_RUNTIME
-    assert frontier.reason_code == "not_implemented"
-    assert frontier.runtime_action is None
+    assert frontier.source_action == "BUILD PYLON"
+    assert frontier.classification is PolicyActionClassification.MAPPED_LEGAL_NOW
+    assert frontier.runtime_action == "Build_Pylon_Screen"
     assert frontier.is_runtime_frontier
 
 
@@ -248,8 +269,10 @@ def test_macro_goal_uses_measurable_prefix_and_stops_at_hard_blocker() -> None:
         "Build_Pylon_Screen",
     ]
     assert [item.count for item in goal.requirements] == [1, 2]
-    assert plan.steps[3].status is MacroStepStatus.BLOCKED
-    assert plan.steps[4].semantic_action == "BUILD GATEWAY"
+    sentry = next(step for step in plan.steps if step.semantic_action == "TRAIN SENTRY")
+    gateway = next(step for step in plan.steps if step.semantic_action == "BUILD GATEWAY")
+    assert sentry.status is MacroStepStatus.BLOCKED
+    assert gateway.status is MacroStepStatus.PENDING
 
 
 def test_macro_goal_stops_before_unknown_token_parse_diagnostic() -> None:

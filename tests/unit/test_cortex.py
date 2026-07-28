@@ -300,12 +300,8 @@ def test_retreat_state_is_actor_local_and_cools_down_after_arrival() -> None:
         ("CombatGroup7/Adept-1", "Move_Minimap"),
         ("CombatGroup8/VoidRay-1", "Attack_Unit"),
     }
-    assert [(item.actor_scopes[0], item.action_names[0]) for item in second] == [
-        ("CombatGroup8/VoidRay-1", "Attack_Unit")
-    ]
-    assert [(item.actor_scopes[0], item.action_names[0]) for item in third] == [
-        ("CombatGroup8/VoidRay-1", "Attack_Unit")
-    ]
+    assert second == []
+    assert third == []
 
 
 def test_retreat_uses_exact_actor_membership_and_shield_aware_durability() -> None:
@@ -668,8 +664,8 @@ def test_tactical_agent_quarantines_only_the_unselectable_actor() -> None:
 
     assert transition is not None
     assert transition["state"] == "actor_quarantined"
-    assert [intent.actor_scopes[0] for intent in active] == [actors[1]]
-    assert {intent.actor_scopes[0] for intent in recovered} == set(actors)
+    assert active == []
+    assert [intent.actor_scopes[0] for intent in recovered] == [actors[0]]
 
 
 def test_tactical_agent_attacks_current_screen_structure_when_units_are_last_known() -> None:

@@ -21,21 +21,20 @@ if [[ ! -f "${baseline_source}" ]]; then
   exit 2
 fi
 
-mkdir -p "${run_set_dir}/frozen" "${run_set_dir}/evolving"
+mkdir -p "${run_set_dir}"
 run_set_dir="$(readlink -f "${run_set_dir}")"
 baseline_snapshot="${run_set_dir}/playbook.baseline.sqlite3"
 
 exec 9>"${lock_path}"
 if ! flock -n 9; then
-  echo "another Protoss Playbook paired experiment owns ${lock_path}" >&2
+  echo "another Protoss Playbook experiment owns ${lock_path}" >&2
   exit 1
 fi
 
 if [[ "${baseline_source}" != "${baseline_snapshot}" ]]; then
   cp "${baseline_source}" "${baseline_snapshot}"
 fi
-cp "${frozen_config}" "${run_set_dir}/frozen.config.yaml"
-cp "${evolving_config}" "${run_set_dir}/evolving.config.yaml"
+baseline_sha256="$(sha256sum "${baseline_snapshot}" | awk '{print $1}')"
 
 cd "${repo_dir}"
 git status --short > "${run_set_dir}/source-status.txt"
@@ -44,77 +43,104 @@ git diff --binary > "${run_set_dir}/source.diff"
   echo "started_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "git_head=$(git rev-parse HEAD)"
   echo "git_dirty=$(test -n "$(git status --porcelain)" && echo true || echo false)"
-  echo "baseline_sha256=$(sha256sum "${baseline_snapshot}" | awk '{print $1}')"
-  echo "frozen_config_sha256=$(sha256sum "${frozen_config}" | awk '{print $1}')"
-  echo "evolving_config_sha256=$(sha256sum "${evolving_config}" | awk '{print $1}')"
+  echo "baseline_sha256=${baseline_sha256}"
   echo "seeds=0,1,2"
-  echo "arm_order=frozen,evolving"
+  echo "experiment_modes=independent_paired,sequential_learning"
+  echo "arm_order=counterbalanced_by_seed"
 } > "${run_set_dir}/experiment-metadata.txt"
 
-rm -f \
-  "${evolving_playbook}" \
-  "${evolving_playbook}-shm" \
-  "${evolving_playbook}-wal"
-cp "${baseline_snapshot}" "${evolving_playbook}"
-
-status_file="${run_set_dir}/paired-status.tsv"
-printf "seed\tarm\texit_code\trun_dir\tplaybook_before_sha256\tplaybook_after_sha256\n" \
+status_file="${run_set_dir}/experiment-status.tsv"
+printf "mode\tseed\tarm\tarm_order\texit_code\trun_dir\tplaybook_before_sha256\tplaybook_after_sha256\tplaybook_before_snapshot\tplaybook_after_snapshot\n" \
   > "${status_file}"
 overall_status=0
 
+reset_playbook() {
+  local target="$1"
+  rm -f "${target}" "${target}-shm" "${target}-wal"
+  cp "${baseline_snapshot}" "${target}"
+}
+
+run_arm() {
+  local mode="$1"
+  local seed="$2"
+  local arm="$3"
+  local order="$4"
+  local config working_playbook
+  if [[ "${arm}" == "frozen" ]]; then
+    config="${frozen_config}"
+    working_playbook="${frozen_playbook}"
+  else
+    config="${evolving_config}"
+    working_playbook="${evolving_playbook}"
+  fi
+  local arm_dir="${run_set_dir}/${mode}/${arm}"
+  mkdir -p "${arm_dir}"
+  local before_sha256 log_path run_status run_dir after_sha256 before_snapshot after_snapshot
+  before_sha256="$(sha256sum "${working_playbook}" | awk '{print $1}')"
+  before_snapshot="${arm_dir}/seed-${seed}.before.sqlite3"
+  cp "${working_playbook}" "${before_snapshot}"
+  log_path="${arm_dir}/seed-${seed}.log"
+  set +e
+  SC2PATH="/mnt/scratch/users/tbczhang/StarCraftII" \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    TOKENIZERS_PARALLELISM=false \
+    uv run rtscortex run \
+      --config "${config}" \
+      --seed "${seed}" \
+      --console \
+      --console-port 8765 \
+    2>&1 | tee "${log_path}"
+  run_status=${PIPESTATUS[0]}
+  set -e
+  run_dir="$(sed -n 's/^Run directory: //p' "${log_path}" | tail -n 1)"
+  after_sha256="$(sha256sum "${working_playbook}" | awk '{print $1}')"
+  after_snapshot="${arm_dir}/seed-${seed}.after.sqlite3"
+  cp "${working_playbook}" "${after_snapshot}"
+  printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+    "${mode}" "${seed}" "${arm}" "${order}" "${run_status}" "${run_dir}" \
+    "${before_sha256}" "${after_sha256}" "${before_snapshot}" "${after_snapshot}" \
+    >> "${status_file}"
+  if [[ ${run_status} -ne 0 ]]; then
+    overall_status=1
+  fi
+}
+
+# Experiment A: both arms start every seed from byte-identical baseline state.
 for seed in 0 1 2; do
-  for arm in frozen evolving; do
-    if [[ "${arm}" == "frozen" ]]; then
-      config="${frozen_config}"
-      working_playbook="${frozen_playbook}"
-      rm -f \
-        "${working_playbook}" \
-        "${working_playbook}-shm" \
-        "${working_playbook}-wal"
-      cp "${baseline_snapshot}" "${working_playbook}"
-    else
-      config="${evolving_config}"
-      working_playbook="${evolving_playbook}"
-    fi
-
-    before_sha256="$(sha256sum "${working_playbook}" | awk '{print $1}')"
-    log_path="${run_set_dir}/${arm}/seed-${seed}.log"
-    echo "seed=${seed} arm=${arm} status=starting utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    set +e
-    SC2PATH="/mnt/scratch/users/tbczhang/StarCraftII" \
-      HF_HUB_OFFLINE=1 \
-      TRANSFORMERS_OFFLINE=1 \
-      TOKENIZERS_PARALLELISM=false \
-      uv run rtscortex run \
-        --config "${config}" \
-        --seed "${seed}" \
-        --console \
-        --console-port 8765 \
-      2>&1 | tee "${log_path}"
-    run_status=${PIPESTATUS[0]}
-    set -e
-
-    run_dir="$(sed -n 's/^Run directory: //p' "${log_path}" | tail -n 1)"
-    after_sha256="$(sha256sum "${working_playbook}" | awk '{print $1}')"
-    cp "${working_playbook}" "${run_set_dir}/${arm}/seed-${seed}.playbook.sqlite3"
-    printf "%s\t%s\t%s\t%s\t%s\t%s\n" \
-      "${seed}" \
-      "${arm}" \
-      "${run_status}" \
-      "${run_dir}" \
-      "${before_sha256}" \
-      "${after_sha256}" \
-      >> "${status_file}"
-    echo "seed=${seed} arm=${arm} status=finished exit_code=${run_status} utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    if [[ ${run_status} -ne 0 ]]; then
-      overall_status=1
-    fi
-  done
+  reset_playbook "${frozen_playbook}"
+  reset_playbook "${evolving_playbook}"
+  if (( seed % 2 == 0 )); then
+    order="frozen,evolving"
+  else
+    order="evolving,frozen"
+  fi
+  IFS=',' read -r first second <<< "${order}"
+  run_arm "independent_paired" "${seed}" "${first}" "${order}"
+  run_arm "independent_paired" "${seed}" "${second}" "${order}"
 done
+
+# Experiment B: only evolving deliberately carries evidence across seeds.
+reset_playbook "${evolving_playbook}"
+for seed in 0 1 2; do
+  reset_playbook "${frozen_playbook}"
+  if (( seed % 2 == 0 )); then
+    order="frozen,evolving"
+  else
+    order="evolving,frozen"
+  fi
+  IFS=',' read -r first second <<< "${order}"
+  run_arm "sequential_learning" "${seed}" "${first}" "${order}"
+  run_arm "sequential_learning" "${seed}" "${second}" "${order}"
+done
+
+uv run python scripts/analyze_playbook_experiment.py \
+  "${run_set_dir}" \
+  --baseline-sha256 "${baseline_sha256}"
 
 {
   echo "finished_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "exit_code=${overall_status}"
 } >> "${run_set_dir}/experiment-metadata.txt"
-echo "paired_experiment status=finished exit_code=${overall_status} status_file=${status_file}"
+echo "playbook_experiment status=finished exit_code=${overall_status} report=${run_set_dir}/comparison.json"
 exit "${overall_status}"

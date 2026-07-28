@@ -98,7 +98,12 @@ class RawActionExecutor:
         """Quarantine an exact build candidate after SC2 rejects it."""
 
         self._inflight.pop(dispatch.command.command_id, None)
-        self._quarantine_failed_build(dispatch, agents, game_loop=game_loop)
+        self._quarantine_failed_build(
+            dispatch,
+            agents,
+            game_loop=game_loop,
+            failure_code="pysc2_rejected",
+        )
 
     def observe_reports(
         self,
@@ -112,9 +117,17 @@ class RawActionExecutor:
         for report in reports:
             command_id = str(report.get("command_id", ""))
             dispatch = self._inflight.pop(command_id, None)
-            if dispatch is None or str(report.get("status", "")) != "failed":
+            if dispatch is None:
                 continue
-            self._quarantine_failed_build(dispatch, agents, game_loop=game_loop)
+            if str(report.get("status", "")) == "failed":
+                self._quarantine_failed_build(
+                    dispatch,
+                    agents,
+                    game_loop=game_loop,
+                    failure_code=str(report.get("failure_code") or "effect_failed"),
+                )
+            else:
+                self.placement_service.release_command(command_id)
 
     def _quarantine_failed_build(
         self,
@@ -122,17 +135,30 @@ class RawActionExecutor:
         agents: Mapping[str, Any],
         *,
         game_loop: int,
+        failure_code: str,
     ) -> None:
-        del agents, game_loop
+        del agents
         if dispatch.command.name in _BUILD_RAW_FUNCTIONS:
-            self._quarantine_command(dispatch.command)
+            self._quarantine_command(
+                dispatch.command,
+                failure_code=failure_code,
+                game_loop=game_loop,
+            )
 
-    def _quarantine_command(self, command: RoutedCommand) -> None:
+    def _quarantine_command(
+        self,
+        command: RoutedCommand,
+        *,
+        failure_code: str,
+        game_loop: int,
+    ) -> None:
         self.placement_service.quarantine_command(
             command_id=command.command_id,
             action_name=command.name,
             requested_arguments=command.requested_arguments,
             world_target=command.screen_world_target,
+            failure_code=failure_code,
+            game_loop=game_loop,
         )
 
     def next_dispatch(
@@ -154,7 +180,11 @@ class RawActionExecutor:
                 return dispatch
             except _RawDispatchFailure as error:
                 if command.name in _BUILD_RAW_FUNCTIONS:
-                    self._quarantine_command(command)
+                    self._quarantine_command(
+                        command,
+                        failure_code=error.code,
+                        game_loop=_game_loop(observation),
+                    )
                 failure_dispatch = PrimitiveDispatch(
                     command.command_id,
                     "raw_pre_dispatch",
@@ -222,8 +252,13 @@ class RawActionExecutor:
             function = getattr(actions.RAW_FUNCTIONS, _CONTROL_RAW_FUNCTIONS[name])
             action = function("now", list(actor_tags))
         elif name in _BUILD_RAW_FUNCTIONS:
-            _require_actor_tags(name, actor_tags)
-            builder_tag = actor_tags[0]
+            available_builders = tuple(
+                tag
+                for tag in actor_tags
+                if tag not in self.placement_service.leased_builder_tags
+            )
+            _require_actor_tags(name, available_builders)
+            builder_tag = available_builders[0]
             function = getattr(actions.RAW_FUNCTIONS, _BUILD_RAW_FUNCTIONS[name])
             try:
                 placement = self.placement_service.resolve(
@@ -233,7 +268,10 @@ class RawActionExecutor:
                     observation=observation,
                     world_target=command.screen_world_target,
                     preferred_anchor_tag=command.screen_anchor_tag,
-                    builder_tags=actor_tags,
+                    builder_tags=available_builders,
+                    builder_tag=builder_tag,
+                    operation_id=command.operation_id,
+                    ability_name=_BUILD_RAW_FUNCTIONS[name],
                 )
             except RawPlacementFailure as error:
                 raise _RawDispatchFailure(error.code, str(error)) from error

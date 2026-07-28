@@ -12,6 +12,7 @@ from pydantic import Field, model_validator
 from rtscortex.contracts import ObservationEnvelope
 from rtscortex.contracts.models import ContractModel
 from rtscortex.cortex.models import CortexIntent, MacroIntent, ReflexIntent, TacticalIntent
+from rtscortex.cortex.operations import OperationKey
 from rtscortex.races import ActionDomain, RaceProfile
 
 
@@ -52,6 +53,7 @@ class ResourceClaim(ContractModel):
 class StrategicIntent(ContractModel):
     schema_version: str = "2.0"
     intent_id: str = Field(min_length=1)
+    operation_id: str | None = Field(default=None, pattern=r"^operation:[0-9a-f]{64}$")
     continuity_key: str = Field(min_length=1)
     run_id: str = Field(min_length=1)
     episode_id: str = Field(min_length=1)
@@ -178,11 +180,20 @@ class StrategicIntentAdapter:
         identity = hashlib.sha256(
             f"{intent.intent_id}|{role.value}|strategic-v2".encode()
         ).hexdigest()
+        target_key = _intent_target_key(intent)
+        semantic_actor = ",".join(sorted(intent.actor_scopes)) or "unbound"
+        operation_id = OperationKey(
+            run_id=intent.run_id,
+            episode_id=intent.episode_id,
+            role=role.value,
+            action_family=first_action,
+            semantic_actor=semantic_actor,
+            target_key=target_key,
+        ).operation_id
         return StrategicIntent(
             intent_id=f"strategic:{identity}",
-            continuity_key="|".join(
-                (role.value, first_action, intent.target.kind.value, intent.target.region or "")
-            ),
+            operation_id=operation_id,
+            continuity_key=operation_id,
             run_id=intent.run_id,
             episode_id=intent.episode_id,
             step_id=intent.step_id,
@@ -244,6 +255,18 @@ class StrategicIntentAdapter:
             return RoleId.OFFENSE
         return RoleId.PRODUCTION
 
+
+def _intent_target_key(intent: CortexIntent) -> str:
+    target = intent.target
+    if target.unit_tag is not None:
+        return f"unit:{target.unit_tag.casefold()}"
+    if target.position is not None:
+        return "position:" + ",".join(f"{float(value):.3f}" for value in target.position)
+    if target.structure_type is not None:
+        return f"structure:{target.structure_type.casefold()}:{target.region or 'any'}"
+    if target.unit_type is not None:
+        return f"type:{target.unit_type.casefold()}:{target.region or 'any'}"
+    return f"{target.kind.value}:{target.region or 'global'}"
 
 class IntentArbiter:
     """Select a deterministic feasible set before commands are materialized."""
