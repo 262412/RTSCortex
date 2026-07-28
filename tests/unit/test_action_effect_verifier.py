@@ -278,6 +278,123 @@ def test_target_removal_terminalizes_all_exact_bound_commands_in_engagement() ->
     assert verifier.is_tracked(second.command_id) is False
 
 
+def test_target_death_with_same_frame_order_clear_neutralizes_bound_peers() -> None:
+    verifier = ActionEffectVerifier(timeout_game_loops=32)
+    first = _attack_command()
+    second = _second_attack_command()
+    for command, actor_tag in ((first, 0xA01), (second, 0xA02)):
+        verifier.track(command)
+        verifier.prepare(
+            command.command_id,
+            _attack_observation(100, health=25, actor_tags=(0xA01, 0xA02)),
+            None,
+            actor_tags=(actor_tag,),
+        )
+        verifier.accept_primitive(command.command_id, game_loop=104)
+    assert verifier.observe(_attack_observation(108, health=25, actor_tags=(0xA01, 0xA02))) == []
+
+    verdicts = verifier.observe(
+        _attack_observation(
+            112,
+            health=None,
+            actor_order_target=None,
+            actor_tags=(0xA01, 0xA02),
+            dead_tags=(0xDEF,),
+        )
+    )
+
+    assert [(verdict.command_id, verdict.status) for verdict in verdicts] == [
+        ("command-attack", "succeeded"),
+        ("command-attack-2", "cancelled"),
+    ]
+    assert verdicts[1].failure_code == "engagement_target_eliminated"
+    assert verdicts[1].evidence is not None
+    assert verdicts[1].evidence["actor_order_bound"] is False
+    assert verdicts[1].evidence["actor_order_ever_bound"] is True
+
+
+def test_previously_replaced_peer_is_not_satisfied_by_target_death() -> None:
+    verifier = ActionEffectVerifier(timeout_game_loops=32)
+    first = _attack_command()
+    second = _second_attack_command()
+    for command, actor_tag in ((first, 0xA01), (second, 0xA02)):
+        verifier.track(command)
+        verifier.prepare(
+            command.command_id,
+            _attack_observation(100, health=25, actor_tags=(0xA01, 0xA02)),
+            None,
+            actor_tags=(actor_tag,),
+        )
+        verifier.accept_primitive(command.command_id, game_loop=104)
+    assert verifier.observe(_attack_observation(108, health=25, actor_tags=(0xA01, 0xA02))) == []
+    assert (
+        verifier.observe(
+            _attack_observation(
+                112,
+                health=25,
+                actor_tags=(0xA01, 0xA02),
+                actor_order_targets={0xA01: 0xDEF, 0xA02: None},
+            )
+        )
+        == []
+    )
+    replaced = verifier.observe(
+        _attack_observation(
+            116,
+            health=25,
+            actor_tags=(0xA01, 0xA02),
+            actor_order_targets={0xA01: 0xDEF, 0xA02: None},
+        )
+    )
+
+    assert [(verdict.command_id, verdict.failure_code) for verdict in replaced] == [
+        ("command-attack-2", "combat_order_replaced")
+    ]
+    kill = verifier.observe(
+        _attack_observation(
+            120,
+            health=None,
+            actor_tags=(0xA01, 0xA02),
+            actor_order_targets={0xA01: 0xDEF, 0xA02: None},
+            dead_tags=(0xDEF,),
+        )
+    )
+    assert [(verdict.command_id, verdict.status) for verdict in kill] == [
+        ("command-attack", "succeeded")
+    ]
+
+
+def test_target_death_with_actor_temporarily_missing_does_not_create_false_target_lost() -> None:
+    verifier = ActionEffectVerifier(timeout_game_loops=32)
+    first = _attack_command()
+    second = _second_attack_command()
+    for command, actor_tag in ((first, 0xA01), (second, 0xA02)):
+        verifier.track(command)
+        verifier.prepare(
+            command.command_id,
+            _attack_observation(100, health=25, actor_tags=(0xA01, 0xA02)),
+            None,
+            actor_tags=(actor_tag,),
+        )
+        verifier.accept_primitive(command.command_id, game_loop=104)
+    assert verifier.observe(_attack_observation(108, health=25, actor_tags=(0xA01, 0xA02))) == []
+
+    verdicts = verifier.observe(
+        _attack_observation(
+            112,
+            health=None,
+            actor_tags=(0xA01,),
+            dead_tags=(0xDEF,),
+        )
+    )
+
+    assert [(verdict.command_id, verdict.status) for verdict in verdicts] == [
+        ("command-attack", "succeeded"),
+        ("command-attack-2", "cancelled"),
+    ]
+    assert all(verdict.failure_code != "combat_target_lost" for verdict in verdicts)
+
+
 def test_stimpack_research_is_confirmed_by_exact_barracks_order() -> None:
     verifier = ActionEffectVerifier(timeout_game_loops=112)
     command = RoutedCommand(
@@ -2140,6 +2257,19 @@ def _attack_command() -> RoutedCommand:
     )
 
 
+def _second_attack_command() -> RoutedCommand:
+    return RoutedCommand(
+        command_id="command-attack-2",
+        actor="CombatGroup1/Stalker-1",
+        team_name="Stalker-1",
+        name="Attack_Unit",
+        source="planner",
+        requested_arguments=("0xdef",),
+        resolved_arguments=("0xdef",),
+        rendered_action="<Attack_Unit(0xdef)>",
+    )
+
+
 def _attack_observation(
     game_loop: int,
     *,
@@ -2147,26 +2277,33 @@ def _attack_observation(
     actor_order_target: int | None = 0xDEF,
     actor_order_ability_id: int = 23,
     actor_tags: tuple[int, ...] = (0xA00,),
+    actor_order_targets: dict[int, int | None] | None = None,
     dead_tags: tuple[int, ...] = (),
 ) -> dict[str, Any]:
-    raw_units: list[dict[str, Any]] = [
-        {
-            "tag": actor_tag,
-            "unit_type": "Stalker",
-            "alliance": 1,
-            "orders": (
-                []
-                if actor_order_target is None
-                else [
-                    {
-                        "ability_id": actor_order_ability_id,
-                        "target_unit_tag": actor_order_target,
-                    }
-                ]
-            ),
-        }
-        for actor_tag in actor_tags
-    ]
+    raw_units: list[dict[str, Any]] = []
+    for actor_tag in actor_tags:
+        target = (
+            actor_order_target
+            if actor_order_targets is None
+            else actor_order_targets.get(actor_tag, actor_order_target)
+        )
+        raw_units.append(
+            {
+                "tag": actor_tag,
+                "unit_type": "Stalker",
+                "alliance": 1,
+                "orders": (
+                    []
+                    if target is None
+                    else [
+                        {
+                            "ability_id": actor_order_ability_id,
+                            "target_unit_tag": target,
+                        }
+                    ]
+                ),
+            }
+        )
     if health is not None:
         raw_units.append(
             {

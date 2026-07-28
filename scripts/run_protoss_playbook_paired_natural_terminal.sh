@@ -134,12 +134,19 @@ for seed in 0 1 2; do
   run_arm "sequential_learning" "${seed}" "${second}" "${order}"
 done
 
+set +e
 uv run python scripts/analyze_playbook_experiment.py \
   "${run_set_dir}" \
   --baseline-sha256 "${baseline_sha256}"
+analysis_status=$?
+set -e
+if [[ ${analysis_status} -ne 0 ]]; then
+  overall_status=1
+fi
 
 {
   echo "finished_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "analysis_exit_code=${analysis_status}"
   echo "exit_code=${overall_status}"
 } >> "${run_set_dir}/experiment-metadata.txt"
 echo "playbook_experiment status=finished exit_code=${overall_status} report=${run_set_dir}/comparison.json"

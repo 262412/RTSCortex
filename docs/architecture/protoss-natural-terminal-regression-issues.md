@@ -317,8 +317,11 @@ experiment under SCX-PT-039 has run.
   event containing rule strength/status at evaluation time, shadow decision,
   target, actual terminal outcome and false-block result. The analyzer folds the
   latest record for each evaluation ID directly from the run journal. Active
-  hard blocks without observable counterfactual outcomes remain unresolved and
-  fail the gate rather than being interpreted as zero false blocks.
+  hard `would_block` evaluations without observable counterfactual outcomes
+  remain unresolved regardless of whether their terminal label is `blocked`,
+  `not_selected`, `cancelled`, `unconfirmed`, `satisfied_by_peer` or `pending`.
+  Only resolved `would_block` evaluations enter the false-block denominator;
+  `would_allow` observations never dilute it.
 - **Acceptance evidence:**
   `test_false_blocks_are_preserved_when_hard_rule_becomes_suspended`,
   `test_soft_to_hard_transition_does_not_import_historical_false_blocks`,
@@ -336,8 +339,9 @@ experiment under SCX-PT-039 has run.
   removal had no engagement-level terminalization rule for other actors that
   had held the same exact attack order.
 - **Correction:** target removal still confirms exactly one command as the kill.
-  Other accepted commands whose actors remain exact-bound to that target end as
-  `cancelled / engagement_target_eliminated` with
+  Other accepted commands in the same engagement whose actors were previously
+  exact-bound and had not received a confirmed replacement before target death
+  end as `cancelled / engagement_target_eliminated` with
   `confirmation_kind=satisfied_by_peer`. Tactical state treats this as a
   satisfied engagement, the reviewer treats it as inconclusive rather than an
   error, and metrics expose a separate neutral
@@ -396,6 +400,71 @@ experiment under SCX-PT-039 has run.
   must wait for explicit per-error exposure predicates.
 - **Acceptance evidence:** the analyzer regression includes an unrelated
   lineaged operation and verifies the honest all-lineage denominator.
+
+## 2026-07-28 acceptance-boundary review closure
+
+The final acceptance-boundary review found two orchestration false-pass paths
+and one remaining FocusFire attribution edge. They are closed at code and
+deterministic-test level below. The twelve-run Frozen/Evolving experiment still
+must be rerun; this section does not mark SCX-PT-039 complete.
+
+### Rejected comparison reports now fail the experiment process
+
+- **Evidence:** the analyzer persisted `comparison.json` with
+  `accepted=false`, then returned normally. The paired shell runner propagated
+  only the twelve SC2 child exit codes.
+- **Impact:** all game processes could exit zero while one or more aggregate
+  engineering or causal gates failed, causing Slurm and external orchestration
+  to record a false pass.
+- **Root cause:** the report producer and experiment process used independent
+  success contracts. No exit status crossed the report/runner boundary.
+- **Correction:** the analyzer writes both JSON and Markdown, then exits zero
+  only when every gate is accepted. The paired runner captures that status
+  under `set +e`, promotes any analyzer rejection to `overall_status=1`, and
+  persists `analysis_exit_code` beside the final experiment exit code.
+- **Acceptance evidence:**
+  `test_analyzer_cli_exits_nonzero_when_report_rejected`,
+  `test_paired_runner_propagates_failed_acceptance_gate`, and shell syntax
+  validation.
+
+### Hard false-block accounting covers every unobservable blocking counterfactual
+
+- **Evidence:** only `would_block + actual_outcome=blocked +
+  false_block=None` was unresolved. `not_selected`, `cancelled`,
+  `unconfirmed`, `satisfied_by_peer` and `pending` remained invisible, while
+  resolved `would_allow` evaluations incorrectly increased the denominator.
+- **Impact:** many harmless `would_allow` samples could dilute an unobservable
+  hard blocking counterfactual and allow the aggregate gate to pass.
+- **Root cause:** the analyzer filtered by a downstream outcome label rather
+  than first selecting the counterfactual population defined by
+  `shadow_decision=would_block`.
+- **Correction:** active hard evaluations are first restricted to
+  `would_block`. Boolean `false_block` values are the only resolved
+  denominator; every `None` is unresolved and blocks acceptance. `would_allow`
+  is excluded from all false-block counts.
+- **Acceptance evidence:** regressions cover unselected, cancelled and pending
+  `would_block` evaluations plus denominator exclusion for `would_allow`.
+
+### FocusFire peer completion uses engagement history, not death-frame orders
+
+- **Evidence:** SC2 may clear or retarget actor orders in the same observation
+  that reports the target's dead tag. The verifier previously required each
+  peer to remain exact-bound in that death frame.
+- **Impact:** a valid assisting attack could remain pending and later become
+  `combat_target_lost`, contaminating tactical failures, repeated-error
+  signatures and Playbook learning.
+- **Root cause:** `current_actor_order_bound` was used for both live causal
+  damage attribution and engagement membership. These are different facts.
+- **Correction:** every concurrent target cohort receives one stable
+  engagement ID. The verifier records the last exact-bound loop and the loop at
+  which an order replacement becomes confirmed. Target death produces one
+  unique kill; same-engagement peers that were ever exact-bound and were not
+  confirmed replaced before death terminate neutrally as
+  `satisfied_by_peer`. A current exact-bound command is preferred as the unique
+  kill claimant when observable.
+- **Acceptance evidence:** regressions cover same-frame order clearing,
+  temporary actor disappearance and a peer that was conclusively replaced
+  before target death.
 
 ## Resolved and removed from the open register
 

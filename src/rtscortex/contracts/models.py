@@ -279,9 +279,12 @@ class EffectEvidence(ContractModel):
     target_tag: str | None = None
     actor_tag: str | None = None
     actor_tags: list[str] = Field(default_factory=list)
+    engagement_id: str | None = Field(default=None, pattern=r"^engagement:[0-9a-f]{64}$")
     actor_order_bound: bool = False
     actor_order_ever_bound: bool = False
     actor_order_ability_ids: list[int] = Field(default_factory=list)
+    last_exact_bound_game_loop: int | None = Field(default=None, ge=0)
+    order_replacement_confirmed_game_loop: int | None = Field(default=None, ge=0)
     builder_tag: str | None = None
     reservation_id: str | None = None
     placement_revision: str | None = None

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -22,10 +23,13 @@ class _PendingCombat:
     baseline_health: Optional[float] = None
     observed_health: Optional[float] = None
     actor_tags: tuple[int, ...] = ()
+    engagement_id: Optional[str] = None
     actor_order_ever_bound: bool = False
     current_actor_order_bound: bool = False
     current_actor_order_ability_ids: tuple[int, ...] = ()
+    last_exact_bound_game_loop: Optional[int] = None
     order_missing_since_game_loop: Optional[int] = None
+    order_replacement_confirmed_game_loop: Optional[int] = None
 
 
 class CombatEffectVerifier:
@@ -40,6 +44,7 @@ class CombatEffectVerifier:
         self.timeout_game_loops = int(timeout_game_loops)
         self.unit_names = dict(unit_names or {})
         self._pending: dict[str, _PendingCombat] = {}
+        self._next_engagement_ordinal = 0
 
     def track(self, command: RoutedCommand) -> bool:
         if command.name != "Attack_Unit":
@@ -71,6 +76,7 @@ class CombatEffectVerifier:
     ) -> None:
         pending = self._pending[command_id]
         pending.actor_tags = tuple(dict.fromkeys(int(tag) for tag in actor_tags if int(tag) > 0))
+        self._assign_engagement(pending)
         target = _unit_by_tag(observation, pending.target_tag)
         pending.dispatched_game_loop = _game_loop(observation)
         pending.latest_game_loop = pending.dispatched_game_loop
@@ -99,9 +105,7 @@ class CombatEffectVerifier:
             ),
         )
         for command_id, pending in ordered_pending:
-            if command_id not in self._pending:
-                continue
-            if pending.accepted_game_loop is None:
+            if command_id not in self._pending or pending.accepted_game_loop is None:
                 continue
             pending.latest_game_loop = game_loop
             target = _unit_by_tag(observation, pending.target_tag)
@@ -109,6 +113,13 @@ class CombatEffectVerifier:
             if target is not None:
                 pending.target_type = pending.target_type or _unit_name(target, self.unit_names)
                 pending.observed_health = _health_pool(target)
+        removal_claimants = self._removal_claimants(ordered_pending, dead_tags)
+        for command_id, pending in ordered_pending:
+            if command_id not in self._pending:
+                continue
+            if pending.accepted_game_loop is None:
+                continue
+            target = _unit_by_tag(observation, pending.target_tag)
             target_removed = pending.target_tag in dead_tags
             damage_observed = (
                 pending.baseline_health is not None
@@ -116,10 +127,11 @@ class CombatEffectVerifier:
                 and pending.observed_health < pending.baseline_health
             )
             if (
-                pending.current_actor_order_bound
-                and (target_removed or damage_observed)
-                and pending.target_tag not in claimed_damage_targets
-            ):
+                target_removed
+                and removal_claimants.get(pending.target_tag) == command_id
+                or pending.current_actor_order_bound
+                and damage_observed
+            ) and pending.target_tag not in claimed_damage_targets:
                 confirmation_kind = "target_removed" if target_removed else "target_damaged"
                 verdicts.append(
                     EffectVerdict(
@@ -138,11 +150,13 @@ class CombatEffectVerifier:
                             or peer_id == command_id
                             or peer.accepted_game_loop is None
                             or peer.target_tag != pending.target_tag
+                            or peer.engagement_id != pending.engagement_id
                         ):
                             continue
-                        peer.latest_game_loop = game_loop
-                        self._refresh_actor_order(peer, observation, game_loop)
-                        if not peer.current_actor_order_bound:
+                        if (
+                            not peer.actor_order_ever_bound
+                            or peer.order_replacement_confirmed_game_loop is not None
+                        ):
                             continue
                         verdicts.append(
                             EffectVerdict(
@@ -150,7 +164,7 @@ class CombatEffectVerifier:
                                 False,
                                 (
                                     "Attack_Unit engagement target was eliminated while "
-                                    "this exact actor remained bound"
+                                    "this exact actor had remained part of the engagement"
                                 ),
                                 status="cancelled",
                                 failure_code="engagement_target_eliminated",
@@ -163,11 +177,7 @@ class CombatEffectVerifier:
                         if other.target_tag == pending.target_tag:
                             other.baseline_health = pending.observed_health
                 continue
-            if (
-                target is not None
-                and pending.order_missing_since_game_loop is not None
-                and game_loop - pending.order_missing_since_game_loop >= 4
-            ):
+            if pending.order_replacement_confirmed_game_loop is not None:
                 verdicts.append(
                     EffectVerdict(
                         command_id,
@@ -219,6 +229,52 @@ class CombatEffectVerifier:
             del self._pending[command_id]
         return verdicts
 
+    def _assign_engagement(self, pending: _PendingCombat) -> None:
+        if pending.engagement_id is not None:
+            return
+        peer = next(
+            (
+                candidate
+                for candidate in self._pending.values()
+                if candidate is not pending
+                and candidate.target_tag == pending.target_tag
+                and candidate.engagement_id is not None
+                and candidate.order_replacement_confirmed_game_loop is None
+            ),
+            None,
+        )
+        if peer is not None:
+            pending.engagement_id = peer.engagement_id
+            return
+        self._next_engagement_ordinal += 1
+        identity = f"{pending.target_tag}:{self._next_engagement_ordinal}".encode()
+        pending.engagement_id = f"engagement:{hashlib.sha256(identity).hexdigest()}"
+
+    @staticmethod
+    def _removal_claimants(
+        ordered_pending: list[tuple[str, _PendingCombat]],
+        dead_tags: set[int],
+    ) -> dict[int, str]:
+        claimants: dict[int, str] = {}
+        candidates = [
+            (command_id, pending)
+            for command_id, pending in ordered_pending
+            if pending.accepted_game_loop is not None
+            and pending.target_tag in dead_tags
+            and pending.actor_order_ever_bound
+            and pending.order_replacement_confirmed_game_loop is None
+        ]
+        for command_id, pending in sorted(
+            candidates,
+            key=lambda item: (
+                not item[1].current_actor_order_bound,
+                item[1].accepted_game_loop,
+                item[0],
+            ),
+        ):
+            claimants.setdefault(pending.target_tag, command_id)
+        return claimants
+
     @staticmethod
     def _refresh_actor_order(
         pending: _PendingCombat,
@@ -247,11 +303,16 @@ class CombatEffectVerifier:
         pending.current_actor_order_ability_ids = bound_ability_ids
         pending.actor_order_ever_bound = pending.actor_order_ever_bound or current_order_bound
         if current_order_bound:
+            pending.last_exact_bound_game_loop = game_loop
             pending.order_missing_since_game_loop = None
         elif pending.actor_order_ever_bound:
             pending.order_missing_since_game_loop = (
                 pending.order_missing_since_game_loop or game_loop
             )
+            if game_loop - pending.order_missing_since_game_loop >= 4:
+                pending.order_replacement_confirmed_game_loop = (
+                    pending.order_replacement_confirmed_game_loop or game_loop
+                )
 
     def cancel(self, command_id: str) -> None:
         self._pending.pop(command_id, None)
@@ -302,9 +363,14 @@ class CombatEffectVerifier:
             "observed_target_health": pending.observed_health,
             "target_health_delta": delta,
             "actor_tags": [hex(tag) for tag in pending.actor_tags],
+            "engagement_id": pending.engagement_id,
             "actor_order_bound": pending.current_actor_order_bound,
             "actor_order_ever_bound": pending.actor_order_ever_bound,
             "actor_order_ability_ids": list(pending.current_actor_order_ability_ids),
+            "last_exact_bound_game_loop": pending.last_exact_bound_game_loop,
+            "order_replacement_confirmed_game_loop": (
+                pending.order_replacement_confirmed_game_loop
+            ),
             "elapsed_game_loops": elapsed,
             "base_timeout_game_loops": self.timeout_game_loops,
             "effective_timeout_game_loops": self.timeout_game_loops,

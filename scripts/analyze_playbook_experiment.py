@@ -82,6 +82,7 @@ def main() -> None:
         encoding="utf-8",
     )
     (run_set / "report.md").write_text(_markdown(report), encoding="utf-8")
+    raise SystemExit(0 if report["accepted"] else 1)
 
 
 def _run_metrics(row: dict[str, str]) -> RunMetrics:
@@ -167,15 +168,19 @@ def _run_metrics(row: dict[str, str]) -> RunMetrics:
         if evaluation.get("strength_at_evaluation") == "hard"
         and evaluation.get("status_at_evaluation") == "active"
     ]
-    false_blocks = sum(evaluation.get("false_block") is True for evaluation in hard_evaluations)
-    shadow_states = sum(
-        isinstance(evaluation.get("false_block"), bool) for evaluation in hard_evaluations
+    blocking_counterfactuals = [
+        evaluation
+        for evaluation in hard_evaluations
+        if evaluation.get("shadow_decision") == "would_block"
+    ]
+    false_blocks = sum(
+        evaluation.get("false_block") is True for evaluation in blocking_counterfactuals
+    )
+    resolved_blocks = sum(
+        isinstance(evaluation.get("false_block"), bool) for evaluation in blocking_counterfactuals
     )
     unresolved_blocks = sum(
-        evaluation.get("shadow_decision") == "would_block"
-        and evaluation.get("actual_outcome") == "blocked"
-        and evaluation.get("false_block") is None
-        for evaluation in hard_evaluations
+        evaluation.get("false_block") is None for evaluation in blocking_counterfactuals
     )
     terminal_report_count = sum(terminal_counts.values())
     dispatched_ids = set(dispatch_counts)
@@ -216,9 +221,9 @@ def _run_metrics(row: dict[str, str]) -> RunMetrics:
         lineaged_operation_count=lineaged_operation_count,
         strategic_consequences=dict(sorted(consequences.items())),
         hard_rule_false_block_count=false_blocks,
-        hard_rule_shadow_state_count=shadow_states,
+        hard_rule_shadow_state_count=resolved_blocks,
         hard_rule_unresolved_block_count=unresolved_blocks,
-        hard_rule_false_block_rate=(false_blocks / shadow_states if shadow_states else 0.0),
+        hard_rule_false_block_rate=(false_blocks / resolved_blocks if resolved_blocks else 0.0),
         journal_bytes=journal_bytes,
         artifact_bytes=artifact_bytes,
         event_count=event_count,
@@ -333,7 +338,7 @@ def _comparison(metrics: list[RunMetrics], *, baseline_sha256: str) -> dict[str,
         else (frozen_error_rate - evolving_error_rate) / frozen_error_rate
     )
     false_blocks = sum(metric.hard_rule_false_block_count for metric in metrics)
-    shadow_states = sum(metric.hard_rule_shadow_state_count for metric in metrics)
+    resolved_blocks = sum(metric.hard_rule_shadow_state_count for metric in metrics)
     unresolved_hard_blocks = sum(metric.hard_rule_unresolved_block_count for metric in metrics)
     gates = {
         "complete_unique_run_matrix": (
@@ -353,9 +358,9 @@ def _comparison(metrics: list[RunMetrics], *, baseline_sha256: str) -> dict[str,
             metric.candidate_outside_dispatch == 0 for metric in metrics
         ),
         "hard_false_block_rate_at_most_1_percent": (
-            shadow_states > 0
+            resolved_blocks > 0
             and unresolved_hard_blocks == 0
-            and false_blocks / shadow_states <= 0.01
+            and false_blocks / resolved_blocks <= 0.01
         ),
         "repeated_error_reduction_at_least_50_percent": reduction >= 0.5,
         "matched_win_rate_not_reduced": (sum(item["win_delta"] for item in independent_pairs) >= 0),
@@ -372,9 +377,12 @@ def _comparison(metrics: list[RunMetrics], *, baseline_sha256: str) -> dict[str,
             "independent_evolving_repeated_errors_per_10k_game_loops": (evolving_error_rate),
             "independent_repeated_error_reduction": reduction,
             "hard_rule_false_block_count": false_blocks,
-            "hard_rule_shadow_state_count": shadow_states,
+            "hard_rule_resolved_block_count": resolved_blocks,
+            "hard_rule_shadow_state_count": resolved_blocks,
             "hard_rule_unresolved_block_count": unresolved_hard_blocks,
-            "hard_rule_false_block_rate": (false_blocks / shadow_states if shadow_states else 0.0),
+            "hard_rule_false_block_rate": (
+                false_blocks / resolved_blocks if resolved_blocks else 0.0
+            ),
         },
         "gates": gates,
         "accepted": all(gates.values()),

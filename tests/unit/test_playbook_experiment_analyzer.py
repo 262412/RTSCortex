@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -145,6 +147,47 @@ def test_false_block_gate_cannot_pass_without_shadow_states() -> None:
 
     assert comparison["gates"]["hard_false_block_rate_at_most_1_percent"] is False
     assert comparison["accepted"] is False
+
+
+def test_analyzer_cli_exits_nonzero_when_report_rejected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_set = tmp_path / "run-set"
+    run_set.mkdir()
+    (run_set / "experiment-status.tsv").write_text(
+        "mode\tseed\tarm\texit_code\trun_dir\tplaybook_before_sha256\tplaybook_after_sha256\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "analyze_playbook_experiment.py",
+            str(run_set),
+            "--baseline-sha256",
+            "baseline",
+        ],
+    )
+
+    with pytest.raises(SystemExit) as raised:
+        analyzer.main()
+
+    assert raised.value.code == 1
+    report = json.loads((run_set / "comparison.json").read_text(encoding="utf-8"))
+    assert report["accepted"] is False
+    assert (run_set / "report.md").is_file()
+
+
+def test_paired_runner_propagates_failed_acceptance_gate() -> None:
+    runner = (
+        Path(__file__).parents[2] / "scripts" / "run_protoss_playbook_paired_natural_terminal.sh"
+    ).read_text(encoding="utf-8")
+
+    assert "analysis_status=$?" in runner
+    assert "if [[ ${analysis_status} -ne 0 ]]; then\n  overall_status=1\nfi" in runner
+    assert 'echo "analysis_exit_code=${analysis_status}"' in runner
+    assert 'exit "${overall_status}"' in runner
 
 
 def test_run_metrics_streams_events_and_normalizes_error_exposure(
@@ -323,6 +366,131 @@ def test_retired_rule_run_delta_uses_event_time_strength(
     assert metrics.hard_rule_shadow_state_count == 1
 
 
+def test_unselected_would_block_is_unresolved(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _assert_would_block_outcome_is_unresolved("not_selected", tmp_path, monkeypatch)
+
+
+def test_cancelled_would_block_is_unresolved(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _assert_would_block_outcome_is_unresolved("cancelled", tmp_path, monkeypatch)
+
+
+@pytest.mark.parametrize("actual_outcome", ["blocked", "unconfirmed", "satisfied_by_peer"])
+def test_every_other_unobservable_would_block_outcome_is_unresolved(
+    actual_outcome: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _assert_would_block_outcome_is_unresolved(actual_outcome, tmp_path, monkeypatch)
+
+
+def _assert_would_block_outcome_is_unresolved(
+    actual_outcome: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metrics = _metrics_for_rule_evaluations(
+        tmp_path,
+        monkeypatch,
+        [
+            _rule_evaluation(
+                event_id=1,
+                evaluation_id=f"evaluation:{actual_outcome}",
+                strength="hard",
+                status="active",
+                false_block=None,
+                actual_outcome=actual_outcome,
+            )
+        ],
+    )
+
+    assert metrics.hard_rule_shadow_state_count == 0
+    assert metrics.hard_rule_unresolved_block_count == 1
+
+
+def test_would_allow_does_not_enter_false_block_denominator(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metrics = _metrics_for_rule_evaluations(
+        tmp_path,
+        monkeypatch,
+        [
+            _rule_evaluation(
+                event_id=1,
+                evaluation_id="evaluation:would-allow",
+                strength="hard",
+                status="active",
+                false_block=False,
+                shadow_decision="would_allow",
+            ),
+            _rule_evaluation(
+                event_id=2,
+                evaluation_id="evaluation:would-block",
+                strength="hard",
+                status="active",
+                false_block=True,
+            ),
+        ],
+    )
+
+    assert metrics.hard_rule_shadow_state_count == 1
+    assert metrics.hard_rule_false_block_count == 1
+    assert metrics.hard_rule_false_block_rate == 1.0
+
+
+def test_pending_would_block_prevents_acceptance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed = _metrics_for_rule_evaluations(
+        tmp_path,
+        monkeypatch,
+        [
+            _rule_evaluation(
+                event_id=1,
+                evaluation_id="evaluation:pending",
+                strength="hard",
+                status="active",
+                false_block=None,
+                actual_outcome="pending",
+            )
+        ],
+    )
+    baseline = "baseline"
+    metrics = [
+        _metrics(
+            mode=mode,
+            seed=seed,
+            arm=arm,
+            before=baseline,
+            after=baseline if arm == "frozen" else f"{mode}-{seed}",
+            repeated_errors=0,
+        )
+        for mode in ("independent_paired", "sequential_learning")
+        for seed in (0, 1, 2)
+        for arm in ("frozen", "evolving")
+    ]
+    first = metrics[0]
+    metrics[0] = first.__class__(
+        **{
+            **first.__dict__,
+            "hard_rule_shadow_state_count": observed.hard_rule_shadow_state_count,
+            "hard_rule_unresolved_block_count": observed.hard_rule_unresolved_block_count,
+        }
+    )
+
+    comparison = _comparison(metrics, baseline_sha256=baseline)
+
+    assert comparison["gates"]["hard_false_block_rate_at_most_1_percent"] is False
+    assert comparison["accepted"] is False
+
+
 def test_unresolved_active_hard_block_cannot_pass_false_block_gate() -> None:
     baseline = "baseline"
     metrics = [
@@ -383,6 +551,8 @@ def _rule_evaluation(
     strength: str,
     status: str,
     false_block: bool | None,
+    shadow_decision: str = "would_block",
+    actual_outcome: str | None = None,
 ) -> StoredEvent:
     return StoredEvent(
         event_id=event_id,
@@ -396,8 +566,12 @@ def _rule_evaluation(
             "rule_id": "rule:test",
             "strength_at_evaluation": strength,
             "status_at_evaluation": status,
-            "shadow_decision": "would_block",
-            "actual_outcome": "succeeded" if false_block else "failed",
+            "shadow_decision": shadow_decision,
+            "actual_outcome": (
+                actual_outcome
+                if actual_outcome is not None
+                else ("succeeded" if false_block else "failed")
+            ),
             "false_block": false_block,
         },
     )
