@@ -681,9 +681,7 @@ class RuntimeEngine:
             )
             recovery_tail_event_count = len(recovery_tail)
             if recovery_tail_event_count > _RUNTIME_RECOVERY_TAIL_EVENT_LIMIT:
-                raise RuntimeError(
-                    "runtime recovery tail exceeds the bounded checkpoint contract"
-                )
+                raise RuntimeError("runtime recovery tail exceeds the bounded checkpoint contract")
 
         decision_events = self.store.events_of_type(
             observation.run_id,

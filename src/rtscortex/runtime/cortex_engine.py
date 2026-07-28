@@ -2830,14 +2830,10 @@ class CortexRuntimeEngine(RuntimeEngine):
         target_ids = {lineage.candidate_id}
         if lineage.strategic_intent_id is not None:
             target_ids.add(lineage.strategic_intent_id)
-        for evaluation_id, evaluation in tuple(
-            self._pending_playbook_rule_evaluations.items()
-        ):
+        for evaluation_id, evaluation in tuple(self._pending_playbook_rule_evaluations.items()):
             if evaluation.target_id not in target_ids:
                 continue
-            observable = evaluation.model_copy(
-                update={"counterfactual_observable": True}
-            )
+            observable = evaluation.model_copy(update={"counterfactual_observable": True})
             self._pending_playbook_rule_evaluations[evaluation_id] = observable
             self._record_cortex_event(
                 observation,
@@ -2956,8 +2952,7 @@ class CortexRuntimeEngine(RuntimeEngine):
                 if any(item.consequence_type.value in negative_types for item in relevant)
                 else False
                 if any(
-                    item.consequence_type.value == "successful_key_decision"
-                    for item in relevant
+                    item.consequence_type.value == "successful_key_decision" for item in relevant
                 )
                 else None
             )

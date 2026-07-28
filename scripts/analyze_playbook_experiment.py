@@ -94,12 +94,8 @@ def main() -> None:
     parser.add_argument("--engineering-baseline", type=Path, required=True)
     arguments = parser.parse_args()
     run_set = arguments.run_set_dir.resolve()
-    engineering_baseline = json.loads(
-        arguments.engineering_baseline.read_text(encoding="utf-8")
-    )
-    baseline_bytes_per_loop = float(
-        engineering_baseline["natural_run_bytes_per_game_loop"]
-    )
+    engineering_baseline = json.loads(arguments.engineering_baseline.read_text(encoding="utf-8"))
+    baseline_bytes_per_loop = float(engineering_baseline["natural_run_bytes_per_game_loop"])
     rows = list(csv.DictReader((run_set / "experiment-status.tsv").open(), delimiter="\t"))
     metrics = [
         _run_metrics(
@@ -345,8 +341,7 @@ def _run_metrics(
         active_hard_block_keys=active_hard_block_keys,
         resolved_counterfactual_keys=resolved_counterfactual_keys,
         strategic_regret_count=sum(
-            evaluation.get("strategic_regret") is True
-            for evaluation in strategic_evaluations
+            evaluation.get("strategic_regret") is True for evaluation in strategic_evaluations
         ),
         strategic_resolved_count=sum(
             isinstance(evaluation.get("strategic_regret"), bool)
@@ -379,9 +374,7 @@ def _consequence_signature(payload: dict[str, Any]) -> str:
 
 def _comparison(metrics: list[RunMetrics], *, baseline_sha256: str) -> dict[str, Any]:
     behavior = [metric for metric in metrics if metric.experiment_kind == "behavior"]
-    calibration = [
-        metric for metric in metrics if metric.experiment_kind == "calibration"
-    ]
+    calibration = [metric for metric in metrics if metric.experiment_kind == "calibration"]
     split_matrix = any(metric.subject_arm is not None for metric in metrics)
     expected_behavior_matrix = {
         (mode, seed, arm)
@@ -389,9 +382,7 @@ def _comparison(metrics: list[RunMetrics], *, baseline_sha256: str) -> dict[str,
         for seed in (0, 1, 2)
         for arm in ("frozen", "evolving")
     }
-    observed_behavior_matrix = {
-        (metric.mode, metric.seed, metric.arm) for metric in behavior
-    }
+    observed_behavior_matrix = {(metric.mode, metric.seed, metric.arm) for metric in behavior}
     expected_calibration_matrix = {
         (mode, seed, subject_arm)
         for mode in ("independent_paired", "sequential_learning")
@@ -399,8 +390,7 @@ def _comparison(metrics: list[RunMetrics], *, baseline_sha256: str) -> dict[str,
         for subject_arm in ("frozen", "evolving")
     }
     observed_calibration_matrix = {
-        (metric.mode, metric.seed, metric.subject_arm)
-        for metric in calibration
+        (metric.mode, metric.seed, metric.subject_arm) for metric in calibration
     }
     paired: list[dict[str, Any]] = []
     for mode in ("independent_paired", "sequential_learning"):
@@ -433,12 +423,8 @@ def _comparison(metrics: list[RunMetrics], *, baseline_sha256: str) -> dict[str,
                     "win_delta": _win(evolving.outcome) - _win(frozen.outcome),
                 }
             )
-    independent_rows = [
-        metric for metric in behavior if metric.mode == "independent_paired"
-    ]
-    sequential_rows = [
-        metric for metric in behavior if metric.mode == "sequential_learning"
-    ]
+    independent_rows = [metric for metric in behavior if metric.mode == "independent_paired"]
+    sequential_rows = [metric for metric in behavior if metric.mode == "sequential_learning"]
     independent_pairs = [item for item in paired if item["mode"] == "independent_paired"]
     baseline_identity = all(
         metric.playbook_before_sha256 == baseline_sha256 for metric in independent_rows
@@ -456,22 +442,15 @@ def _comparison(metrics: list[RunMetrics], *, baseline_sha256: str) -> dict[str,
         current.playbook_before_sha256 == previous.playbook_after_sha256
         for previous, current in zip(evolving_sequence, evolving_sequence[1:], strict=False)
     )
-    behavior_by_subject = {
-        (metric.mode, metric.seed, metric.arm): metric for metric in behavior
-    }
+    behavior_by_subject = {(metric.mode, metric.seed, metric.arm): metric for metric in behavior}
     shadow_baseline_identity = all(
-        (
-            reference := behavior_by_subject.get(
-                (metric.mode, metric.seed, metric.subject_arm or "")
-            )
-        )
+        (reference := behavior_by_subject.get((metric.mode, metric.seed, metric.subject_arm or "")))
         is not None
         and metric.playbook_before_sha256 == reference.playbook_before_sha256
         for metric in calibration
     )
     shadow_immutable = all(
-        metric.playbook_before_sha256 == metric.playbook_after_sha256
-        for metric in calibration
+        metric.playbook_before_sha256 == metric.playbook_after_sha256 for metric in calibration
     )
     frozen_errors = sum(
         metric.repeated_eligible_errors for metric in independent_rows if metric.arm == "frozen"
@@ -495,33 +474,24 @@ def _comparison(metrics: list[RunMetrics], *, baseline_sha256: str) -> dict[str,
         else (frozen_error_rate - evolving_error_rate) / frozen_error_rate
     )
     counterfactual_rows = calibration if split_matrix else behavior
-    false_blocks = sum(
-        metric.hard_rule_false_block_count for metric in counterfactual_rows
-    )
-    resolved_blocks = sum(
-        metric.hard_rule_shadow_state_count for metric in counterfactual_rows
-    )
+    false_blocks = sum(metric.hard_rule_false_block_count for metric in counterfactual_rows)
+    resolved_blocks = sum(metric.hard_rule_shadow_state_count for metric in counterfactual_rows)
     unresolved_hard_blocks = sum(
         metric.hard_rule_unresolved_block_count for metric in counterfactual_rows
     )
-    active_hard_block_keys = {
-        key for metric in behavior for key in metric.active_hard_block_keys
-    }
+    active_hard_block_keys = {key for metric in behavior for key in metric.active_hard_block_keys}
     resolved_counterfactual_keys = {
         key for metric in counterfactual_rows for key in metric.resolved_counterfactual_keys
     }
     calibration_by_subject = {
-        (metric.mode, metric.seed, metric.subject_arm): metric
-        for metric in calibration
+        (metric.mode, metric.seed, metric.subject_arm): metric for metric in calibration
     }
     unmatched_active_hard_blocks: list[str] = []
     for metric in behavior:
         matched_keys = resolved_counterfactual_keys
         if split_matrix:
             matched = calibration_by_subject.get((metric.mode, metric.seed, metric.arm))
-            matched_keys = (
-                set() if matched is None else set(matched.resolved_counterfactual_keys)
-            )
+            matched_keys = set() if matched is None else set(matched.resolved_counterfactual_keys)
         unmatched_active_hard_blocks.extend(
             f"{metric.mode}:{metric.seed}:{metric.arm}:{key}"
             for key in metric.active_hard_block_keys
@@ -533,11 +503,7 @@ def _comparison(metrics: list[RunMetrics], *, baseline_sha256: str) -> dict[str,
         for name in REQUIRED_ENGINEERING_GATES
     }
     missing_engineering_metrics = sorted(
-        {
-            name
-            for metric in behavior
-            for name in metric.engineering_missing_metrics
-        }
+        {name for metric in behavior for name in metric.engineering_missing_metrics}
     )
     gates = {
         "complete_unique_run_matrix": (
@@ -563,9 +529,7 @@ def _comparison(metrics: list[RunMetrics], *, baseline_sha256: str) -> dict[str,
         "shadow_calibration_baseline_identity": (
             shadow_baseline_identity if split_matrix else True
         ),
-        "shadow_calibration_hash_unchanged": (
-            shadow_immutable if split_matrix else True
-        ),
+        "shadow_calibration_hash_unchanged": (shadow_immutable if split_matrix else True),
         "duplicate_dispatch_zero": all(metric.duplicate_dispatches == 0 for metric in metrics),
         "terminal_report_exactly_once": all(
             metric.duplicate_terminal_reports == 0 and metric.missing_terminal_reports == 0
@@ -579,9 +543,7 @@ def _comparison(metrics: list[RunMetrics], *, baseline_sha256: str) -> dict[str,
             and unresolved_hard_blocks == 0
             and false_blocks / resolved_blocks <= 0.01
         ),
-        "active_hard_blocks_have_matched_shadow_evidence": (
-            not unmatched_active_hard_blocks
-        ),
+        "active_hard_blocks_have_matched_shadow_evidence": (not unmatched_active_hard_blocks),
         "required_engineering_metrics_complete": not missing_engineering_metrics,
         "all_engineering_gates_pass": (
             bool(behavior)
@@ -663,8 +625,7 @@ def _markdown(report: dict[str, Any]) -> str:
             "",
             "## Counterfactual calibration",
             "",
-            f"- Resolved execution-guard blocks: "
-            f"`{aggregate['hard_rule_resolved_block_count']}`",
+            f"- Resolved execution-guard blocks: `{aggregate['hard_rule_resolved_block_count']}`",
             f"- Unresolved observable execution-guard blocks: "
             f"`{aggregate['hard_rule_unresolved_block_count']}`",
             f"- Execution false blocks: `{aggregate['hard_rule_false_block_count']}`",

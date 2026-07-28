@@ -146,10 +146,7 @@ def test_active_hard_block_requires_matched_shadow_evidence() -> None:
 
     comparison = _comparison(metrics, baseline_sha256="baseline")
 
-    assert (
-        comparison["gates"]["active_hard_blocks_have_matched_shadow_evidence"]
-        is False
-    )
+    assert comparison["gates"]["active_hard_blocks_have_matched_shadow_evidence"] is False
     assert comparison["accepted"] is False
 
 
@@ -189,12 +186,8 @@ def test_performance_fields_are_thresholded_not_only_reported() -> None:
         baseline_sha256="baseline",
     )
 
-    assert comparison["aggregate"]["engineering_gates"][
-        "effective_loops_per_second"
-    ] is False
-    assert comparison["aggregate"]["engineering_gates"][
-        "natural_run_disk_reduction_ratio"
-    ] is False
+    assert comparison["aggregate"]["engineering_gates"]["effective_loops_per_second"] is False
+    assert comparison["aggregate"]["engineering_gates"]["natural_run_disk_reduction_ratio"] is False
     assert comparison["accepted"] is False
 
 
@@ -214,12 +207,7 @@ def test_build_and_tactical_gates_are_aggregated_across_all_runs() -> None:
     comparison = _comparison(metrics, baseline_sha256="baseline")
 
     assert comparison["aggregate"]["engineering_gates"]["build_start_coverage"] is False
-    assert (
-        comparison["aggregate"]["engineering_gates"][
-            "unchanged_attack_redispatch_zero"
-        ]
-        is False
-    )
+    assert comparison["aggregate"]["engineering_gates"]["unchanged_attack_redispatch_zero"] is False
     assert comparison["accepted"] is False
 
 
@@ -840,11 +828,7 @@ def _rule_evaluation(
                 else {"counterfactual_observable": counterfactual_observable}
             ),
             **({} if rule_kind is None else {"rule_kind": rule_kind}),
-            **(
-                {}
-                if strategic_regret is None
-                else {"strategic_regret": strategic_regret}
-            ),
+            **({} if strategic_regret is None else {"strategic_regret": strategic_regret}),
             "actual_outcome": (
                 actual_outcome
                 if actual_outcome is not None

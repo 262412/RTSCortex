@@ -85,9 +85,7 @@ def build_engineering_gate_report(
         None,
     )
     reports = [
-        (event.event_id, event.payload)
-        for event in events
-        if event.event_type == "execution"
+        (event.event_id, event.payload) for event in events if event.event_type == "execution"
     ]
     accepted_builds = [
         (event_id, payload)
@@ -252,9 +250,7 @@ def build_engineering_gate_report(
         for name, (comparison, threshold) in thresholds.items()
     }
     missing = [
-        name
-        for name in REQUIRED_ENGINEERING_GATES
-        if name not in metrics or metrics[name] is None
+        name for name in REQUIRED_ENGINEERING_GATES if name not in metrics or metrics[name] is None
     ]
     return {
         "format_version": "1.0",
@@ -274,9 +270,7 @@ def build_engineering_gate_report(
             "max_game_loop": max_game_loop,
             "durable_bytes": durable_bytes,
             "durable_bytes_per_game_loop": bytes_per_loop,
-            "natural_run_baseline_bytes_per_game_loop": (
-                natural_run_baseline_bytes_per_loop
-            ),
+            "natural_run_baseline_bytes_per_game_loop": (natural_run_baseline_bytes_per_loop),
         },
         "gates": gates,
         "missing_required_metrics": missing,
@@ -290,11 +284,11 @@ def _is_build(payload: dict[str, Any]) -> bool:
 
 def _pysc2_accepted(payload: dict[str, Any]) -> bool:
     trace = payload.get("primitive_trace")
-    translator = [
-        item
-        for item in trace
-        if isinstance(item, dict) and item.get("origin") == "translator"
-    ] if isinstance(trace, list) else []
+    translator = (
+        [item for item in trace if isinstance(item, dict) and item.get("origin") == "translator"]
+        if isinstance(trace, list)
+        else []
+    )
     return (
         bool(translator and translator[-1].get("accepted") is True)
         or payload.get("execution_stage") == "effect_verification"
@@ -418,9 +412,7 @@ def _expansion_immediate_rearms(events: Sequence[StoredEvent]) -> int:
         if event.event_type == "expansion_commitment_terminal":
             generation = event.payload.get("generation_id")
             if isinstance(generation, int):
-                terminal_by_generation[generation] = int(
-                    event.payload.get("terminal_game_loop", 0)
-                )
+                terminal_by_generation[generation] = int(event.payload.get("terminal_game_loop", 0))
         elif event.event_type == "expansion_commitment_started":
             generation = event.payload.get("generation_id")
             started = event.payload.get("started_game_loop")
