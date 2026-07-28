@@ -169,6 +169,35 @@ class PlaybookRuleApplication(ContractModel):
     reason: str = Field(min_length=1)
 
 
+class PlaybookRuleEvaluation(ContractModel):
+    """Event-time evidence for one rule decision and its observed outcome."""
+
+    evaluation_id: str = Field(pattern=r"^rule-evaluation:[0-9a-f]{64}$")
+    application_id: str = Field(min_length=1)
+    rule_id: str = Field(min_length=1)
+    run_id: str = Field(min_length=1)
+    episode_id: str = Field(min_length=1)
+    step_id: int = Field(ge=0)
+    game_loop: int = Field(ge=0)
+    target_kind: Literal["intent", "candidate"]
+    target_id: str = Field(min_length=1)
+    strength_at_evaluation: PlaybookRuleStrength
+    status_at_evaluation: PlaybookRuleStatus
+    shadow_decision: Literal["would_allow", "would_block"]
+    actual_outcome: Literal[
+        "pending",
+        "allowed",
+        "blocked",
+        "not_selected",
+        "succeeded",
+        "failed",
+        "cancelled",
+        "unconfirmed",
+        "satisfied_by_peer",
+    ]
+    false_block: bool | None = None
+
+
 class PlaybookContext(ContractModel):
     agent_race: str = Field(min_length=1)
     opponent_race: str = Field(min_length=1)

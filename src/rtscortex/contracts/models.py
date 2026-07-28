@@ -352,6 +352,7 @@ class EffectEvidence(ContractModel):
             "upgrade_observed",
             "target_damaged",
             "target_removed",
+            "satisfied_by_peer",
         ]
         | None
     ) = None

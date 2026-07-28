@@ -230,6 +230,54 @@ def test_one_health_delta_confirms_at_most_one_combat_engagement() -> None:
     assert verifier.observe(_attack_observation(116, health=125, actor_tags=(0xA01, 0xA02))) == []
 
 
+def test_target_removal_terminalizes_all_exact_bound_commands_in_engagement() -> None:
+    verifier = ActionEffectVerifier(timeout_game_loops=32)
+    first = _attack_command()
+    second = RoutedCommand(
+        command_id="command-attack-2",
+        actor="CombatGroup1/Stalker-1",
+        team_name="Stalker-1",
+        name="Attack_Unit",
+        source="planner",
+        requested_arguments=("0xdef",),
+        resolved_arguments=("0xdef",),
+        rendered_action="<Attack_Unit(0xdef)>",
+    )
+    for command, actor_tag in ((first, 0xA01), (second, 0xA02)):
+        verifier.track(command)
+        verifier.prepare(
+            command.command_id,
+            _attack_observation(100, health=25, actor_tags=(0xA01, 0xA02)),
+            None,
+            actor_tags=(actor_tag,),
+        )
+        verifier.accept_primitive(command.command_id, game_loop=104)
+    verifier.observe(_attack_observation(108, health=25, actor_tags=(0xA01, 0xA02)))
+
+    verdicts = verifier.observe(
+        _attack_observation(
+            112,
+            health=None,
+            actor_tags=(0xA01, 0xA02),
+            dead_tags=(0xDEF,),
+        )
+    )
+
+    assert len(verdicts) == 2
+    assert verdicts[0].command_id == "command-attack"
+    assert verdicts[0].success is True
+    assert verdicts[0].evidence is not None
+    assert verdicts[0].evidence["confirmation_kind"] == "target_removed"
+    assert verdicts[1].command_id == "command-attack-2"
+    assert verdicts[1].success is False
+    assert verdicts[1].status == "cancelled"
+    assert verdicts[1].failure_code == "engagement_target_eliminated"
+    assert verdicts[1].evidence is not None
+    assert verdicts[1].evidence["confirmation_kind"] == "satisfied_by_peer"
+    assert verifier.is_tracked(first.command_id) is False
+    assert verifier.is_tracked(second.command_id) is False
+
+
 def test_stimpack_research_is_confirmed_by_exact_barracks_order() -> None:
     verifier = ActionEffectVerifier(timeout_game_loops=112)
     command = RoutedCommand(
@@ -2099,6 +2147,7 @@ def _attack_observation(
     actor_order_target: int | None = 0xDEF,
     actor_order_ability_id: int = 23,
     actor_tags: tuple[int, ...] = (0xA00,),
+    dead_tags: tuple[int, ...] = (),
 ) -> dict[str, Any]:
     raw_units: list[dict[str, Any]] = [
         {
@@ -2128,7 +2177,7 @@ def _attack_observation(
                 "shield": 0,
             }
         )
-    return {"game_loop": game_loop, "raw_units": raw_units}
+    return {"game_loop": game_loop, "raw_units": raw_units, "dead_units": dead_tags}
 
 
 def _observation(

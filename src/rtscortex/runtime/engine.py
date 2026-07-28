@@ -1281,7 +1281,15 @@ class RuntimeEngine:
     ) -> bool:
         lifecycle = CommandLifecycle(command=command, status=status, reason=reason)
         current = self._command_states.get(command.command_id)
-        if current is not None and current.command != command:
+        dispatch_attempt_binding = (
+            current is not None
+            and current.status in _ACTIONABLE_COMMAND_STATUSES
+            and status is CommandStatus.DISPATCHED
+            and current.command.attempt_id is None
+            and command.attempt_id is not None
+            and current.command.model_copy(update={"attempt_id": command.attempt_id}) == command
+        )
+        if current is not None and current.command != command and not dispatch_attempt_binding:
             raise RuntimeError(
                 f"command ID {command.command_id!r} was reused with different semantics"
             )

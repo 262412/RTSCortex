@@ -533,6 +533,68 @@ def test_strategic_agenda_is_not_committed_before_command_dispatch(
     asyncio.run(runtime.close())
 
 
+def test_rejected_materialization_does_not_consume_dispatch_attempt_ordinal(
+    tmp_path: Path,
+) -> None:
+    runtime = CortexRuntimeEngine(
+        config=_config(tmp_path, macro=False),
+        store=_store(tmp_path),
+        provider=FakeProvider(),
+    )
+    observation = ObservationEnvelope(
+        run_id="cortex-run",
+        episode_id="episode-1",
+        step_id=1,
+        game_loop=32,
+        state=SC2State(economy=EconomyState(army_supply=4, supply_used=8, supply_cap=15)),
+        available_actions=[
+            AvailableAction(
+                name="Move_Minimap",
+                argument_names=["minimap"],
+                argument_types=[ActionArgumentType.POSITION],
+                actor_scopes=["CombatGroup/Adept-1"],
+                argument_candidates=[[[20, 30]]],
+            )
+        ],
+    )
+    runtime._current_situation = DeterministicSituationAnalyzer().assess(observation)
+    intent = TacticalIntent(
+        intent_id="move-intent",
+        run_id=observation.run_id,
+        episode_id=observation.episode_id,
+        step_id=observation.step_id,
+        created_game_loop=observation.game_loop,
+        objective="Advance to the next waypoint",
+        action_names=["Move_Minimap"],
+        actor_scopes=["CombatGroup/Adept-1"],
+        source_id="test",
+        source_version="1",
+        ttl_game_loops=16,
+    )
+
+    rejected = runtime._compile_intent(observation, intent)
+    assert rejected is not None
+    operation_id = rejected.lineage.operation_id
+    assert operation_id is not None
+    assert rejected.lineage.attempt_id is None
+    assert rejected.command.attempt_id is None
+    assert runtime._attempt_ordinals == {}
+
+    accepted = runtime._compile_intent(
+        observation.model_copy(update={"step_id": 2, "game_loop": 33}),
+        intent.model_copy(update={"step_id": 2, "created_game_loop": 33}),
+        command_id="accepted-command",
+    )
+    assert accepted is not None
+    assert accepted.lineage.operation_id == operation_id
+    dispatched = runtime._bind_dispatch_attempt(accepted)
+
+    assert dispatched.lineage.attempt_ordinal == 0
+    assert dispatched.command.attempt_id == dispatched.lineage.attempt_id
+    assert runtime._attempt_ordinals[operation_id] == 1
+    asyncio.run(runtime.close())
+
+
 def test_opaque_future_step_cannot_dispatch_before_replan(tmp_path: Path) -> None:
     client = _FakeMacroClient(
         "Actions: ['Pylon', 'Gateway', 'Assimilator', 'CyberneticsCore', 'Stargate', 'Zealot']"
@@ -592,6 +654,173 @@ def test_opaque_future_step_cannot_dispatch_before_replan(tmp_path: Path) -> Non
     assert len(events) == 1
     assert events[0].payload["opaque_future_ordinals"] == [5]
     recovered.close()
+
+
+def test_opaque_future_expansion_cannot_dispatch_before_replan(tmp_path: Path) -> None:
+    client = _FakeMacroClient(
+        "Actions: ['Pylon', 'Gateway', 'Assimilator', 'CyberneticsCore', 'Stargate', 'Nexus']"
+    )
+    runtime = CortexRuntimeEngine(
+        config=_config(tmp_path),
+        store=_store(tmp_path),
+        provider=FakeProvider(),
+        macro_client=client,
+    )
+    observation = _macro_observation(step_id=0, game_loop=0)
+
+    async def exercise() -> None:
+        await runtime.start()
+        await runtime.tick(observation)
+        assert runtime._macro_task is not None
+        await runtime._macro_task
+        await runtime._collect_finished_macro(observation)
+        assert runtime._macro_plan is not None
+        assert runtime._macro_proposal is not None
+        assert [step.semantic_action for step in runtime._macro_plan.steps] == [
+            "BUILD PYLON",
+            "BUILD GATEWAY",
+            "BUILD ASSIMILATOR",
+            "BUILD CYBERNETICSCORE",
+            "BUILD STARGATE",
+        ]
+        assert runtime._macro_proposal.steps[-1].canonical_action == "BUILD NEXUS"
+        assert runtime._expansion_commitment_id is None
+        assert runtime._expansion_goal is None
+
+        runtime._macro_plan = runtime._macro_plan.model_copy(
+            update={
+                "steps": [
+                    step.model_copy(
+                        update={
+                            "status": MacroStepStatus.CONFIRMED,
+                            "completed_repeats": step.repeat,
+                        }
+                    )
+                    for step in runtime._macro_plan.steps
+                ]
+            }
+        )
+        prepared = runtime._prepare_macro_command(
+            observation,
+            DeterministicSituationAnalyzer().assess(observation),
+            runtime._macro_goal_progress(observation),
+        )
+
+        assert prepared is None
+        assert runtime._expansion_commitment_id is None
+        await runtime.close()
+
+    asyncio.run(exercise())
+
+
+def test_deferred_horizon_step_does_not_unlock_future_nexus(tmp_path: Path) -> None:
+    client = _FakeMacroClient(
+        "Actions: ['Pylon', 'Gateway', 'Assimilator', 'CyberneticsCore', 'Stargate', 'Nexus']"
+    )
+    runtime = CortexRuntimeEngine(
+        config=_config(tmp_path),
+        store=_store(tmp_path),
+        provider=FakeProvider(),
+        macro_client=client,
+    )
+    observation = _macro_observation(step_id=0, game_loop=0).model_copy(
+        update={
+            "state": SC2State(
+                economy=EconomyState(
+                    minerals=500,
+                    supply_used=12,
+                    supply_cap=23,
+                    workers=12,
+                ),
+                own_structures=[UnitState(unit_id="0x1", unit_type="Nexus", alliance="self")],
+            ),
+            "available_actions": [
+                AvailableAction(
+                    name="Build_Nexus_Near",
+                    argument_names=["tag"],
+                    argument_types=[ActionArgumentType.TAG],
+                    actor_scopes=["Builder/Probe-1"],
+                    argument_candidates=[["0x99"]],
+                )
+            ],
+        }
+    )
+
+    async def exercise() -> None:
+        await runtime.start()
+        await runtime.tick(observation)
+        assert runtime._macro_task is not None
+        await runtime._macro_task
+        await runtime._collect_finished_macro(observation)
+
+        prepared = runtime._prepare_macro_command(
+            observation,
+            DeterministicSituationAnalyzer().assess(observation),
+            runtime._macro_goal_progress(observation),
+        )
+
+        assert prepared is None
+        assert runtime._expansion_commitment_id is None
+        assert runtime._macro_plan is not None
+        assert runtime._macro_plan.steps[0].status is MacroStepStatus.DEFERRED
+        await runtime.close()
+
+    asyncio.run(exercise())
+
+
+def test_active_dispatched_expansion_can_continue_without_reauthorizing_future_step(
+    tmp_path: Path,
+) -> None:
+    runtime = CortexRuntimeEngine(
+        config=_config(tmp_path),
+        store=_store(tmp_path),
+        provider=FakeProvider(),
+        macro_client=_FakeMacroClient("Actions: ['Nexus']"),
+    )
+    observation = ObservationEnvelope(
+        run_id="cortex-run",
+        episode_id="episode-1",
+        step_id=0,
+        game_loop=0,
+        state=SC2State(
+            economy=EconomyState(
+                minerals=500,
+                supply_used=12,
+                supply_cap=23,
+                workers=12,
+            ),
+            own_structures=[UnitState(unit_id="0x1", unit_type="Nexus", alliance="self")],
+        ),
+        available_actions=[
+            AvailableAction(
+                name="Build_Nexus_Near",
+                argument_names=["tag"],
+                argument_types=[ActionArgumentType.TAG],
+                actor_scopes=["Builder/Probe-1"],
+                argument_candidates=[["0x99"]],
+            )
+        ],
+    )
+
+    async def exercise() -> None:
+        await runtime.start()
+        await runtime.tick(observation)
+        assert runtime._macro_task is not None
+        await runtime._macro_task
+        dispatched = await runtime.tick(
+            observation.model_copy(update={"step_id": 1, "game_loop": 1})
+        )
+
+        assert [command.name for command in dispatched.commands] == ["Build_Nexus_Near"]
+        assert runtime._expansion_commitment_dispatched is True
+        assert runtime._macro_proposal is not None
+        continuation = runtime._proposal_with_expansion_commitment(
+            runtime._macro_proposal.model_copy(update={"steps": []})
+        )
+        assert [step.canonical_action for step in continuation.steps] == ["BUILD NEXUS"]
+        await runtime.close()
+
+    asyncio.run(exercise())
 
 
 def test_slow_hima_plan_ttl_starts_at_acceptance_game_loop(tmp_path: Path) -> None:
@@ -1694,10 +1923,7 @@ def test_expansion_goal_reopens_on_new_candidate_epoch(
             }
         )
         runtime._update_expansion_candidate_state(same_generation_candidate)
-        runtime._ensure_expansion_commitment(
-            runtime._macro_proposal,
-            same_generation_candidate,
-        )
+        runtime._ensure_expansion_commitment(same_generation_candidate)
         assert runtime._expansion_commitment_id is None
         assert runtime._expansion_goal is not None
         assert runtime._expansion_goal.terminal_state is None
@@ -1715,10 +1941,7 @@ def test_expansion_goal_reopens_on_new_candidate_epoch(
             }
         )
         runtime._update_expansion_candidate_state(new_generation_candidate)
-        runtime._ensure_expansion_commitment(
-            runtime._macro_proposal,
-            new_generation_candidate,
-        )
+        runtime._ensure_expansion_commitment(new_generation_candidate)
         assert runtime._expansion_commitment_id is not None
         assert runtime._expansion_goal.phase == "active"
         await runtime.close()

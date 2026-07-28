@@ -62,7 +62,7 @@ class EventStorePerformance:
     writer_lag_ms_p95: float
     writer_lag_ms_max: float
     blocked_append_count: int
-    dropped_sampled_event_count: int
+    sampled_drop_supported: bool
     subscriber_dropped_events: int
     journal_bytes: int
 
@@ -155,7 +155,6 @@ class EventStore:
         self._writer_lag_ns_max = 0
         self._writer_lag_samples_ns: deque[int] = deque(maxlen=8192)
         self._blocked_append_count = 0
-        self._dropped_sampled_event_count = 0
         self._writer = threading.Thread(
             target=self._writer_main,
             name=f"rtscortex-event-writer-{id(self):x}",
@@ -278,7 +277,7 @@ class EventStore:
             writer_lag_ms_p95=lag_p95_ns / 1_000_000,
             writer_lag_ms_max=self._writer_lag_ns_max / 1_000_000,
             blocked_append_count=self._blocked_append_count,
-            dropped_sampled_event_count=self._dropped_sampled_event_count,
+            sampled_drop_supported=False,
             subscriber_dropped_events=sum(
                 subscriber.dropped_events for subscriber in self._subscribers.values()
             ),

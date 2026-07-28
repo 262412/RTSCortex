@@ -50,7 +50,7 @@ def profile(*, loops: int, events_per_loop: int) -> dict[str, float | int]:
             "writer_lag_ms_p95": performance.writer_lag_ms_p95,
             "writer_lag_ms_max": performance.writer_lag_ms_max,
             "blocked_append_count": performance.blocked_append_count,
-            "dropped_sampled_event_count": performance.dropped_sampled_event_count,
+            "sampled_drop_supported": performance.sampled_drop_supported,
             "append_latency_ms_mean": performance.append_latency_ms_mean,
         }
 

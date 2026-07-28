@@ -494,6 +494,13 @@ def _rule_content(
 def _assess(
     report: ExecutionReport,
 ) -> tuple[DecisionQuality, FailureOwner, float, str]:
+    if report.failure_code == "engagement_target_eliminated":
+        return (
+            DecisionQuality.INCONCLUSIVE,
+            FailureOwner.NONE,
+            0.8,
+            "The engagement target was eliminated by a peer actor; this command is neutral.",
+        )
     if report.success:
         return (
             DecisionQuality.CORRECT_EXECUTION,

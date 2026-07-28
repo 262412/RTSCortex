@@ -325,6 +325,18 @@ class DeterministicTacticalAgent:
         if target is None:
             return None
         key = (report.actor, target)
+        if failure_code == "engagement_target_eliminated":
+            self._target_failures.pop(key, None)
+            self._engagement_by_actor.pop(report.actor, None)
+            self._focus_target_by_actor.pop(report.actor, None)
+            self._known_enemy_structures.pop(target, None)
+            return {
+                "actor": report.actor,
+                "target_tag": target,
+                "state": "satisfied_by_peer",
+                "failure_count": 0,
+                "failure_code": failure_code,
+            }
         if report.status is ExecutionStatus.SUCCEEDED:
             self._target_failures.pop(key, None)
             engagement = self._engagement_by_actor.get(report.actor)

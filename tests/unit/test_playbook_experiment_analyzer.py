@@ -37,11 +37,12 @@ def _metrics(
         playbook_blocks=0,
         repeated_eligible_errors=repeated_errors,
         repeated_errors_per_10k_game_loops=float(repeated_errors * 100),
-        repeated_errors_per_eligible_operation=float(repeated_errors),
-        eligible_operation_count=1,
+        repeated_errors_per_lineaged_operation=float(repeated_errors),
+        lineaged_operation_count=1,
         strategic_consequences={},
         hard_rule_false_block_count=0,
         hard_rule_shadow_state_count=100,
+        hard_rule_unresolved_block_count=0,
         hard_rule_false_block_rate=0.0,
         journal_bytes=100,
         artifact_bytes=200,
@@ -54,7 +55,7 @@ def _metrics(
         writer_lag_ms_p95=1.0,
         writer_lag_ms_max=2.0,
         blocked_append_count=0,
-        dropped_sampled_event_count=0,
+        sampled_drop_supported=False,
         playbook_before_sha256=before,
         playbook_after_sha256=after,
     )
@@ -172,6 +173,15 @@ def test_run_metrics_streams_events_and_normalizes_error_exposure(
             created_at="2026-07-28T00:00:01+00:00",
             payload={"lineage": {"operation_id": "operation:one"}},
         ),
+        StoredEvent(
+            event_id=20,
+            run_id="run",
+            episode_id="episode",
+            step_id=2,
+            event_type="command_lineage",
+            created_at="2026-07-28T00:00:01.500000+00:00",
+            payload={"lineage": {"operation_id": "operation:unrelated"}},
+        ),
         *(
             StoredEvent(
                 event_id=index,
@@ -201,7 +211,7 @@ def test_run_metrics_streams_events_and_normalizes_error_exposure(
                 "writer_lag_ms_p95": 2.5,
                 "writer_lag_ms_max": 4.0,
                 "blocked_append_count": 0,
-                "dropped_sampled_event_count": 0,
+                "sampled_drop_supported": False,
             },
         ),
     )
@@ -221,10 +231,173 @@ def test_run_metrics_streams_events_and_normalizes_error_exposure(
         }
     )
 
-    assert metrics.event_count == 5
+    assert metrics.event_count == 6
     assert metrics.artifact_bytes >= metrics.journal_bytes
     assert metrics.repeated_eligible_errors == 1
     assert metrics.repeated_errors_per_10k_game_loops == 100.0
-    assert metrics.repeated_errors_per_eligible_operation == 1.0
+    assert metrics.repeated_errors_per_lineaged_operation == 0.5
+    assert metrics.lineaged_operation_count == 2
     assert metrics.writer_queue_peak == 3
     assert metrics.writer_lag_ms_p95 == 2.5
+    assert metrics.sampled_drop_supported is False
+
+
+def test_false_blocks_are_preserved_when_hard_rule_becomes_suspended(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metrics = _metrics_for_rule_evaluations(
+        tmp_path,
+        monkeypatch,
+        [
+            _rule_evaluation(
+                event_id=1,
+                evaluation_id="evaluation:hard-before-suspend",
+                strength="hard",
+                status="active",
+                false_block=True,
+            )
+        ],
+    )
+
+    assert metrics.hard_rule_false_block_count == 1
+    assert metrics.hard_rule_shadow_state_count == 1
+    assert metrics.hard_rule_false_block_rate == 1.0
+
+
+def test_soft_to_hard_transition_does_not_import_historical_false_blocks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metrics = _metrics_for_rule_evaluations(
+        tmp_path,
+        monkeypatch,
+        [
+            _rule_evaluation(
+                event_id=1,
+                evaluation_id="evaluation:soft-history",
+                strength="soft",
+                status="active",
+                false_block=True,
+            ),
+            _rule_evaluation(
+                event_id=2,
+                evaluation_id="evaluation:hard-current",
+                strength="hard",
+                status="active",
+                false_block=False,
+            ),
+        ],
+    )
+
+    assert metrics.hard_rule_false_block_count == 0
+    assert metrics.hard_rule_shadow_state_count == 1
+
+
+def test_retired_rule_run_delta_uses_event_time_strength(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metrics = _metrics_for_rule_evaluations(
+        tmp_path,
+        monkeypatch,
+        [
+            _rule_evaluation(
+                event_id=1,
+                evaluation_id="evaluation:active-hard",
+                strength="hard",
+                status="active",
+                false_block=True,
+            ),
+            _rule_evaluation(
+                event_id=2,
+                evaluation_id="evaluation:after-retirement",
+                strength="hard",
+                status="retired",
+                false_block=True,
+            ),
+        ],
+    )
+
+    assert metrics.hard_rule_false_block_count == 1
+    assert metrics.hard_rule_shadow_state_count == 1
+
+
+def test_unresolved_active_hard_block_cannot_pass_false_block_gate() -> None:
+    baseline = "baseline"
+    metrics = [
+        _metrics(
+            mode=mode,
+            seed=seed,
+            arm=arm,
+            before=baseline,
+            after=baseline if arm == "frozen" else f"{mode}-{seed}",
+            repeated_errors=0,
+        )
+        for mode in ("independent_paired", "sequential_learning")
+        for seed in (0, 1, 2)
+        for arm in ("frozen", "evolving")
+    ]
+    first = metrics[0]
+    metrics[0] = first.__class__(
+        **{
+            **first.__dict__,
+            "hard_rule_unresolved_block_count": 1,
+        }
+    )
+
+    comparison = _comparison(metrics, baseline_sha256=baseline)
+
+    assert comparison["gates"]["hard_false_block_rate_at_most_1_percent"] is False
+    assert comparison["accepted"] is False
+
+
+def _metrics_for_rule_evaluations(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    evaluations: list[StoredEvent],
+) -> RunMetrics:
+    run_dir = tmp_path / f"run-{len(list(tmp_path.iterdir()))}"
+    run_dir.mkdir()
+    (run_dir / "events.jsonl").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr(analyzer, "read_event_log", lambda _: iter(evaluations))
+    return analyzer._run_metrics(
+        {
+            "mode": "independent_paired",
+            "seed": "0",
+            "arm": "frozen",
+            "exit_code": "0",
+            "run_dir": str(run_dir),
+            "playbook_before_snapshot": str(tmp_path / "before.sqlite3"),
+            "playbook_after_snapshot": str(tmp_path / "after.sqlite3"),
+            "playbook_before_sha256": "before",
+            "playbook_after_sha256": "after",
+        }
+    )
+
+
+def _rule_evaluation(
+    *,
+    event_id: int,
+    evaluation_id: str,
+    strength: str,
+    status: str,
+    false_block: bool | None,
+) -> StoredEvent:
+    return StoredEvent(
+        event_id=event_id,
+        run_id="run",
+        episode_id="episode",
+        step_id=event_id,
+        event_type="playbook_rule_evaluated",
+        created_at=f"2026-07-28T00:00:0{event_id}+00:00",
+        payload={
+            "evaluation_id": evaluation_id,
+            "rule_id": "rule:test",
+            "strength_at_evaluation": strength,
+            "status_at_evaluation": status,
+            "shadow_decision": "would_block",
+            "actual_outcome": "succeeded" if false_block else "failed",
+            "false_block": false_block,
+        },
+    )

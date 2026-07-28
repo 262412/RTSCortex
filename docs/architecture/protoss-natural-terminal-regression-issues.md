@@ -207,10 +207,12 @@ SCX-PT-039; it is not implied by this code-review closure.
 
 - **Root cause:** the synthetic writer profile proved bounded memory but did not
   measure real SC2 event payloads, writer lag or end-to-end game-loop speed.
-- **Correction:** EventStore now exposes writer-lag p95/max, blocked durable
-  appends and dropped sampled events. Runtime emits an
+- **Correction:** EventStore now exposes writer-lag p95/max and blocked durable
+  appends. Runtime emits an
   `event_store_performance` terminal event, and the profiling/report path
-  includes event and byte exposure.
+  includes event and byte exposure. Durable events do not currently implement
+  a sampled-drop lane, so the report states
+  `sampled_drop_supported: false` instead of publishing an inert zero counter.
 - **Real smoke:** Slurm job `9988137`, HIMA Protoss-a, active Cortex, 508-step
   bounded live smoke, completed with exit code `0:0`.
 
@@ -222,13 +224,15 @@ writer_queue_peak/capacity: 7/8192
 writer_lag_ms_p95: 420.75
 writer_lag_ms_max: 500.53
 blocked_append_count: 0
-dropped_sampled_event_count: 0
+sampled_drop_supported: false
 artifact_size_bytes: 1,546,192
 ```
 
-The live producer did not approach queue saturation and lost no sampled events.
-This closes the single-run persistence performance gate; natural-terminal
-artifact growth must still be reported by the paired acceptance experiment.
+The live producer did not approach queue saturation and performed no blocked
+durable append. Because sampled dropping is unsupported, this run makes no
+claim about sampled-event loss. This closes the single-run persistence
+performance gate; natural-terminal artifact growth must still be reported by
+the paired acceptance experiment.
 
 ### Terran add-on footprint ownership
 
@@ -249,12 +253,13 @@ artifact growth must still be reported by the paired acceptance experiment.
   memory and compared only raw repeated-error totals, biasing runs of different
   duration.
 - **Correction:** the analyzer makes one streaming pass over each journal and
-  reports repeated errors as a total, per 10,000 game loops and per eligible
+  reports repeated errors as a total, per 10,000 game loops and per lineaged
   operation. Pair-level reduction uses pooled game-loop exposure. It also
   reports live event rate, byte rate, writer performance and total artifact
   size.
 - **Evidence:** tests use a one-shot iterator to reject a second pass and lock
-  both normalized denominators.
+  both normalized denominators. The all-lineage denominator is named explicitly
+  and is not presented as an error-specific eligible exposure.
 
 ### Defense-unit saturation
 
@@ -268,6 +273,129 @@ artifact growth must still be reported by the paired acceptance experiment.
 - **Evidence:** a sustained air-threat test verifies that five Phoenixes plus
   one queued Phoenix satisfy the Protoss limit and suppress another emergency
   training proposal.
+
+## 2026-07-28 final pre-acceptance review closure
+
+The review of `0d5d4c6` identified two formal-acceptance blockers, one
+FocusFire/Playbook metric contaminant and three semantic or observability
+defects. All six are closed at code and deterministic-test level below. This
+does not itself claim that the independent Frozen/Evolving multi-seed
+experiment under SCX-PT-039 has run.
+
+### Expansion continuation cannot authorize an opaque future Nexus
+
+- **Evidence:** the bounded `MacroPlan` may contain ordinals 0-4 while the full
+  HIMA provenance still contains a Nexus at ordinal 5 or later. An expansion
+  commitment previously inspected the full proposal, then injected a synthetic
+  Nexus into the remaining proposal when a current step was deferred.
+- **Impact:** Runtime could execute a macro action outside the finite HIMA
+  execution horizon, invalidating strategy attribution and paired evaluation.
+- **Root cause:** expansion authorization and ordinary macro authorization used
+  different sources: `MacroPlan.steps` for ordinary actions and the complete
+  `MacroPolicyProposal` for expansion.
+- **Correction:** `_ensure_expansion_commitment()` now intersects the proposal
+  with the active plan's executable ordinals. An undispatched commitment is
+  cancelled when no current executable townhall step authorizes it. Synthetic
+  continuation is permitted only after the expansion command has actually
+  entered `DISPATCHED`, and that dispatched bit is checkpointed and recovered.
+- **Acceptance evidence:**
+  `test_opaque_future_expansion_cannot_dispatch_before_replan`,
+  `test_deferred_horizon_step_does_not_unlock_future_nexus` and
+  `test_active_dispatched_expansion_can_continue_without_reauthorizing_future_step`.
+
+### Hard-rule false-block accounting is event-time based
+
+- **Evidence:** before/after SQLite snapshots filtered rules by their final
+  `active + hard` state. A hard rule suspended or retired during a run lost
+  current-run false blocks, while a soft rule promoted to hard imported
+  historical counters.
+- **Impact:** a twelve-run experiment could falsely pass or fail the hard-rule
+  false-block gate even when every game completed successfully.
+- **Root cause:** mutable rule-lifecycle snapshots were used as a substitute for
+  immutable per-decision evidence.
+- **Correction:** each application now records a `playbook_rule_evaluated`
+  event containing rule strength/status at evaluation time, shadow decision,
+  target, actual terminal outcome and false-block result. The analyzer folds the
+  latest record for each evaluation ID directly from the run journal. Active
+  hard blocks without observable counterfactual outcomes remain unresolved and
+  fail the gate rather than being interpreted as zero false blocks.
+- **Acceptance evidence:**
+  `test_false_blocks_are_preserved_when_hard_rule_becomes_suspended`,
+  `test_soft_to_hard_transition_does_not_import_historical_false_blocks`,
+  `test_retired_rule_run_delta_uses_event_time_strength` and
+  `test_unresolved_active_hard_block_cannot_pass_false_block_gate`.
+
+### One killed target produces one kill and neutral peer terminals
+
+- **Evidence:** multiple exact-bound actors can attack the same target. The
+  first command claimed `target_removed`; peers remained pending and later
+  became `combat_target_lost` or timeout failures.
+- **Impact:** valid FocusFire engagements generated false tactical failures,
+  repeated-error signatures and incorrect Playbook lessons.
+- **Root cause:** damage evidence was intentionally one-to-one, but target
+  removal had no engagement-level terminalization rule for other actors that
+  had held the same exact attack order.
+- **Correction:** target removal still confirms exactly one command as the kill.
+  Other accepted commands whose actors remain exact-bound to that target end as
+  `cancelled / engagement_target_eliminated` with
+  `confirmation_kind=satisfied_by_peer`. Tactical state treats this as a
+  satisfied engagement, the reviewer treats it as inconclusive rather than an
+  error, and metrics expose a separate neutral
+  `meaningful_satisfied_by_peer` category excluded from successes, failures and
+  backlog.
+- **Acceptance evidence:**
+  `test_target_removal_terminalizes_all_exact_bound_commands_in_engagement` and
+  `test_peer_satisfied_attack_is_not_counted_as_failure_or_duplicate_kill`.
+
+### Persistence reports unsupported sampled dropping honestly
+
+- **Evidence:** durable queue saturation blocks or raises; no production path
+  identifies and drops sampled telemetry. The old
+  `dropped_sampled_event_count` therefore remained zero by construction.
+- **Impact:** reports could present an inert zero as proof that lossy telemetry
+  had no drops.
+- **Root cause:** a planned sampled telemetry lane was represented in the
+  metrics contract before it existed.
+- **Correction:** the inert counter is removed from `EventStorePerformance`,
+  profiler and experiment analyzer. Reports now publish
+  `sampled_drop_supported: false`. Subscriber drop accounting remains a
+  separate, real metric.
+- **Acceptance criterion:** no report may claim sampled-drop losslessness until
+  a real sampled lane and increment path exist.
+
+### Attempt ordinals count dispatches, not materializations
+
+- **Evidence:** candidate compilation previously incremented the operation's
+  attempt ordinal before ProgressGuard, candidate validation, arbitration and
+  final validation.
+- **Impact:** a rejected candidate could consume ordinal 0, causing the first
+  real dispatch to be labelled attempt 1.
+- **Root cause:** attempt identity was bound where a command object was
+  materialized rather than at the accepted-dispatch boundary.
+- **Correction:** materialized commands carry the stable operation ID but no
+  attempt ID. After final validation accepts the command, Runtime binds the next
+  ordinal immediately before dispatch persistence and records the bound lineage.
+  Lifecycle equality permits only this single immutable enrichment.
+- **Acceptance evidence:**
+  `test_rejected_materialization_does_not_consume_dispatch_attempt_ordinal`;
+  restart recovery continues to advance from the maximum durable dispatched
+  ordinal.
+
+### Operation-normalized metrics use an accurate denominator name
+
+- **Evidence:** the analyzer denominator contains every unique operation present
+  in command lineage, including operations unrelated to a particular strategic
+  consequence.
+- **Impact:** the old name `eligible_operation_count` overstated the semantic
+  specificity of the exposure and could mislead downstream analysis.
+- **Root cause:** no error-type-specific exposure predicate exists in the
+  current event schema.
+- **Correction:** fields are renamed to `lineaged_operation_count` and
+  `repeated_errors_per_lineaged_operation`. The primary paired acceptance gate
+  remains the pooled game-loop-normalized rate. A truly eligible denominator
+  must wait for explicit per-error exposure predicates.
+- **Acceptance evidence:** the analyzer regression includes an unrelated
+  lineaged operation and verifies the honest all-lineage denominator.
 
 ## Resolved and removed from the open register
 

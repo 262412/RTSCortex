@@ -105,33 +105,7 @@ class CombatEffectVerifier:
                 continue
             pending.latest_game_loop = game_loop
             target = _unit_by_tag(observation, pending.target_tag)
-            actors = tuple(
-                unit
-                for tag in pending.actor_tags
-                if (unit := _unit_by_tag(observation, tag)) is not None
-            )
-            bound_ability_ids = tuple(
-                sorted(
-                    {
-                        ability_id
-                        for actor in actors
-                        for ability_id in _attack_abilities_targeting_tag(
-                            actor,
-                            pending.target_tag,
-                        )
-                    }
-                )
-            )
-            current_order_bound = bool(bound_ability_ids)
-            pending.current_actor_order_bound = current_order_bound
-            pending.current_actor_order_ability_ids = bound_ability_ids
-            pending.actor_order_ever_bound = pending.actor_order_ever_bound or current_order_bound
-            if current_order_bound:
-                pending.order_missing_since_game_loop = None
-            elif pending.actor_order_ever_bound:
-                pending.order_missing_since_game_loop = (
-                    pending.order_missing_since_game_loop or game_loop
-                )
+            self._refresh_actor_order(pending, observation, game_loop)
             if target is not None:
                 pending.target_type = pending.target_type or _unit_name(target, self.unit_names)
                 pending.observed_health = _health_pool(target)
@@ -157,6 +131,33 @@ class CombatEffectVerifier:
                 )
                 claimed_damage_targets.add(pending.target_tag)
                 del self._pending[command_id]
+                if target_removed:
+                    for peer_id, peer in ordered_pending:
+                        if (
+                            peer_id not in self._pending
+                            or peer_id == command_id
+                            or peer.accepted_game_loop is None
+                            or peer.target_tag != pending.target_tag
+                        ):
+                            continue
+                        peer.latest_game_loop = game_loop
+                        self._refresh_actor_order(peer, observation, game_loop)
+                        if not peer.current_actor_order_bound:
+                            continue
+                        verdicts.append(
+                            EffectVerdict(
+                                peer_id,
+                                False,
+                                (
+                                    "Attack_Unit engagement target was eliminated while "
+                                    "this exact actor remained bound"
+                                ),
+                                status="cancelled",
+                                failure_code="engagement_target_eliminated",
+                                evidence=self._evidence(peer, "satisfied_by_peer"),
+                            )
+                        )
+                        del self._pending[peer_id]
                 if damage_observed and pending.observed_health is not None:
                     for other in self._pending.values():
                         if other.target_tag == pending.target_tag:
@@ -217,6 +218,40 @@ class CombatEffectVerifier:
             )
             del self._pending[command_id]
         return verdicts
+
+    @staticmethod
+    def _refresh_actor_order(
+        pending: _PendingCombat,
+        observation: Any,
+        game_loop: int,
+    ) -> None:
+        actors = tuple(
+            unit
+            for tag in pending.actor_tags
+            if (unit := _unit_by_tag(observation, tag)) is not None
+        )
+        bound_ability_ids = tuple(
+            sorted(
+                {
+                    ability_id
+                    for actor in actors
+                    for ability_id in _attack_abilities_targeting_tag(
+                        actor,
+                        pending.target_tag,
+                    )
+                }
+            )
+        )
+        current_order_bound = bool(bound_ability_ids)
+        pending.current_actor_order_bound = current_order_bound
+        pending.current_actor_order_ability_ids = bound_ability_ids
+        pending.actor_order_ever_bound = pending.actor_order_ever_bound or current_order_bound
+        if current_order_bound:
+            pending.order_missing_since_game_loop = None
+        elif pending.actor_order_ever_bound:
+            pending.order_missing_since_game_loop = (
+                pending.order_missing_since_game_loop or game_loop
+            )
 
     def cancel(self, command_id: str) -> None:
         self._pending.pop(command_id, None)

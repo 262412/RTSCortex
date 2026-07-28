@@ -1177,6 +1177,7 @@ def _render_execution_metrics(metrics: ExecutionMetrics) -> list[str]:
                 f"- Meaningful commands: `{metrics.meaningful_commands}` — "
                 f"`{metrics.meaningful_successes}` succeeded, "
                 f"`{metrics.meaningful_failures}` failed, "
+                f"`{metrics.meaningful_satisfied_by_peer}` satisfied by peer, "
                 f"`{metrics.meaningful_cancelled}` cancelled, "
                 f"`{metrics.meaningful_unconfirmed}` unconfirmed."
             ),

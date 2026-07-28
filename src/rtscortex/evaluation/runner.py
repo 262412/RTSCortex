@@ -216,11 +216,12 @@ def _write_markdown_report(
             "## Meaningful outcomes",
             "",
             (
-                "| Variant | Commands | Succeeded | Failed | Cancelled | Unconfirmed | "
+                "| Variant | Commands | Succeeded | Failed | Peer-satisfied | "
+                "Cancelled | Unconfirmed | "
                 "Meaningful success | Completed success | Backlog | Terminal coverage | "
                 "Unexpected terminal | Failure classification | Transport NoOps |"
             ),
-            "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+            "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
         ]
     )
     for display_variant, metrics in variants.items():
@@ -229,6 +230,7 @@ def _write_markdown_report(
             f"| `{display_variant}` | {execution['meaningful_commands']} | "
             f"{execution['meaningful_successes']} | "
             f"{execution['meaningful_failures']} | "
+            f"{execution['meaningful_satisfied_by_peer']} | "
             f"{execution['meaningful_cancelled']} | "
             f"{execution['meaningful_unconfirmed']} | "
             f"{execution['meaningful_action_success_rate']:.3f} | "

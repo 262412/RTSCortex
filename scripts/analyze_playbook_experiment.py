@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import sqlite3
 from collections import Counter
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -46,11 +45,12 @@ class RunMetrics:
     playbook_blocks: int
     repeated_eligible_errors: int
     repeated_errors_per_10k_game_loops: float
-    repeated_errors_per_eligible_operation: float
-    eligible_operation_count: int
+    repeated_errors_per_lineaged_operation: float
+    lineaged_operation_count: int
     strategic_consequences: dict[str, int]
     hard_rule_false_block_count: int
     hard_rule_shadow_state_count: int
+    hard_rule_unresolved_block_count: int
     hard_rule_false_block_rate: float
     journal_bytes: int
     artifact_bytes: int
@@ -63,7 +63,7 @@ class RunMetrics:
     writer_lag_ms_p95: float
     writer_lag_ms_max: float
     blocked_append_count: int
-    dropped_sampled_event_count: int
+    sampled_drop_supported: bool
     playbook_before_sha256: str
     playbook_after_sha256: str
 
@@ -97,7 +97,8 @@ def _run_metrics(row: dict[str, str]) -> RunMetrics:
     playbook_blocks = 0
     candidate_outside_dispatch = 0
     max_game_loop = 0
-    eligible_operation_ids: set[str] = set()
+    lineaged_operation_ids: set[str] = set()
+    rule_evaluations: dict[str, dict[str, Any]] = {}
     first_timestamp: datetime | None = None
     last_timestamp: datetime | None = None
     event_count = 0
@@ -134,7 +135,7 @@ def _run_metrics(row: dict[str, str]) -> RunMetrics:
                 lineage = event.payload.get("lineage", event.payload)
                 operation_id = lineage.get("operation_id") if isinstance(lineage, dict) else None
                 if isinstance(operation_id, str):
-                    eligible_operation_ids.add(operation_id)
+                    lineaged_operation_ids.add(operation_id)
             elif event.event_type == "strategic_consequence_attributed":
                 consequence_type = str(event.payload.get("consequence_type", "unknown"))
                 consequences[consequence_type] += 1
@@ -148,6 +149,10 @@ def _run_metrics(row: dict[str, str]) -> RunMetrics:
                 playbook_blocks += event.payload.get("blocked") is True
             elif event.event_type == "event_store_performance":
                 performance = event.payload
+            elif event.event_type == "playbook_rule_evaluated":
+                evaluation_id = event.payload.get("evaluation_id")
+                if isinstance(evaluation_id, str):
+                    rule_evaluations[evaluation_id] = event.payload
 
     elapsed_seconds = (
         0.0
@@ -155,20 +160,28 @@ def _run_metrics(row: dict[str, str]) -> RunMetrics:
         else max(0.0, (last_timestamp - first_timestamp).total_seconds())
     )
     repeated_errors = sum(max(0, count - 1) for count in error_signatures.values())
-    eligible_operation_count = len(eligible_operation_ids) or len(dispatch_counts)
+    lineaged_operation_count = len(lineaged_operation_ids) or len(dispatch_counts)
+    hard_evaluations = [
+        evaluation
+        for evaluation in rule_evaluations.values()
+        if evaluation.get("strength_at_evaluation") == "hard"
+        and evaluation.get("status_at_evaluation") == "active"
+    ]
+    false_blocks = sum(evaluation.get("false_block") is True for evaluation in hard_evaluations)
+    shadow_states = sum(
+        isinstance(evaluation.get("false_block"), bool) for evaluation in hard_evaluations
+    )
+    unresolved_blocks = sum(
+        evaluation.get("shadow_decision") == "would_block"
+        and evaluation.get("actual_outcome") == "blocked"
+        and evaluation.get("false_block") is None
+        for evaluation in hard_evaluations
+    )
     terminal_report_count = sum(terminal_counts.values())
     dispatched_ids = set(dispatch_counts)
     terminal_ids = set(terminal_counts)
     journal_bytes = journal.stat().st_size if journal.is_file() else 0
     artifact_bytes = sum(path.stat().st_size for path in run_dir.rglob("*") if path.is_file())
-    before_false_blocks, before_shadow_states = _hard_false_blocks(
-        Path(row["playbook_before_snapshot"])
-    )
-    after_false_blocks, after_shadow_states = _hard_false_blocks(
-        Path(row["playbook_after_snapshot"])
-    )
-    false_blocks = max(0, after_false_blocks - before_false_blocks)
-    shadow_states = max(0, after_shadow_states - before_shadow_states)
     return RunMetrics(
         mode=row["mode"],
         seed=int(row["seed"]),
@@ -197,13 +210,14 @@ def _run_metrics(row: dict[str, str]) -> RunMetrics:
         repeated_errors_per_10k_game_loops=(
             repeated_errors * 10_000 / max_game_loop if max_game_loop else 0.0
         ),
-        repeated_errors_per_eligible_operation=(
-            repeated_errors / eligible_operation_count if eligible_operation_count else 0.0
+        repeated_errors_per_lineaged_operation=(
+            repeated_errors / lineaged_operation_count if lineaged_operation_count else 0.0
         ),
-        eligible_operation_count=eligible_operation_count,
+        lineaged_operation_count=lineaged_operation_count,
         strategic_consequences=dict(sorted(consequences.items())),
         hard_rule_false_block_count=false_blocks,
         hard_rule_shadow_state_count=shadow_states,
+        hard_rule_unresolved_block_count=unresolved_blocks,
         hard_rule_false_block_rate=(false_blocks / shadow_states if shadow_states else 0.0),
         journal_bytes=journal_bytes,
         artifact_bytes=artifact_bytes,
@@ -218,29 +232,10 @@ def _run_metrics(row: dict[str, str]) -> RunMetrics:
         writer_lag_ms_p95=float(performance.get("writer_lag_ms_p95", 0.0)),
         writer_lag_ms_max=float(performance.get("writer_lag_ms_max", 0.0)),
         blocked_append_count=int(performance.get("blocked_append_count", 0)),
-        dropped_sampled_event_count=int(performance.get("dropped_sampled_event_count", 0)),
+        sampled_drop_supported=bool(performance.get("sampled_drop_supported", False)),
         playbook_before_sha256=row["playbook_before_sha256"],
         playbook_after_sha256=row["playbook_after_sha256"],
     )
-
-
-def _hard_false_blocks(path: Path) -> tuple[int, int]:
-    if not path.is_file():
-        return 0, 0
-    connection = sqlite3.connect(path)
-    try:
-        rows = connection.execute("SELECT payload_json FROM playbook_rules_v2").fetchall()
-    finally:
-        connection.close()
-    false_blocks = 0
-    shadow_states = 0
-    for (encoded,) in rows:
-        payload = json.loads(str(encoded))
-        if payload.get("strength") != "hard" or payload.get("status") != "active":
-            continue
-        false_blocks += int(payload.get("false_block_count", 0))
-        shadow_states += int(payload.get("shadow_state_count", 0))
-    return false_blocks, shadow_states
 
 
 def _consequence_signature(payload: dict[str, Any]) -> str:
@@ -291,8 +286,8 @@ def _comparison(metrics: list[RunMetrics], *, baseline_sha256: str) -> dict[str,
                         - frozen.repeated_errors_per_10k_game_loops
                     ),
                     "repeated_error_per_operation_delta": (
-                        evolving.repeated_errors_per_eligible_operation
-                        - frozen.repeated_errors_per_eligible_operation
+                        evolving.repeated_errors_per_lineaged_operation
+                        - frozen.repeated_errors_per_lineaged_operation
                     ),
                     "win_delta": _win(evolving.outcome) - _win(frozen.outcome),
                 }
@@ -339,6 +334,7 @@ def _comparison(metrics: list[RunMetrics], *, baseline_sha256: str) -> dict[str,
     )
     false_blocks = sum(metric.hard_rule_false_block_count for metric in metrics)
     shadow_states = sum(metric.hard_rule_shadow_state_count for metric in metrics)
+    unresolved_hard_blocks = sum(metric.hard_rule_unresolved_block_count for metric in metrics)
     gates = {
         "complete_unique_run_matrix": (
             len(metrics) == len(expected_matrix) and observed_matrix == expected_matrix
@@ -357,13 +353,15 @@ def _comparison(metrics: list[RunMetrics], *, baseline_sha256: str) -> dict[str,
             metric.candidate_outside_dispatch == 0 for metric in metrics
         ),
         "hard_false_block_rate_at_most_1_percent": (
-            shadow_states > 0 and false_blocks / shadow_states <= 0.01
+            shadow_states > 0
+            and unresolved_hard_blocks == 0
+            and false_blocks / shadow_states <= 0.01
         ),
         "repeated_error_reduction_at_least_50_percent": reduction >= 0.5,
         "matched_win_rate_not_reduced": (sum(item["win_delta"] for item in independent_pairs) >= 0),
     }
     return {
-        "schema_version": "1.0",
+        "schema_version": "1.1",
         "baseline_sha256": baseline_sha256,
         "runs": [asdict(metric) for metric in metrics],
         "paired_differences": paired,
@@ -375,6 +373,7 @@ def _comparison(metrics: list[RunMetrics], *, baseline_sha256: str) -> dict[str,
             "independent_repeated_error_reduction": reduction,
             "hard_rule_false_block_count": false_blocks,
             "hard_rule_shadow_state_count": shadow_states,
+            "hard_rule_unresolved_block_count": unresolved_hard_blocks,
             "hard_rule_false_block_rate": (false_blocks / shadow_states if shadow_states else 0.0),
         },
         "gates": gates,
@@ -426,7 +425,7 @@ def _markdown(report: dict[str, Any]) -> str:
             "## Runtime persistence",
             "",
             "| Mode | Seed | Arm | loops/s | events/loop | bytes/loop "
-            "| artifact bytes | queue peak | writer p95 ms | blocked | dropped |",
+            "| artifact bytes | queue peak | writer p95 ms | blocked | sampled drop |",
             "|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|",
         ]
     )
@@ -438,7 +437,7 @@ def _markdown(report: dict[str, Any]) -> str:
             f"{item['bytes_per_game_loop']:.3f} | "
             f"{item['artifact_bytes']} | {item['writer_queue_peak']} | "
             f"{item['writer_lag_ms_p95']:.3f} | {item['blocked_append_count']} | "
-            f"{item['dropped_sampled_event_count']} |"
+            f"{'supported' if item['sampled_drop_supported'] else 'unsupported'} |"
         )
         for item in report["runs"]
     )

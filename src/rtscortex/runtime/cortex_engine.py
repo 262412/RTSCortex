@@ -80,6 +80,7 @@ from rtscortex.playbook import (
     PlaybookQuery,
     PlaybookRule,
     PlaybookRuleApplication,
+    PlaybookRuleEvaluation,
     PlaybookSelection,
     PlaybookStore,
     RecentTerminalFeedback,
@@ -238,6 +239,7 @@ class CortexRuntimeEngine(RuntimeEngine):
         self._playbook_selection: PlaybookSelection | None = None
         self._playbook_selection_fingerprint: tuple[str, ...] | None = None
         self._playbook_rules: tuple[PlaybookRule, ...] = ()
+        self._pending_playbook_rule_evaluations: dict[str, PlaybookRuleEvaluation] = {}
         self._playbook_promotion_sweep_done = False
         self._playbook_intent_guard = PlaybookIntentGuard()
         self._playbook_candidate_guard = PlaybookCandidateGuard()
@@ -257,6 +259,7 @@ class CortexRuntimeEngine(RuntimeEngine):
         self._expansion_scout_state = "not_discovered_yet"
         self._expansion_scout_generation = 0
         self._expansion_commitment_generation: int | None = None
+        self._expansion_commitment_dispatched = False
         self._expansion_exhausted_generation: int | None = None
         self._expansion_scout_visited_waypoints = 0
         self._expansion_scout_total_waypoints = 0
@@ -490,7 +493,11 @@ class CortexRuntimeEngine(RuntimeEngine):
         )
         outcome = self.validator.validate(arbitration.selected, observation)
         rejected_commands.extend(self._apply_validation_failures(outcome.failures, observation))
-        accepted_commands = outcome.accepted
+        accepted_commands: list[ActionCommand] = []
+        for command in outcome.accepted:
+            prepared_command = self._bind_dispatch_attempt(prepared_by_id[command.command_id])
+            prepared_by_id[command.command_id] = prepared_command
+            accepted_commands.append(prepared_command.command)
         accepted_ids = {command.command_id for command in accepted_commands}
 
         for command in planner_candidates:
@@ -540,6 +547,24 @@ class CortexRuntimeEngine(RuntimeEngine):
                     prepared_command.semantic_action,
                     prepared_command.macro_step_ordinal,
                 )
+                if (
+                    self._expansion_commitment_id is not None
+                    and prepared_command.semantic_action
+                    == self._semantic_action_for_target(self._race_profile.data.townhall_types[0])
+                    and not self._expansion_commitment_dispatched
+                ):
+                    self._expansion_commitment_dispatched = True
+                    self._record_cortex_event(
+                        observation,
+                        "expansion_commitment_dispatched",
+                        {
+                            "commitment_id": self._expansion_commitment_id,
+                            "command_id": command.command_id,
+                            "operation_id": command.operation_id,
+                            "macro_plan_id": plan_id,
+                            "macro_step_ordinal": prepared_command.macro_step_ordinal,
+                        },
+                    )
                 if prepared_command.macro_step_ordinal is not None:
                     self._set_macro_step_status(
                         prepared_command.macro_step_ordinal,
@@ -717,6 +742,7 @@ class CortexRuntimeEngine(RuntimeEngine):
         self._playbook_selection = None
         self._playbook_selection_fingerprint = None
         self._playbook_rules = ()
+        self._pending_playbook_rule_evaluations = {}
         self._recent_terminal_feedback = {}
         self._current_situation = None
         self._macro_goal = None
@@ -733,6 +759,7 @@ class CortexRuntimeEngine(RuntimeEngine):
         self._expansion_scout_state = "not_discovered_yet"
         self._expansion_scout_generation = 0
         self._expansion_commitment_generation = None
+        self._expansion_commitment_dispatched = False
         self._expansion_exhausted_generation = None
         self._expansion_scout_visited_waypoints = 0
         self._expansion_scout_total_waypoints = 0
@@ -849,6 +876,12 @@ class CortexRuntimeEngine(RuntimeEngine):
             "expansion_commitment_terminal",
             after_event_id=checkpoint_event_id,
         )
+        dispatched_commitment = self.store.last_event(
+            observation.run_id,
+            observation.episode_id,
+            "expansion_commitment_dispatched",
+            after_event_id=checkpoint_event_id,
+        )
         goal_event_types = {
             "expansion_goal_started",
             "expansion_goal_reopened",
@@ -900,6 +933,12 @@ class CortexRuntimeEngine(RuntimeEngine):
             self._expansion_commitment_generation = (
                 int(generation) if isinstance(generation, int) else None
             )
+            self._expansion_commitment_dispatched = False
+            if (
+                dispatched_commitment is not None
+                and dispatched_commitment.event_id > started_commitment.event_id
+            ):
+                self._expansion_commitment_dispatched = True
             self._expansion_anchor_evaluations = [
                 dict(event.payload)
                 for event in self.store.events_of_type(
@@ -916,6 +955,7 @@ class CortexRuntimeEngine(RuntimeEngine):
             self._expansion_commitment_id = None
             self._expansion_commitment_started_game_loop = None
             self._expansion_commitment_generation = None
+            self._expansion_commitment_dispatched = False
             self._expansion_anchor_evaluations = []
         if terminal_commitment is not None and (
             terminal_commitment.payload.get("terminal_state") == "expansion_candidates_exhausted"
@@ -1039,6 +1079,7 @@ class CortexRuntimeEngine(RuntimeEngine):
                 "scout_state": self._expansion_scout_state,
                 "scout_generation": self._expansion_scout_generation,
                 "commitment_generation": self._expansion_commitment_generation,
+                "commitment_dispatched": self._expansion_commitment_dispatched,
                 "exhausted_generation": self._expansion_exhausted_generation,
                 "visited_waypoints": self._expansion_scout_visited_waypoints,
                 "total_waypoints": self._expansion_scout_total_waypoints,
@@ -1108,6 +1149,7 @@ class CortexRuntimeEngine(RuntimeEngine):
         self._expansion_commitment_generation = (
             None if commitment_generation is None else int(commitment_generation)
         )
+        self._expansion_commitment_dispatched = bool(expansion.get("commitment_dispatched", False))
         exhausted_generation = expansion.get("exhausted_generation")
         self._expansion_exhausted_generation = (
             None if exhausted_generation is None else int(exhausted_generation)
@@ -1487,7 +1529,7 @@ class CortexRuntimeEngine(RuntimeEngine):
         self._last_planner_failure = None
         self._urgent_replan_requested = False
         self._last_goal_progress_fingerprint = None
-        self._ensure_expansion_commitment(proposal, observation)
+        self._ensure_expansion_commitment(observation)
         self._record_cortex_event(
             observation,
             "macro_plan_accepted",
@@ -1788,6 +1830,7 @@ class CortexRuntimeEngine(RuntimeEngine):
     ) -> MacroPolicyProposal:
         if (
             self._expansion_commitment_id is None
+            or not self._expansion_commitment_dispatched
             or self._expansion_candidates_exhausted
             or self._expansion_goal is None
             or self._expansion_goal.observed_base_count >= self._expansion_goal.desired_base_count
@@ -2388,31 +2431,18 @@ class CortexRuntimeEngine(RuntimeEngine):
             selection,
             command_id=resolved_command_id,
         )
-        attempt_id = None
-        attempt_ordinal = None
         if strategic_intent.operation_id is not None:
-            attempt_ordinal = self._attempt_ordinals.get(
-                strategic_intent.operation_id,
-                0,
-            )
-            self._attempt_ordinals[strategic_intent.operation_id] = attempt_ordinal + 1
-            attempt_id = AttemptKey(
-                operation_id=strategic_intent.operation_id,
-                command_id=resolved_command_id,
-                attempt_ordinal=attempt_ordinal,
-            ).attempt_id
             command = command.model_copy(
                 update={
                     "operation_id": strategic_intent.operation_id,
-                    "attempt_id": attempt_id,
                 }
             )
         assert selection.candidate_id is not None
         lineage = CommandLineage(
             command_id=command.command_id,
             operation_id=strategic_intent.operation_id,
-            attempt_id=attempt_id,
-            attempt_ordinal=attempt_ordinal,
+            attempt_id=None,
+            attempt_ordinal=None,
             intent_id=intent.intent_id,
             candidate_id=selection.candidate_id,
             selection_id=selection.selection_id,
@@ -2433,6 +2463,36 @@ class CortexRuntimeEngine(RuntimeEngine):
             lineage=lineage,
             semantic_action=semantic_action,
             macro_step_ordinal=macro_step_ordinal,
+        )
+
+    def _bind_dispatch_attempt(self, prepared: _PreparedCommand) -> _PreparedCommand:
+        operation_id = prepared.lineage.operation_id
+        if operation_id is None:
+            return prepared
+        if prepared.lineage.attempt_id is not None or prepared.command.attempt_id is not None:
+            raise RuntimeError("dispatch attempt was bound before accepted dispatch")
+        attempt_ordinal = self._attempt_ordinals.get(operation_id, 0)
+        attempt_id = AttemptKey(
+            operation_id=operation_id,
+            command_id=prepared.command.command_id,
+            attempt_ordinal=attempt_ordinal,
+        ).attempt_id
+        self._attempt_ordinals[operation_id] = attempt_ordinal + 1
+        return _PreparedCommand(
+            command=prepared.command.model_copy(
+                update={
+                    "operation_id": operation_id,
+                    "attempt_id": attempt_id,
+                }
+            ),
+            lineage=prepared.lineage.model_copy(
+                update={
+                    "attempt_id": attempt_id,
+                    "attempt_ordinal": attempt_ordinal,
+                }
+            ),
+            semantic_action=prepared.semantic_action,
+            macro_step_ordinal=prepared.macro_step_ordinal,
         )
 
     def _apply_strategic_arbitration(
@@ -2664,6 +2724,7 @@ class CortexRuntimeEngine(RuntimeEngine):
         observation: ObservationEnvelope,
         applications: tuple[PlaybookRuleApplication, ...],
     ) -> None:
+        rules_by_id = {rule.rule_id: rule for rule in self._playbook_rules}
         for application in applications:
             if self._playbook_store is not None:
                 self._playbook_store.record_rule_application(application)
@@ -2672,6 +2733,109 @@ class CortexRuntimeEngine(RuntimeEngine):
                 "playbook_rule_applied",
                 application,
             )
+            rule = rules_by_id.get(application.rule_id)
+            if rule is None:
+                continue
+            would_block = application.reason in {"shadow_would_block", "rule_blocked"}
+            actual_outcome: Literal["pending", "blocked", "allowed"]
+            if would_block and self.config.cortex.playbook.rule_mode == "shadow":
+                actual_outcome = "pending"
+                false_block = None
+            elif application.blocked:
+                actual_outcome = "blocked"
+                false_block = None
+            else:
+                actual_outcome = "allowed"
+                false_block = False
+            digest = hashlib.sha256(
+                (f"{application.application_id}|{rule.strength.value}|{rule.status.value}").encode()
+            ).hexdigest()
+            evaluation = PlaybookRuleEvaluation(
+                evaluation_id=f"rule-evaluation:{digest}",
+                application_id=application.application_id,
+                rule_id=rule.rule_id,
+                run_id=application.run_id,
+                episode_id=application.episode_id,
+                step_id=application.step_id,
+                game_loop=application.game_loop,
+                target_kind=application.target_kind,
+                target_id=application.target_id,
+                strength_at_evaluation=rule.strength,
+                status_at_evaluation=rule.status,
+                shadow_decision="would_block" if would_block else "would_allow",
+                actual_outcome=actual_outcome,
+                false_block=false_block,
+            )
+            self._record_cortex_event(
+                observation,
+                "playbook_rule_evaluated",
+                evaluation,
+            )
+            if actual_outcome == "pending":
+                self._pending_playbook_rule_evaluations[evaluation.evaluation_id] = evaluation
+
+    def _resolve_playbook_rule_evaluations(
+        self,
+        report: ExecutionReport,
+        lineage: CommandLineage | None,
+    ) -> None:
+        if lineage is None:
+            return
+        target_ids = {lineage.candidate_id}
+        if lineage.strategic_intent_id is not None:
+            target_ids.add(lineage.strategic_intent_id)
+        matching = [
+            evaluation
+            for evaluation in self._pending_playbook_rule_evaluations.values()
+            if evaluation.target_id in target_ids
+        ]
+        for evaluation in matching:
+            actual_outcome = (
+                "satisfied_by_peer"
+                if report.failure_code == "engagement_target_eliminated"
+                else report.status.value
+            )
+            false_block = (
+                True
+                if report.status is ExecutionStatus.SUCCEEDED
+                else False
+                if report.status is ExecutionStatus.FAILED
+                else None
+            )
+            resolved = evaluation.model_copy(
+                update={
+                    "step_id": report.step_id,
+                    "game_loop": self._execution_game_loop(report),
+                    "actual_outcome": actual_outcome,
+                    "false_block": false_block,
+                }
+            )
+            self.store.append_event(
+                run_id=report.run_id,
+                episode_id=report.episode_id,
+                step_id=report.step_id,
+                event_type="playbook_rule_evaluated",
+                payload=resolved,
+            )
+            del self._pending_playbook_rule_evaluations[evaluation.evaluation_id]
+
+    def _finalize_unselected_playbook_evaluations(self, result: EpisodeResult) -> None:
+        for evaluation in tuple(self._pending_playbook_rule_evaluations.values()):
+            terminal = evaluation.model_copy(
+                update={
+                    "step_id": result.steps,
+                    "actual_outcome": "not_selected",
+                    "false_block": None,
+                }
+            )
+            self.store.append_event(
+                run_id=result.run_id,
+                episode_id=result.episode_id,
+                step_id=result.steps,
+                event_type="playbook_rule_evaluated",
+                payload=terminal,
+            )
+        self._pending_playbook_rule_evaluations.clear()
 
     def _record_command_lineage(
         self,
@@ -2702,6 +2866,7 @@ class CortexRuntimeEngine(RuntimeEngine):
             return
         self._remember_terminal_feedback(report)
         lineage = self._command_lineages.get(report.command_id)
+        self._resolve_playbook_rule_evaluations(report, lineage)
         responsibility = None if lineage is None else lineage.responsibility
         tactical_responsibilities = {
             RoleId.OFFENSE.value,
@@ -2869,18 +3034,29 @@ class CortexRuntimeEngine(RuntimeEngine):
         ):
             self._urgent_replan_requested = True
 
-    def _ensure_expansion_commitment(
-        self,
-        proposal: MacroPolicyProposal,
-        observation: ObservationEnvelope,
-    ) -> None:
+    def _ensure_expansion_commitment(self, observation: ObservationEnvelope) -> None:
+        plan = self._macro_plan
+        proposal = self._macro_proposal
+        if plan is None or proposal is None:
+            return
         townhall_action = self._semantic_action_for_target(
             self._race_profile.data.townhall_types[0]
         )
+        executable_ordinals = {step.ordinal for step in plan.steps}
         expansion_steps = [
-            step for step in proposal.steps if step.canonical_action == townhall_action
+            step
+            for step in proposal.steps
+            if step.ordinal in executable_ordinals and step.canonical_action == townhall_action
         ]
         if not expansion_steps:
+            if (
+                self._expansion_commitment_id is not None
+                and not self._expansion_commitment_dispatched
+            ):
+                self._terminate_expansion_commitment(
+                    observation,
+                    terminal_state="strategic_cancellation",
+                )
             return
         observed_base_count = self._observed_townhall_count(observation)
         desired_base_count = max(2, max(step.repeat for step in expansion_steps))
@@ -2905,6 +3081,7 @@ class CortexRuntimeEngine(RuntimeEngine):
         commitment_id = f"{goal.goal_id}:candidate-epoch:{self._expansion_scout_generation}"
         self._expansion_commitment_id = commitment_id
         self._expansion_commitment_generation = self._expansion_scout_generation
+        self._expansion_commitment_dispatched = False
         self._expansion_commitment_started_game_loop = observation.game_loop
         self._expansion_anchor_evaluations = []
         self._record_cortex_event(
@@ -3209,6 +3386,7 @@ class CortexRuntimeEngine(RuntimeEngine):
         self._expansion_commitment_id = None
         self._expansion_commitment_started_game_loop = None
         self._expansion_commitment_generation = None
+        self._expansion_commitment_dispatched = False
         self._expansion_anchor_evaluations = []
 
     def _terminate_expansion_commitment_from_report(
@@ -3241,6 +3419,7 @@ class CortexRuntimeEngine(RuntimeEngine):
         self._expansion_commitment_id = None
         self._expansion_commitment_started_game_loop = None
         self._expansion_commitment_generation = None
+        self._expansion_commitment_dispatched = False
         self._expansion_anchor_evaluations = []
         if self._expansion_goal is not None:
             observed = min(
@@ -3447,6 +3626,8 @@ class CortexRuntimeEngine(RuntimeEngine):
 
     def end_episode(self, result: EpisodeResult) -> None:
         already_recorded = self._episode_result_fingerprint is not None
+        if not already_recorded:
+            self._finalize_unselected_playbook_evaluations(result)
         if not already_recorded and self._expansion_commitment_id is not None:
             if not self._expansion_anchor_evaluations:
                 self._expansion_anchor_evaluations.append(
@@ -3476,6 +3657,7 @@ class CortexRuntimeEngine(RuntimeEngine):
             self._expansion_commitment_id = None
             self._expansion_commitment_started_game_loop = None
             self._expansion_commitment_generation = None
+            self._expansion_commitment_dispatched = False
             self._expansion_anchor_evaluations = []
         super().end_episode(result)
         self.store.record_snapshot(
