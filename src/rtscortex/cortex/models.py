@@ -366,6 +366,7 @@ class CommandLineage(ContractModel):
     command_id: str = Field(min_length=1)
     operation_id: str | None = Field(default=None, pattern=r"^operation:[0-9a-f]{64}$")
     attempt_id: str | None = Field(default=None, pattern=r"^attempt:[0-9a-f]{64}$")
+    attempt_ordinal: int | None = Field(default=None, ge=0)
     intent_id: str = Field(min_length=1)
     candidate_id: str = Field(pattern=r"^candidate:[0-9a-f]{64}$")
     selection_id: str = Field(pattern=r"^selection:[0-9a-f]{64}$")

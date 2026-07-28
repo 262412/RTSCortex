@@ -8,6 +8,8 @@ from typing import Any, Optional
 from rtscortex_llm_pysc2.effect_types import EffectVerdict
 from rtscortex_llm_pysc2.routing import RoutedCommand
 
+_ATTACK_ABILITY_IDS = frozenset({23, 1682, 2048, 3674, 3771})
+
 
 @dataclass
 class _PendingCombat:
@@ -20,7 +22,9 @@ class _PendingCombat:
     baseline_health: Optional[float] = None
     observed_health: Optional[float] = None
     actor_tags: tuple[int, ...] = ()
-    actor_order_bound: bool = False
+    actor_order_ever_bound: bool = False
+    current_actor_order_bound: bool = False
+    current_actor_order_ability_ids: tuple[int, ...] = ()
     order_missing_since_game_loop: Optional[int] = None
 
 
@@ -106,13 +110,25 @@ class CombatEffectVerifier:
                 for tag in pending.actor_tags
                 if (unit := _unit_by_tag(observation, tag)) is not None
             )
-            current_order_bound = any(
-                _unit_targets_tag(actor, pending.target_tag) for actor in actors
+            bound_ability_ids = tuple(
+                sorted(
+                    {
+                        ability_id
+                        for actor in actors
+                        for ability_id in _attack_abilities_targeting_tag(
+                            actor,
+                            pending.target_tag,
+                        )
+                    }
+                )
             )
-            pending.actor_order_bound = pending.actor_order_bound or current_order_bound
+            current_order_bound = bool(bound_ability_ids)
+            pending.current_actor_order_bound = current_order_bound
+            pending.current_actor_order_ability_ids = bound_ability_ids
+            pending.actor_order_ever_bound = pending.actor_order_ever_bound or current_order_bound
             if current_order_bound:
                 pending.order_missing_since_game_loop = None
-            elif pending.actor_order_bound and actors:
+            elif pending.actor_order_ever_bound:
                 pending.order_missing_since_game_loop = (
                     pending.order_missing_since_game_loop or game_loop
                 )
@@ -126,7 +142,7 @@ class CombatEffectVerifier:
                 and pending.observed_health < pending.baseline_health
             )
             if (
-                pending.actor_order_bound
+                pending.current_actor_order_bound
                 and (target_removed or damage_observed)
                 and pending.target_tag not in claimed_damage_targets
             ):
@@ -172,7 +188,7 @@ class CombatEffectVerifier:
                     "Attack_Unit target baseline was unavailable before effect "
                     f"verification timed out after {elapsed} game loops"
                 )
-            elif not pending.actor_order_bound:
+            elif not pending.actor_order_ever_bound:
                 failure_code = "combat_actor_order_unbound"
                 failure_reason = (
                     "Attack_Unit was accepted but the exact actor never exposed an order "
@@ -251,7 +267,9 @@ class CombatEffectVerifier:
             "observed_target_health": pending.observed_health,
             "target_health_delta": delta,
             "actor_tags": [hex(tag) for tag in pending.actor_tags],
-            "actor_order_bound": pending.actor_order_bound,
+            "actor_order_bound": pending.current_actor_order_bound,
+            "actor_order_ever_bound": pending.actor_order_ever_bound,
+            "actor_order_ability_ids": list(pending.current_actor_order_ability_ids),
             "elapsed_game_loops": elapsed,
             "base_timeout_game_loops": self.timeout_game_loops,
             "effective_timeout_game_loops": self.timeout_game_loops,
@@ -297,14 +315,23 @@ def _unit_name(unit: Any, unit_names: dict[int, str]) -> str:
     return unit_names.get(int(value), f"unit:{int(value)}")
 
 
-def _unit_targets_tag(unit: Any, target_tag: int) -> bool:
+def _attack_abilities_targeting_tag(unit: Any, target_tag: int) -> set[int]:
+    abilities: set[int] = set()
     for order in _value(unit, "orders", ()):
-        if int(_value(order, "target_unit_tag", 0)) == target_tag:
-            return True
+        ability_id = int(_value(order, "ability_id", 0))
+        if (
+            ability_id in _ATTACK_ABILITY_IDS
+            and int(_value(order, "target_unit_tag", 0)) == target_tag
+        ):
+            abilities.add(ability_id)
     for index in range(4):
-        if int(_value(unit, f"order_id_{index}_target_unit_tag", 0)) == target_tag:
-            return True
-    return False
+        ability_id = int(_value(unit, f"order_id_{index}", 0))
+        if (
+            ability_id in _ATTACK_ABILITY_IDS
+            and int(_value(unit, f"order_id_{index}_target_unit_tag", 0)) == target_tag
+        ):
+            abilities.add(ability_id)
+    return abilities
 
 
 def _dead_unit_tags(observation: Any) -> set[int]:

@@ -43,12 +43,14 @@ from rtscortex.cortex import (
     MacroStep,
     MacroStepStatus,
     ReflexIntent,
+    ResourceClaim,
     RoleAgentContext,
     RoleAgentCoordinator,
     RoleId,
     SituationAssessment,
     SituationProvider,
     StrategicAgenda,
+    StrategicArbitration,
     StrategicIntent,
     StrategicIntentAdapter,
     TacticalIntent,
@@ -290,6 +292,7 @@ class CortexRuntimeEngine(RuntimeEngine):
             max_intents=config.cortex.arbiter.max_intents,
         )
         self._strategic_agenda: StrategicAgenda | None = None
+        self._pending_strategic_arbitration: StrategicArbitration | None = None
         self._strategic_by_legacy_intent: dict[str, StrategicIntent] = {}
 
     async def start(self) -> None:
@@ -317,6 +320,7 @@ class CortexRuntimeEngine(RuntimeEngine):
         tick_started = time.perf_counter()
         await self._activate_episode(observation)
         self._strategic_by_legacy_intent = {}
+        self._pending_strategic_arbitration = None
         self.store.append_event(
             run_id=observation.run_id,
             episode_id=observation.episode_id,
@@ -521,6 +525,8 @@ class CortexRuntimeEngine(RuntimeEngine):
                 self._tactical.record_dispatch(
                     command,
                     responsibility=responsibility,
+                    observation=observation,
+                    situation=assessment,
                 )
             self._transition_command(command, CommandStatus.DISPATCHED, observation)
             if prepared_command.lineage.source_role is CortexRole.MACRO:
@@ -540,6 +546,11 @@ class CortexRuntimeEngine(RuntimeEngine):
                         MacroStepStatus.DISPATCHED,
                         None,
                     )
+        self._commit_dispatched_strategic_agenda(
+            observation,
+            accepted_commands,
+            prepared_by_id,
+        )
 
         idle_reason = None if accepted_commands else self._cortex_idle_reason()
         batch = ActionBatch(
@@ -790,17 +801,14 @@ class CortexRuntimeEngine(RuntimeEngine):
                 )
             )
 
-        arbitration_event = self.store.last_event(
+        agenda_event = self.store.last_event(
             observation.run_id,
             observation.episode_id,
-            "intent_arbitrated",
+            "strategic_agenda_committed",
             after_event_id=checkpoint_event_id,
         )
-        if arbitration_event is not None:
-            arbitration_payload = arbitration_event.payload.get("arbitration")
-            agenda_payload = (
-                arbitration_payload.get("agenda") if isinstance(arbitration_payload, dict) else None
-            )
+        if agenda_event is not None:
+            agenda_payload = agenda_event.payload.get("agenda")
             if isinstance(agenda_payload, dict):
                 agenda = StrategicAgenda.model_validate(agenda_payload)
                 if agenda.commitment_until_game_loop > observation.game_loop:
@@ -815,6 +823,11 @@ class CortexRuntimeEngine(RuntimeEngine):
             payload = event.payload
             lineage = CommandLineage.model_validate(payload.get("lineage", payload))
             self._command_lineages[lineage.command_id] = lineage
+            if lineage.operation_id is not None and lineage.attempt_ordinal is not None:
+                self._attempt_ordinals[lineage.operation_id] = max(
+                    self._attempt_ordinals.get(lineage.operation_id, 0),
+                    lineage.attempt_ordinal + 1,
+                )
             ordinal = payload.get("macro_step_ordinal")
             semantic = payload.get("semantic_action")
             if lineage.macro_plan_id is not None and isinstance(semantic, str):
@@ -836,26 +849,45 @@ class CortexRuntimeEngine(RuntimeEngine):
             "expansion_commitment_terminal",
             after_event_id=checkpoint_event_id,
         )
-        goal_started = self.store.last_event(
-            observation.run_id,
-            observation.episode_id,
+        goal_event_types = {
             "expansion_goal_started",
-            after_event_id=checkpoint_event_id,
-        )
-        goal_terminal = self.store.last_event(
-            observation.run_id,
-            observation.episode_id,
+            "expansion_goal_reopened",
+            "expansion_candidate_epoch_exhausted",
             "expansion_goal_terminal",
-            after_event_id=checkpoint_event_id,
-        )
-        latest_goal = (
-            goal_terminal
-            if goal_terminal is not None
-            and (goal_started is None or goal_terminal.event_id > goal_started.event_id)
-            else goal_started
+        }
+        latest_goal = next(
+            (
+                event
+                for event in sorted(
+                    (
+                        event
+                        for event_type in goal_event_types
+                        for event in self.store.events_of_type(
+                            observation.run_id,
+                            observation.episode_id,
+                            event_type,
+                            after_event_id=checkpoint_event_id,
+                        )
+                    ),
+                    key=lambda item: item.event_id,
+                    reverse=True,
+                )
+            ),
+            None,
         )
         if latest_goal is not None:
             self._expansion_goal = ExpansionGoalState.model_validate(latest_goal.payload)
+            exhausted_epochs = self._expansion_goal.exhausted_candidate_epochs
+            if exhausted_epochs:
+                self._expansion_exhausted_generation = max(exhausted_epochs)
+            self._expansion_scout_generation = max(
+                self._expansion_scout_generation,
+                self._expansion_goal.current_candidate_epoch,
+            )
+            self._expansion_candidates_exhausted = (
+                self._expansion_goal.phase == "waiting_for_candidates"
+                and self._expansion_goal.current_candidate_epoch in exhausted_epochs
+            )
         if started_commitment is not None and (
             terminal_commitment is None
             or terminal_commitment.event_id < started_commitment.event_id
@@ -1530,15 +1562,32 @@ class CortexRuntimeEngine(RuntimeEngine):
                 self._macro_plan_frozen = True
                 self._urgent_replan_requested = True
             return None
+        executable_ordinals = {step.ordinal for step in self._macro_plan.steps}
         remaining_steps = [
             step
             for step in self._macro_proposal.steps
-            if not self._macro_step_is_complete(step.ordinal)
+            if step.ordinal in executable_ordinals
+            and not self._macro_step_is_complete(step.ordinal)
         ]
+        if not remaining_steps:
+            self._macro_plan_frozen = True
+            self._urgent_replan_requested = True
+            self._record_cortex_event(
+                observation,
+                "macro_executable_horizon_exhausted",
+                {
+                    "plan_id": self._macro_plan.plan_id,
+                    "executable_ordinals": sorted(executable_ordinals),
+                    "opaque_future_ordinals": [
+                        step.ordinal
+                        for step in self._macro_proposal.steps
+                        if step.ordinal not in executable_ordinals
+                    ],
+                },
+            )
+            return None
         remaining_proposal = self._macro_proposal.model_copy(update={"steps": remaining_steps})
         remaining_proposal = self._proposal_with_expansion_commitment(remaining_proposal)
-        if not remaining_proposal.steps:
-            return None
         frontier = runtime_frontier(
             remaining_proposal,
             observation,
@@ -2340,6 +2389,7 @@ class CortexRuntimeEngine(RuntimeEngine):
             command_id=resolved_command_id,
         )
         attempt_id = None
+        attempt_ordinal = None
         if strategic_intent.operation_id is not None:
             attempt_ordinal = self._attempt_ordinals.get(
                 strategic_intent.operation_id,
@@ -2362,6 +2412,7 @@ class CortexRuntimeEngine(RuntimeEngine):
             command_id=command.command_id,
             operation_id=strategic_intent.operation_id,
             attempt_id=attempt_id,
+            attempt_ordinal=attempt_ordinal,
             intent_id=intent.intent_id,
             candidate_id=selection.candidate_id,
             selection_id=selection.selection_id,
@@ -2400,7 +2451,7 @@ class CortexRuntimeEngine(RuntimeEngine):
             playbook_deltas=playbook_deltas,
             playbook_rule_ids=playbook_rule_ids,
         )
-        self._strategic_agenda = result.agenda
+        self._pending_strategic_arbitration = result
         selected = set(result.selected_intent_ids)
         actual = tuple(
             sorted(
@@ -2454,6 +2505,71 @@ class CortexRuntimeEngine(RuntimeEngine):
             for item in annotated
             if self._strategic_by_legacy_intent[item.lineage.intent_id].intent_id in selected
         ]
+
+    def _commit_dispatched_strategic_agenda(
+        self,
+        observation: ObservationEnvelope,
+        accepted_commands: list[ActionCommand],
+        prepared_by_id: dict[str, _PreparedCommand],
+    ) -> None:
+        result = self._pending_strategic_arbitration
+        if result is None:
+            return
+        dispatched_intent_ids: set[str] = set()
+        for command in accepted_commands:
+            prepared = prepared_by_id.get(command.command_id)
+            if prepared is None or prepared.lineage.strategic_intent_id is None:
+                continue
+            dispatched_intent_ids.add(prepared.lineage.strategic_intent_id)
+        if not dispatched_intent_ids:
+            return
+        decisions = {
+            decision.intent_id: decision
+            for decision in result.decisions
+            if decision.intent_id in dispatched_intent_ids
+        }
+        intents = {
+            intent.intent_id: intent
+            for intent in self._strategic_by_legacy_intent.values()
+            if intent.intent_id in dispatched_intent_ids
+        }
+        if set(decisions) != set(intents):
+            raise RuntimeError("dispatched strategic agenda lost intent decision provenance")
+        claims = [intent.resource_claim for intent in intents.values()]
+        self._strategic_agenda = StrategicAgenda(
+            run_id=observation.run_id,
+            episode_id=observation.episode_id,
+            game_loop=observation.game_loop,
+            active_intent_ids=tuple(sorted(dispatched_intent_ids)),
+            active_continuity_keys=tuple(
+                sorted(intent.continuity_key for intent in intents.values())
+            ),
+            reserved_resources=ResourceClaim(
+                minerals=sum(claim.minerals for claim in claims),
+                vespene=sum(claim.vespene for claim in claims),
+                supply=sum(claim.supply for claim in claims),
+                reservation_game_loops=max(
+                    (claim.reservation_game_loops for claim in claims),
+                    default=1,
+                ),
+            ),
+            commitment_until_game_loop=max(
+                (
+                    observation.game_loop + intent.resource_claim.reservation_game_loops
+                    for intent in intents.values()
+                ),
+                default=observation.game_loop,
+            ),
+            total_score=sum(decision.score.total for decision in decisions.values()),
+        )
+        self._record_cortex_event(
+            observation,
+            "strategic_agenda_committed",
+            {
+                "agenda": self._strategic_agenda.model_dump(mode="json"),
+                "command_ids": sorted(command.command_id for command in accepted_commands),
+            },
+        )
 
     def _guard_strategic_intents(
         self,

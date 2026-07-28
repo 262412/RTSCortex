@@ -139,6 +139,136 @@ The deliberate saturation proves that memory remains bounded and backpressure
 engages. It is not a substitute for the required SC2 end-to-end live-speed
 measurement.
 
+## 2026-07-28 follow-up review closure
+
+The review of `47480da` identified three remaining behavior blockers, three
+recovery/performance/analysis gaps and two hidden cross-race boundaries. The
+following corrections close the code-level findings. The independent
+Frozen/Evolving twelve-run acceptance remains a separate experiment under
+SCX-PT-039; it is not implied by this code-review closure.
+
+### Dispatch-owned tactical and strategic commitments
+
+- **Root cause:** Tactical and Defense agents mutated engagement, retreat and
+  holding state while merely proposing an Intent. The strategic agenda was
+  likewise committed after arbitration but before validation and dispatch.
+  Additionally, the Arbiter selected only one Intent per role even when actor
+  scopes were disjoint.
+- **Correction:** proposal evaluation is now side-effect free. Engagement,
+  retreat, offense navigation and Defense operation state are created only by
+  `record_dispatch()` for an accepted command. Strategic arbitration remains
+  provisional until the matching command enters `DISPATCHED`, at which point a
+  `strategic_agenda_committed` event is stored. Same-role Intents conflict only
+  when their actor, producer or objective claims overlap.
+- **Evidence:** regression tests cover undispatched FocusFire, Retreat and
+  Defense proposals, two disjoint FocusFire groups, and an arbitrated Intent
+  rejected before command dispatch.
+
+### Current-order combat attribution
+
+- **Root cause:** `actor_order_bound` represented whether the actor had ever
+  held the target order. A later health delta could therefore confirm an old
+  command after the actor had moved or received another order. Any targeted
+  ability with the expected tag could also look like an attack.
+- **Correction:** the historical binding is retained only as diagnostic
+  evidence. Success requires the current observable order to have both the
+  expected target tag and a pinned SC2 attack ability ID, followed by target
+  damage or valid removal in the causal window. Replacement and missing-actor
+  timers cannot be bypassed by another actor's damage.
+- **Evidence:** tests cover damage after order replacement, non-attack targeted
+  abilities and actor disappearance after a prior valid binding.
+
+### Hard HIMA executable horizon
+
+- **Root cause:** `MacroPlan` projected a bounded prefix, but Runtime selected
+  remaining work from the full compact HIMA proposal. An ordinal absent from the
+  active plan could consequently be compiled with no plan-step lineage while a
+  replan was pending.
+- **Correction:** Runtime builds an executable ordinal whitelist exclusively
+  from the active `MacroPlan`. Exhausting that set freezes the old proposal,
+  records `macro_executable_horizon_exhausted` and requests an urgent replan.
+  Full HIMA output remains provenance only.
+- **Evidence:** an end-to-end Runtime test proves that the first opaque future
+  step cannot dispatch before a replacement plan is accepted.
+
+### Checkpoint recovery continuity
+
+- **Root cause:** tail replay restored expansion start/terminal events but not
+  reopen or candidate-epoch exhaustion. Attempt ordinals created after the last
+  snapshot were not folded back into the operation counters.
+- **Correction:** recovery replays the latest expansion goal transition,
+  including phase, generation, exhausted epoch, retry budget and cooldown.
+  Command lineage persists `attempt_ordinal`, and tail replay advances each
+  operation counter to one beyond its maximum durable attempt.
+- **Evidence:** restart tests cover reopen, exhaustion and monotonically
+  increasing attempt ordinals after a checkpoint.
+
+### Live EventStore performance acceptance
+
+- **Root cause:** the synthetic writer profile proved bounded memory but did not
+  measure real SC2 event payloads, writer lag or end-to-end game-loop speed.
+- **Correction:** EventStore now exposes writer-lag p95/max, blocked durable
+  appends and dropped sampled events. Runtime emits an
+  `event_store_performance` terminal event, and the profiling/report path
+  includes event and byte exposure.
+- **Real smoke:** Slurm job `9988137`, HIMA Protoss-a, active Cortex, 508-step
+  bounded live smoke, completed with exit code `0:0`.
+
+```text
+game_loops_per_second: 15.56
+events_per_game_loop: 0.275
+bytes_per_game_loop: 866.29
+writer_queue_peak/capacity: 7/8192
+writer_lag_ms_p95: 420.75
+writer_lag_ms_max: 500.53
+blocked_append_count: 0
+dropped_sampled_event_count: 0
+artifact_size_bytes: 1,546,192
+```
+
+The live producer did not approach queue saturation and lost no sampled events.
+This closes the single-run persistence performance gate; natural-terminal
+artifact growth must still be reported by the paired acceptance experiment.
+
+### Terran add-on footprint ownership
+
+- **Root cause:** Barracks, Factory and Starport candidate checks considered
+  add-on clearance, while the persistent world ledger reserved only the main
+  structure cells. A later structure could occupy future Tech Lab/Reactor
+  space.
+- **Correction:** Terran producers use one 5-by-3 world-space footprint ledger:
+  the 3-by-3 main body plus the pinned two-column add-on area. Candidate
+  generation, validation, reservation and observed occupancy share this exact
+  cell set.
+- **Evidence:** a placement contract test locks all fifteen cells and verifies
+  that another structure cannot overlap the add-on region.
+
+### Streaming, exposure-normalized Playbook analysis
+
+- **Root cause:** experiment analysis materialized complete JSONL journals in
+  memory and compared only raw repeated-error totals, biasing runs of different
+  duration.
+- **Correction:** the analyzer makes one streaming pass over each journal and
+  reports repeated errors as a total, per 10,000 game loops and per eligible
+  operation. Pair-level reduction uses pooled game-loop exposure. It also
+  reports live event rate, byte rate, writer performance and total artifact
+  size.
+- **Evidence:** tests use a one-shot iterator to reject a second pass and lock
+  both normalized denominators.
+
+### Defense-unit saturation
+
+- **Root cause:** static-defense structures had completed/pending/reserved
+  limits, but emergency unit production could re-arm after each holding window
+  without counting completed units, production queue and dispatched responses
+  together.
+- **Correction:** every RaceProfile now declares per-unit defensive saturation
+  limits. Defense compiles a training Intent only when
+  `completed + queued + dispatched response < limit`.
+- **Evidence:** a sustained air-threat test verifies that five Phoenixes plus
+  one queued Phoenix satisfy the Protoss limit and suppress another emergency
+  training proposal.
+
 ## Resolved and removed from the open register
 
 The following previously registered failures are verified as resolved and are

@@ -68,6 +68,7 @@ class RaceProfileData:
     hima_vocabulary_version: str
     defense_doctrine: DefenseDoctrine = field(default_factory=DefenseDoctrine)
     structure_saturation_limits: Mapping[str, int] = field(default_factory=dict)
+    defense_unit_saturation_limits: Mapping[str, int] = field(default_factory=dict)
     macro_contract_ready: bool = True
     runtime_mapping_ready: bool = False
     live_worker_ready: bool = False

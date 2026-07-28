@@ -15,6 +15,7 @@ from rtscortex.contracts import (
     ExecutionStage,
     ExecutionStatus,
     ObservationEnvelope,
+    ProductionItem,
     SC2State,
     UnitState,
 )
@@ -231,6 +232,17 @@ def test_intent_arbiter_conserves_decisions_and_resources() -> None:
     assert intents[2].intent_id in result.selected_intent_ids
 
 
+def test_disjoint_focus_fire_intents_survive_role_arbitration() -> None:
+    observation = _observation()
+    first = _intent("Attack_Unit:first", RoleId.FOCUS_FIRE, actor="CombatGroup1")
+    second = _intent("Attack_Unit:second", RoleId.FOCUS_FIRE, actor="CombatGroup2")
+
+    result = IntentArbiter().arbitrate((first, second), observation)
+
+    assert set(result.selected_intent_ids) == {first.intent_id, second.intent_id}
+    assert all(decision.status is IntentDecisionStatus.SELECTED for decision in result.decisions)
+
+
 def test_only_actual_defense_reflex_is_an_emergency() -> None:
     observation = _observation()
     adapter = StrategicIntentAdapter(race_profile("protoss"))
@@ -402,7 +414,58 @@ def test_defense_agent_compiles_race_profile_emergency_options_and_resource_clai
     assert phoenix.mutually_exclusive_groups == ("defense-emergency-response",)
 
 
-def test_defense_agent_deduplicates_active_response_and_cools_down_after_failure() -> None:
+def test_defense_unit_production_stops_at_race_saturation_target() -> None:
+    base = _observation(minerals=500, vespene=300)
+    observation = base.model_copy(
+        update={
+            "state": base.state.model_copy(
+                update={
+                    "own_units": [
+                        *base.state.own_units,
+                        *[
+                            UnitState(
+                                unit_id=f"0xphoenix{index}",
+                                unit_type="Phoenix",
+                                alliance="self",
+                            )
+                            for index in range(5)
+                        ],
+                    ],
+                    "production_queue": [ProductionItem(name="Phoenix", producer_id="0xstargate")],
+                    "visible_enemies": [
+                        UnitState(
+                            unit_id="0xe1",
+                            unit_type="Mutalisk",
+                            alliance="enemy",
+                            position=(12, 10),
+                        )
+                    ],
+                }
+            ),
+            "available_actions": [
+                AvailableAction(
+                    name="Train_Phoenix",
+                    actor_scopes=["Developer/Empty"],
+                )
+            ],
+        }
+    )
+    assessment = (
+        DeterministicSituationAnalyzer()
+        .assess(observation)
+        .model_copy(update={"threat_level": ThreatLevel.CRITICAL, "threat_score": 20.0})
+    )
+    profile = race_profile("protoss")
+    coordinator = RoleAgentCoordinator(profile, StrategicIntentAdapter(profile))
+
+    source_intents = coordinator.propose_defense_intents(
+        RoleAgentContext(observation, assessment, ())
+    )
+
+    assert all(intent.action_names != ["Train_Phoenix"] for intent in source_intents)
+
+
+def test_undispatched_defense_proposal_does_not_hold_actor() -> None:
     base = _observation()
     observation = base.model_copy(
         update={
@@ -439,16 +502,14 @@ def test_defense_agent_deduplicates_active_response_and_cools_down_after_failure
 
     first = coordinator.propose_defense_intents(RoleAgentContext(observation, assessment, ()))
     assert len(first) == 1
-    assert (
-        coordinator.propose_defense_intents(
-            RoleAgentContext(
-                observation.model_copy(update={"step_id": 2, "game_loop": 33}),
-                assessment,
-                (),
-            )
+    undispatched = coordinator.propose_defense_intents(
+        RoleAgentContext(
+            observation.model_copy(update={"step_id": 2, "game_loop": 33}),
+            assessment,
+            (),
         )
-        == ()
     )
+    assert len(undispatched) == 1
     coordinator.record_dispatch(
         ActionCommand(
             command_id="defense-command",

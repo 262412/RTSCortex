@@ -49,6 +49,8 @@ class ExecutionAwareTacticalPolicyProvider(Protocol):
         command: ActionCommand,
         *,
         responsibility: str,
+        observation: ObservationEnvelope,
+        situation: SituationAssessment,
     ) -> None: ...
 
     def record_execution(

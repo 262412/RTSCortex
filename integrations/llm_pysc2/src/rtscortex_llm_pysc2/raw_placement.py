@@ -100,12 +100,28 @@ def _footprint_cells(
     )
 
 
+def _occupied_cells_for_spec(
+    world_center: tuple[float, float],
+    spec: Any,
+) -> frozenset[tuple[int, int]]:
+    size = int(spec.footprint)
+    main_cells = _footprint_cells(world_center, size, size)
+    if not bool(spec.reserves_addon_space):
+        return main_cells
+    max_x = max(cell[0] for cell in main_cells)
+    min_y = min(cell[1] for cell in main_cells)
+    max_y = max(cell[1] for cell in main_cells)
+    addon_clearance = {(x, y) for x in range(max_x + 1, max_x + 3) for y in range(min_y, max_y + 1)}
+    return frozenset((*main_cells, *addon_clearance))
+
+
 def _placement_candidate_id(
     action_name: str,
     world_target: tuple[float, float],
     anchor_tag: int,
     placement_revision: str,
     footprint: int,
+    reserves_addon_space: bool,
 ) -> str:
     payload = {
         "action_name": action_name,
@@ -113,6 +129,7 @@ def _placement_candidate_id(
         "anchor_tag": int(anchor_tag),
         "placement_revision": placement_revision,
         "footprint": int(footprint),
+        "reserves_addon_space": bool(reserves_addon_space),
     }
     digest = hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
@@ -195,9 +212,7 @@ class RawPlacementService:
     ) -> None:
         from rtscortex_llm_pysc2.extractor import BUILD_SPECS
 
-        footprint_by_structure = {
-            spec.target_structure: int(spec.footprint) for spec in BUILD_SPECS.values()
-        }
+        spec_by_structure = {spec.target_structure: spec for spec in BUILD_SPECS.values()}
         observed_occupancy: dict[int, _SpatialExclusion] = {}
         visible_feature_tags = {
             int(_value(unit, "tag", 0))
@@ -213,16 +228,16 @@ class RawPlacementService:
                 tag > 0
                 and int(_value(unit, "alliance", 0)) == 1
                 and _build_progress(unit) > 0.0
-                and name in footprint_by_structure
+                and name in spec_by_structure
             ):
                 center = (
                     float(_value(unit, "x", 0.0)),
                     float(_value(unit, "y", 0.0)),
                 )
-                size = footprint_by_structure[name]
+                spec = spec_by_structure[name]
                 observed_occupancy[tag] = _SpatialExclusion(
                     center,
-                    _footprint_cells(center, size, size),
+                    _occupied_cells_for_spec(center, spec),
                     "observed_structure",
                 )
             if (
@@ -292,6 +307,7 @@ class RawPlacementService:
                         item.anchor_tag,
                         revision,
                         int(spec.footprint),
+                        bool(spec.reserves_addon_space),
                     ),
                     placement_revision=revision,
                 )
@@ -399,6 +415,7 @@ class RawPlacementService:
                     0 if preferred_anchor_tag is None else preferred_anchor_tag,
                     candidate_placement_revision,
                     int(spec.footprint),
+                    bool(spec.reserves_addon_space),
                 )
                 if placement_candidate_id != expected_candidate_id:
                     raise RawPlacementFailure(
@@ -491,13 +508,11 @@ class RawPlacementService:
             placement_revision=current_revision,
             baseline_builder_orders=baseline_builder_orders,
             structure_type=spec.target_structure,
-            footprint_width=int(spec.footprint),
-            footprint_height=int(spec.footprint),
-            occupied_grid_cells=_footprint_cells(
-                emitted,
-                int(spec.footprint),
-                int(spec.footprint),
+            footprint_width=(
+                int(spec.footprint) + 2 if spec.reserves_addon_space else int(spec.footprint)
             ),
+            footprint_height=int(spec.footprint),
+            occupied_grid_cells=_occupied_cells_for_spec(emitted, spec),
             world_center=emitted,
             placement_state="reserved",
             episode_id=episode_id,
@@ -675,7 +690,9 @@ class RawPlacementService:
         from rtscortex_llm_pysc2.extractor import BUILD_SPECS
 
         spec = BUILD_SPECS.get(action_name)
-        size = max(1, int(round(fallback_radius * 2))) if spec is None else int(spec.footprint)
+        if spec is not None:
+            return _occupied_cells_for_spec(target, spec)
+        size = max(1, int(round(fallback_radius * 2)))
         return _footprint_cells(target, size, size)
 
     def _expire_temporary_suppressions(self, game_loop: int) -> None:

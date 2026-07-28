@@ -1573,6 +1573,14 @@ class RuntimeEngine:
                     CommandStatus.DISPATCHED,
                 },
             )
+        self.store.flush()
+        self.store.append_event(
+            run_id=result.run_id,
+            episode_id=result.episode_id,
+            step_id=result.steps,
+            event_type="event_store_performance",
+            payload=asdict(self.store.performance_snapshot()),
+        )
         self.store.record_episode(result)
         lessons = self.store.lessons(result.run_id, result.episode_id)
         self.store.record_episode_summary(

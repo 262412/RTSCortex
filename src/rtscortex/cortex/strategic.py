@@ -298,7 +298,6 @@ class IntentArbiter:
         conflicts = _build_conflicts(intents)
         rejected: dict[str, tuple[IntentDecisionStatus, str]] = {}
         eligible: list[StrategicIntent] = []
-        role_winners: dict[RoleId, StrategicIntent] = {}
         for intent in sorted(intents, key=lambda item: (-item.priority, item.intent_id)):
             if observation.game_loop - intent.created_game_loop >= intent.ttl_game_loops:
                 rejected[intent.intent_id] = (IntentDecisionStatus.REJECTED, "intent_expired")
@@ -309,13 +308,6 @@ class IntentArbiter:
                     "hard_precondition_failed",
                 )
                 continue
-            if intent.role in role_winners:
-                rejected[intent.intent_id] = (
-                    IntentDecisionStatus.DEFERRED,
-                    "lower_priority_same_role",
-                )
-                continue
-            role_winners[intent.role] = intent
             eligible.append(intent)
         eligible = eligible[: self.max_intents]
         scores = {
@@ -460,10 +452,9 @@ def _build_conflicts(intents: Sequence[StrategicIntent]) -> list[IntentConflict]
     for left, right in itertools.combinations(intents, 2):
         kind: IntentConflictKind | None = None
         detail = ""
-        if left.role is right.role:
-            kind = IntentConflictKind.ROLE
-            detail = f"both intents own role {left.role.value}"
-        elif set(left.actor_scopes).intersection(right.actor_scopes):
+        left_actors = set(left.actor_scopes)
+        right_actors = set(right.actor_scopes)
+        if left_actors.intersection(right_actors):
             kind = IntentConflictKind.ACTOR
             detail = "actor scopes overlap"
         elif set(left.producer_types).intersection(right.producer_types):
@@ -472,6 +463,9 @@ def _build_conflicts(intents: Sequence[StrategicIntent]) -> list[IntentConflict]
         elif set(left.mutually_exclusive_groups).intersection(right.mutually_exclusive_groups):
             kind = IntentConflictKind.OBJECTIVE
             detail = "strategic objective groups are mutually exclusive"
+        elif left.role is right.role and (not left_actors or not right_actors):
+            kind = IntentConflictKind.ROLE
+            detail = f"actor-free intents both own role {left.role.value}"
         if kind is None:
             continue
         pair = tuple(sorted((left.intent_id, right.intent_id)))

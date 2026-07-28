@@ -7,6 +7,7 @@ import queue
 import sqlite3
 import threading
 import time
+from collections import deque
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -58,7 +59,10 @@ class EventStorePerformance:
     current_queue_depth: int
     queue_capacity: int
     append_latency_ms_mean: float
+    writer_lag_ms_p95: float
     writer_lag_ms_max: float
+    blocked_append_count: int
+    dropped_sampled_event_count: int
     subscriber_dropped_events: int
     journal_bytes: int
 
@@ -149,6 +153,9 @@ class EventStore:
         self._append_latency_ns = 0
         self._event_enqueued_ns: dict[int, int] = {}
         self._writer_lag_ns_max = 0
+        self._writer_lag_samples_ns: deque[int] = deque(maxlen=8192)
+        self._blocked_append_count = 0
+        self._dropped_sampled_event_count = 0
         self._writer = threading.Thread(
             target=self._writer_main,
             name=f"rtscortex-event-writer-{id(self):x}",
@@ -253,6 +260,14 @@ class EventStore:
             if self._enqueued_events == 0
             else self._append_latency_ns / self._enqueued_events / 1_000_000
         )
+        lag_samples = sorted(self._writer_lag_samples_ns)
+        lag_p95_ns = (
+            0
+            if not lag_samples
+            else lag_samples[
+                max(0, min(len(lag_samples) - 1, (len(lag_samples) * 95 + 99) // 100 - 1))
+            ]
+        )
         return EventStorePerformance(
             enqueued_events=self._enqueued_events,
             written_events=self._written_events,
@@ -260,7 +275,10 @@ class EventStore:
             current_queue_depth=self._write_queue.qsize(),
             queue_capacity=self._writer_queue_size,
             append_latency_ms_mean=mean_ms,
+            writer_lag_ms_p95=lag_p95_ns / 1_000_000,
             writer_lag_ms_max=self._writer_lag_ns_max / 1_000_000,
+            blocked_append_count=self._blocked_append_count,
+            dropped_sampled_event_count=self._dropped_sampled_event_count,
             subscriber_dropped_events=sum(
                 subscriber.dropped_events for subscriber in self._subscribers.values()
             ),
@@ -321,6 +339,11 @@ class EventStore:
     ) -> None:
         """Bound memory while applying explicit backpressure to durable events."""
 
+        try:
+            self._write_queue.put_nowait(item)
+            return
+        except queue.Full:
+            self._blocked_append_count += 1
         try:
             self._write_queue.put(item, timeout=30)
         except queue.Full as error:
@@ -405,7 +428,9 @@ class EventStore:
         now = time.perf_counter_ns()
         for record in records:
             enqueued = self._event_enqueued_ns.pop(record.event_id, now)
-            self._writer_lag_ns_max = max(self._writer_lag_ns_max, now - enqueued)
+            lag = now - enqueued
+            self._writer_lag_ns_max = max(self._writer_lag_ns_max, lag)
+            self._writer_lag_samples_ns.append(lag)
         for record in records:
             journal.write(json.dumps(record.__dict__, ensure_ascii=False, sort_keys=True) + "\n")
         journal.flush()

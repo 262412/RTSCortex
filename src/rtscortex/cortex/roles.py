@@ -220,12 +220,6 @@ class DefenseAgent(_RoutingRoleAgent):
                     game_loop=observation.game_loop,
                 ):
                     continue
-                self._activate_actor(
-                    actor,
-                    signature,
-                    action_name="Attack_Unit",
-                    game_loop=observation.game_loop,
-                )
                 proposals.append(
                     self._source_intent(
                         context,
@@ -261,12 +255,6 @@ class DefenseAgent(_RoutingRoleAgent):
                     game_loop=observation.game_loop,
                 ):
                     continue
-                self._activate_actor(
-                    actor,
-                    signature,
-                    action_name="Move_Minimap",
-                    game_loop=observation.game_loop,
-                )
                 proposals.append(
                     self._source_intent(
                         context,
@@ -343,6 +331,11 @@ class DefenseAgent(_RoutingRoleAgent):
             for action_name in action_names:
                 action = available.get(action_name)
                 if action is None:
+                    continue
+                if action_name.startswith("Train_") and self._defense_unit_saturated(
+                    observation,
+                    action_name,
+                ):
                     continue
                 actor = next(
                     (value for value in action.actor_scopes if value not in claimed_actor_scopes),
@@ -466,6 +459,28 @@ class DefenseAgent(_RoutingRoleAgent):
                     )
                     return proposals
         return proposals
+
+    def _defense_unit_saturated(
+        self,
+        observation: ObservationEnvelope,
+        action_name: str,
+    ) -> bool:
+        unit_type = action_name.removeprefix("Train_")
+        limit = self.profile.data.defense_unit_saturation_limits.get(unit_type)
+        if limit is None:
+            return False
+        completed = sum(
+            unit.unit_type == unit_type and unit.health_fraction > 0.0
+            for unit in observation.state.own_units
+        )
+        queued = sum(item.name == unit_type for item in observation.state.production_queue)
+        dispatched = sum(
+            state.action_name == action_name
+            and state.phase == "responding"
+            and state.command_id is not None
+            for state in self._actor_states.values()
+        )
+        return completed + queued + dispatched >= limit
 
     def record_dispatch(
         self,

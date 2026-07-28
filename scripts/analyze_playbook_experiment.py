@@ -45,14 +45,25 @@ class RunMetrics:
     playbook_nonzero_score_applications: int
     playbook_blocks: int
     repeated_eligible_errors: int
+    repeated_errors_per_10k_game_loops: float
+    repeated_errors_per_eligible_operation: float
+    eligible_operation_count: int
     strategic_consequences: dict[str, int]
     hard_rule_false_block_count: int
     hard_rule_shadow_state_count: int
     hard_rule_false_block_rate: float
     journal_bytes: int
+    artifact_bytes: int
+    event_count: int
     max_game_loop: int
+    events_per_game_loop: float
     bytes_per_game_loop: float
     effective_game_loops_per_second: float
+    writer_queue_peak: int
+    writer_lag_ms_p95: float
+    writer_lag_ms_max: float
+    blocked_append_count: int
+    dropped_sampled_event_count: int
     playbook_before_sha256: str
     playbook_after_sha256: str
 
@@ -76,42 +87,80 @@ def main() -> None:
 def _run_metrics(row: dict[str, str]) -> RunMetrics:
     run_dir = Path(row["run_dir"]).expanduser()
     journal = run_dir / "events.jsonl"
-    events = list(read_event_log(journal)) if journal.is_file() else []
-    episode_result = next(
-        (event.payload for event in reversed(events) if event.event_type == "episode_result"),
-        {},
-    )
-    executions = [event.payload for event in events if event.event_type == "execution"]
-    terminal_counts = Counter(str(payload.get("command_id")) for payload in executions)
+    episode_result: dict[str, Any] = {}
+    terminal_counts: Counter[str] = Counter()
     dispatch_counts: Counter[str] = Counter()
-    for event in events:
-        if event.event_type != "command_lifecycle":
-            continue
-        if event.payload.get("status") == "dispatched":
-            command = event.payload.get("command")
-            if isinstance(command, dict):
-                dispatch_counts[str(command.get("command_id"))] += 1
-    consequence_events = [
-        event.payload for event in events if event.event_type == "strategic_consequence_attributed"
-    ]
-    consequences = Counter(
-        str(payload.get("consequence_type", "unknown")) for payload in consequence_events
+    consequences: Counter[str] = Counter()
+    error_signatures: Counter[str] = Counter()
+    playbook_applications = 0
+    playbook_nonzero_score_applications = 0
+    playbook_blocks = 0
+    candidate_outside_dispatch = 0
+    max_game_loop = 0
+    eligible_operation_ids: set[str] = set()
+    first_timestamp: datetime | None = None
+    last_timestamp: datetime | None = None
+    event_count = 0
+    performance: dict[str, Any] = {}
+    if journal.is_file():
+        for event in read_event_log(journal):
+            event_count += 1
+            try:
+                timestamp = datetime.fromisoformat(event.created_at)
+            except ValueError:
+                timestamp = None
+            if timestamp is not None:
+                first_timestamp = timestamp if first_timestamp is None else first_timestamp
+                last_timestamp = timestamp
+            value = event.payload.get("game_loop")
+            if isinstance(value, int | float):
+                max_game_loop = max(max_game_loop, int(value))
+            if event.event_type == "episode_result":
+                episode_result = event.payload
+            elif event.event_type == "execution":
+                command_id = str(event.payload.get("command_id"))
+                terminal_counts[command_id] += 1
+                candidate_outside_dispatch += (
+                    event.payload.get("failure_code") == "candidate_outside_dispatch"
+                )
+            elif (
+                event.event_type == "command_lifecycle"
+                and event.payload.get("status") == "dispatched"
+            ):
+                command = event.payload.get("command")
+                if isinstance(command, dict):
+                    dispatch_counts[str(command.get("command_id"))] += 1
+            elif event.event_type == "command_lineage":
+                lineage = event.payload.get("lineage", event.payload)
+                operation_id = lineage.get("operation_id") if isinstance(lineage, dict) else None
+                if isinstance(operation_id, str):
+                    eligible_operation_ids.add(operation_id)
+            elif event.event_type == "strategic_consequence_attributed":
+                consequence_type = str(event.payload.get("consequence_type", "unknown"))
+                consequences[consequence_type] += 1
+                if consequence_type in _ERROR_CONSEQUENCES:
+                    error_signatures[_consequence_signature(event.payload)] += 1
+            elif event.event_type == "playbook_rule_applied":
+                playbook_applications += 1
+                playbook_nonzero_score_applications += (
+                    float(event.payload.get("score_delta", 0.0)) != 0.0
+                )
+                playbook_blocks += event.payload.get("blocked") is True
+            elif event.event_type == "event_store_performance":
+                performance = event.payload
+
+    elapsed_seconds = (
+        0.0
+        if first_timestamp is None or last_timestamp is None
+        else max(0.0, (last_timestamp - first_timestamp).total_seconds())
     )
-    error_signatures = Counter(
-        _consequence_signature(payload)
-        for payload in consequence_events
-        if str(payload.get("consequence_type")) in _ERROR_CONSEQUENCES
-    )
-    applications = [
-        event.payload for event in events if event.event_type == "playbook_rule_applied"
-    ]
-    observed_game_loops = [
-        value
-        for event in events
-        if isinstance(value := event.payload.get("game_loop"), int | float)
-    ]
-    max_game_loop = max((*observed_game_loops, *(event.step_id for event in events)), default=0)
-    elapsed_seconds = _elapsed_seconds(events)
+    repeated_errors = sum(max(0, count - 1) for count in error_signatures.values())
+    eligible_operation_count = len(eligible_operation_ids) or len(dispatch_counts)
+    terminal_report_count = sum(terminal_counts.values())
+    dispatched_ids = set(dispatch_counts)
+    terminal_ids = set(terminal_counts)
+    journal_bytes = journal.stat().st_size if journal.is_file() else 0
+    artifact_bytes = sum(path.stat().st_size for path in run_dir.rglob("*") if path.is_file())
     before_false_blocks, before_shadow_states = _hard_false_blocks(
         Path(row["playbook_before_snapshot"])
     )
@@ -120,8 +169,6 @@ def _run_metrics(row: dict[str, str]) -> RunMetrics:
     )
     false_blocks = max(0, after_false_blocks - before_false_blocks)
     shadow_states = max(0, after_shadow_states - before_shadow_states)
-    dispatched_ids = set(dispatch_counts)
-    terminal_ids = set(terminal_counts)
     return RunMetrics(
         mode=row["mode"],
         seed=int(row["seed"]),
@@ -136,35 +183,42 @@ def _run_metrics(row: dict[str, str]) -> RunMetrics:
             str(episode_result["outcome"]) if episode_result.get("outcome") is not None else None
         ),
         score=float(episode_result.get("score", 0.0)),
-        terminal_report_count=len(executions),
+        terminal_report_count=terminal_report_count,
         missing_terminal_reports=len(dispatched_ids - terminal_ids),
         duplicate_terminal_reports=sum(
             count - 1 for count in terminal_counts.values() if count > 1
         ),
         duplicate_dispatches=sum(count - 1 for count in dispatch_counts.values() if count > 1),
-        candidate_outside_dispatch=sum(
-            payload.get("failure_code") == "candidate_outside_dispatch" for payload in executions
+        candidate_outside_dispatch=candidate_outside_dispatch,
+        playbook_applications=playbook_applications,
+        playbook_nonzero_score_applications=playbook_nonzero_score_applications,
+        playbook_blocks=playbook_blocks,
+        repeated_eligible_errors=repeated_errors,
+        repeated_errors_per_10k_game_loops=(
+            repeated_errors * 10_000 / max_game_loop if max_game_loop else 0.0
         ),
-        playbook_applications=len(applications),
-        playbook_nonzero_score_applications=sum(
-            float(payload.get("score_delta", 0.0)) != 0.0 for payload in applications
+        repeated_errors_per_eligible_operation=(
+            repeated_errors / eligible_operation_count if eligible_operation_count else 0.0
         ),
-        playbook_blocks=sum(payload.get("blocked") is True for payload in applications),
-        repeated_eligible_errors=sum(max(0, count - 1) for count in error_signatures.values()),
+        eligible_operation_count=eligible_operation_count,
         strategic_consequences=dict(sorted(consequences.items())),
         hard_rule_false_block_count=false_blocks,
         hard_rule_shadow_state_count=shadow_states,
         hard_rule_false_block_rate=(false_blocks / shadow_states if shadow_states else 0.0),
-        journal_bytes=journal.stat().st_size if journal.is_file() else 0,
-        max_game_loop=int(max_game_loop) if isinstance(max_game_loop, int | float) else 0,
-        bytes_per_game_loop=(
-            journal.stat().st_size / max_game_loop
-            if journal.is_file() and isinstance(max_game_loop, int | float) and max_game_loop > 0
-            else 0.0
-        ),
+        journal_bytes=journal_bytes,
+        artifact_bytes=artifact_bytes,
+        event_count=event_count,
+        max_game_loop=max_game_loop,
+        events_per_game_loop=(event_count / max_game_loop if max_game_loop else 0.0),
+        bytes_per_game_loop=(journal_bytes / max_game_loop if max_game_loop else 0.0),
         effective_game_loops_per_second=(
             max_game_loop / elapsed_seconds if elapsed_seconds else 0.0
         ),
+        writer_queue_peak=int(performance.get("max_queue_depth", 0)),
+        writer_lag_ms_p95=float(performance.get("writer_lag_ms_p95", 0.0)),
+        writer_lag_ms_max=float(performance.get("writer_lag_ms_max", 0.0)),
+        blocked_append_count=int(performance.get("blocked_append_count", 0)),
+        dropped_sampled_event_count=int(performance.get("dropped_sampled_event_count", 0)),
         playbook_before_sha256=row["playbook_before_sha256"],
         playbook_after_sha256=row["playbook_after_sha256"],
     )
@@ -204,18 +258,6 @@ def _consequence_signature(payload: dict[str, Any]) -> str:
     )
 
 
-def _elapsed_seconds(events: list[Any]) -> float:
-    timestamps: list[datetime] = []
-    for event in events:
-        try:
-            timestamps.append(datetime.fromisoformat(event.created_at))
-        except ValueError:
-            continue
-    if len(timestamps) < 2:
-        return 0.0
-    return max(0.0, (timestamps[-1] - timestamps[0]).total_seconds())
-
-
 def _comparison(metrics: list[RunMetrics], *, baseline_sha256: str) -> dict[str, Any]:
     expected_matrix = {
         (mode, seed, arm)
@@ -243,6 +285,14 @@ def _comparison(metrics: list[RunMetrics], *, baseline_sha256: str) -> dict[str,
                     "score_delta": evolving.score - frozen.score,
                     "repeated_error_delta": (
                         evolving.repeated_eligible_errors - frozen.repeated_eligible_errors
+                    ),
+                    "repeated_error_rate_per_10k_delta": (
+                        evolving.repeated_errors_per_10k_game_loops
+                        - frozen.repeated_errors_per_10k_game_loops
+                    ),
+                    "repeated_error_per_operation_delta": (
+                        evolving.repeated_errors_per_eligible_operation
+                        - frozen.repeated_errors_per_eligible_operation
                     ),
                     "win_delta": _win(evolving.outcome) - _win(frozen.outcome),
                 }
@@ -272,7 +322,21 @@ def _comparison(metrics: list[RunMetrics], *, baseline_sha256: str) -> dict[str,
     evolving_errors = sum(
         metric.repeated_eligible_errors for metric in independent_rows if metric.arm == "evolving"
     )
-    reduction = 0.0 if frozen_errors == 0 else (frozen_errors - evolving_errors) / frozen_errors
+    frozen_game_loops = sum(
+        metric.max_game_loop for metric in independent_rows if metric.arm == "frozen"
+    )
+    evolving_game_loops = sum(
+        metric.max_game_loop for metric in independent_rows if metric.arm == "evolving"
+    )
+    frozen_error_rate = frozen_errors * 10_000 / frozen_game_loops if frozen_game_loops else 0.0
+    evolving_error_rate = (
+        evolving_errors * 10_000 / evolving_game_loops if evolving_game_loops else 0.0
+    )
+    reduction = (
+        0.0
+        if frozen_error_rate == 0.0
+        else (frozen_error_rate - evolving_error_rate) / frozen_error_rate
+    )
     false_blocks = sum(metric.hard_rule_false_block_count for metric in metrics)
     shadow_states = sum(metric.hard_rule_shadow_state_count for metric in metrics)
     gates = {
@@ -306,6 +370,8 @@ def _comparison(metrics: list[RunMetrics], *, baseline_sha256: str) -> dict[str,
         "aggregate": {
             "independent_frozen_repeated_errors": frozen_errors,
             "independent_evolving_repeated_errors": evolving_errors,
+            "independent_frozen_repeated_errors_per_10k_game_loops": frozen_error_rate,
+            "independent_evolving_repeated_errors_per_10k_game_loops": (evolving_error_rate),
             "independent_repeated_error_reduction": reduction,
             "hard_rule_false_block_count": false_blocks,
             "hard_rule_shadow_state_count": shadow_states,
@@ -339,16 +405,42 @@ def _markdown(report: dict[str, Any]) -> str:
             "",
             "## Paired differences",
             "",
-            "| Mode | Seed | Score delta | Repeated-error delta | Win delta |",
-            "|---|---:|---:|---:|---:|",
+            "| Mode | Seed | Score delta | Error delta | Error/10k delta "
+            "| Error/op delta | Win delta |",
+            "|---|---:|---:|---:|---:|---:|---:|",
         ]
     )
     lines.extend(
         (
             f"| {item['mode']} | {item['seed']} | {item['score_delta']:.3f} | "
-            f"{item['repeated_error_delta']} | {item['win_delta']} |"
+            f"{item['repeated_error_delta']} | "
+            f"{item['repeated_error_rate_per_10k_delta']:.3f} | "
+            f"{item['repeated_error_per_operation_delta']:.3f} | "
+            f"{item['win_delta']} |"
         )
         for item in report["paired_differences"]
+    )
+    lines.extend(
+        [
+            "",
+            "## Runtime persistence",
+            "",
+            "| Mode | Seed | Arm | loops/s | events/loop | bytes/loop "
+            "| artifact bytes | queue peak | writer p95 ms | blocked | dropped |",
+            "|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+        ]
+    )
+    lines.extend(
+        (
+            f"| {item['mode']} | {item['seed']} | {item['arm']} | "
+            f"{item['effective_game_loops_per_second']:.3f} | "
+            f"{item['events_per_game_loop']:.3f} | "
+            f"{item['bytes_per_game_loop']:.3f} | "
+            f"{item['artifact_bytes']} | {item['writer_queue_peak']} | "
+            f"{item['writer_lag_ms_p95']:.3f} | {item['blocked_append_count']} | "
+            f"{item['dropped_sampled_event_count']} |"
+        )
+        for item in report["runs"]
     )
     return "\n".join(lines) + "\n"
 

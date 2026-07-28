@@ -225,22 +225,6 @@ class DeterministicTacticalAgent:
                     # the target changes, disappears or execution reports failure.
                     engaged_actors.add(actor)
                     continue
-                self._engagement_by_actor[actor] = _ActorEngagementState(
-                    target_tag=target_tag,
-                    actor_tags=actor_tags,
-                    entered_game_loop=observation.game_loop,
-                    last_command_game_loop=observation.game_loop,
-                )
-                previous = self._offense_by_actor.get(actor)
-                self._offense_by_actor[actor] = _ActorOffenseState(
-                    phase="engaged",
-                    entered_game_loop=(
-                        observation.game_loop if previous is None else previous.entered_game_loop
-                    ),
-                    last_command_game_loop=observation.game_loop,
-                    cooldown_until_game_loop=observation.game_loop,
-                    target_tag=target_tag,
-                )
                 target_kind = (
                     "enemy structure" if target.unit_type in ENEMY_STRUCTURE_TYPES else "enemy unit"
                 )
@@ -386,17 +370,70 @@ class DeterministicTacticalAgent:
         command: ActionCommand,
         *,
         responsibility: str,
+        observation: ObservationEnvelope,
+        situation: SituationAssessment,
     ) -> None:
-        state: _ActorEngagementState | _ActorRetreatState | _ActorOffenseState | None
         if command.name == "Attack_Unit":
-            state = self._engagement_by_actor.get(command.actor)
+            if not command.arguments:
+                raise ValueError("dispatched Attack_Unit command has no target tag")
+            target_tag = _normalize_tag(command.arguments[0])
+            actor_tags = _actor_tags(observation, command.actor)
+            state: _ActorEngagementState | _ActorRetreatState | _ActorOffenseState
+            state = _ActorEngagementState(
+                target_tag=target_tag,
+                actor_tags=actor_tags,
+                entered_game_loop=observation.game_loop,
+                last_command_game_loop=observation.game_loop,
+            )
+            self._engagement_by_actor[command.actor] = state
+            self._focus_target_by_actor[command.actor] = target_tag
+            previous = self._offense_by_actor.get(command.actor)
+            self._offense_by_actor[command.actor] = _ActorOffenseState(
+                phase="engaged",
+                entered_game_loop=(
+                    observation.game_loop if previous is None else previous.entered_game_loop
+                ),
+                last_command_game_loop=observation.game_loop,
+                cooldown_until_game_loop=observation.game_loop,
+                target_tag=target_tag,
+                obsolete_waypoints=({} if previous is None else dict(previous.obsolete_waypoints)),
+            )
         elif responsibility == "retreat":
-            state = self._retreat_by_actor.get(command.actor)
+            state = _ActorRetreatState(
+                phase="retreating",
+                entered_game_loop=observation.game_loop,
+                last_command_game_loop=observation.game_loop,
+                cooldown_until_game_loop=(observation.game_loop + self.retreat_cooldown_game_loops),
+                actor_tags=_actor_tags(observation, command.actor),
+                threat_signature=_threat_signature(
+                    situation,
+                    living_targetable_enemies(observation.state.visible_enemies),
+                ),
+            )
+            self._retreat_by_actor[command.actor] = state
         elif command.name == "Move_Minimap":
-            state = self._offense_by_actor.get(command.actor)
+            waypoint = _command_position(command)
+            previous = self._offense_by_actor.get(command.actor)
+            centroid = _actor_minimap_centroid(observation, command.actor)
+            state = _ActorOffenseState(
+                phase="advancing",
+                entered_game_loop=(
+                    observation.game_loop if previous is None else previous.entered_game_loop
+                ),
+                last_command_game_loop=observation.game_loop,
+                cooldown_until_game_loop=(
+                    observation.game_loop + self.reacquire_cooldown_game_loops
+                ),
+                waypoint=waypoint,
+                waypoint_index=-1,
+                best_distance=(
+                    None if waypoint is None or centroid is None else math.dist(centroid, waypoint)
+                ),
+                last_progress_game_loop=observation.game_loop,
+                obsolete_waypoints=({} if previous is None else dict(previous.obsolete_waypoints)),
+            )
+            self._offense_by_actor[command.actor] = state
         else:
-            state = None
-        if state is None:
             return
         state.command_id = command.command_id
         state.operation_id = command.operation_id
@@ -404,18 +441,18 @@ class DeterministicTacticalAgent:
         if command.operation_id is None:
             return
         if isinstance(state, _ActorRetreatState):
-            actor_tags = tuple(int(tag, 0) for tag in state.actor_tags)
+            commitment_actor_tags = tuple(int(tag, 0) for tag in state.actor_tags)
             state.commitment_id = RetreatCommitmentKey(
                 operation_id=command.operation_id,
-                actor_tags=actor_tags,
+                actor_tags=commitment_actor_tags,
                 threat_signature=state.threat_signature,
                 destination=state.destination,
             ).commitment_id
         elif isinstance(state, _ActorEngagementState):
-            actor_tags = tuple(int(tag, 0) for tag in state.actor_tags)
+            engagement_actor_tags = tuple(int(tag, 0) for tag in state.actor_tags)
             state.engagement_id = EngagementKey(
                 operation_id=command.operation_id,
-                actor_tags=actor_tags,
+                actor_tags=engagement_actor_tags,
                 ability_name="Attack_Attack_unit",
                 target_tag=int(state.target_tag, 0),
             ).engagement_id
@@ -599,41 +636,6 @@ class DeterministicTacticalAgent:
             waypoint = self._select_offense_waypoint(
                 available,
             )
-            next_index = candidates.index(waypoint)
-            waypoint_distance = None if centroid is None else math.dist(centroid, waypoint)
-            if state is None:
-                state = _ActorOffenseState(
-                    phase=(
-                        "searching"
-                        if last_known_targets or self._known_enemy_structures
-                        else "advancing"
-                    ),
-                    entered_game_loop=observation.game_loop,
-                    last_command_game_loop=observation.game_loop,
-                    cooldown_until_game_loop=(
-                        observation.game_loop + self.reacquire_cooldown_game_loops
-                    ),
-                    waypoint=waypoint,
-                    waypoint_index=next_index,
-                    best_distance=waypoint_distance,
-                    last_progress_game_loop=observation.game_loop,
-                )
-                self._offense_by_actor[actor] = state
-            else:
-                state.phase = (
-                    "searching"
-                    if last_known_targets or self._known_enemy_structures
-                    else "advancing"
-                )
-                state.last_command_game_loop = observation.game_loop
-                state.cooldown_until_game_loop = (
-                    observation.game_loop + self.reacquire_cooldown_game_loops
-                )
-                state.waypoint = waypoint
-                state.waypoint_index = next_index
-                state.target_tag = None
-                state.best_distance = waypoint_distance
-                state.last_progress_game_loop = observation.game_loop
 
             objective = (
                 "Search the last-known enemy structure location and reacquire targets"
@@ -743,17 +745,6 @@ class DeterministicTacticalAgent:
                 continue
             retreating.add(actor)
             if at_home:
-                if state is None:
-                    self._retreat_by_actor[actor] = _ActorRetreatState(
-                        phase="arrived",
-                        entered_game_loop=observation.game_loop,
-                        last_command_game_loop=observation.game_loop,
-                        cooldown_until_game_loop=(
-                            observation.game_loop + self.retreat_cooldown_game_loops
-                        ),
-                        actor_tags=actor_tags,
-                        threat_signature=threat_signature,
-                    )
                 continue
             same_operation = (
                 state is not None
@@ -767,27 +758,6 @@ class DeterministicTacticalAgent:
                 and observation.game_loop < state.cooldown_until_game_loop
             ):
                 continue
-            if state is None:
-                state = _ActorRetreatState(
-                    phase="retreating",
-                    entered_game_loop=observation.game_loop,
-                    last_command_game_loop=observation.game_loop,
-                    cooldown_until_game_loop=(
-                        observation.game_loop + self.retreat_cooldown_game_loops
-                    ),
-                    actor_tags=actor_tags,
-                    threat_signature=threat_signature,
-                )
-                self._retreat_by_actor[actor] = state
-            else:
-                state.phase = "retreating"
-                state.last_command_game_loop = observation.game_loop
-                state.actor_tags = actor_tags
-                state.threat_signature = threat_signature
-                state.arrival_emitted = False
-                state.cooldown_until_game_loop = (
-                    observation.game_loop + self.retreat_cooldown_game_loops
-                )
             intents.append(
                 self._intent(
                     observation,
@@ -845,7 +815,6 @@ class DeterministicTacticalAgent:
         if previous is not None and previous in by_tag:
             return by_tag[previous], False
         target = min(enemies, key=_target_rank)
-        self._focus_target_by_actor[actor] = _normalize_tag(target.unit_id)
         return target, previous is not None
 
     def _attack_targets_for_actor(
@@ -1068,6 +1037,16 @@ def _units_at_home(
         )
         for unit_position in unit_positions
     )
+
+
+def _command_position(command: ActionCommand) -> tuple[int, int] | None:
+    if (
+        not command.arguments
+        or not isinstance(command.arguments[0], (list, tuple))
+        or len(command.arguments[0]) != 2
+    ):
+        return None
+    return int(command.arguments[0][0]), int(command.arguments[0][1])
 
 
 def _normalize_tag(value: object) -> str:

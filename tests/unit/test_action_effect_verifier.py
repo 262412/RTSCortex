@@ -138,6 +138,68 @@ def test_overwritten_attack_order_can_be_reissued() -> None:
     assert verdict.failure_code == "combat_order_replaced"
 
 
+def test_damage_after_order_replacement_does_not_confirm_old_attack() -> None:
+    verifier = ActionEffectVerifier(timeout_game_loops=32)
+    command = _attack_command()
+    verifier.track(command)
+    verifier.prepare(
+        command.command_id,
+        _attack_observation(100, health=150),
+        None,
+        actor_tags=(0xA00,),
+    )
+    verifier.accept_primitive(command.command_id, game_loop=104)
+    assert verifier.observe(_attack_observation(108, health=150)) == []
+
+    assert verifier.observe(_attack_observation(112, health=100, actor_order_target=None)) == []
+    verdict = verifier.observe(_attack_observation(116, health=100, actor_order_target=None))[0]
+
+    assert verdict.success is False
+    assert verdict.failure_code == "combat_order_replaced"
+    assert verdict.evidence is not None
+    assert verdict.evidence["actor_order_bound"] is False
+    assert verdict.evidence["actor_order_ever_bound"] is True
+
+
+def test_non_attack_targeted_order_does_not_bind_combat_command() -> None:
+    verifier = ActionEffectVerifier(timeout_game_loops=16)
+    command = _attack_command()
+    verifier.track(command)
+    verifier.prepare(
+        command.command_id,
+        _attack_observation(100, health=150, actor_order_ability_id=4),
+        None,
+        actor_tags=(0xA00,),
+    )
+    verifier.accept_primitive(command.command_id, game_loop=104)
+
+    assert verifier.observe(_attack_observation(112, health=100, actor_order_ability_id=4)) == []
+    verdict = verifier.observe(_attack_observation(120, health=100, actor_order_ability_id=4))[0]
+
+    assert verdict.success is False
+    assert verdict.failure_code == "combat_actor_order_unbound"
+
+
+def test_missing_actor_after_prior_binding_cannot_claim_damage() -> None:
+    verifier = ActionEffectVerifier(timeout_game_loops=32)
+    command = _attack_command()
+    verifier.track(command)
+    verifier.prepare(
+        command.command_id,
+        _attack_observation(100, health=150),
+        None,
+        actor_tags=(0xA00,),
+    )
+    verifier.accept_primitive(command.command_id, game_loop=104)
+    assert verifier.observe(_attack_observation(108, health=150)) == []
+
+    assert verifier.observe(_attack_observation(112, health=100, actor_tags=())) == []
+    verdict = verifier.observe(_attack_observation(116, health=100, actor_tags=()))[0]
+
+    assert verdict.success is False
+    assert verdict.failure_code == "combat_order_replaced"
+
+
 def test_one_health_delta_confirms_at_most_one_combat_engagement() -> None:
     verifier = ActionEffectVerifier(timeout_game_loops=32)
     first = _attack_command()
@@ -2035,6 +2097,7 @@ def _attack_observation(
     *,
     health: float | None,
     actor_order_target: int | None = 0xDEF,
+    actor_order_ability_id: int = 23,
     actor_tags: tuple[int, ...] = (0xA00,),
 ) -> dict[str, Any]:
     raw_units: list[dict[str, Any]] = [
@@ -2045,7 +2108,12 @@ def _attack_observation(
             "orders": (
                 []
                 if actor_order_target is None
-                else [{"ability_id": 23, "target_unit_tag": actor_order_target}]
+                else [
+                    {
+                        "ability_id": actor_order_ability_id,
+                        "target_unit_tag": actor_order_target,
+                    }
+                ]
             ),
         }
         for actor_tag in actor_tags

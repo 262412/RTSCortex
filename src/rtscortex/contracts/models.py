@@ -280,6 +280,8 @@ class EffectEvidence(ContractModel):
     actor_tag: str | None = None
     actor_tags: list[str] = Field(default_factory=list)
     actor_order_bound: bool = False
+    actor_order_ever_bound: bool = False
+    actor_order_ability_ids: list[int] = Field(default_factory=list)
     builder_tag: str | None = None
     reservation_id: str | None = None
     placement_revision: str | None = None

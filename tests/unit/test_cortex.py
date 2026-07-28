@@ -116,6 +116,44 @@ def _macro_intent(*, action_names: list[str] | None = None) -> MacroIntent:
     )
 
 
+def _record_tactical_dispatch(
+    agent: DeterministicTacticalAgent,
+    observation: ObservationEnvelope,
+    intent: TacticalIntent,
+    *,
+    command_id: str,
+    operation_id: str | None = None,
+    attempt_id: str | None = None,
+) -> ActionCommand:
+    context = CandidateCompiler().compile(observation, intent)
+    candidate = next(item for item in context.candidates if item.actor == intent.actor_scopes[0])
+    responsibility = (
+        "retreat"
+        if "retreat" in intent.objective.casefold()
+        else "focus_fire"
+        if intent.action_names[0] == "Attack_Unit"
+        else "offense"
+    )
+    command = ActionCommand(
+        command_id=command_id,
+        operation_id=operation_id,
+        attempt_id=attempt_id,
+        actor=candidate.actor,
+        name=candidate.action_name,
+        arguments=candidate.arguments,
+        created_game_loop=observation.game_loop,
+        ttl_game_loops=intent.ttl_game_loops,
+        source=ActionSource.PLANNER,
+    )
+    agent.record_dispatch(
+        command,
+        responsibility=responsibility,
+        observation=observation,
+        situation=DeterministicSituationAnalyzer().assess(observation),
+    )
+    return command
+
+
 def test_candidate_compiler_enumerates_only_exact_available_domain() -> None:
     compiler = CandidateCompiler()
 
@@ -273,6 +311,13 @@ def test_retreat_state_is_actor_local_and_cools_down_after_arrival() -> None:
         observation,
         DeterministicSituationAnalyzer().assess(observation),
     )
+    for index, intent in enumerate(first):
+        _record_tactical_dispatch(
+            agent,
+            observation,
+            intent,
+            command_id=f"tactical-{index}",
+        )
     next_tick = observation.model_copy(update={"step_id": 5, "game_loop": 65})
     second = agent.evaluate(
         next_tick,
@@ -367,6 +412,8 @@ def test_stale_report_cannot_mutate_new_retreat_commitment() -> None:
             source=ActionSource.PLANNER,
         ),
         responsibility="retreat",
+        observation=observation,
+        situation=DeterministicSituationAnalyzer().assess(observation),
     )
     later = observation.model_copy(update={"step_id": 5, "game_loop": 200})
     assert agent.evaluate(later, DeterministicSituationAnalyzer().assess(later))
@@ -385,6 +432,8 @@ def test_stale_report_cannot_mutate_new_retreat_commitment() -> None:
             source=ActionSource.PLANNER,
         ),
         responsibility="retreat",
+        observation=later,
+        situation=DeterministicSituationAnalyzer().assess(later),
     )
 
     transition = agent.record_execution(
@@ -411,6 +460,65 @@ def test_stale_report_cannot_mutate_new_retreat_commitment() -> None:
     current = agent._retreat_by_actor[actor]
     assert current.command_id == "new-retreat"
     assert current.phase == "retreating"
+
+
+def test_undispatched_retreat_does_not_start_cooldown() -> None:
+    base = _observation()
+    actor = "CombatGroup7/Adept-1"
+    observation = base.model_copy(
+        update={
+            "state": base.state.model_copy(
+                update={
+                    "own_units": [
+                        UnitState(
+                            unit_id="0x10",
+                            unit_type="Adept",
+                            alliance="self",
+                            position=(50.0, 50.0),
+                            durability_fraction=0.2,
+                            actor_scopes=(actor,),
+                        )
+                    ],
+                    "own_structures": [
+                        UnitState(
+                            unit_id="0x12",
+                            unit_type="Nexus",
+                            alliance="self",
+                            position=(10.0, 10.0),
+                        )
+                    ],
+                }
+            ),
+            "available_actions": [
+                AvailableAction(
+                    name="Move_Minimap",
+                    argument_names=["minimap"],
+                    argument_types=[ActionArgumentType.POSITION],
+                    actor_scopes=[actor],
+                    argument_candidates=[[[12, 12]]],
+                )
+            ],
+        }
+    )
+    agent = DeterministicTacticalAgent(
+        retreat_health_threshold=0.3,
+        minimum_advance_army_supply=4,
+        retreat_cooldown_game_loops=112,
+    )
+
+    first = agent.evaluate(
+        observation,
+        DeterministicSituationAnalyzer().assess(observation),
+    )
+    next_tick = observation.model_copy(update={"step_id": 5, "game_loop": 65})
+    second = agent.evaluate(
+        next_tick,
+        DeterministicSituationAnalyzer().assess(next_tick),
+    )
+
+    assert len(first) == 1
+    assert len(second) == 1
+    assert agent._retreat_by_actor == {}
 
 
 def test_retreat_uses_exact_actor_membership_and_shield_aware_durability() -> None:
@@ -539,6 +647,13 @@ def test_tactical_agent_focuses_one_target_and_reacquires_when_it_disappears() -
     assert {intent.target.unit_type for intent in first} == {"VoidRay"}
     contexts = [CandidateCompiler().compile(observation, intent) for intent in first]
     assert all(context.candidates[0].arguments == ["0x21"] for context in contexts)
+    for index, intent in enumerate(first):
+        _record_tactical_dispatch(
+            agent,
+            observation,
+            intent,
+            command_id=f"focus-{index}",
+        )
 
     next_observation = observation.model_copy(
         update={
@@ -562,6 +677,27 @@ def test_tactical_agent_focuses_one_target_and_reacquires_when_it_disappears() -
     assert second
     assert second[0].target.unit_type == "Zergling"
     assert second[0].objective.startswith("Reacquire")
+
+
+def test_undispatched_focus_fire_is_reproposed() -> None:
+    observation = _observation()
+    agent = DeterministicTacticalAgent(
+        retreat_health_threshold=0.3,
+        minimum_advance_army_supply=4,
+    )
+
+    [first] = agent.evaluate(
+        observation,
+        DeterministicSituationAnalyzer().assess(observation),
+    )
+    next_tick = observation.model_copy(update={"step_id": 5, "game_loop": 65})
+    [second] = agent.evaluate(
+        next_tick,
+        DeterministicSituationAnalyzer().assess(next_tick),
+    )
+
+    assert first.target.unit_tag == second.target.unit_tag == "0x20"
+    assert agent._engagement_by_actor == {}
 
 
 def test_tactical_agent_quarantines_repeated_actor_target_failure() -> None:
@@ -613,6 +749,7 @@ def test_tactical_agent_quarantines_repeated_actor_target_failure() -> None:
         DeterministicSituationAnalyzer().assess(observation),
     )
     assert first.target.unit_tag == "0x20"
+    _record_tactical_dispatch(agent, observation, first, command_id="attack-1")
     failure = ExecutionReport(
         run_id=observation.run_id,
         episode_id=observation.episode_id,
@@ -631,9 +768,15 @@ def test_tactical_agent_quarantines_repeated_actor_target_failure() -> None:
 
     first_failure = agent.record_execution(failure, game_loop=64)
     retry_observation = observation.model_copy(update={"step_id": 4, "game_loop": 68})
-    agent.evaluate(
+    [retry_intent] = agent.evaluate(
         retry_observation,
         DeterministicSituationAnalyzer().assess(retry_observation),
+    )
+    _record_tactical_dispatch(
+        agent,
+        retry_observation,
+        retry_intent,
+        command_id="attack-2",
     )
     second_failure = agent.record_execution(
         failure.model_copy(update={"command_id": "attack-2"}),
@@ -690,6 +833,7 @@ def test_tactical_agent_preserves_retry_count_across_candidate_generation() -> N
         observation,
         DeterministicSituationAnalyzer().assess(observation),
     )
+    _record_tactical_dispatch(agent, observation, first, command_id="attack-1")
     failure = ExecutionReport(
         run_id=observation.run_id,
         episode_id=observation.episode_id,
@@ -712,7 +856,16 @@ def test_tactical_agent_preserves_retry_count_across_candidate_generation() -> N
         retry_observation,
         DeterministicSituationAnalyzer().assess(retry_observation),
     )
-    second_failure = agent.record_execution(failure, game_loop=96)
+    _record_tactical_dispatch(
+        agent,
+        retry_observation,
+        retry,
+        command_id="attack-2",
+    )
+    second_failure = agent.record_execution(
+        failure.model_copy(update={"command_id": "attack-2"}),
+        game_loop=96,
+    )
     quarantined_observation = observation.model_copy(update={"step_id": 6, "game_loop": 104})
     [fallback] = agent.evaluate(
         quarantined_observation,
@@ -763,9 +916,16 @@ def test_tactical_agent_quarantines_only_the_unselectable_actor() -> None:
         failure_code="actor_selection_timeout",
     )
 
-    agent.evaluate(
+    intents = agent.evaluate(
         observation,
         DeterministicSituationAnalyzer().assess(observation),
+    )
+    first_actor_intent = next(intent for intent in intents if intent.actor_scopes[0] == actors[0])
+    _record_tactical_dispatch(
+        agent,
+        observation,
+        first_actor_intent,
+        command_id="attack-unselectable",
     )
     transition = agent.record_execution(failure, game_loop=64)
     during_cooldown = observation.model_copy(update={"step_id": 5, "game_loop": 80})
@@ -781,8 +941,8 @@ def test_tactical_agent_quarantines_only_the_unselectable_actor() -> None:
 
     assert transition is not None
     assert transition["state"] == "actor_quarantined"
-    assert active == []
-    assert [intent.actor_scopes[0] for intent in recovered] == [actors[0]]
+    assert [intent.actor_scopes[0] for intent in active] == [actors[1]]
+    assert [intent.actor_scopes[0] for intent in recovered] == actors
 
 
 def test_tactical_agent_attacks_current_screen_structure_when_units_are_last_known() -> None:
@@ -858,6 +1018,7 @@ def test_last_known_enemy_without_screen_target_triggers_reacquire_move() -> Non
         observation,
         DeterministicSituationAnalyzer().assess(observation),
     )
+    _record_tactical_dispatch(agent, observation, first, command_id="move-1")
     later = observation.model_copy(update={"step_id": 5, "game_loop": 80})
     [second] = agent.evaluate(
         later,
@@ -916,6 +1077,13 @@ def test_offense_navigation_uses_actor_centroid_and_obsoletes_arrived_waypoint()
         observation,
         DeterministicSituationAnalyzer().assess(observation),
     )
+    for index, intent in enumerate(first):
+        _record_tactical_dispatch(
+            agent,
+            observation,
+            intent,
+            command_id=f"move-{index}",
+        )
     arrived = observation.model_copy(
         update={
             "step_id": 5,
@@ -978,6 +1146,7 @@ def test_offense_move_failure_obsoletes_waypoint_until_actor_cooldown() -> None:
         observation,
         DeterministicSituationAnalyzer().assess(observation),
     )[0]
+    _record_tactical_dispatch(agent, observation, first, command_id="failed-move")
     transition = agent.record_execution(
         ExecutionReport(
             run_id=observation.run_id,
@@ -1125,6 +1294,7 @@ def test_tactical_reacquire_move_is_suppressed_until_cooldown_expires() -> None:
         observation,
         DeterministicSituationAnalyzer().assess(observation),
     )
+    _record_tactical_dispatch(agent, observation, first[0], command_id="move-cooldown")
     during_cooldown = observation.model_copy(update={"step_id": 5, "game_loop": 100})
     second = agent.evaluate(
         during_cooldown,

@@ -258,6 +258,35 @@ def test_cross_structure_footprints_cannot_overlap() -> None:
     )
 
 
+def test_terran_producer_ledger_reserves_addon_cells() -> None:
+    service = RawPlacementService(unit_names={})
+    observation = SimpleNamespace(
+        raw_units=[],
+        feature_units=[],
+        feature_screen=None,
+        game_loop=[100],
+    )
+
+    reservation = service.resolve(
+        command_id="barracks-a",
+        action_name="Build_Barracks_Screen",
+        requested_arguments=([64, 64],),
+        observation=observation,
+        world_target=(22.0, 22.0),
+    )
+
+    assert reservation.footprint_width == 5
+    assert reservation.footprint_height == 3
+    assert len(reservation.occupied_grid_cells) == 15
+    assert {(24, 21), (25, 21), (24, 22), (25, 22), (24, 23), (25, 23)} <= set(
+        reservation.occupied_grid_cells
+    )
+    assert service.is_quarantined(
+        "Build_SupplyDepot_Screen",
+        (25.0, 22.0),
+    )
+
+
 def test_actor_failure_does_not_quarantine_placement() -> None:
     service = RawPlacementService(unit_names={})
     service.quarantine_command(

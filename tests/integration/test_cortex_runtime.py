@@ -32,7 +32,18 @@ from rtscortex.contracts import (
     SC2State,
     UnitState,
 )
-from rtscortex.cortex import HIMAEnsemblePolicyClient, SituationAssessment, TacticalIntent
+from rtscortex.cortex import (
+    AttemptKey,
+    CommandLineage,
+    CortexRole,
+    DeterministicSituationAnalyzer,
+    ExpansionGoalKey,
+    ExpansionGoalState,
+    HIMAEnsemblePolicyClient,
+    MacroStepStatus,
+    SituationAssessment,
+    TacticalIntent,
+)
 from rtscortex.evaluation import compute_cortex_observability
 from rtscortex.memory import EventStore
 from rtscortex.playbook import CortexPlaybookReviewer, PlaybookStore
@@ -463,6 +474,123 @@ def test_hima_macro_plan_dispatches_only_through_current_candidate_domain(
     assert metrics.executor_candidate_violations == 0
     assert metrics.command_lineage_coverage == 1.0
     assert client.closed is True
+    recovered.close()
+
+
+def test_strategic_agenda_is_not_committed_before_command_dispatch(
+    tmp_path: Path,
+) -> None:
+    runtime = CortexRuntimeEngine(
+        config=_config(tmp_path, macro=False),
+        store=_store(tmp_path),
+        provider=FakeProvider(),
+    )
+    observation = ObservationEnvelope(
+        run_id="cortex-run",
+        episode_id="episode-1",
+        step_id=1,
+        game_loop=32,
+        state=SC2State(economy=EconomyState(army_supply=4, supply_used=8, supply_cap=15)),
+        available_actions=[
+            AvailableAction(
+                name="Move_Minimap",
+                argument_names=["minimap"],
+                argument_types=[ActionArgumentType.POSITION],
+                actor_scopes=["CombatGroup/Adept-1"],
+                argument_candidates=[[[20, 30]]],
+            )
+        ],
+    )
+    assessment = DeterministicSituationAnalyzer().assess(observation)
+    runtime._current_situation = assessment
+    intent = TacticalIntent(
+        intent_id="move-intent",
+        run_id=observation.run_id,
+        episode_id=observation.episode_id,
+        step_id=observation.step_id,
+        created_game_loop=observation.game_loop,
+        objective="Advance to the next waypoint",
+        action_names=["Move_Minimap"],
+        actor_scopes=["CombatGroup/Adept-1"],
+        source_id="test",
+        source_version="1",
+        ttl_game_loops=16,
+    )
+
+    prepared = runtime._compile_intent(observation, intent)
+    assert prepared is not None
+    selected = runtime._apply_strategic_arbitration(observation, [prepared])
+
+    assert len(selected) == 1
+    assert runtime._pending_strategic_arbitration is not None
+    assert runtime._strategic_agenda is None
+    runtime._commit_dispatched_strategic_agenda(
+        observation,
+        [],
+        {prepared.command.command_id: prepared},
+    )
+    assert runtime._strategic_agenda is None
+    asyncio.run(runtime.close())
+
+
+def test_opaque_future_step_cannot_dispatch_before_replan(tmp_path: Path) -> None:
+    client = _FakeMacroClient(
+        "Actions: ['Pylon', 'Gateway', 'Assimilator', 'CyberneticsCore', 'Stargate', 'Zealot']"
+    )
+    store = _store(tmp_path)
+    runtime = CortexRuntimeEngine(
+        config=_config(tmp_path),
+        store=store,
+        provider=FakeProvider(),
+        macro_client=client,
+    )
+    observation = _macro_observation(step_id=0, game_loop=0)
+
+    async def exercise() -> None:
+        await runtime.start()
+        await runtime.tick(observation)
+        assert runtime._macro_task is not None
+        await runtime._macro_task
+        await runtime._collect_finished_macro(observation)
+        assert runtime._macro_plan is not None
+        assert runtime._macro_proposal is not None
+        assert len(runtime._macro_plan.steps) == 5
+        assert len(runtime._macro_proposal.steps) == 6
+        runtime._macro_plan = runtime._macro_plan.model_copy(
+            update={
+                "steps": [
+                    step.model_copy(
+                        update={
+                            "status": MacroStepStatus.CONFIRMED,
+                            "completed_repeats": step.repeat,
+                        }
+                    )
+                    for step in runtime._macro_plan.steps
+                ]
+            }
+        )
+
+        prepared = runtime._prepare_macro_command(
+            observation,
+            DeterministicSituationAnalyzer().assess(observation),
+            runtime._macro_goal_progress(observation),
+        )
+
+        assert prepared is None
+        assert runtime._macro_plan_frozen is True
+        assert runtime._urgent_replan_requested is True
+        await runtime.close()
+
+    asyncio.run(exercise())
+
+    recovered = _store(tmp_path)
+    events = recovered.events_of_type(
+        observation.run_id,
+        observation.episode_id,
+        "macro_executable_horizon_exhausted",
+    )
+    assert len(events) == 1
+    assert events[0].payload["opaque_future_ordinals"] == [5]
     recovered.close()
 
 
@@ -2055,6 +2183,201 @@ def test_runtime_restart_does_not_redispatch_inflight_macro_command(
     ]
     assert len(dispatched) == 1
     store.close()
+
+
+def test_recovery_replays_expansion_reopen_after_checkpoint(tmp_path: Path) -> None:
+    observation = _macro_observation(step_id=4, game_loop=100)
+    goal_id = ExpansionGoalKey(
+        run_id=observation.run_id,
+        episode_id=observation.episode_id,
+        race="protoss",
+        desired_base_count=2,
+    ).goal_id
+    checkpoint_goal = ExpansionGoalState(
+        goal_id=goal_id,
+        baseline_base_count=1,
+        desired_base_count=2,
+        observed_base_count=1,
+        strategic_revision=0,
+        current_candidate_epoch=1,
+        exhausted_candidate_epochs=(1,),
+        retry_budget=7,
+        cooldown_until_game_loop=96,
+        phase="waiting_for_candidates",
+    )
+    first = CortexRuntimeEngine(
+        config=_config(tmp_path, macro=False),
+        store=_store(tmp_path),
+        provider=FakeProvider(),
+    )
+
+    async def checkpoint_then_reopen() -> None:
+        await first._activate_episode(observation)
+        first._expansion_goal = checkpoint_goal
+        first._expansion_scout_generation = 1
+        first._expansion_exhausted_generation = 1
+        first._record_cortex_checkpoint(observation)
+        reopened = checkpoint_goal.model_copy(
+            update={
+                "phase": "active",
+                "current_candidate_epoch": 2,
+                "cooldown_until_game_loop": 0,
+            }
+        )
+        first.store.append_event(
+            run_id=observation.run_id,
+            episode_id=observation.episode_id,
+            step_id=observation.step_id + 1,
+            event_type="expansion_goal_reopened",
+            payload=reopened,
+        )
+        await first.close()
+
+    asyncio.run(checkpoint_then_reopen())
+    recovered = CortexRuntimeEngine(
+        config=_config(tmp_path, macro=False),
+        store=_store(tmp_path),
+        provider=FakeProvider(),
+    )
+
+    async def recover() -> None:
+        await recovered._activate_episode(
+            observation.model_copy(update={"step_id": 6, "game_loop": 101})
+        )
+        assert recovered._expansion_goal is not None
+        assert recovered._expansion_goal.phase == "active"
+        assert recovered._expansion_goal.current_candidate_epoch == 2
+        assert recovered._expansion_goal.exhausted_candidate_epochs == (1,)
+        assert recovered._expansion_scout_generation == 2
+        await recovered.close()
+
+    asyncio.run(recover())
+
+
+def test_recovery_replays_candidate_epoch_exhaustion(tmp_path: Path) -> None:
+    observation = _macro_observation(step_id=4, game_loop=100)
+    goal_id = ExpansionGoalKey(
+        run_id=observation.run_id,
+        episode_id=observation.episode_id,
+        race="protoss",
+        desired_base_count=2,
+    ).goal_id
+    active = ExpansionGoalState(
+        goal_id=goal_id,
+        baseline_base_count=1,
+        desired_base_count=2,
+        observed_base_count=1,
+        strategic_revision=0,
+        current_candidate_epoch=2,
+        retry_budget=7,
+        phase="active",
+    )
+    first = CortexRuntimeEngine(
+        config=_config(tmp_path, macro=False),
+        store=_store(tmp_path),
+        provider=FakeProvider(),
+    )
+
+    async def checkpoint_then_exhaust() -> None:
+        await first._activate_episode(observation)
+        first._expansion_goal = active
+        first._expansion_scout_generation = 2
+        first._record_cortex_checkpoint(observation)
+        exhausted = active.model_copy(
+            update={
+                "phase": "waiting_for_candidates",
+                "exhausted_candidate_epochs": (2,),
+                "retry_budget": 6,
+                "cooldown_until_game_loop": 140,
+            }
+        )
+        first.store.append_event(
+            run_id=observation.run_id,
+            episode_id=observation.episode_id,
+            step_id=observation.step_id + 1,
+            event_type="expansion_candidate_epoch_exhausted",
+            payload=exhausted,
+        )
+        await first.close()
+
+    asyncio.run(checkpoint_then_exhaust())
+    recovered = CortexRuntimeEngine(
+        config=_config(tmp_path, macro=False),
+        store=_store(tmp_path),
+        provider=FakeProvider(),
+    )
+
+    async def recover() -> None:
+        await recovered._activate_episode(
+            observation.model_copy(update={"step_id": 6, "game_loop": 101})
+        )
+        assert recovered._expansion_goal is not None
+        assert recovered._expansion_goal.phase == "waiting_for_candidates"
+        assert recovered._expansion_goal.exhausted_candidate_epochs == (2,)
+        assert recovered._expansion_goal.retry_budget == 6
+        assert recovered._expansion_goal.cooldown_until_game_loop == 140
+        assert recovered._expansion_candidates_exhausted is True
+        await recovered.close()
+
+    asyncio.run(recover())
+
+
+def test_attempt_ordinal_remains_monotonic_after_restart(tmp_path: Path) -> None:
+    observation = _macro_observation(step_id=4, game_loop=100)
+    operation_id = f"operation:{'a' * 64}"
+    first = CortexRuntimeEngine(
+        config=_config(tmp_path, macro=False),
+        store=_store(tmp_path),
+        provider=FakeProvider(),
+    )
+
+    async def checkpoint_then_dispatch() -> None:
+        await first._activate_episode(observation)
+        first._attempt_ordinals[operation_id] = 2
+        first._record_cortex_checkpoint(observation)
+        lineage = CommandLineage(
+            command_id="post-checkpoint-command",
+            operation_id=operation_id,
+            attempt_id=AttemptKey(
+                operation_id=operation_id,
+                command_id="post-checkpoint-command",
+                attempt_ordinal=2,
+            ).attempt_id,
+            attempt_ordinal=2,
+            intent_id="post-checkpoint-intent",
+            candidate_id=f"candidate:{'b' * 64}",
+            selection_id=f"selection:{'c' * 64}",
+            source_role=CortexRole.TACTICAL,
+            source_id="test",
+            source_version="1",
+            executor_id="test",
+            executor_version="1",
+            selected_game_loop=101,
+        )
+        first.store.append_event(
+            run_id=observation.run_id,
+            episode_id=observation.episode_id,
+            step_id=observation.step_id + 1,
+            event_type="command_lineage",
+            payload={"lineage": lineage.model_dump(mode="json")},
+        )
+        await first.close()
+
+    asyncio.run(checkpoint_then_dispatch())
+    recovered = CortexRuntimeEngine(
+        config=_config(tmp_path, macro=False),
+        store=_store(tmp_path),
+        provider=FakeProvider(),
+    )
+
+    async def recover() -> None:
+        await recovered._activate_episode(
+            observation.model_copy(update={"step_id": 6, "game_loop": 102})
+        )
+        assert recovered._attempt_ordinals[operation_id] == 3
+        await recovered.close()
+
+    asyncio.run(recover())
 
 
 def test_optional_macro_startup_failure_falls_back_to_reflex(tmp_path: Path) -> None:
