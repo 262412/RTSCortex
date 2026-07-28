@@ -877,8 +877,7 @@ def _render_execution(
         )
     if (
         report.effect_evidence is None
-        and
-        report.action_name is not None
+        and report.action_name is not None
         and report.action_name.startswith("Train_")
         and report.status.value == "succeeded"
         and report.execution_stage is not None
@@ -960,13 +959,16 @@ def _render_cortex_event(event: StoredEvent) -> list[str]:
         "macro_frontier_preempted",
         "macro_structure_deferred",
     }:
-        action = _payload_text(
-            payload,
-            "blocked_runtime_action",
-            "runtime_action",
-            "blocked_action",
-            "semantic_action",
-        ) or "unknown"
+        action = (
+            _payload_text(
+                payload,
+                "blocked_runtime_action",
+                "runtime_action",
+                "blocked_action",
+                "semantic_action",
+            )
+            or "unknown"
+        )
         reason = _payload_text(payload, "reason", "blocked_reason") or "unspecified"
         fallback = _payload_text(payload, "fallback_runtime_action", "fallback_action")
         target = _payload_text(payload, "target_structure")

@@ -65,6 +65,8 @@ class ScreenCandidateProvenance:
     screen_target: tuple[int, int]
     world_target: tuple[float, float]
     anchor_tag: int
+    placement_candidate_id: str | None = None
+    placement_revision: str | None = None
 
 
 BUILD_SPECS = {
@@ -1169,6 +1171,8 @@ def _available_team_actions(
                     "screen_target": list(item.screen_target),
                     "world_target": list(item.world_target),
                     "anchor_tag": item.anchor_tag,
+                    "placement_candidate_id": item.placement_candidate_id,
+                    "placement_revision": item.placement_revision,
                 }
                 for item in screen_provenance
             ]

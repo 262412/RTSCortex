@@ -20,7 +20,12 @@ def test_attack_effect_requires_damage_after_pysc2_acceptance() -> None:
     verifier = ActionEffectVerifier(timeout_game_loops=32)
     command = _attack_command()
     assert verifier.track(command) is True
-    verifier.prepare(command.command_id, _attack_observation(100, health=150), 0xA00)
+    verifier.prepare(
+        command.command_id,
+        _attack_observation(100, health=150),
+        None,
+        actor_tags=(0xA00,),
+    )
     verifier.accept_primitive(command.command_id, game_loop=104)
 
     assert verifier.observe(_attack_observation(108, health=150)) == []
@@ -38,7 +43,12 @@ def test_attack_effect_does_not_treat_lost_target_as_confirmed_kill() -> None:
     verifier = ActionEffectVerifier(timeout_game_loops=16)
     command = _attack_command()
     verifier.track(command)
-    verifier.prepare(command.command_id, _attack_observation(100, health=20), 0xA00)
+    verifier.prepare(
+        command.command_id,
+        _attack_observation(100, health=20),
+        None,
+        actor_tags=(0xA00,),
+    )
     verifier.accept_primitive(command.command_id, game_loop=104)
 
     assert verifier.observe(_attack_observation(108, health=None)) == []
@@ -54,7 +64,12 @@ def test_attack_regeneration_cannot_emit_negative_protocol_evidence() -> None:
     verifier = ActionEffectVerifier(timeout_game_loops=16)
     command = _attack_command()
     verifier.track(command)
-    verifier.prepare(command.command_id, _attack_observation(100, health=13), 0xA00)
+    verifier.prepare(
+        command.command_id,
+        _attack_observation(100, health=13),
+        None,
+        actor_tags=(0xA00,),
+    )
     verifier.accept_primitive(command.command_id, game_loop=104)
 
     assert verifier.observe(_attack_observation(108, health=14)) == []
@@ -71,12 +86,56 @@ def test_attack_effect_times_out_when_target_health_does_not_change() -> None:
     verifier = ActionEffectVerifier(timeout_game_loops=16)
     command = _attack_command()
     verifier.track(command)
-    verifier.prepare(command.command_id, _attack_observation(100, health=150), 0xA00)
+    verifier.prepare(
+        command.command_id,
+        _attack_observation(100, health=150),
+        None,
+        actor_tags=(0xA00,),
+    )
     verifier.accept_primitive(command.command_id, game_loop=104)
 
     verdicts = verifier.observe(_attack_observation(120, health=150))
 
     assert [verdict.failure_code for verdict in verdicts] == ["combat_effect_not_observed"]
+
+
+def test_unrelated_damage_does_not_confirm_attack() -> None:
+    verifier = ActionEffectVerifier(timeout_game_loops=16)
+    command = _attack_command()
+    verifier.track(command)
+    verifier.prepare(
+        command.command_id,
+        _attack_observation(100, health=150, actor_order_target=None),
+        None,
+        actor_tags=(0xA00,),
+    )
+    verifier.accept_primitive(command.command_id, game_loop=104)
+
+    assert verifier.observe(_attack_observation(112, health=100, actor_order_target=None)) == []
+    verdict = verifier.observe(_attack_observation(120, health=100, actor_order_target=None))[0]
+
+    assert verdict.success is False
+    assert verdict.failure_code == "combat_actor_order_unbound"
+
+
+def test_overwritten_attack_order_can_be_reissued() -> None:
+    verifier = ActionEffectVerifier(timeout_game_loops=32)
+    command = _attack_command()
+    verifier.track(command)
+    verifier.prepare(
+        command.command_id,
+        _attack_observation(100, health=150),
+        None,
+        actor_tags=(0xA00,),
+    )
+    verifier.accept_primitive(command.command_id, game_loop=104)
+    assert verifier.observe(_attack_observation(108, health=150)) == []
+
+    assert verifier.observe(_attack_observation(112, health=150, actor_order_target=None)) == []
+    verdict = verifier.observe(_attack_observation(116, health=150, actor_order_target=None))[0]
+
+    assert verdict.success is False
+    assert verdict.failure_code == "combat_order_replaced"
 
 
 def test_one_health_delta_confirms_at_most_one_combat_engagement() -> None:
@@ -96,17 +155,17 @@ def test_one_health_delta_confirms_at_most_one_combat_engagement() -> None:
         verifier.track(command)
         verifier.prepare(
             command.command_id,
-            _attack_observation(100, health=150),
+            _attack_observation(100, health=150, actor_tags=(0xA01, 0xA02)),
             None,
             actor_tags=(actor_tag,),
         )
         verifier.accept_primitive(command.command_id, game_loop=104)
 
-    verdicts = verifier.observe(_attack_observation(112, health=125))
+    verdicts = verifier.observe(_attack_observation(112, health=125, actor_tags=(0xA01, 0xA02)))
 
     assert [verdict.command_id for verdict in verdicts] == ["command-attack"]
     assert verifier.is_tracked("command-attack-2") is True
-    assert verifier.observe(_attack_observation(116, health=125)) == []
+    assert verifier.observe(_attack_observation(116, health=125, actor_tags=(0xA01, 0xA02))) == []
 
 
 def test_stimpack_research_is_confirmed_by_exact_barracks_order() -> None:
@@ -245,7 +304,7 @@ def test_build_effect_uses_raw_placement_service_target_as_single_authority() ->
     assert [verdict.success for verdict in verdicts] == [True]
     assert verdicts[0].evidence is not None
     assert verdicts[0].evidence["target_position"] == (32.0, 30.0)
-    assert verdicts[0].evidence["validated_target_position"] == (32.0, 30.0)
+    assert verdicts[0].evidence["validated_target_position"] == (31.875, 30.0)
     assert verdicts[0].evidence["emitted_target_position"] == (32.0, 30.0)
 
 
@@ -1975,8 +2034,22 @@ def _attack_observation(
     game_loop: int,
     *,
     health: float | None,
+    actor_order_target: int | None = 0xDEF,
+    actor_tags: tuple[int, ...] = (0xA00,),
 ) -> dict[str, Any]:
-    raw_units: list[dict[str, Any]] = []
+    raw_units: list[dict[str, Any]] = [
+        {
+            "tag": actor_tag,
+            "unit_type": "Stalker",
+            "alliance": 1,
+            "orders": (
+                []
+                if actor_order_target is None
+                else [{"ability_id": 23, "target_unit_tag": actor_order_target}]
+            ),
+        }
+        for actor_tag in actor_tags
+    ]
     if health is not None:
         raw_units.append(
             {

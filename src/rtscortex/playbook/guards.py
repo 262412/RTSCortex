@@ -122,8 +122,7 @@ class PlaybookCandidateGuard:
             (
                 item
                 for item in recent_feedback
-                if item.signature == signature
-                and item.expires_game_loop >= game_loop
+                if item.signature == signature and item.expires_game_loop >= game_loop
             ),
             None,
         )
@@ -156,11 +155,7 @@ class PlaybookCandidateGuard:
         )
         return GuardResult(
             blocked=rules_result.blocked or blocked,
-            score_delta=(
-                rules_result.score_delta + score_delta
-                if mode == "active"
-                else 0.0
-            ),
+            score_delta=(rules_result.score_delta + score_delta if mode == "active" else 0.0),
             rule_ids=(*rules_result.rule_ids, application.rule_id),
             applications=(*rules_result.applications, application),
         )

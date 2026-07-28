@@ -157,7 +157,9 @@ def test_builder_selection_lease_blocks_optional_selection_changes() -> None:
 def _combat_observation(
     game_loop: int,
     target_health: dict[int, float],
+    actor_targets: dict[int, int] | None = None,
 ) -> dict[str, Any]:
+    actor_targets = actor_targets or {}
     return {
         "game_loop": game_loop,
         "raw_units": [
@@ -169,6 +171,22 @@ def _combat_observation(
                 "shield": 0,
             }
             for tag, health in target_health.items()
+        ]
+        + [
+            {
+                "tag": actor_tag,
+                "unit_type": "Stalker",
+                "alliance": 1,
+                "health": 80,
+                "shield": 80,
+                "orders": [
+                    {
+                        "ability_id": 23,
+                        "target_unit_tag": target_tag,
+                    }
+                ],
+            }
+            for actor_tag, target_tag in actor_targets.items()
         ],
     }
 
@@ -6365,8 +6383,9 @@ def test_broker_attributes_builder_failure_and_combat_success_in_same_step() -> 
     assert combat is not None
     broker.prepare_effect(
         combat,
-        _combat_observation(20810, {0xDEF: 100.0}),
+        _combat_observation(20810, {0xDEF: 100.0}, {0x10: 0xDEF}),
         builder_tag=0x10,
+        actor_tags=(0x10,),
     )
     broker.settle_primitive(
         builder,
@@ -6375,7 +6394,7 @@ def test_broker_attributes_builder_failure_and_combat_success_in_same_step() -> 
         game_loop=20811,
     )
     broker.settle_primitive(combat, success=True, game_loop=20811)
-    broker.observe_effects(_combat_observation(20812, {0xDEF: 80.0}))
+    broker.observe_effects(_combat_observation(20812, {0xDEF: 80.0}, {0x10: 0xDEF}))
 
     reports = {report["command_id"]: report for report in runtime.execution_reports}
     assert set(reports) == {"command-builder", "command-combat"}
@@ -6444,17 +6463,33 @@ def test_broker_keeps_same_attack_action_isolated_by_explicit_team() -> None:
     assert alpha is not None and alpha.command_id == "attack-alpha"
     broker.prepare_effect(
         beta,
-        _combat_observation(899, {0xAAA: 100.0, 0xBBB: 100.0}),
+        _combat_observation(
+            899,
+            {0xAAA: 100.0, 0xBBB: 100.0},
+            {0x20: 0xBBB},
+        ),
         builder_tag=0x20,
+        actor_tags=(0x20,),
     )
     broker.prepare_effect(
         alpha,
-        _combat_observation(899, {0xAAA: 100.0, 0xBBB: 100.0}),
+        _combat_observation(
+            899,
+            {0xAAA: 100.0, 0xBBB: 100.0},
+            {0x10: 0xAAA},
+        ),
         builder_tag=0x10,
+        actor_tags=(0x10,),
     )
     broker.settle_primitive(beta, success=True, game_loop=900)
     broker.settle_primitive(alpha, success=True, game_loop=900)
-    broker.observe_effects(_combat_observation(904, {0xAAA: 80.0, 0xBBB: 70.0}))
+    broker.observe_effects(
+        _combat_observation(
+            904,
+            {0xAAA: 80.0, 0xBBB: 70.0},
+            {0x10: 0xAAA, 0x20: 0xBBB},
+        )
+    )
 
     reports = {report["command_id"]: report for report in runtime.execution_reports}
     assert reports["attack-alpha"]["actor"] == "Combat/Alpha"

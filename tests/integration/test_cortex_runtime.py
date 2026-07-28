@@ -1498,7 +1498,7 @@ def test_invalid_expansion_anchor_keeps_commitment_and_dispatches_next_anchor(
     recovered.close()
 
 
-def test_expansion_candidate_exhaustion_terminalizes_active_commitment(
+def test_expansion_goal_reopens_on_new_candidate_epoch(
     tmp_path: Path,
 ) -> None:
     store = _store(tmp_path)
@@ -1571,6 +1571,28 @@ def test_expansion_candidate_exhaustion_terminalizes_active_commitment(
             same_generation_candidate,
         )
         assert runtime._expansion_commitment_id is None
+        assert runtime._expansion_goal is not None
+        assert runtime._expansion_goal.terminal_state is None
+        assert runtime._expansion_goal.phase == "waiting_for_candidates"
+
+        new_generation_candidate = same_generation_candidate.model_copy(
+            update={
+                "step_id": 3,
+                "game_loop": 34,
+                "alerts": [
+                    "expansion_scout_state=candidate_available",
+                    "expansion_scout_generation=2",
+                    "expansion_scout_waypoints=1/8",
+                ],
+            }
+        )
+        runtime._update_expansion_candidate_state(new_generation_candidate)
+        runtime._ensure_expansion_commitment(
+            runtime._macro_proposal,
+            new_generation_candidate,
+        )
+        assert runtime._expansion_commitment_id is not None
+        assert runtime._expansion_goal.phase == "active"
         await runtime.close()
 
     asyncio.run(exercise())

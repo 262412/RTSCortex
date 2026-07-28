@@ -303,9 +303,7 @@ def test_terran_production_fixture_tracks_the_combined_arms_frontier() -> None:
                     ],
                 }
             ),
-            "available_actions": [
-                AvailableAction(name="Train_Marine", actor_scopes=["barracks"])
-            ],
+            "available_actions": [AvailableAction(name="Train_Marine", actor_scopes=["barracks"])],
         }
     )
     verifier = GoalProgressVerifier(action_specs=semantics.profile.progress_action_specs)
@@ -362,9 +360,7 @@ def test_terran_combat_fixture_responds_to_observed_roach_technology() -> None:
                     ],
                 }
             ),
-            "available_actions": [
-                AvailableAction(name="Train_Marine", actor_scopes=["barracks"])
-            ],
+            "available_actions": [AvailableAction(name="Train_Marine", actor_scopes=["barracks"])],
         }
     )
     verifier = GoalProgressVerifier(action_specs=semantics.profile.progress_action_specs)

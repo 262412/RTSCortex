@@ -306,14 +306,12 @@ def test_live_hima_cortex_regression_uses_long_multi_seed_window() -> None:
 
 def test_protoss_playbook_paired_configs_differ_only_by_playbook_persistence() -> None:
     frozen = load_config(
-        PROJECT_ROOT
-        / "configs/experiments/"
+        PROJECT_ROOT / "configs/experiments/"
         "live_simple64_hima_protoss_ensemble_cortex_v0_5_"
         "frozen_playbook_natural_terminal.yaml"
     )
     evolving = load_config(
-        PROJECT_ROOT
-        / "configs/experiments/"
+        PROJECT_ROOT / "configs/experiments/"
         "live_simple64_hima_protoss_ensemble_cortex_v0_5_natural_terminal.yaml"
     )
 

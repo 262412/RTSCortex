@@ -395,8 +395,7 @@ def _extract_nonstandard_action_items(
                 ParseDiagnostic(
                     code="invalid_target_count",
                     message=(
-                        "A HIMA cumulative action count must be between "
-                        f"1 and {MAX_ACTION_REPEAT}."
+                        f"A HIMA cumulative action count must be between 1 and {MAX_ACTION_REPEAT}."
                     ),
                     raw_token=raw_token,
                     ordinal=ordinal,

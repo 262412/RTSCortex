@@ -63,7 +63,7 @@ def test_comparison_separates_independent_pairs_from_sequential_learning() -> No
                     arm="evolving",
                     before=baseline,
                     after=f"independent-{seed}",
-                    repeated_errors=10,
+                    repeated_errors=4,
                 ),
             )
         )
@@ -91,8 +91,39 @@ def test_comparison_separates_independent_pairs_from_sequential_learning() -> No
 
     comparison = _comparison(metrics, baseline_sha256=baseline)
 
-    assert comparison["aggregate"]["sequential_repeated_error_reduction"] == 0.6
+    assert comparison["aggregate"]["independent_repeated_error_reduction"] == 0.6
     assert comparison["gates"]["complete_unique_run_matrix"] is True
     assert comparison["gates"]["independent_baseline_identity"] is True
     assert comparison["gates"]["sequential_evolving_carry"] is True
     assert comparison["accepted"] is True
+
+
+def test_false_block_gate_cannot_pass_without_shadow_states() -> None:
+    baseline = "baseline"
+    metrics = [
+        _metrics(
+            mode=mode,
+            seed=seed,
+            arm=arm,
+            before=baseline,
+            after=baseline if arm == "frozen" else f"{mode}-{seed}",
+            repeated_errors=0,
+        )
+        for mode in ("independent_paired", "sequential_learning")
+        for seed in (0, 1, 2)
+        for arm in ("frozen", "evolving")
+    ]
+    metrics = [
+        metric.__class__(
+            **{
+                **metric.__dict__,
+                "hard_rule_shadow_state_count": 0,
+            }
+        )
+        for metric in metrics
+    ]
+
+    comparison = _comparison(metrics, baseline_sha256=baseline)
+
+    assert comparison["gates"]["hard_false_block_rate_at_most_1_percent"] is False
+    assert comparison["accepted"] is False

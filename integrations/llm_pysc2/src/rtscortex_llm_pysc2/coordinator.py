@@ -107,9 +107,7 @@ class BridgeCoordinator:
         builder_tag: Optional[int],
         producer_tag: Optional[int] = None,
         actor_tags: tuple[int, ...] = (),
-        minimap_transform: Optional[
-            tuple[float, float, float, float, float]
-        ] = None,
+        minimap_transform: Optional[tuple[float, float, float, float, float]] = None,
     ) -> None:
         if self.effect_verifier.is_tracked(command_id):
             self.effect_verifier.prepare(

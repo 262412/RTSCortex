@@ -217,6 +217,13 @@ class RawActionExecutor:
         builder_tag: Optional[int] = None
         producer_tag: Optional[int] = None
         resolved_arguments = tuple(arguments)
+        leased_actor_tags = set(actor_tags) & self.placement_service.leased_builder_tags
+        if name not in _BUILD_RAW_FUNCTIONS and leased_actor_tags:
+            raise _RawDispatchFailure(
+                "actor_order_lease_conflict",
+                f"{name} would overwrite leased builder tags "
+                + ", ".join(hex(tag) for tag in sorted(leased_actor_tags)),
+            )
 
         if name == "No_Operation":
             function = actions.RAW_FUNCTIONS.no_op
@@ -252,10 +259,15 @@ class RawActionExecutor:
             function = getattr(actions.RAW_FUNCTIONS, _CONTROL_RAW_FUNCTIONS[name])
             action = function("now", list(actor_tags))
         elif name in _BUILD_RAW_FUNCTIONS:
+            if name.endswith("_Screen") and (
+                command.placement_candidate_id is None or command.placement_revision is None
+            ):
+                raise _RawDispatchFailure(
+                    "placement_provenance_missing",
+                    f"{name} has no candidate-stage placement identity",
+                )
             available_builders = tuple(
-                tag
-                for tag in actor_tags
-                if tag not in self.placement_service.leased_builder_tags
+                tag for tag in actor_tags if tag not in self.placement_service.leased_builder_tags
             )
             _require_actor_tags(name, available_builders)
             builder_tag = available_builders[0]
@@ -272,6 +284,9 @@ class RawActionExecutor:
                     builder_tag=builder_tag,
                     operation_id=command.operation_id,
                     ability_name=_BUILD_RAW_FUNCTIONS[name],
+                    episode_id=command.episode_id or "unknown",
+                    placement_candidate_id=command.placement_candidate_id,
+                    candidate_placement_revision=command.placement_revision,
                 )
             except RawPlacementFailure as error:
                 raise _RawDispatchFailure(error.code, str(error)) from error

@@ -91,10 +91,16 @@ def _run_metrics(row: dict[str, str]) -> RunMetrics:
             command = event.payload.get("command")
             if isinstance(command, dict):
                 dispatch_counts[str(command.get("command_id"))] += 1
+    consequence_events = [
+        event.payload for event in events if event.event_type == "strategic_consequence_attributed"
+    ]
     consequences = Counter(
-        str(event.payload.get("consequence_type", "unknown"))
-        for event in events
-        if event.event_type == "strategic_consequence_attributed"
+        str(payload.get("consequence_type", "unknown")) for payload in consequence_events
+    )
+    error_signatures = Counter(
+        _consequence_signature(payload)
+        for payload in consequence_events
+        if str(payload.get("consequence_type")) in _ERROR_CONSEQUENCES
     )
     applications = [
         event.payload for event in events if event.event_type == "playbook_rule_applied"
@@ -122,7 +128,10 @@ def _run_metrics(row: dict[str, str]) -> RunMetrics:
         arm=row["arm"],
         exit_code=int(row["exit_code"]),
         run_dir=str(run_dir),
-        natural_terminal=bool(episode_result) and not bool(episode_result.get("failure_reason")),
+        natural_terminal=(
+            episode_result.get("outcome") in {"victory", "defeat", "draw"}
+            and not bool(episode_result.get("failure_reason"))
+        ),
         outcome=(
             str(episode_result["outcome"]) if episode_result.get("outcome") is not None else None
         ),
@@ -141,9 +150,7 @@ def _run_metrics(row: dict[str, str]) -> RunMetrics:
             float(payload.get("score_delta", 0.0)) != 0.0 for payload in applications
         ),
         playbook_blocks=sum(payload.get("blocked") is True for payload in applications),
-        repeated_eligible_errors=sum(
-            count for kind, count in consequences.items() if kind in _ERROR_CONSEQUENCES
-        ),
+        repeated_eligible_errors=sum(max(0, count - 1) for count in error_signatures.values()),
         strategic_consequences=dict(sorted(consequences.items())),
         hard_rule_false_block_count=false_blocks,
         hard_rule_shadow_state_count=shadow_states,
@@ -180,6 +187,21 @@ def _hard_false_blocks(path: Path) -> tuple[int, int]:
         false_blocks += int(payload.get("false_block_count", 0))
         shadow_states += int(payload.get("shadow_state_count", 0))
     return false_blocks, shadow_states
+
+
+def _consequence_signature(payload: dict[str, Any]) -> str:
+    condition = payload.get("condition")
+    normalized_condition = condition if isinstance(condition, dict) else {}
+    return json.dumps(
+        {
+            "consequence_type": payload.get("consequence_type"),
+            "role": payload.get("role"),
+            "semantic_action": payload.get("semantic_action"),
+            "condition": normalized_condition,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
 
 
 def _elapsed_seconds(events: list[Any]) -> float:
@@ -227,7 +249,7 @@ def _comparison(metrics: list[RunMetrics], *, baseline_sha256: str) -> dict[str,
             )
     independent_rows = [metric for metric in metrics if metric.mode == "independent_paired"]
     sequential_rows = [metric for metric in metrics if metric.mode == "sequential_learning"]
-    sequential_pairs = [item for item in paired if item["mode"] == "sequential_learning"]
+    independent_pairs = [item for item in paired if item["mode"] == "independent_paired"]
     baseline_identity = all(
         metric.playbook_before_sha256 == baseline_sha256 for metric in independent_rows
     )
@@ -245,10 +267,10 @@ def _comparison(metrics: list[RunMetrics], *, baseline_sha256: str) -> dict[str,
         for previous, current in zip(evolving_sequence, evolving_sequence[1:], strict=False)
     )
     frozen_errors = sum(
-        metric.repeated_eligible_errors for metric in sequential_rows if metric.arm == "frozen"
+        metric.repeated_eligible_errors for metric in independent_rows if metric.arm == "frozen"
     )
     evolving_errors = sum(
-        metric.repeated_eligible_errors for metric in sequential_rows if metric.arm == "evolving"
+        metric.repeated_eligible_errors for metric in independent_rows if metric.arm == "evolving"
     )
     reduction = 0.0 if frozen_errors == 0 else (frozen_errors - evolving_errors) / frozen_errors
     false_blocks = sum(metric.hard_rule_false_block_count for metric in metrics)
@@ -271,10 +293,10 @@ def _comparison(metrics: list[RunMetrics], *, baseline_sha256: str) -> dict[str,
             metric.candidate_outside_dispatch == 0 for metric in metrics
         ),
         "hard_false_block_rate_at_most_1_percent": (
-            false_blocks / shadow_states <= 0.01 if shadow_states else True
+            shadow_states > 0 and false_blocks / shadow_states <= 0.01
         ),
         "repeated_error_reduction_at_least_50_percent": reduction >= 0.5,
-        "matched_win_rate_not_reduced": (sum(item["win_delta"] for item in sequential_pairs) >= 0),
+        "matched_win_rate_not_reduced": (sum(item["win_delta"] for item in independent_pairs) >= 0),
     }
     return {
         "schema_version": "1.0",
@@ -282,9 +304,9 @@ def _comparison(metrics: list[RunMetrics], *, baseline_sha256: str) -> dict[str,
         "runs": [asdict(metric) for metric in metrics],
         "paired_differences": paired,
         "aggregate": {
-            "sequential_frozen_repeated_errors": frozen_errors,
-            "sequential_evolving_repeated_errors": evolving_errors,
-            "sequential_repeated_error_reduction": reduction,
+            "independent_frozen_repeated_errors": frozen_errors,
+            "independent_evolving_repeated_errors": evolving_errors,
+            "independent_repeated_error_reduction": reduction,
             "hard_rule_false_block_count": false_blocks,
             "hard_rule_shadow_state_count": shadow_states,
             "hard_rule_false_block_rate": (false_blocks / shadow_states if shadow_states else 0.0),

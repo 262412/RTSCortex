@@ -105,10 +105,7 @@ def _build_cortex_runtime(
             playbook_store,
             promotion_support=config.cortex.playbook.promotion_support,
         )
-        if (
-            playbook_store is not None
-            and config.cortex.playbook.learning_mode == "evolving"
-        )
+        if (playbook_store is not None and config.cortex.playbook.learning_mode == "evolving")
         else None
     )
     return CortexRuntimeEngine(

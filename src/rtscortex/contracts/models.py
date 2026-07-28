@@ -283,6 +283,11 @@ class EffectEvidence(ContractModel):
     builder_tag: str | None = None
     reservation_id: str | None = None
     placement_revision: str | None = None
+    placement_state: str | None = None
+    placement_episode_id: str | None = None
+    footprint_width: int | None = Field(default=None, ge=1)
+    footprint_height: int | None = Field(default=None, ge=1)
+    occupied_grid_cells: list[tuple[int, int]] = Field(default_factory=list)
     baseline_builder_orders: list[int] = Field(default_factory=list)
     requested_producer_tag: str | None = None
     producer_tag: str | None = None
@@ -319,11 +324,14 @@ class EffectEvidence(ContractModel):
     resource_delta: dict[str, int] = Field(default_factory=dict)
     order_seen: bool = False
     build_started: bool = False
-    build_start_confirmation_kind: Literal[
-        "builder_order",
-        "supporting_quorum",
-        "new_structure",
-    ] | None = None
+    build_start_confirmation_kind: (
+        Literal[
+            "builder_order",
+            "supporting_quorum",
+            "new_structure",
+        ]
+        | None
+    ) = None
     build_start_confirmed_game_loop: int | None = Field(default=None, ge=0)
     resource_debit_seen: bool = False
     builder_approach_seen: bool = False

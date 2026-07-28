@@ -6,7 +6,7 @@ import hashlib
 import json
 import math
 from collections.abc import Collection, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Optional
 
 
@@ -29,6 +29,14 @@ class RawPlacementReservation:
     anchor_tag: int | None
     placement_revision: str
     baseline_builder_orders: tuple[int, ...]
+    structure_type: str
+    footprint_width: int
+    footprint_height: int
+    occupied_grid_cells: frozenset[tuple[int, int]]
+    world_center: tuple[float, float]
+    placement_state: str
+    episode_id: str
+    expires_game_loop: int
 
     @property
     def reservation_id(self) -> str:
@@ -51,13 +59,14 @@ class RawPlacementReservation:
 @dataclass(frozen=True)
 class _SpatialExclusion:
     world_target: tuple[float, float]
-    radius: float
+    occupied_grid_cells: frozenset[tuple[int, int]]
     reason: str
 
 
 @dataclass(frozen=True)
 class _TemporarySuppression:
     world_target: tuple[float, float]
+    occupied_grid_cells: frozenset[tuple[int, int]]
     expires_game_loop: int
     reason: str
 
@@ -73,6 +82,42 @@ class RawPlacementFailure(RuntimeError):
     def __init__(self, code: str, reason: str) -> None:
         super().__init__(reason)
         self.code = code
+
+
+def _footprint_cells(
+    world_center: tuple[float, float],
+    width: int,
+    height: int,
+) -> frozenset[tuple[int, int]]:
+    """Return the exact discrete build-grid cells covered by a world rectangle."""
+
+    if width < 1 or height < 1:
+        raise ValueError("placement footprint dimensions must be positive")
+    start_x = math.floor(float(world_center[0]) - width / 2 + 0.5)
+    start_y = math.floor(float(world_center[1]) - height / 2 + 0.5)
+    return frozenset(
+        (x, y) for y in range(start_y, start_y + height) for x in range(start_x, start_x + width)
+    )
+
+
+def _placement_candidate_id(
+    action_name: str,
+    world_target: tuple[float, float],
+    anchor_tag: int,
+    placement_revision: str,
+    footprint: int,
+) -> str:
+    payload = {
+        "action_name": action_name,
+        "world_target": [float(world_target[0]), float(world_target[1])],
+        "anchor_tag": int(anchor_tag),
+        "placement_revision": placement_revision,
+        "footprint": int(footprint),
+    }
+    digest = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    return f"placement-candidate:{digest}"
 
 
 class RawPlacementService:
@@ -91,6 +136,7 @@ class RawPlacementService:
         self._permanent_exclusions: list[_SpatialExclusion] = []
         self._temporary_suppressions: dict[str, list[_TemporarySuppression]] = {}
         self._command_targets: dict[str, RawPlacementReservation] = {}
+        self._observed_occupancy: dict[int, _SpatialExclusion] = {}
         self._builder_leases: dict[int, str] = {}
         self._placement_diagnostics: dict[str, str] = {}
 
@@ -147,6 +193,12 @@ class RawPlacementService:
         *,
         require_feature_visibility: bool,
     ) -> None:
+        from rtscortex_llm_pysc2.extractor import BUILD_SPECS
+
+        footprint_by_structure = {
+            spec.target_structure: int(spec.footprint) for spec in BUILD_SPECS.values()
+        }
+        observed_occupancy: dict[int, _SpatialExclusion] = {}
         visible_feature_tags = {
             int(_value(unit, "tag", 0))
             for unit in feature_units
@@ -157,6 +209,22 @@ class RawPlacementService:
         for unit in raw_units:
             tag = int(_value(unit, "tag", 0))
             name = _unit_name(unit, self.unit_names)
+            if (
+                tag > 0
+                and int(_value(unit, "alliance", 0)) == 1
+                and _build_progress(unit) > 0.0
+                and name in footprint_by_structure
+            ):
+                center = (
+                    float(_value(unit, "x", 0.0)),
+                    float(_value(unit, "y", 0.0)),
+                )
+                size = footprint_by_structure[name]
+                observed_occupancy[tag] = _SpatialExclusion(
+                    center,
+                    _footprint_cells(center, size, size),
+                    "observed_structure",
+                )
             if (
                 tag <= 0
                 or int(_value(unit, "alliance", 0)) != 3
@@ -174,6 +242,18 @@ class RawPlacementService:
                 "y": float(_value(unit, "y", 0.0)),
                 "display_type": 1,
             }
+        self._observed_occupancy = observed_occupancy
+        observed_cells = {
+            cell
+            for exclusion in observed_occupancy.values()
+            for cell in exclusion.occupied_grid_cells
+        }
+        for command_id, reservation in list(self._command_targets.items()):
+            if (
+                reservation.placement_state == "occupied"
+                and reservation.occupied_grid_cells & observed_cells
+            ):
+                self.release_command(command_id)
 
     def candidates(
         self,
@@ -202,14 +282,27 @@ class RawPlacementService:
                 builder_tags=builder_tags,
             )
             provenance = screen_candidate_provenance(observation, screen_candidates)
-            radius = max(1.5, spec.footprint * 0.75)
+            revision = _placement_revision(observation)
+            provenance = [
+                replace(
+                    item,
+                    placement_candidate_id=_placement_candidate_id(
+                        action_name,
+                        item.world_target,
+                        item.anchor_tag,
+                        revision,
+                        int(spec.footprint),
+                    ),
+                    placement_revision=revision,
+                )
+                for item in provenance
+            ]
             kept = [
                 (candidate, item)
                 for candidate, item in zip(screen_candidates, provenance)  # noqa: B905 - Python 3.9
                 if not self.is_quarantined(
                     action_name,
                     item.world_target,
-                    radius=radius,
                     game_loop=game_loop,
                 )
             ]
@@ -255,6 +348,10 @@ class RawPlacementService:
         builder_tag: int | None = None,
         operation_id: str | None = None,
         ability_name: str | None = None,
+        episode_id: str = "unknown",
+        expires_game_loop: int | None = None,
+        placement_candidate_id: str | None = None,
+        candidate_placement_revision: str | None = None,
     ) -> RawPlacementReservation:
         from rtscortex_llm_pysc2.extractor import (
             BUILD_SPECS,
@@ -264,6 +361,7 @@ class RawPlacementService:
 
         spec = BUILD_SPECS[action_name]
         game_loop = _game_loop(observation)
+        current_revision = _placement_revision(observation)
         self._expire_temporary_suppressions(game_loop)
         normalized_builder = None if builder_tag is None else int(builder_tag)
         baseline_builder_orders: tuple[int, ...] = ()
@@ -282,17 +380,36 @@ class RawPlacementService:
                 )
             baseline_builder_orders = _orders(builder)
         if spec.placement_kind == "screen":
+            if (placement_candidate_id is None) != (candidate_placement_revision is None):
+                raise RawPlacementFailure(
+                    "placement_provenance_missing",
+                    f"{action_name} has no immutable candidate placement identity",
+                )
             if world_target is None:
                 raise RawPlacementFailure(
                     "no_legal_placement",
                     f"{action_name} has no validated world-space target",
                 )
             target = (float(world_target[0]), float(world_target[1]))
+            if placement_candidate_id is not None:
+                assert candidate_placement_revision is not None
+                expected_candidate_id = _placement_candidate_id(
+                    action_name,
+                    target,
+                    0 if preferred_anchor_tag is None else preferred_anchor_tag,
+                    candidate_placement_revision,
+                    int(spec.footprint),
+                )
+                if placement_candidate_id != expected_candidate_id:
+                    raise RawPlacementFailure(
+                        "placement_provenance_mismatch",
+                        f"{action_name} candidate placement identity does not match "
+                        "its world target",
+                    )
             emitted_target = (float(round(target[0])), float(round(target[1])))
             if self.is_quarantined(
                 action_name,
                 emitted_target,
-                radius=max(1.5, spec.footprint * 0.75),
                 game_loop=game_loop,
             ):
                 raise RawPlacementFailure(
@@ -371,8 +488,22 @@ class RawPlacementService:
             requested_world_target=requested_target,
             world_target=emitted,
             anchor_tag=anchor_tag,
-            placement_revision=_placement_revision(observation),
+            placement_revision=current_revision,
             baseline_builder_orders=baseline_builder_orders,
+            structure_type=spec.target_structure,
+            footprint_width=int(spec.footprint),
+            footprint_height=int(spec.footprint),
+            occupied_grid_cells=_footprint_cells(
+                emitted,
+                int(spec.footprint),
+                int(spec.footprint),
+            ),
+            world_center=emitted,
+            placement_state="reserved",
+            episode_id=episode_id,
+            expires_game_loop=(
+                int(expires_game_loop) if expires_game_loop is not None else game_loop + 224
+            ),
         )
         self._command_targets[command_id] = reservation
         if normalized_builder is not None:
@@ -425,8 +556,10 @@ class RawPlacementService:
                 expires_game_loop=current_loop + 112,
                 reason=failure_code,
             )
-        if anchor is not None and failure_code in permanent_spatial_codes and any(
-            townhall in action_name for townhall in ("Nexus", "CommandCenter", "Hatchery")
+        if (
+            anchor is not None
+            and failure_code in permanent_spatial_codes
+            and any(townhall in action_name for townhall in ("Nexus", "CommandCenter", "Hatchery"))
         ):
             self.suppress_anchor(anchor)
         self.release_command(command_id)
@@ -442,8 +575,7 @@ class RawPlacementService:
         if placement is None:
             return
         if placement.anchor_tag is not None and any(
-            townhall in placement.action_name
-            for townhall in ("Nexus", "CommandCenter", "Hatchery")
+            townhall in placement.action_name for townhall in ("Nexus", "CommandCenter", "Hatchery")
         ):
             self.suppress_anchor(placement.anchor_tag)
             self.suppress_world_target(
@@ -451,13 +583,23 @@ class RawPlacementService:
                 placement.world_target,
                 reason="confirmed_townhall_occupancy",
             )
-        self.release_command(command_id)
+        self._command_targets[command_id] = replace(
+            placement,
+            placement_state="occupied",
+            expires_game_loop=max(placement.expires_game_loop, 2**31 - 1),
+        )
+        self._release_builder_lease(placement)
 
     def release_command(self, command_id: str) -> None:
         placement = self._command_targets.pop(command_id, None)
-        if placement is None or placement.builder_tag is None:
+        if placement is None:
             return
-        if self._builder_leases.get(placement.builder_tag) == command_id:
+        self._release_builder_lease(placement)
+
+    def _release_builder_lease(self, placement: RawPlacementReservation) -> None:
+        if placement.builder_tag is None:
+            return
+        if self._builder_leases.get(placement.builder_tag) == placement.command_id:
             del self._builder_leases[placement.builder_tag]
 
     def suppress_world_target(
@@ -471,12 +613,11 @@ class RawPlacementService:
         if len(target) != 2:
             return
         point = (float(target[0]), float(target[1]))
-        del action_name
+        cells = self._cells_for_action(action_name, point, fallback_radius=radius)
         if not any(
-            math.dist(point, previous.world_target) < 0.25
-            for previous in self._permanent_exclusions
+            cells == previous.occupied_grid_cells for previous in self._permanent_exclusions
         ):
-            self._permanent_exclusions.append(_SpatialExclusion(point, radius, reason))
+            self._permanent_exclusions.append(_SpatialExclusion(point, cells, reason))
 
     def suppress_world_target_temporarily(
         self,
@@ -489,35 +630,60 @@ class RawPlacementService:
         if len(target) != 2:
             return
         point = (float(target[0]), float(target[1]))
+        cells = self._cells_for_action(action_name, point)
         stored = self._temporary_suppressions.setdefault(action_name, [])
-        stored.append(_TemporarySuppression(point, int(expires_game_loop), reason))
+        stored.append(_TemporarySuppression(point, cells, int(expires_game_loop), reason))
 
     def is_quarantined(
         self,
         action_name: str,
         target: tuple[float, float],
         *,
-        radius: float,
+        radius: float | None = None,
         game_loop: int | None = None,
     ) -> bool:
         if game_loop is not None:
             self._expire_temporary_suppressions(game_loop)
-        if any(
-            math.dist(target, exclusion.world_target) <= max(radius, exclusion.radius)
-            for exclusion in self._permanent_exclusions
-        ):
+        cells = self._cells_for_action(
+            action_name,
+            target,
+            fallback_radius=1.5 if radius is None else radius,
+        )
+        if any(cells & exclusion.occupied_grid_cells for exclusion in self._permanent_exclusions):
             return True
         if any(
-            math.dist(target, suppression.world_target) <= radius
+            cells & suppression.occupied_grid_cells
             for suppression in self._temporary_suppressions.get(action_name, ())
         ):
             return True
+        if any(
+            cells & exclusion.occupied_grid_cells for exclusion in self._observed_occupancy.values()
+        ):
+            return True
         return any(
-            math.dist(target, reservation.world_target) <= radius
+            cells & reservation.occupied_grid_cells
             for reservation in self._command_targets.values()
         )
 
+    @staticmethod
+    def _cells_for_action(
+        action_name: str,
+        target: tuple[float, float],
+        *,
+        fallback_radius: float = 1.5,
+    ) -> frozenset[tuple[int, int]]:
+        from rtscortex_llm_pysc2.extractor import BUILD_SPECS
+
+        spec = BUILD_SPECS.get(action_name)
+        size = max(1, int(round(fallback_radius * 2))) if spec is None else int(spec.footprint)
+        return _footprint_cells(target, size, size)
+
     def _expire_temporary_suppressions(self, game_loop: int) -> None:
+        for command_id, reservation in list(self._command_targets.items()):
+            if reservation.placement_state != "occupied" and reservation.expires_game_loop <= int(
+                game_loop
+            ):
+                self.release_command(command_id)
         for action_name, suppressions in list(self._temporary_suppressions.items()):
             kept = [
                 suppression
@@ -812,11 +978,7 @@ def _plane_has_positive(plane: Any) -> bool:
     shape: Sequence[Any] = getattr(plane, "shape", ())
     if plane is None or len(shape) != 2:
         return False
-    return any(
-        int(plane[y][x]) > 0
-        for y in range(int(shape[0]))
-        for x in range(int(shape[1]))
-    )
+    return any(int(plane[y][x]) > 0 for y in range(int(shape[0])) for x in range(int(shape[1])))
 
 
 def _value(value: Any, name: str, default: Any) -> Any:

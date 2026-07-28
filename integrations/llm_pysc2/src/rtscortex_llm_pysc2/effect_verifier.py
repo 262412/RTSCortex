@@ -891,16 +891,21 @@ class ActionEffectVerifier:
             "target_type": pending.target_structure,
             "target_position": pending.target_position,
             "validated_target_position": (
-                None if reservation is None else reservation.world_target
+                None
+                if reservation is None
+                else reservation.requested_world_target or reservation.world_target
             ),
-            "emitted_target_position": (
-                None if reservation is None else reservation.world_target
-            ),
+            "emitted_target_position": (None if reservation is None else reservation.world_target),
             "target_tag": None if pending.target_tag is None else hex(pending.target_tag),
             "builder_tag": None if pending.builder_tag is None else hex(pending.builder_tag),
             "reservation_id": None if reservation is None else reservation.reservation_id,
-            "placement_revision": (
-                None if reservation is None else reservation.placement_revision
+            "placement_revision": (None if reservation is None else reservation.placement_revision),
+            "placement_state": (None if reservation is None else reservation.placement_state),
+            "placement_episode_id": (None if reservation is None else reservation.episode_id),
+            "footprint_width": (None if reservation is None else reservation.footprint_width),
+            "footprint_height": (None if reservation is None else reservation.footprint_height),
+            "occupied_grid_cells": (
+                [] if reservation is None else sorted(reservation.occupied_grid_cells)
             ),
             "baseline_builder_orders": (
                 [] if reservation is None else list(reservation.baseline_builder_orders)
@@ -941,27 +946,21 @@ class ActionEffectVerifier:
             ),
             "active_order_extension": pending.active_order_extension,
             "baseline_builder_position": (
-                None
-                if baseline is None or baseline.builder is None
-                else baseline.builder.position
+                None if baseline is None or baseline.builder is None else baseline.builder.position
             ),
             "observed_builder_position": (
                 None if current.builder is None else current.builder.position
             ),
             "builder_displacement": (
                 None
-                if baseline is None
-                or baseline.builder is None
-                or current.builder is None
+                if baseline is None or baseline.builder is None or current.builder is None
                 else _position_distance(
                     baseline.builder.position,
                     current.builder.position,
                 )
             ),
             "confirmation_kind": (
-                "new_structure"
-                if structure is not None
-                else pending.build_start_confirmation_kind
+                "new_structure" if structure is not None else pending.build_start_confirmation_kind
             ),
         }
 

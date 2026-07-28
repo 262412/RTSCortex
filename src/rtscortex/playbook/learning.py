@@ -67,8 +67,7 @@ class PlaybookRunLearner:
                 episode_events = tuple(
                     event
                     for event in events
-                    if event.run_id == result.run_id
-                    and event.episode_id == result.episode_id
+                    if event.run_id == result.run_id and event.episode_id == result.episode_id
                 )
                 cases, lessons = self.reviewer.review_episode(
                     episode_events,

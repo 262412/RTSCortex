@@ -268,6 +268,7 @@ def _intent_target_key(intent: CortexIntent) -> str:
         return f"type:{target.unit_type.casefold()}:{target.region or 'any'}"
     return f"{target.kind.value}:{target.region or 'global'}"
 
+
 class IntentArbiter:
     """Select a deterministic feasible set before commands are materialized."""
 

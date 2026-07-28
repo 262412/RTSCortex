@@ -21,6 +21,8 @@ class RoutedCommand:
     team_name: str
     name: str
     rendered_action: str
+    run_id: str = ""
+    episode_id: str = ""
     operation_id: str | None = None
     attempt_id: str | None = None
     source: str = "planner"
@@ -28,6 +30,8 @@ class RoutedCommand:
     resolved_arguments: tuple[Any, ...] = ()
     screen_world_target: tuple[float, float] | None = None
     screen_anchor_tag: int | None = None
+    placement_candidate_id: str | None = None
+    placement_revision: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -48,6 +52,10 @@ class RoutedCommand:
             payload["screen_world_target"] = list(self.screen_world_target)
         if self.screen_anchor_tag is not None:
             payload["screen_anchor_tag"] = self.screen_anchor_tag
+        if self.placement_candidate_id is not None:
+            payload["placement_candidate_id"] = self.placement_candidate_id
+        if self.placement_revision is not None:
+            payload["placement_revision"] = self.placement_revision
         return payload
 
 
@@ -138,11 +146,19 @@ class ActionRouter:
                     requested_arguments=tuple(arguments),
                     resolved_arguments=tuple(arguments),
                     rendered_action=f"<{name}({rendered_arguments})>",
+                    run_id=str(batch["run_id"]),
+                    episode_id=str(batch["episode_id"]),
                     screen_world_target=(
                         None if screen_metadata is None else screen_metadata.world_target
                     ),
                     screen_anchor_tag=(
                         None if screen_metadata is None else screen_metadata.anchor_tag
+                    ),
+                    placement_candidate_id=(
+                        None if screen_metadata is None else screen_metadata.placement_candidate_id
+                    ),
+                    placement_revision=(
+                        None if screen_metadata is None else screen_metadata.placement_revision
                     ),
                 )
             )

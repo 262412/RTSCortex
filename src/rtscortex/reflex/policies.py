@@ -187,6 +187,7 @@ def _controller_priority(action_name: str) -> int:
         "Build_CreepTumor_Tumor_Screen": 40,
     }[action_name]
 
+
 def _normalize_tag(value: object) -> str:
     if isinstance(value, int) and not isinstance(value, bool):
         return hex(value)

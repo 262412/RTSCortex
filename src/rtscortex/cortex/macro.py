@@ -134,6 +134,34 @@ def macro_plan_from_hima(
                 }
             )
         steps.append(macro_step)
+    bounded_assessments = sorted(
+        assessments,
+        key=lambda item: (item.ordinal, item.source_action),
+    )[:frontier_step_limit]
+    assessments_by_ordinal = {
+        assessment.ordinal: (index, assessment)
+        for index, assessment in enumerate(bounded_assessments)
+    }
+    steps = [
+        (
+            step.model_copy(
+                update={
+                    "status": MacroStepStatus.OBSOLETE,
+                    "reason": "unsupported_independent_future",
+                }
+            )
+            if step.status is MacroStepStatus.BLOCKED
+            and step.reason == "unsupported_by_runtime"
+            and (entry := assessments_by_ordinal.get(step.ordinal)) is not None
+            and not _unsupported_is_dependency(
+                entry[1],
+                bounded_assessments[entry[0] + 1 :],
+                profile,
+            )
+            else step
+        )
+        for step in steps
+    ]
     metadata = proposal.generation_metadata
     raw_response = response.model_dump(mode="json")
     raw_response_hash = sha256(
@@ -332,22 +360,35 @@ def _compact_goal_steps(
     by_action: dict[str, list[MacroActionStep]] = {}
     for step in ordered:
         by_action.setdefault(step.canonical_action, []).append(step)
-    compact: list[MacroActionStep] = []
     desired_counts: dict[str, int] = {}
     for action, instances in by_action.items():
-        first = instances[0]
+        explicit_targets = [
+            instance.target_count for instance in instances if instance.target_count is not None
+        ]
+        desired_counts[action] = (
+            max(explicit_targets)
+            if explicit_targets
+            else sum(instance.repeat for instance in instances)
+        )
+
+    compact: list[MacroActionStep] = []
+    index = 0
+    while index < len(ordered):
+        first = ordered[index]
+        instances = [first]
+        index += 1
+        while index < len(ordered) and ordered[index].canonical_action == first.canonical_action:
+            instances.append(ordered[index])
+            index += 1
         explicit_targets = [
             instance.target_count for instance in instances if instance.target_count is not None
         ]
         if explicit_targets:
-            desired = max(explicit_targets)
             repeat = 1
-            target_count = desired
+            target_count = max(explicit_targets)
         else:
-            desired = sum(instance.repeat for instance in instances)
-            repeat = desired
+            repeat = sum(instance.repeat for instance in instances)
             target_count = None
-        desired_counts[action] = desired
         compact.append(
             first.model_copy(
                 update={
@@ -356,7 +397,7 @@ def _compact_goal_steps(
                 }
             )
         )
-    return sorted(compact, key=lambda item: item.ordinal), desired_counts
+    return compact, desired_counts
 
 
 def _strategic_constraints(proposal: MacroPolicyProposal) -> list[str]:
@@ -385,16 +426,36 @@ def _unsupported_is_dependency(
 ) -> bool:
     unsupported_target = _semantic_target(unsupported.source_action)
     specs = {spec.name: spec for spec in profile.progress_action_specs}
+    specs_by_effect = {
+        _normalize_target(spec.effect_target): spec for spec in profile.progress_action_specs
+    }
+
+    def transitive_prerequisites(action_name: str) -> set[str]:
+        discovered: set[str] = set()
+        pending = [action_name]
+        visited_actions: set[str] = set()
+        while pending:
+            current_action = pending.pop()
+            if current_action in visited_actions:
+                continue
+            visited_actions.add(current_action)
+            current_spec = specs.get(current_action)
+            if current_spec is None:
+                continue
+            for prerequisite in current_spec.prerequisites:
+                target = _normalize_target(prerequisite.target)
+                if target in discovered:
+                    continue
+                discovered.add(target)
+                producer = specs_by_effect.get(target)
+                if producer is not None:
+                    pending.append(producer.name)
+        return discovered
+
     for assessment in later:
         if assessment.runtime_action is None:
             continue
-        spec = specs.get(assessment.runtime_action)
-        if spec is None:
-            continue
-        if any(
-            _normalize_target(prerequisite.target) == unsupported_target
-            for prerequisite in spec.prerequisites
-        ):
+        if unsupported_target in transitive_prerequisites(assessment.runtime_action):
             return True
     return False
 

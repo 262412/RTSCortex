@@ -7,7 +7,13 @@ import math
 from dataclasses import dataclass, field
 from typing import Literal
 
-from rtscortex.contracts import ExecutionReport, ExecutionStatus, ObservationEnvelope, UnitState
+from rtscortex.contracts import (
+    ActionCommand,
+    ExecutionReport,
+    ExecutionStatus,
+    ObservationEnvelope,
+    UnitState,
+)
 from rtscortex.cortex.models import (
     ArmyReadiness,
     IntentTarget,
@@ -16,6 +22,7 @@ from rtscortex.cortex.models import (
     TacticalIntent,
     ThreatLevel,
 )
+from rtscortex.cortex.operations import EngagementKey, RetreatCommitmentKey
 from rtscortex.targeting import (
     ENEMY_STRUCTURE_TYPES,
     attackable_enemies_for_actor,
@@ -62,6 +69,10 @@ class _ActorRetreatState:
     destination: str = "home"
     missing_since_game_loop: int | None = None
     arrival_emitted: bool = False
+    command_id: str | None = None
+    operation_id: str | None = None
+    attempt_id: str | None = None
+    commitment_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -71,6 +82,10 @@ class _ActorEngagementState:
     entered_game_loop: int
     last_command_game_loop: int
     last_confirmed_game_loop: int | None = None
+    command_id: str | None = None
+    operation_id: str | None = None
+    attempt_id: str | None = None
+    engagement_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -85,6 +100,9 @@ class _ActorOffenseState:
     best_distance: float | None = None
     last_progress_game_loop: int = 0
     obsolete_waypoints: dict[tuple[int, int], int] = field(default_factory=dict)
+    command_id: str | None = None
+    operation_id: str | None = None
+    attempt_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -272,6 +290,8 @@ class DeterministicTacticalAgent:
     ) -> dict[str, object] | None:
         if report.action_name not in {"Attack_Unit", "Move_Minimap"} or report.actor is None:
             return None
+        if not self._report_matches_active_state(report):
+            return None
         actor_failure_codes = {
             "actor_not_available",
             "actor_not_observable",
@@ -360,6 +380,72 @@ class DeterministicTacticalAgent:
             "failure_code": failure_code,
             "quarantined_until_game_loop": until if quarantined else None,
         }
+
+    def record_dispatch(
+        self,
+        command: ActionCommand,
+        *,
+        responsibility: str,
+    ) -> None:
+        state: _ActorEngagementState | _ActorRetreatState | _ActorOffenseState | None
+        if command.name == "Attack_Unit":
+            state = self._engagement_by_actor.get(command.actor)
+        elif responsibility == "retreat":
+            state = self._retreat_by_actor.get(command.actor)
+        elif command.name == "Move_Minimap":
+            state = self._offense_by_actor.get(command.actor)
+        else:
+            state = None
+        if state is None:
+            return
+        state.command_id = command.command_id
+        state.operation_id = command.operation_id
+        state.attempt_id = command.attempt_id
+        if command.operation_id is None:
+            return
+        if isinstance(state, _ActorRetreatState):
+            actor_tags = tuple(int(tag, 0) for tag in state.actor_tags)
+            state.commitment_id = RetreatCommitmentKey(
+                operation_id=command.operation_id,
+                actor_tags=actor_tags,
+                threat_signature=state.threat_signature,
+                destination=state.destination,
+            ).commitment_id
+        elif isinstance(state, _ActorEngagementState):
+            actor_tags = tuple(int(tag, 0) for tag in state.actor_tags)
+            state.engagement_id = EngagementKey(
+                operation_id=command.operation_id,
+                actor_tags=actor_tags,
+                ability_name="Attack_Attack_unit",
+                target_tag=int(state.target_tag, 0),
+            ).engagement_id
+
+    def _report_matches_active_state(self, report: ExecutionReport) -> bool:
+        if report.actor is None:
+            return False
+        state: _ActorEngagementState | _ActorRetreatState | _ActorOffenseState | None
+        if report.action_name == "Attack_Unit":
+            state = self._engagement_by_actor.get(report.actor)
+        else:
+            retreat = self._retreat_by_actor.get(report.actor)
+            offense = self._offense_by_actor.get(report.actor)
+            state = next(
+                (
+                    candidate
+                    for candidate in (retreat, offense)
+                    if candidate is not None and candidate.command_id == report.command_id
+                ),
+                retreat or offense,
+            )
+        if state is None:
+            return False
+        if state.command_id is None:
+            return report.operation_id is None and report.attempt_id is None
+        return (
+            state.command_id == report.command_id
+            and state.operation_id == report.operation_id
+            and state.attempt_id == report.attempt_id
+        )
 
     def _record_move_execution(
         self,
@@ -897,13 +983,28 @@ def _threat_signature(
     assessment: SituationAssessment,
     enemies: list[UnitState],
 ) -> str:
+    enemy_types = {enemy.unit_type for enemy in enemies}
+    threat_domain = (
+        "air-and-ground"
+        if assessment.visible_enemy_force.air_units and assessment.visible_enemy_force.ground_units
+        else "air"
+        if assessment.visible_enemy_force.air_units
+        else "ground"
+        if assessment.visible_enemy_force.ground_units
+        else "unknown"
+    )
+    strategic_class = (
+        "high-value"
+        if enemy_types & _HIGH_VALUE_THREATS
+        else "workers"
+        if enemy_types and enemy_types <= _WORKER_TYPES
+        else "conventional"
+    )
     payload = "|".join(
         (
             assessment.threat_level.value,
-            *sorted(
-                f"{_normalize_tag(enemy.unit_id)}:{enemy.unit_type}"
-                for enemy in enemies
-            ),
+            threat_domain,
+            strategic_class,
         )
     )
     return hashlib.sha256(payload.encode()).hexdigest()

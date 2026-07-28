@@ -248,9 +248,7 @@ def test_validator_rejects_zero_health_enemy_even_if_worker_candidate_is_stale()
             "state": base.state.model_copy(
                 update={
                     "visible_enemies": [
-                        base.state.visible_enemies[0].model_copy(
-                            update={"health_fraction": 0.0}
-                        )
+                        base.state.visible_enemies[0].model_copy(update={"health_fraction": 0.0})
                     ]
                 }
             )

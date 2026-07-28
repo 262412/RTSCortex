@@ -7,6 +7,7 @@ import pytest
 
 from rtscortex.contracts import (
     ActionArgumentType,
+    ActionCommand,
     ActionSource,
     AvailableAction,
     EconomyState,
@@ -448,6 +449,19 @@ def test_defense_agent_deduplicates_active_response_and_cools_down_after_failure
         )
         == ()
     )
+    coordinator.record_dispatch(
+        ActionCommand(
+            command_id="defense-command",
+            actor="CombatGroup0/Zealot-1",
+            name="Attack_Unit",
+            arguments=["0xe1"],
+            created_game_loop=33,
+            ttl_game_loops=8,
+            source=ActionSource.REFLEX,
+        ),
+        responsibility="defense",
+        game_loop=33,
+    )
 
     transition = coordinator.record_execution(
         ExecutionReport(
@@ -456,11 +470,11 @@ def test_defense_agent_deduplicates_active_response_and_cools_down_after_failure
             step_id=3,
             command_id="defense-command",
             success=False,
-                action_name="Attack_Unit",
-                actor="CombatGroup0/Zealot-1",
-                source=ActionSource.REFLEX,
-                requested_arguments=["0xe1"],
-                status=ExecutionStatus.FAILED,
+            action_name="Attack_Unit",
+            actor="CombatGroup0/Zealot-1",
+            source=ActionSource.REFLEX,
+            requested_arguments=["0xe1"],
+            status=ExecutionStatus.FAILED,
             execution_stage=ExecutionStage.EFFECT_VERIFICATION,
             failure_code="effect_timeout",
         ),
@@ -493,7 +507,7 @@ def test_defense_agent_deduplicates_active_response_and_cools_down_after_failure
     )
 
 
-def test_defense_agent_keeps_successful_response_holding_until_threat_clears() -> None:
+def test_defense_holding_expires_under_sustained_threat() -> None:
     base = _observation()
     actor = "CombatGroup0/Zealot-1"
     observation = base.model_copy(
@@ -532,6 +546,19 @@ def test_defense_agent_keeps_successful_response_holding_until_threat_clears() -
     first = coordinator.propose_defense_intents(RoleAgentContext(observation, assessment, ()))
 
     assert [intent.actor_scopes[0] for intent in first] == [actor]
+    coordinator.record_dispatch(
+        ActionCommand(
+            command_id="successful-defense-move",
+            actor=actor,
+            name="Move_Minimap",
+            arguments=[[12, 12]],
+            created_game_loop=32,
+            ttl_game_loops=8,
+            source=ActionSource.REFLEX,
+        ),
+        responsibility="defense",
+        game_loop=32,
+    )
     transition = coordinator.record_execution(
         ExecutionReport(
             run_id=observation.run_id,
@@ -539,11 +566,11 @@ def test_defense_agent_keeps_successful_response_holding_until_threat_clears() -
             step_id=2,
             command_id="successful-defense-move",
             success=True,
-                action_name="Move_Minimap",
-                actor=actor,
-                source=ActionSource.REFLEX,
-                requested_arguments=[[12, 12]],
-                status=ExecutionStatus.SUCCEEDED,
+            action_name="Move_Minimap",
+            actor=actor,
+            source=ActionSource.REFLEX,
+            requested_arguments=[[12, 12]],
+            status=ExecutionStatus.SUCCEEDED,
             execution_stage=ExecutionStage.EFFECT_VERIFICATION,
         ),
         responsibility="defense",
@@ -552,12 +579,15 @@ def test_defense_agent_keeps_successful_response_holding_until_threat_clears() -
 
     assert transition is not None
     assert transition["state"] == "defense_response_holding"
-    still_threatened = observation.model_copy(update={"step_id": 3, "game_loop": 1_000})
+    still_threatened = observation.model_copy(update={"step_id": 3, "game_loop": 100})
     assert (
-        coordinator.propose_defense_intents(
-            RoleAgentContext(still_threatened, assessment, ())
-        )
+        coordinator.propose_defense_intents(RoleAgentContext(still_threatened, assessment, ()))
         == ()
+    )
+    expired_holding = observation.model_copy(update={"step_id": 4, "game_loop": 145})
+    assert (
+        len(coordinator.propose_defense_intents(RoleAgentContext(expired_holding, assessment, ())))
+        == 1
     )
 
     clear_assessment = assessment.model_copy(
@@ -569,10 +599,8 @@ def test_defense_agent_keeps_successful_response_holding_until_threat_clears() -
         )
         == ()
     )
-    renewed = observation.model_copy(update={"step_id": 4, "game_loop": 1_001})
-    assert len(
-        coordinator.propose_defense_intents(RoleAgentContext(renewed, assessment, ()))
-    ) == 1
+    renewed = observation.model_copy(update={"step_id": 5, "game_loop": 1_001})
+    assert len(coordinator.propose_defense_intents(RoleAgentContext(renewed, assessment, ()))) == 1
 
 
 def test_zerg_queen_controller_routes_inject_to_economy_and_creep_to_defense() -> None:

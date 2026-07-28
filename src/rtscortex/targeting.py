@@ -64,11 +64,7 @@ ENEMY_STRUCTURE_TYPES = frozenset(
 def living_targetable_enemies(units: Iterable[UnitState]) -> list[UnitState]:
     """Return living enemies retained in the structured world state."""
 
-    return [
-        unit
-        for unit in units
-        if unit.alliance == "enemy" and unit.health_fraction > 0.0
-    ]
+    return [unit for unit in units if unit.alliance == "enemy" and unit.health_fraction > 0.0]
 
 
 def attackable_enemies_for_actor(
@@ -80,8 +76,7 @@ def attackable_enemies_for_actor(
     """Return living enemies compatible with the actor's actual weapon domain."""
 
     domains = {
-        combat_target_domain(unit.unit_type)
-        for unit in _units_for_actor(observation, actor)
+        combat_target_domain(unit.unit_type) for unit in _units_for_actor(observation, actor)
     }
     if not domains:
         actor_type = _actor_unit_type(actor)
@@ -93,14 +88,8 @@ def attackable_enemies_for_actor(
     can_attack_ground = bool(
         domains.intersection({CombatTargetDomain.GROUND, CombatTargetDomain.BOTH})
     )
-    can_attack_air = bool(
-        domains.intersection({CombatTargetDomain.AIR, CombatTargetDomain.BOTH})
-    )
-    candidate_tags = (
-        _attack_candidate_tags(observation, actor)
-        if current_screen_only
-        else None
-    )
+    can_attack_air = bool(domains.intersection({CombatTargetDomain.AIR, CombatTargetDomain.BOTH}))
+    candidate_tags = _attack_candidate_tags(observation, actor) if current_screen_only else None
     return [
         enemy
         for enemy in living_targetable_enemies(observation.state.visible_enemies)

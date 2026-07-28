@@ -189,11 +189,7 @@ def _candidate_arguments(
         return candidates[-1:]
     if action.name == "Move_Minimap" and intent.target.position is not None:
         target = list(intent.target.position)
-        return [
-            arguments
-            for arguments in candidates
-            if arguments and list(arguments[0]) == target
-        ]
+        return [arguments for arguments in candidates if arguments and list(arguments[0]) == target]
     if (
         action.name == "Move_Minimap"
         and intent.target.kind is IntentTargetKind.ENEMY
@@ -205,10 +201,7 @@ def _candidate_arguments(
     enemy_by_tag = {
         _normalize_tag(enemy.unit_id): enemy
         for enemy in attackable_enemies_for_actor(observation, actor)
-        if (
-            intent.target.unit_type is None
-            or enemy.unit_type == intent.target.unit_type
-        )
+        if (intent.target.unit_type is None or enemy.unit_type == intent.target.unit_type)
         and (
             intent.target.unit_tag is None
             or _normalize_tag(enemy.unit_id) == _normalize_tag(intent.target.unit_tag)

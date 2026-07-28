@@ -68,9 +68,7 @@ def test_raw_placement_service_persists_and_quarantines_expansion_identity() -> 
         requested_arguments=(0x101,),
         world_target=None,
     )
-    assert service.suppressed_anchors == frozenset(
-        0x101 + index for index in range(len(resources))
-    )
+    assert service.suppressed_anchors == frozenset(0x101 + index for index in range(len(resources)))
     with pytest.raises(RawPlacementFailure, match="permanently suppressed"):
         service.resolve(
             command_id="expand-again",
@@ -138,10 +136,13 @@ def test_raw_placement_service_retires_expansion_cluster_after_confirmation() ->
 
     service.confirm_command("confirmed-expand")
 
-    assert service.candidates(
-        observation,
-        "Build_Nexus_Near",
-    ).argument_candidates == []
+    assert (
+        service.candidates(
+            observation,
+            "Build_Nexus_Near",
+        ).argument_candidates
+        == []
+    )
 
 
 def test_raw_placement_service_reports_missing_visible_build_space() -> None:
@@ -152,9 +153,7 @@ def test_raw_placement_service_reports_missing_visible_build_space() -> None:
 
     assert candidates.argument_candidates == []
     assert candidates.unavailable_reason == "out_of_view"
-    assert service.placement_alerts == (
-        "placement_unavailable:Build_Pylon_Screen:out_of_view",
-    )
+    assert service.placement_alerts == ("placement_unavailable:Build_Pylon_Screen:out_of_view",)
 
 
 def test_raw_placement_service_rejects_dispatch_time_relocation(
@@ -234,4 +233,43 @@ def test_permanent_spatial_exclusion_applies_across_building_types() -> None:
         "Build_Gateway_Screen",
         (22.0, 24.0),
         radius=2.0,
+    )
+
+
+def test_cross_structure_footprints_cannot_overlap() -> None:
+    service = RawPlacementService(unit_names={})
+    observation = SimpleNamespace(
+        raw_units=[],
+        feature_units=[],
+        feature_screen=None,
+        game_loop=[100],
+    )
+    service.resolve(
+        command_id="gateway-a",
+        action_name="Build_Gateway_Screen",
+        requested_arguments=([64, 64],),
+        observation=observation,
+        world_target=(22.0, 22.0),
+    )
+
+    assert service.is_quarantined(
+        "Build_Gateway_Screen",
+        (24.0, 24.0),
+    )
+
+
+def test_actor_failure_does_not_quarantine_placement() -> None:
+    service = RawPlacementService(unit_names={})
+    service.quarantine_command(
+        command_id="missing-builder",
+        action_name="Build_Pylon_Screen",
+        requested_arguments=([64, 64],),
+        world_target=(22.0, 24.0),
+        failure_code="builder_unavailable",
+        game_loop=100,
+    )
+
+    assert not service.is_quarantined(
+        "Build_Pylon_Screen",
+        (22.0, 24.0),
     )

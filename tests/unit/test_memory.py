@@ -146,6 +146,43 @@ def test_event_subscriber_can_cross_a_durability_barrier_without_locking_append(
     store.close()
 
 
+def test_event_writer_queue_is_bounded(tmp_path: Path) -> None:
+    store = EventStore(
+        tmp_path / "events.sqlite3",
+        tmp_path / "events.jsonl",
+        writer_queue_size=3,
+    )
+
+    snapshot = store.performance_snapshot()
+
+    assert store._write_queue.maxsize == 3
+    assert snapshot.queue_capacity == 3
+    assert snapshot.current_queue_depth <= snapshot.queue_capacity
+    store.close()
+
+
+def test_event_store_reconciles_malformed_jsonl_tail_from_sqlite(tmp_path: Path) -> None:
+    database = tmp_path / "events.sqlite3"
+    journal = tmp_path / "events.jsonl"
+    store = EventStore(database, journal)
+    for step_id in range(3):
+        store.append_event(
+            run_id="run",
+            episode_id="episode",
+            step_id=step_id,
+            event_type="semantic",
+            payload={"step": step_id},
+        )
+    store.close()
+    with journal.open("a", encoding="utf-8") as stream:
+        stream.write("{malformed-tail")
+
+    reopened = EventStore(database, journal)
+    reopened.close()
+
+    assert [event.event_id for event in read_event_log(journal)] == [1, 2, 3]
+
+
 def test_runtime_snapshot_is_ordered_after_events_and_replaced_monotonically(
     tmp_path: Path,
 ) -> None:

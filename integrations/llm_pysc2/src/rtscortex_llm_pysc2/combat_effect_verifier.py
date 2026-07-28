@@ -21,6 +21,7 @@ class _PendingCombat:
     observed_health: Optional[float] = None
     actor_tags: tuple[int, ...] = ()
     actor_order_bound: bool = False
+    order_missing_since_game_loop: Optional[int] = None
 
 
 class CombatEffectVerifier:
@@ -89,9 +90,7 @@ class CombatEffectVerifier:
         ordered_pending = sorted(
             self._pending.items(),
             key=lambda item: (
-                item[1].accepted_game_loop
-                if item[1].accepted_game_loop is not None
-                else 2**63 - 1,
+                item[1].accepted_game_loop if item[1].accepted_game_loop is not None else 2**63 - 1,
                 item[0],
             ),
         )
@@ -107,9 +106,16 @@ class CombatEffectVerifier:
                 for tag in pending.actor_tags
                 if (unit := _unit_by_tag(observation, tag)) is not None
             )
-            pending.actor_order_bound = pending.actor_order_bound or any(
+            current_order_bound = any(
                 _unit_targets_tag(actor, pending.target_tag) for actor in actors
             )
+            pending.actor_order_bound = pending.actor_order_bound or current_order_bound
+            if current_order_bound:
+                pending.order_missing_since_game_loop = None
+            elif pending.actor_order_bound and actors:
+                pending.order_missing_since_game_loop = (
+                    pending.order_missing_since_game_loop or game_loop
+                )
             if target is not None:
                 pending.target_type = pending.target_type or _unit_name(target, self.unit_names)
                 pending.observed_health = _health_pool(target)
@@ -120,7 +126,8 @@ class CombatEffectVerifier:
                 and pending.observed_health < pending.baseline_health
             )
             if (
-                (target_removed or damage_observed)
+                pending.actor_order_bound
+                and (target_removed or damage_observed)
                 and pending.target_tag not in claimed_damage_targets
             ):
                 confirmation_kind = "target_removed" if target_removed else "target_damaged"
@@ -139,6 +146,23 @@ class CombatEffectVerifier:
                         if other.target_tag == pending.target_tag:
                             other.baseline_health = pending.observed_health
                 continue
+            if (
+                target is not None
+                and pending.order_missing_since_game_loop is not None
+                and game_loop - pending.order_missing_since_game_loop >= 4
+            ):
+                verdicts.append(
+                    EffectVerdict(
+                        command_id,
+                        False,
+                        "Attack_Unit RAW order was overwritten before the target effect completed",
+                        status="failed",
+                        failure_code="combat_order_replaced",
+                        evidence=self._evidence(pending, None),
+                    )
+                )
+                del self._pending[command_id]
+                continue
             elapsed = game_loop - pending.accepted_game_loop
             if elapsed < self.timeout_game_loops:
                 continue
@@ -147,6 +171,12 @@ class CombatEffectVerifier:
                 failure_reason = (
                     "Attack_Unit target baseline was unavailable before effect "
                     f"verification timed out after {elapsed} game loops"
+                )
+            elif not pending.actor_order_bound:
+                failure_code = "combat_actor_order_unbound"
+                failure_reason = (
+                    "Attack_Unit was accepted but the exact actor never exposed an order "
+                    f"bound to target {hex(pending.target_tag)}"
                 )
             elif target is None:
                 failure_code = "combat_target_lost"
@@ -157,8 +187,7 @@ class CombatEffectVerifier:
             else:
                 failure_code = "combat_effect_not_observed"
                 failure_reason = (
-                    "Attack_Unit produced no observable target damage after "
-                    f"{elapsed} game loops"
+                    f"Attack_Unit produced no observable target damage after {elapsed} game loops"
                 )
             verdicts.append(
                 EffectVerdict(

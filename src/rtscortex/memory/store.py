@@ -56,7 +56,11 @@ class EventStorePerformance:
     written_events: int
     max_queue_depth: int
     current_queue_depth: int
+    queue_capacity: int
     append_latency_ms_mean: float
+    writer_lag_ms_max: float
+    subscriber_dropped_events: int
+    journal_bytes: int
 
 
 @dataclass(frozen=True)
@@ -72,6 +76,14 @@ class _StopWriter:
 @dataclass(frozen=True)
 class _SnapshotRecord:
     snapshot: StoredSnapshot
+
+
+@dataclass
+class _SubscriberWorker:
+    callback: Callable[[StoredEvent], None]
+    queue: queue.Queue[StoredEvent | None]
+    thread: threading.Thread
+    dropped_events: int = 0
 
 
 def _json_payload(payload: BaseModel | dict[str, Any]) -> dict[str, Any]:
@@ -90,11 +102,17 @@ class EventStore:
         *,
         flush_event_limit: int = 64,
         flush_interval_seconds: float = 0.25,
+        writer_queue_size: int = 8192,
+        subscriber_queue_size: int = 256,
     ) -> None:
         if flush_event_limit < 1:
             raise ValueError("flush_event_limit must be positive")
         if flush_interval_seconds <= 0:
             raise ValueError("flush_interval_seconds must be positive")
+        if writer_queue_size < 1:
+            raise ValueError("writer_queue_size must be positive")
+        if subscriber_queue_size < 1:
+            raise ValueError("subscriber_queue_size must be positive")
         database_path.parent.mkdir(parents=True, exist_ok=True)
         journal_path.parent.mkdir(parents=True, exist_ok=True)
         self.database_path = database_path
@@ -103,10 +121,12 @@ class EventStore:
         self._metadata_lock = threading.Lock()
         self._reader_lock = threading.Lock()
         self._subscriber_lock = threading.Lock()
-        self._subscribers: dict[int, Callable[[StoredEvent], None]] = {}
+        self._subscribers: dict[int, _SubscriberWorker] = {}
         self._next_subscriber_id = 0
         self._flush_event_limit = flush_event_limit
         self._flush_interval_seconds = flush_interval_seconds
+        self._writer_queue_size = writer_queue_size
+        self._subscriber_queue_size = subscriber_queue_size
         self._connection = sqlite3.connect(database_path, check_same_thread=False)
         self._connection.row_factory = sqlite3.Row
         self._initialize()
@@ -117,15 +137,18 @@ class EventStore:
         self._next_event_id = (
             1 if row is None or row["event_id"] is None else int(row["event_id"]) + 1
         )
+        self._reconcile_journal()
         self._write_queue: queue.Queue[
             StoredEvent | _SnapshotRecord | _FlushBarrier | _StopWriter
-        ] = queue.Queue()
+        ] = queue.Queue(maxsize=writer_queue_size)
         self._writer_error: BaseException | None = None
         self._closed = False
         self._enqueued_events = 0
         self._written_events = 0
         self._max_queue_depth = 0
         self._append_latency_ns = 0
+        self._event_enqueued_ns: dict[int, int] = {}
+        self._writer_lag_ns_max = 0
         self._writer = threading.Thread(
             target=self._writer_main,
             name=f"rtscortex-event-writer-{id(self):x}",
@@ -214,7 +237,8 @@ class EventStore:
                 created_at=created_at,
                 payload=normalized,
             )
-            self._write_queue.put(record)
+            self._event_enqueued_ns[event_id] = time.perf_counter_ns()
+            self._enqueue(record)
         self._enqueued_events += 1
         self._max_queue_depth = max(self._max_queue_depth, self._write_queue.qsize())
         # Console and other best-effort observers must never share the durable
@@ -234,7 +258,13 @@ class EventStore:
             written_events=self._written_events,
             max_queue_depth=self._max_queue_depth,
             current_queue_depth=self._write_queue.qsize(),
+            queue_capacity=self._writer_queue_size,
             append_latency_ms_mean=mean_ms,
+            writer_lag_ms_max=self._writer_lag_ns_max / 1_000_000,
+            subscriber_dropped_events=sum(
+                subscriber.dropped_events for subscriber in self._subscribers.values()
+            ),
+            journal_bytes=(self.journal_path.stat().st_size if self.journal_path.exists() else 0),
         )
 
     def record_snapshot(
@@ -269,7 +299,7 @@ class EventStore:
                 created_at=datetime.now(UTC).isoformat(),
                 payload=_json_payload(payload),
             )
-            self._write_queue.put(_SnapshotRecord(snapshot))
+            self._enqueue(_SnapshotRecord(snapshot))
         self._max_queue_depth = max(self._max_queue_depth, self._write_queue.qsize())
         return snapshot
 
@@ -280,10 +310,21 @@ class EventStore:
         if self._closed:
             return
         barrier = _FlushBarrier(threading.Event())
-        self._write_queue.put(barrier)
+        self._enqueue(barrier)
         if not barrier.completed.wait(timeout=30):
             raise TimeoutError("event writer did not acknowledge the durability barrier")
         self._raise_writer_error()
+
+    def _enqueue(
+        self,
+        item: StoredEvent | _SnapshotRecord | _FlushBarrier | _StopWriter,
+    ) -> None:
+        """Bound memory while applying explicit backpressure to durable events."""
+
+        try:
+            self._write_queue.put(item, timeout=30)
+        except queue.Full as error:
+            raise TimeoutError("event writer queue remained saturated for 30 seconds") from error
 
     def _writer_main(self) -> None:
         connection = sqlite3.connect(self.database_path)
@@ -361,6 +402,10 @@ class EventStore:
         # SQLite is the canonical durable authority. The JSONL stream is its
         # ordered compatibility mirror and may only lag, never lead, a commit.
         connection.commit()
+        now = time.perf_counter_ns()
+        for record in records:
+            enqueued = self._event_enqueued_ns.pop(record.event_id, now)
+            self._writer_lag_ns_max = max(self._writer_lag_ns_max, now - enqueued)
         for record in records:
             journal.write(json.dumps(record.__dict__, ensure_ascii=False, sort_keys=True) + "\n")
         journal.flush()
@@ -411,11 +456,28 @@ class EventStore:
         with self._subscriber_lock:
             subscriber_id = self._next_subscriber_id
             self._next_subscriber_id += 1
-            self._subscribers[subscriber_id] = subscriber
+            subscriber_queue: queue.Queue[StoredEvent | None] = queue.Queue(
+                maxsize=self._subscriber_queue_size
+            )
+            worker = _SubscriberWorker(
+                callback=subscriber,
+                queue=subscriber_queue,
+                thread=threading.Thread(),
+            )
+            worker.thread = threading.Thread(
+                target=self._subscriber_main,
+                args=(worker,),
+                name=f"rtscortex-event-subscriber-{subscriber_id}",
+                daemon=True,
+            )
+            self._subscribers[subscriber_id] = worker
+            worker.thread.start()
 
         def unsubscribe() -> None:
             with self._subscriber_lock:
-                self._subscribers.pop(subscriber_id, None)
+                worker = self._subscribers.pop(subscriber_id, None)
+            if worker is not None:
+                self._stop_subscriber(worker)
 
         return unsubscribe
 
@@ -424,10 +486,30 @@ class EventStore:
             subscribers = tuple(self._subscribers.values())
         for subscriber in subscribers:
             try:
-                subscriber(event)
+                subscriber.queue.put_nowait(event)
+            except queue.Full:
+                subscriber.dropped_events += 1
+
+    @staticmethod
+    def _subscriber_main(worker: _SubscriberWorker) -> None:
+        while True:
+            event = worker.queue.get()
+            if event is None:
+                return
+            try:
+                worker.callback(event)
             except Exception:
-                # Console and other observers are best-effort and must never stop a run.
                 continue
+
+    @staticmethod
+    def _stop_subscriber(worker: _SubscriberWorker) -> None:
+        try:
+            worker.queue.put_nowait(None)
+        except queue.Full:
+            with worker.queue.mutex:
+                worker.queue.queue.clear()
+            worker.queue.put_nowait(None)
+        worker.thread.join(timeout=5)
 
     def events_after(
         self,
@@ -705,15 +787,51 @@ class EventStore:
             return
         self.flush()
         self._closed = True
-        self._write_queue.put(_StopWriter())
+        self._enqueue(_StopWriter())
         self._writer.join(timeout=30)
         if self._writer.is_alive():
             raise TimeoutError("event writer did not stop")
         self._raise_writer_error()
         with self._subscriber_lock:
+            subscribers = tuple(self._subscribers.values())
             self._subscribers.clear()
+        for subscriber in subscribers:
+            self._stop_subscriber(subscriber)
         self._reader_connection.close()
         self._connection.close()
+
+    def _reconcile_journal(self) -> None:
+        """Repair the compatibility JSONL mirror from canonical SQLite rows."""
+
+        last_event_id = 0
+        valid_prefix = True
+        if self.journal_path.exists():
+            try:
+                with self.journal_path.open(encoding="utf-8") as stream:
+                    for line in stream:
+                        if not line.strip():
+                            continue
+                        payload = json.loads(line)
+                        event_id = int(payload["event_id"])
+                        if event_id != last_event_id + 1:
+                            valid_prefix = False
+                            break
+                        last_event_id = event_id
+            except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+                valid_prefix = False
+        database_max = self._next_event_id - 1
+        if not valid_prefix or last_event_id > database_max:
+            last_event_id = 0
+            self.journal_path.write_text("", encoding="utf-8")
+        rows = self._connection.execute(
+            "SELECT * FROM events WHERE event_id > ? ORDER BY event_id",
+            (last_event_id,),
+        )
+        mode = "a" if last_event_id else "w"
+        with self.journal_path.open(mode, encoding="utf-8") as journal:
+            for row in rows:
+                event = self._row_to_event(row)
+                journal.write(json.dumps(event.__dict__, ensure_ascii=False, sort_keys=True) + "\n")
 
 
 def read_event_log(path: Path) -> Iterable[StoredEvent]:

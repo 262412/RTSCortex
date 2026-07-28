@@ -339,12 +339,13 @@ class RuntimeEngine:
                 "reflex_candidates": [
                     command.model_dump(mode="json") for command in reflex_candidates
                 ],
-                "busy_actor_candidates": [
-                    command.model_dump(mode="json") for command in busy_actor_candidates
-                ],
-                "validated_candidates": [
-                    command.model_dump(mode="json") for command in candidate_outcome.accepted
-                ],
+                "candidate_counts": {
+                    "planner": len(planner_candidates),
+                    "reflex": len(reflex_candidates),
+                    "busy_actor": len(busy_actor_candidates),
+                    "validated": len(candidate_outcome.accepted),
+                    "selected": len(accepted_commands),
+                },
                 "goal_progress": (
                     None
                     if dispatch_goal_progress is None

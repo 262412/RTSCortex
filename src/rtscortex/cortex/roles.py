@@ -40,6 +40,7 @@ class _DefenseActorState:
     cooldown_until_game_loop: int = 0
     command_id: str | None = None
     operation_id: str | None = None
+    attempt_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -317,8 +318,7 @@ class DefenseAgent(_RoutingRoleAgent):
             )
             has_anti_air_source = any(
                 self.profile.data.combat_target_domains.get(unit.unit_type)
-                and self.profile.data.combat_target_domains[unit.unit_type].value
-                in {"air", "both"}
+                and self.profile.data.combat_target_domains[unit.unit_type].value in {"air", "both"}
                 for unit in observation.state.own_units
             ) or any(action_name in available for action_name in production)
             if not has_anti_air_source:
@@ -483,6 +483,7 @@ class DefenseAgent(_RoutingRoleAgent):
         state = self._actor_states[f"{command.actor}|{command.name}|{signature}"]
         state.command_id = command.command_id
         state.operation_id = command.operation_id
+        state.attempt_id = command.attempt_id
 
     def record_execution(
         self,
@@ -498,16 +499,8 @@ class DefenseAgent(_RoutingRoleAgent):
                 key
                 for key, value in self._actor_states.items()
                 if value.command_id == report.command_id
-                or (
-                    value.command_id is None
-                    and value.actor == actor
-                    and value.action_name == report.action_name
-                    and value.signature
-                    == _command_signature(
-                        report.action_name or "",
-                        report.resolved_arguments or report.requested_arguments,
-                    )
-                )
+                and value.operation_id == report.operation_id
+                and value.attempt_id == report.attempt_id
             ),
             None,
         )
@@ -552,7 +545,12 @@ class DefenseAgent(_RoutingRoleAgent):
         if state is None:
             return True
         if state.phase == "holding":
-            return False
+            if game_loop < state.active_until_game_loop:
+                return False
+            state.phase = "responding"
+            state.command_id = None
+            state.operation_id = None
+            state.attempt_id = None
         if game_loop < state.cooldown_until_game_loop:
             return False
         if game_loop < state.active_until_game_loop:

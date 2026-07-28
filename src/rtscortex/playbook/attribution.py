@@ -288,11 +288,7 @@ class StrategicConsequenceAttributor:
                 points[index + 1 :],
                 start.game_loop + self.persistence_window_game_loops,
             )
-            if (
-                end is None
-                or not end.bases_known
-                or end.production_capacity >= expected_capacity
-            ):
+            if end is None or not end.bases_known or end.production_capacity >= expected_capacity:
                 continue
             production_attempts = [
                 decision
@@ -642,9 +638,7 @@ class StrategicConsequenceAttributor:
                 "attributor_version": self.attributor_version,
             },
             confidence=(
-                min(confidence, 0.7)
-                if result.outcome is EpisodeOutcome.TRUNCATED
-                else confidence
+                min(confidence, 0.7) if result.outcome is EpisodeOutcome.TRUNCATED else confidence
             ),
             censored=result.outcome is EpisodeOutcome.TRUNCATED,
         )
@@ -770,9 +764,7 @@ def _verified_advantage(
             else 0
         )
         force_delta = (
-            end.own_value - start.own_value
-            if start.force_known and end.force_known
-            else 0
+            end.own_value - start.own_value if start.force_known and end.force_known else 0
         )
         if capacity_delta > 0 or force_delta >= 300:
             return 300 + capacity_delta * 100 + max(0, force_delta), {
@@ -805,8 +797,7 @@ def _first_after(
         (
             point
             for point in points
-            if point.game_loop >= minimum
-            and (maximum is None or point.game_loop <= maximum)
+            if point.game_loop >= minimum and (maximum is None or point.game_loop <= maximum)
         ),
         None,
     )

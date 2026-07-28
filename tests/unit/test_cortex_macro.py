@@ -122,6 +122,22 @@ def test_counted_hima_action_projects_only_remaining_cumulative_target() -> None
     assert plan.steps[0].status is MacroStepStatus.PENDING
 
 
+def test_hima_compaction_preserves_interleaved_order() -> None:
+    observation = _pylon_observation()
+    plan = macro_plan_from_hima(
+        _response("Actions: ['Pylon', 'Gateway', 'Pylon']"),
+        observation,
+        ttl_game_loops=448,
+    )
+
+    assert [step.semantic_action for step in plan.steps] == [
+        "BUILD PYLON",
+        "BUILD GATEWAY",
+        "BUILD PYLON",
+    ]
+    assert plan.desired_counts["BUILD PYLON"] == 2
+
+
 def test_terran_mule_remains_in_lineage_but_is_managed_outside_goal_progress() -> None:
     observation = make_observation(include_enemy=False, game_loop=224).model_copy(
         update={
@@ -256,7 +272,7 @@ def test_runtime_frontier_treats_parse_error_as_hard_blocker() -> None:
     assert frontier.reason_code == "unknown_action_token"
 
 
-def test_macro_goal_uses_measurable_prefix_and_stops_at_hard_blocker() -> None:
+def test_macro_goal_skips_unrelated_unsupported_step() -> None:
     observation = _pylon_observation()
     response = _response("Actions: ['Probe', 'Pylon', 'Pylon', 'Sentry', 'Gateway']")
     plan = macro_plan_from_hima(response, observation, ttl_game_loops=448)
@@ -267,11 +283,12 @@ def test_macro_goal_uses_measurable_prefix_and_stops_at_hard_blocker() -> None:
     assert [item.action_name for item in goal.requirements] == [
         "Build_Pylon_Screen",
         "Build_Pylon_Screen",
+        "Build_Gateway_Screen",
     ]
-    assert [item.count for item in goal.requirements] == [1, 2]
+    assert [item.count for item in goal.requirements] == [1, 2, 1]
     sentry = next(step for step in plan.steps if step.semantic_action == "TRAIN SENTRY")
     gateway = next(step for step in plan.steps if step.semantic_action == "BUILD GATEWAY")
-    assert sentry.status is MacroStepStatus.BLOCKED
+    assert sentry.status is MacroStepStatus.OBSOLETE
     assert gateway.status is MacroStepStatus.PENDING
 
 

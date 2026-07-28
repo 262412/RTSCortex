@@ -14,6 +14,8 @@ class ScreenCandidateMetadata:
 
     world_target: tuple[float, float]
     anchor_tag: int
+    placement_candidate_id: str | None = None
+    placement_revision: str | None = None
 
 
 class BridgeAvailableAction(dict[str, Any]):
@@ -248,6 +250,14 @@ def _map_screen_provenance(
         result[target] = ScreenCandidateMetadata(
             world_target=(float(world[0]), float(world[1])),
             anchor_tag=int(item["anchor_tag"]),
+            placement_candidate_id=(
+                None
+                if item.get("placement_candidate_id") is None
+                else str(item["placement_candidate_id"])
+            ),
+            placement_revision=(
+                None if item.get("placement_revision") is None else str(item["placement_revision"])
+            ),
         )
     return result
 

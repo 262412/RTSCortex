@@ -72,9 +72,7 @@ class PlaybookPromotionSweep:
         run_directories: Mapping[str, Path] | None = None,
     ) -> None:
         self.store = store
-        self.run_root = (
-            store.database_path.parent if run_root is None else run_root.expanduser()
-        )
+        self.run_root = store.database_path.parent if run_root is None else run_root.expanduser()
         self.run_directories = {
             run_id: path.expanduser()
             for run_id, path in ({} if run_directories is None else run_directories).items()
@@ -84,9 +82,7 @@ class PlaybookPromotionSweep:
     def run(self) -> PromotionSweepResult:
         consolidated = self._consolidate_compatible_candidates()
         candidates = [
-            rule
-            for rule in self.store.rules()
-            if rule.status is PlaybookRuleStatus.CANDIDATE
+            rule for rule in self.store.rules() if rule.status is PlaybookRuleStatus.CANDIDATE
         ]
         coverage_updated: list[str] = []
         promoted: list[str] = []
@@ -188,15 +184,9 @@ class PlaybookPromotionSweep:
             if len(rules) < 2:
                 continue
             run_ids = tuple(
-                dict.fromkeys(
-                    run_id
-                    for rule in rules
-                    for run_id in rule.source_run_ids
-                )
+                dict.fromkeys(run_id for rule in rules for run_id in rule.source_run_ids)
             )
-            seeds = tuple(
-                dict.fromkeys(seed for rule in rules for seed in rule.source_seeds)
-            )
+            seeds = tuple(dict.fromkeys(seed for rule in rules for seed in rule.source_seeds))
             if len(set(run_ids)) < 2 or len(set(seeds)) < 2:
                 continue
             contextual_conditions = _consolidated_contextual_conditions(rules)
@@ -237,27 +227,17 @@ class PlaybookPromotionSweep:
                     confidence=min(rule.confidence for rule in rules),
                     support_count=len(run_ids),
                     source_case_ids=tuple(
-                        dict.fromkeys(
-                            case_id
-                            for rule in rules
-                            for case_id in rule.source_case_ids
-                        )
+                        dict.fromkeys(case_id for rule in rules for case_id in rule.source_case_ids)
                     ),
                     source_run_ids=run_ids,
                     source_seeds=seeds,
                     censored_source_run_ids=tuple(
                         dict.fromkeys(
-                            run_id
-                            for rule in rules
-                            for run_id in rule.censored_source_run_ids
+                            run_id for rule in rules for run_id in rule.censored_source_run_ids
                         )
                     ),
                     censored_source_seeds=tuple(
-                        dict.fromkeys(
-                            seed
-                            for rule in rules
-                            for seed in rule.censored_source_seeds
-                        )
+                        dict.fromkeys(seed for rule in rules for seed in rule.censored_source_seeds)
                     ),
                     evidence={
                         "consolidation": "typed_multi_run_strategy",
@@ -354,8 +334,7 @@ def _core_condition_values(
         if condition.operator is PlaybookConditionOperator.EQ
     }
     core = tuple(
-        values.get(field)
-        for field in ("agent_race", "opponent_race", "phase", "map_name")
+        values.get(field) for field in ("agent_race", "opponent_race", "phase", "map_name")
     )
     if not all(isinstance(value, str) for value in core):
         return None

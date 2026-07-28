@@ -291,18 +291,12 @@ class DeterministicSituationAnalyzer:
             building_under_attack=building_under_attack,
             damage_evidence=damage_evidence,
         )
-        if (
-            army_supply > 0
-            and threat_level in {ThreatLevel.HIGH, ThreatLevel.CRITICAL}
-        ):
+        if army_supply > 0 and threat_level in {ThreatLevel.HIGH, ThreatLevel.CRITICAL}:
             readiness = ArmyReadiness.ENGAGED
         crisis = (
             bases.own_base_count == 0
             and bool(enemies)
-            and bool(
-                observation.state.own_structures
-                or observation.state.economy.workers
-            )
+            and bool(observation.state.own_structures or observation.state.economy.workers)
         )
         phase = self._phase(
             observation,
@@ -402,20 +396,15 @@ class DeterministicSituationAnalyzer:
         threat_level: ThreatLevel,
     ) -> GamePhase:
         state = observation.state
-        if (
-            crisis
-            or under_attack
-            or threat_level in {ThreatLevel.HIGH, ThreatLevel.CRITICAL}
-        ):
+        if crisis or under_attack or threat_level in {ThreatLevel.HIGH, ThreatLevel.CRITICAL}:
             return GamePhase.COMBAT
         if state.economy.army_supply >= 24:
             return GamePhase.COMBAT
         structure_types = {structure.unit_type for structure in state.own_structures}
         if state.production_queue:
             return GamePhase.PRODUCTION
-        if (
-            state.economy.army_supply >= 8
-            and structure_types.intersection(_PRODUCTION_TYPES - _TOWNHALL_TYPES)
+        if state.economy.army_supply >= 8 and structure_types.intersection(
+            _PRODUCTION_TYPES - _TOWNHALL_TYPES
         ):
             return GamePhase.PRODUCTION
         if state.upgrades or structure_types.intersection(_TECH_STRUCTURES):
@@ -520,16 +509,12 @@ class DeterministicSituationAnalyzer:
                 score += 3.0
                 evidence.append("enemy_force_comparable")
         if any(
-            enemy_force.counts.get(unit_type, 0)
-            for unit_type in _AIR_COMBAT_THREAT_TYPES
-        ) and not any(
-            own_force.counts.get(unit_type, 0) for unit_type in _ANTI_AIR_TYPES
-        ):
+            enemy_force.counts.get(unit_type, 0) for unit_type in _AIR_COMBAT_THREAT_TYPES
+        ) and not any(own_force.counts.get(unit_type, 0) for unit_type in _ANTI_AIR_TYPES):
             score += 2.0
             evidence.append("capability_mismatch:no_anti_air")
-        if (
-            bases.own_base_count == 0
-            and (observation.state.own_structures or observation.state.economy.workers)
+        if bases.own_base_count == 0 and (
+            observation.state.own_structures or observation.state.economy.workers
         ):
             score = max(score, 7.0)
             evidence.append("no_surviving_townhall")

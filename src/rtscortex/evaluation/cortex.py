@@ -423,9 +423,7 @@ def compute_cortex_observability(
         threat_level_counts=dict(sorted(threat_levels.items())),
         threat_evidence_counts=dict(sorted(threat_evidence.items())),
         threat_evidence_coverage=(
-            threat_observations_with_evidence / threat_observations
-            if threat_observations
-            else 0.0
+            threat_observations_with_evidence / threat_observations if threat_observations else 0.0
         ),
         max_threat_score=max_threat_score,
     )

@@ -223,8 +223,7 @@ def test_screen_world_target_round_trips_through_route_serialization() -> None:
     assert all(command.screen_world_target == (103.0, 53.0) for command in route.commands)
     assert all(command.screen_anchor_tag == 1 for command in route.commands)
     assert all(
-        command.to_dict()["screen_world_target"] == [103.0, 53.0]
-        for command in route.commands
+        command.to_dict()["screen_world_target"] == [103.0, 53.0] for command in route.commands
     )
     assert all(command.to_dict()["screen_anchor_tag"] == 1 for command in route.commands)
 
@@ -643,9 +642,7 @@ def _observation(
     buildable_values = buildable or [[1 for _ in range(128)] for _ in range(128)]
     pathable_values = pathable or [[1 for _ in range(128)] for _ in range(128)]
     return SimpleNamespace(
-        raw_units=[
-            SimpleNamespace(tag=1, x=100.0, y=50.0, alliance=1, is_selected=True)
-        ],
+        raw_units=[SimpleNamespace(tag=1, x=100.0, y=50.0, alliance=1, is_selected=True)],
         feature_units=[
             SimpleNamespace(
                 tag=1,

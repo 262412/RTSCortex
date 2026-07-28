@@ -246,6 +246,7 @@ class CortexRuntimeEngine(RuntimeEngine):
         self._macro_inflight_command_id: str | None = None
         self._macro_command_steps: dict[str, tuple[str, str, int | None]] = {}
         self._command_lineages: dict[str, CommandLineage] = {}
+        self._attempt_ordinals: dict[str, int] = {}
         self._previous_hima_actions: list[tuple[int, str]] = []
         self._expansion_commitment_id: str | None = None
         self._expansion_commitment_started_game_loop: int | None = None
@@ -511,6 +512,16 @@ class CortexRuntimeEngine(RuntimeEngine):
                 responsibility=prepared_command.lineage.responsibility,
                 game_loop=observation.game_loop,
             )
+            responsibility = prepared_command.lineage.responsibility
+            if responsibility in {
+                RoleId.OFFENSE.value,
+                RoleId.FOCUS_FIRE.value,
+                RoleId.RETREAT.value,
+            } and isinstance(self._tactical, ExecutionAwareTacticalPolicyProvider):
+                self._tactical.record_dispatch(
+                    command,
+                    responsibility=responsibility,
+                )
             self._transition_command(command, CommandStatus.DISPATCHED, observation)
             if prepared_command.lineage.source_role is CortexRole.MACRO:
                 plan_id = prepared_command.lineage.macro_plan_id
@@ -560,21 +571,21 @@ class CortexRuntimeEngine(RuntimeEngine):
                 "reflex_latency_target_ms": self.config.reflex.target_latency_ms,
                 "tick_latency_ms": (time.perf_counter() - tick_started) * 1_000,
                 "preemptions": [asdict(record) for record in arbitration.preemptions],
-                "macro_candidates": [
-                    command.model_dump(mode="json") for command in macro_candidates
-                ],
-                "tactical_candidates": [
-                    command.model_dump(mode="json") for command in tactical_candidates
+                "planner_candidates": [
+                    command.model_dump(mode="json")
+                    for command in (*macro_candidates, *tactical_candidates)
                 ],
                 "reflex_candidates": [
                     command.model_dump(mode="json") for command in reflex_candidates
                 ],
-                "busy_actor_candidates": [
-                    command.model_dump(mode="json") for command in busy_actor_candidates
-                ],
-                "validated_candidates": [
-                    command.model_dump(mode="json") for command in candidate_outcome.accepted
-                ],
+                "candidate_counts": {
+                    "macro": len(macro_candidates),
+                    "tactical": len(tactical_candidates),
+                    "reflex": len(reflex_candidates),
+                    "busy_actor": len(busy_actor_candidates),
+                    "validated": len(candidate_outcome.accepted),
+                    "selected": len(accepted_commands),
+                },
                 "goal_progress": (
                     None if goal_progress is None else goal_progress.model_dump(mode="json")
                 ),
@@ -702,6 +713,7 @@ class CortexRuntimeEngine(RuntimeEngine):
         self._macro_inflight_command_id = None
         self._macro_command_steps = {}
         self._command_lineages = {}
+        self._attempt_ordinals = {}
         self._previous_hima_actions = []
         self._expansion_commitment_id = None
         self._expansion_commitment_started_game_loop = None
@@ -983,6 +995,7 @@ class CortexRuntimeEngine(RuntimeEngine):
                 command_id: lineage.model_dump(mode="json")
                 for command_id, lineage in self._command_lineages.items()
             },
+            "attempt_ordinals": dict(self._attempt_ordinals),
             "previous_hima_actions": [
                 [game_loop, token] for game_loop, token in self._previous_hima_actions
             ],
@@ -1038,6 +1051,10 @@ class CortexRuntimeEngine(RuntimeEngine):
         self._command_lineages = {
             str(command_id): CommandLineage.model_validate(lineage)
             for command_id, lineage in dict(payload.get("command_lineages", {})).items()
+        }
+        self._attempt_ordinals = {
+            str(operation_id): int(ordinal)
+            for operation_id, ordinal in dict(payload.get("attempt_ordinals", {})).items()
         }
         self._previous_hima_actions = [
             (int(item[0]), str(item[1])) for item in payload.get("previous_hima_actions", ())
@@ -2324,9 +2341,15 @@ class CortexRuntimeEngine(RuntimeEngine):
         )
         attempt_id = None
         if strategic_intent.operation_id is not None:
+            attempt_ordinal = self._attempt_ordinals.get(
+                strategic_intent.operation_id,
+                0,
+            )
+            self._attempt_ordinals[strategic_intent.operation_id] = attempt_ordinal + 1
             attempt_id = AttemptKey(
                 operation_id=strategic_intent.operation_id,
                 command_id=resolved_command_id,
+                attempt_ordinal=attempt_ordinal,
             ).attempt_id
             command = command.model_copy(
                 update={
@@ -2920,6 +2943,23 @@ class CortexRuntimeEngine(RuntimeEngine):
                 ):
                     self._expansion_commitment_generation = generation
                 self._expansion_candidates_exhausted = False
+                if (
+                    self._expansion_goal is not None
+                    and self._expansion_goal.terminal_state is None
+                    and self._expansion_goal.phase == "waiting_for_candidates"
+                ):
+                    self._expansion_goal = self._expansion_goal.model_copy(
+                        update={
+                            "phase": "active",
+                            "current_candidate_epoch": generation,
+                            "cooldown_until_game_loop": 0,
+                        }
+                    )
+                    self._record_cortex_event(
+                        observation,
+                        "expansion_goal_reopened",
+                        self._expansion_goal,
+                    )
         if progress is not None:
             try:
                 visited, total = progress.split("/", 1)
@@ -2983,12 +3023,23 @@ class CortexRuntimeEngine(RuntimeEngine):
                     )
                 )
                 self._expansion_goal = self._expansion_goal.model_copy(
-                    update={"exhausted_candidate_epochs": exhausted}
+                    update={
+                        "exhausted_candidate_epochs": exhausted,
+                        "phase": "waiting_for_candidates",
+                        "retry_budget": max(0, self._expansion_goal.retry_budget - 1),
+                        "cooldown_until_game_loop": observation.game_loop + 32,
+                    }
                 )
-                self._terminalize_expansion_goal(
+                self._record_cortex_event(
                     observation,
-                    terminal_state="expansion_candidates_exhausted",
+                    "expansion_candidate_epoch_exhausted",
+                    self._expansion_goal,
                 )
+                if self._expansion_goal.retry_budget == 0:
+                    self._terminalize_expansion_goal(
+                        observation,
+                        terminal_state="global_retry_budget_exhausted",
+                    )
 
     def _record_expansion_anchor_rejection(self, report: ExecutionReport) -> None:
         anchor = next(

@@ -44,6 +44,13 @@ class TacticalPolicyProvider(Protocol):
 class ExecutionAwareTacticalPolicyProvider(Protocol):
     """Tactical policy that consumes terminal command evidence."""
 
+    def record_dispatch(
+        self,
+        command: ActionCommand,
+        *,
+        responsibility: str,
+    ) -> None: ...
+
     def record_execution(
         self,
         report: ExecutionReport,

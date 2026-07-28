@@ -37,6 +37,108 @@ The aggregate success rate is not yet a reliable tactical-quality metric:
 `Attack_Unit` for `CombatGroup3/VoidRay-1` contributed 1,504 reports, and the
 same target received up to 101 separately tracked successful attack commands.
 
+## 2026-07-28 review remediation
+
+The follow-up review of revision `a2886c5` found four behavior blockers and
+several partially closed lifecycle contracts. The code corrections below are
+implemented together so that an identity, not an actor name or approximate
+coordinate, crosses each asynchronous boundary. They require a fresh live smoke
+before this register may claim runtime acceptance.
+
+### Placement and building lifecycle
+
+- **Root cause:** placement exclusion compared center-point radii, reservations
+  were created only at final dispatch, and ordinary confirmed structures were
+  released without an authoritative occupied footprint.
+- **Correction:** every build reservation now records structure type, exact
+  width/height, occupied build-grid cells, original and emitted world target,
+  state, episode, revision and expiry. Candidate-stage screen metadata carries
+  an immutable placement candidate ID through Router and RawExecutor. Conflict
+  checks use cell intersection across structure types; observations maintain an
+  occupied-structure ledger; confirmed reservations remain occupied until the
+  observed structure takes ownership. Builder leases expire and all other RAW
+  orders reject leased tags.
+- **Regression evidence:** `test_cross_structure_footprints_cannot_overlap`,
+  `test_actor_failure_does_not_quarantine_placement`, placement provenance and
+  build-effect tests.
+
+### Expansion goal versus scouting epoch
+
+- **Root cause:** `expansion_candidates_exhausted` terminalized both the active
+  commitment and its durable desired-base-count goal. A later scout generation
+  therefore could not reopen the goal.
+- **Correction:** candidate exhaustion now closes only the current commitment,
+  records the exhausted epoch, decrements the bounded global retry budget and
+  moves the goal to `waiting_for_candidates`. A newer scout generation returns
+  it to `active`; only satisfaction, strategic cancellation, episode end or
+  genuine global retry exhaustion is terminal.
+- **Regression evidence:** `test_expansion_goal_reopens_on_new_candidate_epoch`
+  and commitment recovery tests.
+
+### Combat, retreat and Defense lineage
+
+- **Root cause:** target damage could confirm an Attack without evidence that
+  the exact actor held the target order; tactical and Defense reports could fall
+  back to actor/action matching; threat signatures included unstable visible
+  tags; successful Defense responses entered an unbounded `holding` state.
+- **Correction:** combat success requires PySC2 acceptance, an exact actor RAW
+  order observed against the target, and target damage or valid removal. An
+  overwritten order produces `combat_order_replaced`, allowing the tactical
+  agent to reissue. Dispatch binds command, operation and attempt to the current
+  engagement/retreat/Defense state, and stale reports are ignored. Retreat
+  signatures use stable threat class/domain rather than tag membership. Defense
+  holding expires and is re-evaluated under sustained threat until inventory
+  saturation guards stop further production.
+- **Regression evidence:** `test_unrelated_damage_does_not_confirm_attack`,
+  `test_overwritten_attack_order_can_be_reissued`,
+  `test_stale_report_cannot_mutate_new_retreat_commitment` and
+  `test_defense_holding_expires_under_sustained_threat`.
+
+### Persistence, HIMA and experiment gates
+
+- **Root cause:** EventStore used an unbounded writer queue and synchronous
+  subscriber callbacks, JSONL had no repair path, HIMA globally merged repeated
+  actions across intervening dependencies, and Playbook gates treated absent
+  shadow evidence as success while measuring benefit from sequential carry.
+- **Correction:** the durable queue and subscriber queues are bounded;
+  subscribers run on isolated workers; overload applies explicit durable
+  backpressure; queue depth, writer lag, journal bytes and append latency are
+  observable. Startup reconciles a malformed or lagging JSONL mirror from
+  canonical SQLite. HIMA compacts only contiguous identical actions, preserves
+  interleaving and resolves transitive prerequisites. Playbook benefit is
+  measured on independent pairs, repeated errors use canonical consequence
+  signatures, natural terminal requires victory/defeat/draw, and zero shadow
+  states fails the hard-rule false-block gate.
+- **Regression evidence:** `test_hima_compaction_preserves_interleaved_order`,
+  `test_event_writer_queue_is_bounded`, JSONL reconciliation tests and
+  `test_false_block_gate_cannot_pass_without_shadow_states`.
+
+The short persistence smoke is:
+
+```bash
+uv run python scripts/profile_event_store.py
+```
+
+It reports `loops_per_second`, `events_per_loop`, `bytes_per_loop`,
+`queue_peak`, `queue_capacity`, `writer_lag_ms_max` and append latency. These
+metrics validate the persistence subsystem; the next SC2 smoke must still
+measure end-to-end live loop speed before Frozen/Evolving acceptance.
+
+Local 2,000-loop / 12,000-event smoke after this correction:
+
+```text
+loops_per_second: 7701.33
+events_per_loop: 6.0
+bytes_per_loop: 1367.79
+queue_peak/capacity: 8192/8192
+writer_lag_ms_max: 165.07
+append_latency_ms_mean: 0.0097
+```
+
+The deliberate saturation proves that memory remains bounded and backpressure
+engages. It is not a substitute for the required SC2 end-to-end live-speed
+measurement.
+
 ## Resolved and removed from the open register
 
 The following previously registered failures are verified as resolved and are

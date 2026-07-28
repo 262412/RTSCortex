@@ -104,6 +104,7 @@ class ExpansionGoalState(ContractModel):
     retry_budget: int = Field(default=8, ge=0)
     cooldown_until_game_loop: int = Field(default=0, ge=0)
     active_reservation_id: str | None = None
+    phase: str = Field(default="active", pattern=r"^(active|waiting_for_candidates)$")
     terminal_state: str | None = None
 
 

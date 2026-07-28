@@ -383,9 +383,7 @@ class ProductionEffectVerifier:
         producer_is_valid = producer_type in {
             pending.spec.producer_type,
             *pending.spec.alternate_producer_types,
-        } or (
-            pending.spec.producer_consumed and producer_type in pending.spec.intermediate_types
-        )
+        } or (pending.spec.producer_consumed and producer_type in pending.spec.intermediate_types)
         producer = producer_unit if producer_is_valid else None
         player = _value(observation, "player_common", _value(observation, "player", None))
         if player is None:

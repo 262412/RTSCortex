@@ -4,6 +4,7 @@ import pytest
 
 from rtscortex.contracts import (
     ActionArgumentType,
+    ActionCommand,
     ActionSource,
     AvailableAction,
     EconomyState,
@@ -304,6 +305,114 @@ def test_retreat_state_is_actor_local_and_cools_down_after_arrival() -> None:
     assert third == []
 
 
+def test_stale_report_cannot_mutate_new_retreat_commitment() -> None:
+    base = _observation()
+    actor = "CombatGroup7/Adept-1"
+    observation = base.model_copy(
+        update={
+            "state": base.state.model_copy(
+                update={
+                    "own_units": [
+                        UnitState(
+                            unit_id="0x10",
+                            unit_type="Adept",
+                            alliance="self",
+                            position=(50.0, 50.0),
+                            health_fraction=0.2,
+                            actor_scopes=(actor,),
+                        )
+                    ],
+                    "own_structures": [
+                        UnitState(
+                            unit_id="0x12",
+                            unit_type="Nexus",
+                            alliance="self",
+                            position=(10.0, 10.0),
+                        )
+                    ],
+                }
+            ),
+            "available_actions": [
+                AvailableAction(
+                    name="Move_Minimap",
+                    argument_names=["minimap"],
+                    argument_types=[ActionArgumentType.POSITION],
+                    actor_scopes=[actor],
+                    argument_candidates=[[[90, 90]], [[12, 12]]],
+                )
+            ],
+        }
+    )
+    agent = DeterministicTacticalAgent(
+        retreat_health_threshold=0.3,
+        minimum_advance_army_supply=4,
+        retreat_cooldown_game_loops=112,
+    )
+    assert agent.evaluate(
+        observation,
+        DeterministicSituationAnalyzer().assess(observation),
+    )
+    old_operation = f"operation:{'a' * 64}"
+    old_attempt = f"attempt:{'b' * 64}"
+    agent.record_dispatch(
+        ActionCommand(
+            command_id="old-retreat",
+            operation_id=old_operation,
+            attempt_id=old_attempt,
+            actor=actor,
+            name="Move_Minimap",
+            arguments=[[12, 12]],
+            created_game_loop=64,
+            ttl_game_loops=8,
+            source=ActionSource.PLANNER,
+        ),
+        responsibility="retreat",
+    )
+    later = observation.model_copy(update={"step_id": 5, "game_loop": 200})
+    assert agent.evaluate(later, DeterministicSituationAnalyzer().assess(later))
+    new_operation = f"operation:{'c' * 64}"
+    new_attempt = f"attempt:{'d' * 64}"
+    agent.record_dispatch(
+        ActionCommand(
+            command_id="new-retreat",
+            operation_id=new_operation,
+            attempt_id=new_attempt,
+            actor=actor,
+            name="Move_Minimap",
+            arguments=[[12, 12]],
+            created_game_loop=200,
+            ttl_game_loops=8,
+            source=ActionSource.PLANNER,
+        ),
+        responsibility="retreat",
+    )
+
+    transition = agent.record_execution(
+        ExecutionReport(
+            run_id=observation.run_id,
+            episode_id=observation.episode_id,
+            step_id=6,
+            command_id="old-retreat",
+            operation_id=old_operation,
+            attempt_id=old_attempt,
+            success=True,
+            action_name="Move_Minimap",
+            actor=actor,
+            source=ActionSource.PLANNER,
+            requested_arguments=[[12, 12]],
+            resolved_arguments=[[12, 12]],
+            status=ExecutionStatus.SUCCEEDED,
+            execution_stage=ExecutionStage.EFFECT_VERIFICATION,
+        ),
+        game_loop=208,
+    )
+
+    assert transition is None
+    current = agent._retreat_by_actor[actor]
+    assert current.command_id == "new-retreat"
+    assert current.phase == "retreating"
+
+
 def test_retreat_uses_exact_actor_membership_and_shield_aware_durability() -> None:
     base = _observation()
     adept_actor = "CombatGroup7/Adept-1"
@@ -521,7 +630,15 @@ def test_tactical_agent_quarantines_repeated_actor_target_failure() -> None:
     )
 
     first_failure = agent.record_execution(failure, game_loop=64)
-    second_failure = agent.record_execution(failure, game_loop=72)
+    retry_observation = observation.model_copy(update={"step_id": 4, "game_loop": 68})
+    agent.evaluate(
+        retry_observation,
+        DeterministicSituationAnalyzer().assess(retry_observation),
+    )
+    second_failure = agent.record_execution(
+        failure.model_copy(update={"command_id": "attack-2"}),
+        game_loop=72,
+    )
     next_observation = observation.model_copy(update={"step_id": 5, "game_loop": 80})
     [next_intent] = agent.evaluate(
         next_observation,
