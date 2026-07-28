@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import subprocess
 import sys
 from pathlib import Path
@@ -1331,3 +1332,16 @@ def test_playbook_quarantines_legacy_soft_execution_penalty(tmp_path: Path) -> N
     assert rule.strength is PlaybookRuleStrength.ADVISORY
     assert rule.evidence["suspension_reason"] == "missing_typed_failure_precondition"
     playbook.close()
+
+
+def test_frozen_playbook_store_preserves_database_bytes(tmp_path: Path) -> None:
+    path = tmp_path / "frozen-playbook.sqlite3"
+    writable = PlaybookStore(path)
+    writable.close()
+    before = hashlib.sha256(path.read_bytes()).hexdigest()
+
+    frozen = PlaybookStore(path, read_only=True)
+
+    assert frozen.rules() == []
+    frozen.close()
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == before

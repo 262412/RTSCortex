@@ -467,6 +467,87 @@ def test_defense_agent_deduplicates_active_response_and_cools_down_after_failure
     )
 
 
+def test_defense_agent_keeps_successful_response_holding_until_threat_clears() -> None:
+    base = _observation()
+    actor = "CombatGroup0/Zealot-1"
+    observation = base.model_copy(
+        update={
+            "state": base.state.model_copy(
+                update={
+                    "visible_enemies": [
+                        UnitState(
+                            unit_id="0xe1",
+                            unit_type="Drone",
+                            alliance="enemy",
+                            position=(12, 10),
+                        )
+                    ]
+                }
+            ),
+            "available_actions": [
+                AvailableAction(
+                    name="Move_Minimap",
+                    argument_names=["minimap"],
+                    argument_types=[ActionArgumentType.POSITION],
+                    actor_scopes=[actor, "Builder/Builder-Probe-1"],
+                    argument_candidates=[[[12, 12]]],
+                )
+            ],
+        }
+    )
+    assessment = (
+        DeterministicSituationAnalyzer()
+        .assess(observation)
+        .model_copy(update={"threat_level": ThreatLevel.CRITICAL, "threat_score": 12.0})
+    )
+    profile = race_profile("protoss")
+    coordinator = RoleAgentCoordinator(profile, StrategicIntentAdapter(profile))
+
+    first = coordinator.propose_defense_intents(RoleAgentContext(observation, assessment, ()))
+
+    assert [intent.actor_scopes[0] for intent in first] == [actor]
+    transition = coordinator.record_execution(
+        ExecutionReport(
+            run_id=observation.run_id,
+            episode_id=observation.episode_id,
+            step_id=2,
+            command_id="successful-defense-move",
+            success=True,
+            action_name="Move_Minimap",
+            actor=actor,
+            source=ActionSource.REFLEX,
+            status=ExecutionStatus.SUCCEEDED,
+            execution_stage=ExecutionStage.EFFECT_VERIFICATION,
+        ),
+        responsibility="defense",
+        game_loop=32,
+    )
+
+    assert transition is not None
+    assert transition["state"] == "defense_response_holding"
+    still_threatened = observation.model_copy(update={"step_id": 3, "game_loop": 1_000})
+    assert (
+        coordinator.propose_defense_intents(
+            RoleAgentContext(still_threatened, assessment, ())
+        )
+        == ()
+    )
+
+    clear_assessment = assessment.model_copy(
+        update={"threat_level": ThreatLevel.NONE, "threat_score": 0.0}
+    )
+    assert (
+        coordinator.propose_defense_intents(
+            RoleAgentContext(still_threatened, clear_assessment, ())
+        )
+        == ()
+    )
+    renewed = observation.model_copy(update={"step_id": 4, "game_loop": 1_001})
+    assert len(
+        coordinator.propose_defense_intents(RoleAgentContext(renewed, assessment, ()))
+    ) == 1
+
+
 def test_zerg_queen_controller_routes_inject_to_economy_and_creep_to_defense() -> None:
     observation = _observation()
     assessment = DeterministicSituationAnalyzer().assess(observation)

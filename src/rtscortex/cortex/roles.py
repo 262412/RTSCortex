@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Literal, Protocol
 
 from rtscortex.contracts import ExecutionReport, ExecutionStatus, ObservationEnvelope
 from rtscortex.cortex.models import (
@@ -30,6 +30,7 @@ class _DefenseActorState:
     actor: str
     action_name: str
     signature: str
+    phase: Literal["responding", "holding", "cooldown"]
     active_until_game_loop: int
     cooldown_until_game_loop: int = 0
 
@@ -174,10 +175,8 @@ class DefenseAgent(_RoutingRoleAgent):
             ThreatLevel.HIGH,
             ThreatLevel.CRITICAL,
         }
-        if not threatened and not any(
-            observation.game_loop < state.active_until_game_loop
-            for state in self._actor_states.values()
-        ):
+        if not threatened:
+            self._actor_states.clear()
             return ()
 
         proposals: list[TacticalIntent] = []
@@ -192,7 +191,7 @@ class DefenseAgent(_RoutingRoleAgent):
         ]
         for action in attack_actions:
             for actor in action.actor_scopes:
-                if actor in claimed:
+                if actor in claimed or not _is_combat_actor(actor):
                     continue
                 targets = attackable_enemies_for_actor(observation, actor)
                 if not targets:
@@ -238,7 +237,7 @@ class DefenseAgent(_RoutingRoleAgent):
             if action.name != "Move_Minimap" or not action.argument_candidates:
                 continue
             for actor in action.actor_scopes:
-                if actor in claimed:
+                if actor in claimed or not _is_combat_actor(actor):
                     continue
                 position = _defensive_minimap_position(
                     observation,
@@ -450,18 +449,23 @@ class DefenseAgent(_RoutingRoleAgent):
         if state is None:
             return None
         if report.status is ExecutionStatus.SUCCEEDED:
-            assert state_key is not None
-            del self._actor_states[state_key]
+            state.phase = "holding"
+            state.active_until_game_loop = max(
+                state.active_until_game_loop,
+                game_loop + _DEFENSE_COMMITMENT_GAME_LOOPS,
+            )
             return {
                 "actor": actor,
-                "state": "defense_response_terminal",
+                "state": "defense_response_holding",
                 "status": "succeeded",
                 "game_loop": game_loop,
+                "active_until_game_loop": state.active_until_game_loop,
             }
         if report.status is not ExecutionStatus.FAILED:
             return None
         state.active_until_game_loop = game_loop
         state.cooldown_until_game_loop = game_loop + _DEFENSE_RETRY_COOLDOWN_GAME_LOOPS
+        state.phase = "cooldown"
         return {
             "actor": actor,
             "state": "defense_response_cooldown",
@@ -481,6 +485,8 @@ class DefenseAgent(_RoutingRoleAgent):
         state = self._actor_states.get(f"{actor}|{action_name}|{signature}")
         if state is None:
             return True
+        if state.phase == "holding":
+            return False
         if game_loop < state.cooldown_until_game_loop:
             return False
         if game_loop < state.active_until_game_loop:
@@ -503,6 +509,7 @@ class DefenseAgent(_RoutingRoleAgent):
             actor=actor,
             action_name=action_name,
             signature=signature,
+            phase="responding",
             active_until_game_loop=(game_loop + _DEFENSE_COMMITMENT_GAME_LOOPS),
         )
 
@@ -697,6 +704,10 @@ def _is_worker_actor(actor: str, profile: RaceProfile) -> bool:
     worker = profile.data.worker_type.casefold()
     normalized = actor.casefold()
     return normalized.startswith("builder/") or worker in normalized
+
+
+def _is_combat_actor(actor: str) -> bool:
+    return actor.casefold().startswith("combatgroup")
 
 
 def _normalized_tag(value: str) -> str:

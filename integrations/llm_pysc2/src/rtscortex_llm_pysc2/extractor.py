@@ -655,6 +655,7 @@ class TimeStepExtractor:
 
         raw_units = list(_value(observation, "raw_units", ()))
         self.observe_expansion_resources(observation, agents)
+        self.placement_service.reset_diagnostics()
         minimap_transform = _world_to_minimap_transform(agents)
         teams = _extract_team_actions(
             agents,
@@ -695,6 +696,7 @@ class TimeStepExtractor:
             "alerts": [
                 *[_alert_name(value) for value in _value(observation, "alerts", ())],
                 *self._expansion_scout_alerts,
+                *self.placement_service.placement_alerts,
                 *(
                     ["expansion_candidates_exhausted"]
                     if self._expansion_candidates_exhausted

@@ -310,12 +310,24 @@ class EffectEvidence(ContractModel):
     producer_orders: list[int] = Field(default_factory=list)
     resource_delta: dict[str, int] = Field(default_factory=dict)
     order_seen: bool = False
+    build_started: bool = False
+    build_start_confirmation_kind: Literal[
+        "builder_order",
+        "supporting_quorum",
+        "new_structure",
+    ] | None = None
+    build_start_confirmed_game_loop: int | None = Field(default=None, ge=0)
+    resource_debit_seen: bool = False
+    builder_approach_seen: bool = False
+    target_occupancy_seen: bool = False
     production_order_seen: bool = False
     confirmation_kind: (
         Literal[
             "producer_order",
             "producer_morph",
             "source_morph",
+            "builder_order",
+            "supporting_quorum",
             "target_buff",
             "new_unit",
             "new_structure",

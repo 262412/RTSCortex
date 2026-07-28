@@ -93,7 +93,10 @@ def _build_cortex_runtime(
             objective=config.cortex.macro.scripted_objective,
         )
     playbook_store = (
-        PlaybookStore(config.cortex.playbook.database_path)
+        PlaybookStore(
+            config.cortex.playbook.database_path,
+            read_only=config.cortex.playbook.learning_mode == "frozen",
+        )
         if config.cortex.playbook.enabled
         else None
     )
@@ -102,7 +105,10 @@ def _build_cortex_runtime(
             playbook_store,
             promotion_support=config.cortex.playbook.promotion_support,
         )
-        if playbook_store is not None
+        if (
+            playbook_store is not None
+            and config.cortex.playbook.learning_mode == "evolving"
+        )
         else None
     )
     return CortexRuntimeEngine(

@@ -15,7 +15,7 @@ environment:
   # PySC2 uses 0 as the explicit no-limit sentinel. Null would inherit the
   # Simple64 map default of 39,600 game loops.
   game_steps_per_episode: 0
-  simulation_speed_multiplier: 0.5
+  simulation_speed_multiplier: 1.0
   pause_until_first_plan: true
   sc2_path: ~/scratch/StarCraftII
   action_effect_timeout_game_loops: 112
@@ -72,6 +72,7 @@ cortex:
     # The launch harness restores this working database from one immutable
     # snapshot before every seed so that no episode can affect the next one.
     database_path: ~/scratch/outputs/RTSCortex/cortex-playbook-frozen-working.sqlite3
+    learning_mode: frozen
     top_k: 6
     min_confidence: 0.6
     promotion_support: 2

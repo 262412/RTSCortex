@@ -525,6 +525,8 @@ const VALUE_LABELS: Record<string, string> = {
   worker_order_replaced: "工人订单被替换",
   target_not_created: "目标建筑未出现",
   builder_not_observable: "无法继续观察建造工",
+  no_build_start_evidence: "未观察到可靠的开工证据",
+  build_started_effect_missing: "已确认开工但目标建筑未出现",
   actor_not_observable: "无法继续观察执行单位",
   producer_not_observable: "无法继续观察生产建筑",
   no_production_order_observed: "未观察到生产订单",

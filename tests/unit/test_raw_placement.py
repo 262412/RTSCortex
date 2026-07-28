@@ -68,12 +68,22 @@ def test_raw_placement_service_persists_and_quarantines_expansion_identity() -> 
         requested_arguments=(0x101,),
         world_target=None,
     )
-    assert service.suppressed_anchors == frozenset({0x101})
+    assert service.suppressed_anchors == frozenset(
+        0x101 + index for index in range(len(resources))
+    )
     with pytest.raises(RawPlacementFailure, match="permanently suppressed"):
         service.resolve(
             command_id="expand-again",
             action_name="Build_Nexus_Near",
             requested_arguments=(0x101,),
+            observation=observation,
+            world_target=None,
+        )
+    with pytest.raises(RawPlacementFailure, match="permanently suppressed"):
+        service.resolve(
+            command_id="same-cluster-alternate-tag",
+            action_name="Build_Nexus_Near",
+            requested_arguments=(0x104,),
             observation=observation,
             world_target=None,
         )
@@ -93,6 +103,57 @@ def test_raw_placement_service_quarantines_pre_dispatch_world_target() -> None:
         "Build_Pylon_Screen",
         (22.25, 24.5),
         radius=1.5,
+    )
+
+
+def test_raw_placement_service_retires_expansion_cluster_after_confirmation() -> None:
+    service = RawPlacementService(unit_names={59: "Nexus", 341: "MineralField"})
+    resources = [
+        _unit(0x201 + index, 341, alliance=3, x=x, y=y)
+        for index, (x, y) in enumerate(
+            (
+                (87, 80),
+                (85, 85),
+                (80, 87),
+                (75, 85),
+                (73, 80),
+                (75, 75),
+                (80, 73),
+                (85, 75),
+            )
+        )
+    ]
+    observation = SimpleNamespace(
+        raw_units=[_unit(0xC1, 59, alliance=1, x=20, y=20), *resources],
+        feature_units=[],
+    )
+    service.observe(observation, require_feature_visibility=False)
+    service.resolve(
+        command_id="confirmed-expand",
+        action_name="Build_Nexus_Near",
+        requested_arguments=(0x204,),
+        observation=observation,
+        world_target=None,
+    )
+
+    service.confirm_command("confirmed-expand")
+
+    assert service.candidates(
+        observation,
+        "Build_Nexus_Near",
+    ).argument_candidates == []
+
+
+def test_raw_placement_service_reports_missing_visible_build_space() -> None:
+    service = RawPlacementService(unit_names={})
+    observation = SimpleNamespace(feature_screen=None)
+
+    candidates = service.candidates(observation, "Build_Pylon_Screen")
+
+    assert candidates.argument_candidates == []
+    assert candidates.unavailable_reason == "out_of_view"
+    assert service.placement_alerts == (
+        "placement_unavailable:Build_Pylon_Screen:out_of_view",
     )
 
 

@@ -417,10 +417,12 @@ def test_same_structure_at_another_position_does_not_confirm_effect() -> None:
     pylon["x"] = 60
     pylon["y"] = 60
 
+    assert verifier.observe(observation) == []
+    observation["game_loop"] = 141
     verdict = verifier.observe(observation)[0]
 
     assert verdict.success is False
-    assert verdict.failure_code == "no_build_order_observed"
+    assert verdict.failure_code == "build_started_effect_missing"
 
 
 def test_concurrent_same_type_builds_match_new_tags_one_to_one() -> None:
@@ -490,7 +492,7 @@ def test_claimed_structure_tag_is_not_reused_across_observations() -> None:
     assert verifier.observe(one_new_pylon) == []
 
     timeout_observation = _observation(
-        game_loop=121,
+        game_loop=181,
         minerals=300,
         structures=["Nexus", "Pylon"],
     )
@@ -520,7 +522,10 @@ def test_resource_and_builder_order_are_diagnostic_only() -> None:
 
     assert len(verdicts) == 1
     assert verdicts[0].success is False
-    assert verdicts[0].failure_code == "target_not_created"
+    assert verdicts[0].failure_code == "build_started_effect_missing"
+    assert verdicts[0].evidence is not None
+    assert verdicts[0].evidence["build_started"] is True
+    assert verdicts[0].evidence["build_start_confirmation_kind"] == "builder_order"
 
 
 def test_build_effect_times_out_with_diagnostic_evidence() -> None:
@@ -566,7 +571,7 @@ def test_build_effect_diagnostic_identifies_replaced_worker_order() -> None:
     verdict = verifier.observe(_observation(game_loop=141, minerals=250, builder_orders=[154]))[0]
 
     assert verdict.success is False
-    assert verdict.failure_code == "worker_order_replaced"
+    assert verdict.failure_code == "build_started_effect_missing"
     assert "observed and later changed" in (verdict.failure_reason or "")
 
 
@@ -578,10 +583,10 @@ def test_post_order_grace_expires_at_32_loops_without_structure() -> None:
     verifier.accept_primitive(command.command_id, game_loop=101)
 
     assert verifier.observe(_observation(game_loop=105, minerals=150, builder_orders=[35])) == []
-    assert verifier.observe(_observation(game_loop=136, minerals=150, builder_orders=[])) == []
-    verdict = verifier.observe(_observation(game_loop=137, minerals=150, builder_orders=[]))[0]
+    assert verifier.observe(_observation(game_loop=140, minerals=150, builder_orders=[])) == []
+    verdict = verifier.observe(_observation(game_loop=141, minerals=150, builder_orders=[]))[0]
 
-    assert verdict.failure_code == "target_not_created"
+    assert verdict.failure_code == "build_started_effect_missing"
 
 
 def test_active_nexus_order_extends_timeout_until_effect_is_visible() -> None:
@@ -631,7 +636,7 @@ def test_active_build_order_extension_has_a_hard_limit() -> None:
     verdict = verifier.observe(_observation(game_loop=221, minerals=100, builder_orders=[34]))[0]
 
     assert verdict.success is False
-    assert verdict.failure_code == "target_not_created"
+    assert verdict.failure_code == "build_started_effect_missing"
     assert verdict.evidence is not None
     assert verdict.evidence["elapsed_game_loops"] == 120
     assert verdict.evidence["effective_timeout_game_loops"] == 120
@@ -651,7 +656,7 @@ def test_changed_order_without_observed_build_order_is_not_called_replaced() -> 
     verdict = verifier.observe(_observation(game_loop=111, minerals=250, builder_orders=[154]))[0]
 
     assert verdict.success is False
-    assert verdict.failure_code == "no_build_order_observed"
+    assert verdict.failure_code == "no_build_start_evidence"
     assert "automatic worker" not in (verdict.failure_reason or "")
 
 
@@ -961,7 +966,7 @@ def test_stargate_raw_build_order_marks_order_seen_for_diagnostics() -> None:
     verdict = verifier.observe(_observation(game_loop=141, minerals=500, builder_orders=[154]))[0]
 
     assert verdict.success is False
-    assert verdict.failure_code == "worker_order_replaced"
+    assert verdict.failure_code == "build_started_effect_missing"
     assert verdict.evidence is not None
     assert verdict.evidence["order_seen"] is True
     assert verdict.evidence["order_last_seen_game_loop"] == 105

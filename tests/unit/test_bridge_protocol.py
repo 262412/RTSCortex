@@ -263,7 +263,7 @@ def test_coordinator_does_not_report_one_structure_for_two_commands() -> None:
 
     timeout_reports = coordinator.observe_effects(
         _raw_effect_observation(
-            game_loop=337,
+            game_loop=673,
             minerals=300,
             structures=["Nexus", "Pylon"],
         )

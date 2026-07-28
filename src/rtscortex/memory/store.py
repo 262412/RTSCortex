@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -46,7 +47,18 @@ def _json_payload(payload: BaseModel | dict[str, Any]) -> dict[str, Any]:
 class EventStore:
     """Store runtime events in SQLite and mirror each event to JSONL."""
 
-    def __init__(self, database_path: Path, journal_path: Path) -> None:
+    def __init__(
+        self,
+        database_path: Path,
+        journal_path: Path,
+        *,
+        flush_event_limit: int = 64,
+        flush_interval_seconds: float = 0.25,
+    ) -> None:
+        if flush_event_limit < 1:
+            raise ValueError("flush_event_limit must be positive")
+        if flush_interval_seconds <= 0:
+            raise ValueError("flush_interval_seconds must be positive")
         database_path.parent.mkdir(parents=True, exist_ok=True)
         journal_path.parent.mkdir(parents=True, exist_ok=True)
         self.database_path = database_path
@@ -56,11 +68,16 @@ class EventStore:
         self._subscriber_lock = threading.Lock()
         self._subscribers: dict[int, Callable[[StoredEvent], None]] = {}
         self._next_subscriber_id = 0
+        self._flush_event_limit = flush_event_limit
+        self._flush_interval_seconds = flush_interval_seconds
+        self._pending_events = 0
+        self._last_flush_monotonic = time.monotonic()
         self._connection = sqlite3.connect(database_path, check_same_thread=False)
         self._connection.row_factory = sqlite3.Row
         self._initialize()
         self._reader_connection = sqlite3.connect(database_path, check_same_thread=False)
         self._reader_connection.row_factory = sqlite3.Row
+        self._journal = self.journal_path.open("a", encoding="utf-8", buffering=1024 * 1024)
 
     def _initialize(self) -> None:
         self._connection.executescript(
@@ -123,7 +140,6 @@ class EventStore:
                 """,
                 (run_id, episode_id, step_id, event_type, created_at, encoded),
             )
-            self._connection.commit()
             assert cursor.lastrowid is not None
             event_id = cursor.lastrowid
             record = StoredEvent(
@@ -135,19 +151,43 @@ class EventStore:
                 created_at=created_at,
                 payload=normalized,
             )
-            with self.journal_path.open("a", encoding="utf-8") as journal:
-                journal.write(
-                    json.dumps(record.__dict__, ensure_ascii=False, sort_keys=True) + "\n"
-                )
+            self._journal.write(
+                json.dumps(record.__dict__, ensure_ascii=False, sort_keys=True) + "\n"
+            )
+            self._pending_events += 1
+            self._flush_if_due_locked()
             # Sinks enqueue only; publishing under the write lock preserves event-id order.
             self._publish(record)
         return record
 
+    def flush(self) -> None:
+        """Make pending SQLite and JSONL events visible to external readers."""
+
+        with self._lock:
+            self._flush_locked()
+
+    def _flush_if_due_locked(self) -> None:
+        if (
+            self._pending_events >= self._flush_event_limit
+            or time.monotonic() - self._last_flush_monotonic
+            >= self._flush_interval_seconds
+        ):
+            self._flush_locked()
+
+    def _flush_locked(self) -> None:
+        if self._pending_events == 0:
+            return
+        self._connection.commit()
+        self._journal.flush()
+        self._pending_events = 0
+        self._last_flush_monotonic = time.monotonic()
+
     def subscribe(self, subscriber: Callable[[StoredEvent], None]) -> Callable[[], None]:
         """Subscribe a non-blocking event sink and return its unsubscribe function.
 
-        Subscribers run after the event is durable. Their failures never affect the
-        runtime write path. Subscribers should only enqueue work and return immediately.
+        Subscribers receive events in event-id order before the next bounded durable
+        flush. Their failures never affect the runtime write path. Subscribers should
+        only enqueue work and return immediately.
         """
 
         with self._subscriber_lock:
@@ -185,6 +225,7 @@ class EventStore:
             raise ValueError("after_event_id must be non-negative")
         if limit < 1:
             raise ValueError("limit must be positive")
+        self.flush()
         if episode_id is None:
             query = """
                 SELECT * FROM events
@@ -204,6 +245,7 @@ class EventStore:
         return [self._row_to_event(row) for row in rows]
 
     def latest_event_id(self, run_id: str, *, episode_id: str | None = None) -> int:
+        self.flush()
         if episode_id is None:
             query = "SELECT MAX(event_id) AS event_id FROM events WHERE run_id = ?"
             parameters: tuple[object, ...] = (run_id,)
@@ -387,8 +429,10 @@ class EventStore:
         ]
 
     def close(self) -> None:
+        self.flush()
         with self._subscriber_lock:
             self._subscribers.clear()
+        self._journal.close()
         self._reader_connection.close()
         self._connection.close()
 

@@ -40,12 +40,14 @@ class _BuilderEvidence:
     status: str
     orders: tuple[int, ...]
     selected: bool
+    position: tuple[float, float]
 
 
 @dataclass(frozen=True)
 class _Evidence:
     game_loop: int
     structures: tuple[_StructureEvidence, ...]
+    occupants: tuple[tuple[int, tuple[float, float]], ...]
     minerals: int
     builder: Optional[_BuilderEvidence]
 
@@ -72,6 +74,12 @@ class _PendingBuild:
     coordinate_space: Optional[str] = None
     order_seen: bool = False
     order_last_seen_game_loop: Optional[int] = None
+    build_started: bool = False
+    build_start_confirmation_kind: Optional[str] = None
+    build_start_confirmed_game_loop: Optional[int] = None
+    resource_debit_seen: bool = False
+    builder_approach_seen: bool = False
+    target_occupancy_seen: bool = False
     active_order_extension: bool = False
 
 
@@ -362,12 +370,25 @@ class ActionEffectVerifier:
             ):
                 pending.order_seen = True
                 pending.order_last_seen_game_loop = current.game_loop
+                self._confirm_build_started(
+                    pending,
+                    current,
+                    confirmation_kind="builder_order",
+                )
+            self._update_supporting_build_start_evidence(pending, current)
         assignments = self._match_new_structures(accepted, current_by_command)
         self._claimed_structure_tags.update(structure.tag for structure in assignments.values())
         for command_id, structure in assignments.items():
             pending = self._pending.pop(command_id)
             current = current_by_command[command_id]
             pending.latest = current
+            self._confirm_build_started(
+                pending,
+                current,
+                confirmation_kind="new_structure",
+            )
+            if self.placement_service is not None:
+                self.placement_service.confirm_command(command_id)
             verdicts.append(
                 EffectVerdict(
                     command_id,
@@ -396,7 +417,9 @@ class ActionEffectVerifier:
                 and current.game_loop - pending.order_last_seen_game_loop
                 < POST_ORDER_EFFECT_GRACE_GAME_LOOPS
             )
-            if elapsed < hard_timeout and (order_is_active or within_order_grace):
+            if elapsed < hard_timeout and (
+                pending.build_started or order_is_active or within_order_grace
+            ):
                 pending.active_order_extension = True
                 continue
             if elapsed >= self.timeout_game_loops:
@@ -652,6 +675,17 @@ class ActionEffectVerifier:
                 )
                 for unit in target_units
             ),
+            occupants=tuple(
+                (
+                    int(_value(unit, "tag", 0)),
+                    (
+                        float(_value(unit, "x", 0.0)),
+                        float(_value(unit, "y", 0.0)),
+                    ),
+                )
+                for unit in raw_units
+                if int(_value(unit, "alliance", 0)) == 1
+            ),
             minerals=int(_value(player, "minerals", 0)),
             builder=None if builder is None else _builder_evidence(builder),
         )
@@ -808,15 +842,10 @@ class ActionEffectVerifier:
 
     @staticmethod
     def _timeout_code(pending: _PendingBuild, current: _Evidence) -> str:
-        baseline = pending.baseline
-        if baseline is None or baseline.builder is None or current.builder is None:
-            return "builder_not_observable"
-        if not pending.order_seen:
-            return "no_build_order_observed"
-        expected_order = BUILD_RAW_FUNCTION_IDS.get(pending.target_structure)
-        if current.builder.orders and expected_order not in current.builder.orders:
-            return "worker_order_replaced"
-        return "target_not_created"
+        del current
+        if pending.build_started:
+            return "build_started_effect_missing"
+        return "no_build_start_evidence"
 
     @staticmethod
     def _diagnostic(pending: _PendingBuild, current: _Evidence) -> str:
@@ -865,6 +894,12 @@ class ActionEffectVerifier:
                 "minerals": 0 if baseline is None else current.minerals - baseline.minerals,
             },
             "order_seen": pending.order_seen,
+            "build_started": pending.build_started,
+            "build_start_confirmation_kind": pending.build_start_confirmation_kind,
+            "build_start_confirmed_game_loop": pending.build_start_confirmed_game_loop,
+            "resource_debit_seen": pending.resource_debit_seen,
+            "builder_approach_seen": pending.builder_approach_seen,
+            "target_occupancy_seen": pending.target_occupancy_seen,
             "order_last_seen_game_loop": pending.order_last_seen_game_loop,
             "post_order_grace_game_loops": POST_ORDER_EFFECT_GRACE_GAME_LOOPS,
             "mineral_delta": 0 if baseline is None else baseline.minerals - current.minerals,
@@ -880,7 +915,81 @@ class ActionEffectVerifier:
                 else self.timeout_game_loops
             ),
             "active_order_extension": pending.active_order_extension,
+            "baseline_builder_position": (
+                None
+                if baseline is None or baseline.builder is None
+                else baseline.builder.position
+            ),
+            "observed_builder_position": (
+                None if current.builder is None else current.builder.position
+            ),
+            "builder_displacement": (
+                None
+                if baseline is None
+                or baseline.builder is None
+                or current.builder is None
+                else _position_distance(
+                    baseline.builder.position,
+                    current.builder.position,
+                )
+            ),
+            "confirmation_kind": (
+                "new_structure"
+                if structure is not None
+                else pending.build_start_confirmation_kind
+            ),
         }
+
+    def _confirm_build_started(
+        self,
+        pending: _PendingBuild,
+        current: _Evidence,
+        *,
+        confirmation_kind: str,
+    ) -> None:
+        if pending.build_started:
+            return
+        pending.build_started = True
+        pending.build_start_confirmation_kind = confirmation_kind
+        pending.build_start_confirmed_game_loop = current.game_loop
+
+    def _update_supporting_build_start_evidence(
+        self,
+        pending: _PendingBuild,
+        current: _Evidence,
+    ) -> None:
+        baseline = pending.baseline
+        target = pending.target_position
+        if baseline is None:
+            return
+        spec = BUILD_SPECS.get(pending.command.name)
+        mineral_cost = 0 if spec is None else spec.mineral_cost
+        pending.resource_debit_seen = pending.resource_debit_seen or (
+            mineral_cost > 0 and baseline.minerals - current.minerals >= mineral_cost
+        )
+        if baseline.builder is not None and current.builder is not None and target is not None:
+            baseline_distance = _position_distance(baseline.builder.position, target)
+            current_distance = _position_distance(current.builder.position, target)
+            pending.builder_approach_seen = pending.builder_approach_seen or (
+                current_distance + 1.0 <= baseline_distance
+                or current_distance <= max(3.0, float(spec.footprint if spec else 2))
+            )
+        if target is not None:
+            baseline_tags = {tag for tag, _ in baseline.occupants}
+            footprint_radius = max(1.5, float(spec.footprint if spec else 2) / 2.0)
+            pending.target_occupancy_seen = pending.target_occupancy_seen or any(
+                tag not in baseline_tags
+                and _position_distance(position, target) <= footprint_radius
+                for tag, position in current.occupants
+            )
+        if pending.resource_debit_seen and (
+            pending.builder_approach_seen or pending.target_occupancy_seen
+        ):
+            self._confirm_build_started(
+                pending,
+                current,
+                confirmation_kind="supporting_quorum",
+            )
 
     def _active_order_timeout(self, pending: _PendingBuild) -> int:
         multiplier = (
@@ -1024,6 +1133,10 @@ def _builder_evidence(unit: Any) -> _BuilderEvidence:
         status="active" if int(_value(unit, "order_length", len(orders))) > 0 else "idle",
         orders=orders,
         selected=bool(_value(unit, "is_selected", False)),
+        position=(
+            float(_value(unit, "x", 0.0)),
+            float(_value(unit, "y", 0.0)),
+        ),
     )
 
 

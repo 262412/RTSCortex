@@ -42,6 +42,7 @@ from rtscortex.cortex import (
     ReflexIntent,
     RoleAgentContext,
     RoleAgentCoordinator,
+    RoleId,
     SituationAssessment,
     SituationProvider,
     StrategicAgenda,
@@ -2256,7 +2257,17 @@ class CortexRuntimeEngine(RuntimeEngine):
         if existing is not None:
             return
         self._remember_terminal_feedback(report)
-        if isinstance(self._tactical, ExecutionAwareTacticalPolicyProvider):
+        lineage = self._command_lineages.get(report.command_id)
+        responsibility = None if lineage is None else lineage.responsibility
+        tactical_responsibilities = {
+            RoleId.OFFENSE.value,
+            RoleId.FOCUS_FIRE.value,
+            RoleId.RETREAT.value,
+        }
+        if (
+            responsibility in tactical_responsibilities
+            and isinstance(self._tactical, ExecutionAwareTacticalPolicyProvider)
+        ):
             transition = self._tactical.record_execution(
                 report,
                 game_loop=self._execution_game_loop(report),
@@ -2273,10 +2284,9 @@ class CortexRuntimeEngine(RuntimeEngine):
                     ),
                     payload=transition,
                 )
-        lineage = self._command_lineages.get(report.command_id)
         defense_transition = self._role_agents.record_execution(
             report,
-            responsibility=None if lineage is None else lineage.responsibility,
+            responsibility=responsibility,
             game_loop=self._execution_game_loop(report),
         )
         if defense_transition is not None:
@@ -2778,6 +2788,7 @@ class CortexRuntimeEngine(RuntimeEngine):
         if (
             not self._playbook_promotion_sweep_done
             and self.config.cortex.playbook.rule_mode == "active"
+            and self.config.cortex.playbook.learning_mode == "evolving"
         ):
             self._playbook_promotion_sweep_done = True
             sweep = PlaybookPromotionSweep(self._playbook_store).run()

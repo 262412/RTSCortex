@@ -74,6 +74,12 @@ describe("Chinese event presentation", () => {
     expect(semanticScalar("target_not_created", "failure_code")).toBe(
       "目标建筑未出现（target_not_created）",
     );
+    expect(semanticScalar("no_build_start_evidence", "failure_code")).toBe(
+      "未观察到可靠的开工证据（no_build_start_evidence）",
+    );
+    expect(semanticScalar("build_started_effect_missing", "failure_code")).toBe(
+      "已确认开工但目标建筑未出现（build_started_effect_missing）",
+    );
   });
 
   it("reduces observations to useful state and retains canonical protocol names", () => {

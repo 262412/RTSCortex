@@ -32,12 +32,25 @@ from rtscortex.playbook.models import (
 class PlaybookStore:
     """Persist reusable experience outside any individual run directory."""
 
-    def __init__(self, database_path: Path) -> None:
+    def __init__(self, database_path: Path, *, read_only: bool = False) -> None:
         database_path.parent.mkdir(parents=True, exist_ok=True)
+        if read_only and not database_path.is_file():
+            raise ValueError(f"frozen Playbook database does not exist: {database_path}")
         self.database_path = database_path
+        self.read_only = read_only
         self._lock = threading.Lock()
-        self._connection = sqlite3.connect(database_path, check_same_thread=False)
+        self._connection = sqlite3.connect(
+            (
+                f"file:{database_path}?mode=ro"
+                if read_only
+                else str(database_path)
+            ),
+            uri=read_only,
+            check_same_thread=False,
+        )
         self._connection.row_factory = sqlite3.Row
+        if read_only:
+            return
         self._connection.executescript(
             """
             CREATE TABLE IF NOT EXISTS decision_cases (
@@ -211,6 +224,8 @@ class PlaybookStore:
         return tuple([*hard, *soft, *candidates, *advisory])
 
     def record_rule_application(self, application: PlaybookRuleApplication) -> bool:
+        if self.read_only:
+            return False
         with self._lock:
             cursor = self._connection.execute(
                 """

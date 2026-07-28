@@ -202,6 +202,7 @@ class CortexExplanationSettings(SettingsModel):
 class CortexPlaybookSettings(SettingsModel):
     enabled: bool = False
     database_path: Path = Path("~/scratch/outputs/RTSCortex/cortex-playbook.sqlite3")
+    learning_mode: Literal["evolving", "frozen"] = "evolving"
     top_k: int = Field(default=6, ge=1, le=20)
     min_confidence: float = Field(default=0.6, ge=0.0, le=1.0)
     promotion_support: int = Field(default=2, ge=1)

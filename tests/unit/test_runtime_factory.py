@@ -304,7 +304,7 @@ def test_live_hima_cortex_regression_uses_long_multi_seed_window() -> None:
     assert config.provider.kind == "fake"
 
 
-def test_protoss_playbook_paired_configs_differ_only_by_database_path() -> None:
+def test_protoss_playbook_paired_configs_differ_only_by_playbook_persistence() -> None:
     frozen = load_config(
         PROJECT_ROOT
         / "configs/experiments/"
@@ -323,6 +323,10 @@ def test_protoss_playbook_paired_configs_differ_only_by_database_path() -> None:
     evolving_payload = evolving.model_dump(mode="json")
     frozen_payload["cortex"]["playbook"]["database_path"] = "<arm-playbook>"
     evolving_payload["cortex"]["playbook"]["database_path"] = "<arm-playbook>"
+    assert frozen_payload["cortex"]["playbook"]["learning_mode"] == "frozen"
+    assert evolving_payload["cortex"]["playbook"]["learning_mode"] == "evolving"
+    frozen_payload["cortex"]["playbook"]["learning_mode"] = "<arm-learning-mode>"
+    evolving_payload["cortex"]["playbook"]["learning_mode"] = "<arm-learning-mode>"
     assert frozen_payload == evolving_payload
 
 

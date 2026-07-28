@@ -806,6 +806,8 @@ def compute_execution_metrics(events: list[StoredEvent]) -> ExecutionMetrics:
                 "worker_order_replaced",
                 "target_not_created",
                 "builder_not_observable",
+                "no_build_start_evidence",
+                "build_started_effect_missing",
             }:
                 build_effect_timeout_ids.add(command_id)
             final_translator = _final_translator_primitive(payload)
