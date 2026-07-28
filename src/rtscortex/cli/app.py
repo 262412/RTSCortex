@@ -298,6 +298,7 @@ def _snapshot_config(config: ExperimentConfig, run_dir: Path) -> None:
 def _echo_report_artifacts(artifacts: RunReportArtifacts) -> None:
     typer.echo(f"Timeline: {artifacts.timeline_path}")
     typer.echo(f"Summary: {artifacts.summary_path}")
+    typer.echo(f"Engineering gates: {artifacts.engineering_gates_path}")
 
 
 def _write_run_reports_best_effort(run_dir: Path) -> None:

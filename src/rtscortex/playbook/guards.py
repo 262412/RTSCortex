@@ -7,7 +7,7 @@ import json
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, cast
 
 from rtscortex.cortex.models import ExecutableCandidate, SituationAssessment
 from rtscortex.cortex.strategic import StrategicIntent
@@ -15,9 +15,12 @@ from rtscortex.playbook.models import (
     PlaybookCondition,
     PlaybookConditionOperator,
     PlaybookContext,
+    PlaybookRoleId,
     PlaybookRule,
     PlaybookRuleApplication,
+    PlaybookRuleCategory,
     PlaybookRuleEffect,
+    PlaybookRuleKind,
     PlaybookRuleStatus,
     PlaybookRuleStrength,
 )
@@ -264,6 +267,11 @@ def _evaluate(
         if matched or rule_blocked:
             applied_ids.append(rule.rule_id)
         if matched or rule_blocked or rule_delta:
+            counterfactual_key = _counterfactual_key(
+                rule.rule_id,
+                target_kind=target_kind,
+                values=values,
+            )
             identity = hashlib.sha256(
                 f"{rule.rule_id}|{target_kind}|{target_id}|{game_loop}".encode()
             ).hexdigest()
@@ -277,6 +285,10 @@ def _evaluate(
                     game_loop=game_loop,
                     target_kind=target_kind,
                     target_id=target_id,
+                    rule_kind=_rule_kind(rule),
+                    action_name=action_name,
+                    role=cast(PlaybookRoleId, role),
+                    counterfactual_key=counterfactual_key,
                     matched=matched,
                     blocked=effective_block,
                     score_delta=rule_delta,
@@ -298,6 +310,38 @@ def _evaluate(
         score_delta=delta if mode == "active" else 0.0,
         rule_ids=tuple(dict.fromkeys(applied_ids)),
         applications=tuple(applications),
+    )
+
+
+def _counterfactual_key(
+    rule_id: str,
+    *,
+    target_kind: Literal["intent", "candidate"],
+    values: Mapping[str, object],
+) -> str:
+    """Identify the same rule decision across matched active/shadow runs."""
+
+    payload = json.dumps(
+        {
+            "rule_id": rule_id,
+            "target_kind": target_kind,
+            "values": dict(values),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return f"counterfactual:{hashlib.sha256(payload.encode()).hexdigest()}"
+
+
+def _rule_kind(rule: PlaybookRule) -> PlaybookRuleKind:
+    return (
+        PlaybookRuleKind.EXECUTION_GUARD
+        if rule.category
+        in {
+            PlaybookRuleCategory.ENGINE_INVARIANT,
+            PlaybookRuleCategory.EXECUTION_GUARD,
+        }
+        else PlaybookRuleKind.STRATEGY
     )
 
 

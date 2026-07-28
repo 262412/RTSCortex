@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -61,6 +62,180 @@ def _metrics(
         playbook_before_sha256=before,
         playbook_after_sha256=after,
     )
+
+
+def _strict_matrix(
+    *,
+    engineering_overrides: dict[str, bool] | None = None,
+) -> list[RunMetrics]:
+    baseline = "baseline"
+    rows: list[RunMetrics] = []
+    for mode in ("independent_paired", "sequential_learning"):
+        for seed in (0, 1, 2):
+            for arm in ("frozen", "evolving"):
+                before = (
+                    baseline
+                    if mode == "independent_paired" or arm == "frozen" or seed == 0
+                    else f"sequential-{seed - 1}"
+                )
+                after = (
+                    baseline
+                    if arm == "frozen"
+                    else f"sequential-{seed}"
+                    if mode == "sequential_learning"
+                    else f"independent-{seed}"
+                )
+                behavior = replace(
+                    _metrics(
+                        mode=mode,
+                        seed=seed,
+                        arm=arm,
+                        before=before,
+                        after=after,
+                        repeated_errors=10 if arm == "frozen" else 4,
+                    ),
+                    experiment_kind="behavior",
+                    subject_arm=arm,
+                )
+                if engineering_overrides:
+                    behavior = replace(
+                        behavior,
+                        engineering_gates={
+                            **behavior.engineering_gates,
+                            **engineering_overrides,
+                        },
+                        engineering_accepted=all(
+                            {
+                                **behavior.engineering_gates,
+                                **engineering_overrides,
+                            }.values()
+                        ),
+                    )
+                rows.append(behavior)
+                rows.append(
+                    replace(
+                        _metrics(
+                            mode=mode,
+                            seed=seed,
+                            arm="shadow",
+                            before=before,
+                            after=before,
+                            repeated_errors=0,
+                        ),
+                        experiment_kind="calibration",
+                        subject_arm=arm,
+                    )
+                )
+    return rows
+
+
+def test_current_acceptance_matrix_can_produce_resolved_would_block() -> None:
+    comparison = _comparison(_strict_matrix(), baseline_sha256="baseline")
+
+    assert comparison["gates"]["complete_unique_run_matrix"] is True
+    assert comparison["aggregate"]["hard_rule_resolved_block_count"] > 0
+    assert comparison["gates"]["hard_false_block_rate_at_most_1_percent"] is True
+
+
+def test_active_hard_block_requires_matched_shadow_evidence() -> None:
+    metrics = _strict_matrix()
+    metrics[0] = replace(
+        metrics[0],
+        active_hard_block_keys=("counterfactual:active-only",),
+    )
+
+    comparison = _comparison(metrics, baseline_sha256="baseline")
+
+    assert (
+        comparison["gates"]["active_hard_blocks_have_matched_shadow_evidence"]
+        is False
+    )
+    assert comparison["accepted"] is False
+
+
+def test_comparison_rejects_when_any_required_engineering_gate_fails() -> None:
+    comparison = _comparison(
+        _strict_matrix(engineering_overrides={"build_confirmation_rate": False}),
+        baseline_sha256="baseline",
+    )
+
+    assert comparison["gates"]["all_engineering_gates_pass"] is False
+    assert comparison["aggregate"]["engineering_gates"]["build_confirmation_rate"] is False
+    assert comparison["accepted"] is False
+
+
+def test_missing_required_engineering_metric_fails_closed() -> None:
+    metrics = _strict_matrix()
+    metrics[0] = replace(
+        metrics[0],
+        engineering_missing_metrics=("effective_loops_per_second",),
+        engineering_accepted=False,
+    )
+
+    comparison = _comparison(metrics, baseline_sha256="baseline")
+
+    assert comparison["gates"]["required_engineering_metrics_complete"] is False
+    assert comparison["accepted"] is False
+
+
+def test_performance_fields_are_thresholded_not_only_reported() -> None:
+    comparison = _comparison(
+        _strict_matrix(
+            engineering_overrides={
+                "effective_loops_per_second": False,
+                "natural_run_disk_reduction_ratio": False,
+            }
+        ),
+        baseline_sha256="baseline",
+    )
+
+    assert comparison["aggregate"]["engineering_gates"][
+        "effective_loops_per_second"
+    ] is False
+    assert comparison["aggregate"]["engineering_gates"][
+        "natural_run_disk_reduction_ratio"
+    ] is False
+    assert comparison["accepted"] is False
+
+
+def test_build_and_tactical_gates_are_aggregated_across_all_runs() -> None:
+    metrics = _strict_matrix()
+    target = metrics[-2]
+    metrics[-2] = replace(
+        target,
+        engineering_gates={
+            **target.engineering_gates,
+            "build_start_coverage": False,
+            "unchanged_attack_redispatch_zero": False,
+        },
+        engineering_accepted=False,
+    )
+
+    comparison = _comparison(metrics, baseline_sha256="baseline")
+
+    assert comparison["aggregate"]["engineering_gates"]["build_start_coverage"] is False
+    assert (
+        comparison["aggregate"]["engineering_gates"][
+            "unchanged_attack_redispatch_zero"
+        ]
+        is False
+    )
+    assert comparison["accepted"] is False
+
+
+def test_dirty_or_unexpected_source_revision_rejects_formal_acceptance() -> None:
+    metrics = _strict_matrix()
+    metrics[0] = replace(
+        metrics[0],
+        source_tree_clean=False,
+        source_commit_matches_expected_sha=False,
+    )
+
+    comparison = _comparison(metrics, baseline_sha256="baseline")
+
+    assert comparison["gates"]["source_tree_clean"] is False
+    assert comparison["gates"]["source_commit_matches_expected_sha"] is False
+    assert comparison["accepted"] is False
 
 
 def test_comparison_separates_independent_pairs_from_sequential_learning() -> None:
@@ -159,6 +334,11 @@ def test_analyzer_cli_exits_nonzero_when_report_rejected(
         "mode\tseed\tarm\texit_code\trun_dir\tplaybook_before_sha256\tplaybook_after_sha256\n",
         encoding="utf-8",
     )
+    engineering_baseline = tmp_path / "engineering-baseline.json"
+    engineering_baseline.write_text(
+        json.dumps({"natural_run_bytes_per_game_loop": 100.0}),
+        encoding="utf-8",
+    )
     monkeypatch.setattr(
         sys,
         "argv",
@@ -167,6 +347,10 @@ def test_analyzer_cli_exits_nonzero_when_report_rejected(
             str(run_set),
             "--baseline-sha256",
             "baseline",
+            "--expected-git-sha",
+            "expected",
+            "--engineering-baseline",
+            str(engineering_baseline),
         ],
     )
 
@@ -187,6 +371,9 @@ def test_paired_runner_propagates_failed_acceptance_gate() -> None:
     assert "analysis_status=$?" in runner
     assert "if [[ ${analysis_status} -ne 0 ]]; then\n  overall_status=1\nfi" in runner
     assert 'echo "analysis_exit_code=${analysis_status}"' in runner
+    assert "--expected-git-sha" in runner
+    assert "run_shadow_calibration" in runner
+    assert "--engineering-baseline" in runner
     assert 'exit "${overall_status}"' in runner
 
 
@@ -373,6 +560,83 @@ def test_unselected_would_block_is_unresolved(
     _assert_would_block_outcome_is_unresolved("not_selected", tmp_path, monkeypatch)
 
 
+def test_unselected_prearbitration_candidate_is_not_counterfactual_observable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metrics = _metrics_for_rule_evaluations(
+        tmp_path,
+        monkeypatch,
+        [
+            _rule_evaluation(
+                event_id=1,
+                evaluation_id="evaluation:prearbitration",
+                strength="hard",
+                status="active",
+                false_block=None,
+                actual_outcome="not_selected",
+                counterfactual_observable=False,
+            )
+        ],
+    )
+
+    assert metrics.hard_rule_shadow_state_count == 0
+    assert metrics.hard_rule_unresolved_block_count == 0
+
+
+def test_shadow_observable_block_resolves_from_terminal_execution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metrics = _metrics_for_rule_evaluations(
+        tmp_path,
+        monkeypatch,
+        [
+            _rule_evaluation(
+                event_id=1,
+                evaluation_id="evaluation:observable-terminal",
+                strength="hard",
+                status="active",
+                false_block=False,
+                actual_outcome="failed",
+                counterfactual_observable=True,
+            )
+        ],
+    )
+
+    assert metrics.hard_rule_shadow_state_count == 1
+    assert metrics.hard_rule_unresolved_block_count == 0
+    assert metrics.hard_rule_false_block_rate == 0.0
+
+
+def test_strategic_rule_success_is_not_execution_false_block(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metrics = _metrics_for_rule_evaluations(
+        tmp_path,
+        monkeypatch,
+        [
+            _rule_evaluation(
+                event_id=1,
+                evaluation_id="evaluation:strategy",
+                strength="hard",
+                status="active",
+                false_block=True,
+                actual_outcome="succeeded",
+                counterfactual_observable=True,
+                rule_kind="strategy",
+                strategic_regret=False,
+            )
+        ],
+    )
+
+    assert metrics.hard_rule_shadow_state_count == 0
+    assert metrics.hard_rule_false_block_count == 0
+    assert metrics.strategic_resolved_count == 1
+    assert metrics.strategic_regret_count == 0
+
+
 def test_cancelled_would_block_is_unresolved(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -553,6 +817,9 @@ def _rule_evaluation(
     false_block: bool | None,
     shadow_decision: str = "would_block",
     actual_outcome: str | None = None,
+    counterfactual_observable: bool | None = None,
+    rule_kind: str | None = None,
+    strategic_regret: bool | None = None,
 ) -> StoredEvent:
     return StoredEvent(
         event_id=event_id,
@@ -567,6 +834,17 @@ def _rule_evaluation(
             "strength_at_evaluation": strength,
             "status_at_evaluation": status,
             "shadow_decision": shadow_decision,
+            **(
+                {}
+                if counterfactual_observable is None
+                else {"counterfactual_observable": counterfactual_observable}
+            ),
+            **({} if rule_kind is None else {"rule_kind": rule_kind}),
+            **(
+                {}
+                if strategic_regret is None
+                else {"strategic_regret": strategic_regret}
+            ),
             "actual_outcome": (
                 actual_outcome
                 if actual_outcome is not None

@@ -163,6 +163,13 @@ class PlaybookRuleApplication(ContractModel):
     game_loop: int = Field(ge=0)
     target_kind: Literal["intent", "candidate"]
     target_id: str = Field(min_length=1)
+    rule_kind: PlaybookRuleKind | None = None
+    action_name: str | None = None
+    role: PlaybookRoleId | None = None
+    counterfactual_key: str | None = Field(
+        default=None,
+        pattern=r"^counterfactual:[0-9a-f]{64}$",
+    )
     matched: bool
     blocked: bool = False
     score_delta: float = 0.0
@@ -181,6 +188,12 @@ class PlaybookRuleEvaluation(ContractModel):
     game_loop: int = Field(ge=0)
     target_kind: Literal["intent", "candidate"]
     target_id: str = Field(min_length=1)
+    rule_kind: PlaybookRuleKind
+    action_name: str | None = None
+    role: PlaybookRoleId | None = None
+    counterfactual_key: str = Field(pattern=r"^counterfactual:[0-9a-f]{64}$")
+    counterfactual_observable: bool = False
+    strategic_outcome_window_end_game_loop: int | None = Field(default=None, ge=0)
     strength_at_evaluation: PlaybookRuleStrength
     status_at_evaluation: PlaybookRuleStatus
     shadow_decision: Literal["would_allow", "would_block"]
@@ -195,6 +208,9 @@ class PlaybookRuleEvaluation(ContractModel):
         "unconfirmed",
         "satisfied_by_peer",
     ]
+    execution_false_block: bool | None = None
+    strategic_regret: bool | None = None
+    # Deprecated compatibility projection for protocol v1.1 journals.
     false_block: bool | None = None
 
 

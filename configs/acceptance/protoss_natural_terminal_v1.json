@@ -1,0 +1,8 @@
+{
+  "format_version": "1.0",
+  "source_issue": "SCX-PT-034",
+  "source_run_game_loops": 27294,
+  "source_run_durable_bytes": 2044723200,
+  "natural_run_bytes_per_game_loop": 74917.5643,
+  "required_reduction_ratio": 4.0
+}

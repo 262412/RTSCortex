@@ -1198,6 +1198,50 @@ Two limitations are deliberately still visible:
     a changed hash alone never constitute acceptance;
   - all P0 engineering gates pass across the aggregate.
 
+#### 2026-07-28 acceptance-framework correction
+
+- **Additional evidence:** the first paired harness revision used `rule_mode:
+  active` for every Frozen/Evolving run, while its hard false-block gate
+  required at least one resolved counterfactual. An active hard block prevents
+  dispatch and therefore cannot acquire a terminal counterfactual result; a run
+  with no active hard block likewise has a zero denominator. The 12-run matrix
+  consequently had no production path to a passing false-block gate.
+- **Additional root cause:** two different evidence domains were collapsed:
+  active behavior measures the real effect of Playbook decisions, whereas a
+  blocking counterfactual is observable only when the same candidate is allowed
+  to pass all non-Playbook validation, wins final arbitration, is dispatched,
+  and reaches one terminal outcome. Pre-arbitration candidates that were never
+  selected are not missing counterfactuals. In addition, the comparison
+  analyzer reported several engineering metrics but did not include the full
+  SCX-PT-039 engineering contract in `accepted`, allowing a causal pass to hide
+  build, tactical, recovery, speed or storage failures.
+- **Implemented correction:**
+  - the 12 active behavior runs remain unchanged, but every behavior arm now
+    has a separate shadow calibration twin restored from that arm's exact
+    pre-run Playbook snapshot;
+  - `PlaybookRuleEvaluation` records a stable cross-run
+    `counterfactual_key`, rule kind and `counterfactual_observable`; only a
+    final dispatch marks a shadow decision observable;
+  - active hard blocks must have matched resolved shadow evidence, and
+    unselected pre-arbitration candidates are excluded rather than counted as
+    unresolved;
+  - execution-guard false blocks and strategic regret are separate metrics.
+    Strategic rules use post-game strategic consequences and never treat a raw
+    command success as proof that the block was wrong;
+  - every run emits `engineering-gates.json`. Missing required values fail
+    closed, and the aggregate gates every behavior run for lineage, production,
+    build start/effect/provenance, placement identity, quarantine/redispatch,
+    Retreat/FocusFire/Expansion/Defense invariants, subscriber isolation,
+    bounded recovery, post-game coverage, live speed and disk reduction;
+  - the formal runner now requires an expected Git SHA and a clean
+    superproject worktree (the intentionally patched read-only submodule is
+    recorded separately), and propagates analyzer rejection to its exit code.
+- **Remaining evidence requirement:** the framework correction is covered by
+  deterministic tests, but SCX-PT-039 remains open until the expanded active +
+  matched-shadow run set completes and every generated causal and engineering
+  gate passes. Code completion must not be reported as multi-seed empirical
+  acceptance.
+
 ## Repair order
 
 1. Freeze characterization tests and add the cross-layer `OperationKey`,

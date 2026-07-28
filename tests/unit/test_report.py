@@ -228,6 +228,8 @@ def test_timeline_renders_live_state_reasoning_actions_and_execution(tmp_path: P
 
     assert artifacts.timeline_path == run_dir / "timeline.md"
     assert artifacts.summary_path == run_dir / "summary.json"
+    assert artifacts.engineering_gates_path == run_dir / "engineering-gates.json"
+    assert artifacts.engineering_gates_path.is_file()
     assert episode["complete"] is True
     assert episode["result"]["outcome"] == "victory"
     assert episode["result"]["scenario"] == "2s3z"

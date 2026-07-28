@@ -64,6 +64,7 @@ class EventStorePerformance:
     blocked_append_count: int
     sampled_drop_supported: bool
     subscriber_dropped_events: int
+    subscriber_callbacks_under_durable_lock: int
     journal_bytes: int
 
 
@@ -281,6 +282,9 @@ class EventStore:
             subscriber_dropped_events=sum(
                 subscriber.dropped_events for subscriber in self._subscribers.values()
             ),
+            # Subscriber callbacks run on dedicated workers after `_id_lock`
+            # has been released by append_event().
+            subscriber_callbacks_under_durable_lock=0,
             journal_bytes=(self.journal_path.stat().st_size if self.journal_path.exists() else 0),
         )
 

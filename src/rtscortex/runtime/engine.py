@@ -129,6 +129,7 @@ _ALLOWED_COMMAND_TRANSITIONS = {
 
 _PROGRESS_ACTION_NAMES = frozenset(action.name for action in PROTOSS_SIMPLE64_ACTION_SPECS)
 _RUNTIME_CHECKPOINT_INTERVAL_GAME_LOOPS = 224
+_RUNTIME_RECOVERY_TAIL_EVENT_LIMIT = 4096
 _RUNTIME_SNAPSHOT_TYPE = "runtime-engine-v1"
 
 
@@ -667,10 +668,22 @@ class RuntimeEngine:
             _RUNTIME_SNAPSHOT_TYPE,
         )
         checkpoint_event_id = 0
+        recovery_tail_event_count = 0
         if checkpoint is not None:
             self._restore_runtime_checkpoint(checkpoint.payload)
             self._last_runtime_checkpoint_game_loop = int(checkpoint.payload["game_loop"])
             checkpoint_event_id = checkpoint.through_event_id
+            recovery_tail = self.store.events_after(
+                observation.run_id,
+                checkpoint_event_id,
+                _RUNTIME_RECOVERY_TAIL_EVENT_LIMIT + 1,
+                episode_id=observation.episode_id,
+            )
+            recovery_tail_event_count = len(recovery_tail)
+            if recovery_tail_event_count > _RUNTIME_RECOVERY_TAIL_EVENT_LIMIT:
+                raise RuntimeError(
+                    "runtime recovery tail exceeds the bounded checkpoint contract"
+                )
 
         decision_events = self.store.events_of_type(
             observation.run_id,
@@ -831,6 +844,18 @@ class RuntimeEngine:
                     reason="legacy runtime state cannot prove command was not dispatched",
                 )
                 self._urgent_replan_requested = True
+        if checkpoint is not None:
+            self.store.append_event(
+                run_id=observation.run_id,
+                episode_id=observation.episode_id,
+                step_id=observation.step_id,
+                event_type="runtime_recovery_completed",
+                payload={
+                    "checkpoint_event_id": checkpoint_event_id,
+                    "tail_event_count": recovery_tail_event_count,
+                    "tail_event_limit": _RUNTIME_RECOVERY_TAIL_EVENT_LIMIT,
+                },
+            )
 
     def _record_runtime_checkpoint_if_due(
         self,

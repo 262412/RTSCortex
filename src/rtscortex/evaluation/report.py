@@ -25,6 +25,10 @@ from rtscortex.evaluation.cortex import (
     CortexObservabilityMetrics,
     compute_cortex_observability,
 )
+from rtscortex.evaluation.engineering import (
+    ENGINEERING_GATES_FILENAME,
+    build_engineering_gate_report,
+)
 from rtscortex.evaluation.metrics import (
     EpisodeMetrics,
     ExecutionMetrics,
@@ -45,6 +49,7 @@ class RunReportArtifacts:
 
     timeline_path: Path
     summary_path: Path
+    engineering_gates_path: Path
 
 
 @dataclass(frozen=True)
@@ -85,25 +90,43 @@ def write_timeline_report(run_dir: Path) -> Path:
     return output_path
 
 
-def write_run_reports(run_dir: Path) -> RunReportArtifacts:
+def write_run_reports(
+    run_dir: Path,
+    *,
+    natural_run_baseline_bytes_per_loop: float | None = None,
+) -> RunReportArtifacts:
     """Idempotently derive the Markdown timeline and JSON summary from a journal."""
 
     resolved_run_dir, events = _read_run_events(run_dir)
     timeline_path = resolved_run_dir / REPORT_FILENAME
     summary_path = resolved_run_dir / SUMMARY_FILENAME
+    engineering_gates_path = resolved_run_dir / ENGINEERING_GATES_FILENAME
     timeline = render_timeline(events)
     summary = _build_run_summary(events)
+    engineering = build_engineering_gate_report(
+        events,
+        run_dir=resolved_run_dir,
+        natural_run_baseline_bytes_per_loop=natural_run_baseline_bytes_per_loop,
+    )
     try:
         timeline_path.write_text(timeline, encoding="utf-8")
         summary_path.write_text(
             json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
+        engineering_gates_path.write_text(
+            json.dumps(engineering, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
     except OSError as error:
         raise ReportError(
             f"Could not write run reports below {resolved_run_dir}: {error}"
         ) from error
-    return RunReportArtifacts(timeline_path=timeline_path, summary_path=summary_path)
+    return RunReportArtifacts(
+        timeline_path=timeline_path,
+        summary_path=summary_path,
+        engineering_gates_path=engineering_gates_path,
+    )
 
 
 def _read_run_events(run_dir: Path) -> tuple[Path, list[StoredEvent]]:

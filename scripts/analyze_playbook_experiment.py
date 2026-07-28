@@ -6,11 +6,16 @@ import argparse
 import csv
 import json
 from collections import Counter
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from rtscortex.evaluation.engineering import (
+    ENGINEERING_GATES_FILENAME,
+    REQUIRED_ENGINEERING_GATES,
+    build_engineering_gate_report,
+)
 from rtscortex.memory import read_event_log
 
 _ERROR_CONSEQUENCES = frozenset(
@@ -66,16 +71,44 @@ class RunMetrics:
     sampled_drop_supported: bool
     playbook_before_sha256: str
     playbook_after_sha256: str
+    experiment_kind: str = "behavior"
+    subject_arm: str | None = None
+    active_hard_block_keys: tuple[str, ...] = ()
+    resolved_counterfactual_keys: tuple[str, ...] = ()
+    strategic_regret_count: int = 0
+    strategic_resolved_count: int = 0
+    engineering_gates: dict[str, bool] = field(
+        default_factory=lambda: {name: True for name in REQUIRED_ENGINEERING_GATES}
+    )
+    engineering_missing_metrics: tuple[str, ...] = ()
+    engineering_accepted: bool = True
+    source_tree_clean: bool = True
+    source_commit_matches_expected_sha: bool = True
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("run_set_dir", type=Path)
     parser.add_argument("--baseline-sha256", required=True)
+    parser.add_argument("--expected-git-sha", required=True)
+    parser.add_argument("--engineering-baseline", type=Path, required=True)
     arguments = parser.parse_args()
     run_set = arguments.run_set_dir.resolve()
+    engineering_baseline = json.loads(
+        arguments.engineering_baseline.read_text(encoding="utf-8")
+    )
+    baseline_bytes_per_loop = float(
+        engineering_baseline["natural_run_bytes_per_game_loop"]
+    )
     rows = list(csv.DictReader((run_set / "experiment-status.tsv").open(), delimiter="\t"))
-    metrics = [_run_metrics(row) for row in rows]
+    metrics = [
+        _run_metrics(
+            row,
+            natural_run_baseline_bytes_per_loop=baseline_bytes_per_loop,
+            expected_git_sha=arguments.expected_git_sha,
+        )
+        for row in rows
+    ]
     report = _comparison(metrics, baseline_sha256=arguments.baseline_sha256)
     (run_set / "comparison.json").write_text(
         json.dumps(report, indent=2, sort_keys=True) + "\n",
@@ -85,8 +118,18 @@ def main() -> None:
     raise SystemExit(0 if report["accepted"] else 1)
 
 
-def _run_metrics(row: dict[str, str]) -> RunMetrics:
-    run_dir = Path(row["run_dir"]).expanduser()
+def _run_metrics(
+    row: dict[str, str],
+    *,
+    natural_run_baseline_bytes_per_loop: float | None = None,
+    expected_git_sha: str | None = None,
+) -> RunMetrics:
+    run_dir_value = row.get("run_dir", "").strip()
+    run_dir = (
+        Path(run_dir_value).expanduser()
+        if run_dir_value
+        else Path("/__rtscortex_missing_run_dir__")
+    )
     journal = run_dir / "events.jsonl"
     episode_result: dict[str, Any] = {}
     terminal_counts: Counter[str] = Counter()
@@ -104,8 +147,10 @@ def _run_metrics(row: dict[str, str]) -> RunMetrics:
     last_timestamp: datetime | None = None
     event_count = 0
     performance: dict[str, Any] = {}
+    events: list[Any] = []
     if journal.is_file():
         for event in read_event_log(journal):
+            events.append(event)
             event_count += 1
             try:
                 timestamp = datetime.fromisoformat(event.created_at)
@@ -172,21 +217,76 @@ def _run_metrics(row: dict[str, str]) -> RunMetrics:
         evaluation
         for evaluation in hard_evaluations
         if evaluation.get("shadow_decision") == "would_block"
+        and evaluation.get("counterfactual_observable", True) is True
+        and evaluation.get("rule_kind", "execution_guard") == "execution_guard"
     ]
     false_blocks = sum(
-        evaluation.get("false_block") is True for evaluation in blocking_counterfactuals
+        evaluation.get("execution_false_block", evaluation.get("false_block")) is True
+        for evaluation in blocking_counterfactuals
     )
     resolved_blocks = sum(
-        isinstance(evaluation.get("false_block"), bool) for evaluation in blocking_counterfactuals
+        isinstance(
+            evaluation.get("execution_false_block", evaluation.get("false_block")),
+            bool,
+        )
+        for evaluation in blocking_counterfactuals
     )
     unresolved_blocks = sum(
-        evaluation.get("false_block") is None for evaluation in blocking_counterfactuals
+        evaluation.get("execution_false_block", evaluation.get("false_block")) is None
+        for evaluation in blocking_counterfactuals
     )
+    active_hard_block_keys = tuple(
+        sorted(
+            {
+                str(evaluation["counterfactual_key"])
+                for evaluation in hard_evaluations
+                if evaluation.get("actual_outcome") == "blocked"
+                and isinstance(evaluation.get("counterfactual_key"), str)
+            }
+        )
+    )
+    resolved_counterfactual_keys = tuple(
+        sorted(
+            {
+                str(evaluation["counterfactual_key"])
+                for evaluation in hard_evaluations
+                if evaluation.get("counterfactual_observable", True) is True
+                and (
+                    isinstance(evaluation.get("execution_false_block"), bool)
+                    or isinstance(evaluation.get("strategic_regret"), bool)
+                )
+                and isinstance(evaluation.get("counterfactual_key"), str)
+            }
+        )
+    )
+    strategic_evaluations = [
+        evaluation
+        for evaluation in hard_evaluations
+        if evaluation.get("shadow_decision") == "would_block"
+        and evaluation.get("counterfactual_observable", True) is True
+        and evaluation.get("rule_kind") == "strategy"
+    ]
     terminal_report_count = sum(terminal_counts.values())
     dispatched_ids = set(dispatch_counts)
     terminal_ids = set(terminal_counts)
     journal_bytes = journal.stat().st_size if journal.is_file() else 0
     artifact_bytes = sum(path.stat().st_size for path in run_dir.rglob("*") if path.is_file())
+    engineering = build_engineering_gate_report(
+        events,
+        run_dir=run_dir,
+        natural_run_baseline_bytes_per_loop=natural_run_baseline_bytes_per_loop,
+    )
+    if run_dir.is_dir():
+        (run_dir / ENGINEERING_GATES_FILENAME).write_text(
+            json.dumps(engineering, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    engineering_gates = {
+        name: engineering.get("gates", {}).get(name, {}).get("passed") is True
+        for name in REQUIRED_ENGINEERING_GATES
+    }
+    row_git_head = row.get("git_head", "")
+    row_git_dirty = row.get("git_dirty", "")
     return RunMetrics(
         mode=row["mode"],
         seed=int(row["seed"]),
@@ -240,6 +340,25 @@ def _run_metrics(row: dict[str, str]) -> RunMetrics:
         sampled_drop_supported=bool(performance.get("sampled_drop_supported", False)),
         playbook_before_sha256=row["playbook_before_sha256"],
         playbook_after_sha256=row["playbook_after_sha256"],
+        experiment_kind=row.get("experiment_kind") or "behavior",
+        subject_arm=row.get("subject_arm") or None,
+        active_hard_block_keys=active_hard_block_keys,
+        resolved_counterfactual_keys=resolved_counterfactual_keys,
+        strategic_regret_count=sum(
+            evaluation.get("strategic_regret") is True
+            for evaluation in strategic_evaluations
+        ),
+        strategic_resolved_count=sum(
+            isinstance(evaluation.get("strategic_regret"), bool)
+            for evaluation in strategic_evaluations
+        ),
+        engineering_gates=engineering_gates,
+        engineering_missing_metrics=tuple(engineering["missing_required_metrics"]),
+        engineering_accepted=engineering["accepted"] is True,
+        source_tree_clean=row_git_dirty == "false",
+        source_commit_matches_expected_sha=(
+            expected_git_sha is not None and row_git_head == expected_git_sha
+        ),
     )
 
 
@@ -259,19 +378,36 @@ def _consequence_signature(payload: dict[str, Any]) -> str:
 
 
 def _comparison(metrics: list[RunMetrics], *, baseline_sha256: str) -> dict[str, Any]:
-    expected_matrix = {
+    behavior = [metric for metric in metrics if metric.experiment_kind == "behavior"]
+    calibration = [
+        metric for metric in metrics if metric.experiment_kind == "calibration"
+    ]
+    split_matrix = any(metric.subject_arm is not None for metric in metrics)
+    expected_behavior_matrix = {
         (mode, seed, arm)
         for mode in ("independent_paired", "sequential_learning")
         for seed in (0, 1, 2)
         for arm in ("frozen", "evolving")
     }
-    observed_matrix = {(metric.mode, metric.seed, metric.arm) for metric in metrics}
+    observed_behavior_matrix = {
+        (metric.mode, metric.seed, metric.arm) for metric in behavior
+    }
+    expected_calibration_matrix = {
+        (mode, seed, subject_arm)
+        for mode in ("independent_paired", "sequential_learning")
+        for seed in (0, 1, 2)
+        for subject_arm in ("frozen", "evolving")
+    }
+    observed_calibration_matrix = {
+        (metric.mode, metric.seed, metric.subject_arm)
+        for metric in calibration
+    }
     paired: list[dict[str, Any]] = []
     for mode in ("independent_paired", "sequential_learning"):
-        for seed in sorted({metric.seed for metric in metrics if metric.mode == mode}):
+        for seed in sorted({metric.seed for metric in behavior if metric.mode == mode}):
             pair = {
                 metric.arm: metric
-                for metric in metrics
+                for metric in behavior
                 if metric.mode == mode and metric.seed == seed
             }
             if set(pair) != {"frozen", "evolving"}:
@@ -297,15 +433,19 @@ def _comparison(metrics: list[RunMetrics], *, baseline_sha256: str) -> dict[str,
                     "win_delta": _win(evolving.outcome) - _win(frozen.outcome),
                 }
             )
-    independent_rows = [metric for metric in metrics if metric.mode == "independent_paired"]
-    sequential_rows = [metric for metric in metrics if metric.mode == "sequential_learning"]
+    independent_rows = [
+        metric for metric in behavior if metric.mode == "independent_paired"
+    ]
+    sequential_rows = [
+        metric for metric in behavior if metric.mode == "sequential_learning"
+    ]
     independent_pairs = [item for item in paired if item["mode"] == "independent_paired"]
     baseline_identity = all(
         metric.playbook_before_sha256 == baseline_sha256 for metric in independent_rows
     )
     frozen_immutable = all(
         metric.playbook_before_sha256 == metric.playbook_after_sha256
-        for metric in metrics
+        for metric in behavior
         if metric.arm == "frozen"
     )
     evolving_sequence = sorted(
@@ -315,6 +455,23 @@ def _comparison(metrics: list[RunMetrics], *, baseline_sha256: str) -> dict[str,
     sequential_carry = all(
         current.playbook_before_sha256 == previous.playbook_after_sha256
         for previous, current in zip(evolving_sequence, evolving_sequence[1:], strict=False)
+    )
+    behavior_by_subject = {
+        (metric.mode, metric.seed, metric.arm): metric for metric in behavior
+    }
+    shadow_baseline_identity = all(
+        (
+            reference := behavior_by_subject.get(
+                (metric.mode, metric.seed, metric.subject_arm or "")
+            )
+        )
+        is not None
+        and metric.playbook_before_sha256 == reference.playbook_before_sha256
+        for metric in calibration
+    )
+    shadow_immutable = all(
+        metric.playbook_before_sha256 == metric.playbook_after_sha256
+        for metric in calibration
     )
     frozen_errors = sum(
         metric.repeated_eligible_errors for metric in independent_rows if metric.arm == "frozen"
@@ -337,18 +494,78 @@ def _comparison(metrics: list[RunMetrics], *, baseline_sha256: str) -> dict[str,
         if frozen_error_rate == 0.0
         else (frozen_error_rate - evolving_error_rate) / frozen_error_rate
     )
-    false_blocks = sum(metric.hard_rule_false_block_count for metric in metrics)
-    resolved_blocks = sum(metric.hard_rule_shadow_state_count for metric in metrics)
-    unresolved_hard_blocks = sum(metric.hard_rule_unresolved_block_count for metric in metrics)
+    counterfactual_rows = calibration if split_matrix else behavior
+    false_blocks = sum(
+        metric.hard_rule_false_block_count for metric in counterfactual_rows
+    )
+    resolved_blocks = sum(
+        metric.hard_rule_shadow_state_count for metric in counterfactual_rows
+    )
+    unresolved_hard_blocks = sum(
+        metric.hard_rule_unresolved_block_count for metric in counterfactual_rows
+    )
+    active_hard_block_keys = {
+        key for metric in behavior for key in metric.active_hard_block_keys
+    }
+    resolved_counterfactual_keys = {
+        key for metric in counterfactual_rows for key in metric.resolved_counterfactual_keys
+    }
+    calibration_by_subject = {
+        (metric.mode, metric.seed, metric.subject_arm): metric
+        for metric in calibration
+    }
+    unmatched_active_hard_blocks: list[str] = []
+    for metric in behavior:
+        matched_keys = resolved_counterfactual_keys
+        if split_matrix:
+            matched = calibration_by_subject.get((metric.mode, metric.seed, metric.arm))
+            matched_keys = (
+                set() if matched is None else set(matched.resolved_counterfactual_keys)
+            )
+        unmatched_active_hard_blocks.extend(
+            f"{metric.mode}:{metric.seed}:{metric.arm}:{key}"
+            for key in metric.active_hard_block_keys
+            if key not in matched_keys
+        )
+    unmatched_active_hard_blocks.sort()
+    engineering_gate_results = {
+        name: all(metric.engineering_gates.get(name) is True for metric in behavior)
+        for name in REQUIRED_ENGINEERING_GATES
+    }
+    missing_engineering_metrics = sorted(
+        {
+            name
+            for metric in behavior
+            for name in metric.engineering_missing_metrics
+        }
+    )
     gates = {
         "complete_unique_run_matrix": (
-            len(metrics) == len(expected_matrix) and observed_matrix == expected_matrix
+            len(behavior) == len(expected_behavior_matrix)
+            and observed_behavior_matrix == expected_behavior_matrix
+            and (
+                not split_matrix
+                or (
+                    len(calibration) == len(expected_calibration_matrix)
+                    and observed_calibration_matrix == expected_calibration_matrix
+                )
+            )
         ),
         "all_runs_exit_zero": all(metric.exit_code == 0 for metric in metrics),
         "all_runs_natural_terminal": all(metric.natural_terminal for metric in metrics),
+        "source_tree_clean": all(metric.source_tree_clean for metric in metrics),
+        "source_commit_matches_expected_sha": all(
+            metric.source_commit_matches_expected_sha for metric in metrics
+        ),
         "independent_baseline_identity": baseline_identity,
         "frozen_hash_unchanged": frozen_immutable,
         "sequential_evolving_carry": sequential_carry,
+        "shadow_calibration_baseline_identity": (
+            shadow_baseline_identity if split_matrix else True
+        ),
+        "shadow_calibration_hash_unchanged": (
+            shadow_immutable if split_matrix else True
+        ),
         "duplicate_dispatch_zero": all(metric.duplicate_dispatches == 0 for metric in metrics),
         "terminal_report_exactly_once": all(
             metric.duplicate_terminal_reports == 0 and metric.missing_terminal_reports == 0
@@ -362,11 +579,20 @@ def _comparison(metrics: list[RunMetrics], *, baseline_sha256: str) -> dict[str,
             and unresolved_hard_blocks == 0
             and false_blocks / resolved_blocks <= 0.01
         ),
+        "active_hard_blocks_have_matched_shadow_evidence": (
+            not unmatched_active_hard_blocks
+        ),
+        "required_engineering_metrics_complete": not missing_engineering_metrics,
+        "all_engineering_gates_pass": (
+            bool(behavior)
+            and not missing_engineering_metrics
+            and all(engineering_gate_results.values())
+        ),
         "repeated_error_reduction_at_least_50_percent": reduction >= 0.5,
         "matched_win_rate_not_reduced": (sum(item["win_delta"] for item in independent_pairs) >= 0),
     }
     return {
-        "schema_version": "1.1",
+        "schema_version": "1.2",
         "baseline_sha256": baseline_sha256,
         "runs": [asdict(metric) for metric in metrics],
         "paired_differences": paired,
@@ -383,6 +609,17 @@ def _comparison(metrics: list[RunMetrics], *, baseline_sha256: str) -> dict[str,
             "hard_rule_false_block_rate": (
                 false_blocks / resolved_blocks if resolved_blocks else 0.0
             ),
+            "active_hard_block_count": len(active_hard_block_keys),
+            "unmatched_active_hard_block_count": len(unmatched_active_hard_blocks),
+            "unmatched_active_hard_block_keys": unmatched_active_hard_blocks,
+            "strategic_regret_count": sum(
+                metric.strategic_regret_count for metric in counterfactual_rows
+            ),
+            "strategic_resolved_count": sum(
+                metric.strategic_resolved_count for metric in counterfactual_rows
+            ),
+            "engineering_gates": engineering_gate_results,
+            "missing_engineering_metrics": missing_engineering_metrics,
         },
         "gates": gates,
         "accepted": all(gates.values()),
@@ -406,6 +643,36 @@ def _markdown(report: dict[str, Any]) -> str:
     ]
     lines.extend(
         f"| `{name}` | {'PASS' if passed else 'FAIL'} |" for name, passed in report["gates"].items()
+    )
+    lines.extend(
+        [
+            "",
+            "## Aggregate engineering gates",
+            "",
+            "| Engineering gate | Result |",
+            "|---|---:|",
+        ]
+    )
+    lines.extend(
+        f"| `{name}` | {'PASS' if passed else 'FAIL'} |"
+        for name, passed in report["aggregate"]["engineering_gates"].items()
+    )
+    aggregate = report["aggregate"]
+    lines.extend(
+        [
+            "",
+            "## Counterfactual calibration",
+            "",
+            f"- Resolved execution-guard blocks: "
+            f"`{aggregate['hard_rule_resolved_block_count']}`",
+            f"- Unresolved observable execution-guard blocks: "
+            f"`{aggregate['hard_rule_unresolved_block_count']}`",
+            f"- Execution false blocks: `{aggregate['hard_rule_false_block_count']}`",
+            f"- Strategic outcomes resolved: `{aggregate['strategic_resolved_count']}`; "
+            f"regret: `{aggregate['strategic_regret_count']}`",
+            f"- Active hard blocks without matched shadow evidence: "
+            f"`{aggregate['unmatched_active_hard_block_count']}`",
+        ]
     )
     lines.extend(
         [

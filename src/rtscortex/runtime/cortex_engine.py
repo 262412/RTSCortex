@@ -80,7 +80,9 @@ from rtscortex.playbook import (
     PlaybookQuery,
     PlaybookRule,
     PlaybookRuleApplication,
+    PlaybookRuleCategory,
     PlaybookRuleEvaluation,
+    PlaybookRuleKind,
     PlaybookSelection,
     PlaybookStore,
     RecentTerminalFeedback,
@@ -240,6 +242,7 @@ class CortexRuntimeEngine(RuntimeEngine):
         self._playbook_selection_fingerprint: tuple[str, ...] | None = None
         self._playbook_rules: tuple[PlaybookRule, ...] = ()
         self._pending_playbook_rule_evaluations: dict[str, PlaybookRuleEvaluation] = {}
+        self._terminal_strategy_rule_evaluations: dict[str, PlaybookRuleEvaluation] = {}
         self._playbook_promotion_sweep_done = False
         self._playbook_intent_guard = PlaybookIntentGuard()
         self._playbook_candidate_guard = PlaybookCandidateGuard()
@@ -517,6 +520,10 @@ class CortexRuntimeEngine(RuntimeEngine):
 
         for command in accepted_commands:
             prepared_command = prepared_by_id[command.command_id]
+            self._mark_playbook_counterfactual_observable(
+                observation,
+                prepared_command.lineage,
+            )
             self._record_command_lineage(observation, prepared_command)
             self._role_agents.record_dispatch(
                 command,
@@ -743,6 +750,7 @@ class CortexRuntimeEngine(RuntimeEngine):
         self._playbook_selection_fingerprint = None
         self._playbook_rules = ()
         self._pending_playbook_rule_evaluations = {}
+        self._terminal_strategy_rule_evaluations = {}
         self._recent_terminal_feedback = {}
         self._current_situation = None
         self._macro_goal = None
@@ -2760,10 +2768,25 @@ class CortexRuntimeEngine(RuntimeEngine):
                 game_loop=application.game_loop,
                 target_kind=application.target_kind,
                 target_id=application.target_id,
+                rule_kind=application.rule_kind or self._playbook_rule_kind(rule),
+                action_name=application.action_name,
+                role=application.role,
+                counterfactual_key=(
+                    application.counterfactual_key
+                    or self._playbook_counterfactual_key(application, rule)
+                ),
+                counterfactual_observable=False,
+                strategic_outcome_window_end_game_loop=(
+                    application.game_loop + 448
+                    if (application.rule_kind or self._playbook_rule_kind(rule))
+                    is PlaybookRuleKind.STRATEGY
+                    else None
+                ),
                 strength_at_evaluation=rule.strength,
                 status_at_evaluation=rule.status,
                 shadow_decision="would_block" if would_block else "would_allow",
                 actual_outcome=actual_outcome,
+                execution_false_block=false_block,
                 false_block=false_block,
             )
             self._record_cortex_event(
@@ -2773,6 +2796,54 @@ class CortexRuntimeEngine(RuntimeEngine):
             )
             if actual_outcome == "pending":
                 self._pending_playbook_rule_evaluations[evaluation.evaluation_id] = evaluation
+
+    @staticmethod
+    def _playbook_rule_kind(rule: PlaybookRule) -> PlaybookRuleKind:
+        return (
+            PlaybookRuleKind.EXECUTION_GUARD
+            if rule.category
+            in {
+                PlaybookRuleCategory.ENGINE_INVARIANT,
+                PlaybookRuleCategory.EXECUTION_GUARD,
+            }
+            else PlaybookRuleKind.STRATEGY
+        )
+
+    @staticmethod
+    def _playbook_counterfactual_key(
+        application: PlaybookRuleApplication,
+        rule: PlaybookRule,
+    ) -> str:
+        digest = hashlib.sha256(
+            (
+                f"{rule.rule_id}|{application.target_kind}|"
+                f"{application.action_name or ''}|{application.role or ''}"
+            ).encode()
+        ).hexdigest()
+        return f"counterfactual:{digest}"
+
+    def _mark_playbook_counterfactual_observable(
+        self,
+        observation: ObservationEnvelope,
+        lineage: CommandLineage,
+    ) -> None:
+        target_ids = {lineage.candidate_id}
+        if lineage.strategic_intent_id is not None:
+            target_ids.add(lineage.strategic_intent_id)
+        for evaluation_id, evaluation in tuple(
+            self._pending_playbook_rule_evaluations.items()
+        ):
+            if evaluation.target_id not in target_ids:
+                continue
+            observable = evaluation.model_copy(
+                update={"counterfactual_observable": True}
+            )
+            self._pending_playbook_rule_evaluations[evaluation_id] = observable
+            self._record_cortex_event(
+                observation,
+                "playbook_rule_evaluated",
+                observable,
+            )
 
     def _resolve_playbook_rule_evaluations(
         self,
@@ -2787,7 +2858,7 @@ class CortexRuntimeEngine(RuntimeEngine):
         matching = [
             evaluation
             for evaluation in self._pending_playbook_rule_evaluations.values()
-            if evaluation.target_id in target_ids
+            if evaluation.target_id in target_ids and evaluation.counterfactual_observable
         ]
         for evaluation in matching:
             actual_outcome = (
@@ -2795,11 +2866,15 @@ class CortexRuntimeEngine(RuntimeEngine):
                 if report.failure_code == "engagement_target_eliminated"
                 else report.status.value
             )
-            false_block = (
-                True
-                if report.status is ExecutionStatus.SUCCEEDED
-                else False
-                if report.status is ExecutionStatus.FAILED
+            execution_false_block = (
+                (
+                    True
+                    if report.status is ExecutionStatus.SUCCEEDED
+                    else False
+                    if report.status is ExecutionStatus.FAILED
+                    else None
+                )
+                if evaluation.rule_kind is PlaybookRuleKind.EXECUTION_GUARD
                 else None
             )
             resolved = evaluation.model_copy(
@@ -2807,7 +2882,8 @@ class CortexRuntimeEngine(RuntimeEngine):
                     "step_id": report.step_id,
                     "game_loop": self._execution_game_loop(report),
                     "actual_outcome": actual_outcome,
-                    "false_block": false_block,
+                    "execution_false_block": execution_false_block,
+                    "false_block": execution_false_block,
                 }
             )
             self.store.append_event(
@@ -2818,6 +2894,8 @@ class CortexRuntimeEngine(RuntimeEngine):
                 payload=resolved,
             )
             del self._pending_playbook_rule_evaluations[evaluation.evaluation_id]
+            if evaluation.rule_kind is PlaybookRuleKind.STRATEGY:
+                self._terminal_strategy_rule_evaluations[evaluation.evaluation_id] = resolved
 
     def _finalize_unselected_playbook_evaluations(self, result: EpisodeResult) -> None:
         for evaluation in tuple(self._pending_playbook_rule_evaluations.values()):
@@ -2825,6 +2903,7 @@ class CortexRuntimeEngine(RuntimeEngine):
                 update={
                     "step_id": result.steps,
                     "actual_outcome": "not_selected",
+                    "execution_false_block": None,
                     "false_block": None,
                 }
             )
@@ -2836,6 +2915,61 @@ class CortexRuntimeEngine(RuntimeEngine):
                 payload=terminal,
             )
         self._pending_playbook_rule_evaluations.clear()
+
+    def _resolve_strategic_rule_evaluations(
+        self,
+        result: EpisodeResult,
+        consequences: tuple[Any, ...],
+    ) -> None:
+        negative_types = {
+            "threat_unanswered",
+            "expansion_delayed",
+            "production_imbalance",
+            "timing_attack_failed",
+            "unnecessary_retreat",
+            "advantage_not_converted",
+        }
+        for evaluation in self._terminal_strategy_rule_evaluations.values():
+            window_end = (
+                evaluation.game_loop + 448
+                if evaluation.strategic_outcome_window_end_game_loop is None
+                else evaluation.strategic_outcome_window_end_game_loop
+            )
+            relevant = [
+                consequence
+                for consequence in consequences
+                if not consequence.censored
+                and consequence.end_game_loop >= evaluation.game_loop
+                and consequence.start_game_loop <= window_end
+                if (
+                    evaluation.action_name is None
+                    or consequence.semantic_action == evaluation.action_name
+                )
+                and (
+                    evaluation.role is None
+                    or consequence.role is None
+                    or consequence.role == evaluation.role
+                )
+            ]
+            regret = (
+                True
+                if any(item.consequence_type.value in negative_types for item in relevant)
+                else False
+                if any(
+                    item.consequence_type.value == "successful_key_decision"
+                    for item in relevant
+                )
+                else None
+            )
+            resolved = evaluation.model_copy(update={"strategic_regret": regret})
+            self.store.append_event(
+                run_id=result.run_id,
+                episode_id=result.episode_id,
+                step_id=result.steps,
+                event_type="playbook_rule_evaluated",
+                payload=resolved,
+            )
+        self._terminal_strategy_rule_evaluations.clear()
 
     def _record_command_lineage(
         self,
@@ -3626,8 +3760,6 @@ class CortexRuntimeEngine(RuntimeEngine):
 
     def end_episode(self, result: EpisodeResult) -> None:
         already_recorded = self._episode_result_fingerprint is not None
-        if not already_recorded:
-            self._finalize_unselected_playbook_evaluations(result)
         if not already_recorded and self._expansion_commitment_id is not None:
             if not self._expansion_anchor_evaluations:
                 self._expansion_anchor_evaluations.append(
@@ -3660,6 +3792,18 @@ class CortexRuntimeEngine(RuntimeEngine):
             self._expansion_commitment_dispatched = False
             self._expansion_anchor_evaluations = []
         super().end_episode(result)
+        if not already_recorded:
+            for event in self.store.events_of_type(
+                result.run_id,
+                result.episode_id,
+                "execution",
+            ):
+                report = ExecutionReport.model_validate(event.payload)
+                self._resolve_playbook_rule_evaluations(
+                    report,
+                    self._command_lineages.get(report.command_id),
+                )
+            self._finalize_unselected_playbook_evaluations(result)
         self.store.record_snapshot(
             run_id=result.run_id,
             episode_id=result.episode_id,
@@ -3688,6 +3832,10 @@ class CortexRuntimeEngine(RuntimeEngine):
                 event_type="strategic_consequence_attributed",
                 payload=consequence,
             )
+        self._resolve_strategic_rule_evaluations(
+            result,
+            self._playbook_reviewer.last_consequences,
+        )
         for case in cases:
             self.store.append_event(
                 run_id=result.run_id,

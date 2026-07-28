@@ -520,6 +520,7 @@ class DeterministicTacticalAgent:
                 return {
                     "actor": actor,
                     "state": "retreat_arrived",
+                    "commitment_id": retreat.commitment_id,
                     "game_loop": game_loop,
                 }
             assert offense is not None
