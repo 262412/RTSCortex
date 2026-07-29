@@ -1507,7 +1507,13 @@ Two limitations are deliberately still visible:
   4. Runtime-side transition idempotency made duplicate delivery safe, but the
      Worker sent each Placement transition only once. An HTTP acknowledgement
      lost after the Runtime commit could still terminate a long game, because
-     the Worker did not retain the exact payload for retry.
+     the Worker did not retain the exact payload for retry;
+  5. the first bounded fixture run exposed two harness contract mismatches.
+     Runners parsed the obsolete `Run directory:` label while the CLI emits
+     `Artifacts:`, leaving the analyzer with an empty journal path. Separately,
+     the generic canary analyzer required a terminally observable false-block
+     even for Path A, although that path only claims that Active blocks and
+     matched Shadow allows the same operation at the same prestate.
 - **Implemented correction:**
   - `rtscortex playbook hard-readiness` emits
     `playbook-hard-readiness.json` before Recovery, SC2 or model startup. It
@@ -1535,7 +1541,12 @@ Two limitations are deliberately still visible:
     the complete event before sending, retries the same transition ID and
     payload, treats `recorded` and `already_recorded` as success, treats HTTP
     409 as a fatal identity conflict and retains transport/5xx failures across
-    Worker restart. The queue is bounded to 64 events.
+    Worker restart. The queue is bounded to 64 events;
+  - all experiment runners accept both the legacy and current artifact labels.
+    Path A matches the Shadow `would_block` decision itself and identical
+    prestate; Path B production canaries still require a terminally observable
+    execution/strategy counterfactual. Fixture status rows now use one
+    22-field tabular record, preventing format-string column drift.
 - **Acceptance criteria:**
   - the current production baseline produces the readiness artifact and exits
     2 with `context_applicable_blocking_hard_count=0`, before Recovery/SC2/GPU;
@@ -1543,7 +1554,8 @@ Two limitations are deliberately still visible:
     qualification-seed-overlapping hard rule cannot make `canary_runnable`
     true;
   - the bounded fixture can prove one matched Active block and Shadow
-    counterfactual without being accepted by the formal 24-run analyzer;
+    allow decision at the same prestate without requiring a natural terminal,
+    and still cannot be accepted by the formal 24-run analyzer;
   - a qualified child is `hard + forbid`, retains its soft parent and
     has hashed, revision-bound, seed-disjoint provenance;
   - a lost acknowledgement and Worker restart resend byte-equivalent Placement

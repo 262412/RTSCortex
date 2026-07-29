@@ -21,7 +21,11 @@ def build_canary_report(
     readiness_evidence: dict[str, Any],
     canary_kind: Literal["production", "fixture"] = "production",
 ) -> dict[str, Any]:
-    resolved = set(shadow.resolved_counterfactual_keys)
+    resolved = set(
+        shadow.shadow_would_block_keys
+        if canary_kind == "fixture"
+        else shadow.resolved_counterfactual_keys
+    )
     unmatched = [
         record for record in behavior.active_hard_block_records if record[0] not in resolved
     ]

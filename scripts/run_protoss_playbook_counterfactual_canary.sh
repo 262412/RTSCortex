@@ -88,7 +88,13 @@ run_canary_arm() {
   local run_status=${PIPESTATUS[0]}
   set -e
   local run_dir
-  run_dir="$(sed -n 's/^Run directory: //p' "${log_path}" | tail -n 1)"
+  run_dir="$(
+    sed -n \
+      -e 's/^Run directory: //p' \
+      -e 's/^Artifacts: //p' \
+      "${log_path}" \
+      | tail -n 1
+  )"
   local after_sha256
   after_sha256="$(sha256sum "${working_playbook}" | awk '{print $1}')"
   cp "${working_playbook}" "${after_snapshot}"

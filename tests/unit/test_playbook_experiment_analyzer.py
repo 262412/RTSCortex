@@ -473,6 +473,14 @@ def test_paired_runner_propagates_failed_acceptance_gate() -> None:
     assert canary_runner.index("playbook hard-readiness") < canary_runner.index(
         "run_recovery_acceptance_canary.py"
     )
+    assert "s/^Artifacts: //p" in runner
+    assert "s/^Artifacts: //p" in canary_runner
+
+    fixture_runner = (
+        Path(__file__).parents[2] / "scripts" / "run_playbook_counterfactual_fixture_canary.sh"
+    ).read_text(encoding="utf-8")
+    assert "s/^Artifacts: //p" in fixture_runner
+    assert "local fields=(" in fixture_runner
 
 
 def test_active_intent_cannot_be_resolved_by_different_shadow_target() -> None:
@@ -771,7 +779,7 @@ def test_formal_comparison_rejects_fixture_counterfactual_canary() -> None:
             after="baseline",
             repeated_errors=0,
         ),
-        resolved_counterfactual_keys=("counterfactual:shared",),
+        shadow_would_block_keys=("counterfactual:shared",),
         counterfactual_state_records=((100, "s" * 64, "a" * 64),),
     )
     fixture = build_canary_report(
@@ -925,6 +933,30 @@ def test_false_blocks_are_preserved_when_hard_rule_becomes_suspended(
     assert metrics.hard_rule_false_block_count == 1
     assert metrics.hard_rule_shadow_state_count == 1
     assert metrics.hard_rule_false_block_rate == 1.0
+
+
+def test_fixture_shadow_allow_is_retained_without_terminal_observability(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metrics = _metrics_for_rule_evaluations(
+        tmp_path,
+        monkeypatch,
+        [
+            _rule_evaluation(
+                event_id=1,
+                evaluation_id="evaluation:fixture-shadow-allow",
+                strength="hard",
+                status="active",
+                false_block=None,
+                actual_outcome="not_selected",
+                counterfactual_observable=False,
+            )
+        ],
+    )
+
+    assert metrics.shadow_would_block_keys == ("counterfactual:" + "a" * 64,)
+    assert metrics.resolved_counterfactual_keys == ()
 
 
 def test_soft_to_hard_transition_does_not_import_historical_false_blocks(

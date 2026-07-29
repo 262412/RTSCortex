@@ -92,7 +92,13 @@ run_arm() {
   local run_status=${PIPESTATUS[0]}
   set -e
   local run_dir
-  run_dir="$(sed -n 's/^Run directory: //p' "${log_path}" | tail -n 1)"
+  run_dir="$(
+    sed -n \
+      -e 's/^Run directory: //p' \
+      -e 's/^Artifacts: //p' \
+      "${log_path}" \
+      | tail -n 1
+  )"
   local after_sha256
   after_sha256="$(sha256sum "${working_playbook}" | awk '{print $1}')"
   cp "${working_playbook}" "${after_snapshot}"
@@ -106,13 +112,18 @@ run_arm() {
   submodule_commit_after="$(git -C third_party/LLM-PySC2 rev-parse HEAD)"
   submodule_dirty_after="$(test -n "$(git -C third_party/LLM-PySC2 status --porcelain)" && echo true || echo false)"
   submodule_diff_after="$(git -C third_party/LLM-PySC2 diff --binary | sha256sum | awk '{print $1}')"
-  printf "%s\tfixture\t%s\t%s\t%s\tactive,shadow\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
-    "${kind}" "${seed}" "${arm}" "${subject_arm}" "${run_status}" "${run_dir}" \
-    "${before_sha256}" "${after_sha256}" "${before_snapshot}" "${after_snapshot}" \
-    "${git_head}" "${git_head_after}" "${superproject_dirty}" "${dirty_after}" \
-    "${submodule_commit}" "${submodule_commit_after}" "${submodule_dirty}" \
-    "${submodule_dirty_after}" "${submodule_diff_sha256}" "${submodule_diff_after}" \
-    >> "${status_file}"
+  local fields=(
+    "${kind}" "fixture" "${seed}" "${arm}" "${subject_arm}" "active,shadow"
+    "${run_status}" "${run_dir}" "${before_sha256}" "${after_sha256}"
+    "${before_snapshot}" "${after_snapshot}" "${git_head}" "${git_head_after}"
+    "${superproject_dirty}" "${dirty_after}" "${submodule_commit}"
+    "${submodule_commit_after}" "${submodule_dirty}" "${submodule_dirty_after}"
+    "${submodule_diff_sha256}" "${submodule_diff_after}"
+  )
+  (
+    IFS=$'\t'
+    echo "${fields[*]}"
+  ) >> "${status_file}"
 }
 
 run_arm behavior active "" "${active_config}" "${active_playbook}"

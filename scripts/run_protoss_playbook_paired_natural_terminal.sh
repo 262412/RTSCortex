@@ -204,7 +204,13 @@ run_arm() {
     echo "source attestation changed during ${mode}/${arm}/seed-${seed}" >&2
     run_status=86
   fi
-  run_dir="$(sed -n 's/^Run directory: //p' "${log_path}" | tail -n 1)"
+  run_dir="$(
+    sed -n \
+      -e 's/^Run directory: //p' \
+      -e 's/^Artifacts: //p' \
+      "${log_path}" \
+      | tail -n 1
+  )"
   after_sha256="$(sha256sum "${working_playbook}" | awk '{print $1}')"
   after_snapshot="${arm_dir}/seed-${seed}.after.sqlite3"
   cp "${working_playbook}" "${after_snapshot}"
@@ -271,7 +277,13 @@ run_shadow_calibration() {
     echo "source attestation changed during ${mode}/shadow-${subject_arm}/seed-${seed}" >&2
     run_status=86
   fi
-  run_dir="$(sed -n 's/^Run directory: //p' "${log_path}" | tail -n 1)"
+  run_dir="$(
+    sed -n \
+      -e 's/^Run directory: //p' \
+      -e 's/^Artifacts: //p' \
+      "${log_path}" \
+      | tail -n 1
+  )"
   after_sha256="$(sha256sum "${shadow_playbook}" | awk '{print $1}')"
   after_snapshot="${arm_dir}/seed-${seed}.after.sqlite3"
   cp "${shadow_playbook}" "${after_snapshot}"

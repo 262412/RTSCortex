@@ -107,6 +107,7 @@ class RunMetrics:
     experiment_kind: str = "behavior"
     subject_arm: str | None = None
     active_hard_block_keys: tuple[str, ...] = ()
+    shadow_would_block_keys: tuple[str, ...] = ()
     resolved_counterfactual_keys: tuple[str, ...] = ()
     strategic_regret_count: int = 0
     strategic_resolved_count: int = 0
@@ -342,6 +343,17 @@ def _run_metrics(
             }
         )
     )
+    shadow_would_block_keys = tuple(
+        sorted(
+            {
+                str(evaluation["counterfactual_key"])
+                for evaluation in hard_evaluations
+                if evaluation.get("shadow_decision") == "would_block"
+                and evaluation.get("actual_outcome") != "blocked"
+                and isinstance(evaluation.get("counterfactual_key"), str)
+            }
+        )
+    )
     active_hard_block_records = tuple(
         sorted(
             (
@@ -523,6 +535,7 @@ def _run_metrics(
         experiment_kind=row.get("experiment_kind") or "behavior",
         subject_arm=row.get("subject_arm") or None,
         active_hard_block_keys=active_hard_block_keys,
+        shadow_would_block_keys=shadow_would_block_keys,
         resolved_counterfactual_keys=resolved_counterfactual_keys,
         strategic_regret_count=sum(
             evaluation.get("strategic_regret") is True for evaluation in strategic_evaluations
