@@ -21,6 +21,8 @@ class RuntimeAPI(Protocol):
 
     def execution(self, report: dict[str, Any]) -> None: ...
 
+    def placement_transition(self, event: dict[str, Any]) -> None: ...
+
     def end_episode(self, result: dict[str, Any]) -> None: ...
 
 
@@ -58,6 +60,14 @@ class BridgeCoordinator:
         agent_team_order: Mapping[str, Sequence[str]],
     ) -> BridgeDecision:
         observation = self.mapper.map(snapshot)
+        service = self.effect_verifier.placement_service
+        if service is not None:
+            service.set_runtime_context(
+                run_id=str(observation["run_id"]),
+                episode_id=str(observation["episode_id"]),
+                step_id=int(observation["step_id"]),
+                game_loop=int(observation["game_loop"]),
+            )
         batch = self.runtime.tick(observation)
         duplicate_ids = [
             str(command["command_id"])
@@ -277,6 +287,8 @@ class BridgeCoordinator:
     ) -> dict[str, Any]:
         service = self.effect_verifier.placement_service
         if service is None:
+            return report
+        if service.transitions_are_durable:
             return report
         transitions = service.drain_transition_history(str(report.get("command_id", "")))
         if not transitions:

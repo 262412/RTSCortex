@@ -15,6 +15,8 @@ from rtscortex.contracts import (
     ExecutionReport,
     ExecutionStage,
     ExecutionStatus,
+    PlacementLedgerEvent,
+    PlacementLedgerTransition,
 )
 from rtscortex.memory import EventStore
 from rtscortex.providers import FakeProvider
@@ -46,6 +48,33 @@ def test_versioned_api_health_and_tick(tmp_path: Path) -> None:
                 assert response.status_code == 200
                 assert response.json()["commands"][0]["name"] == "Attack_Unit"
                 command_id = response.json()["commands"][0]["command_id"]
+                placement = await client.post(
+                    "/v1/placement/transition",
+                    json=PlacementLedgerEvent(
+                        run_id="run-1",
+                        episode_id="episode-1",
+                        step_id=0,
+                        command_id=command_id,
+                        action_name="Attack_Unit",
+                        transition_id="placement-transition:" + "a" * 64,
+                        transition=PlacementLedgerTransition(
+                            reservation_id="placement:test",
+                            structure_type="Pylon",
+                            footprint_cells=[(1, 1)],
+                            previous_state="unreserved",
+                            next_state="reserved",
+                            game_loop=0,
+                        ),
+                    ).model_dump(mode="json"),
+                )
+                assert placement.json() == {"status": "recorded"}
+                placement_events = runtime.store.events_of_type(
+                    "run-1",
+                    "episode-1",
+                    "placement_ledger_transition",
+                )
+                assert len(placement_events) == 1
+                assert placement_events[0].payload["command_id"] == command_id
                 execution = await client.post(
                     "/v1/execution",
                     json=ExecutionReport(

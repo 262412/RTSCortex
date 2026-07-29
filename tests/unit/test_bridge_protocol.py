@@ -726,5 +726,8 @@ class FakeRuntime:
     def execution(self, report: dict[str, Any]) -> None:
         self.execution_reports.append(report)
 
+    def placement_transition(self, event: dict[str, Any]) -> None:
+        del event
+
     def end_episode(self, result: dict[str, Any]) -> None:
         self.episode_results.append(result)

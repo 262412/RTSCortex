@@ -16,6 +16,7 @@ from rtscortex.contracts import (
     EpisodeResult,
     ExecutionReport,
     ObservationEnvelope,
+    PlacementLedgerEvent,
 )
 from rtscortex.runtime import RuntimeEngine
 
@@ -57,6 +58,12 @@ def create_app(
     async def execution(report: ExecutionReport) -> dict[str, str]:
         _require_current_protocol(report.protocol_version)
         engine.record_execution(report)
+        return {"status": "recorded"}
+
+    @app.post("/v1/placement/transition")
+    async def placement_transition(event: PlacementLedgerEvent) -> dict[str, str]:
+        _require_current_protocol(event.protocol_version)
+        engine.record_placement_transition(event)
         return {"status": "recorded"}
 
     @app.post("/v1/episode/end")

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -ne 4 || "$3" != "--expected-git-sha" ]]; then
-  echo "usage: $0 <baseline-playbook.sqlite3> <run-set-dir> --expected-git-sha <sha>" >&2
+if [[ $# -ne 6 || "$3" != "--expected-git-sha" || "$5" != "--counterfactual-canary" ]]; then
+  echo "usage: $0 <baseline-playbook.sqlite3> <run-set-dir> --expected-git-sha <sha> --counterfactual-canary <json>" >&2
   exit 2
 fi
 
@@ -11,6 +11,7 @@ output_root="/mnt/scratch/users/tbczhang/outputs/RTSCortex"
 baseline_source="$(readlink -f "$1")"
 run_set_dir="$2"
 expected_git_sha="$4"
+counterfactual_canary="$(readlink -f "$6")"
 frozen_config="${repo_dir}/configs/experiments/live_simple64_hima_protoss_ensemble_cortex_v0_5_frozen_playbook_natural_terminal.yaml"
 evolving_config="${repo_dir}/configs/experiments/live_simple64_hima_protoss_ensemble_cortex_v0_5_natural_terminal.yaml"
 shadow_config="${repo_dir}/configs/experiments/live_simple64_hima_protoss_ensemble_cortex_v0_5_shadow_calibration_natural_terminal.yaml"
@@ -40,6 +41,21 @@ if [[ "${baseline_source}" != "${baseline_snapshot}" ]]; then
   cp "${baseline_source}" "${baseline_snapshot}"
 fi
 baseline_sha256="$(sha256sum "${baseline_snapshot}" | awk '{print $1}')"
+
+uv run python - "${counterfactual_canary}" "${expected_git_sha}" "${baseline_sha256}" <<'PY'
+import sys
+import json
+from pathlib import Path
+from scripts.analyze_playbook_experiment import counterfactual_canary_is_valid
+
+artifact = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+if not counterfactual_canary_is_valid(
+    artifact,
+    baseline_sha256=sys.argv[3],
+    expected_git_sha=sys.argv[2],
+):
+    raise SystemExit("counterfactual canary is missing, rejected, or source-mismatched")
+PY
 
 cd "${repo_dir}"
 git status --short > "${run_set_dir}/source-status.txt"
@@ -86,6 +102,7 @@ uv run python scripts/run_recovery_acceptance_canary.py \
   echo "experiment_modes=independent_paired,sequential_learning"
   echo "arm_order=counterbalanced_by_seed"
   echo "counterfactual_calibration=matched_shadow_twin_per_behavior_run"
+  echo "counterfactual_canary=${counterfactual_canary}"
 } > "${run_set_dir}/experiment-metadata.txt"
 
 status_file="${run_set_dir}/experiment-status.tsv"
@@ -283,7 +300,8 @@ uv run python scripts/analyze_playbook_experiment.py \
   --baseline-sha256 "${baseline_sha256}" \
   --expected-git-sha "${expected_git_sha}" \
   --engineering-baseline "${engineering_baseline}" \
-  --recovery-evidence "${recovery_evidence}"
+  --recovery-evidence "${recovery_evidence}" \
+  --counterfactual-canary "${counterfactual_canary}"
 analysis_status=$?
 set -e
 if [[ ${analysis_status} -ne 0 ]]; then

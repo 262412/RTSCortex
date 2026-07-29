@@ -194,18 +194,18 @@ def candidate_signature(
 
 
 def _intent_signature(intent: StrategicIntent) -> str:
+    """Return one run-neutral identity for the exact semantic operation."""
+
     payload = json.dumps(
         {
             "role": intent.role.value,
             "action_names": list(intent.action_names),
-            "actor_scopes": list(intent.actor_scopes),
-            "objective": intent.objective,
+            "actor_scopes": sorted(scope.casefold() for scope in intent.actor_scopes),
+            "semantic_target_key": intent.semantic_target_key.casefold(),
             "desired_effect": intent.desired_effect,
-            "producer_types": list(intent.producer_types),
+            "producer_types": sorted(item.casefold() for item in intent.producer_types),
             "resource_claim": intent.resource_claim.model_dump(mode="json"),
-            "dependency_count": len(intent.dependency_intent_ids),
-            "source_id": intent.source_id,
-            "source_version": intent.source_version,
+            "dependency_semantic_keys": sorted(intent.dependency_semantic_keys),
         },
         sort_keys=True,
         separators=(",", ":"),

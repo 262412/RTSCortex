@@ -40,6 +40,10 @@ class RuntimeClient:
         response = self.client.post("/v1/execution", json=report)
         response.raise_for_status()
 
+    def placement_transition(self, event: dict[str, Any]) -> None:
+        response = self.client.post("/v1/placement/transition", json=event)
+        response.raise_for_status()
+
     def end_episode(self, result: dict[str, Any]) -> None:
         response = self.client.post("/v1/episode/end", json=result)
         response.raise_for_status()

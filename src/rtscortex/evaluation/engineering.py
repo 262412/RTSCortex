@@ -25,7 +25,9 @@ REQUIRED_ENGINEERING_GATES = (
     "placement_identity_complete",
     "builder_provenance_complete",
     "placement_ledger_evidence_present",
+    "placement_ledger_coverage",
     "placement_ledger_transitions_valid",
+    "placement_ledger_terminal_complete",
     "cross_type_footprint_overlap_zero",
     "nonspatial_quarantine_zero",
     "invalid_footprint_redispatch_zero",
@@ -41,6 +43,7 @@ REQUIRED_ENGINEERING_GATES = (
     "postgame_semantic_event_coverage",
     "effective_loops_per_second",
     "natural_run_disk_reduction_ratio",
+    "analysis_evidence_retention_bounded",
 )
 
 _NEGATIVE_BUILD_EFFECT_CODES = frozenset(
@@ -71,6 +74,7 @@ _RETAINED_EVENT_TYPES = frozenset(
         "postgame_review_completed",
     }
 )
+DEFAULT_MAX_RETAINED_ENGINEERING_EVENTS = 100_000
 
 
 @dataclass
@@ -82,6 +86,8 @@ class EngineeringAccumulator:
     max_game_loop: int = 0
     first_timestamp: datetime | None = None
     last_timestamp: datetime | None = None
+    retention_limit: int = DEFAULT_MAX_RETAINED_ENGINEERING_EVENTS
+    retention_overflow_count: int = 0
 
     def ingest(self, event: StoredEvent) -> None:
         self.event_count += 1
@@ -97,7 +103,10 @@ class EngineeringAccumulator:
         if isinstance(game_loop, int | float) and not isinstance(game_loop, bool):
             self.max_game_loop = max(self.max_game_loop, int(game_loop))
         if event.event_type in _RETAINED_EVENT_TYPES:
-            self.events.append(event)
+            if len(self.events) < self.retention_limit:
+                self.events.append(event)
+            else:
+                self.retention_overflow_count += 1
 
     @classmethod
     def from_events(cls, events: Iterable[StoredEvent]) -> EngineeringAccumulator:
@@ -175,7 +184,7 @@ def build_engineering_gate_report(
         payload for _, payload in reports if _is_production(payload) and _pysc2_accepted(payload)
     ]
     production_confirmed = sum(_production_confirmed(payload) for payload in production_reports)
-    ledger = _placement_ledger_audit(retained)
+    ledger = _placement_ledger_audit(retained, accepted_builds=accepted_builds)
     retreat_repeats = _repeated_retreat_arrivals(retained)
     unchanged_attacks = _unchanged_attack_redispatches(retained)
     health_delta_collisions = _health_delta_engagement_collisions(reports)
@@ -256,11 +265,13 @@ def build_engineering_gate_report(
         "builder_provenance_complete": (
             None if build_count == 0 else builder_complete == build_count
         ),
-        "placement_ledger_evidence_present": ledger["transition_count"] > 0,
-        "placement_ledger_transitions_valid": ledger["invalid_transition_count"] == 0,
-        "cross_type_footprint_overlap_zero": ledger["overlap_count"] == 0,
-        "nonspatial_quarantine_zero": ledger["nonspatial_quarantine_count"] == 0,
-        "invalid_footprint_redispatch_zero": ledger["invalid_redispatch_count"] == 0,
+        "placement_ledger_evidence_present": int(ledger["transition_count"] or 0) > 0,
+        "placement_ledger_coverage": ledger["coverage"],
+        "placement_ledger_transitions_valid": int(ledger["invalid_transition_count"] or 0) == 0,
+        "placement_ledger_terminal_complete": int(ledger["orphan_reservation_count"] or 0) == 0,
+        "cross_type_footprint_overlap_zero": int(ledger["overlap_count"] or 0) == 0,
+        "nonspatial_quarantine_zero": int(ledger["nonspatial_quarantine_count"] or 0) == 0,
+        "invalid_footprint_redispatch_zero": int(ledger["invalid_redispatch_count"] or 0) == 0,
         "repeated_retreat_arrival_zero": retreat_repeats == 0,
         "unchanged_attack_redispatch_zero": unchanged_attacks == 0,
         "health_delta_engagement_attribution_valid": health_delta_collisions == 0,
@@ -291,6 +302,7 @@ def build_engineering_gate_report(
         "postgame_semantic_event_coverage": postgame_coverage,
         "effective_loops_per_second": loops_per_second,
         "natural_run_disk_reduction_ratio": disk_ratio,
+        "analysis_evidence_retention_bounded": accumulator.retention_overflow_count == 0,
     }
     thresholds = _thresholds()
     gates = {
@@ -329,6 +341,8 @@ def build_engineering_gate_report(
             "natural_run_baseline_bytes_per_game_loop": natural_run_baseline_bytes_per_loop,
             "retained_event_count": len(retained),
             "scanned_event_count": accumulator.event_count,
+            "retention_limit": accumulator.retention_limit,
+            "retention_overflow_count": accumulator.retention_overflow_count,
         },
         "gates": gates,
         "missing_required_metrics": missing,
@@ -342,6 +356,7 @@ def _thresholds() -> dict[str, tuple[str, bool | int | float]]:
         "build_start_coverage",
         "build_confirmation_rate",
         "build_failure_rate",
+        "placement_ledger_coverage",
         "postgame_semantic_event_coverage",
         "effective_loops_per_second",
         "natural_run_disk_reduction_ratio",
@@ -355,6 +370,7 @@ def _thresholds() -> dict[str, tuple[str, bool | int | float]]:
             "build_start_coverage": (">=", 1.0),
             "build_confirmation_rate": (">=", 0.90),
             "build_failure_rate": ("<=", 0.10),
+            "placement_ledger_coverage": (">=", 1.0),
             "postgame_semantic_event_coverage": (">=", 1.0),
             "effective_loops_per_second": (">=", 2.0),
             "natural_run_disk_reduction_ratio": (">=", 4.0),
@@ -427,9 +443,18 @@ def _builder_provenance_complete(payload: dict[str, Any]) -> bool:
     return bool(_evidence(payload).get("builder_tag"))
 
 
-def _placement_ledger_audit(events: Sequence[StoredEvent]) -> dict[str, int]:
+def _placement_ledger_audit(
+    events: Sequence[StoredEvent],
+    *,
+    accepted_builds: Sequence[tuple[int, dict[str, Any]]],
+) -> dict[str, int | float | None]:
     active: dict[str, tuple[str, frozenset[tuple[int, int]]]] = {}
     states: dict[str, str] = {}
+    identities: dict[str, tuple[str, frozenset[tuple[int, int]], str]] = {}
+    command_by_reservation: dict[str, str] = {}
+    transitions_by_reservation: defaultdict[str, list[dict[str, Any]]] = defaultdict(list)
+    last_loop: dict[str, int] = {}
+    transition_ids: set[str] = set()
     permanent_cells: set[tuple[int, int]] = set()
     invalid_transitions = 0
     overlaps = 0
@@ -453,10 +478,21 @@ def _placement_ledger_audit(events: Sequence[StoredEvent]) -> dict[str, int]:
         transition_count += 1
         payload = event.payload
         reservation_id = payload.get("reservation_id")
+        command_id = payload.get("command_id")
+        transition_id = payload.get("transition_id")
         raw_cells = payload.get("footprint_cells")
-        if not isinstance(reservation_id, str) or not isinstance(raw_cells, list):
+        if (
+            not isinstance(reservation_id, str)
+            or not isinstance(command_id, str)
+            or not isinstance(transition_id, str)
+            or not transition_id.startswith("placement-transition:")
+            or not isinstance(raw_cells, list)
+        ):
             invalid_transitions += 1
             continue
+        if transition_id in transition_ids:
+            invalid_transitions += 1
+        transition_ids.add(transition_id)
         try:
             cells = frozenset((int(cell[0]), int(cell[1])) for cell in raw_cells)
         except (IndexError, TypeError, ValueError):
@@ -464,8 +500,27 @@ def _placement_ledger_audit(events: Sequence[StoredEvent]) -> dict[str, int]:
             continue
         previous = str(payload.get("previous_state", ""))
         next_state = str(payload.get("next_state", ""))
+        structure_type = str(payload.get("structure_type", ""))
+        game_loop = payload.get("game_loop")
+        if not isinstance(game_loop, int) or isinstance(game_loop, bool):
+            invalid_transitions += 1
+            continue
+        identity = (structure_type, cells, command_id)
+        if reservation_id in identities and identities[reservation_id] != identity:
+            invalid_transitions += 1
+        identities.setdefault(reservation_id, identity)
+        if game_loop < last_loop.get(reservation_id, 0):
+            invalid_transitions += 1
+        last_loop[reservation_id] = game_loop
+        command_by_reservation.setdefault(reservation_id, command_id)
+        transitions_by_reservation[reservation_id].append(payload)
         observed_previous = states.get(reservation_id, "unreserved")
-        if not cells or previous != observed_previous or (previous, next_state) not in allowed:
+        if (
+            not cells
+            or not structure_type
+            or previous != observed_previous
+            or (previous, next_state) not in allowed
+        ):
             invalid_transitions += 1
         states[reservation_id] = next_state
         if next_state == "reserved":
@@ -474,11 +529,11 @@ def _placement_ledger_audit(events: Sequence[StoredEvent]) -> dict[str, int]:
             for other_id, (_, other_cells) in active.items():
                 if other_id != reservation_id and cells & other_cells:
                     overlaps += 1
-            active[reservation_id] = (str(payload.get("structure_type", "")), cells)
+            active[reservation_id] = (structure_type, cells)
         elif next_state == "occupied":
             if reservation_id not in active:
                 invalid_transitions += 1
-            active[reservation_id] = (str(payload.get("structure_type", "")), cells)
+            active[reservation_id] = (structure_type, cells)
         elif next_state in {
             "released",
             "temporary_suppressed",
@@ -489,12 +544,45 @@ def _placement_ledger_audit(events: Sequence[StoredEvent]) -> dict[str, int]:
             permanent_cells.update(cells)
             if payload.get("actor_failure") is True or payload.get("failure_class") == "nonspatial":
                 nonspatial_quarantines += 1
+    complete_builds = 0
+    for _, report in accepted_builds:
+        command_id = report.get("command_id")
+        evidence = _evidence(report)
+        reservation_id = evidence.get("reservation_id")
+        if not isinstance(command_id, str) or not isinstance(reservation_id, str):
+            continue
+        chain = transitions_by_reservation.get(reservation_id, [])
+        if not chain or command_by_reservation.get(reservation_id) != command_id:
+            continue
+        starts_reserved = (
+            chain[0].get("previous_state") == "unreserved"
+            and chain[0].get("next_state") == "reserved"
+        )
+        terminal_state = chain[-1].get("next_state")
+        confirmed = report.get("status") == "succeeded"
+        occupied = any(item.get("next_state") == "occupied" for item in chain)
+        terminal_complete = terminal_state in {
+            "released",
+            "temporary_suppressed",
+            "permanent_invalid",
+        }
+        builder_bound = any(isinstance(item.get("builder_tag"), str) for item in chain)
+        lease_complete = not builder_bound or (
+            chain[0].get("builder_lease_state") == "acquired"
+            and any(item.get("builder_lease_state") == "released" for item in chain[1:])
+        )
+        if starts_reserved and terminal_complete and lease_complete and (not confirmed or occupied):
+            complete_builds += 1
+    accepted_build_count = len(accepted_builds)
     return {
         "transition_count": transition_count,
         "invalid_transition_count": invalid_transitions,
         "overlap_count": overlaps,
         "invalid_redispatch_count": invalid_redispatches,
         "nonspatial_quarantine_count": nonspatial_quarantines,
+        "accepted_build_ledger_count": complete_builds,
+        "orphan_reservation_count": len(active),
+        "coverage": (None if accepted_build_count == 0 else complete_builds / accepted_build_count),
     }
 
 

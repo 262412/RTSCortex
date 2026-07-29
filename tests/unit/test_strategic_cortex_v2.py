@@ -97,6 +97,9 @@ def _intent(
     minerals: int = 0,
     emergency: bool = False,
     actor: str = "",
+    semantic_target_key: str = "global:none",
+    dependency_intent_ids: tuple[str, ...] = (),
+    dependency_semantic_keys: tuple[str, ...] = (),
 ) -> StrategicIntent:
     return StrategicIntent(
         intent_id=f"intent:{identity}",
@@ -110,7 +113,10 @@ def _intent(
         desired_effect=identity,
         action_names=(identity,),
         actor_scopes=() if not actor else (actor,),
+        semantic_target_key=semantic_target_key,
         resource_claim=ResourceClaim(minerals=minerals, reservation_game_loops=16),
+        dependency_intent_ids=dependency_intent_ids,
+        dependency_semantic_keys=dependency_semantic_keys,
         emergency=emergency,
         urgency=1.0 if emergency else 0.5,
         source_id="test",
@@ -944,6 +950,82 @@ def test_equivalent_intent_matches_across_run_local_operation_ids() -> None:
     ]
 
     assert keys[0] == keys[1]
+
+
+def test_intent_counterfactual_differs_for_different_target() -> None:
+    first = _intent(
+        "Attack_Unit",
+        RoleId.FOCUS_FIRE,
+        actor="CombatGroup8",
+        semantic_target_key="unit:0x100",
+    )
+    second = first.model_copy(update={"semantic_target_key": "unit:0x200"})
+
+    assert _intent_counterfactual_key(first) != _intent_counterfactual_key(second)
+
+
+def test_intent_counterfactual_differs_for_different_semantic_operation() -> None:
+    first = _intent(
+        "Move_Minimap",
+        RoleId.OFFENSE,
+        actor="CombatGroup8",
+        semantic_target_key="position:10,20",
+    )
+    second = first.model_copy(
+        update={
+            "action_names": ("Attack_Unit",),
+            "semantic_target_key": "unit:0x100",
+        }
+    )
+
+    assert _intent_counterfactual_key(first) != _intent_counterfactual_key(second)
+
+
+def test_dependency_identity_not_only_dependency_count() -> None:
+    first = _intent(
+        "Train_VoidRay",
+        RoleId.PRODUCTION,
+        dependency_intent_ids=("intent:local-a",),
+        dependency_semantic_keys=("technology:stargate",),
+    )
+    second = first.model_copy(
+        update={
+            "dependency_intent_ids": ("intent:local-b",),
+            "dependency_semantic_keys": ("economy:second-gas",),
+        }
+    )
+
+    assert _intent_counterfactual_key(first) != _intent_counterfactual_key(second)
+
+
+def _intent_counterfactual_key(intent: StrategicIntent) -> str | None:
+    rule = PlaybookRule(
+        rule_id="rule:no-operation",
+        canonical_key="no-operation",
+        category=PlaybookRuleCategory.EXECUTION_GUARD,
+        conditions=(PlaybookCondition(field="agent_race", value="protoss"),),
+        effect=PlaybookRuleEffect.FORBID,
+        strength=PlaybookRuleStrength.HARD,
+        status=PlaybookRuleStatus.ACTIVE,
+        action_names=intent.action_names,
+        confidence=1.0,
+    )
+    situation = DeterministicSituationAnalyzer().assess(_observation())
+    result = PlaybookIntentGuard().evaluate(
+        intent,
+        context=PlaybookContext(
+            agent_race="protoss",
+            opponent_race="zerg",
+            phase=situation.phase,
+            map_name="Simple64",
+        ),
+        situation=situation,
+        rules=(rule,),
+        game_loop=32,
+        behavior_before_hash="f" * 64,
+        mode="shadow",
+    )
+    return result.applications[0].counterfactual_key
 
 
 def _candidate_counterfactual_keys(

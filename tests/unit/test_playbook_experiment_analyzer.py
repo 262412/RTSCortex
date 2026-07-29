@@ -9,6 +9,7 @@ import pytest
 
 import scripts.analyze_playbook_experiment as analyzer
 from rtscortex.memory import StoredEvent
+from scripts.analyze_playbook_counterfactual_canary import build_canary_report
 from scripts.analyze_playbook_experiment import RunMetrics, _comparison
 
 
@@ -393,6 +394,17 @@ def test_analyzer_cli_exits_nonzero_when_report_rejected(
         json.dumps({"passed": True, "git_sha": "expected"}),
         encoding="utf-8",
     )
+    counterfactual_canary = tmp_path / "counterfactual-canary.json"
+    counterfactual_canary.write_text(
+        json.dumps(
+            {
+                "accepted": True,
+                "baseline_sha256": "baseline",
+                "expected_git_sha": "expected",
+            }
+        ),
+        encoding="utf-8",
+    )
     monkeypatch.setattr(
         sys,
         "argv",
@@ -407,6 +419,8 @@ def test_analyzer_cli_exits_nonzero_when_report_rejected(
             str(engineering_baseline),
             "--recovery-evidence",
             str(recovery_evidence),
+            "--counterfactual-canary",
+            str(counterfactual_canary),
         ],
     )
 
@@ -431,9 +445,160 @@ def test_paired_runner_propagates_failed_acceptance_gate() -> None:
     assert "run_shadow_calibration" in runner
     assert "--engineering-baseline" in runner
     assert "--recovery-evidence" in runner
+    assert "--counterfactual-canary" in runner
     assert "submodule_diff_sha256_before" in runner
     assert "capture_source_attestation" in runner
     assert 'exit "${overall_status}"' in runner
+
+
+def test_active_intent_cannot_be_resolved_by_different_shadow_target() -> None:
+    behavior = replace(
+        _metrics(
+            mode="causal_canary",
+            seed=0,
+            arm="active",
+            before="baseline",
+            after="after",
+            repeated_errors=0,
+        ),
+        active_hard_block_keys=("counterfactual:target-a",),
+        active_hard_block_records=(("counterfactual:target-a", 100, "a" * 64),),
+    )
+    shadow = replace(
+        _metrics(
+            mode="causal_canary",
+            seed=0,
+            arm="shadow",
+            before="baseline",
+            after="baseline",
+            repeated_errors=0,
+        ),
+        resolved_counterfactual_keys=("counterfactual:target-b",),
+    )
+
+    report = build_canary_report(
+        behavior,
+        shadow,
+        baseline_sha256="baseline",
+        expected_git_sha="expected",
+    )
+
+    assert report["matched_counterfactual_count"] == 0
+    assert report["unmatched_active_hard_block_count"] == 1
+    assert report["accepted"] is False
+
+
+def test_counterfactual_canary_reports_first_divergence_and_memory() -> None:
+    behavior = replace(
+        _metrics(
+            mode="causal_canary",
+            seed=0,
+            arm="active",
+            before="baseline",
+            after="after",
+            repeated_errors=0,
+        ),
+        active_hard_block_keys=("counterfactual:shared",),
+        active_hard_block_records=(("counterfactual:shared", 100, "a" * 64),),
+        counterfactual_state_records=((100, "s" * 64, "a" * 64),),
+        analysis_peak_rss_kib=1234,
+        retained_event_count=50,
+        rule_evaluation_count=4,
+    )
+    shadow = replace(
+        _metrics(
+            mode="causal_canary",
+            seed=0,
+            arm="shadow",
+            before="baseline",
+            after="baseline",
+            repeated_errors=0,
+        ),
+        resolved_counterfactual_keys=("counterfactual:shared",),
+        counterfactual_state_records=((100, "s" * 64, "b" * 64),),
+    )
+
+    report = build_canary_report(
+        behavior,
+        shadow,
+        baseline_sha256="baseline",
+        expected_git_sha="expected",
+    )
+
+    assert report["first_state_hash_divergence_game_loop"] == 100
+    assert report["analysis_memory"]["behavior_peak_rss_kib"] == 1234
+    assert report["gates"]["matched_prestate_identity"] is False
+    assert report["accepted"] is False
+
+
+def test_formal_comparison_accepts_complete_counterfactual_canary() -> None:
+    behavior = replace(
+        _metrics(
+            mode="causal_canary",
+            seed=0,
+            arm="active",
+            before="baseline",
+            after="after",
+            repeated_errors=0,
+        ),
+        active_hard_block_keys=("counterfactual:shared",),
+        active_hard_block_records=(("counterfactual:shared", 100, "a" * 64),),
+        counterfactual_state_records=((100, "s" * 64, "a" * 64),),
+    )
+    shadow = replace(
+        _metrics(
+            mode="causal_canary",
+            seed=0,
+            arm="shadow",
+            before="baseline",
+            after="baseline",
+            repeated_errors=0,
+        ),
+        resolved_counterfactual_keys=("counterfactual:shared",),
+        counterfactual_state_records=((100, "s" * 64, "a" * 64),),
+    )
+    canary = build_canary_report(
+        behavior,
+        shadow,
+        baseline_sha256="baseline",
+        expected_git_sha="expected",
+    )
+
+    comparison = _comparison(
+        _strict_matrix(),
+        baseline_sha256="baseline",
+        expected_git_sha="expected",
+        counterfactual_canary=canary,
+    )
+
+    assert canary["accepted"] is True
+    assert comparison["gates"]["counterfactual_canary_accepted"] is True
+
+
+def test_analysis_evidence_overflow_rejects_formal_comparison() -> None:
+    metrics = _strict_matrix()
+    metrics[0] = replace(metrics[0], analysis_evidence_overflow_count=1)
+
+    comparison = _comparison(metrics, baseline_sha256="baseline")
+
+    assert comparison["gates"]["analysis_memory_budget_respected"] is False
+    assert comparison["accepted"] is False
+
+
+def test_formal_comparison_rejects_source_mismatched_counterfactual_canary() -> None:
+    comparison = _comparison(
+        _strict_matrix(),
+        baseline_sha256="baseline",
+        expected_git_sha="expected",
+        counterfactual_canary={
+            "accepted": True,
+            "baseline_sha256": "different",
+            "expected_git_sha": "expected",
+        },
+    )
+
+    assert comparison["gates"]["counterfactual_canary_accepted"] is False
+    assert comparison["accepted"] is False
 
 
 def test_run_metrics_streams_events_and_normalizes_error_exposure(

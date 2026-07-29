@@ -269,6 +269,21 @@ class PlacementLedgerTransition(ContractModel):
     release_reason: str | None = None
 
 
+class PlacementLedgerEvent(ContractModel):
+    """One durable placement state change emitted when the change occurs."""
+
+    protocol_version: ProtocolVersion = CURRENT_PROTOCOL_VERSION
+    run_id: str = Field(min_length=1)
+    episode_id: str = Field(min_length=1)
+    step_id: int = Field(ge=0)
+    command_id: str = Field(min_length=1)
+    action_name: str = Field(min_length=1)
+    transition_id: str = Field(pattern=r"^placement-transition:[0-9a-f]{64}$")
+    builder_tag: str | None = None
+    builder_lease_state: Literal["acquired", "released"] | None = None
+    transition: PlacementLedgerTransition
+
+
 class EffectEvidence(ContractModel):
     effect_kind: (
         Literal[

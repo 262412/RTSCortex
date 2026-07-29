@@ -6,6 +6,7 @@ import argparse
 import csv
 import hashlib
 import json
+import resource
 from collections import Counter
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
@@ -30,6 +31,7 @@ _ERROR_CONSEQUENCES = frozenset(
         "advantage_not_converted",
     }
 )
+MAX_RULE_EVALUATIONS = 100_000
 
 
 @dataclass(frozen=True)
@@ -89,6 +91,13 @@ class RunMetrics:
     source_commit_matches_expected_sha: bool = True
     source_attestation_consistent: bool = True
     source_attestation_fingerprint: str | None = "source-baseline"
+    retained_event_count: int = 0
+    rule_evaluation_count: int = 0
+    analysis_peak_rss_kib: int = 0
+    analysis_rss_per_10k_game_loops: float = 0.0
+    analysis_evidence_overflow_count: int = 0
+    active_hard_block_records: tuple[tuple[str, int, str], ...] = ()
+    counterfactual_state_records: tuple[tuple[int, str, str], ...] = ()
 
 
 def main() -> None:
@@ -98,11 +107,13 @@ def main() -> None:
     parser.add_argument("--expected-git-sha", required=True)
     parser.add_argument("--engineering-baseline", type=Path, required=True)
     parser.add_argument("--recovery-evidence", type=Path, required=True)
+    parser.add_argument("--counterfactual-canary", type=Path, required=True)
     arguments = parser.parse_args()
     run_set = arguments.run_set_dir.resolve()
     engineering_baseline = json.loads(arguments.engineering_baseline.read_text(encoding="utf-8"))
     baseline_bytes_per_loop = float(engineering_baseline["natural_run_bytes_per_game_loop"])
     recovery_evidence = json.loads(arguments.recovery_evidence.read_text(encoding="utf-8"))
+    counterfactual_canary = json.loads(arguments.counterfactual_canary.read_text(encoding="utf-8"))
     rows = list(csv.DictReader((run_set / "experiment-status.tsv").open(), delimiter="\t"))
     metrics = [
         _run_metrics(
@@ -113,7 +124,12 @@ def main() -> None:
         )
         for row in rows
     ]
-    report = _comparison(metrics, baseline_sha256=arguments.baseline_sha256)
+    report = _comparison(
+        metrics,
+        baseline_sha256=arguments.baseline_sha256,
+        counterfactual_canary=counterfactual_canary,
+        expected_git_sha=arguments.expected_git_sha,
+    )
     (run_set / "comparison.json").write_text(
         json.dumps(report, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
@@ -148,6 +164,7 @@ def _run_metrics(
     max_game_loop = 0
     lineaged_operation_ids: set[str] = set()
     rule_evaluations: dict[str, dict[str, Any]] = {}
+    rule_evaluation_overflow_count = 0
     first_timestamp: datetime | None = None
     last_timestamp: datetime | None = None
     event_count = 0
@@ -203,7 +220,13 @@ def _run_metrics(
             elif event.event_type == "playbook_rule_evaluated":
                 evaluation_id = event.payload.get("evaluation_id")
                 if isinstance(evaluation_id, str):
-                    rule_evaluations[evaluation_id] = event.payload
+                    if (
+                        evaluation_id in rule_evaluations
+                        or len(rule_evaluations) < MAX_RULE_EVALUATIONS
+                    ):
+                        rule_evaluations[evaluation_id] = event.payload
+                    else:
+                        rule_evaluation_overflow_count += 1
 
     elapsed_seconds = (
         0.0
@@ -271,6 +294,34 @@ def _run_metrics(
                 and isinstance(evaluation.get("decision_epoch"), int)
                 and isinstance(evaluation.get("counterfactual_key"), str)
             }
+        )
+    )
+    active_hard_block_records = tuple(
+        sorted(
+            (
+                str(evaluation["counterfactual_key"]),
+                int(evaluation["decision_epoch"]),
+                str(evaluation["behavior_before_hash"]),
+            )
+            for evaluation in hard_evaluations
+            if evaluation.get("actual_outcome") == "blocked"
+            and isinstance(evaluation.get("counterfactual_key"), str)
+            and isinstance(evaluation.get("decision_epoch"), int)
+            and isinstance(evaluation.get("behavior_before_hash"), str)
+        )
+    )
+    counterfactual_state_records = tuple(
+        sorted(
+            (
+                int(evaluation["decision_epoch"]),
+                str(evaluation["counterfactual_signature"]),
+                str(evaluation["behavior_before_hash"]),
+            )
+            for evaluation in hard_evaluations
+            if evaluation.get("shadow_decision") == "would_block"
+            and isinstance(evaluation.get("decision_epoch"), int)
+            and isinstance(evaluation.get("counterfactual_signature"), str)
+            and isinstance(evaluation.get("behavior_before_hash"), str)
         )
     )
     resolved_counterfactual_keys = tuple(
@@ -364,6 +415,10 @@ def _run_metrics(
         if source_attestation_consistent
         else None
     )
+    peak_rss_kib = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    analysis_evidence_overflow_count = (
+        engineering_accumulator.retention_overflow_count + rule_evaluation_overflow_count
+    )
     return RunMetrics(
         mode=row["mode"],
         seed=int(row["seed"]),
@@ -440,6 +495,15 @@ def _run_metrics(
         ),
         source_attestation_consistent=source_attestation_consistent,
         source_attestation_fingerprint=source_attestation_fingerprint,
+        retained_event_count=len(engineering_accumulator.events),
+        rule_evaluation_count=len(rule_evaluations),
+        analysis_peak_rss_kib=peak_rss_kib,
+        analysis_rss_per_10k_game_loops=(
+            peak_rss_kib * 10_000 / max_game_loop if max_game_loop else 0.0
+        ),
+        analysis_evidence_overflow_count=analysis_evidence_overflow_count,
+        active_hard_block_records=active_hard_block_records,
+        counterfactual_state_records=counterfactual_state_records,
     )
 
 
@@ -480,7 +544,42 @@ def _source_attestation_fingerprint(
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
-def _comparison(metrics: list[RunMetrics], *, baseline_sha256: str) -> dict[str, Any]:
+def counterfactual_canary_is_valid(
+    artifact: dict[str, Any],
+    *,
+    baseline_sha256: str,
+    expected_git_sha: str | None,
+) -> bool:
+    gates = artifact.get("gates")
+    behavior = artifact.get("behavior")
+    shadow = artifact.get("shadow")
+    return (
+        artifact.get("schema_version") == "1.0"
+        and artifact.get("accepted") is True
+        and artifact.get("baseline_sha256") == baseline_sha256
+        and (expected_git_sha is None or artifact.get("expected_git_sha") == expected_git_sha)
+        and isinstance(gates, dict)
+        and bool(gates)
+        and all(value is True for value in gates.values())
+        and int(artifact.get("active_hard_block_count", 0)) > 0
+        and int(artifact.get("matched_counterfactual_count", 0)) > 0
+        and int(artifact.get("unmatched_active_hard_block_count", -1)) == 0
+        and isinstance(behavior, dict)
+        and isinstance(shadow, dict)
+        and behavior.get("source_attestation_fingerprint")
+        == shadow.get("source_attestation_fingerprint")
+        and behavior.get("analysis_evidence_overflow_count") == 0
+        and shadow.get("analysis_evidence_overflow_count") == 0
+    )
+
+
+def _comparison(
+    metrics: list[RunMetrics],
+    *,
+    baseline_sha256: str,
+    counterfactual_canary: dict[str, Any] | None = None,
+    expected_git_sha: str | None = None,
+) -> dict[str, Any]:
     behavior = [metric for metric in metrics if metric.experiment_kind == "behavior"]
     calibration = [metric for metric in metrics if metric.experiment_kind == "calibration"]
     split_matrix = any(metric.subject_arm is not None for metric in metrics)
@@ -666,6 +765,18 @@ def _comparison(metrics: list[RunMetrics], *, baseline_sha256: str) -> dict[str,
         ),
         "active_hard_blocks_have_matched_shadow_evidence": (not unmatched_active_hard_blocks),
         "counterfactual_schema_complete": invalid_counterfactual_evidence_count == 0,
+        "counterfactual_canary_accepted": (
+            True
+            if counterfactual_canary is None
+            else counterfactual_canary_is_valid(
+                counterfactual_canary,
+                baseline_sha256=baseline_sha256,
+                expected_git_sha=expected_git_sha,
+            )
+        ),
+        "analysis_memory_budget_respected": all(
+            metric.analysis_evidence_overflow_count == 0 for metric in metrics
+        ),
         "required_engineering_metrics_complete": not missing_engineering_metrics,
         "all_engineering_gates_pass": (
             bool(metrics)
@@ -704,6 +815,9 @@ def _comparison(metrics: list[RunMetrics], *, baseline_sha256: str) -> dict[str,
                 metric.strategic_resolved_count for metric in counterfactual_rows
             ),
             "invalid_counterfactual_evidence_count": invalid_counterfactual_evidence_count,
+            "analysis_evidence_overflow_count": sum(
+                metric.analysis_evidence_overflow_count for metric in metrics
+            ),
             "engineering_gates": engineering_gate_results,
             "missing_engineering_metrics": missing_engineering_metrics,
         },

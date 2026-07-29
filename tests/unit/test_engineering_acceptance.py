@@ -39,6 +39,16 @@ def test_missing_required_engineering_evidence_fails_closed(tmp_path: Path) -> N
     assert "natural_run_disk_reduction_ratio" in report["missing_required_metrics"]
 
 
+def test_engineering_accumulator_is_hard_bounded() -> None:
+    accumulator = EngineeringAccumulator(retention_limit=2)
+
+    for event_id in range(1, 5):
+        accumulator.ingest(_event(event_id, "execution", {"command_id": str(event_id)}))
+
+    assert len(accumulator.events) == 2
+    assert accumulator.retention_overflow_count == 2
+
+
 def test_build_gates_use_effect_evidence_not_api_acceptance(tmp_path: Path) -> None:
     events = [
         _event(
@@ -316,6 +326,7 @@ def test_placement_ledger_rejects_declared_state_that_does_not_match_history(
         "placement_ledger_transition",
         {
             **reserved.payload,
+            "transition_id": "placement-transition:" + "2" * 64,
             "previous_state": "occupied",
             "next_state": "released",
             "game_loop": 2,
@@ -439,19 +450,209 @@ def _ledger_transition(
     next_state: str = "reserved",
     failure_class: str | None = None,
     actor_failure: bool = False,
+    command_id: str | None = None,
+    previous_state: str = "unreserved",
+    game_loop: int | None = None,
 ) -> StoredEvent:
+    resolved_command_id = command_id or f"command:{reservation_id}"
     return _event(
         event_id,
         "placement_ledger_transition",
         {
+            "command_id": resolved_command_id,
+            "action_name": f"Build_{structure_type}_Screen",
+            "transition_id": f"placement-transition:{event_id:064x}",
+            "builder_tag": "0xb1",
+            "builder_lease_state": (
+                "acquired"
+                if next_state == "reserved"
+                else "released"
+                if next_state
+                in {
+                    "occupied",
+                    "released",
+                    "temporary_suppressed",
+                    "permanent_invalid",
+                }
+                else None
+            ),
             "reservation_id": reservation_id,
             "structure_type": structure_type,
             "footprint_cells": cells,
-            "previous_state": "unreserved",
+            "previous_state": previous_state,
             "next_state": next_state,
             "failure_class": failure_class,
             "actor_failure": actor_failure,
-            "game_loop": event_id,
+            "game_loop": event_id if game_loop is None else game_loop,
             "release_reason": failure_class,
         },
     )
+
+
+def _accepted_build(
+    event_id: int,
+    *,
+    command_id: str,
+    reservation_id: str,
+    status: str = "succeeded",
+) -> StoredEvent:
+    return _event(
+        event_id,
+        "execution",
+        {
+            "command_id": command_id,
+            "action_name": "Build_Pylon_Screen",
+            "status": status,
+            "execution_stage": "effect_verification",
+            "primitive_trace": [
+                {
+                    "origin": "translator",
+                    "accepted": True,
+                }
+            ],
+            "effect_evidence": {
+                "effect_kind": "build",
+                "reservation_id": reservation_id,
+                "target_position": [22.0, 24.0],
+                "validated_target_position": [22.0, 24.0],
+                "emitted_target_position": [22.0, 24.0],
+                "builder_tag": "0xb1",
+                "build_started": True,
+            },
+        },
+    )
+
+
+def test_every_accepted_build_requires_complete_ledger_chain(tmp_path: Path) -> None:
+    events = [
+        _ledger_transition(
+            1,
+            reservation_id="placement:one",
+            structure_type="Pylon",
+            cells=[[21, 23], [22, 23], [21, 24], [22, 24]],
+            command_id="build-one",
+        ),
+        _ledger_transition(
+            2,
+            reservation_id="placement:one",
+            structure_type="Pylon",
+            cells=[[21, 23], [22, 23], [21, 24], [22, 24]],
+            command_id="build-one",
+            previous_state="reserved",
+            next_state="occupied",
+        ),
+        _ledger_transition(
+            3,
+            reservation_id="placement:one",
+            structure_type="Pylon",
+            cells=[[21, 23], [22, 23], [21, 24], [22, 24]],
+            command_id="build-one",
+            previous_state="occupied",
+            next_state="released",
+        ),
+        _accepted_build(4, command_id="build-one", reservation_id="placement:one"),
+        _accepted_build(5, command_id="build-two", reservation_id="placement:two"),
+    ]
+
+    report = build_engineering_gate_report(
+        events,
+        run_dir=tmp_path,
+        natural_run_baseline_bytes_per_loop=100.0,
+    )
+
+    assert report["metrics"]["placement_ledger_coverage"] == 0.5
+    assert report["gates"]["placement_ledger_coverage"]["passed"] is False
+
+
+def test_one_ledger_chain_cannot_cover_multiple_accepted_builds(tmp_path: Path) -> None:
+    events = [
+        _ledger_transition(
+            1,
+            reservation_id="placement:shared",
+            structure_type="Pylon",
+            cells=[[21, 23], [22, 23], [21, 24], [22, 24]],
+            command_id="build-one",
+        ),
+        _ledger_transition(
+            2,
+            reservation_id="placement:shared",
+            structure_type="Pylon",
+            cells=[[21, 23], [22, 23], [21, 24], [22, 24]],
+            command_id="build-one",
+            previous_state="reserved",
+            next_state="occupied",
+        ),
+        _ledger_transition(
+            3,
+            reservation_id="placement:shared",
+            structure_type="Pylon",
+            cells=[[21, 23], [22, 23], [21, 24], [22, 24]],
+            command_id="build-one",
+            previous_state="occupied",
+            next_state="released",
+        ),
+        _accepted_build(4, command_id="build-one", reservation_id="placement:shared"),
+        _accepted_build(5, command_id="build-two", reservation_id="placement:shared"),
+    ]
+
+    report = build_engineering_gate_report(
+        events,
+        run_dir=tmp_path,
+        natural_run_baseline_bytes_per_loop=100.0,
+    )
+
+    assert report["diagnostics"]["accepted_build_ledger_count"] == 1
+    assert report["metrics"]["placement_ledger_coverage"] == 0.5
+
+
+def test_placement_ledger_rejects_identity_mutation_and_nonmonotonic_time(
+    tmp_path: Path,
+) -> None:
+    events = [
+        _ledger_transition(
+            20,
+            reservation_id="placement:one",
+            structure_type="Pylon",
+            cells=[[21, 23], [22, 23], [21, 24], [22, 24]],
+            command_id="build-one",
+            game_loop=20,
+        ),
+        _ledger_transition(
+            21,
+            reservation_id="placement:one",
+            structure_type="Gateway",
+            cells=[[21, 23], [22, 23], [23, 23]],
+            command_id="build-one",
+            previous_state="reserved",
+            next_state="released",
+            game_loop=19,
+        ),
+    ]
+
+    report = build_engineering_gate_report(
+        events,
+        run_dir=tmp_path,
+        natural_run_baseline_bytes_per_loop=100.0,
+    )
+
+    assert report["diagnostics"]["invalid_transition_count"] >= 2
+    assert report["gates"]["placement_ledger_transitions_valid"]["passed"] is False
+
+
+def test_terminal_episode_rejects_orphan_reservation(tmp_path: Path) -> None:
+    report = build_engineering_gate_report(
+        [
+            _ledger_transition(
+                1,
+                reservation_id="placement:orphan",
+                structure_type="Pylon",
+                cells=[[21, 23], [22, 23], [21, 24], [22, 24]],
+                command_id="build-orphan",
+            )
+        ],
+        run_dir=tmp_path,
+        natural_run_baseline_bytes_per_loop=100.0,
+    )
+
+    assert report["diagnostics"]["orphan_reservation_count"] == 1
+    assert report["gates"]["placement_ledger_terminal_complete"]["passed"] is False

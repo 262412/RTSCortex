@@ -64,9 +64,11 @@ class StrategicIntent(ContractModel):
     desired_effect: str = Field(min_length=1)
     action_names: tuple[str, ...] = Field(min_length=1)
     actor_scopes: tuple[str, ...] = ()
+    semantic_target_key: str = Field(min_length=1)
     producer_types: tuple[str, ...] = ()
     resource_claim: ResourceClaim = Field(default_factory=ResourceClaim)
     dependency_intent_ids: tuple[str, ...] = ()
+    dependency_semantic_keys: tuple[str, ...] = ()
     mutually_exclusive_groups: tuple[str, ...] = ()
     hard_blockers: tuple[str, ...] = ()
     urgency: float = Field(default=0.5, ge=0.0, le=1.0)
@@ -92,11 +94,17 @@ class StrategicIntent(ContractModel):
             ("actor_scopes", self.actor_scopes),
             ("producer_types", self.producer_types),
             ("dependency_intent_ids", self.dependency_intent_ids),
+            ("dependency_semantic_keys", self.dependency_semantic_keys),
             ("mutually_exclusive_groups", self.mutually_exclusive_groups),
             ("playbook_rule_ids", self.playbook_rule_ids),
         ):
             if len(values) != len(set(values)):
                 raise ValueError(f"{name} must be unique")
+        if len(self.dependency_intent_ids) != len(self.dependency_semantic_keys):
+            raise ValueError(
+                "dependency_intent_ids and dependency_semantic_keys must identify "
+                "the same dependencies"
+            )
         return self
 
 
@@ -203,6 +211,7 @@ class StrategicIntentAdapter:
             desired_effect=intent.objective,
             action_names=tuple(intent.action_names),
             actor_scopes=tuple(intent.actor_scopes),
+            semantic_target_key=target_key,
             producer_types=self.profile.data.producers_for_action(first_action),
             resource_claim=ResourceClaim(
                 minerals=0 if spec is None else spec.minerals,

@@ -31,6 +31,7 @@ from rtscortex.contracts import (
     ExecutionStatus,
     IdleReason,
     ObservationEnvelope,
+    PlacementLedgerEvent,
 )
 from rtscortex.contracts.interfaces import (
     ActivePlanSnapshot,
@@ -190,6 +191,7 @@ class RuntimeEngine:
         self._command_states: dict[str, CommandLifecycle] = {}
         self._reported_command_reasons: set[tuple[str, str]] = set()
         self._terminal_execution_fingerprints: dict[str, str] = {}
+        self._placement_transition_ids: set[str] = set()
         self._episode_result_fingerprint: str | None = None
         self._last_decision: ActionBatch | None = None
         self._decision_by_command_id: dict[str, ActionBatch] = {}
@@ -1465,6 +1467,37 @@ class RuntimeEngine:
             report,
             allowed_from={CommandStatus.DISPATCHED},
         )
+
+    def record_placement_transition(self, event: PlacementLedgerEvent) -> None:
+        """Persist one placement state change independently of command terminal state."""
+
+        if event.transition_id in self._placement_transition_ids:
+            return
+        lifecycle = self._command_states.get(event.command_id)
+        if lifecycle is None:
+            raise RuntimeError(
+                f"placement transition references unknown command {event.command_id!r}"
+            )
+        if lifecycle.command.name != event.action_name:
+            raise RuntimeError(
+                f"placement transition action {event.action_name!r} does not match "
+                f"command {lifecycle.command.name!r}"
+            )
+        self.store.append_event(
+            run_id=event.run_id,
+            episode_id=event.episode_id,
+            step_id=event.step_id,
+            event_type="placement_ledger_transition",
+            payload={
+                "command_id": event.command_id,
+                "action_name": event.action_name,
+                "transition_id": event.transition_id,
+                "builder_tag": event.builder_tag,
+                "builder_lease_state": event.builder_lease_state,
+                **event.transition.model_dump(mode="json"),
+            },
+        )
+        self._placement_transition_ids.add(event.transition_id)
 
     def _record_execution_from(
         self,

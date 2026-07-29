@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Any, Optional
 
@@ -145,7 +145,12 @@ class RawPlacementService:
     world target retained here.
     """
 
-    def __init__(self, *, unit_names: Mapping[int, str]) -> None:
+    def __init__(
+        self,
+        *,
+        unit_names: Mapping[int, str],
+        transition_sink: Callable[[dict[str, Any]], None] | None = None,
+    ) -> None:
         self.unit_names = {int(key): str(value) for key, value in unit_names.items()}
         self._known_resources: dict[int, dict[str, Any]] = {}
         self._suppressed_clusters: set[int] = set()
@@ -157,6 +162,30 @@ class RawPlacementService:
         self._builder_leases: dict[int, str] = {}
         self._placement_diagnostics: dict[str, str] = {}
         self._transition_history: dict[str, list[dict[str, Any]]] = {}
+        self._transition_sink = transition_sink
+        self._transition_sequence = 0
+        self._runtime_run_id: str | None = None
+        self._runtime_episode_id: str | None = None
+        self._runtime_step_id = 0
+        self._runtime_game_loop = 0
+        self._last_transition_loop: dict[str, int] = {}
+
+    @property
+    def transitions_are_durable(self) -> bool:
+        return self._transition_sink is not None
+
+    def set_runtime_context(
+        self,
+        *,
+        run_id: str,
+        episode_id: str,
+        step_id: int,
+        game_loop: int,
+    ) -> None:
+        self._runtime_run_id = run_id
+        self._runtime_episode_id = episode_id
+        self._runtime_step_id = int(step_id)
+        self._runtime_game_loop = max(self._runtime_game_loop, int(game_loop))
 
     @property
     def known_resources(self) -> tuple[dict[str, Any], ...]:
@@ -198,6 +227,7 @@ class RawPlacementService:
         self._placement_diagnostics.clear()
 
     def observe(self, observation: Any, *, require_feature_visibility: bool) -> None:
+        self._runtime_game_loop = max(self._runtime_game_loop, _game_loop(observation))
         self.observe_units(
             _value(observation, "raw_units", ()),
             _value(observation, "feature_units", ()),
@@ -641,7 +671,10 @@ class RawPlacementService:
             reservation=placement,
             previous_state=placement.placement_state,
             next_state="occupied",
-            game_loop=0 if game_loop is None else int(game_loop),
+            game_loop=self._resolved_transition_loop(
+                placement.reservation_id,
+                game_loop,
+            ),
             release_reason="effect_confirmed",
         )
         self._release_builder_lease(placement)
@@ -650,7 +683,7 @@ class RawPlacementService:
         self,
         command_id: str,
         *,
-        game_loop: int = 0,
+        game_loop: int | None = None,
         reason: str = "released",
         record_transition: bool = True,
     ) -> None:
@@ -663,7 +696,10 @@ class RawPlacementService:
                 reservation=placement,
                 previous_state=placement.placement_state,
                 next_state="released",
-                game_loop=game_loop,
+                game_loop=self._resolved_transition_loop(
+                    placement.reservation_id,
+                    game_loop,
+                ),
                 release_reason=reason,
             )
         self._release_builder_lease(placement)
@@ -819,19 +855,83 @@ class RawPlacementService:
                 ).encode()
             ).hexdigest()
         )
-        self._transition_history.setdefault(command_id, []).append(
+        resolved_loop = self._resolved_transition_loop(reservation_id, game_loop)
+        transition = {
+            "reservation_id": reservation_id,
+            "structure_type": spec.target_structure,
+            "footprint_cells": sorted(cells),
+            "previous_state": previous_state,
+            "next_state": next_state,
+            "failure_class": failure_class,
+            "actor_failure": actor_failure,
+            "game_loop": resolved_loop,
+            "release_reason": release_reason,
+        }
+        self._transition_sequence += 1
+        transition_id = (
+            "placement-transition:"
+            + hashlib.sha256(
+                json.dumps(
+                    {
+                        "command_id": command_id,
+                        "transition": transition,
+                        "sequence": self._transition_sequence,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+            ).hexdigest()
+        )
+        builder_tag = None if reservation is None else reservation.builder_tag
+        lease_state = (
+            "acquired"
+            if next_state == "reserved" and builder_tag is not None
+            else "released"
+            if builder_tag is not None
+            and next_state
+            in {
+                "occupied",
+                "released",
+                "temporary_suppressed",
+                "permanent_invalid",
+            }
+            else None
+        )
+        if self._transition_sink is None:
+            self._transition_history.setdefault(command_id, []).append(transition)
+            return
+        if self._runtime_run_id is None or self._runtime_episode_id is None:
+            raise RuntimeError("durable placement transition has no Runtime context")
+        self._transition_sink(
             {
-                "reservation_id": reservation_id,
-                "structure_type": spec.target_structure,
-                "footprint_cells": sorted(cells),
-                "previous_state": previous_state,
-                "next_state": next_state,
-                "failure_class": failure_class,
-                "actor_failure": actor_failure,
-                "game_loop": int(game_loop),
-                "release_reason": release_reason,
+                "protocol_version": "1.1",
+                "run_id": self._runtime_run_id,
+                "episode_id": self._runtime_episode_id,
+                "step_id": self._runtime_step_id,
+                "command_id": command_id,
+                "action_name": resolved_action,
+                "transition_id": transition_id,
+                "builder_tag": None if builder_tag is None else hex(builder_tag),
+                "builder_lease_state": lease_state,
+                "transition": transition,
             }
         )
+
+    def _resolved_transition_loop(
+        self,
+        reservation_id: str,
+        game_loop: int | None,
+    ) -> int:
+        resolved = self._runtime_game_loop if game_loop is None else int(game_loop)
+        resolved = max(
+            0,
+            resolved,
+            self._runtime_game_loop,
+            self._last_transition_loop.get(reservation_id, 0),
+        )
+        self._runtime_game_loop = max(self._runtime_game_loop, resolved)
+        self._last_transition_loop[reservation_id] = resolved
+        return resolved
 
     def _expansion_target(
         self,

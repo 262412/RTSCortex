@@ -1536,7 +1536,10 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
         self.runtime_client.health()
         unit_names, building_types = _unit_metadata()
         upgrade_names = _upgrade_metadata()
-        placement_service = RawPlacementService(unit_names=unit_names)
+        placement_service = RawPlacementService(
+            unit_names=unit_names,
+            transition_sink=self.runtime_client.placement_transition,
+        )
         coordinator = BridgeCoordinator(
             self.runtime_client,
             effect_verifier=ActionEffectVerifier(

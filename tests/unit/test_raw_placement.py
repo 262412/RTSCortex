@@ -221,6 +221,84 @@ def test_builder_lease_is_exact_and_released_at_terminal() -> None:
     assert service.leased_builder_tags == frozenset()
 
 
+def test_placement_transition_is_durable_before_command_terminal() -> None:
+    durable_events: list[dict[str, object]] = []
+    service = RawPlacementService(
+        unit_names={2: "Probe"},
+        transition_sink=durable_events.append,
+    )
+    service.set_runtime_context(
+        run_id="run",
+        episode_id="episode",
+        step_id=7,
+        game_loop=100,
+    )
+    observation = SimpleNamespace(
+        raw_units=[_unit(0xB1, 2, alliance=1, x=20, y=20)],
+        feature_units=[],
+        feature_screen=None,
+        game_loop=[100],
+    )
+
+    reservation = service.resolve(
+        command_id="build-durable",
+        action_name="Build_Pylon_Screen",
+        requested_arguments=([64, 64],),
+        observation=observation,
+        world_target=(22.0, 24.0),
+        builder_tag=0xB1,
+    )
+
+    assert len(durable_events) == 1
+    assert durable_events[0]["command_id"] == "build-durable"
+    assert durable_events[0]["transition"] == {
+        "reservation_id": reservation.reservation_id,
+        "structure_type": "Pylon",
+        "footprint_cells": [(21, 23), (21, 24), (22, 23), (22, 24)],
+        "previous_state": "unreserved",
+        "next_state": "reserved",
+        "failure_class": None,
+        "actor_failure": False,
+        "game_loop": 100,
+        "release_reason": None,
+    }
+    assert service.drain_transition_history("build-durable") == []
+
+
+def test_placement_transition_game_loops_are_monotonic() -> None:
+    durable_events: list[dict[str, object]] = []
+    service = RawPlacementService(
+        unit_names={2: "Probe"},
+        transition_sink=durable_events.append,
+    )
+    service.set_runtime_context(
+        run_id="run",
+        episode_id="episode",
+        step_id=7,
+        game_loop=100,
+    )
+    observation = SimpleNamespace(
+        raw_units=[_unit(0xB1, 2, alliance=1, x=20, y=20)],
+        feature_units=[],
+        feature_screen=None,
+        game_loop=[100],
+    )
+    service.resolve(
+        command_id="build-monotonic",
+        action_name="Build_Pylon_Screen",
+        requested_arguments=([64, 64],),
+        observation=observation,
+        world_target=(22.0, 24.0),
+        builder_tag=0xB1,
+    )
+    service.confirm_command("build-monotonic", game_loop=112)
+    service.release_command("build-monotonic")
+
+    loops = [int(event["transition"]["game_loop"]) for event in durable_events]  # type: ignore[index]
+    assert loops == sorted(loops)
+    assert loops == [100, 112, 112]
+
+
 def test_permanent_spatial_exclusion_applies_across_building_types() -> None:
     service = RawPlacementService(unit_names={})
     service.suppress_world_target(

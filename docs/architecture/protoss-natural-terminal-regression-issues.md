@@ -1318,6 +1318,74 @@ Two limitations are deliberately still visible:
     Observation-scale;
   - any pre/post or cross-run source-attestation change rejects acceptance.
 
+#### 2026-07-29 semantic counterfactual and durable-placement follow-up
+
+- **Status:** the two false-pass defects and both formal-experiment risks in the
+  follow-up review are corrected in code and deterministic tests. The required
+  Active/Shadow causal canary and the 24-run experiment have not been executed,
+  so SCX-PT-039 remains open.
+- **Evidence, impact and root cause:**
+  1. Intent counterfactual identity used role, action text, actor scopes,
+     objective/resource fields and only the dependency count. It omitted the
+     exact semantic target and dependency identities. Two same-loop FocusFire
+     intents aimed at different enemy tags could therefore share a key and let
+     one Shadow outcome resolve a different Active hard block.
+  2. Placement acceptance required only one ledger transition somewhere in the
+     run. It did not join every accepted build command to a unique reservation
+     chain, enforce immutable structure/cells, require monotonic loops or reject
+     orphan reservations. Bridge transitions were retained in memory until the
+     terminal ExecutionReport, so a pre-terminal Worker failure erased the
+     authoritative history; missing loop context could also record release at
+     loop zero.
+  3. A whole-game Shadow twin diverges after its first intervention. Later
+     Active decisions may no longer have the same pre-state or decision epoch,
+     producing a formally safe but practically unusable matrix with unmatched
+     hard blocks only after all 24 runs have completed.
+  4. Observation events were removed from retained analysis state, but
+     command-scale events and rule evaluations were still unbounded lists/maps.
+     A sufficiently long game could exhaust analyzer memory without an explicit
+     failed gate.
+- **Implemented correction:**
+  - every `StrategicIntent` now carries a required run-neutral
+    `semantic_target_key`; dependency IDs require one-to-one
+    `dependency_semantic_keys`. Intent signatures hash role, action family,
+    canonical actor scopes, exact target, desired effect, producer/resource
+    claims and sorted dependency semantic keys. Run/episode-local operation IDs
+    remain excluded so matched runs can compare;
+  - `RawPlacementService` publishes reserve, occupied, suppression and release
+    transitions immediately through `/v1/placement/transition`. Each event has
+    a unique transition ID, exact command/reservation/action identity, discrete
+    footprint, builder lease state and nondecreasing real game loop. Terminal
+    report attachment remains only as a no-sink test/compatibility path;
+  - placement audit now joins every PySC2-accepted build to its reservation,
+    requires `unreserved -> reserved`, requires occupied evidence for confirmed
+    builds, requires a terminal release/suppression, validates immutable
+    structure/cells/command and monotonic time, and fails on any orphan active
+    reservation. `placement_ledger_coverage` must equal 100%;
+  - `run_protoss_playbook_counterfactual_canary.sh` runs one Active behavior and
+    one matched Shadow from the same snapshot. Its analyzer records hard-block
+    matches, first unmatched loop, first state-hash divergence, peak RSS,
+    retained/scanned events and rule-evaluation count. The formal paired runner
+    refuses to start without an accepted canary bound to the same baseline and
+    Git SHA;
+  - engineering evidence and rule-evaluation retention now have explicit hard
+    limits. Overflow stops retaining new evidence and fails
+    `analysis_memory_budget_respected`, preventing either OOM-driven ambiguity
+    or a truncated-evidence false pass.
+- **Acceptance criteria:**
+  - different target, action family or dependency semantic identity always
+    produces a different Intent counterfactual key;
+  - a Shadow result for a different target cannot resolve an Active hard block;
+  - accepted-build ledger coverage is exactly 100%, all identities are
+    immutable, all transition loops are monotonic and terminal orphan count is
+    zero;
+  - the initial reserve transition is durable before command terminal state;
+  - the causal canary observes at least one hard block, resolves at least one,
+    leaves no Active hard block unmatched and has no matched-prestate
+    divergence;
+  - retained evidence and rule evaluations remain within their configured
+    bounds, otherwise formal acceptance fails.
+
 ## Repair order
 
 1. Freeze characterization tests and add the cross-layer `OperationKey`,
@@ -1359,6 +1427,10 @@ build failure/timeout <= 10%
 validated placement target equals emitted and verified target = 100%
 accepted build builder-tag provenance = 100%
 authoritative placement ledger evidence is present and transitions are legal
+accepted-build placement ledger coverage = 100%
+terminal placement orphan reservations = 0
+placement structure, footprint and command identity remain immutable
+placement transition game loops are monotonic
 cross-type active footprint overlap = 0
 non-spatial failure permanent footprint quarantine = 0
 invalid world footprint redispatch = 0
@@ -1373,6 +1445,8 @@ post-game semantic event coverage = 100%
 source-bound restart recovery evidence is present and bounded by checkpoint tail
 effective live speed >= 2 game loops/s
 natural-run disk usage reduced by >= 4x
+counterfactual causal canary accepted for the same baseline and Git SHA
+analysis evidence retention overflow = 0
 frozen Playbook hash remains unchanged
 evolving Playbook survives and affects the next game
 independent paired and sequential-learning experiments reported separately
