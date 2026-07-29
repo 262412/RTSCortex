@@ -1,8 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -ne 6 || "$3" != "--expected-git-sha" || "$5" != "--counterfactual-canary" ]]; then
-  echo "usage: $0 <baseline-playbook.sqlite3> <run-set-dir> --expected-git-sha <sha> --counterfactual-canary <json>" >&2
+if [[ $# -ne 6 && $# -ne 8 ]]; then
+  echo "usage: $0 <baseline-playbook.sqlite3> <run-set-dir> --expected-git-sha <sha> --counterfactual-canary <json> [--seeds 3,4,5]" >&2
+  exit 2
+fi
+if [[ "$3" != "--expected-git-sha" || "$5" != "--counterfactual-canary" ]]; then
+  echo "usage: $0 <baseline-playbook.sqlite3> <run-set-dir> --expected-git-sha <sha> --counterfactual-canary <json> [--seeds 3,4,5]" >&2
+  exit 2
+fi
+if [[ $# -eq 8 ]] && [[ "$7" != "--seeds" ]]; then
+  echo "the optional seventh argument must be --seeds" >&2
   exit 2
 fi
 
@@ -12,6 +20,20 @@ baseline_source="$(readlink -f "$1")"
 run_set_dir="$2"
 expected_git_sha="$4"
 counterfactual_canary="$(readlink -f "$6")"
+seed_csv="${8:-0,1,2}"
+IFS=',' read -r -a seeds <<< "${seed_csv}"
+if [[ ${#seeds[@]} -ne 3 ]]; then
+  echo "formal acceptance requires exactly three held-out seeds" >&2
+  exit 2
+fi
+declare -A unique_seeds=()
+for seed in "${seeds[@]}"; do
+  if [[ ! "${seed}" =~ ^[0-9]+$ || -n "${unique_seeds[${seed}]:-}" ]]; then
+    echo "held-out seeds must be three distinct non-negative integers" >&2
+    exit 2
+  fi
+  unique_seeds["${seed}"]=1
+done
 frozen_config="${repo_dir}/configs/experiments/live_simple64_hima_protoss_ensemble_cortex_v0_5_frozen_playbook_natural_terminal.yaml"
 evolving_config="${repo_dir}/configs/experiments/live_simple64_hima_protoss_ensemble_cortex_v0_5_natural_terminal.yaml"
 shadow_config="${repo_dir}/configs/experiments/live_simple64_hima_protoss_ensemble_cortex_v0_5_shadow_calibration_natural_terminal.yaml"
@@ -29,6 +51,7 @@ fi
 mkdir -p "${run_set_dir}"
 run_set_dir="$(readlink -f "${run_set_dir}")"
 recovery_evidence="${run_set_dir}/recovery-canary.json"
+readiness_evidence="${run_set_dir}/playbook-hard-readiness.json"
 baseline_snapshot="${run_set_dir}/playbook.baseline.sqlite3"
 
 exec 9>"${lock_path}"
@@ -70,6 +93,18 @@ if [[ "${git_head}" != "${expected_git_sha}" || "${superproject_dirty}" != "fals
   exit 2
 fi
 
+readiness_seed_args=()
+for seed in "${seeds[@]}"; do
+  readiness_seed_args+=(--evaluation-seed "${seed}")
+done
+uv run rtscortex playbook hard-readiness \
+  --database "${baseline_snapshot}" \
+  --config "${frozen_config}" \
+  --expected-git-sha "${expected_git_sha}" \
+  --sc2-patch "4.10" \
+  "${readiness_seed_args[@]}" \
+  --output "${readiness_evidence}"
+
 capture_source_attestation() {
   source_git_head="$(git rev-parse HEAD)"
   source_superproject_dirty="$(test -n "$(git status --porcelain --ignore-submodules=dirty)" && echo true || echo false)"
@@ -98,7 +133,7 @@ uv run python scripts/run_recovery_acceptance_canary.py \
   echo "submodule_diff_sha256=${submodule_diff_sha256}"
   echo "expected_git_sha=${expected_git_sha}"
   echo "baseline_sha256=${baseline_sha256}"
-  echo "seeds=0,1,2"
+  echo "seeds=${seed_csv}"
   echo "experiment_modes=independent_paired,sequential_learning"
   echo "arm_order=counterbalanced_by_seed"
   echo "counterfactual_calibration=matched_shadow_twin_per_behavior_run"
@@ -254,10 +289,11 @@ run_shadow_calibration() {
 }
 
 # Experiment A: both arms start every seed from byte-identical baseline state.
-for seed in 0 1 2; do
+for index in "${!seeds[@]}"; do
+  seed="${seeds[${index}]}"
   reset_playbook "${frozen_playbook}"
   reset_playbook "${evolving_playbook}"
-  if (( seed % 2 == 0 )); then
+  if (( index % 2 == 0 )); then
     order="frozen,evolving"
   else
     order="evolving,frozen"
@@ -269,9 +305,10 @@ done
 
 # Experiment B: only evolving deliberately carries evidence across seeds.
 reset_playbook "${evolving_playbook}"
-for seed in 0 1 2; do
+for index in "${!seeds[@]}"; do
+  seed="${seeds[${index}]}"
   reset_playbook "${frozen_playbook}"
-  if (( seed % 2 == 0 )); then
+  if (( index % 2 == 0 )); then
     order="frozen,evolving"
   else
     order="evolving,frozen"
@@ -301,7 +338,10 @@ uv run python scripts/analyze_playbook_experiment.py \
   --expected-git-sha "${expected_git_sha}" \
   --engineering-baseline "${engineering_baseline}" \
   --recovery-evidence "${recovery_evidence}" \
-  --counterfactual-canary "${counterfactual_canary}"
+  --counterfactual-canary "${counterfactual_canary}" \
+  --expected-seed "${seeds[0]}" \
+  --expected-seed "${seeds[1]}" \
+  --expected-seed "${seeds[2]}"
 analysis_status=$?
 set -e
 if [[ ${analysis_status} -ne 0 ]]; then

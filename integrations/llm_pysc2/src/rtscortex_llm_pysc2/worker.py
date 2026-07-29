@@ -96,6 +96,7 @@ class WorkerSettings:
     socket_path: Optional[str]
     runtime_url: str
     seed: int
+    placement_outbox_path: Optional[str] = None
     execution_action_space: str = "features"
     agent_race: str = "protoss"
     scenario: str = "pvz_task1_level1"
@@ -199,6 +200,7 @@ class WorkerSettings:
             or os.environ.get("RTSCORTEX_SOCKET"),
             runtime_url=os.environ.get("RTSCORTEX_RUNTIME_URL", "http://127.0.0.1:8765"),
             seed=int(os.environ.get("RTSCORTEX_SEED", "0")),
+            placement_outbox_path=os.environ.get("RTSCORTEX_PLACEMENT_OUTBOX_PATH"),
             execution_action_space=execution_action_space,
             agent_race=agent_race,
             scenario=os.environ.get("RTSCORTEX_SCENARIO", "pvz_task1_level1"),
@@ -1532,6 +1534,7 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
             base_url=self.worker_settings.runtime_url,
             unix_socket=self.worker_settings.socket_path,
             timeout_seconds=self.worker_settings.runtime_request_timeout_seconds,
+            placement_outbox_path=self.worker_settings.placement_outbox_path,
         )
         self.runtime_client.health()
         unit_names, building_types = _unit_metadata()

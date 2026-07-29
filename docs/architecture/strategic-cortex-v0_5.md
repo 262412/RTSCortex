@@ -111,6 +111,25 @@ support. Candidate-to-soft promotion requires independent runs and independent s
 requires the configured seed, revision, false-block and paired A/B gates. Independent
 contradictions reduce confidence and eventually suspend or retire a rule.
 
+Before any production causal experiment, run:
+
+```bash
+rtscortex playbook hard-readiness \
+  --database <frozen-baseline.sqlite3> \
+  --config <production-config.yaml> \
+  --expected-git-sha <40-char-sha> \
+  --sc2-patch 4.10 \
+  --evaluation-seed <held-out-seed> \
+  --output playbook-hard-readiness.json
+```
+
+Exit status 2 means no Recovery, SC2, or model process may start. A production baseline needs
+at least one context-applicable, reachable, provenance-complete hard blocking rule. A
+qualification command creates a `HARD + FORBID` child from a `SOFT + AVOID` parent instead of
+mutating its soft parent, and rejects
+overlap between qualification and held-out evaluation seeds. The bounded fixture canary uses
+an isolated `evidence.canary_fixture=true` database; formal evaluation rejects that artifact.
+
 ### Strategic consequence attribution and self-iteration
 
 Post-game attribution runs only for completed `victory`, `defeat`, or `draw` episodes. A
@@ -172,7 +191,10 @@ intent, arbitration decision, Playbook rules, candidate and terminal execution r
 1. Run the Protoss a/b/c ensemble with Arbiter and Playbook in shadow mode on seeds 0, 1 and
    2; verify deterministic replay, reservations, ownership and no command-success regression.
 2. Promote the Arbiter to active only after the shadow engineering gates pass.
-3. Run paired Playbook on/off seeds; promote only the rules that satisfy the published gates.
+3. Validate the Active/Shadow mechanism with the bounded fixture canary. Qualify real hard
+   rules on a dedicated seed set, freeze the resulting baseline, run one production
+   natural-terminal Active/Shadow canary, then use disjoint held-out seeds for paired
+   Playbook evaluation.
 4. Completed: Terran Worker, add-on effects, smoke and seed regression.
 5. Completed: Zerg larva, inject, creep/morph provenance, seed regression, and 48-state corpus.
 6. Completed: Terran blocked-production and blocked-combat coverage and its verified

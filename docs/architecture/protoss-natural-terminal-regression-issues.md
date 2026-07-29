@@ -1485,6 +1485,71 @@ Two limitations are deliberately still visible:
   - non-build actions and action/structure mismatches cannot enter the
     Placement ledger.
 
+#### 2026-07-29 hard-rule readiness, canary isolation and Worker outbox follow-up
+
+- **Status:** the zero-GPU readiness and isolated canary infrastructure are
+  implemented. The current production baseline is intentionally **not**
+  canary-ready: it contains 39 active soft rules and no active hard blocking
+  rule. Real hard-rule qualification and held-out production evaluation remain
+  empirical work under SCX-PT-039.
+- **Evidence, impact and root cause:**
+  1. the production baseline could enter Recovery, SC2 startup and HIMA GPU
+     startup before proving that any hard blocking rule matched the configured
+     race, opponent and map. Counting all active hard rules would also accept a
+     rule that could never fire in the requested context;
+  2. the earlier causal canary and formal comparison shared one artifact type.
+     A synthetic hard rule could therefore prove the Active/Shadow mechanism
+     but be misread as evidence that a learned production rule was safe;
+  3. soft `avoid/prefer` rules cannot be made into safe blockers by changing
+     only `strength`. A qualified hard rule needs explicit `forbid/require`
+     semantics, immutable evidence hashes, parent lineage, source revision,
+     SC2 patch and disjoint qualification/evaluation seeds;
+  4. Runtime-side transition idempotency made duplicate delivery safe, but the
+     Worker sent each Placement transition only once. An HTTP acknowledgement
+     lost after the Runtime commit could still terminate a long game, because
+     the Worker did not retain the exact payload for retry.
+- **Implemented correction:**
+  - `rtscortex playbook hard-readiness` emits
+    `playbook-hard-readiness.json` before Recovery, SC2 or model startup. It
+    reports baseline hash, expected Git SHA, active soft/hard/blocking counts,
+    context-applicable and reachable blocking counts, qualification/evaluation
+    seed overlap and per-rule effect, action/role, typed context, source
+    runs/seeds, confidence, contradictions, shadow/false-block evidence,
+    strategic regret, revision/patch and rejection reasons. A non-runnable
+    baseline exits with status 2;
+  - both the production Active/Shadow canary runner and the formal paired
+    runner execute this preflight before Recovery. The current 39-soft/0-hard
+    baseline therefore stops without SC2 or GPU allocation;
+  - Path A uses a separate bounded scripted configuration and a baseline with
+    exactly one narrow `ACTIVE + HARD + FORBID` rule marked
+    `evidence.canary_fixture=true`. Runtime requires an explicit fixture opt-in,
+    consumes the fixture intervention once per episode and restores that state
+    from durable events after restart. Formal comparison accepts only
+    `canary_kind=production` and rejects fixture artifacts;
+  - `rtscortex playbook qualify-hard` derives a `HARD + FORBID` child from an
+    active `SOFT + AVOID` parent, preserving the parent. The child stores parent ID, evidence
+    hashes, qualified Git SHA and patch, qualification seeds, held-out
+    evaluation seeds and qualification kind. Strategic rules still require
+    paired outcome evidence; qualification/evaluation seed overlap is rejected;
+  - every live Worker receives a run-local SQLite Placement outbox. It writes
+    the complete event before sending, retries the same transition ID and
+    payload, treats `recorded` and `already_recorded` as success, treats HTTP
+    409 as a fatal identity conflict and retains transport/5xx failures across
+    Worker restart. The queue is bounded to 64 events.
+- **Acceptance criteria:**
+  - the current production baseline produces the readiness artifact and exits
+    2 with `context_applicable_blocking_hard_count=0`, before Recovery/SC2/GPU;
+  - a wrong-context, stale-revision, wrong-patch, under-supported or
+    qualification-seed-overlapping hard rule cannot make `canary_runnable`
+    true;
+  - the bounded fixture can prove one matched Active block and Shadow
+    counterfactual without being accepted by the formal 24-run analyzer;
+  - a qualified child is `hard + forbid`, retains its soft parent and
+    has hashed, revision-bound, seed-disjoint provenance;
+  - a lost acknowledgement and Worker restart resend byte-equivalent Placement
+    JSON and produce one Runtime ledger event; a same-ID/different-payload retry
+    remains fatal.
+
 ## Repair order
 
 1. Freeze characterization tests and add the cross-layer `OperationKey`,
@@ -1505,8 +1570,11 @@ Two limitations are deliberately still visible:
    frontier.
 8. Run all Python 3.11, Bridge Python 3.9 and front-end checks, including
    restart/crash/recovery tests.
-9. SCX-PT-039: run independent paired evaluation and sequential-learning
-   evaluation as separate acceptance sets.
+9. SCX-PT-039: run the bounded fixture Active/Shadow canary to validate the
+   mechanism; qualify real production hard rules from a dedicated seed set;
+   freeze that baseline; then run one natural-terminal Active/Shadow production
+   canary and the independent paired/sequential evaluation on disjoint held-out
+   seeds.
 
 ## Required engineering gates
 
@@ -1547,6 +1615,9 @@ source-bound restart recovery evidence is present and bounded by checkpoint tail
 effective live speed >= 2 game loops/s
 natural-run disk usage reduced by >= 4x
 counterfactual causal canary accepted for the same baseline and Git SHA
+zero-GPU hard readiness passes before Recovery, SC2 and model startup
+canary fixture evidence is rejected by formal production evaluation
+hard qualification and held-out evaluation seed sets are disjoint
 analysis evidence retention overflow = 0
 frozen Playbook hash remains unchanged
 evolving Playbook survives and affects the next game

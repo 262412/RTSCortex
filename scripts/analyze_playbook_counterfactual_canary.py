@@ -7,7 +7,7 @@ import csv
 import json
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from scripts.analyze_playbook_experiment import RunMetrics, _run_metrics
 
@@ -18,6 +18,8 @@ def build_canary_report(
     *,
     baseline_sha256: str,
     expected_git_sha: str,
+    readiness_evidence: dict[str, Any],
+    canary_kind: Literal["production", "fixture"] = "production",
 ) -> dict[str, Any]:
     resolved = set(shadow.resolved_counterfactual_keys)
     unmatched = [
@@ -40,9 +42,25 @@ def build_canary_report(
     ]
     first_unmatched_loop = min((record[1] for record in unmatched), default=None)
     first_state_hash_divergence = min(divergent_epochs, default=first_unmatched_loop)
+    readiness_valid = (
+        readiness_evidence.get("canary_runnable") is True
+        and readiness_evidence.get("baseline_sha256") == baseline_sha256
+        and readiness_evidence.get("expected_git_sha") == expected_git_sha
+        and int(readiness_evidence.get("context_applicable_blocking_hard_count", 0)) >= 1
+        and (
+            bool(readiness_evidence.get("canary_fixture_rule_ids"))
+            if canary_kind == "fixture"
+            else not bool(readiness_evidence.get("canary_fixture_rule_ids"))
+        )
+    )
     gates = {
+        "hard_readiness_accepted": readiness_valid,
         "runs_exit_zero": behavior.exit_code == 0 and shadow.exit_code == 0,
-        "runs_natural_terminal": behavior.natural_terminal and shadow.natural_terminal,
+        "runs_complete_for_kind": (
+            behavior.natural_terminal and shadow.natural_terminal
+            if canary_kind == "production"
+            else behavior.exit_code == 0 and shadow.exit_code == 0
+        ),
         "source_attestation_matches": (
             behavior.source_attestation_consistent
             and shadow.source_attestation_consistent
@@ -61,8 +79,11 @@ def build_canary_report(
     }
     return {
         "schema_version": "1.0",
+        "canary_kind": canary_kind,
+        "canary_fixture": canary_kind == "fixture",
         "baseline_sha256": baseline_sha256,
         "expected_git_sha": expected_git_sha,
+        "hard_readiness": readiness_evidence,
         "behavior": asdict(behavior),
         "shadow": asdict(shadow),
         "active_hard_block_count": len(active_keys),
@@ -98,10 +119,17 @@ def main() -> None:
     parser.add_argument("--expected-git-sha", required=True)
     parser.add_argument("--engineering-baseline", type=Path, required=True)
     parser.add_argument("--recovery-evidence", type=Path, required=True)
+    parser.add_argument("--readiness-evidence", type=Path, required=True)
+    parser.add_argument(
+        "--canary-kind",
+        choices=("production", "fixture"),
+        default="production",
+    )
     parser.add_argument("--output", type=Path, required=True)
     arguments = parser.parse_args()
     engineering_baseline = json.loads(arguments.engineering_baseline.read_text(encoding="utf-8"))
     recovery_evidence = json.loads(arguments.recovery_evidence.read_text(encoding="utf-8"))
+    readiness_evidence = json.loads(arguments.readiness_evidence.read_text(encoding="utf-8"))
     rows = list(
         csv.DictReader(
             (arguments.run_set_dir / "experiment-status.tsv").open(),
@@ -124,6 +152,8 @@ def main() -> None:
         _run_metrics(shadow_rows[0], **kwargs),
         baseline_sha256=arguments.baseline_sha256,
         expected_git_sha=arguments.expected_git_sha,
+        readiness_evidence=readiness_evidence,
+        canary_kind=arguments.canary_kind,
     )
     arguments.output.write_text(
         json.dumps(report, indent=2, sort_keys=True) + "\n",

@@ -14,6 +14,16 @@ from scripts.analyze_playbook_counterfactual_canary import build_canary_report
 from scripts.analyze_playbook_experiment import RunMetrics, _comparison
 
 
+def _readiness(*, fixture: bool = False) -> dict[str, object]:
+    return {
+        "baseline_sha256": "baseline",
+        "expected_git_sha": "expected",
+        "context_applicable_blocking_hard_count": 1,
+        "canary_fixture_rule_ids": ["fixture-rule"] if fixture else [],
+        "canary_runnable": True,
+    }
+
+
 def _metrics(
     *,
     mode: str,
@@ -447,9 +457,22 @@ def test_paired_runner_propagates_failed_acceptance_gate() -> None:
     assert "--engineering-baseline" in runner
     assert "--recovery-evidence" in runner
     assert "--counterfactual-canary" in runner
+    assert "--seeds" in runner
+    assert "--expected-seed" in runner
+    assert "playbook hard-readiness" in runner
+    assert runner.index("playbook hard-readiness") < runner.index(
+        "run_recovery_acceptance_canary.py"
+    )
     assert "submodule_diff_sha256_before" in runner
     assert "capture_source_attestation" in runner
     assert 'exit "${overall_status}"' in runner
+
+    canary_runner = (
+        Path(__file__).parents[2] / "scripts" / "run_protoss_playbook_counterfactual_canary.sh"
+    ).read_text(encoding="utf-8")
+    assert canary_runner.index("playbook hard-readiness") < canary_runner.index(
+        "run_recovery_acceptance_canary.py"
+    )
 
 
 def test_active_intent_cannot_be_resolved_by_different_shadow_target() -> None:
@@ -482,6 +505,7 @@ def test_active_intent_cannot_be_resolved_by_different_shadow_target() -> None:
         shadow,
         baseline_sha256="baseline",
         expected_git_sha="expected",
+        readiness_evidence=_readiness(),
     )
 
     assert report["matched_counterfactual_count"] == 0
@@ -524,6 +548,7 @@ def test_counterfactual_canary_reports_first_divergence_and_memory() -> None:
         shadow,
         baseline_sha256="baseline",
         expected_git_sha="expected",
+        readiness_evidence=_readiness(),
     )
 
     assert report["first_state_hash_divergence_game_loop"] == 100
@@ -563,6 +588,7 @@ def test_formal_comparison_accepts_complete_counterfactual_canary() -> None:
         shadow,
         baseline_sha256="baseline",
         expected_git_sha="expected",
+        readiness_evidence=_readiness(),
     )
 
     comparison = _comparison(
@@ -720,6 +746,67 @@ def test_formal_comparison_rejects_source_mismatched_counterfactual_canary() -> 
 
     assert comparison["gates"]["counterfactual_canary_accepted"] is False
     assert comparison["accepted"] is False
+
+
+def test_formal_comparison_rejects_fixture_counterfactual_canary() -> None:
+    behavior = replace(
+        _metrics(
+            mode="fixture",
+            seed=0,
+            arm="active",
+            before="baseline",
+            after="baseline",
+            repeated_errors=0,
+        ),
+        active_hard_block_keys=("counterfactual:shared",),
+        active_hard_block_records=(("counterfactual:shared", 100, "a" * 64),),
+        counterfactual_state_records=((100, "s" * 64, "a" * 64),),
+    )
+    shadow = replace(
+        _metrics(
+            mode="fixture",
+            seed=0,
+            arm="shadow",
+            before="baseline",
+            after="baseline",
+            repeated_errors=0,
+        ),
+        resolved_counterfactual_keys=("counterfactual:shared",),
+        counterfactual_state_records=((100, "s" * 64, "a" * 64),),
+    )
+    fixture = build_canary_report(
+        behavior,
+        shadow,
+        baseline_sha256="baseline",
+        expected_git_sha="expected",
+        readiness_evidence=_readiness(fixture=True),
+        canary_kind="fixture",
+    )
+
+    comparison = _comparison(
+        _strict_matrix(),
+        baseline_sha256="baseline",
+        expected_git_sha="expected",
+        counterfactual_canary=fixture,
+    )
+
+    assert fixture["accepted"] is True
+    assert fixture["canary_fixture"] is True
+    assert comparison["gates"]["counterfactual_canary_accepted"] is False
+    assert comparison["accepted"] is False
+
+
+def test_formal_comparison_accepts_an_explicit_held_out_seed_matrix() -> None:
+    held_out = [replace(metric, seed=metric.seed + 3) for metric in _strict_matrix()]
+
+    comparison = _comparison(
+        held_out,
+        baseline_sha256="baseline",
+        expected_seeds=(3, 4, 5),
+    )
+
+    assert comparison["expected_seed_ids"] == [3, 4, 5]
+    assert comparison["gates"]["complete_unique_run_matrix"] is True
 
 
 def test_run_metrics_streams_events_and_normalizes_error_exposure(

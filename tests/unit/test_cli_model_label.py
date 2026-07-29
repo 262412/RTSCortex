@@ -64,7 +64,12 @@ def test_live_worker_environment_propagates_the_configured_agent_race() -> None:
     )
     worker = LiveWorkerSpec(command=("python",), sc2_path=Path("/tmp/StarCraftII"))
 
-    environment = _live_worker_environment(config, worker)
+    environment = _live_worker_environment(
+        config,
+        worker,
+        placement_outbox_path=Path("/tmp/run/placement-outbox.sqlite3"),
+    )
 
     assert environment["RTSCORTEX_AGENT_RACE"] == "terran"
     assert environment["SC2PATH"] == "/tmp/StarCraftII"
+    assert environment["RTSCORTEX_PLACEMENT_OUTBOX_PATH"] == "/tmp/run/placement-outbox.sqlite3"

@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -ne 5 ]]; then
+  echo "usage: $0 <run-set-dir> --expected-git-sha <sha> --seed <seed>" >&2
+  exit 2
+fi
+if [[ "$2" != "--expected-git-sha" || "$4" != "--seed" ]]; then
+  echo "usage: $0 <run-set-dir> --expected-git-sha <sha> --seed <seed>" >&2
+  exit 2
+fi
+
+repo_dir="/mnt/scratch/users/tbczhang/projects/RTSCortex"
+output_root="/mnt/scratch/users/tbczhang/outputs/RTSCortex"
+run_set_dir="$1"
+expected_git_sha="$3"
+seed="$5"
+active_config="${repo_dir}/configs/experiments/live_simple64_scripted_playbook_fixture_active.yaml"
+shadow_config="${repo_dir}/configs/experiments/live_simple64_scripted_playbook_fixture_shadow.yaml"
+active_playbook="${output_root}/cortex-playbook-canary-fixture-active.sqlite3"
+shadow_playbook="${output_root}/cortex-playbook-canary-fixture-shadow.sqlite3"
+baseline_snapshot="${run_set_dir}/playbook.canary-fixture.sqlite3"
+readiness_evidence="${run_set_dir}/playbook-hard-readiness.json"
+recovery_placeholder="${run_set_dir}/recovery-not-required.json"
+status_file="${run_set_dir}/experiment-status.tsv"
+
+mkdir -p "${run_set_dir}"
+run_set_dir="$(readlink -f "${run_set_dir}")"
+baseline_snapshot="${run_set_dir}/playbook.canary-fixture.sqlite3"
+readiness_evidence="${run_set_dir}/playbook-hard-readiness.json"
+recovery_placeholder="${run_set_dir}/recovery-not-required.json"
+status_file="${run_set_dir}/experiment-status.tsv"
+
+cd "${repo_dir}"
+git_head="$(git rev-parse HEAD)"
+superproject_dirty="$(test -n "$(git status --porcelain --ignore-submodules=dirty)" && echo true || echo false)"
+if [[ "${git_head}" != "${expected_git_sha}" || "${superproject_dirty}" != "false" ]]; then
+  echo "fixture canary requires clean ${expected_git_sha}" >&2
+  exit 2
+fi
+
+rm -f "${baseline_snapshot}" "${baseline_snapshot}-shm" "${baseline_snapshot}-wal"
+uv run rtscortex playbook create-canary-fixture \
+  --database "${baseline_snapshot}" \
+  --expected-git-sha "${expected_git_sha}" \
+  --sc2-patch "4.10"
+baseline_sha256="$(sha256sum "${baseline_snapshot}" | awk '{print $1}')"
+
+uv run rtscortex playbook hard-readiness \
+  --database "${baseline_snapshot}" \
+  --config "${active_config}" \
+  --expected-git-sha "${expected_git_sha}" \
+  --sc2-patch "4.10" \
+  --evaluation-seed "${seed}" \
+  --allow-canary-fixture \
+  --output "${readiness_evidence}"
+
+printf '{"accepted":false,"skipped":true,"reason":"bounded fixture canary does not claim recovery acceptance"}\n' \
+  > "${recovery_placeholder}"
+printf "experiment_kind\tmode\tseed\tarm\tsubject_arm\tarm_order\texit_code\trun_dir\tplaybook_before_sha256\tplaybook_after_sha256\tplaybook_before_snapshot\tplaybook_after_snapshot\tgit_head_before\tgit_head_after\tsuperproject_dirty_before\tsuperproject_dirty_after\tsubmodule_commit_before\tsubmodule_commit_after\tsubmodule_dirty_before\tsubmodule_dirty_after\tsubmodule_diff_sha256_before\tsubmodule_diff_sha256_after\n" \
+  > "${status_file}"
+
+run_arm() {
+  local kind="$1"
+  local arm="$2"
+  local subject_arm="$3"
+  local config="$4"
+  local working_playbook="$5"
+  local arm_dir="${run_set_dir}/${arm}"
+  mkdir -p "${arm_dir}"
+  rm -f "${working_playbook}" "${working_playbook}-shm" "${working_playbook}-wal"
+  cp "${baseline_snapshot}" "${working_playbook}"
+  local before_snapshot="${arm_dir}/before.sqlite3"
+  local after_snapshot="${arm_dir}/after.sqlite3"
+  cp "${working_playbook}" "${before_snapshot}"
+  local before_sha256
+  before_sha256="$(sha256sum "${working_playbook}" | awk '{print $1}')"
+  local log_path="${arm_dir}/seed-${seed}.log"
+  local submodule_commit
+  local submodule_dirty
+  local submodule_diff_sha256
+  submodule_commit="$(git -C third_party/LLM-PySC2 rev-parse HEAD)"
+  submodule_dirty="$(test -n "$(git -C third_party/LLM-PySC2 status --porcelain)" && echo true || echo false)"
+  submodule_diff_sha256="$(git -C third_party/LLM-PySC2 diff --binary | sha256sum | awk '{print $1}')"
+  set +e
+  SC2PATH="/mnt/scratch/users/tbczhang/StarCraftII" \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    TOKENIZERS_PARALLELISM=false \
+    uv run rtscortex run --config "${config}" --seed "${seed}" \
+    2>&1 | tee "${log_path}"
+  local run_status=${PIPESTATUS[0]}
+  set -e
+  local run_dir
+  run_dir="$(sed -n 's/^Run directory: //p' "${log_path}" | tail -n 1)"
+  local after_sha256
+  after_sha256="$(sha256sum "${working_playbook}" | awk '{print $1}')"
+  cp "${working_playbook}" "${after_snapshot}"
+  local git_head_after
+  local dirty_after
+  local submodule_commit_after
+  local submodule_dirty_after
+  local submodule_diff_after
+  git_head_after="$(git rev-parse HEAD)"
+  dirty_after="$(test -n "$(git status --porcelain --ignore-submodules=dirty)" && echo true || echo false)"
+  submodule_commit_after="$(git -C third_party/LLM-PySC2 rev-parse HEAD)"
+  submodule_dirty_after="$(test -n "$(git -C third_party/LLM-PySC2 status --porcelain)" && echo true || echo false)"
+  submodule_diff_after="$(git -C third_party/LLM-PySC2 diff --binary | sha256sum | awk '{print $1}')"
+  printf "%s\tfixture\t%s\t%s\t%s\tactive,shadow\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+    "${kind}" "${seed}" "${arm}" "${subject_arm}" "${run_status}" "${run_dir}" \
+    "${before_sha256}" "${after_sha256}" "${before_snapshot}" "${after_snapshot}" \
+    "${git_head}" "${git_head_after}" "${superproject_dirty}" "${dirty_after}" \
+    "${submodule_commit}" "${submodule_commit_after}" "${submodule_dirty}" \
+    "${submodule_dirty_after}" "${submodule_diff_sha256}" "${submodule_diff_after}" \
+    >> "${status_file}"
+}
+
+run_arm behavior active "" "${active_config}" "${active_playbook}"
+run_arm calibration shadow active "${shadow_config}" "${shadow_playbook}"
+
+uv run python -m scripts.analyze_playbook_counterfactual_canary \
+  "${run_set_dir}" \
+  --baseline-sha256 "${baseline_sha256}" \
+  --expected-git-sha "${expected_git_sha}" \
+  --engineering-baseline "${repo_dir}/configs/acceptance/protoss_natural_terminal_v1.json" \
+  --recovery-evidence "${recovery_placeholder}" \
+  --readiness-evidence "${readiness_evidence}" \
+  --canary-kind fixture \
+  --output "${run_set_dir}/counterfactual-canary.json"

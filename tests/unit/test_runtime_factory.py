@@ -11,6 +11,7 @@ from rtscortex.config import (
     AgentSettings,
     CortexHIMAEnsembleMemberSettings,
     CortexMacroSettings,
+    CortexPlaybookSettings,
     CortexSettings,
     ExperimentConfig,
     ProviderSettings,
@@ -18,6 +19,7 @@ from rtscortex.config import (
     load_config,
 )
 from rtscortex.contracts import EconomyState, ObservationEnvelope, SC2State
+from rtscortex.playbook import create_canary_fixture
 from rtscortex.policy.hima import HIMA_PINNED_REVISIONS
 from rtscortex.providers import FakeProvider
 from rtscortex.runtime import factory
@@ -89,6 +91,50 @@ def test_cortex_disabled_uses_fake_provider_and_no_sidecar(
     assert isinstance(runtime.provider, FakeProvider)
     assert runtime._macro_client is None
     assert runtime._macro_sidecar is None
+    asyncio.run(runtime.close())
+
+
+def test_runtime_rejects_canary_fixture_without_explicit_config_opt_in(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "fixture.sqlite3"
+    create_canary_fixture(database, expected_git_sha="a" * 40, sc2_patch="4.10")
+    config = ExperimentConfig(
+        agent=AgentSettings(variant="cortex"),
+        cortex=CortexSettings(
+            playbook=CortexPlaybookSettings(
+                enabled=True,
+                database_path=database,
+                learning_mode="frozen",
+                rule_mode="active",
+            )
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="allow_canary_fixture"):
+        factory.build_runtime(config, tmp_path / "run")
+
+
+def test_runtime_allows_canary_fixture_only_with_explicit_config_opt_in(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "fixture.sqlite3"
+    create_canary_fixture(database, expected_git_sha="a" * 40, sc2_patch="4.10")
+    config = ExperimentConfig(
+        agent=AgentSettings(variant="cortex"),
+        cortex=CortexSettings(
+            playbook=CortexPlaybookSettings(
+                enabled=True,
+                database_path=database,
+                learning_mode="frozen",
+                rule_mode="active",
+                allow_canary_fixture=True,
+            )
+        ),
+    )
+
+    runtime = factory.build_runtime(config, tmp_path / "run")
+
     asyncio.run(runtime.close())
 
 

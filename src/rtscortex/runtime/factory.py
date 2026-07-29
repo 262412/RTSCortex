@@ -14,7 +14,11 @@ from rtscortex.cortex.race_brain import (
     HIMAEnsembleSidecar,
 )
 from rtscortex.memory import EventStore
-from rtscortex.playbook import CortexPlaybookReviewer, PlaybookStore
+from rtscortex.playbook import (
+    CortexPlaybookReviewer,
+    PlaybookStore,
+    contains_canary_fixture,
+)
 from rtscortex.policy.hima.live import HIMALivePolicyClient
 from rtscortex.providers import FakeProvider, OpenAICompatibleProvider
 from rtscortex.runtime.engine import RuntimeEngine
@@ -100,6 +104,15 @@ def _build_cortex_runtime(
         if config.cortex.playbook.enabled
         else None
     )
+    if (
+        playbook_store is not None
+        and contains_canary_fixture(playbook_store.rules())
+        and not config.cortex.playbook.allow_canary_fixture
+    ):
+        playbook_store.close()
+        raise RuntimeError(
+            "canary fixture Playbook requires cortex.playbook.allow_canary_fixture=true"
+        )
     playbook_reviewer = (
         CortexPlaybookReviewer(
             playbook_store,

@@ -121,7 +121,7 @@ class PlaybookCondition(ContractModel):
 
 
 class PlaybookRule(ContractModel):
-    schema_version: str = "2.0"
+    schema_version: str = "2.1"
     rule_id: str = Field(min_length=1)
     canonical_key: str = Field(min_length=1)
     category: PlaybookRuleCategory
@@ -145,6 +145,16 @@ class PlaybookRule(ContractModel):
     expires_at: datetime | None = None
     shadow_state_count: int = Field(default=0, ge=0)
     false_block_count: int = Field(default=0, ge=0)
+    parent_rule_id: str | None = None
+    evidence_hashes: tuple[str, ...] = ()
+    qualified_at_git_sha: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{40}$",
+    )
+    qualified_at_sc2_patch: str | None = None
+    qualification_seed_ids: tuple[int, ...] = ()
+    evaluation_seed_ids: tuple[int, ...] = ()
+    qualification_kind: Literal["execution", "strategic"] | None = None
     evidence: dict[str, object] = Field(default_factory=dict)
 
     @property

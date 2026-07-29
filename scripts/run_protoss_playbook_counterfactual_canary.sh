@@ -25,6 +25,7 @@ baseline_snapshot="${run_set_dir}/playbook.baseline.sqlite3"
 cp "${baseline_source}" "${baseline_snapshot}"
 baseline_sha256="$(sha256sum "${baseline_snapshot}" | awk '{print $1}')"
 recovery_evidence="${run_set_dir}/recovery-canary.json"
+readiness_evidence="${run_set_dir}/playbook-hard-readiness.json"
 status_file="${run_set_dir}/experiment-status.tsv"
 
 cd "${repo_dir}"
@@ -42,6 +43,14 @@ if [[ "${git_head}" != "${expected_git_sha}" || "${superproject_dirty}" != "fals
   echo "counterfactual canary requires clean ${expected_git_sha}" >&2
   exit 2
 fi
+
+uv run rtscortex playbook hard-readiness \
+  --database "${baseline_snapshot}" \
+  --config "${active_config}" \
+  --expected-git-sha "${expected_git_sha}" \
+  --sc2-patch "4.10" \
+  --evaluation-seed "${seed}" \
+  --output "${readiness_evidence}"
 
 uv run python scripts/run_recovery_acceptance_canary.py \
   --expected-git-sha "${expected_git_sha}" \
@@ -111,4 +120,5 @@ uv run python -m scripts.analyze_playbook_counterfactual_canary \
   --expected-git-sha "${expected_git_sha}" \
   --engineering-baseline "${engineering_baseline}" \
   --recovery-evidence "${recovery_evidence}" \
+  --readiness-evidence "${readiness_evidence}" \
   --output "${run_set_dir}/counterfactual-canary.json"

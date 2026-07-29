@@ -242,6 +242,7 @@ class CortexRuntimeEngine(RuntimeEngine):
         self._playbook_selection: PlaybookSelection | None = None
         self._playbook_selection_fingerprint: tuple[str, ...] | None = None
         self._playbook_rules: tuple[PlaybookRule, ...] = ()
+        self._consumed_canary_fixture_rule_ids: set[str] = set()
         self._pending_playbook_rule_evaluations: dict[str, PlaybookRuleEvaluation] = {}
         self._terminal_strategy_rule_evaluations: dict[str, PlaybookRuleEvaluation] = {}
         self._playbook_promotion_sweep_done = False
@@ -768,6 +769,7 @@ class CortexRuntimeEngine(RuntimeEngine):
         self._playbook_selection = None
         self._playbook_selection_fingerprint = None
         self._playbook_rules = ()
+        self._consumed_canary_fixture_rule_ids = set()
         self._pending_playbook_rule_evaluations = {}
         self._terminal_strategy_rule_evaluations = {}
         self._recent_terminal_feedback = {}
@@ -798,6 +800,7 @@ class CortexRuntimeEngine(RuntimeEngine):
         self._macro_task_outcome_revision = None
         self._macro_outcome_revision = 0
         self._next_macro_retry_game_loop = None
+        self._restore_consumed_canary_fixture_rules(observation)
         self._recover_cortex_episode(observation)
         if (
             self.store.last_event(
@@ -2664,18 +2667,19 @@ class CortexRuntimeEngine(RuntimeEngine):
     ) -> tuple[tuple[StrategicIntent, ...], dict[str, float], dict[str, tuple[str, ...]]]:
         mode = self.config.cortex.playbook.rule_mode
         assessment = self._current_situation
-        if mode == "disabled" or assessment is None or not self._playbook_rules:
+        if mode == "disabled" or assessment is None or not self._available_playbook_rules():
             return tuple(self._strategic_by_legacy_intent.values()), {}, {}
         context = self._playbook_context(assessment)
         guarded: list[StrategicIntent] = []
         deltas: dict[str, float] = {}
         rule_ids: dict[str, tuple[str, ...]] = {}
         for legacy_id, intent in tuple(self._strategic_by_legacy_intent.items()):
+            rules = self._available_playbook_rules()
             result = self._playbook_intent_guard.evaluate(
                 intent,
                 context=context,
                 situation=assessment,
-                rules=self._playbook_rules,
+                rules=rules,
                 game_loop=observation.game_loop,
                 behavior_before_hash=counterfactual_observation_fingerprint(observation),
                 mode=mode,
@@ -2714,18 +2718,19 @@ class CortexRuntimeEngine(RuntimeEngine):
         if (
             mode == "disabled"
             or assessment is None
-            or (not self._playbook_rules and not recent_feedback)
+            or (not self._available_playbook_rules() and not recent_feedback)
         ):
             return context
         playbook_context = self._playbook_context(assessment)
         candidates = []
         for candidate in context.candidates:
+            rules = self._available_playbook_rules()
             result = self._playbook_candidate_guard.evaluate(
                 candidate,
                 role=intent.role.value,
                 context=playbook_context,
                 situation=assessment,
-                rules=self._playbook_rules,
+                rules=rules,
                 run_id=observation.run_id,
                 episode_id=observation.episode_id,
                 step_id=observation.step_id,
@@ -2765,6 +2770,11 @@ class CortexRuntimeEngine(RuntimeEngine):
             rule = rules_by_id.get(application.rule_id)
             if rule is None:
                 continue
+            if rule.evidence.get("canary_fixture") is True and application.reason in {
+                "shadow_would_block",
+                "rule_blocked",
+            }:
+                self._consumed_canary_fixture_rule_ids.add(rule.rule_id)
             would_block = application.reason in {"shadow_would_block", "rule_blocked"}
             actual_outcome: Literal["pending", "blocked", "allowed"]
             if would_block and self.config.cortex.playbook.rule_mode == "shadow":
@@ -2820,6 +2830,36 @@ class CortexRuntimeEngine(RuntimeEngine):
             )
             if actual_outcome == "pending":
                 self._pending_playbook_rule_evaluations[evaluation.evaluation_id] = evaluation
+
+    def _available_playbook_rules(self) -> tuple[PlaybookRule, ...]:
+        return tuple(
+            rule
+            for rule in self._playbook_rules
+            if rule.rule_id not in self._consumed_canary_fixture_rule_ids
+        )
+
+    def _restore_consumed_canary_fixture_rules(
+        self,
+        observation: ObservationEnvelope,
+    ) -> None:
+        if self._playbook_store is None:
+            return
+        fixture_rule_ids = {
+            rule.rule_id
+            for rule in self._playbook_store.rules()
+            if rule.evidence.get("canary_fixture") is True
+        }
+        if not fixture_rule_ids:
+            return
+        for event in self.store.events_of_type(
+            observation.run_id,
+            observation.episode_id,
+            "playbook_rule_applied",
+        ):
+            rule_id = event.payload.get("rule_id")
+            reason = event.payload.get("reason")
+            if rule_id in fixture_rule_ids and reason in {"shadow_would_block", "rule_blocked"}:
+                self._consumed_canary_fixture_rule_ids.add(str(rule_id))
 
     @staticmethod
     def _playbook_rule_kind(rule: PlaybookRule) -> PlaybookRuleKind:

@@ -39,6 +39,15 @@ from rtscortex.playbook.models import (
     StrategicConsequenceType,
 )
 from rtscortex.playbook.promotion import PlaybookPromotionSweep, PromotionSweepResult
+from rtscortex.playbook.readiness import (
+    PlaybookHardReadinessReport,
+    PlaybookRuleReadiness,
+    analyze_hard_readiness,
+    analyze_hard_readiness_database,
+    contains_canary_fixture,
+    create_canary_fixture,
+    qualify_hard_rule,
+)
 from rtscortex.playbook.reviewer import CortexPlaybookReviewer
 from rtscortex.playbook.store import PlaybookStore
 
@@ -59,9 +68,11 @@ __all__ = [
     "RecentTerminalFeedback",
     "GuardResult",
     "PlaybookHit",
+    "PlaybookHardReadinessReport",
     "PlaybookLesson",
     "PlaybookQuery",
     "PlaybookRuleKind",
+    "PlaybookRuleReadiness",
     "PlaybookRule",
     "PlaybookRuleApplication",
     "PlaybookRuleEvaluation",
@@ -79,5 +90,10 @@ __all__ = [
     "StrategicConsequenceType",
     "PlaybookSelection",
     "PlaybookStore",
+    "analyze_hard_readiness",
+    "analyze_hard_readiness_database",
     "candidate_signature",
+    "contains_canary_fixture",
+    "create_canary_fixture",
+    "qualify_hard_rule",
 ]

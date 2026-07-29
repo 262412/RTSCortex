@@ -139,6 +139,12 @@ def main() -> None:
     parser.add_argument("--engineering-baseline", type=Path, required=True)
     parser.add_argument("--recovery-evidence", type=Path, required=True)
     parser.add_argument("--counterfactual-canary", type=Path, required=True)
+    parser.add_argument(
+        "--expected-seed",
+        type=int,
+        action="append",
+        dest="expected_seeds",
+    )
     arguments = parser.parse_args()
     run_set = arguments.run_set_dir.resolve()
     engineering_baseline = json.loads(arguments.engineering_baseline.read_text(encoding="utf-8"))
@@ -160,6 +166,7 @@ def main() -> None:
         baseline_sha256=arguments.baseline_sha256,
         counterfactual_canary=counterfactual_canary,
         expected_git_sha=arguments.expected_git_sha,
+        expected_seeds=tuple(arguments.expected_seeds or (0, 1, 2)),
     )
     (run_set / "comparison.json").write_text(
         json.dumps(report, indent=2, sort_keys=True) + "\n",
@@ -596,14 +603,23 @@ def counterfactual_canary_is_valid(
     gates = artifact.get("gates")
     behavior = artifact.get("behavior")
     shadow = artifact.get("shadow")
+    readiness = artifact.get("hard_readiness")
     return (
         artifact.get("schema_version") == "1.0"
+        and artifact.get("canary_kind") == "production"
+        and artifact.get("canary_fixture") is False
         and artifact.get("accepted") is True
         and artifact.get("baseline_sha256") == baseline_sha256
         and (expected_git_sha is None or artifact.get("expected_git_sha") == expected_git_sha)
         and isinstance(gates, dict)
         and bool(gates)
         and all(value is True for value in gates.values())
+        and isinstance(readiness, dict)
+        and readiness.get("canary_runnable") is True
+        and readiness.get("baseline_sha256") == baseline_sha256
+        and readiness.get("expected_git_sha") == expected_git_sha
+        and int(readiness.get("context_applicable_blocking_hard_count", 0)) >= 1
+        and not bool(readiness.get("canary_fixture_rule_ids"))
         and int(artifact.get("active_hard_block_count", 0)) > 0
         and int(artifact.get("matched_counterfactual_count", 0)) > 0
         and int(artifact.get("unmatched_active_hard_block_count", -1)) == 0
@@ -622,21 +638,25 @@ def _comparison(
     baseline_sha256: str,
     counterfactual_canary: dict[str, Any] | None = None,
     expected_git_sha: str | None = None,
+    expected_seeds: tuple[int, ...] = (0, 1, 2),
 ) -> dict[str, Any]:
     behavior = [metric for metric in metrics if metric.experiment_kind == "behavior"]
     calibration = [metric for metric in metrics if metric.experiment_kind == "calibration"]
     split_matrix = any(metric.subject_arm is not None for metric in metrics)
+    unique_expected_seeds = tuple(dict.fromkeys(expected_seeds))
+    if len(unique_expected_seeds) != 3:
+        raise ValueError("formal comparison requires exactly three distinct held-out seeds")
     expected_behavior_matrix = {
         (mode, seed, arm)
         for mode in ("independent_paired", "sequential_learning")
-        for seed in (0, 1, 2)
+        for seed in unique_expected_seeds
         for arm in ("frozen", "evolving")
     }
     observed_behavior_matrix = {(metric.mode, metric.seed, metric.arm) for metric in behavior}
     expected_calibration_matrix = {
         (mode, seed, subject_arm)
         for mode in ("independent_paired", "sequential_learning")
-        for seed in (0, 1, 2)
+        for seed in unique_expected_seeds
         for subject_arm in ("frozen", "evolving")
     }
     observed_calibration_matrix = {
@@ -833,6 +853,7 @@ def _comparison(
     return {
         "schema_version": "1.2",
         "baseline_sha256": baseline_sha256,
+        "expected_seed_ids": list(unique_expected_seeds),
         "runs": [asdict(metric) for metric in metrics],
         "paired_differences": paired,
         "aggregate": {

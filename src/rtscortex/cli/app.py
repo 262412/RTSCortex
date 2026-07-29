@@ -36,9 +36,14 @@ from rtscortex.evaluation import (
 from rtscortex.evaluation.replay import replay_event_log
 from rtscortex.memory import EventStore, read_event_log
 from rtscortex.playbook import (
+    PlaybookHardReadinessReport,
     PlaybookPromotionSweep,
     PlaybookRunLearner,
     PlaybookStore,
+    StrategicABEvidence,
+    analyze_hard_readiness_database,
+    create_canary_fixture,
+    qualify_hard_rule,
 )
 from rtscortex.policy import (
     LLMPlanningPolicySubagent,
@@ -109,6 +114,8 @@ def _reserve_run_dir(output_root: Path, prefix: str) -> tuple[str, Path]:
 def _live_worker_environment(
     config: ExperimentConfig,
     live_worker: LiveWorkerSpec,
+    *,
+    placement_outbox_path: Path | None = None,
 ) -> dict[str, str]:
     environment = {
         "SC2PATH": str(live_worker.sc2_path),
@@ -148,6 +155,10 @@ def _live_worker_environment(
     if config.environment.simulation_speed_multiplier is not None:
         environment["RTSCORTEX_SIMULATION_SPEED_MULTIPLIER"] = str(
             config.environment.simulation_speed_multiplier
+        )
+    if placement_outbox_path is not None:
+        environment["RTSCORTEX_PLACEMENT_OUTBOX_PATH"] = str(
+            placement_outbox_path.expanduser().resolve()
         )
     return environment
 
@@ -286,6 +297,207 @@ def playbook_learn(
     typer.echo(json.dumps(asdict(result), ensure_ascii=False, indent=2, sort_keys=True))
 
 
+@playbook_app.command("hard-readiness")
+def playbook_hard_readiness(
+    database: Annotated[
+        Path,
+        typer.Option("--database", dir_okay=False, help="Frozen Playbook baseline."),
+    ],
+    config_path: Annotated[
+        Path,
+        typer.Option("--config", exists=True, dir_okay=False, help="Canary experiment config."),
+    ],
+    expected_git_sha: Annotated[
+        str,
+        typer.Option("--expected-git-sha", help="Exact 40-character source revision."),
+    ],
+    sc2_patch: Annotated[
+        str,
+        typer.Option("--sc2-patch", help="SC2 patch used for qualification and execution."),
+    ],
+    output: Annotated[
+        Path,
+        typer.Option("--output", dir_okay=False, help="Readiness JSON artifact."),
+    ] = Path("playbook-hard-readiness.json"),
+    evaluation_seeds: Annotated[
+        list[int] | None,
+        typer.Option(
+            "--evaluation-seed",
+            help="Held-out evaluation seed. Repeat to reject qualification-data reuse.",
+        ),
+    ] = None,
+    allow_canary_fixture: Annotated[
+        bool,
+        typer.Option(
+            "--allow-canary-fixture",
+            help="Allow the isolated one-shot infrastructure fixture.",
+        ),
+    ] = False,
+) -> None:
+    """Fail before Recovery, SC2, or GPU work unless a blocking rule can apply."""
+
+    path = database.expanduser().resolve()
+    if not path.is_file():
+        raise typer.BadParameter(
+            f"playbook database does not exist: {path}",
+            param_hint="--database",
+        )
+    if len(expected_git_sha) != 40 or any(
+        character not in "0123456789abcdef" for character in expected_git_sha
+    ):
+        raise typer.BadParameter(
+            "expected git SHA must be 40 lowercase hexadecimal characters",
+            param_hint="--expected-git-sha",
+        )
+    config = load_config(config_path)
+    if config.cortex.playbook.allow_canary_fixture and not allow_canary_fixture:
+        raise typer.BadParameter(
+            "fixture-enabled configs require --allow-canary-fixture",
+            param_hint="--allow-canary-fixture",
+        )
+    report = analyze_hard_readiness_database(
+        path,
+        expected_git_sha=expected_git_sha,
+        sc2_patch=sc2_patch,
+        agent_race=config.environment.agent_race,
+        opponent_race=config.environment.opponent_race,
+        map_name=config.environment.scenario,
+        evaluation_seed_ids=tuple(evaluation_seeds or ()),
+        allow_canary_fixture=allow_canary_fixture,
+    )
+    _write_readiness_report(report, output)
+    typer.echo(report.model_dump_json(indent=2))
+    if not report.canary_runnable:
+        raise typer.Exit(code=2)
+
+
+@playbook_app.command("qualify-hard")
+def playbook_qualify_hard(
+    database: Annotated[
+        Path,
+        typer.Option("--database", dir_okay=False, help="Writable qualification store."),
+    ],
+    parent_rule_id: Annotated[
+        str,
+        typer.Option("--parent-rule-id", help="Active soft rule to qualify."),
+    ],
+    expected_git_sha: Annotated[
+        str,
+        typer.Option("--expected-git-sha", help="Exact qualification source revision."),
+    ],
+    sc2_patch: Annotated[
+        str,
+        typer.Option("--sc2-patch", help="SC2 patch used by the evidence."),
+    ],
+    evidence_paths: Annotated[
+        list[Path],
+        typer.Option(
+            "--evidence",
+            exists=True,
+            dir_okay=False,
+            help="Immutable evidence artifact. Repeat for every source.",
+        ),
+    ],
+    evaluation_seeds: Annotated[
+        list[int],
+        typer.Option(
+            "--evaluation-seed",
+            help="Held-out seed. Repeat; it must not overlap qualification evidence.",
+        ),
+    ],
+    strategic_ab_path: Annotated[
+        Path | None,
+        typer.Option(
+            "--strategic-ab",
+            exists=True,
+            dir_okay=False,
+            help="Paired outcome JSON required for strategic blocking rules.",
+        ),
+    ] = None,
+) -> None:
+    """Derive a provenance-bound hard child without mutating its soft parent."""
+
+    path = database.expanduser().resolve()
+    if not path.is_file():
+        raise typer.BadParameter(
+            f"playbook database does not exist: {path}",
+            param_hint="--database",
+        )
+    strategic_ab = (
+        None if strategic_ab_path is None else _load_strategic_ab_evidence(strategic_ab_path)
+    )
+    store = PlaybookStore(path)
+    try:
+        try:
+            qualified = qualify_hard_rule(
+                store,
+                parent_rule_id=parent_rule_id,
+                expected_git_sha=expected_git_sha,
+                sc2_patch=sc2_patch,
+                evidence_paths=evidence_paths,
+                evaluation_seed_ids=evaluation_seeds,
+                strategic_ab=strategic_ab,
+            )
+        except ValueError as error:
+            raise typer.BadParameter(str(error)) from error
+    finally:
+        store.close()
+    typer.echo(qualified.model_dump_json(indent=2))
+
+
+@playbook_app.command("create-canary-fixture")
+def playbook_create_canary_fixture(
+    database: Annotated[
+        Path,
+        typer.Option("--database", dir_okay=False, help="New isolated fixture database."),
+    ],
+    expected_git_sha: Annotated[
+        str,
+        typer.Option("--expected-git-sha", help="Exact canary source revision."),
+    ],
+    sc2_patch: Annotated[
+        str,
+        typer.Option("--sc2-patch", help="SC2 patch used by the canary."),
+    ],
+) -> None:
+    """Create the isolated one-shot hard-rule fixture used only by Path A."""
+
+    try:
+        rule = create_canary_fixture(
+            database,
+            expected_git_sha=expected_git_sha,
+            sc2_patch=sc2_patch,
+        )
+    except ValueError as error:
+        raise typer.BadParameter(str(error), param_hint="--database") from error
+    typer.echo(rule.model_dump_json(indent=2))
+
+
+def _write_readiness_report(
+    report: PlaybookHardReadinessReport,
+    output: Path,
+) -> None:
+    destination = output.expanduser().resolve()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(report.model_dump_json(indent=2) + "\n", encoding="utf-8")
+
+
+def _load_strategic_ab_evidence(path: Path) -> StrategicABEvidence:
+    try:
+        payload = json.loads(path.expanduser().read_text(encoding="utf-8"))
+        return StrategicABEvidence(
+            paired_seed_count=int(payload["paired_seed_count"]),
+            repeat_error_reduction=float(payload["repeat_error_reduction"]),
+            task_score_improvement=float(payload["task_score_improvement"]),
+            win_rate_delta=float(payload["win_rate_delta"]),
+        )
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+        raise typer.BadParameter(
+            f"invalid strategic paired-evidence JSON: {error}",
+            param_hint="--strategic-ab",
+        ) from error
+
+
 def _snapshot_config(config: ExperimentConfig, run_dir: Path) -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
     payload = config.model_dump(mode="json")
@@ -400,7 +612,11 @@ def run_experiment(
         runtime = build_runtime(config, run_dir)
         if live_worker is not None:
             assert runtime_socket is not None
-            worker_environment = _live_worker_environment(config, live_worker)
+            worker_environment = _live_worker_environment(
+                config,
+                live_worker,
+                placement_outbox_path=run_dir / "placement-transition-outbox.sqlite3",
+            )
             console_hub: LiveConsoleHub | None = None
             console_api = None
             if config.console.enabled:
