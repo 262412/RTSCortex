@@ -22,6 +22,7 @@ shadow_playbook="${output_root}/cortex-playbook-canary-fixture-shadow.sqlite3"
 baseline_snapshot="${run_set_dir}/playbook.canary-fixture.sqlite3"
 readiness_evidence="${run_set_dir}/playbook-hard-readiness.json"
 recovery_placeholder="${run_set_dir}/recovery-not-required.json"
+reviewed_source_root="${run_set_dir}/reviewed-source"
 status_file="${run_set_dir}/experiment-status.tsv"
 
 mkdir -p "${run_set_dir}"
@@ -61,9 +62,20 @@ uv run rtscortex playbook hard-readiness \
   --allow-canary-fixture \
   --output "${readiness_evidence}"
 
+uv run python scripts/prepare_reviewed_llm_pysc2_runtime.py \
+  --source third_party/LLM-PySC2 \
+  --output-root "${reviewed_source_root}" \
+  --patch-directory integrations/llm_pysc2/patches \
+  --expected-gitlink "${submodule_gitlink}"
+export RTSCORTEX_REVIEWED_SOURCE_ROOT="${reviewed_source_root}"
+reviewed_llm_pysc2="${reviewed_source_root}/third_party/LLM-PySC2"
+reviewed_source_diff_sha256="$(
+  git -C "${reviewed_llm_pysc2}" diff --binary | sha256sum | awk '{print $1}'
+)"
+
 printf '{"accepted":false,"skipped":true,"reason":"bounded fixture canary does not claim recovery acceptance"}\n' \
   > "${recovery_placeholder}"
-printf "experiment_kind\tmode\tseed\tarm\tsubject_arm\tarm_order\texit_code\trun_dir\tplaybook_before_sha256\tplaybook_after_sha256\tplaybook_before_snapshot\tplaybook_after_snapshot\tgit_head_before\tgit_head_after\tsuperproject_dirty_before\tsuperproject_dirty_after\tsubmodule_commit_before\tsubmodule_commit_after\tsubmodule_dirty_before\tsubmodule_dirty_after\tsubmodule_gitlink_before\tsubmodule_gitlink_after\tsubmodule_diff_sha256_before\tsubmodule_diff_sha256_after\n" \
+printf "experiment_kind\tmode\tseed\tarm\tsubject_arm\tarm_order\texit_code\trun_dir\tplaybook_before_sha256\tplaybook_after_sha256\tplaybook_before_snapshot\tplaybook_after_snapshot\tgit_head_before\tgit_head_after\tsuperproject_dirty_before\tsuperproject_dirty_after\tsubmodule_commit_before\tsubmodule_commit_after\tsubmodule_dirty_before\tsubmodule_dirty_after\tsubmodule_gitlink_before\tsubmodule_gitlink_after\tsubmodule_diff_sha256_before\tsubmodule_diff_sha256_after\treviewed_source_commit_before\treviewed_source_commit_after\treviewed_source_diff_sha256_before\treviewed_source_diff_sha256_after\n" \
   > "${status_file}"
 
 run_arm() {
@@ -84,6 +96,17 @@ run_arm() {
   local log_path="${arm_dir}/seed-${seed}.log"
   local submodule_diff_sha256
   submodule_diff_sha256="$(git -C third_party/LLM-PySC2 diff --binary | sha256sum | awk '{print $1}')"
+  local reviewed_commit_before
+  reviewed_commit_before="$(git -C "${reviewed_llm_pysc2}" rev-parse HEAD)"
+  local reviewed_diff_before
+  reviewed_diff_before="$(
+    git -C "${reviewed_llm_pysc2}" diff --binary | sha256sum | awk '{print $1}'
+  )"
+  if [[ "${reviewed_commit_before}" != "${submodule_gitlink}" \
+    || "${reviewed_diff_before}" != "${reviewed_source_diff_sha256}" ]]; then
+    echo "reviewed Worker source changed before fixture ${arm}/seed-${seed}" >&2
+    exit 2
+  fi
   set +e
   SC2PATH="/mnt/scratch/users/tbczhang/StarCraftII" \
     HF_HUB_OFFLINE=1 \
@@ -116,6 +139,17 @@ run_arm() {
   submodule_dirty_after="$(test -n "$(git -C third_party/LLM-PySC2 status --porcelain)" && echo true || echo false)"
   submodule_gitlink_after="$(git ls-tree HEAD third_party/LLM-PySC2 | awk '{print $3}')"
   submodule_diff_after="$(git -C third_party/LLM-PySC2 diff --binary | sha256sum | awk '{print $1}')"
+  local reviewed_commit_after
+  reviewed_commit_after="$(git -C "${reviewed_llm_pysc2}" rev-parse HEAD)"
+  local reviewed_diff_after
+  reviewed_diff_after="$(
+    git -C "${reviewed_llm_pysc2}" diff --binary | sha256sum | awk '{print $1}'
+  )"
+  if [[ "${reviewed_commit_after}" != "${submodule_gitlink}" \
+    || "${reviewed_diff_after}" != "${reviewed_source_diff_sha256}" ]]; then
+    echo "reviewed Worker source changed during fixture ${arm}/seed-${seed}" >&2
+    run_status=86
+  fi
   local fields=(
     "${kind}" "fixture" "${seed}" "${arm}" "${subject_arm}" "active,shadow"
     "${run_status}" "${run_dir}" "${before_sha256}" "${after_sha256}"
@@ -124,6 +158,8 @@ run_arm() {
     "${submodule_commit_after}" "${submodule_dirty}" "${submodule_dirty_after}"
     "${submodule_gitlink}" "${submodule_gitlink_after}"
     "${submodule_diff_sha256}" "${submodule_diff_after}"
+    "${reviewed_commit_before}" "${reviewed_commit_after}"
+    "${reviewed_diff_before}" "${reviewed_diff_after}"
   )
   (
     IFS=$'\t'

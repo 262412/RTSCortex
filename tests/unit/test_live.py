@@ -143,6 +143,16 @@ def test_prepare_live_worker_builds_fixed_pysc2_command(tmp_path: Path) -> None:
         "0",
     )
 
+    reviewed_root = tmp_path / "reviewed"
+    reviewed_root.mkdir()
+    (tmp_path / "third_party").rename(reviewed_root / "third_party")
+    reviewed_spec = prepare_live_worker(
+        config,
+        tmp_path,
+        environment={"RTSCORTEX_REVIEWED_SOURCE_ROOT": str(reviewed_root)},
+    )
+    assert reviewed_spec.python_path == (reviewed_root / "third_party" / "LLM-PySC2",)
+
     executable.unlink()
     old_executable = sc2_path / "Versions/Base75689/SC2_x64"
     old_executable.parent.mkdir(parents=True)

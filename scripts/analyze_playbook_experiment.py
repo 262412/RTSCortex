@@ -442,6 +442,10 @@ def _run_metrics(
     submodule_gitlink_after = row.get("submodule_gitlink_after", "")
     submodule_diff_before = row.get("submodule_diff_sha256_before", "")
     submodule_diff_after = row.get("submodule_diff_sha256_after", "")
+    reviewed_source_commit_before = row.get("reviewed_source_commit_before", "")
+    reviewed_source_commit_after = row.get("reviewed_source_commit_after", "")
+    reviewed_source_diff_before = row.get("reviewed_source_diff_sha256_before", "")
+    reviewed_source_diff_after = row.get("reviewed_source_diff_sha256_after", "")
     has_source_attestation = all(
         (
             git_head_before,
@@ -456,6 +460,10 @@ def _run_metrics(
             submodule_gitlink_after,
             submodule_diff_before,
             submodule_diff_after,
+            reviewed_source_commit_before,
+            reviewed_source_commit_after,
+            reviewed_source_diff_before,
+            reviewed_source_diff_after,
         )
     )
     source_attestation_consistent = (
@@ -467,6 +475,10 @@ def _run_metrics(
         and submodule_gitlink_before == submodule_gitlink_after
         and submodule_commit_before == submodule_gitlink_before
         and submodule_diff_before == submodule_diff_after
+        and reviewed_source_commit_before
+        == reviewed_source_commit_after
+        == submodule_gitlink_before
+        and reviewed_source_diff_before == reviewed_source_diff_after
     )
     source_attestation_fingerprint = (
         _source_attestation_fingerprint(
@@ -476,6 +488,8 @@ def _run_metrics(
             submodule_dirty=submodule_dirty_before,
             submodule_gitlink=submodule_gitlink_before,
             submodule_diff_sha256=submodule_diff_before,
+            reviewed_source_commit=reviewed_source_commit_before,
+            reviewed_source_diff_sha256=reviewed_source_diff_before,
         )
         if source_attestation_consistent
         else None
@@ -600,6 +614,8 @@ def _source_attestation_fingerprint(
     submodule_dirty: str,
     submodule_gitlink: str,
     submodule_diff_sha256: str,
+    reviewed_source_commit: str,
+    reviewed_source_diff_sha256: str,
 ) -> str:
     payload = json.dumps(
         {
@@ -609,6 +625,8 @@ def _source_attestation_fingerprint(
             "submodule_dirty": submodule_dirty,
             "submodule_gitlink": submodule_gitlink,
             "submodule_diff_sha256": submodule_diff_sha256,
+            "reviewed_source_commit": reviewed_source_commit,
+            "reviewed_source_diff_sha256": reviewed_source_diff_sha256,
         },
         sort_keys=True,
         separators=(",", ":"),

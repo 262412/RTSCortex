@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from rtscortex.cli.app import _active_model_label, _live_worker_environment
 from rtscortex.config import (
     AgentSettings,
@@ -54,7 +56,9 @@ def test_console_model_label_identifies_the_race_brain_ensemble() -> None:
     assert _active_model_label(config) == "HIMA Protoss a/b/c Ensemble"
 
 
-def test_live_worker_environment_propagates_the_configured_agent_race() -> None:
+def test_live_worker_environment_propagates_the_configured_agent_race(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     config = ExperimentConfig(
         environment=EnvironmentSettings(
             adapter="llm_pysc2",
@@ -62,7 +66,12 @@ def test_live_worker_environment_propagates_the_configured_agent_race() -> None:
             agent_race="terran",
         )
     )
-    worker = LiveWorkerSpec(command=("python",), sc2_path=Path("/tmp/StarCraftII"))
+    monkeypatch.setenv("PYTHONPATH", "/existing/python/path")
+    worker = LiveWorkerSpec(
+        command=("python",),
+        sc2_path=Path("/tmp/StarCraftII"),
+        python_path=(Path("/tmp/reviewed/LLM-PySC2"),),
+    )
 
     environment = _live_worker_environment(
         config,
@@ -73,3 +82,4 @@ def test_live_worker_environment_propagates_the_configured_agent_race() -> None:
     assert environment["RTSCORTEX_AGENT_RACE"] == "terran"
     assert environment["SC2PATH"] == "/tmp/StarCraftII"
     assert environment["RTSCORTEX_PLACEMENT_OUTBOX_PATH"] == "/tmp/run/placement-outbox.sqlite3"
+    assert environment["PYTHONPATH"] == "/tmp/reviewed/LLM-PySC2:/existing/python/path"

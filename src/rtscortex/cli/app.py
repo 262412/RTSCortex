@@ -159,6 +159,12 @@ def _live_worker_environment(
         environment["RTSCORTEX_PLACEMENT_OUTBOX_PATH"] = str(
             placement_outbox_path.expanduser().resolve()
         )
+    if live_worker.python_path:
+        existing_python_path = os.environ.get("PYTHONPATH")
+        python_paths = [*(str(path) for path in live_worker.python_path)]
+        if existing_python_path:
+            python_paths.append(existing_python_path)
+        environment["PYTHONPATH"] = os.pathsep.join(python_paths)
     return environment
 
 

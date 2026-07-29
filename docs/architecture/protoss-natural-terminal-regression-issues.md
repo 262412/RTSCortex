@@ -1589,11 +1589,18 @@ Two limitations are deliberately still visible:
      recorded gitlink;
   6. readiness treated unsupported operators on static race/opponent/map
      fields as matches, which could launch an expensive production canary for
-     a rule whose static scope was invalid.
+     a rule whose static scope was invalid;
+  7. the first source-attestation correction required the tracked
+     LLM-PySC2 checkout to be clean, while `prepare_live_worker()` required the
+     reviewed patch markers to exist in that same checkout. A truly clean
+     gitlink therefore could not start the live Worker, and a patched checkout
+     could not pass source attestation.
 - **Root cause:** the experiment had separate notions of execution seed,
   held-out evaluation set, individually acceptable rules, Runtime-loaded
   rules, evidence file identity and source identity. These values were logged
-  but were not bound into one fail-closed baseline contract.
+  but were not bound into one fail-closed baseline contract. The Bridge source
+  also conflated the immutable upstream identity with the mutable,
+  reviewed-at-runtime patch application.
 - **Implemented correction:**
   - the production canary now requires one `--execution-seed` plus the complete
     `--evaluation-seeds` set. The execution seed must be a member of that
@@ -1624,6 +1631,14 @@ Two limitations are deliberately still visible:
     LLM-PySC2 submodule and require its HEAD to equal the superproject gitlink.
     Per-run TSV attestation includes the gitlink before and after; the analyzer
     rejects dirty or mismatched rows;
+  - after readiness succeeds and before Recovery or SC2 starts, every runner
+    creates one run-set-local reviewed source tree from the exact clean
+    gitlink, applies the tracked 23-patch chain in order and records every
+    patch hash, the patch-set hash and the resulting binary-diff hash. The
+    Worker probe and process prepend only this reviewed tree to `PYTHONPATH`;
+    every behavior and Shadow row records the reviewed commit and diff before
+    and after execution, while the tracked submodule remains unchanged and
+    continues to be the upstream source-identity authority;
   - static race/opponent/map conditions accept only `eq`, `in` and `contains`.
     Unsupported operators are explicit readiness rejection reasons.
 - **Acceptance criteria:**
@@ -1638,7 +1653,10 @@ Two limitations are deliberately still visible:
     in readiness;
   - fixture success never claims a terminal counterfactual;
   - dirty, detached or gitlink-mismatched LLM-PySC2 state rejects every formal
-    entry point before SC2 startup.
+    entry point before SC2 startup;
+  - all 23 reviewed patches apply to an isolated copy of the recorded gitlink,
+    the Worker imports LLM-PySC2 from that copy, and the tracked submodule
+    remains clean before and after every arm.
 
 ## Repair order
 

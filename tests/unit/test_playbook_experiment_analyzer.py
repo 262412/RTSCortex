@@ -313,9 +313,11 @@ def test_runs_from_different_source_attestations_reject_acceptance() -> None:
         {"submodule_dirty_before": "true", "submodule_dirty_after": "true"},
         {"submodule_gitlink_before": "other", "submodule_gitlink_after": "other"},
         {"submodule_commit_after": "other"},
+        {"reviewed_source_commit_after": "other"},
+        {"reviewed_source_diff_sha256_after": "other"},
     ],
 )
-def test_dirty_or_gitlink_mismatched_submodule_fails_source_attestation(
+def test_divergent_source_attestation_fails_closed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     source_overrides: dict[str, str],
@@ -496,8 +498,13 @@ def test_paired_runner_propagates_failed_acceptance_gate() -> None:
     assert runner.index("playbook hard-readiness") < runner.index(
         "run_recovery_acceptance_canary.py"
     )
+    assert runner.index("prepare_reviewed_llm_pysc2_runtime.py") < runner.index(
+        "run_recovery_acceptance_canary.py"
+    )
+    assert 'export RTSCORTEX_REVIEWED_SOURCE_ROOT="${reviewed_source_root}"' in runner
     assert "submodule_diff_sha256_before" in runner
     assert "submodule_gitlink_before" in runner
+    assert "reviewed_source_diff_sha256_before" in runner
     assert '"${submodule_dirty}" != "false"' in runner
     assert '"${submodule_commit}" != "${submodule_gitlink}"' in runner
     assert "capture_source_attestation" in runner
@@ -509,10 +516,15 @@ def test_paired_runner_propagates_failed_acceptance_gate() -> None:
     assert canary_runner.index("playbook hard-readiness") < canary_runner.index(
         "run_recovery_acceptance_canary.py"
     )
+    assert canary_runner.index("prepare_reviewed_llm_pysc2_runtime.py") < (
+        canary_runner.index("run_recovery_acceptance_canary.py")
+    )
+    assert 'export RTSCORTEX_REVIEWED_SOURCE_ROOT="${reviewed_source_root}"' in canary_runner
     assert "--execution-seed" in canary_runner
     assert "--evaluation-seeds" in canary_runner
     assert "readiness_seed_args" in canary_runner
     assert "submodule_gitlink_before" in canary_runner
+    assert "reviewed_source_diff_sha256_before" in canary_runner
     assert '"${submodule_dirty}" != "false"' in canary_runner
     assert "s/^Artifacts: //p" in runner
     assert "s/^Artifacts: //p" in canary_runner
@@ -523,7 +535,10 @@ def test_paired_runner_propagates_failed_acceptance_gate() -> None:
     assert "s/^Artifacts: //p" in fixture_runner
     assert "local fields=(" in fixture_runner
     assert "submodule_gitlink_before" in fixture_runner
+    assert "reviewed_source_diff_sha256_before" in fixture_runner
     assert '"${submodule_dirty}" != "false"' in fixture_runner
+    assert "prepare_reviewed_llm_pysc2_runtime.py" in fixture_runner
+    assert 'export RTSCORTEX_REVIEWED_SOURCE_ROOT="${reviewed_source_root}"' in fixture_runner
 
 
 def test_active_intent_cannot_be_resolved_by_different_shadow_target() -> None:
@@ -1529,6 +1544,10 @@ def _metrics_for_events(
         "submodule_gitlink_after": "gitlink",
         "submodule_diff_sha256_before": "clean",
         "submodule_diff_sha256_after": "clean",
+        "reviewed_source_commit_before": "gitlink",
+        "reviewed_source_commit_after": "gitlink",
+        "reviewed_source_diff_sha256_before": "reviewed",
+        "reviewed_source_diff_sha256_after": "reviewed",
     }
     if source_overrides:
         row.update(source_overrides)
