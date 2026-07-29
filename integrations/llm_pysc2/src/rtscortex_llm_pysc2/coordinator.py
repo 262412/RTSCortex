@@ -170,6 +170,7 @@ class BridgeCoordinator:
                 return None
             self.effect_verifier.cancel(command_id)
         report = self.tracker.complete(command_id, game_result=game_result)
+        report = self._attach_placement_transitions(report)
         self.runtime.execution(report)
         return report
 
@@ -211,6 +212,7 @@ class BridgeCoordinator:
             execution_stage=execution_stage,
             failure_code="bridge_integrity_error",
         )
+        report = self._attach_placement_transitions(report)
         self.runtime.execution(report)
         return report
 
@@ -228,6 +230,7 @@ class BridgeCoordinator:
             failure_reason="episode ended before command completion",
             game_result=normalized_result,
         ):
+            report = self._attach_placement_transitions(report)
             self.runtime.execution(report)
         self.runtime.end_episode(result)
 
@@ -237,8 +240,9 @@ class BridgeCoordinator:
         *,
         game_result: Optional[str] = None,
     ) -> list[dict[str, Any]]:
-        reports = [
-            self.tracker.complete(
+        reports: list[dict[str, Any]] = []
+        for verdict in verdicts:
+            report = self.tracker.complete(
                 verdict.command_id,
                 game_result=game_result,
                 failure_reason=verdict.failure_reason if not verdict.success else None,
@@ -249,8 +253,35 @@ class BridgeCoordinator:
                 failure_code=verdict.failure_code,
                 effect_evidence=verdict.evidence,
             )
-            for verdict in verdicts
-        ]
+            service = self.effect_verifier.placement_service
+            if (
+                verdict.success
+                and service is not None
+                and service.command_target(verdict.command_id) is not None
+            ):
+                evidence = verdict.evidence or {}
+                confirmed_loop = evidence.get("confirmed_game_loop")
+                service.release_command(
+                    verdict.command_id,
+                    game_loop=(int(confirmed_loop) if isinstance(confirmed_loop, int) else 0),
+                    reason="effect_terminal_persisted",
+                )
+            reports.append(self._attach_placement_transitions(report))
         for report in reports:
             self.runtime.execution(report)
         return reports
+
+    def _attach_placement_transitions(
+        self,
+        report: dict[str, Any],
+    ) -> dict[str, Any]:
+        service = self.effect_verifier.placement_service
+        if service is None:
+            return report
+        transitions = service.drain_transition_history(str(report.get("command_id", "")))
+        if not transitions:
+            return report
+        evidence = report.get("effect_evidence")
+        merged = dict(evidence) if isinstance(evidence, dict) else {"effect_kind": "build"}
+        merged["placement_ledger_transitions"] = transitions
+        return {**report, "effect_evidence": merged}

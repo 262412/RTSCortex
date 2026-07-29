@@ -1242,6 +1242,82 @@ Two limitations are deliberately still visible:
   gate passes. Code completion must not be reported as multi-seed empirical
   acceptance.
 
+#### 2026-07-29 fail-closed acceptance review
+
+- **Status:** the eight review findings A-01 through A-08 are corrected in code
+  and deterministic regression tests. SCX-PT-039 itself remains open until the
+  12 active behavior runs and their 12 matched shadow calibration runs complete.
+- **Evidence and root causes:**
+  1. the comparison aggregated `REQUIRED_ENGINEERING_GATES` only across active
+     behavior rows even though shadow rows supply the causal evidence;
+  2. unchanged-attack detection counted terminal reports by engagement ID, so
+     one legitimate multi-actor FocusFire engagement and its
+     `satisfied_by_peer` terminal could be reported as redispatch;
+  3. zero production/build exposure and absent recovery events were represented
+     as success rather than unobserved evidence;
+  4. placement acceptance inferred identity from building action and center
+     position. It did not consume the authoritative discrete footprint ledger,
+     could not see pre-acceptance failures or cross-type overlap, and could not
+     prove that non-spatial failures avoided permanent suppression;
+  5. Defense acceptance reconstructed only completed Shield Batteries from
+     observations and omitted construction, queue, reservation, dispatch and
+     RaceProfile unit caps;
+  6. Active/Shadow counterfactual keys represented broad situation context,
+     not the same intent/candidate, actor, target, decision epoch and pre-action
+     state. Missing observability and rule-kind fields were accepted through
+     permissive defaults;
+  7. the analyzer read each entire natural-terminal JSONL into memory and then
+     traversed it repeatedly;
+  8. source identity was checked only once before the long experiment and
+     ignored the patched submodule. A mid-run source mutation could therefore
+     retain the initial clean metadata.
+- **Implemented correction:**
+  - all required engineering gates and all missing values now aggregate across
+    every behavior and calibration row;
+  - attack redispatch identity is derived from dispatched
+    `(actor, target, operation_id)` commands and remains locked only until that
+    exact command reaches a terminal report. Terminal report multiplicity and
+    `satisfied_by_peer` are not dispatch evidence, while a post-terminal retry
+    is a new attempt;
+  - production/build minimum exposure and recovery evidence are explicit
+    gates. Zero denominators remain `null` and fail closed. Recovery is supplied
+    by a deterministic canary artifact bound to the expected Git SHA;
+  - `RawPlacementService` emits reservation, occupancy, suppression and release
+    transitions with exact footprint cells. Terminal execution persists these
+    transitions before publishing the report. The analyzer validates declared
+    state history, cross-type cell overlap, permanent-invalid redispatch and
+    spatial versus actor/non-spatial failure classes;
+  - `DefenseAgent` emits authoritative `defense_inventory_evaluated` events for
+    structures and units using completed, constructing/training, reserved and
+    dispatched-not-terminal counts against RaceProfile hard caps;
+  - candidate counterfactual identity includes canonical action arguments,
+    actor, rule, decision epoch and a run-neutral pre-action observation hash.
+    Intent identity includes action family, actor scopes, desired effect,
+    producer/resource claims, operation and continuity. The analyzer rejects
+    missing identity, observability or rule-kind fields;
+  - engineering analysis uses a single-pass accumulator and retains only
+    command-scale acceptance evidence rather than Observation-frequency events;
+  - the formal runner records Git HEAD, superproject dirty state, submodule
+    commit, submodule dirty state and binary-diff SHA before and after every
+    behavior and shadow run, checks them against one baseline, checks again
+    before analysis, and requires one source-attestation fingerprint across the
+    full matrix.
+- **Acceptance criteria added by this review:**
+  - one failed or missing Shadow engineering gate rejects the full comparison;
+  - zero production/build observations and missing recovery proof never appear
+    as successful coverage;
+  - two actors attacking one target once do not count as redispatch, while the
+    same actor/target/operation dispatched twice does;
+  - every accepted placement run contains legal authoritative ledger
+    transitions, no overlapping active footprints and no reservation after a
+    permanent-invalid cell;
+  - Defense effective inventory never exceeds its emitted hard cap;
+  - only an exact observable Active/Shadow candidate or intent match may resolve
+    a blocking counterfactual;
+  - analyzer retained-event growth is command-scale rather than
+    Observation-scale;
+  - any pre/post or cross-run source-attestation change rejects acceptance.
+
 ## Repair order
 
 1. Freeze characterization tests and add the cross-layer `OperationKey`,
@@ -1274,12 +1350,16 @@ duplicate dispatch = 0
 friendly target = 0
 terminal report exactly once = 100%
 command and role lineage = 100%
+minimum accepted production exposure >= 1 per run
 production effect confirmation = 100%
+minimum accepted build exposure >= 1 per run
 build-start evidence coverage = 100%
 build effect confirmation >= 90%
 build failure/timeout <= 10%
 validated placement target equals emitted and verified target = 100%
 accepted build builder-tag provenance = 100%
+authoritative placement ledger evidence is present and transitions are legal
+cross-type active footprint overlap = 0
 non-spatial failure permanent footprint quarantine = 0
 invalid world footprint redispatch = 0
 repeated retreat arrival = 0
@@ -1287,12 +1367,14 @@ unchanged actor-target attack redispatch = 0
 one health delta confirms at most one engagement
 expansion commitment immediate re-arm after terminal = 0
 Defense completed + constructing + reserved inventory <= hard cap
+authoritative Defense inventory evidence is present
 subscriber callback under durable append lock = 0
 post-game semantic event coverage = 100%
-restart recovery bounded by checkpoint tail
+source-bound restart recovery evidence is present and bounded by checkpoint tail
 effective live speed >= 2 game loops/s
 natural-run disk usage reduced by >= 4x
 frozen Playbook hash remains unchanged
 evolving Playbook survives and affects the next game
 independent paired and sequential-learning experiments reported separately
+all behavior and shadow rows share one pre/post source attestation
 ```

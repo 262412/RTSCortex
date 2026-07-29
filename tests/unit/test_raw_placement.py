@@ -302,3 +302,35 @@ def test_actor_failure_does_not_quarantine_placement() -> None:
         "Build_Pylon_Screen",
         (22.0, 24.0),
     )
+    transition = service.drain_transition_history("missing-builder")
+    assert transition[0]["next_state"] == "released"
+    assert transition[0]["failure_class"] == "nonspatial"
+    assert transition[0]["actor_failure"] is True
+
+
+def test_permanent_spatial_failure_emits_exact_footprint_transition() -> None:
+    service = RawPlacementService(unit_names={})
+    service.quarantine_command(
+        command_id="blocked-pylon",
+        action_name="Build_Pylon_Screen",
+        requested_arguments=([64, 64],),
+        world_target=(22.0, 24.0),
+        failure_code="not_pathable",
+        game_loop=100,
+    )
+
+    transition = service.drain_transition_history("blocked-pylon")
+
+    assert transition == [
+        {
+            "reservation_id": transition[0]["reservation_id"],
+            "structure_type": "Pylon",
+            "footprint_cells": [(21, 23), (21, 24), (22, 23), (22, 24)],
+            "previous_state": "unreserved",
+            "next_state": "permanent_invalid",
+            "failure_class": "spatial_permanent",
+            "actor_failure": False,
+            "game_loop": 100,
+            "release_reason": "not_pathable",
+        }
+    ]

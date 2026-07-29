@@ -156,6 +156,7 @@ class RawPlacementService:
         self._observed_occupancy: dict[int, _SpatialExclusion] = {}
         self._builder_leases: dict[int, str] = {}
         self._placement_diagnostics: dict[str, str] = {}
+        self._transition_history: dict[str, list[dict[str, Any]]] = {}
 
     @property
     def known_resources(self) -> tuple[dict[str, Any], ...]:
@@ -268,7 +269,11 @@ class RawPlacementService:
                 reservation.placement_state == "occupied"
                 and reservation.occupied_grid_cells & observed_cells
             ):
-                self.release_command(command_id)
+                self.release_command(
+                    command_id,
+                    game_loop=0,
+                    reason="observed_structure_occupancy",
+                )
 
     def candidates(
         self,
@@ -521,12 +526,22 @@ class RawPlacementService:
             ),
         )
         self._command_targets[command_id] = reservation
+        self._record_transition(
+            command_id,
+            reservation=reservation,
+            previous_state="unreserved",
+            next_state="reserved",
+            game_loop=game_loop,
+        )
         if normalized_builder is not None:
             self._builder_leases[normalized_builder] = command_id
         return reservation
 
     def command_target(self, command_id: str) -> RawPlacementReservation | None:
         return self._command_targets.get(command_id)
+
+    def drain_transition_history(self, command_id: str) -> list[dict[str, Any]]:
+        return self._transition_history.pop(command_id, [])
 
     def quarantine_command(
         self,
@@ -561,8 +576,12 @@ class RawPlacementService:
             "no_legal_placement",
             "pysc2_rejected",
         }
+        transition_state = "released"
+        failure_class = "nonspatial"
         if target is not None and failure_code in permanent_spatial_codes:
             self.suppress_world_target(action_name, target, reason=failure_code)
+            transition_state = "permanent_invalid"
+            failure_class = "spatial_permanent"
         elif target is not None and failure_code in retryable_spatial_codes:
             current_loop = 0 if game_loop is None else int(game_loop)
             self.suppress_world_target_temporarily(
@@ -571,13 +590,27 @@ class RawPlacementService:
                 expires_game_loop=current_loop + 112,
                 reason=failure_code,
             )
+            transition_state = "temporary_suppressed"
+            failure_class = "spatial_retryable"
         if (
             anchor is not None
             and failure_code in permanent_spatial_codes
             and any(townhall in action_name for townhall in ("Nexus", "CommandCenter", "Hatchery"))
         ):
             self.suppress_anchor(anchor)
-        self.release_command(command_id)
+        self._record_transition(
+            command_id,
+            reservation=placement,
+            action_name=action_name,
+            world_target=target,
+            previous_state=("unreserved" if placement is None else placement.placement_state),
+            next_state=transition_state,
+            failure_class=failure_class,
+            actor_failure=failure_code in {"builder_unavailable", "actor_not_available"},
+            game_loop=0 if game_loop is None else int(game_loop),
+            release_reason=failure_code,
+        )
+        self.release_command(command_id, record_transition=False)
 
     def suppress_anchor(self, tag: int) -> None:
         cluster = self._resource_cluster(int(tag))
@@ -585,7 +618,7 @@ class RawPlacementService:
         self._suppressed_clusters.add(int(tag) if cluster_id is None else cluster_id)
         self._suppressed_resource_tags.update(int(unit["tag"]) for unit in cluster)
 
-    def confirm_command(self, command_id: str) -> None:
+    def confirm_command(self, command_id: str, *, game_loop: int | None = None) -> None:
         placement = self._command_targets.get(command_id)
         if placement is None:
             return
@@ -603,12 +636,36 @@ class RawPlacementService:
             placement_state="occupied",
             expires_game_loop=max(placement.expires_game_loop, 2**31 - 1),
         )
+        self._record_transition(
+            command_id,
+            reservation=placement,
+            previous_state=placement.placement_state,
+            next_state="occupied",
+            game_loop=0 if game_loop is None else int(game_loop),
+            release_reason="effect_confirmed",
+        )
         self._release_builder_lease(placement)
 
-    def release_command(self, command_id: str) -> None:
+    def release_command(
+        self,
+        command_id: str,
+        *,
+        game_loop: int = 0,
+        reason: str = "released",
+        record_transition: bool = True,
+    ) -> None:
         placement = self._command_targets.pop(command_id, None)
         if placement is None:
             return
+        if record_transition:
+            self._record_transition(
+                command_id,
+                reservation=placement,
+                previous_state=placement.placement_state,
+                next_state="released",
+                game_loop=game_loop,
+                release_reason=reason,
+            )
         self._release_builder_lease(placement)
 
     def _release_builder_lease(self, placement: RawPlacementReservation) -> None:
@@ -700,7 +757,11 @@ class RawPlacementService:
             if reservation.placement_state != "occupied" and reservation.expires_game_loop <= int(
                 game_loop
             ):
-                self.release_command(command_id)
+                self.release_command(
+                    command_id,
+                    game_loop=int(game_loop),
+                    reason="reservation_expired",
+                )
         for action_name, suppressions in list(self._temporary_suppressions.items()):
             kept = [
                 suppression
@@ -711,6 +772,66 @@ class RawPlacementService:
                 self._temporary_suppressions[action_name] = kept
             else:
                 del self._temporary_suppressions[action_name]
+
+    def _record_transition(
+        self,
+        command_id: str,
+        *,
+        reservation: RawPlacementReservation | None,
+        previous_state: str,
+        next_state: str,
+        game_loop: int,
+        action_name: str | None = None,
+        world_target: tuple[float, float] | None = None,
+        failure_class: str | None = None,
+        actor_failure: bool = False,
+        release_reason: str | None = None,
+    ) -> None:
+        from rtscortex_llm_pysc2.extractor import BUILD_SPECS
+
+        resolved_action = reservation.action_name if reservation is not None else action_name
+        if resolved_action is None:
+            return
+        spec = BUILD_SPECS.get(resolved_action)
+        if spec is None:
+            return
+        target = reservation.world_target if reservation is not None else world_target
+        if target is None:
+            return
+        cells = (
+            reservation.occupied_grid_cells
+            if reservation is not None
+            else _occupied_cells_for_spec(target, spec)
+        )
+        reservation_id = (
+            reservation.reservation_id
+            if reservation is not None
+            else "placement:"
+            + hashlib.sha256(
+                json.dumps(
+                    {
+                        "command_id": command_id,
+                        "action_name": resolved_action,
+                        "world_target": target,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+            ).hexdigest()
+        )
+        self._transition_history.setdefault(command_id, []).append(
+            {
+                "reservation_id": reservation_id,
+                "structure_type": spec.target_structure,
+                "footprint_cells": sorted(cells),
+                "previous_state": previous_state,
+                "next_state": next_state,
+                "failure_class": failure_class,
+                "actor_failure": actor_failure,
+                "game_loop": int(game_loop),
+                "release_reason": release_reason,
+            }
+        )
 
     def _expansion_target(
         self,

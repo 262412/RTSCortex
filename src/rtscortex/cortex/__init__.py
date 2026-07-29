@@ -9,6 +9,7 @@ from rtscortex.cortex.benchmark import (
 from rtscortex.cortex.candidates import (
     CandidateCompilationError,
     CandidateCompiler,
+    counterfactual_observation_fingerprint,
     observation_fingerprint,
 )
 from rtscortex.cortex.dataset import (
@@ -139,6 +140,7 @@ __all__ = [
     "BaseAssessment",
     "CandidateCompilationError",
     "CandidateCompiler",
+    "counterfactual_observation_fingerprint",
     "CandidateFeatures",
     "CandidateSelection",
     "CandidateSelectionStatus",

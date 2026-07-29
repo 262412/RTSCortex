@@ -1489,6 +1489,19 @@ class RuntimeEngine:
                 f"state {lifecycle.status.value!r}"
             )
         self._validate_execution_identity(report, lifecycle.command)
+        if report.effect_evidence is not None:
+            for transition in report.effect_evidence.placement_ledger_transitions:
+                self.store.append_event(
+                    run_id=report.run_id,
+                    episode_id=report.episode_id,
+                    step_id=report.step_id,
+                    event_type="placement_ledger_transition",
+                    payload={
+                        "command_id": report.command_id,
+                        "action_name": report.action_name,
+                        **transition.model_dump(mode="json"),
+                    },
+                )
         self.store.append_event(
             run_id=report.run_id,
             episode_id=report.episode_id,

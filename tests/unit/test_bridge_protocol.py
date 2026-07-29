@@ -6,8 +6,10 @@ from typing import Any, cast
 
 import pytest
 from rtscortex_llm_pysc2.coordinator import BridgeCoordinator
+from rtscortex_llm_pysc2.effect_verifier import ActionEffectVerifier
 from rtscortex_llm_pysc2.execution import ExecutionTracker
 from rtscortex_llm_pysc2.observation import ObservationMapper, canonical_actor, split_actor
+from rtscortex_llm_pysc2.raw_placement import RawPlacementService
 from rtscortex_llm_pysc2.routing import ActionRouter, RoutedActionBatch
 
 from rtscortex.contracts import ActionBatch, ExecutionReport, ObservationEnvelope
@@ -141,12 +143,27 @@ def test_coordinator_calls_runtime_once_and_reports_execution() -> None:
 def test_coordinator_defers_build_report_until_raw_state_confirms_effect() -> None:
     snapshot = _build_snapshot()
     runtime = FakeRuntime(_build_batch())
-    coordinator = BridgeCoordinator(runtime)
+    placement_service = RawPlacementService(unit_names={})
+    baseline = _raw_effect_observation(game_loop=224, minerals=250)
+    placement_service.resolve(
+        command_id="command-pylon",
+        action_name="Build_Pylon_Screen",
+        requested_arguments=([65, 65],),
+        observation=baseline,
+        world_target=(32.0, 30.0),
+        builder_tag=0xABC,
+    )
+    coordinator = BridgeCoordinator(
+        runtime,
+        effect_verifier=ActionEffectVerifier(
+            placement_service=placement_service,
+        ),
+    )
 
     coordinator.decide(snapshot, {"Builder": ["Builder-Probe-1"]})
     coordinator.prepare_effect(
         "command-pylon",
-        _raw_effect_observation(game_loop=224, minerals=250),
+        baseline,
         builder_tag=0xABC,
     )
     coordinator.record_primitive(
@@ -169,6 +186,11 @@ def test_coordinator_defers_build_report_until_raw_state_confirms_effect() -> No
     assert len(reports) == 1
     assert reports[0]["success"] is True
     assert reports[0]["pysc2_function"] == "Build_Pylon_screen"
+    assert [
+        transition["next_state"]
+        for transition in reports[0]["effect_evidence"]["placement_ledger_transitions"]
+    ] == ["reserved", "occupied", "released"]
+    assert placement_service.command_target("command-pylon") is None
     assert runtime.execution_reports == reports
     assert coordinator.observe_effects(_raw_effect_observation(game_loop=268, minerals=175)) == []
 

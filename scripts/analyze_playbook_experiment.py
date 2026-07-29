@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 from collections import Counter
 from dataclasses import asdict, dataclass, field
@@ -14,6 +15,7 @@ from typing import Any
 from rtscortex.evaluation.engineering import (
     ENGINEERING_GATES_FILENAME,
     REQUIRED_ENGINEERING_GATES,
+    EngineeringAccumulator,
     build_engineering_gate_report,
 )
 from rtscortex.memory import read_event_log
@@ -77,6 +79,7 @@ class RunMetrics:
     resolved_counterfactual_keys: tuple[str, ...] = ()
     strategic_regret_count: int = 0
     strategic_resolved_count: int = 0
+    invalid_counterfactual_evidence_count: int = 0
     engineering_gates: dict[str, bool] = field(
         default_factory=lambda: {name: True for name in REQUIRED_ENGINEERING_GATES}
     )
@@ -84,6 +87,8 @@ class RunMetrics:
     engineering_accepted: bool = True
     source_tree_clean: bool = True
     source_commit_matches_expected_sha: bool = True
+    source_attestation_consistent: bool = True
+    source_attestation_fingerprint: str | None = "source-baseline"
 
 
 def main() -> None:
@@ -92,16 +97,19 @@ def main() -> None:
     parser.add_argument("--baseline-sha256", required=True)
     parser.add_argument("--expected-git-sha", required=True)
     parser.add_argument("--engineering-baseline", type=Path, required=True)
+    parser.add_argument("--recovery-evidence", type=Path, required=True)
     arguments = parser.parse_args()
     run_set = arguments.run_set_dir.resolve()
     engineering_baseline = json.loads(arguments.engineering_baseline.read_text(encoding="utf-8"))
     baseline_bytes_per_loop = float(engineering_baseline["natural_run_bytes_per_game_loop"])
+    recovery_evidence = json.loads(arguments.recovery_evidence.read_text(encoding="utf-8"))
     rows = list(csv.DictReader((run_set / "experiment-status.tsv").open(), delimiter="\t"))
     metrics = [
         _run_metrics(
             row,
             natural_run_baseline_bytes_per_loop=baseline_bytes_per_loop,
             expected_git_sha=arguments.expected_git_sha,
+            recovery_evidence=recovery_evidence,
         )
         for row in rows
     ]
@@ -119,6 +127,7 @@ def _run_metrics(
     *,
     natural_run_baseline_bytes_per_loop: float | None = None,
     expected_git_sha: str | None = None,
+    recovery_evidence: dict[str, Any] | None = None,
 ) -> RunMetrics:
     run_dir_value = row.get("run_dir", "").strip()
     run_dir = (
@@ -143,10 +152,10 @@ def _run_metrics(
     last_timestamp: datetime | None = None
     event_count = 0
     performance: dict[str, Any] = {}
-    events: list[Any] = []
+    engineering_accumulator = EngineeringAccumulator()
     if journal.is_file():
         for event in read_event_log(journal):
-            events.append(event)
+            engineering_accumulator.ingest(event)
             event_count += 1
             try:
                 timestamp = datetime.fromisoformat(event.created_at)
@@ -209,12 +218,32 @@ def _run_metrics(
         if evaluation.get("strength_at_evaluation") == "hard"
         and evaluation.get("status_at_evaluation") == "active"
     ]
+    would_block_evaluations = [
+        evaluation
+        for evaluation in hard_evaluations
+        if evaluation.get("shadow_decision") == "would_block"
+    ]
+    invalid_counterfactual_evidence = [
+        evaluation
+        for evaluation in would_block_evaluations
+        if not (
+            isinstance(evaluation.get("counterfactual_key"), str)
+            and isinstance(evaluation.get("counterfactual_signature"), str)
+            and isinstance(evaluation.get("behavior_before_hash"), str)
+            and isinstance(evaluation.get("decision_epoch"), int)
+            and evaluation.get("counterfactual_observable") in {True, False}
+            and evaluation.get("rule_kind") in {"execution_guard", "strategy"}
+        )
+    ]
     blocking_counterfactuals = [
         evaluation
         for evaluation in hard_evaluations
         if evaluation.get("shadow_decision") == "would_block"
-        and evaluation.get("counterfactual_observable", True) is True
-        and evaluation.get("rule_kind", "execution_guard") == "execution_guard"
+        and evaluation.get("counterfactual_observable") is True
+        and evaluation.get("rule_kind") == "execution_guard"
+        and isinstance(evaluation.get("counterfactual_signature"), str)
+        and isinstance(evaluation.get("behavior_before_hash"), str)
+        and isinstance(evaluation.get("decision_epoch"), int)
     ]
     false_blocks = sum(
         evaluation.get("execution_false_block", evaluation.get("false_block")) is True
@@ -237,6 +266,9 @@ def _run_metrics(
                 str(evaluation["counterfactual_key"])
                 for evaluation in hard_evaluations
                 if evaluation.get("actual_outcome") == "blocked"
+                and isinstance(evaluation.get("counterfactual_signature"), str)
+                and isinstance(evaluation.get("behavior_before_hash"), str)
+                and isinstance(evaluation.get("decision_epoch"), int)
                 and isinstance(evaluation.get("counterfactual_key"), str)
             }
         )
@@ -246,7 +278,10 @@ def _run_metrics(
             {
                 str(evaluation["counterfactual_key"])
                 for evaluation in hard_evaluations
-                if evaluation.get("counterfactual_observable", True) is True
+                if evaluation.get("counterfactual_observable") is True
+                and isinstance(evaluation.get("counterfactual_signature"), str)
+                and isinstance(evaluation.get("behavior_before_hash"), str)
+                and isinstance(evaluation.get("decision_epoch"), int)
                 and (
                     isinstance(evaluation.get("execution_false_block"), bool)
                     or isinstance(evaluation.get("strategic_regret"), bool)
@@ -259,8 +294,11 @@ def _run_metrics(
         evaluation
         for evaluation in hard_evaluations
         if evaluation.get("shadow_decision") == "would_block"
-        and evaluation.get("counterfactual_observable", True) is True
+        and evaluation.get("counterfactual_observable") is True
         and evaluation.get("rule_kind") == "strategy"
+        and isinstance(evaluation.get("counterfactual_signature"), str)
+        and isinstance(evaluation.get("behavior_before_hash"), str)
+        and isinstance(evaluation.get("decision_epoch"), int)
     ]
     terminal_report_count = sum(terminal_counts.values())
     dispatched_ids = set(dispatch_counts)
@@ -268,9 +306,11 @@ def _run_metrics(
     journal_bytes = journal.stat().st_size if journal.is_file() else 0
     artifact_bytes = sum(path.stat().st_size for path in run_dir.rglob("*") if path.is_file())
     engineering = build_engineering_gate_report(
-        events,
+        engineering_accumulator,
         run_dir=run_dir,
         natural_run_baseline_bytes_per_loop=natural_run_baseline_bytes_per_loop,
+        recovery_evidence=recovery_evidence,
+        expected_git_sha=expected_git_sha,
     )
     if run_dir.is_dir():
         (run_dir / ENGINEERING_GATES_FILENAME).write_text(
@@ -281,8 +321,49 @@ def _run_metrics(
         name: engineering.get("gates", {}).get(name, {}).get("passed") is True
         for name in REQUIRED_ENGINEERING_GATES
     }
-    row_git_head = row.get("git_head", "")
-    row_git_dirty = row.get("git_dirty", "")
+    git_head_before = row.get("git_head_before") or row.get("git_head", "")
+    git_head_after = row.get("git_head_after") or row.get("git_head", "")
+    dirty_before = row.get("superproject_dirty_before") or row.get("git_dirty", "")
+    dirty_after = row.get("superproject_dirty_after") or row.get("git_dirty", "")
+    submodule_commit_before = row.get("submodule_commit_before", "")
+    submodule_commit_after = row.get("submodule_commit_after", "")
+    submodule_dirty_before = row.get("submodule_dirty_before", "")
+    submodule_dirty_after = row.get("submodule_dirty_after", "")
+    submodule_diff_before = row.get("submodule_diff_sha256_before", "")
+    submodule_diff_after = row.get("submodule_diff_sha256_after", "")
+    has_source_attestation = all(
+        (
+            git_head_before,
+            git_head_after,
+            dirty_before,
+            dirty_after,
+            submodule_commit_before,
+            submodule_commit_after,
+            submodule_dirty_before,
+            submodule_dirty_after,
+            submodule_diff_before,
+            submodule_diff_after,
+        )
+    )
+    source_attestation_consistent = (
+        has_source_attestation
+        and git_head_before == git_head_after
+        and dirty_before == dirty_after
+        and submodule_commit_before == submodule_commit_after
+        and submodule_dirty_before == submodule_dirty_after
+        and submodule_diff_before == submodule_diff_after
+    )
+    source_attestation_fingerprint = (
+        _source_attestation_fingerprint(
+            git_head=git_head_before,
+            superproject_dirty=dirty_before,
+            submodule_commit=submodule_commit_before,
+            submodule_dirty=submodule_dirty_before,
+            submodule_diff_sha256=submodule_diff_before,
+        )
+        if source_attestation_consistent
+        else None
+    )
     return RunMetrics(
         mode=row["mode"],
         seed=int(row["seed"]),
@@ -347,13 +428,18 @@ def _run_metrics(
             isinstance(evaluation.get("strategic_regret"), bool)
             for evaluation in strategic_evaluations
         ),
+        invalid_counterfactual_evidence_count=len(invalid_counterfactual_evidence),
         engineering_gates=engineering_gates,
         engineering_missing_metrics=tuple(engineering["missing_required_metrics"]),
         engineering_accepted=engineering["accepted"] is True,
-        source_tree_clean=row_git_dirty == "false",
+        source_tree_clean=dirty_before == "false" and dirty_after == "false",
         source_commit_matches_expected_sha=(
-            expected_git_sha is not None and row_git_head == expected_git_sha
+            expected_git_sha is not None
+            and git_head_before == expected_git_sha
+            and git_head_after == expected_git_sha
         ),
+        source_attestation_consistent=source_attestation_consistent,
+        source_attestation_fingerprint=source_attestation_fingerprint,
     )
 
 
@@ -370,6 +456,28 @@ def _consequence_signature(payload: dict[str, Any]) -> str:
         sort_keys=True,
         separators=(",", ":"),
     )
+
+
+def _source_attestation_fingerprint(
+    *,
+    git_head: str,
+    superproject_dirty: str,
+    submodule_commit: str,
+    submodule_dirty: str,
+    submodule_diff_sha256: str,
+) -> str:
+    payload = json.dumps(
+        {
+            "git_head": git_head,
+            "superproject_dirty": superproject_dirty,
+            "submodule_commit": submodule_commit,
+            "submodule_dirty": submodule_dirty,
+            "submodule_diff_sha256": submodule_diff_sha256,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode()).hexdigest()
 
 
 def _comparison(metrics: list[RunMetrics], *, baseline_sha256: str) -> dict[str, Any]:
@@ -499,12 +607,20 @@ def _comparison(metrics: list[RunMetrics], *, baseline_sha256: str) -> dict[str,
         )
     unmatched_active_hard_blocks.sort()
     engineering_gate_results = {
-        name: all(metric.engineering_gates.get(name) is True for metric in behavior)
+        name: all(metric.engineering_gates.get(name) is True for metric in metrics)
         for name in REQUIRED_ENGINEERING_GATES
     }
     missing_engineering_metrics = sorted(
-        {name for metric in behavior for name in metric.engineering_missing_metrics}
+        {name for metric in metrics for name in metric.engineering_missing_metrics}
     )
+    invalid_counterfactual_evidence_count = sum(
+        metric.invalid_counterfactual_evidence_count for metric in metrics
+    )
+    source_fingerprints = {
+        metric.source_attestation_fingerprint
+        for metric in metrics
+        if metric.source_attestation_fingerprint is not None
+    }
     gates = {
         "complete_unique_run_matrix": (
             len(behavior) == len(expected_behavior_matrix)
@@ -523,6 +639,11 @@ def _comparison(metrics: list[RunMetrics], *, baseline_sha256: str) -> dict[str,
         "source_commit_matches_expected_sha": all(
             metric.source_commit_matches_expected_sha for metric in metrics
         ),
+        "source_attestation_consistent": all(
+            metric.source_attestation_consistent for metric in metrics
+        )
+        and all(metric.source_attestation_fingerprint is not None for metric in metrics)
+        and len(source_fingerprints) == 1,
         "independent_baseline_identity": baseline_identity,
         "frozen_hash_unchanged": frozen_immutable,
         "sequential_evolving_carry": sequential_carry,
@@ -544,10 +665,12 @@ def _comparison(metrics: list[RunMetrics], *, baseline_sha256: str) -> dict[str,
             and false_blocks / resolved_blocks <= 0.01
         ),
         "active_hard_blocks_have_matched_shadow_evidence": (not unmatched_active_hard_blocks),
+        "counterfactual_schema_complete": invalid_counterfactual_evidence_count == 0,
         "required_engineering_metrics_complete": not missing_engineering_metrics,
         "all_engineering_gates_pass": (
-            bool(behavior)
+            bool(metrics)
             and not missing_engineering_metrics
+            and all(metric.engineering_accepted for metric in metrics)
             and all(engineering_gate_results.values())
         ),
         "repeated_error_reduction_at_least_50_percent": reduction >= 0.5,
@@ -580,6 +703,7 @@ def _comparison(metrics: list[RunMetrics], *, baseline_sha256: str) -> dict[str,
             "strategic_resolved_count": sum(
                 metric.strategic_resolved_count for metric in counterfactual_rows
             ),
+            "invalid_counterfactual_evidence_count": invalid_counterfactual_evidence_count,
             "engineering_gates": engineering_gate_results,
             "missing_engineering_metrics": missing_engineering_metrics,
         },

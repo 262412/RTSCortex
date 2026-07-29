@@ -67,6 +67,8 @@ def _metrics(
 def _strict_matrix(
     *,
     engineering_overrides: dict[str, bool] | None = None,
+    shadow_engineering_overrides: dict[str, bool] | None = None,
+    shadow_missing_metrics: tuple[str, ...] = (),
 ) -> list[RunMetrics]:
     baseline = "baseline"
     rows: list[RunMetrics] = []
@@ -112,20 +114,35 @@ def _strict_matrix(
                         ),
                     )
                 rows.append(behavior)
-                rows.append(
-                    replace(
-                        _metrics(
-                            mode=mode,
-                            seed=seed,
-                            arm="shadow",
-                            before=before,
-                            after=before,
-                            repeated_errors=0,
-                        ),
-                        experiment_kind="calibration",
-                        subject_arm=arm,
-                    )
+                shadow = replace(
+                    _metrics(
+                        mode=mode,
+                        seed=seed,
+                        arm="shadow",
+                        before=before,
+                        after=before,
+                        repeated_errors=0,
+                    ),
+                    experiment_kind="calibration",
+                    subject_arm=arm,
                 )
+                if shadow_engineering_overrides:
+                    shadow_gates = {
+                        **shadow.engineering_gates,
+                        **shadow_engineering_overrides,
+                    }
+                    shadow = replace(
+                        shadow,
+                        engineering_gates=shadow_gates,
+                        engineering_accepted=all(shadow_gates.values()),
+                    )
+                if shadow_missing_metrics:
+                    shadow = replace(
+                        shadow,
+                        engineering_missing_metrics=shadow_missing_metrics,
+                        engineering_accepted=False,
+                    )
+                rows.append(shadow)
     return rows
 
 
@@ -170,6 +187,27 @@ def test_missing_required_engineering_metric_fails_closed() -> None:
     )
 
     comparison = _comparison(metrics, baseline_sha256="baseline")
+
+    assert comparison["gates"]["required_engineering_metrics_complete"] is False
+    assert comparison["accepted"] is False
+
+
+def test_shadow_engineering_failure_rejects_comparison() -> None:
+    comparison = _comparison(
+        _strict_matrix(shadow_engineering_overrides={"build_confirmation_rate": False}),
+        baseline_sha256="baseline",
+    )
+
+    assert comparison["gates"]["all_engineering_gates_pass"] is False
+    assert comparison["aggregate"]["engineering_gates"]["build_confirmation_rate"] is False
+    assert comparison["accepted"] is False
+
+
+def test_shadow_missing_engineering_metric_fails_closed() -> None:
+    comparison = _comparison(
+        _strict_matrix(shadow_missing_metrics=("health_delta_engagement_attribution_valid",)),
+        baseline_sha256="baseline",
+    )
 
     assert comparison["gates"]["required_engineering_metrics_complete"] is False
     assert comparison["accepted"] is False
@@ -223,6 +261,29 @@ def test_dirty_or_unexpected_source_revision_rejects_formal_acceptance() -> None
 
     assert comparison["gates"]["source_tree_clean"] is False
     assert comparison["gates"]["source_commit_matches_expected_sha"] is False
+    assert comparison["accepted"] is False
+
+
+def test_submodule_source_change_rejects_formal_acceptance() -> None:
+    metrics = _strict_matrix()
+    metrics[0] = replace(metrics[0], source_attestation_consistent=False)
+
+    comparison = _comparison(metrics, baseline_sha256="baseline")
+
+    assert comparison["gates"]["source_attestation_consistent"] is False
+    assert comparison["accepted"] is False
+
+
+def test_runs_from_different_source_attestations_reject_acceptance() -> None:
+    metrics = _strict_matrix()
+    metrics[0] = replace(
+        metrics[0],
+        source_attestation_fingerprint="different-source",
+    )
+
+    comparison = _comparison(metrics, baseline_sha256="baseline")
+
+    assert comparison["gates"]["source_attestation_consistent"] is False
     assert comparison["accepted"] is False
 
 
@@ -327,6 +388,11 @@ def test_analyzer_cli_exits_nonzero_when_report_rejected(
         json.dumps({"natural_run_bytes_per_game_loop": 100.0}),
         encoding="utf-8",
     )
+    recovery_evidence = tmp_path / "recovery-evidence.json"
+    recovery_evidence.write_text(
+        json.dumps({"passed": True, "git_sha": "expected"}),
+        encoding="utf-8",
+    )
     monkeypatch.setattr(
         sys,
         "argv",
@@ -339,6 +405,8 @@ def test_analyzer_cli_exits_nonzero_when_report_rejected(
             "expected",
             "--engineering-baseline",
             str(engineering_baseline),
+            "--recovery-evidence",
+            str(recovery_evidence),
         ],
     )
 
@@ -362,6 +430,9 @@ def test_paired_runner_propagates_failed_acceptance_gate() -> None:
     assert "--expected-git-sha" in runner
     assert "run_shadow_calibration" in runner
     assert "--engineering-baseline" in runner
+    assert "--recovery-evidence" in runner
+    assert "submodule_diff_sha256_before" in runner
+    assert "capture_source_attestation" in runner
     assert 'exit "${overall_status}"' in runner
 
 
@@ -625,6 +696,50 @@ def test_strategic_rule_success_is_not_execution_false_block(
     assert metrics.strategic_regret_count == 0
 
 
+@pytest.mark.parametrize(
+    ("counterfactual_observable", "rule_kind", "metric_index"),
+    [
+        (None, "execution_guard", 0),
+        (True, None, 0),
+        (None, "execution_guard", 1),
+        (True, None, 1),
+    ],
+)
+def test_missing_counterfactual_schema_field_fails_closed(
+    counterfactual_observable: bool | None,
+    rule_kind: str | None,
+    metric_index: int,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed = _metrics_for_rule_evaluations(
+        tmp_path,
+        monkeypatch,
+        [
+            _rule_evaluation(
+                event_id=1,
+                evaluation_id="evaluation:missing-schema",
+                strength="hard",
+                status="active",
+                false_block=False,
+                counterfactual_observable=counterfactual_observable,
+                rule_kind=rule_kind,
+            )
+        ],
+    )
+    metrics = _strict_matrix()
+    metrics[metric_index] = replace(
+        metrics[metric_index],
+        invalid_counterfactual_evidence_count=(observed.invalid_counterfactual_evidence_count),
+    )
+
+    comparison = _comparison(metrics, baseline_sha256="baseline")
+
+    assert observed.invalid_counterfactual_evidence_count == 1
+    assert comparison["gates"]["counterfactual_schema_complete"] is False
+    assert comparison["accepted"] is False
+
+
 def test_cancelled_would_block_is_unresolved(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -805,9 +920,10 @@ def _rule_evaluation(
     false_block: bool | None,
     shadow_decision: str = "would_block",
     actual_outcome: str | None = None,
-    counterfactual_observable: bool | None = None,
-    rule_kind: str | None = None,
+    counterfactual_observable: bool | None = True,
+    rule_kind: str | None = "execution_guard",
     strategic_regret: bool | None = None,
+    include_counterfactual_identity: bool = True,
 ) -> StoredEvent:
     return StoredEvent(
         event_id=event_id,
@@ -822,6 +938,16 @@ def _rule_evaluation(
             "strength_at_evaluation": strength,
             "status_at_evaluation": status,
             "shadow_decision": shadow_decision,
+            **(
+                {
+                    "counterfactual_key": "counterfactual:" + "a" * 64,
+                    "counterfactual_signature": "b" * 64,
+                    "behavior_before_hash": "c" * 64,
+                    "decision_epoch": event_id,
+                }
+                if include_counterfactual_identity
+                else {}
+            ),
             **(
                 {}
                 if counterfactual_observable is None

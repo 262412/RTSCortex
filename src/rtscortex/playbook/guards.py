@@ -56,6 +56,7 @@ class PlaybookIntentGuard:
         situation: SituationAssessment,
         rules: Sequence[PlaybookRule],
         game_loop: int,
+        behavior_before_hash: str | None = None,
         mode: Literal["shadow", "active"] = "shadow",
     ) -> GuardResult:
         values = _values(
@@ -75,6 +76,9 @@ class PlaybookIntentGuard:
             target_id=intent.intent_id,
             action_name=intent.action_names[0],
             role=intent.role.value,
+            counterfactual_signature=_intent_signature(intent),
+            behavior_before_hash=behavior_before_hash,
+            decision_epoch=game_loop,
             mode=mode,
         )
 
@@ -94,6 +98,7 @@ class PlaybookCandidateGuard:
         episode_id: str,
         step_id: int,
         game_loop: int,
+        behavior_before_hash: str | None = None,
         mode: Literal["shadow", "active"] = "shadow",
         recent_feedback: Sequence[RecentTerminalFeedback] = (),
     ) -> GuardResult:
@@ -114,6 +119,13 @@ class PlaybookCandidateGuard:
             target_id=candidate.candidate_id,
             action_name=candidate.action_name,
             role=role,
+            counterfactual_signature=candidate_signature(
+                candidate.action_name,
+                candidate.actor,
+                candidate.arguments,
+            ),
+            behavior_before_hash=behavior_before_hash,
+            decision_epoch=game_loop,
             mode=mode,
         )
         signature = candidate_signature(
@@ -181,6 +193,26 @@ def candidate_signature(
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
+def _intent_signature(intent: StrategicIntent) -> str:
+    payload = json.dumps(
+        {
+            "role": intent.role.value,
+            "action_names": list(intent.action_names),
+            "actor_scopes": list(intent.actor_scopes),
+            "objective": intent.objective,
+            "desired_effect": intent.desired_effect,
+            "producer_types": list(intent.producer_types),
+            "resource_claim": intent.resource_claim.model_dump(mode="json"),
+            "dependency_count": len(intent.dependency_intent_ids),
+            "source_id": intent.source_id,
+            "source_version": intent.source_version,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
 def _values(
     context: PlaybookContext,
     situation: SituationAssessment,
@@ -214,6 +246,9 @@ def _evaluate(
     target_id: str,
     action_name: str,
     role: str,
+    counterfactual_signature: str,
+    behavior_before_hash: str | None,
+    decision_epoch: int,
     mode: Literal["shadow", "active"],
 ) -> GuardResult:
     applicable = [
@@ -270,7 +305,9 @@ def _evaluate(
             counterfactual_key = _counterfactual_key(
                 rule.rule_id,
                 target_kind=target_kind,
-                values=values,
+                counterfactual_signature=counterfactual_signature,
+                behavior_before_hash=behavior_before_hash,
+                decision_epoch=decision_epoch,
             )
             identity = hashlib.sha256(
                 f"{rule.rule_id}|{target_kind}|{target_id}|{game_loop}".encode()
@@ -289,6 +326,9 @@ def _evaluate(
                     action_name=action_name,
                     role=cast(PlaybookRoleId, role),
                     counterfactual_key=counterfactual_key,
+                    counterfactual_signature=counterfactual_signature,
+                    behavior_before_hash=behavior_before_hash,
+                    decision_epoch=decision_epoch,
                     matched=matched,
                     blocked=effective_block,
                     score_delta=rule_delta,
@@ -317,15 +357,19 @@ def _counterfactual_key(
     rule_id: str,
     *,
     target_kind: Literal["intent", "candidate"],
-    values: Mapping[str, object],
+    counterfactual_signature: str,
+    behavior_before_hash: str | None,
+    decision_epoch: int,
 ) -> str:
-    """Identify the same rule decision across matched active/shadow runs."""
+    """Identify one exact rule decision across matched active/shadow runs."""
 
     payload = json.dumps(
         {
             "rule_id": rule_id,
             "target_kind": target_kind,
-            "values": dict(values),
+            "counterfactual_signature": counterfactual_signature,
+            "behavior_before_hash": behavior_before_hash,
+            "decision_epoch": decision_epoch,
         },
         sort_keys=True,
         separators=(",", ":"),

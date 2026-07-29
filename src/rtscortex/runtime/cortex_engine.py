@@ -55,6 +55,7 @@ from rtscortex.cortex import (
     StrategicIntentAdapter,
     TacticalIntent,
     TacticalPolicyProvider,
+    counterfactual_observation_fingerprint,
     hima_previous_action_for_runtime_action,
     macro_goal_spec,
     macro_plan_from_hima,
@@ -293,6 +294,7 @@ class CortexRuntimeEngine(RuntimeEngine):
             self._race_profile,
             self._strategic_adapter,
         )
+        self._last_defense_inventory_signatures: dict[str, str] = {}
         self._strategic_arbiter = IntentArbiter(
             switch_margin=config.cortex.arbiter.switch_margin,
             max_intents=config.cortex.arbiter.max_intents,
@@ -325,6 +327,7 @@ class CortexRuntimeEngine(RuntimeEngine):
     async def tick(self, observation: ObservationEnvelope) -> ActionBatch:
         tick_started = time.perf_counter()
         await self._activate_episode(observation)
+        self._record_defense_inventory(observation)
         self._strategic_by_legacy_intent = {}
         self._pending_strategic_arbitration = None
         self.store.append_event(
@@ -651,6 +654,7 @@ class CortexRuntimeEngine(RuntimeEngine):
         failures: list[ValidationFailure] = []
         current_ids = {command.command_id for command in commands}
         reserved_by_structure: dict[str, int] = {}
+        dispatched_by_structure: dict[str, int] = {}
         for lifecycle in self._command_states.values():
             if lifecycle.command.command_id in current_ids or lifecycle.status not in {
                 CommandStatus.PENDING,
@@ -660,11 +664,19 @@ class CortexRuntimeEngine(RuntimeEngine):
                 continue
             target = self._structure_target_for_action(lifecycle.command.name)
             if target is not None:
-                reserved_by_structure[target] = reserved_by_structure.get(target, 0) + 1
+                counts = (
+                    dispatched_by_structure
+                    if lifecycle.status is CommandStatus.DISPATCHED
+                    else reserved_by_structure
+                )
+                counts[target] = counts.get(target, 0) + 1
         completed_or_constructing: dict[str, int] = {}
+        constructing_by_structure: dict[str, int] = {}
         for structure in observation.state.own_structures:
             key = structure.unit_type.casefold()
             completed_or_constructing[key] = completed_or_constructing.get(key, 0) + 1
+            if structure.status == "constructing":
+                constructing_by_structure[key] = constructing_by_structure.get(key, 0) + 1
         selected_by_structure: dict[str, int] = {}
         for command in sorted(commands, key=lambda item: (-item.priority, item.command_id)):
             target = self._structure_target_for_action(command.name)
@@ -677,9 +689,14 @@ class CortexRuntimeEngine(RuntimeEngine):
                 accepted.append(command)
                 continue
             key = target.casefold()
+            unobserved_dispatches = max(
+                0,
+                dispatched_by_structure.get(target, 0) - constructing_by_structure.get(key, 0),
+            )
             effective_count = (
                 completed_or_constructing.get(key, 0)
                 + reserved_by_structure.get(target, 0)
+                + unobserved_dispatches
                 + selected_by_structure.get(target, 0)
             )
             if effective_count >= limit:
@@ -714,6 +731,8 @@ class CortexRuntimeEngine(RuntimeEngine):
     async def _activate_episode(self, observation: ObservationEnvelope) -> None:
         episode_key = (observation.run_id, observation.episode_id)
         changed = self._episode_key != episode_key
+        if changed:
+            self._last_defense_inventory_signatures.clear()
         if changed and self._episode_key is not None:
             active_commands = [
                 lifecycle.command.command_id
@@ -2658,6 +2677,7 @@ class CortexRuntimeEngine(RuntimeEngine):
                 situation=assessment,
                 rules=self._playbook_rules,
                 game_loop=observation.game_loop,
+                behavior_before_hash=counterfactual_observation_fingerprint(observation),
                 mode=mode,
             )
             updated = intent
@@ -2710,6 +2730,7 @@ class CortexRuntimeEngine(RuntimeEngine):
                 episode_id=observation.episode_id,
                 step_id=observation.step_id,
                 game_loop=observation.game_loop,
+                behavior_before_hash=counterfactual_observation_fingerprint(observation),
                 mode=mode,
                 recent_feedback=recent_feedback,
             )
@@ -2775,6 +2796,9 @@ class CortexRuntimeEngine(RuntimeEngine):
                     application.counterfactual_key
                     or self._playbook_counterfactual_key(application, rule)
                 ),
+                counterfactual_signature=application.counterfactual_signature,
+                behavior_before_hash=application.behavior_before_hash,
+                decision_epoch=application.decision_epoch,
                 counterfactual_observable=False,
                 strategic_outcome_window_end_game_loop=(
                     application.game_loop + 448
@@ -3692,6 +3716,32 @@ class CortexRuntimeEngine(RuntimeEngine):
             event_type=event_type,
             payload=payload,
         )
+
+    def _record_defense_inventory(self, observation: ObservationEnvelope) -> None:
+        active_commands = tuple(
+            (lifecycle.command.name, lifecycle.status.value)
+            for lifecycle in self._command_states.values()
+            if lifecycle.status
+            in {
+                CommandStatus.PENDING,
+                CommandStatus.DEFERRED,
+                CommandStatus.DISPATCHED,
+            }
+        )
+        for payload in self._role_agents.defense_inventory_evaluations(
+            observation,
+            active_commands=active_commands,
+        ):
+            item_type = str(payload["item_type"])
+            signature = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+            if self._last_defense_inventory_signatures.get(item_type) == signature:
+                continue
+            self._last_defense_inventory_signatures[item_type] = signature
+            self._record_cortex_event(
+                observation,
+                "defense_inventory_evaluated",
+                payload,
+            )
 
     def _refresh_playbook(
         self,

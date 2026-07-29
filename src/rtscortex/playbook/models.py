@@ -170,6 +170,15 @@ class PlaybookRuleApplication(ContractModel):
         default=None,
         pattern=r"^counterfactual:[0-9a-f]{64}$",
     )
+    counterfactual_signature: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    behavior_before_hash: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    decision_epoch: int | None = Field(default=None, ge=0)
     matched: bool
     blocked: bool = False
     score_delta: float = 0.0
@@ -192,6 +201,15 @@ class PlaybookRuleEvaluation(ContractModel):
     action_name: str | None = None
     role: PlaybookRoleId | None = None
     counterfactual_key: str = Field(pattern=r"^counterfactual:[0-9a-f]{64}$")
+    counterfactual_signature: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    behavior_before_hash: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    decision_epoch: int | None = Field(default=None, ge=0)
     counterfactual_observable: bool = False
     strategic_outcome_window_end_game_loop: int | None = Field(default=None, ge=0)
     strength_at_evaluation: PlaybookRuleStrength

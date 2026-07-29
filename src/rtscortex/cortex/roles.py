@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
@@ -480,7 +481,91 @@ class DefenseAgent(_RoutingRoleAgent):
             and state.command_id is not None
             for state in self._actor_states.values()
         )
-        return completed + queued + dispatched >= limit
+        unobserved_dispatches = max(0, dispatched - queued)
+        return completed + queued + unobserved_dispatches >= limit
+
+    def inventory_evaluations(
+        self,
+        observation: ObservationEnvelope,
+        *,
+        active_commands: Sequence[tuple[str, str]],
+    ) -> tuple[dict[str, object], ...]:
+        """Return the inventory actually used by Defense saturation guards."""
+
+        status_counts: dict[tuple[str, str], int] = {}
+        for action_name, status in active_commands:
+            key = (action_name, status)
+            status_counts[key] = status_counts.get(key, 0) + 1
+
+        evaluations: list[dict[str, object]] = []
+        static_actions = tuple(
+            dict.fromkeys(
+                (
+                    *self.profile.data.defense_doctrine.static_defense_actions,
+                    *self.profile.data.defense_doctrine.anti_air_defense_actions,
+                )
+            )
+        )
+        progress_specs = {spec.name: spec for spec in self.profile.data.progress_action_specs}
+        for action_name in static_actions:
+            spec = progress_specs.get(action_name)
+            if spec is None:
+                continue
+            item_type = spec.effect_target
+            cap = self.profile.data.structure_saturation_limits.get(item_type)
+            if cap is None:
+                continue
+            structures = [
+                item
+                for item in observation.state.own_structures
+                if item.unit_type == item_type and item.health_fraction > 0.0
+            ]
+            evaluations.append(
+                _inventory_payload(
+                    item_type=item_type,
+                    action_name=action_name,
+                    completed=sum(item.status != "constructing" for item in structures),
+                    constructing_or_training=sum(
+                        item.status == "constructing" for item in structures
+                    ),
+                    reserved=sum(
+                        status_counts.get((action_name, status), 0)
+                        for status in ("pending", "deferred")
+                    ),
+                    dispatched_not_terminal=status_counts.get(
+                        (action_name, "dispatched"),
+                        0,
+                    ),
+                    hard_cap=cap,
+                )
+            )
+
+        for item_type, cap in self.profile.data.defense_unit_saturation_limits.items():
+            action_name = f"Train_{item_type}"
+            evaluations.append(
+                _inventory_payload(
+                    item_type=item_type,
+                    action_name=action_name,
+                    completed=sum(
+                        unit.unit_type == item_type and unit.health_fraction > 0.0
+                        for unit in observation.state.own_units
+                    ),
+                    constructing_or_training=sum(
+                        item.name in {item_type, action_name}
+                        for item in observation.state.production_queue
+                    ),
+                    reserved=sum(
+                        status_counts.get((action_name, status), 0)
+                        for status in ("pending", "deferred")
+                    ),
+                    dispatched_not_terminal=status_counts.get(
+                        (action_name, "dispatched"),
+                        0,
+                    ),
+                    hard_cap=cap,
+                )
+            )
+        return tuple(evaluations)
 
     def record_dispatch(
         self,
@@ -741,6 +826,17 @@ class RoleAgentCoordinator:
             return None
         return self.defense_agent.record_execution(report, game_loop=game_loop)
 
+    def defense_inventory_evaluations(
+        self,
+        observation: ObservationEnvelope,
+        *,
+        active_commands: Sequence[tuple[str, str]],
+    ) -> tuple[dict[str, object], ...]:
+        return self.defense_agent.inventory_evaluations(
+            observation,
+            active_commands=active_commands,
+        )
+
     def record_dispatch(
         self,
         command: ActionCommand,
@@ -757,6 +853,45 @@ def _source_intent_id(intent: StrategicIntent) -> str:
     if source is None:
         raise RuntimeError("strategic intent lost its source intent ID")
     return source
+
+
+def _inventory_payload(
+    *,
+    item_type: str,
+    action_name: str,
+    completed: int,
+    constructing_or_training: int,
+    reserved: int,
+    dispatched_not_terminal: int,
+    hard_cap: int,
+) -> dict[str, object]:
+    queued = 0
+    dispatches_not_already_observed = max(
+        0,
+        dispatched_not_terminal - constructing_or_training - queued,
+    )
+    effective_count = (
+        completed + constructing_or_training + queued + reserved + dispatches_not_already_observed
+    )
+    return {
+        "item_type": item_type,
+        "action_name": action_name,
+        "completed": completed,
+        "constructing_or_training": constructing_or_training,
+        "queued": queued,
+        "reserved": reserved,
+        "dispatched_not_terminal": dispatched_not_terminal,
+        "dispatches_not_already_observed": dispatches_not_already_observed,
+        "effective_count": effective_count,
+        "hard_cap": hard_cap,
+        "decision": (
+            "over_cap"
+            if effective_count > hard_cap
+            else "at_cap"
+            if effective_count == hard_cap
+            else "within_cap"
+        ),
+    }
 
 
 def _domain(role: RoleId) -> ActionDomain | None:

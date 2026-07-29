@@ -465,6 +465,41 @@ def test_defense_unit_production_stops_at_race_saturation_target() -> None:
     assert all(intent.action_names != ["Train_Phoenix"] for intent in source_intents)
 
 
+def test_defense_inventory_deduplicates_dispatched_effect_already_observed() -> None:
+    base = _observation()
+    structures = [
+        UnitState(
+            unit_id=f"0xbattery{index}",
+            unit_type="ShieldBattery",
+            alliance="self",
+            status=("constructing" if index == 3 else "ready"),
+        )
+        for index in range(4)
+    ]
+    observation = base.model_copy(
+        update={
+            "state": base.state.model_copy(
+                update={"own_structures": [*base.state.own_structures, *structures]}
+            )
+        }
+    )
+    profile = race_profile("protoss")
+    coordinator = RoleAgentCoordinator(profile, StrategicIntentAdapter(profile))
+
+    inventory = coordinator.defense_inventory_evaluations(
+        observation,
+        active_commands=(("Build_ShieldBattery_Screen", "dispatched"),),
+    )
+    battery = next(item for item in inventory if item["item_type"] == "ShieldBattery")
+
+    assert battery["completed"] == 3
+    assert battery["constructing_or_training"] == 1
+    assert battery["dispatched_not_terminal"] == 1
+    assert battery["dispatches_not_already_observed"] == 0
+    assert battery["effective_count"] == 4
+    assert battery["hard_cap"] == 4
+
+
 def test_undispatched_defense_proposal_does_not_hold_actor() -> None:
     base = _observation()
     observation = base.model_copy(
@@ -832,6 +867,142 @@ def test_playbook_hard_rule_requires_active_mode_to_block() -> None:
     assert shadow.blocked is False
     assert shadow.applications[0].reason == "shadow_would_block"
     assert active.blocked is True
+
+
+def test_different_actor_same_context_does_not_match_counterfactual() -> None:
+    first, second = _candidate_counterfactual_keys(
+        actor_a="CombatGroup1",
+        actor_b="CombatGroup2",
+        arguments_a=["0xabc"],
+        arguments_b=["0xabc"],
+    )
+
+    assert first != second
+
+
+def test_different_target_same_context_does_not_match_counterfactual() -> None:
+    first, second = _candidate_counterfactual_keys(
+        actor_a="CombatGroup1",
+        actor_b="CombatGroup1",
+        arguments_a=["0xabc"],
+        arguments_b=["0xdef"],
+    )
+
+    assert first != second
+
+
+def test_equivalent_intent_matches_across_run_local_operation_ids() -> None:
+    rule = PlaybookRule(
+        rule_id="rule:avoid-adept",
+        canonical_key="avoid-adept",
+        category=PlaybookRuleCategory.EXECUTION_GUARD,
+        conditions=(PlaybookCondition(field="agent_race", value="protoss"),),
+        effect=PlaybookRuleEffect.FORBID,
+        strength=PlaybookRuleStrength.HARD,
+        status=PlaybookRuleStatus.ACTIVE,
+        action_names=("Train_Adept",),
+        confidence=1.0,
+    )
+    first = _intent("Train_Adept", RoleId.PRODUCTION).model_copy(
+        update={
+            "run_id": "active-run",
+            "episode_id": "active-episode",
+            "operation_id": "operation:" + "a" * 64,
+            "continuity_key": "active-local-continuity",
+        }
+    )
+    second = first.model_copy(
+        update={
+            "run_id": "shadow-run",
+            "episode_id": "shadow-episode",
+            "operation_id": "operation:" + "b" * 64,
+            "continuity_key": "shadow-local-continuity",
+        }
+    )
+    situation = DeterministicSituationAnalyzer().assess(_observation())
+    context = PlaybookContext(
+        agent_race="protoss",
+        opponent_race="zerg",
+        phase=situation.phase,
+        map_name="Simple64",
+    )
+    guard = PlaybookIntentGuard()
+
+    keys = [
+        guard.evaluate(
+            intent,
+            context=context,
+            situation=situation,
+            rules=(rule,),
+            game_loop=32,
+            behavior_before_hash="f" * 64,
+            mode="shadow",
+        )
+        .applications[0]
+        .counterfactual_key
+        for intent in (first, second)
+    ]
+
+    assert keys[0] == keys[1]
+
+
+def _candidate_counterfactual_keys(
+    *,
+    actor_a: str,
+    actor_b: str,
+    arguments_a: list[str],
+    arguments_b: list[str],
+) -> tuple[str | None, str | None]:
+    rule = PlaybookRule(
+        rule_id="rule:no-attack",
+        canonical_key="no-attack",
+        category=PlaybookRuleCategory.EXECUTION_GUARD,
+        conditions=(PlaybookCondition(field="agent_race", value="protoss"),),
+        effect=PlaybookRuleEffect.FORBID,
+        strength=PlaybookRuleStrength.HARD,
+        status=PlaybookRuleStatus.ACTIVE,
+        action_names=("Attack_Unit",),
+        confidence=1.0,
+    )
+    situation = DeterministicSituationAnalyzer().assess(_observation())
+    context = PlaybookContext(
+        agent_race="protoss",
+        opponent_race="zerg",
+        phase=situation.phase,
+        map_name="Simple64",
+    )
+    guard = PlaybookCandidateGuard()
+    keys: list[str | None] = []
+    for index, (actor, arguments) in enumerate(((actor_a, arguments_a), (actor_b, arguments_b))):
+        candidate = ExecutableCandidate(
+            candidate_id=f"candidate:{index:064x}",
+            observation_fingerprint="0" * 64,
+            intent_id="intent:focus-fire",
+            action_name="Attack_Unit",
+            actor=actor,
+            arguments=arguments,
+            features=CandidateFeatures(
+                action_rank=0,
+                actor_rank=index,
+                argument_rank=0,
+                compile_ordinal=index,
+            ),
+        )
+        result = guard.evaluate(
+            candidate,
+            role="focus_fire",
+            context=context,
+            situation=situation,
+            rules=(rule,),
+            run_id="run",
+            episode_id="episode",
+            step_id=1,
+            game_loop=32,
+            behavior_before_hash="f" * 64,
+            mode="shadow",
+        )
+        keys.append(result.applications[0].counterfactual_key)
+    return keys[0], keys[1]
 
 
 def test_playbook_soft_intent_score_is_observed_but_not_applied_in_shadow() -> None:

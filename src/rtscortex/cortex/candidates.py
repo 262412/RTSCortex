@@ -142,6 +142,23 @@ def observation_fingerprint(observation: ObservationEnvelope) -> str:
     return _sha256(payload)
 
 
+def counterfactual_observation_fingerprint(observation: ObservationEnvelope) -> str:
+    """Hash the pre-decision game state without run-local identity fields."""
+
+    payload = observation.model_dump(
+        mode="json",
+        exclude={
+            "run_id",
+            "episode_id",
+            "step_id",
+            "game_loop",
+            "observed_at",
+            "image_uri",
+        },
+    )
+    return _sha256(payload)
+
+
 def _validate_intent_observation(
     intent: CortexIntent,
     observation: ObservationEnvelope,

@@ -257,6 +257,18 @@ class PrimitiveTraceEntry(ContractModel):
     )
 
 
+class PlacementLedgerTransition(ContractModel):
+    reservation_id: str = Field(min_length=1)
+    structure_type: str = Field(min_length=1)
+    footprint_cells: list[tuple[int, int]] = Field(min_length=1)
+    previous_state: str = Field(min_length=1)
+    next_state: str = Field(min_length=1)
+    failure_class: str | None = None
+    actor_failure: bool = False
+    game_loop: int = Field(ge=0)
+    release_reason: str | None = None
+
+
 class EffectEvidence(ContractModel):
     effect_kind: (
         Literal[
@@ -293,6 +305,7 @@ class EffectEvidence(ContractModel):
     footprint_width: int | None = Field(default=None, ge=1)
     footprint_height: int | None = Field(default=None, ge=1)
     occupied_grid_cells: list[tuple[int, int]] = Field(default_factory=list)
+    placement_ledger_transitions: list[PlacementLedgerTransition] = Field(default_factory=list)
     baseline_builder_orders: list[int] = Field(default_factory=list)
     requested_producer_tag: str | None = None
     producer_tag: str | None = None

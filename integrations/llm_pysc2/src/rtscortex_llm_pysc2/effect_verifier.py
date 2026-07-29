@@ -395,7 +395,10 @@ class ActionEffectVerifier:
             )
             evidence = self._effect_evidence(pending, current, structure)
             if self.placement_service is not None:
-                self.placement_service.confirm_command(command_id)
+                self.placement_service.confirm_command(
+                    command_id,
+                    game_loop=current.game_loop,
+                )
             verdicts.append(
                 EffectVerdict(
                     command_id,
@@ -431,6 +434,16 @@ class ActionEffectVerifier:
                 continue
             if elapsed >= self.timeout_game_loops:
                 failure_code = self._timeout_code(pending, current)
+                evidence = self._effect_evidence(pending, current, None)
+                if self.placement_service is not None:
+                    self.placement_service.quarantine_command(
+                        command_id=command_id,
+                        action_name=pending.command.name,
+                        requested_arguments=pending.command.requested_arguments,
+                        world_target=pending.command.screen_world_target,
+                        failure_code=failure_code,
+                        game_loop=current.game_loop,
+                    )
                 verdicts.append(
                     EffectVerdict(
                         command_id,
@@ -438,7 +451,7 @@ class ActionEffectVerifier:
                         self._timeout_reason(pending, current),
                         status="failed",
                         failure_code=failure_code,
-                        evidence=self._effect_evidence(pending, current, None),
+                        evidence=evidence,
                     )
                 )
                 del self._pending[command_id]
@@ -556,6 +569,12 @@ class ActionEffectVerifier:
                     ),
                 )
             )
+            if self.placement_service is not None:
+                self.placement_service.release_command(
+                    command_id,
+                    game_loop=(0 if current is None else current.game_loop),
+                    reason="episode_ended_unconfirmed",
+                )
             del self._pending[command_id]
         for command_id, pending_move in list(self._pending_moves.items()):
             if pending_move.accepted_game_loop is None:

@@ -8,6 +8,7 @@ from rtscortex.evaluation.cortex import (
 from rtscortex.evaluation.engineering import (
     ENGINEERING_GATES_FILENAME,
     REQUIRED_ENGINEERING_GATES,
+    EngineeringAccumulator,
     build_engineering_gate_report,
 )
 from rtscortex.evaluation.metrics import EpisodeMetrics, compute_episode_metrics
@@ -25,6 +26,7 @@ __all__ = [
     "CortexObservabilityMetrics",
     "EpisodeMetrics",
     "ENGINEERING_GATES_FILENAME",
+    "EngineeringAccumulator",
     "REQUIRED_ENGINEERING_GATES",
     "ReportError",
     "RunReportArtifacts",

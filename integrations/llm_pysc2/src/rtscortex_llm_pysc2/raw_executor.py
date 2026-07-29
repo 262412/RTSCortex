@@ -120,12 +120,13 @@ class RawActionExecutor:
             if dispatch is None:
                 continue
             if str(report.get("status", "")) == "failed":
-                self._quarantine_failed_build(
-                    dispatch,
-                    agents,
-                    game_loop=game_loop,
-                    failure_code=str(report.get("failure_code") or "effect_failed"),
-                )
+                if self.placement_service.command_target(command_id) is not None:
+                    self._quarantine_failed_build(
+                        dispatch,
+                        agents,
+                        game_loop=game_loop,
+                        failure_code=str(report.get("failure_code") or "effect_failed"),
+                    )
             else:
                 self.placement_service.release_command(command_id)
 
