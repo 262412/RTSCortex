@@ -20,7 +20,7 @@ baseline_source="$(readlink -f "$1")"
 run_set_dir="$2"
 expected_git_sha="$4"
 counterfactual_canary="$(readlink -f "$6")"
-seed_csv="${8:-0,1,2}"
+seed_csv="${8:-3,4,5}"
 IFS=',' read -r -a seeds <<< "${seed_csv}"
 if [[ ${#seeds[@]} -ne 3 ]]; then
   echo "formal acceptance requires exactly three held-out seeds" >&2
@@ -65,21 +65,6 @@ if [[ "${baseline_source}" != "${baseline_snapshot}" ]]; then
 fi
 baseline_sha256="$(sha256sum "${baseline_snapshot}" | awk '{print $1}')"
 
-uv run python - "${counterfactual_canary}" "${expected_git_sha}" "${baseline_sha256}" <<'PY'
-import sys
-import json
-from pathlib import Path
-from scripts.analyze_playbook_experiment import counterfactual_canary_is_valid
-
-artifact = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-if not counterfactual_canary_is_valid(
-    artifact,
-    baseline_sha256=sys.argv[3],
-    expected_git_sha=sys.argv[2],
-):
-    raise SystemExit("counterfactual canary is missing, rejected, or source-mismatched")
-PY
-
 cd "${repo_dir}"
 git status --short > "${run_set_dir}/source-status.txt"
 git diff --binary > "${run_set_dir}/source.diff"
@@ -87,9 +72,13 @@ git_head="$(git rev-parse HEAD)"
 superproject_dirty="$(test -n "$(git status --porcelain --ignore-submodules=dirty)" && echo true || echo false)"
 submodule_commit="$(git -C third_party/LLM-PySC2 rev-parse HEAD)"
 submodule_dirty="$(test -n "$(git -C third_party/LLM-PySC2 status --porcelain)" && echo true || echo false)"
+submodule_gitlink="$(git ls-tree HEAD third_party/LLM-PySC2 | awk '{print $3}')"
 submodule_diff_sha256="$(git -C third_party/LLM-PySC2 diff --binary | sha256sum | awk '{print $1}')"
-if [[ "${git_head}" != "${expected_git_sha}" || "${superproject_dirty}" != "false" ]]; then
-  echo "formal acceptance requires clean ${expected_git_sha}; got head=${git_head} dirty=${superproject_dirty}" >&2
+if [[ "${git_head}" != "${expected_git_sha}" \
+  || "${superproject_dirty}" != "false" \
+  || "${submodule_dirty}" != "false" \
+  || "${submodule_commit}" != "${submodule_gitlink}" ]]; then
+  echo "formal acceptance requires clean ${expected_git_sha} and exact clean gitlink ${submodule_gitlink}" >&2
   exit 2
 fi
 
@@ -105,11 +94,39 @@ uv run rtscortex playbook hard-readiness \
   "${readiness_seed_args[@]}" \
   --output "${readiness_evidence}"
 
+uv run python - \
+  "${counterfactual_canary}" \
+  "${expected_git_sha}" \
+  "${baseline_sha256}" \
+  "${readiness_evidence}" \
+  "${seeds[@]}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+from scripts.analyze_playbook_experiment import counterfactual_canary_is_valid
+
+artifact = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+readiness = json.loads(Path(sys.argv[4]).read_text(encoding="utf-8"))
+evaluation_seeds = tuple(int(value) for value in sys.argv[5:])
+if not counterfactual_canary_is_valid(
+    artifact,
+    baseline_sha256=sys.argv[3],
+    expected_git_sha=sys.argv[2],
+    expected_evaluation_seeds=evaluation_seeds,
+    approved_rule_set_sha256=readiness.get("approved_rule_set_sha256"),
+):
+    raise SystemExit(
+        "counterfactual canary is rejected or mismatched to source, seeds, or approved rules"
+    )
+PY
+
 capture_source_attestation() {
   source_git_head="$(git rev-parse HEAD)"
   source_superproject_dirty="$(test -n "$(git status --porcelain --ignore-submodules=dirty)" && echo true || echo false)"
   source_submodule_commit="$(git -C third_party/LLM-PySC2 rev-parse HEAD)"
   source_submodule_dirty="$(test -n "$(git -C third_party/LLM-PySC2 status --porcelain)" && echo true || echo false)"
+  source_submodule_gitlink="$(git ls-tree HEAD third_party/LLM-PySC2 | awk '{print $3}')"
   source_submodule_diff_sha256="$(git -C third_party/LLM-PySC2 diff --binary | sha256sum | awk '{print $1}')"
 }
 
@@ -117,7 +134,9 @@ source_matches_baseline() {
   [[ "${source_git_head}" == "${expected_git_sha}" ]] \
     && [[ "${source_superproject_dirty}" == "false" ]] \
     && [[ "${source_submodule_commit}" == "${submodule_commit}" ]] \
-    && [[ "${source_submodule_dirty}" == "${submodule_dirty}" ]] \
+    && [[ "${source_submodule_dirty}" == "false" ]] \
+    && [[ "${source_submodule_gitlink}" == "${submodule_gitlink}" ]] \
+    && [[ "${source_submodule_commit}" == "${source_submodule_gitlink}" ]] \
     && [[ "${source_submodule_diff_sha256}" == "${submodule_diff_sha256}" ]]
 }
 
@@ -130,6 +149,7 @@ uv run python scripts/run_recovery_acceptance_canary.py \
   echo "superproject_dirty=${superproject_dirty}"
   echo "submodule_commit=${submodule_commit}"
   echo "submodule_dirty=${submodule_dirty}"
+  echo "submodule_gitlink=${submodule_gitlink}"
   echo "submodule_diff_sha256=${submodule_diff_sha256}"
   echo "expected_git_sha=${expected_git_sha}"
   echo "baseline_sha256=${baseline_sha256}"
@@ -141,7 +161,7 @@ uv run python scripts/run_recovery_acceptance_canary.py \
 } > "${run_set_dir}/experiment-metadata.txt"
 
 status_file="${run_set_dir}/experiment-status.tsv"
-printf "experiment_kind\tmode\tseed\tarm\tsubject_arm\tarm_order\texit_code\trun_dir\tplaybook_before_sha256\tplaybook_after_sha256\tplaybook_before_snapshot\tplaybook_after_snapshot\tgit_head_before\tgit_head_after\tsuperproject_dirty_before\tsuperproject_dirty_after\tsubmodule_commit_before\tsubmodule_commit_after\tsubmodule_dirty_before\tsubmodule_dirty_after\tsubmodule_diff_sha256_before\tsubmodule_diff_sha256_after\n" \
+printf "experiment_kind\tmode\tseed\tarm\tsubject_arm\tarm_order\texit_code\trun_dir\tplaybook_before_sha256\tplaybook_after_sha256\tplaybook_before_snapshot\tplaybook_after_snapshot\tgit_head_before\tgit_head_after\tsuperproject_dirty_before\tsuperproject_dirty_after\tsubmodule_commit_before\tsubmodule_commit_after\tsubmodule_dirty_before\tsubmodule_dirty_after\tsubmodule_gitlink_before\tsubmodule_gitlink_after\tsubmodule_diff_sha256_before\tsubmodule_diff_sha256_after\n" \
   > "${status_file}"
 overall_status=0
 
@@ -175,6 +195,7 @@ run_arm() {
   local dirty_before="${source_superproject_dirty}"
   local submodule_commit_before="${source_submodule_commit}"
   local submodule_dirty_before="${source_submodule_dirty}"
+  local submodule_gitlink_before="${source_submodule_gitlink}"
   local submodule_diff_before="${source_submodule_diff_sha256}"
   local before_sha256 log_path run_status run_dir after_sha256 before_snapshot after_snapshot
   before_sha256="$(sha256sum "${working_playbook}" | awk '{print $1}')"
@@ -199,6 +220,7 @@ run_arm() {
   local dirty_after="${source_superproject_dirty}"
   local submodule_commit_after="${source_submodule_commit}"
   local submodule_dirty_after="${source_submodule_dirty}"
+  local submodule_gitlink_after="${source_submodule_gitlink}"
   local submodule_diff_after="${source_submodule_diff_sha256}"
   if ! source_matches_baseline; then
     echo "source attestation changed during ${mode}/${arm}/seed-${seed}" >&2
@@ -214,12 +236,13 @@ run_arm() {
   after_sha256="$(sha256sum "${working_playbook}" | awk '{print $1}')"
   after_snapshot="${arm_dir}/seed-${seed}.after.sqlite3"
   cp "${working_playbook}" "${after_snapshot}"
-  printf "behavior\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+  printf "behavior\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
     "${mode}" "${seed}" "${arm}" "${arm}" "${order}" "${run_status}" "${run_dir}" \
     "${before_sha256}" "${after_sha256}" "${before_snapshot}" "${after_snapshot}" \
     "${git_head_before}" "${git_head_after}" "${dirty_before}" "${dirty_after}" \
     "${submodule_commit_before}" "${submodule_commit_after}" \
     "${submodule_dirty_before}" "${submodule_dirty_after}" \
+    "${submodule_gitlink_before}" "${submodule_gitlink_after}" \
     "${submodule_diff_before}" "${submodule_diff_after}" \
     >> "${status_file}"
   if [[ ${run_status} -ne 0 ]]; then
@@ -248,6 +271,7 @@ run_shadow_calibration() {
   local dirty_before="${source_superproject_dirty}"
   local submodule_commit_before="${source_submodule_commit}"
   local submodule_dirty_before="${source_submodule_dirty}"
+  local submodule_gitlink_before="${source_submodule_gitlink}"
   local submodule_diff_before="${source_submodule_diff_sha256}"
   local before_sha256 log_path run_status run_dir after_sha256 before_snapshot after_snapshot
   before_sha256="$(sha256sum "${shadow_playbook}" | awk '{print $1}')"
@@ -272,6 +296,7 @@ run_shadow_calibration() {
   local dirty_after="${source_superproject_dirty}"
   local submodule_commit_after="${source_submodule_commit}"
   local submodule_dirty_after="${source_submodule_dirty}"
+  local submodule_gitlink_after="${source_submodule_gitlink}"
   local submodule_diff_after="${source_submodule_diff_sha256}"
   if ! source_matches_baseline; then
     echo "source attestation changed during ${mode}/shadow-${subject_arm}/seed-${seed}" >&2
@@ -287,12 +312,13 @@ run_shadow_calibration() {
   after_sha256="$(sha256sum "${shadow_playbook}" | awk '{print $1}')"
   after_snapshot="${arm_dir}/seed-${seed}.after.sqlite3"
   cp "${shadow_playbook}" "${after_snapshot}"
-  printf "calibration\t%s\t%s\tshadow\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+  printf "calibration\t%s\t%s\tshadow\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
     "${mode}" "${seed}" "${subject_arm}" "${order}" "${run_status}" "${run_dir}" \
     "${before_sha256}" "${after_sha256}" "${before_snapshot}" "${after_snapshot}" \
     "${git_head_before}" "${git_head_after}" "${dirty_before}" "${dirty_after}" \
     "${submodule_commit_before}" "${submodule_commit_after}" \
     "${submodule_dirty_before}" "${submodule_dirty_after}" \
+    "${submodule_gitlink_before}" "${submodule_gitlink_after}" \
     "${submodule_diff_before}" "${submodule_diff_after}" \
     >> "${status_file}"
   if [[ ${run_status} -ne 0 ]]; then
@@ -340,6 +366,7 @@ fi
   echo "final_superproject_dirty=${source_superproject_dirty}"
   echo "final_submodule_commit=${source_submodule_commit}"
   echo "final_submodule_dirty=${source_submodule_dirty}"
+  echo "final_submodule_gitlink=${source_submodule_gitlink}"
   echo "final_submodule_diff_sha256=${source_submodule_diff_sha256}"
 } >> "${run_set_dir}/experiment-metadata.txt"
 

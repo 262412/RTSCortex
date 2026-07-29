@@ -438,6 +438,8 @@ def _run_metrics(
     submodule_commit_after = row.get("submodule_commit_after", "")
     submodule_dirty_before = row.get("submodule_dirty_before", "")
     submodule_dirty_after = row.get("submodule_dirty_after", "")
+    submodule_gitlink_before = row.get("submodule_gitlink_before", "")
+    submodule_gitlink_after = row.get("submodule_gitlink_after", "")
     submodule_diff_before = row.get("submodule_diff_sha256_before", "")
     submodule_diff_after = row.get("submodule_diff_sha256_after", "")
     has_source_attestation = all(
@@ -450,6 +452,8 @@ def _run_metrics(
             submodule_commit_after,
             submodule_dirty_before,
             submodule_dirty_after,
+            submodule_gitlink_before,
+            submodule_gitlink_after,
             submodule_diff_before,
             submodule_diff_after,
         )
@@ -459,7 +463,9 @@ def _run_metrics(
         and git_head_before == git_head_after
         and dirty_before == dirty_after
         and submodule_commit_before == submodule_commit_after
-        and submodule_dirty_before == submodule_dirty_after
+        and submodule_dirty_before == submodule_dirty_after == "false"
+        and submodule_gitlink_before == submodule_gitlink_after
+        and submodule_commit_before == submodule_gitlink_before
         and submodule_diff_before == submodule_diff_after
     )
     source_attestation_fingerprint = (
@@ -468,6 +474,7 @@ def _run_metrics(
             superproject_dirty=dirty_before,
             submodule_commit=submodule_commit_before,
             submodule_dirty=submodule_dirty_before,
+            submodule_gitlink=submodule_gitlink_before,
             submodule_diff_sha256=submodule_diff_before,
         )
         if source_attestation_consistent
@@ -591,6 +598,7 @@ def _source_attestation_fingerprint(
     superproject_dirty: str,
     submodule_commit: str,
     submodule_dirty: str,
+    submodule_gitlink: str,
     submodule_diff_sha256: str,
 ) -> str:
     payload = json.dumps(
@@ -599,6 +607,7 @@ def _source_attestation_fingerprint(
             "superproject_dirty": superproject_dirty,
             "submodule_commit": submodule_commit,
             "submodule_dirty": submodule_dirty,
+            "submodule_gitlink": submodule_gitlink,
             "submodule_diff_sha256": submodule_diff_sha256,
         },
         sort_keys=True,
@@ -612,17 +621,21 @@ def counterfactual_canary_is_valid(
     *,
     baseline_sha256: str,
     expected_git_sha: str | None,
+    expected_evaluation_seeds: tuple[int, ...],
+    approved_rule_set_sha256: str | None = None,
 ) -> bool:
     gates = artifact.get("gates")
     behavior = artifact.get("behavior")
     shadow = artifact.get("shadow")
     readiness = artifact.get("hard_readiness")
     return (
-        artifact.get("schema_version") == "1.0"
+        artifact.get("schema_version") == "1.1"
         and artifact.get("canary_kind") == "production"
         and artifact.get("canary_fixture") is False
         and artifact.get("accepted") is True
         and artifact.get("baseline_sha256") == baseline_sha256
+        and set(artifact.get("evaluation_seed_ids", ())) == set(expected_evaluation_seeds)
+        and artifact.get("execution_seed") in set(expected_evaluation_seeds)
         and (expected_git_sha is None or artifact.get("expected_git_sha") == expected_git_sha)
         and isinstance(gates, dict)
         and bool(gates)
@@ -631,10 +644,19 @@ def counterfactual_canary_is_valid(
         and readiness.get("canary_runnable") is True
         and readiness.get("baseline_sha256") == baseline_sha256
         and readiness.get("expected_git_sha") == expected_git_sha
+        and set(readiness.get("evaluation_seed_ids", ())) == set(expected_evaluation_seeds)
+        and bool(readiness.get("approved_blocking_rule_ids"))
+        and not bool(readiness.get("rejected_context_applicable_blocking_hard_rule_ids"))
+        and artifact.get("approved_rule_set_sha256") == readiness.get("approved_rule_set_sha256")
+        and (
+            approved_rule_set_sha256 is None
+            or artifact.get("approved_rule_set_sha256") == approved_rule_set_sha256
+        )
         and int(readiness.get("context_applicable_blocking_hard_count", 0)) >= 1
         and not bool(readiness.get("canary_fixture_rule_ids"))
         and int(artifact.get("active_hard_block_count", 0)) > 0
-        and int(artifact.get("matched_counterfactual_count", 0)) > 0
+        and artifact.get("terminal_counterfactual_required") is True
+        and int(artifact.get("terminal_counterfactual_resolved_count", 0)) > 0
         and int(artifact.get("unmatched_active_hard_block_count", -1)) == 0
         and isinstance(behavior, dict)
         and isinstance(shadow, dict)
@@ -848,6 +870,7 @@ def _comparison(
                 counterfactual_canary,
                 baseline_sha256=baseline_sha256,
                 expected_git_sha=expected_git_sha,
+                expected_evaluation_seeds=unique_expected_seeds,
             )
         ),
         "analysis_memory_budget_respected": all(

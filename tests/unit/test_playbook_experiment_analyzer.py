@@ -14,11 +14,19 @@ from scripts.analyze_playbook_counterfactual_canary import build_canary_report
 from scripts.analyze_playbook_experiment import RunMetrics, _comparison
 
 
-def _readiness(*, fixture: bool = False) -> dict[str, object]:
+def _readiness(
+    *,
+    fixture: bool = False,
+    evaluation_seeds: tuple[int, ...] = (0, 1, 2),
+) -> dict[str, object]:
     return {
         "baseline_sha256": "baseline",
         "expected_git_sha": "expected",
+        "evaluation_seed_ids": list(evaluation_seeds),
         "context_applicable_blocking_hard_count": 1,
+        "approved_blocking_rule_ids": ["fixture-rule" if fixture else "production-rule"],
+        "approved_rule_set_sha256": "approved-rule-set",
+        "rejected_context_applicable_blocking_hard_rule_ids": [],
         "canary_fixture_rule_ids": ["fixture-rule"] if fixture else [],
         "canary_runnable": True,
     }
@@ -284,6 +292,7 @@ def test_submodule_source_change_rejects_formal_acceptance() -> None:
 
     assert comparison["gates"]["source_attestation_consistent"] is False
     assert comparison["accepted"] is False
+    assert comparison["accepted"] is False
 
 
 def test_runs_from_different_source_attestations_reject_acceptance() -> None:
@@ -296,7 +305,31 @@ def test_runs_from_different_source_attestations_reject_acceptance() -> None:
     comparison = _comparison(metrics, baseline_sha256="baseline")
 
     assert comparison["gates"]["source_attestation_consistent"] is False
-    assert comparison["accepted"] is False
+
+
+@pytest.mark.parametrize(
+    "source_overrides",
+    [
+        {"submodule_dirty_before": "true", "submodule_dirty_after": "true"},
+        {"submodule_gitlink_before": "other", "submodule_gitlink_after": "other"},
+        {"submodule_commit_after": "other"},
+    ],
+)
+def test_dirty_or_gitlink_mismatched_submodule_fails_source_attestation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    source_overrides: dict[str, str],
+) -> None:
+    metrics = _metrics_for_events(
+        tmp_path,
+        monkeypatch,
+        [],
+        metric_state_limit=10,
+        source_overrides=source_overrides,
+    )
+
+    assert metrics.source_attestation_consistent is False
+    assert metrics.source_attestation_fingerprint is None
 
 
 def test_comparison_separates_independent_pairs_from_sequential_learning() -> None:
@@ -464,6 +497,9 @@ def test_paired_runner_propagates_failed_acceptance_gate() -> None:
         "run_recovery_acceptance_canary.py"
     )
     assert "submodule_diff_sha256_before" in runner
+    assert "submodule_gitlink_before" in runner
+    assert '"${submodule_dirty}" != "false"' in runner
+    assert '"${submodule_commit}" != "${submodule_gitlink}"' in runner
     assert "capture_source_attestation" in runner
     assert 'exit "${overall_status}"' in runner
 
@@ -473,6 +509,11 @@ def test_paired_runner_propagates_failed_acceptance_gate() -> None:
     assert canary_runner.index("playbook hard-readiness") < canary_runner.index(
         "run_recovery_acceptance_canary.py"
     )
+    assert "--execution-seed" in canary_runner
+    assert "--evaluation-seeds" in canary_runner
+    assert "readiness_seed_args" in canary_runner
+    assert "submodule_gitlink_before" in canary_runner
+    assert '"${submodule_dirty}" != "false"' in canary_runner
     assert "s/^Artifacts: //p" in runner
     assert "s/^Artifacts: //p" in canary_runner
 
@@ -481,6 +522,8 @@ def test_paired_runner_propagates_failed_acceptance_gate() -> None:
     ).read_text(encoding="utf-8")
     assert "s/^Artifacts: //p" in fixture_runner
     assert "local fields=(" in fixture_runner
+    assert "submodule_gitlink_before" in fixture_runner
+    assert '"${submodule_dirty}" != "false"' in fixture_runner
 
 
 def test_active_intent_cannot_be_resolved_by_different_shadow_target() -> None:
@@ -516,7 +559,7 @@ def test_active_intent_cannot_be_resolved_by_different_shadow_target() -> None:
         readiness_evidence=_readiness(),
     )
 
-    assert report["matched_counterfactual_count"] == 0
+    assert report["terminal_counterfactual_resolved_count"] == 0
     assert report["unmatched_active_hard_block_count"] == 1
     assert report["accepted"] is False
 
@@ -608,6 +651,139 @@ def test_formal_comparison_accepts_complete_counterfactual_canary() -> None:
 
     assert canary["accepted"] is True
     assert comparison["gates"]["counterfactual_canary_accepted"] is True
+
+
+def test_production_canary_uses_full_held_out_seed_set() -> None:
+    behavior = replace(
+        _metrics(
+            mode="causal_canary",
+            seed=3,
+            arm="active",
+            before="baseline",
+            after="after",
+            repeated_errors=0,
+        ),
+        active_hard_block_keys=("counterfactual:shared",),
+        active_hard_block_records=(("counterfactual:shared", 100, "a" * 64),),
+    )
+    shadow = replace(
+        _metrics(
+            mode="causal_canary",
+            seed=3,
+            arm="shadow",
+            before="baseline",
+            after="baseline",
+            repeated_errors=0,
+        ),
+        resolved_counterfactual_keys=("counterfactual:shared",),
+    )
+    canary = build_canary_report(
+        behavior,
+        shadow,
+        baseline_sha256="baseline",
+        expected_git_sha="expected",
+        readiness_evidence=_readiness(evaluation_seeds=(3, 4, 5)),
+    )
+    held_out = [replace(metric, seed=metric.seed + 3) for metric in _strict_matrix()]
+
+    comparison = _comparison(
+        held_out,
+        baseline_sha256="baseline",
+        expected_git_sha="expected",
+        counterfactual_canary=canary,
+        expected_seeds=(3, 4, 5),
+    )
+
+    assert canary["execution_seed"] == 3
+    assert canary["evaluation_seed_ids"] == [3, 4, 5]
+    assert comparison["gates"]["counterfactual_canary_accepted"] is True
+
+
+def test_formal_runner_rejects_canary_with_different_evaluation_seed_set() -> None:
+    behavior = replace(
+        _metrics(
+            mode="causal_canary",
+            seed=3,
+            arm="active",
+            before="baseline",
+            after="after",
+            repeated_errors=0,
+        ),
+        active_hard_block_keys=("counterfactual:shared",),
+        active_hard_block_records=(("counterfactual:shared", 100, "a" * 64),),
+    )
+    shadow = replace(
+        _metrics(
+            mode="causal_canary",
+            seed=3,
+            arm="shadow",
+            before="baseline",
+            after="baseline",
+            repeated_errors=0,
+        ),
+        resolved_counterfactual_keys=("counterfactual:shared",),
+    )
+    canary = build_canary_report(
+        behavior,
+        shadow,
+        baseline_sha256="baseline",
+        expected_git_sha="expected",
+        readiness_evidence=_readiness(evaluation_seeds=(3, 4, 6)),
+    )
+    held_out = [replace(metric, seed=metric.seed + 3) for metric in _strict_matrix()]
+
+    comparison = _comparison(
+        held_out,
+        baseline_sha256="baseline",
+        expected_git_sha="expected",
+        counterfactual_canary=canary,
+        expected_seeds=(3, 4, 5),
+    )
+
+    assert comparison["gates"]["counterfactual_canary_accepted"] is False
+
+
+def test_formal_runner_rejects_canary_with_different_approved_rule_set() -> None:
+    behavior = replace(
+        _metrics(
+            mode="causal_canary",
+            seed=0,
+            arm="active",
+            before="baseline",
+            after="after",
+            repeated_errors=0,
+        ),
+        active_hard_block_keys=("counterfactual:shared",),
+        active_hard_block_records=(("counterfactual:shared", 100, "a" * 64),),
+    )
+    shadow = replace(
+        _metrics(
+            mode="causal_canary",
+            seed=0,
+            arm="shadow",
+            before="baseline",
+            after="baseline",
+            repeated_errors=0,
+        ),
+        resolved_counterfactual_keys=("counterfactual:shared",),
+    )
+    canary = build_canary_report(
+        behavior,
+        shadow,
+        baseline_sha256="baseline",
+        expected_git_sha="expected",
+        readiness_evidence=_readiness(),
+    )
+    canary["approved_rule_set_sha256"] = "different"
+
+    comparison = _comparison(
+        _strict_matrix(),
+        baseline_sha256="baseline",
+        expected_git_sha="expected",
+        counterfactual_canary=canary,
+    )
+
+    assert comparison["gates"]["counterfactual_canary_accepted"] is False
 
 
 def test_analysis_evidence_overflow_rejects_formal_comparison() -> None:
@@ -800,6 +976,9 @@ def test_formal_comparison_rejects_fixture_counterfactual_canary() -> None:
 
     assert fixture["accepted"] is True
     assert fixture["canary_fixture"] is True
+    assert fixture["terminal_counterfactual_required"] is False
+    assert fixture["terminal_counterfactual_resolved_count"] == 0
+    assert fixture["matched_shadow_guard_allow_count"] == 1
     assert comparison["gates"]["counterfactual_canary_accepted"] is False
     assert comparison["accepted"] is False
 
@@ -1322,23 +1501,39 @@ def _metrics_for_events(
     events: list[StoredEvent],
     *,
     metric_state_limit: int,
+    source_overrides: dict[str, str] | None = None,
 ) -> RunMetrics:
     run_dir = tmp_path / f"run-{len(list(tmp_path.iterdir()))}"
     run_dir.mkdir()
     (run_dir / "events.jsonl").write_text("{}\n", encoding="utf-8")
     monkeypatch.setattr(analyzer, "read_event_log", lambda _: iter(events))
+    row = {
+        "mode": "independent_paired",
+        "seed": "0",
+        "arm": "frozen",
+        "exit_code": "0",
+        "run_dir": str(run_dir),
+        "playbook_before_snapshot": str(tmp_path / "before.sqlite3"),
+        "playbook_after_snapshot": str(tmp_path / "after.sqlite3"),
+        "playbook_before_sha256": "before",
+        "playbook_after_sha256": "after",
+        "git_head_before": "expected",
+        "git_head_after": "expected",
+        "superproject_dirty_before": "false",
+        "superproject_dirty_after": "false",
+        "submodule_commit_before": "gitlink",
+        "submodule_commit_after": "gitlink",
+        "submodule_dirty_before": "false",
+        "submodule_dirty_after": "false",
+        "submodule_gitlink_before": "gitlink",
+        "submodule_gitlink_after": "gitlink",
+        "submodule_diff_sha256_before": "clean",
+        "submodule_diff_sha256_after": "clean",
+    }
+    if source_overrides:
+        row.update(source_overrides)
     return analyzer._run_metrics(
-        {
-            "mode": "independent_paired",
-            "seed": "0",
-            "arm": "frozen",
-            "exit_code": "0",
-            "run_dir": str(run_dir),
-            "playbook_before_snapshot": str(tmp_path / "before.sqlite3"),
-            "playbook_after_snapshot": str(tmp_path / "after.sqlite3"),
-            "playbook_before_sha256": "before",
-            "playbook_after_sha256": "after",
-        },
+        row,
         metric_state_limit=metric_state_limit,
     )
 

@@ -34,8 +34,14 @@ status_file="${run_set_dir}/experiment-status.tsv"
 cd "${repo_dir}"
 git_head="$(git rev-parse HEAD)"
 superproject_dirty="$(test -n "$(git status --porcelain --ignore-submodules=dirty)" && echo true || echo false)"
-if [[ "${git_head}" != "${expected_git_sha}" || "${superproject_dirty}" != "false" ]]; then
-  echo "fixture canary requires clean ${expected_git_sha}" >&2
+submodule_commit="$(git -C third_party/LLM-PySC2 rev-parse HEAD)"
+submodule_dirty="$(test -n "$(git -C third_party/LLM-PySC2 status --porcelain)" && echo true || echo false)"
+submodule_gitlink="$(git ls-tree HEAD third_party/LLM-PySC2 | awk '{print $3}')"
+if [[ "${git_head}" != "${expected_git_sha}" \
+  || "${superproject_dirty}" != "false" \
+  || "${submodule_dirty}" != "false" \
+  || "${submodule_commit}" != "${submodule_gitlink}" ]]; then
+  echo "fixture canary requires clean ${expected_git_sha} and exact clean gitlink ${submodule_gitlink}" >&2
   exit 2
 fi
 
@@ -57,7 +63,7 @@ uv run rtscortex playbook hard-readiness \
 
 printf '{"accepted":false,"skipped":true,"reason":"bounded fixture canary does not claim recovery acceptance"}\n' \
   > "${recovery_placeholder}"
-printf "experiment_kind\tmode\tseed\tarm\tsubject_arm\tarm_order\texit_code\trun_dir\tplaybook_before_sha256\tplaybook_after_sha256\tplaybook_before_snapshot\tplaybook_after_snapshot\tgit_head_before\tgit_head_after\tsuperproject_dirty_before\tsuperproject_dirty_after\tsubmodule_commit_before\tsubmodule_commit_after\tsubmodule_dirty_before\tsubmodule_dirty_after\tsubmodule_diff_sha256_before\tsubmodule_diff_sha256_after\n" \
+printf "experiment_kind\tmode\tseed\tarm\tsubject_arm\tarm_order\texit_code\trun_dir\tplaybook_before_sha256\tplaybook_after_sha256\tplaybook_before_snapshot\tplaybook_after_snapshot\tgit_head_before\tgit_head_after\tsuperproject_dirty_before\tsuperproject_dirty_after\tsubmodule_commit_before\tsubmodule_commit_after\tsubmodule_dirty_before\tsubmodule_dirty_after\tsubmodule_gitlink_before\tsubmodule_gitlink_after\tsubmodule_diff_sha256_before\tsubmodule_diff_sha256_after\n" \
   > "${status_file}"
 
 run_arm() {
@@ -76,11 +82,7 @@ run_arm() {
   local before_sha256
   before_sha256="$(sha256sum "${working_playbook}" | awk '{print $1}')"
   local log_path="${arm_dir}/seed-${seed}.log"
-  local submodule_commit
-  local submodule_dirty
   local submodule_diff_sha256
-  submodule_commit="$(git -C third_party/LLM-PySC2 rev-parse HEAD)"
-  submodule_dirty="$(test -n "$(git -C third_party/LLM-PySC2 status --porcelain)" && echo true || echo false)"
   submodule_diff_sha256="$(git -C third_party/LLM-PySC2 diff --binary | sha256sum | awk '{print $1}')"
   set +e
   SC2PATH="/mnt/scratch/users/tbczhang/StarCraftII" \
@@ -106,11 +108,13 @@ run_arm() {
   local dirty_after
   local submodule_commit_after
   local submodule_dirty_after
+  local submodule_gitlink_after
   local submodule_diff_after
   git_head_after="$(git rev-parse HEAD)"
   dirty_after="$(test -n "$(git status --porcelain --ignore-submodules=dirty)" && echo true || echo false)"
   submodule_commit_after="$(git -C third_party/LLM-PySC2 rev-parse HEAD)"
   submodule_dirty_after="$(test -n "$(git -C third_party/LLM-PySC2 status --porcelain)" && echo true || echo false)"
+  submodule_gitlink_after="$(git ls-tree HEAD third_party/LLM-PySC2 | awk '{print $3}')"
   submodule_diff_after="$(git -C third_party/LLM-PySC2 diff --binary | sha256sum | awk '{print $1}')"
   local fields=(
     "${kind}" "fixture" "${seed}" "${arm}" "${subject_arm}" "active,shadow"
@@ -118,6 +122,7 @@ run_arm() {
     "${before_snapshot}" "${after_snapshot}" "${git_head}" "${git_head_after}"
     "${superproject_dirty}" "${dirty_after}" "${submodule_commit}"
     "${submodule_commit_after}" "${submodule_dirty}" "${submodule_dirty_after}"
+    "${submodule_gitlink}" "${submodule_gitlink_after}"
     "${submodule_diff_sha256}" "${submodule_diff_after}"
   )
   (

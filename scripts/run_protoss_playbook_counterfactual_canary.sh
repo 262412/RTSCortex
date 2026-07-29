@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -ne 6 || "$3" != "--expected-git-sha" || "$5" != "--seed" ]]; then
-  echo "usage: $0 <baseline-playbook.sqlite3> <run-set-dir> --expected-git-sha <sha> --seed <seed>" >&2
+if [[ $# -ne 8 || "$3" != "--expected-git-sha" || "$5" != "--execution-seed" || "$7" != "--evaluation-seeds" ]]; then
+  echo "usage: $0 <baseline-playbook.sqlite3> <run-set-dir> --expected-git-sha <sha> --execution-seed <seed> --evaluation-seeds 3,4,5" >&2
   exit 2
 fi
 
@@ -12,6 +12,28 @@ baseline_source="$(readlink -f "$1")"
 run_set_dir="$2"
 expected_git_sha="$4"
 seed="$6"
+evaluation_seed_csv="$8"
+IFS=',' read -r -a evaluation_seeds <<< "${evaluation_seed_csv}"
+if [[ ${#evaluation_seeds[@]} -ne 3 ]]; then
+  echo "production canary requires the formal three-seed evaluation set" >&2
+  exit 2
+fi
+declare -A unique_evaluation_seeds=()
+execution_seed_is_held_out=false
+for evaluation_seed in "${evaluation_seeds[@]}"; do
+  if [[ ! "${evaluation_seed}" =~ ^[0-9]+$ || -n "${unique_evaluation_seeds[${evaluation_seed}]:-}" ]]; then
+    echo "evaluation seeds must be three distinct non-negative integers" >&2
+    exit 2
+  fi
+  unique_evaluation_seeds["${evaluation_seed}"]=1
+  if [[ "${evaluation_seed}" == "${seed}" ]]; then
+    execution_seed_is_held_out=true
+  fi
+done
+if [[ ! "${seed}" =~ ^[0-9]+$ || "${execution_seed_is_held_out}" != "true" ]]; then
+  echo "execution seed must be one member of the full held-out evaluation set" >&2
+  exit 2
+fi
 active_config="${repo_dir}/configs/experiments/live_simple64_hima_protoss_ensemble_cortex_v0_5_natural_terminal.yaml"
 shadow_config="${repo_dir}/configs/experiments/live_simple64_hima_protoss_ensemble_cortex_v0_5_shadow_calibration_natural_terminal.yaml"
 engineering_baseline="${repo_dir}/configs/acceptance/protoss_natural_terminal_v1.json"
@@ -38,25 +60,33 @@ git_head="$(git rev-parse HEAD)"
 superproject_dirty="$(test -n "$(git status --porcelain --ignore-submodules=dirty)" && echo true || echo false)"
 submodule_commit="$(git -C third_party/LLM-PySC2 rev-parse HEAD)"
 submodule_dirty="$(test -n "$(git -C third_party/LLM-PySC2 status --porcelain)" && echo true || echo false)"
+submodule_gitlink="$(git ls-tree HEAD third_party/LLM-PySC2 | awk '{print $3}')"
 submodule_diff_sha256="$(git -C third_party/LLM-PySC2 diff --binary | sha256sum | awk '{print $1}')"
-if [[ "${git_head}" != "${expected_git_sha}" || "${superproject_dirty}" != "false" ]]; then
-  echo "counterfactual canary requires clean ${expected_git_sha}" >&2
+if [[ "${git_head}" != "${expected_git_sha}" \
+  || "${superproject_dirty}" != "false" \
+  || "${submodule_dirty}" != "false" \
+  || "${submodule_commit}" != "${submodule_gitlink}" ]]; then
+  echo "counterfactual canary requires clean ${expected_git_sha} and exact clean gitlink ${submodule_gitlink}" >&2
   exit 2
 fi
 
+readiness_seed_args=()
+for evaluation_seed in "${evaluation_seeds[@]}"; do
+  readiness_seed_args+=(--evaluation-seed "${evaluation_seed}")
+done
 uv run rtscortex playbook hard-readiness \
   --database "${baseline_snapshot}" \
   --config "${active_config}" \
   --expected-git-sha "${expected_git_sha}" \
   --sc2-patch "4.10" \
-  --evaluation-seed "${seed}" \
+  "${readiness_seed_args[@]}" \
   --output "${readiness_evidence}"
 
 uv run python scripts/run_recovery_acceptance_canary.py \
   --expected-git-sha "${expected_git_sha}" \
   --output "${recovery_evidence}"
 
-printf "experiment_kind\tmode\tseed\tarm\tsubject_arm\tarm_order\texit_code\trun_dir\tplaybook_before_sha256\tplaybook_after_sha256\tplaybook_before_snapshot\tplaybook_after_snapshot\tgit_head_before\tgit_head_after\tsuperproject_dirty_before\tsuperproject_dirty_after\tsubmodule_commit_before\tsubmodule_commit_after\tsubmodule_dirty_before\tsubmodule_dirty_after\tsubmodule_diff_sha256_before\tsubmodule_diff_sha256_after\n" > "${status_file}"
+printf "experiment_kind\tmode\tseed\tarm\tsubject_arm\tarm_order\texit_code\trun_dir\tplaybook_before_sha256\tplaybook_after_sha256\tplaybook_before_snapshot\tplaybook_after_snapshot\tgit_head_before\tgit_head_after\tsuperproject_dirty_before\tsuperproject_dirty_after\tsubmodule_commit_before\tsubmodule_commit_after\tsubmodule_dirty_before\tsubmodule_dirty_after\tsubmodule_gitlink_before\tsubmodule_gitlink_after\tsubmodule_diff_sha256_before\tsubmodule_diff_sha256_after\n" > "${status_file}"
 
 run_canary_arm() {
   local kind="$1"
@@ -106,14 +136,17 @@ run_canary_arm() {
   submodule_commit_after="$(git -C third_party/LLM-PySC2 rev-parse HEAD)"
   local submodule_dirty_after
   submodule_dirty_after="$(test -n "$(git -C third_party/LLM-PySC2 status --porcelain)" && echo true || echo false)"
+  local submodule_gitlink_after
+  submodule_gitlink_after="$(git ls-tree HEAD third_party/LLM-PySC2 | awk '{print $3}')"
   local submodule_diff_after
   submodule_diff_after="$(git -C third_party/LLM-PySC2 diff --binary | sha256sum | awk '{print $1}')"
-  printf "%s\tcausal_canary\t%s\t%s\t%s\tactive,shadow\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+  printf "%s\tcausal_canary\t%s\t%s\t%s\tactive,shadow\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
     "${kind}" "${seed}" "${arm}" "${subject_arm}" "${run_status}" "${run_dir}" \
     "${before_sha256}" "${after_sha256}" "${before_snapshot}" "${after_snapshot}" \
     "${git_head}" "${git_head_after}" "${superproject_dirty}" "${dirty_after}" \
     "${submodule_commit}" "${submodule_commit_after}" "${submodule_dirty}" \
-    "${submodule_dirty_after}" "${submodule_diff_sha256}" "${submodule_diff_after}" \
+    "${submodule_dirty_after}" "${submodule_gitlink}" "${submodule_gitlink_after}" \
+    "${submodule_diff_sha256}" "${submodule_diff_after}" \
     >> "${status_file}"
 }
 

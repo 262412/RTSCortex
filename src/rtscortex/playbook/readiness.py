@@ -26,6 +26,13 @@ from rtscortex.policy.capabilities import DEFAULT_RUNTIME_CAPABILITIES
 from rtscortex.races import race_profile
 
 _STATIC_CONTEXT_FIELDS = frozenset({"agent_race", "opponent_race", "map_name"})
+_STATIC_CONTEXT_OPERATORS = frozenset(
+    {
+        PlaybookConditionOperator.EQ,
+        PlaybookConditionOperator.IN,
+        PlaybookConditionOperator.CONTAINS,
+    }
+)
 _VALID_ROLES = frozenset(
     {
         "economy",
@@ -70,8 +77,53 @@ class PlaybookRuleReadiness(ContractModel):
     qualification_seed_ids: tuple[int, ...]
     evaluation_seed_ids: tuple[int, ...]
     evidence_hashes: tuple[str, ...]
+    qualification_manifest_sha256: str | None = None
+    strategic_ab_evidence_sha256: str | None = None
+    strategic_ab_seed_ids: tuple[int, ...] = ()
+    strategic_ab_metrics: dict[str, float | int] = Field(default_factory=dict)
     canary_fixture: bool
     rejection_reasons: tuple[str, ...]
+
+
+class PlaybookHardQualificationManifest(ContractModel):
+    """Typed evidence produced by qualification-only runs."""
+
+    schema_version: Literal["1.0"]
+    artifact_kind: Literal["playbook-hard-qualification"]
+    parent_rule_id: str = Field(min_length=1)
+    parent_canonical_key: str = Field(min_length=1)
+    baseline_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    git_sha: str = Field(pattern=r"^[0-9a-f]{40}$")
+    sc2_patch: str = Field(min_length=1)
+    qualification_seed_ids: tuple[int, ...]
+    source_run_ids: tuple[str, ...]
+    engineering_accepted: bool
+    counterfactual_evidence_accepted: bool
+    analysis_evidence_overflow_count: int = Field(ge=0)
+    shadow_state_count: int = Field(ge=0)
+    execution_false_block_count: int = Field(ge=0)
+    execution_false_block_rate: float = Field(ge=0.0, le=1.0)
+
+
+class PlaybookStrategicABQualificationArtifact(ContractModel):
+    """Typed paired-outcome evidence bound to one qualification manifest."""
+
+    schema_version: Literal["1.0"]
+    artifact_kind: Literal["playbook-strategic-ab-qualification"]
+    parent_rule_id: str = Field(min_length=1)
+    parent_canonical_key: str = Field(min_length=1)
+    baseline_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    git_sha: str = Field(pattern=r"^[0-9a-f]{40}$")
+    sc2_patch: str = Field(min_length=1)
+    qualification_seed_ids: tuple[int, ...]
+    source_run_ids: tuple[str, ...]
+    paired_seed_ids: tuple[int, ...]
+    paired_run_ids: tuple[str, ...]
+    accepted: bool
+    analysis_evidence_overflow_count: int = Field(ge=0)
+    repeat_error_reduction: float
+    task_score_improvement: float
+    win_rate_delta: float
 
 
 class PlaybookHardReadinessReport(ContractModel):
@@ -90,6 +142,9 @@ class PlaybookHardReadinessReport(ContractModel):
     active_blocking_hard_count: int = Field(ge=0)
     context_applicable_blocking_hard_count: int = Field(ge=0)
     reachable_blocking_hard_count: int = Field(ge=0)
+    approved_blocking_rule_ids: tuple[str, ...] = ()
+    approved_rule_set_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    rejected_context_applicable_blocking_hard_rule_ids: tuple[str, ...] = ()
     canary_fixture_rule_ids: tuple[str, ...] = ()
     canary_runnable: bool
     rejection_reasons: dict[str, tuple[str, ...]]
@@ -130,6 +185,7 @@ def analyze_hard_readiness(
     context_applicable = [rule for rule in blocking if _context_is_applicable(rule, context)]
     rejection_reasons: dict[str, tuple[str, ...]] = {}
     reachable: list[PlaybookRule] = []
+    rejected_relevant_blockers: list[str] = []
     fixture_rule_ids: list[str] = []
     rule_audits: list[PlaybookRuleReadiness] = []
     rules_by_id = {rule.rule_id: rule for rule in rules}
@@ -151,7 +207,15 @@ def analyze_hard_readiness(
             rejection_reasons[rule.rule_id] = reasons
         elif rule in context_applicable:
             reachable.append(rule)
+        if (
+            rule in blocking
+            and _rule_target_is_reachable(rule, reachable_actions)
+            and (_context_is_applicable(rule, context) or _has_invalid_static_operator(rule))
+            and reasons
+        ):
+            rejected_relevant_blockers.append(rule.rule_id)
         strategic_regret = rule.evidence.get("strategic_regret_count")
+        strategic_ab_manifest = rule.evidence.get("strategic_ab_manifest")
         rule_audits.append(
             PlaybookRuleReadiness(
                 rule_id=rule.rule_id,
@@ -184,10 +248,28 @@ def analyze_hard_readiness(
                 qualification_seed_ids=rule.qualification_seed_ids,
                 evaluation_seed_ids=rule.evaluation_seed_ids,
                 evidence_hashes=rule.evidence_hashes,
+                qualification_manifest_sha256=_optional_string(
+                    rule.evidence.get("qualification_manifest_sha256")
+                ),
+                strategic_ab_evidence_sha256=_optional_string(
+                    rule.evidence.get("strategic_ab_evidence_sha256")
+                ),
+                strategic_ab_seed_ids=_manifest_int_tuple(
+                    strategic_ab_manifest,
+                    "paired_seed_ids",
+                ),
+                strategic_ab_metrics=_strategic_metrics(strategic_ab_manifest),
                 canary_fixture=fixture,
                 rejection_reasons=reasons,
             )
         )
+    approved_rule_ids = tuple(sorted(rule.rule_id for rule in reachable))
+    approved_rule_set_sha256 = _sha256_json(
+        {
+            "baseline_sha256": baseline_sha256,
+            "approved_blocking_rule_ids": approved_rule_ids,
+        }
+    )
     return PlaybookHardReadinessReport(
         baseline_sha256=baseline_sha256,
         expected_git_sha=expected_git_sha,
@@ -201,8 +283,13 @@ def analyze_hard_readiness(
         active_blocking_hard_count=len(blocking),
         context_applicable_blocking_hard_count=len(context_applicable),
         reachable_blocking_hard_count=len(reachable),
+        approved_blocking_rule_ids=approved_rule_ids,
+        approved_rule_set_sha256=approved_rule_set_sha256,
+        rejected_context_applicable_blocking_hard_rule_ids=tuple(
+            sorted(rejected_relevant_blockers)
+        ),
         canary_fixture_rule_ids=tuple(sorted(fixture_rule_ids)),
-        canary_runnable=bool(reachable),
+        canary_runnable=bool(reachable) and not rejected_relevant_blockers,
         rejection_reasons=rejection_reasons,
         rules=tuple(rule_audits),
     )
@@ -246,9 +333,9 @@ def qualify_hard_rule(
     parent_rule_id: str,
     expected_git_sha: str,
     sc2_patch: str,
-    evidence_paths: Sequence[Path],
+    qualification_manifest_path: Path,
     evaluation_seed_ids: Sequence[int],
-    strategic_ab: StrategicABEvidence | None = None,
+    strategic_ab_path: Path | None = None,
 ) -> PlaybookRule:
     """Create a derived hard rule without mutating its soft parent."""
 
@@ -259,6 +346,10 @@ def qualify_hard_rule(
         raise ValueError("hard qualification requires an active parent rule")
     if parent.strength is not PlaybookRuleStrength.SOFT:
         raise ValueError("hard qualification requires a soft parent rule")
+    if parent.code_revision != expected_git_sha or parent.sc2_patch != sc2_patch:
+        raise ValueError(
+            "soft parent must already be bound to the qualification git revision and SC2 patch"
+        )
     effect = _qualified_effect(parent.effect)
     qualification_seeds = tuple(
         sorted(set(parent.source_seeds) - set(parent.censored_source_seeds))
@@ -272,11 +363,18 @@ def qualify_hard_rule(
             "qualification and held-out evaluation seeds overlap: "
             + ", ".join(str(seed) for seed in sorted(overlap))
         )
-    evidence_hashes = tuple(
-        sorted({_sha256_file(path.expanduser().resolve()) for path in evidence_paths})
+    qualification_path = qualification_manifest_path.expanduser().resolve()
+    qualification_manifest = _load_qualification_manifest(qualification_path)
+    qualification_manifest_sha256 = _sha256_file(qualification_path)
+    qualification_baseline_sha256 = _sha256_file(store.database_path.resolve())
+    _validate_qualification_manifest(
+        qualification_manifest,
+        parent=parent,
+        expected_git_sha=expected_git_sha,
+        sc2_patch=sc2_patch,
+        baseline_sha256=qualification_baseline_sha256,
+        qualification_seeds=qualification_seeds,
     )
-    if not evidence_hashes:
-        raise ValueError("hard qualification requires hashed evidence artifacts")
     qualification_kind: Literal["execution", "strategic"] = (
         "execution"
         if parent.category
@@ -287,8 +385,46 @@ def qualify_hard_rule(
         }
         else "strategic"
     )
-    if qualification_kind == "strategic" and strategic_ab is None:
+    strategic_ab_manifest: PlaybookStrategicABQualificationArtifact | None = None
+    strategic_ab_sha256: str | None = None
+    strategic_ab: StrategicABEvidence | None = None
+    if strategic_ab_path is not None:
+        resolved_strategic_path = strategic_ab_path.expanduser().resolve()
+        strategic_ab_manifest = _load_strategic_ab_manifest(resolved_strategic_path)
+        strategic_ab_sha256 = _sha256_file(resolved_strategic_path)
+        _validate_strategic_ab_manifest(
+            strategic_ab_manifest,
+            qualification_manifest=qualification_manifest,
+            parent=parent,
+        )
+        strategic_ab = StrategicABEvidence(
+            paired_seed_count=len(set(strategic_ab_manifest.paired_seed_ids)),
+            repeat_error_reduction=strategic_ab_manifest.repeat_error_reduction,
+            task_score_improvement=strategic_ab_manifest.task_score_improvement,
+            win_rate_delta=strategic_ab_manifest.win_rate_delta,
+        )
+    if qualification_kind == "strategic" and strategic_ab_manifest is None:
         raise ValueError("strategic hard qualification requires paired outcome evidence")
+    evidence_hashes = tuple(
+        sorted(
+            {
+                qualification_manifest_sha256,
+                *(() if strategic_ab_sha256 is None else (strategic_ab_sha256,)),
+            }
+        )
+    )
+    strategic_identity = (
+        None
+        if strategic_ab_manifest is None
+        else {
+            "sha256": strategic_ab_sha256,
+            "paired_seed_ids": tuple(sorted(set(strategic_ab_manifest.paired_seed_ids))),
+            "paired_run_ids": tuple(sorted(set(strategic_ab_manifest.paired_run_ids))),
+            "repeat_error_reduction": strategic_ab_manifest.repeat_error_reduction,
+            "task_score_improvement": strategic_ab_manifest.task_score_improvement,
+            "win_rate_delta": strategic_ab_manifest.win_rate_delta,
+        }
+    )
     canonical_payload = {
         "parent_rule_id": parent.rule_id,
         "parent_canonical_key": parent.canonical_key,
@@ -296,6 +432,8 @@ def qualify_hard_rule(
         "expected_git_sha": expected_git_sha,
         "sc2_patch": sc2_patch,
         "evidence_hashes": evidence_hashes,
+        "qualification_manifest_sha256": qualification_manifest_sha256,
+        "strategic_ab": strategic_identity,
         "qualification_seed_ids": qualification_seeds,
         "evaluation_seed_ids": held_out_seeds,
     }
@@ -321,6 +459,16 @@ def qualify_hard_rule(
             "evidence": {
                 **parent.evidence,
                 "qualification": canonical_payload,
+                "qualification_manifest": qualification_manifest.model_dump(mode="json"),
+                "qualification_manifest_sha256": qualification_manifest_sha256,
+                **(
+                    {}
+                    if strategic_ab_manifest is None
+                    else {
+                        "strategic_ab_manifest": strategic_ab_manifest.model_dump(mode="json"),
+                        "strategic_ab_evidence_sha256": strategic_ab_sha256,
+                    }
+                ),
             },
         }
     )
@@ -420,6 +568,11 @@ def _hard_rejection_reasons(
         reasons.append("action_or_role_unreachable")
     if fixture and not allow_canary_fixture:
         reasons.append("canary_fixture_not_allowed")
+    invalid_static_operators = _invalid_static_operators(rule)
+    reasons.extend(
+        f"unsupported_static_operator:{condition.field}:{condition.operator.value}"
+        for condition in invalid_static_operators
+    )
     if not (fixture and allow_canary_fixture):
         if rule.code_revision is None:
             reasons.append("missing_code_revision")
@@ -470,6 +623,14 @@ def _hard_rejection_reasons(
             for value in rule.evidence_hashes
         ):
             reasons.append("invalid_evidence_hash")
+        reasons.extend(
+            _qualification_evidence_reasons(
+                rule,
+                parent=parent,
+                expected_git_sha=expected_git_sha,
+                sc2_patch=sc2_patch,
+            )
+        )
         if not evaluation_seed_ids:
             reasons.append("missing_evaluation_seed_set")
         elif set(rule.evaluation_seed_ids) != set(evaluation_seed_ids):
@@ -497,7 +658,20 @@ def _condition_matches_static(condition: PlaybookCondition, actual: str) -> bool
         return actual.casefold() in {str(value).casefold() for value in values}
     if condition.operator is PlaybookConditionOperator.CONTAINS:
         return str(expected).casefold() in actual.casefold()
-    return True
+    return False
+
+
+def _invalid_static_operators(rule: PlaybookRule) -> tuple[PlaybookCondition, ...]:
+    return tuple(
+        condition
+        for condition in rule.conditions
+        if condition.field in _STATIC_CONTEXT_FIELDS
+        and condition.operator not in _STATIC_CONTEXT_OPERATORS
+    )
+
+
+def _has_invalid_static_operator(rule: PlaybookRule) -> bool:
+    return bool(_invalid_static_operators(rule))
 
 
 def _rule_target_is_reachable(rule: PlaybookRule, reachable_actions: set[str]) -> bool:
@@ -524,3 +698,188 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _sha256_json(payload: object) -> str:
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def _load_qualification_manifest(path: Path) -> PlaybookHardQualificationManifest:
+    try:
+        return PlaybookHardQualificationManifest.model_validate_json(
+            path.read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError) as error:
+        raise ValueError(f"invalid hard qualification manifest {path}: {error}") from error
+
+
+def _load_strategic_ab_manifest(
+    path: Path,
+) -> PlaybookStrategicABQualificationArtifact:
+    try:
+        return PlaybookStrategicABQualificationArtifact.model_validate_json(
+            path.read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError) as error:
+        raise ValueError(f"invalid strategic A/B qualification artifact {path}: {error}") from error
+
+
+def _validate_qualification_manifest(
+    manifest: PlaybookHardQualificationManifest,
+    *,
+    parent: PlaybookRule,
+    expected_git_sha: str,
+    sc2_patch: str,
+    baseline_sha256: str,
+    qualification_seeds: tuple[int, ...],
+) -> None:
+    expected_runs = tuple(sorted(set(parent.source_run_ids) - set(parent.censored_source_run_ids)))
+    checks = {
+        "parent_rule_id": manifest.parent_rule_id == parent.rule_id,
+        "parent_canonical_key": manifest.parent_canonical_key == parent.canonical_key,
+        "baseline_sha256": manifest.baseline_sha256 == baseline_sha256,
+        "git_sha": manifest.git_sha == expected_git_sha,
+        "sc2_patch": manifest.sc2_patch == sc2_patch,
+        "qualification_seed_ids": set(manifest.qualification_seed_ids) == set(qualification_seeds),
+        "source_run_ids": set(manifest.source_run_ids) == set(expected_runs),
+        "engineering_accepted": manifest.engineering_accepted is True,
+        "counterfactual_evidence_accepted": (manifest.counterfactual_evidence_accepted is True),
+        "analysis_evidence_overflow_count": manifest.analysis_evidence_overflow_count == 0,
+        "shadow_state_count": manifest.shadow_state_count == parent.shadow_state_count,
+        "execution_false_block_count": (
+            manifest.execution_false_block_count == parent.false_block_count
+        ),
+        "execution_false_block_rate": (
+            abs(manifest.execution_false_block_rate - parent.false_block_rate) < 1e-12
+        ),
+    }
+    failures = [name for name, accepted in checks.items() if not accepted]
+    if failures:
+        raise ValueError(
+            "qualification manifest does not match the parent evidence: " + ", ".join(failures)
+        )
+
+
+def _validate_strategic_ab_manifest(
+    manifest: PlaybookStrategicABQualificationArtifact,
+    *,
+    qualification_manifest: PlaybookHardQualificationManifest,
+    parent: PlaybookRule,
+) -> None:
+    checks = {
+        "parent_rule_id": manifest.parent_rule_id == parent.rule_id,
+        "parent_canonical_key": manifest.parent_canonical_key == parent.canonical_key,
+        "baseline_sha256": manifest.baseline_sha256 == qualification_manifest.baseline_sha256,
+        "git_sha": manifest.git_sha == qualification_manifest.git_sha,
+        "sc2_patch": manifest.sc2_patch == qualification_manifest.sc2_patch,
+        "qualification_seed_ids": set(manifest.qualification_seed_ids)
+        == set(qualification_manifest.qualification_seed_ids),
+        "source_run_ids": set(manifest.source_run_ids)
+        == set(qualification_manifest.source_run_ids),
+        "paired_seed_ids": set(manifest.paired_seed_ids)
+        == set(qualification_manifest.qualification_seed_ids),
+        "paired_run_ids": set(manifest.paired_run_ids)
+        == set(qualification_manifest.source_run_ids),
+        "accepted": manifest.accepted is True,
+        "analysis_evidence_overflow_count": manifest.analysis_evidence_overflow_count == 0,
+    }
+    failures = [name for name, accepted in checks.items() if not accepted]
+    if failures:
+        raise ValueError(
+            "strategic A/B artifact does not match qualification evidence: " + ", ".join(failures)
+        )
+
+
+def _qualification_evidence_reasons(
+    rule: PlaybookRule,
+    *,
+    parent: PlaybookRule | None,
+    expected_git_sha: str,
+    sc2_patch: str,
+) -> tuple[str, ...]:
+    manifest_payload = rule.evidence.get("qualification_manifest")
+    manifest_sha256 = rule.evidence.get("qualification_manifest_sha256")
+    if not isinstance(manifest_payload, dict):
+        return ("missing_qualification_manifest",)
+    try:
+        manifest = PlaybookHardQualificationManifest.model_validate(manifest_payload)
+    except ValueError:
+        return ("invalid_qualification_manifest",)
+    reasons: list[str] = []
+    if parent is None:
+        return ("qualification_manifest_parent_unavailable",)
+    if manifest.parent_rule_id != parent.rule_id:
+        reasons.append("qualification_manifest_parent_mismatch")
+    if manifest.parent_canonical_key != parent.canonical_key:
+        reasons.append("qualification_manifest_parent_key_mismatch")
+    if manifest.git_sha != expected_git_sha or manifest.git_sha != rule.qualified_at_git_sha:
+        reasons.append("qualification_manifest_git_mismatch")
+    if manifest.sc2_patch != sc2_patch or manifest.sc2_patch != rule.qualified_at_sc2_patch:
+        reasons.append("qualification_manifest_sc2_patch_mismatch")
+    if set(manifest.qualification_seed_ids) != set(rule.qualification_seed_ids):
+        reasons.append("qualification_manifest_seed_mismatch")
+    if set(manifest.source_run_ids) != (
+        set(rule.source_run_ids) - set(rule.censored_source_run_ids)
+    ):
+        reasons.append("qualification_manifest_run_mismatch")
+    if (
+        not manifest.engineering_accepted
+        or not manifest.counterfactual_evidence_accepted
+        or manifest.analysis_evidence_overflow_count
+    ):
+        reasons.append("qualification_manifest_not_accepted")
+    if not isinstance(manifest_sha256, str) or manifest_sha256 not in rule.evidence_hashes:
+        reasons.append("qualification_manifest_hash_unbound")
+    strategic_payload = rule.evidence.get("strategic_ab_manifest")
+    strategic_sha256 = rule.evidence.get("strategic_ab_evidence_sha256")
+    if rule.qualification_kind == "strategic":
+        if not isinstance(strategic_payload, dict):
+            reasons.append("missing_strategic_ab_manifest")
+        else:
+            try:
+                strategic = PlaybookStrategicABQualificationArtifact.model_validate(
+                    strategic_payload
+                )
+            except ValueError:
+                reasons.append("invalid_strategic_ab_manifest")
+            else:
+                if strategic.parent_rule_id != parent.rule_id:
+                    reasons.append("strategic_ab_parent_mismatch")
+                if set(strategic.paired_seed_ids) != set(rule.qualification_seed_ids):
+                    reasons.append("strategic_ab_seed_mismatch")
+                if (
+                    not isinstance(strategic_sha256, str)
+                    or strategic_sha256 not in rule.evidence_hashes
+                ):
+                    reasons.append("strategic_ab_hash_unbound")
+    return tuple(reasons)
+
+
+def _optional_string(value: object) -> str | None:
+    return value if isinstance(value, str) else None
+
+
+def _manifest_int_tuple(payload: object, field: str) -> tuple[int, ...]:
+    if not isinstance(payload, dict):
+        return ()
+    values = payload.get(field)
+    if not isinstance(values, list | tuple):
+        return ()
+    return tuple(int(value) for value in values if isinstance(value, int))
+
+
+def _strategic_metrics(payload: object) -> dict[str, float | int]:
+    if not isinstance(payload, dict):
+        return {}
+    result: dict[str, float | int] = {}
+    for field in (
+        "repeat_error_reduction",
+        "task_score_improvement",
+        "win_rate_delta",
+    ):
+        value = payload.get(field)
+        if isinstance(value, int | float):
+            result[field] = value
+    return result

@@ -40,7 +40,6 @@ from rtscortex.playbook import (
     PlaybookPromotionSweep,
     PlaybookRunLearner,
     PlaybookStore,
-    StrategicABEvidence,
     analyze_hard_readiness_database,
     create_canary_fixture,
     qualify_hard_rule,
@@ -389,13 +388,13 @@ def playbook_qualify_hard(
         str,
         typer.Option("--sc2-patch", help="SC2 patch used by the evidence."),
     ],
-    evidence_paths: Annotated[
-        list[Path],
+    qualification_manifest_path: Annotated[
+        Path,
         typer.Option(
-            "--evidence",
+            "--qualification-manifest",
             exists=True,
             dir_okay=False,
-            help="Immutable evidence artifact. Repeat for every source.",
+            help="Typed qualification-only evidence manifest.",
         ),
     ],
     evaluation_seeds: Annotated[
@@ -423,9 +422,6 @@ def playbook_qualify_hard(
             f"playbook database does not exist: {path}",
             param_hint="--database",
         )
-    strategic_ab = (
-        None if strategic_ab_path is None else _load_strategic_ab_evidence(strategic_ab_path)
-    )
     store = PlaybookStore(path)
     try:
         try:
@@ -434,9 +430,9 @@ def playbook_qualify_hard(
                 parent_rule_id=parent_rule_id,
                 expected_git_sha=expected_git_sha,
                 sc2_patch=sc2_patch,
-                evidence_paths=evidence_paths,
+                qualification_manifest_path=qualification_manifest_path,
                 evaluation_seed_ids=evaluation_seeds,
-                strategic_ab=strategic_ab,
+                strategic_ab_path=strategic_ab_path,
             )
         except ValueError as error:
             raise typer.BadParameter(str(error)) from error
@@ -480,22 +476,6 @@ def _write_readiness_report(
     destination = output.expanduser().resolve()
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(report.model_dump_json(indent=2) + "\n", encoding="utf-8")
-
-
-def _load_strategic_ab_evidence(path: Path) -> StrategicABEvidence:
-    try:
-        payload = json.loads(path.expanduser().read_text(encoding="utf-8"))
-        return StrategicABEvidence(
-            paired_seed_count=int(payload["paired_seed_count"]),
-            repeat_error_reduction=float(payload["repeat_error_reduction"]),
-            task_score_improvement=float(payload["task_score_improvement"]),
-            win_rate_delta=float(payload["win_rate_delta"]),
-        )
-    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
-        raise typer.BadParameter(
-            f"invalid strategic paired-evidence JSON: {error}",
-            param_hint="--strategic-ab",
-        ) from error
 
 
 def _snapshot_config(config: ExperimentConfig, run_dir: Path) -> None:

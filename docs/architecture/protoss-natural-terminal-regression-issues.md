@@ -1545,8 +1545,8 @@ Two limitations are deliberately still visible:
   - all experiment runners accept both the legacy and current artifact labels.
     Path A matches the Shadow `would_block` decision itself and identical
     prestate; Path B production canaries still require a terminally observable
-    execution/strategy counterfactual. Fixture status rows now use one
-    22-field tabular record, preventing format-string column drift.
+    execution/strategy counterfactual. Fixture status rows use one bounded
+    tabular record, preventing format-string column drift.
 - **Acceptance criteria:**
   - the current production baseline produces the readiness artifact and exits
     2 with `context_applicable_blocking_hard_count=0`, before Recovery/SC2/GPU;
@@ -1561,6 +1561,84 @@ Two limitations are deliberately still visible:
   - a lost acknowledgement and Worker restart resend byte-equivalent Placement
     JSON and produce one Runtime ledger event; a same-ID/different-payload retry
     remains fatal.
+
+#### 2026-07-29 hard-rule qualification and formal seed-contract closure
+
+- **Status:** implemented in code and regression tests. A production hard rule
+  still requires real qualification evidence; this correction deliberately
+  prevents the existing soft-only baseline from entering SC2.
+- **Evidence and impact:**
+  1. the production canary passed one execution seed to readiness, while the
+     formal matrix passed its complete three-seed held-out set. Because a hard
+     child binds one exact evaluation set, no rule could satisfy both entry
+     points;
+  2. readiness accepted a baseline when any one reachable hard blocker passed,
+     even though Runtime loaded every active hard rule. A stale or
+     qualification/evaluation-overlapping blocker could therefore execute
+     behind one valid rule;
+  3. `qualify-hard` hashed arbitrary files without parsing their meaning. A
+     JSON object containing only `accepted=true` could be used to restamp a
+     parent that had no revision-bound evidence. Strategic A/B metrics and
+     seed identity were not part of the child identity;
+  4. the bounded fixture used a Shadow Guard decision as its intentionally
+     non-terminal proof, but exposed it under the production-sounding
+     `matched_counterfactual_count` name;
+  5. source attestation allowed a submodule to remain dirty as long as its
+     dirty state did not change during the experiment. The superproject SHA
+     could therefore identify a Bridge implementation different from the
+     recorded gitlink;
+  6. readiness treated unsupported operators on static race/opponent/map
+     fields as matches, which could launch an expensive production canary for
+     a rule whose static scope was invalid.
+- **Root cause:** the experiment had separate notions of execution seed,
+  held-out evaluation set, individually acceptable rules, Runtime-loaded
+  rules, evidence file identity and source identity. These values were logged
+  but were not bound into one fail-closed baseline contract.
+- **Implemented correction:**
+  - the production canary now requires one `--execution-seed` plus the complete
+    `--evaluation-seeds` set. The execution seed must be a member of that
+    three-seed set. Its schema-v1.1 artifact records both values, and the
+    formal runner requires an exact set match;
+  - readiness emits `approved_blocking_rule_ids` and an
+    `approved_rule_set_sha256` bound to the baseline hash. If any
+    context-applicable, action/role-reachable active hard forbid rule has a
+    rejection reason, the whole baseline exits 2. The production canary and
+    formal matrix bind the same approved-set hash;
+  - qualification accepts a typed
+    `playbook-hard-qualification` manifest rather than arbitrary evidence
+    paths. It verifies parent ID/key, pre-qualification baseline hash, Git SHA,
+    SC2 patch, exact uncensored source runs/seeds, engineering and
+    counterfactual acceptance, analyzer overflow, shadow coverage and
+    false-block statistics. A parent must already carry the same revision and
+    patch;
+  - strategic qualification additionally requires a typed, accepted
+    `playbook-strategic-ab-qualification` artifact. Its hash, paired seed/run
+    IDs and outcome metrics enter both the child evidence and canonical
+    identity;
+  - fixture reports now distinguish
+    `matched_shadow_guard_allow_count` from
+    `terminal_counterfactual_resolved_count`, and explicitly set
+    `terminal_counterfactual_required=false`. Production remains terminally
+    observable;
+  - fixture, production-canary and formal runners now reject a dirty
+    LLM-PySC2 submodule and require its HEAD to equal the superproject gitlink.
+    Per-run TSV attestation includes the gitlink before and after; the analyzer
+    rejects dirty or mismatched rows;
+  - static race/opponent/map conditions accept only `eq`, `in` and `contains`.
+    Unsupported operators are explicit readiness rejection reasons.
+- **Acceptance criteria:**
+  - one qualified hard child can use one of `[3,4,5]` for the canary execution
+    while binding `[3,4,5]` for both canary and formal evaluation;
+  - a different evaluation set, approved-rule-set hash or additional stale
+    active hard blocker rejects the formal run before Recovery or SC2;
+  - arbitrary JSON, mismatched parent/source/revision/patch/baseline evidence,
+    overflowed analysis and reused qualification seeds cannot create a hard
+    child;
+  - strategic A/B content changes the hard child identity and remains visible
+    in readiness;
+  - fixture success never claims a terminal counterfactual;
+  - dirty, detached or gitlink-mismatched LLM-PySC2 state rejects every formal
+    entry point before SC2 startup.
 
 ## Repair order
 

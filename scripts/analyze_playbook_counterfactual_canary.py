@@ -21,16 +21,16 @@ def build_canary_report(
     readiness_evidence: dict[str, Any],
     canary_kind: Literal["production", "fixture"] = "production",
 ) -> dict[str, Any]:
-    resolved = set(
-        shadow.shadow_would_block_keys
-        if canary_kind == "fixture"
-        else shadow.resolved_counterfactual_keys
-    )
+    terminal_resolved = set(shadow.resolved_counterfactual_keys)
+    shadow_guard_allows = set(shadow.shadow_would_block_keys)
+    resolved = shadow_guard_allows if canary_kind == "fixture" else terminal_resolved
     unmatched = [
         record for record in behavior.active_hard_block_records if record[0] not in resolved
     ]
     active_keys = {record[0] for record in behavior.active_hard_block_records}
     matched_count = len(active_keys & resolved)
+    terminal_resolved_count = len(active_keys & terminal_resolved)
+    matched_shadow_guard_allow_count = len(active_keys & shadow_guard_allows)
     behavior_states = {
         (epoch, signature): state_hash
         for epoch, signature, state_hash in behavior.counterfactual_state_records
@@ -51,15 +51,24 @@ def build_canary_report(
         and readiness_evidence.get("baseline_sha256") == baseline_sha256
         and readiness_evidence.get("expected_git_sha") == expected_git_sha
         and int(readiness_evidence.get("context_applicable_blocking_hard_count", 0)) >= 1
+        and bool(readiness_evidence.get("approved_blocking_rule_ids"))
+        and isinstance(readiness_evidence.get("approved_rule_set_sha256"), str)
+        and not bool(readiness_evidence.get("rejected_context_applicable_blocking_hard_rule_ids"))
         and (
             bool(readiness_evidence.get("canary_fixture_rule_ids"))
             if canary_kind == "fixture"
             else not bool(readiness_evidence.get("canary_fixture_rule_ids"))
         )
     )
+    evaluation_seed_ids = tuple(
+        int(seed) for seed in readiness_evidence.get("evaluation_seed_ids", ())
+    )
     gates = {
         "hard_readiness_accepted": readiness_valid,
         "runs_exit_zero": behavior.exit_code == 0 and shadow.exit_code == 0,
+        "execution_seed_contract": (
+            behavior.seed == shadow.seed and behavior.seed in evaluation_seed_ids
+        ),
         "runs_complete_for_kind": (
             behavior.natural_terminal and shadow.natural_terminal
             if canary_kind == "production"
@@ -73,7 +82,11 @@ def build_canary_report(
             and behavior.source_attestation_fingerprint == shadow.source_attestation_fingerprint
         ),
         "active_hard_block_observed": bool(active_keys),
-        "matched_counterfactual_observed": matched_count > 0,
+        (
+            "matched_shadow_guard_allow_observed"
+            if canary_kind == "fixture"
+            else "terminal_counterfactual_resolved"
+        ): matched_count > 0,
         "all_active_hard_blocks_matched": not unmatched,
         "matched_prestate_identity": not divergent_epochs,
         "analysis_memory_budget_respected": (
@@ -82,16 +95,21 @@ def build_canary_report(
         ),
     }
     return {
-        "schema_version": "1.0",
+        "schema_version": "1.1",
         "canary_kind": canary_kind,
         "canary_fixture": canary_kind == "fixture",
         "baseline_sha256": baseline_sha256,
         "expected_git_sha": expected_git_sha,
+        "execution_seed": behavior.seed,
+        "evaluation_seed_ids": list(evaluation_seed_ids),
+        "approved_rule_set_sha256": readiness_evidence.get("approved_rule_set_sha256"),
         "hard_readiness": readiness_evidence,
         "behavior": asdict(behavior),
         "shadow": asdict(shadow),
         "active_hard_block_count": len(active_keys),
-        "matched_counterfactual_count": matched_count,
+        "terminal_counterfactual_required": canary_kind == "production",
+        "terminal_counterfactual_resolved_count": terminal_resolved_count,
+        "matched_shadow_guard_allow_count": matched_shadow_guard_allow_count,
         "unmatched_active_hard_block_count": len(unmatched),
         "unmatched_active_hard_blocks": [
             {"counterfactual_key": key, "game_loop": loop, "state_hash": state_hash}
