@@ -5,6 +5,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from rtscortex.contracts import (
     ActionSource,
     EpisodeOutcome,
@@ -49,6 +51,47 @@ from rtscortex.playbook import (
     RecentTerminalFeedback,
     candidate_signature,
 )
+from rtscortex.playbook.conditions import condition_matches
+
+
+@pytest.mark.parametrize(
+    ("condition", "values"),
+    [
+        (
+            PlaybookCondition(field="map_name", value="simple64"),
+            {"map_name": "Simple64"},
+        ),
+        (
+            PlaybookCondition(
+                field="map_name",
+                operator=PlaybookConditionOperator.IN,
+                value=("simple64", "abyssalreef"),
+            ),
+            {"map_name": "Simple64"},
+        ),
+        (
+            PlaybookCondition(
+                field="map_name",
+                operator=PlaybookConditionOperator.CONTAINS,
+                value="simple",
+            ),
+            {"map_name": "Simple64"},
+        ),
+        (
+            PlaybookCondition(
+                field="alert",
+                operator=PlaybookConditionOperator.CONTAINS,
+                value="enemy_air",
+            ),
+            {"alert": ("Enemy_Air",)},
+        ),
+    ],
+)
+def test_playbook_condition_matching_has_one_case_insensitive_semantics(
+    condition: PlaybookCondition,
+    values: dict[str, object],
+) -> None:
+    assert condition_matches(condition, values) is True
 
 
 def test_playbook_public_import_succeeds_in_cold_interpreter() -> None:

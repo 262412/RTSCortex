@@ -5,7 +5,10 @@ from pathlib import Path
 
 import pytest
 
-from scripts.prepare_reviewed_llm_pysc2_runtime import prepare_reviewed_source
+from scripts.prepare_reviewed_llm_pysc2_runtime import (
+    prepare_reviewed_source,
+    reviewed_source_tree_manifest,
+)
 
 
 def _git(repository: Path, *arguments: str) -> str:
@@ -56,6 +59,10 @@ def test_reviewed_runtime_uses_a_clean_gitlink_without_mutating_it(tmp_path: Pat
     assert _git(target, "status", "--porcelain") == "M agent.py"
     assert manifest["source_gitlink"] == gitlink
     assert manifest["patch_count"] == 1
+    assert (
+        manifest["reviewed_tree_sha256"]
+        == reviewed_source_tree_manifest(target)["reviewed_tree_sha256"]
+    )
     assert (output_root / "reviewed-source.json").is_file()
 
     with pytest.raises(ValueError, match="already exists"):
@@ -89,3 +96,30 @@ def test_reviewed_runtime_rejects_a_dirty_source(tmp_path: Path) -> None:
             patch_directory,
             expected_gitlink=gitlink,
         )
+
+
+def test_reviewed_tree_attestation_includes_untracked_and_ignored_files(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "reviewed"
+    repository.mkdir()
+    subprocess.run(["git", "init", "--quiet", str(repository)], check=True)
+    _git(repository, "config", "user.email", "test@example.com")
+    _git(repository, "config", "user.name", "RTSCortex Test")
+    (repository / ".gitignore").write_text("ignored.py\n", encoding="utf-8")
+    (repository / "tracked.py").write_text("VALUE = 1\n", encoding="utf-8")
+    _git(repository, "add", ".gitignore", "tracked.py")
+    _git(repository, "commit", "--quiet", "-m", "baseline")
+
+    baseline = reviewed_source_tree_manifest(repository)
+    (repository / "untracked.py").write_text("VALUE = 2\n", encoding="utf-8")
+    untracked = reviewed_source_tree_manifest(repository)
+    (repository / "ignored.py").write_text("VALUE = 3\n", encoding="utf-8")
+    ignored = reviewed_source_tree_manifest(repository)
+
+    assert baseline["reviewed_tree_sha256"] != untracked["reviewed_tree_sha256"]
+    assert untracked["reviewed_tree_sha256"] != ignored["reviewed_tree_sha256"]
+    assert untracked["reviewed_untracked_paths"] == ["untracked.py"]
+    baseline_file_count = baseline["reviewed_tree_file_count"]
+    assert isinstance(baseline_file_count, int)
+    assert ignored["reviewed_tree_file_count"] == baseline_file_count + 2

@@ -8,11 +8,11 @@ import threading
 from datetime import UTC, datetime
 from pathlib import Path
 
+from rtscortex.playbook.conditions import condition_matches
 from rtscortex.playbook.models import (
     DecisionCase,
     LessonStatus,
     PlaybookCondition,
-    PlaybookConditionOperator,
     PlaybookContext,
     PlaybookHit,
     PlaybookLesson,
@@ -370,17 +370,8 @@ def _rule_matches_context(rule: PlaybookRule, context: PlaybookContext) -> bool:
     for condition in rule.conditions:
         if condition.field not in values:
             continue
-        actual = values[condition.field]
-        expected = condition.value
-        if condition.operator is PlaybookConditionOperator.EQ and actual != expected:
+        if not condition_matches(condition, values):
             return False
-        if condition.operator is PlaybookConditionOperator.IN:
-            options = expected if isinstance(expected, tuple) else (expected,)
-            if actual not in options:
-                return False
-        if condition.operator is PlaybookConditionOperator.CONTAINS:
-            if not isinstance(actual, tuple) or expected not in actual:
-                return False
     return True
 
 

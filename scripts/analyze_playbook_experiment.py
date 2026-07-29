@@ -457,6 +457,8 @@ def _run_metrics(
     reviewed_source_commit_after = row.get("reviewed_source_commit_after", "")
     reviewed_source_diff_before = row.get("reviewed_source_diff_sha256_before", "")
     reviewed_source_diff_after = row.get("reviewed_source_diff_sha256_after", "")
+    reviewed_source_tree_before = row.get("reviewed_source_tree_sha256_before", "")
+    reviewed_source_tree_after = row.get("reviewed_source_tree_sha256_after", "")
     has_source_attestation = all(
         (
             git_head_before,
@@ -475,6 +477,8 @@ def _run_metrics(
             reviewed_source_commit_after,
             reviewed_source_diff_before,
             reviewed_source_diff_after,
+            reviewed_source_tree_before,
+            reviewed_source_tree_after,
         )
     )
     source_attestation_consistent = (
@@ -490,6 +494,7 @@ def _run_metrics(
         == reviewed_source_commit_after
         == submodule_gitlink_before
         and reviewed_source_diff_before == reviewed_source_diff_after
+        and reviewed_source_tree_before == reviewed_source_tree_after
     )
     source_attestation_fingerprint = (
         _source_attestation_fingerprint(
@@ -501,6 +506,7 @@ def _run_metrics(
             submodule_diff_sha256=submodule_diff_before,
             reviewed_source_commit=reviewed_source_commit_before,
             reviewed_source_diff_sha256=reviewed_source_diff_before,
+            reviewed_source_tree_sha256=reviewed_source_tree_before,
         )
         if source_attestation_consistent
         else None
@@ -628,6 +634,7 @@ def _source_attestation_fingerprint(
     submodule_diff_sha256: str,
     reviewed_source_commit: str,
     reviewed_source_diff_sha256: str,
+    reviewed_source_tree_sha256: str,
 ) -> str:
     payload = json.dumps(
         {
@@ -639,6 +646,7 @@ def _source_attestation_fingerprint(
             "submodule_diff_sha256": submodule_diff_sha256,
             "reviewed_source_commit": reviewed_source_commit,
             "reviewed_source_diff_sha256": reviewed_source_diff_sha256,
+            "reviewed_source_tree_sha256": reviewed_source_tree_sha256,
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -664,8 +672,8 @@ def counterfactual_canary_is_valid(
         and artifact.get("canary_fixture") is False
         and artifact.get("accepted") is True
         and artifact.get("baseline_sha256") == baseline_sha256
-        and set(artifact.get("evaluation_seed_ids", ())) == set(expected_evaluation_seeds)
-        and artifact.get("execution_seed") in set(expected_evaluation_seeds)
+        and tuple(artifact.get("evaluation_seed_ids", ())) == expected_evaluation_seeds
+        and artifact.get("execution_seed") in expected_evaluation_seeds
         and (expected_git_sha is None or artifact.get("expected_git_sha") == expected_git_sha)
         and isinstance(gates, dict)
         and bool(gates)
@@ -674,7 +682,7 @@ def counterfactual_canary_is_valid(
         and readiness.get("canary_runnable") is True
         and readiness.get("baseline_sha256") == baseline_sha256
         and readiness.get("expected_git_sha") == expected_git_sha
-        and set(readiness.get("evaluation_seed_ids", ())) == set(expected_evaluation_seeds)
+        and tuple(readiness.get("evaluation_seed_ids", ())) == expected_evaluation_seeds
         and readiness.get("schema_version") == "1.1"
         and bool(readiness.get("approved_hard_rule_ids"))
         and readiness.get("approved_hard_rule_ids")
@@ -715,6 +723,8 @@ def _comparison(
     unique_expected_seeds = tuple(dict.fromkeys(expected_seeds))
     if len(unique_expected_seeds) != 3:
         raise ValueError("formal comparison requires exactly three distinct held-out seeds")
+    if unique_expected_seeds != tuple(sorted(unique_expected_seeds)):
+        raise ValueError("held-out seeds must be in strictly increasing execution order")
     expected_behavior_matrix = {
         (mode, seed, arm)
         for mode in ("independent_paired", "sequential_learning")
@@ -733,7 +743,7 @@ def _comparison(
     }
     paired: list[dict[str, Any]] = []
     for mode in ("independent_paired", "sequential_learning"):
-        for seed in sorted({metric.seed for metric in behavior if metric.mode == mode}):
+        for seed in unique_expected_seeds:
             pair = {
                 metric.arm: metric
                 for metric in behavior
@@ -773,10 +783,12 @@ def _comparison(
         for metric in behavior
         if metric.arm == "frozen"
     )
-    evolving_sequence = sorted(
-        (metric for metric in sequential_rows if metric.arm == "evolving"),
-        key=lambda metric: metric.seed,
-    )
+    evolving_by_seed = {
+        metric.seed: metric for metric in sequential_rows if metric.arm == "evolving"
+    }
+    evolving_sequence = [
+        evolving_by_seed[seed] for seed in unique_expected_seeds if seed in evolving_by_seed
+    ]
     sequential_carry = all(
         current.playbook_before_sha256 == previous.playbook_after_sha256
         for previous, current in zip(evolving_sequence, evolving_sequence[1:], strict=False)

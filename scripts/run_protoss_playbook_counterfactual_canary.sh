@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export PYTHONDONTWRITEBYTECODE=1
 
 if [[ $# -ne 8 || "$3" != "--expected-git-sha" || "$5" != "--execution-seed" || "$7" != "--evaluation-seeds" ]]; then
   echo "usage: $0 <baseline-playbook.sqlite3> <run-set-dir> --expected-git-sha <sha> --execution-seed <seed> --evaluation-seeds 3,4,5" >&2
@@ -32,6 +33,13 @@ for evaluation_seed in "${evaluation_seeds[@]}"; do
 done
 if [[ ! "${seed}" =~ ^[0-9]+$ || "${execution_seed_is_held_out}" != "true" ]]; then
   echo "execution seed must be one member of the full held-out evaluation set" >&2
+  exit 2
+fi
+sorted_evaluation_seed_csv="$(
+  printf '%s\n' "${evaluation_seeds[@]}" | sort -n | paste -sd, -
+)"
+if [[ "${evaluation_seed_csv}" != "${sorted_evaluation_seed_csv}" ]]; then
+  echo "evaluation seeds must be supplied in strictly increasing execution order" >&2
   exit 2
 fi
 active_config="${repo_dir}/configs/experiments/live_simple64_hima_protoss_ensemble_cortex_v0_5_natural_terminal.yaml"
@@ -94,12 +102,16 @@ reviewed_llm_pysc2="${reviewed_source_root}/third_party/LLM-PySC2"
 reviewed_source_diff_sha256="$(
   git -C "${reviewed_llm_pysc2}" diff --binary | sha256sum | awk '{print $1}'
 )"
+reviewed_source_tree_sha256="$(
+  uv run python -m scripts.hash_reviewed_source_tree \
+    "${reviewed_llm_pysc2}" --field reviewed_tree_sha256
+)"
 
 uv run python scripts/run_recovery_acceptance_canary.py \
   --expected-git-sha "${expected_git_sha}" \
   --output "${recovery_evidence}"
 
-printf "experiment_kind\tmode\tseed\tarm\tsubject_arm\tarm_order\texit_code\trun_dir\tplaybook_before_sha256\tplaybook_after_sha256\tplaybook_before_snapshot\tplaybook_after_snapshot\tgit_head_before\tgit_head_after\tsuperproject_dirty_before\tsuperproject_dirty_after\tsubmodule_commit_before\tsubmodule_commit_after\tsubmodule_dirty_before\tsubmodule_dirty_after\tsubmodule_gitlink_before\tsubmodule_gitlink_after\tsubmodule_diff_sha256_before\tsubmodule_diff_sha256_after\treviewed_source_commit_before\treviewed_source_commit_after\treviewed_source_diff_sha256_before\treviewed_source_diff_sha256_after\n" > "${status_file}"
+printf "experiment_kind\tmode\tseed\tarm\tsubject_arm\tarm_order\texit_code\trun_dir\tplaybook_before_sha256\tplaybook_after_sha256\tplaybook_before_snapshot\tplaybook_after_snapshot\tgit_head_before\tgit_head_after\tsuperproject_dirty_before\tsuperproject_dirty_after\tsubmodule_commit_before\tsubmodule_commit_after\tsubmodule_dirty_before\tsubmodule_dirty_after\tsubmodule_gitlink_before\tsubmodule_gitlink_after\tsubmodule_diff_sha256_before\tsubmodule_diff_sha256_after\treviewed_source_commit_before\treviewed_source_commit_after\treviewed_source_diff_sha256_before\treviewed_source_diff_sha256_after\treviewed_source_tree_sha256_before\treviewed_source_tree_sha256_after\n" > "${status_file}"
 
 run_canary_arm() {
   local kind="$1"
@@ -123,8 +135,14 @@ run_canary_arm() {
   reviewed_diff_before="$(
     git -C "${reviewed_llm_pysc2}" diff --binary | sha256sum | awk '{print $1}'
   )"
+  local reviewed_tree_before
+  reviewed_tree_before="$(
+    uv run python -m scripts.hash_reviewed_source_tree \
+      "${reviewed_llm_pysc2}" --field reviewed_tree_sha256
+  )"
   if [[ "${reviewed_commit_before}" != "${submodule_gitlink}" \
-    || "${reviewed_diff_before}" != "${reviewed_source_diff_sha256}" ]]; then
+    || "${reviewed_diff_before}" != "${reviewed_source_diff_sha256}" \
+    || "${reviewed_tree_before}" != "${reviewed_source_tree_sha256}" ]]; then
     echo "reviewed Worker source changed before canary ${arm}/seed-${seed}" >&2
     exit 2
   fi
@@ -170,8 +188,14 @@ run_canary_arm() {
   reviewed_diff_after="$(
     git -C "${reviewed_llm_pysc2}" diff --binary | sha256sum | awk '{print $1}'
   )"
+  local reviewed_tree_after
+  reviewed_tree_after="$(
+    uv run python -m scripts.hash_reviewed_source_tree \
+      "${reviewed_llm_pysc2}" --field reviewed_tree_sha256
+  )"
   if [[ "${reviewed_commit_after}" != "${submodule_gitlink}" \
-    || "${reviewed_diff_after}" != "${reviewed_source_diff_sha256}" ]]; then
+    || "${reviewed_diff_after}" != "${reviewed_source_diff_sha256}" \
+    || "${reviewed_tree_after}" != "${reviewed_source_tree_sha256}" ]]; then
     echo "reviewed Worker source changed during canary ${arm}/seed-${seed}" >&2
     run_status=86
   fi
@@ -185,6 +209,7 @@ run_canary_arm() {
     "${submodule_diff_sha256}" "${submodule_diff_after}"
     "${reviewed_commit_before}" "${reviewed_commit_after}"
     "${reviewed_diff_before}" "${reviewed_diff_after}"
+    "${reviewed_tree_before}" "${reviewed_tree_after}"
   )
   (
     IFS=$'\t'

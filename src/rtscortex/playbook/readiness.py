@@ -190,7 +190,7 @@ def analyze_hard_readiness(
         *profile.controller_capabilities,
         *profile.controller_managed_actions,
     }
-    evaluation_seeds = tuple(dict.fromkeys(int(seed) for seed in evaluation_seed_ids))
+    evaluation_seeds = tuple(sorted(set(int(seed) for seed in evaluation_seed_ids)))
     active = [rule for rule in rules if rule.status is PlaybookRuleStatus.ACTIVE]
     active_hard = [rule for rule in active if rule.strength is PlaybookRuleStrength.HARD]
     blocking_effects = {

@@ -330,6 +330,7 @@ def test_runs_from_different_source_attestations_reject_acceptance() -> None:
         {"submodule_commit_after": "other"},
         {"reviewed_source_commit_after": "other"},
         {"reviewed_source_diff_sha256_after": "other"},
+        {"reviewed_source_tree_sha256_after": "other"},
     ],
 )
 def test_divergent_source_attestation_fails_closed(
@@ -402,6 +403,15 @@ def test_comparison_separates_independent_pairs_from_sequential_learning() -> No
     assert comparison["gates"]["independent_baseline_identity"] is True
     assert comparison["gates"]["sequential_evolving_carry"] is True
     assert comparison["accepted"] is True
+
+
+def test_comparison_rejects_noncanonical_seed_execution_order() -> None:
+    with pytest.raises(ValueError, match="strictly increasing execution order"):
+        _comparison(
+            _strict_matrix(),
+            baseline_sha256="baseline",
+            expected_seeds=(2, 0, 1),
+        )
 
 
 def test_false_block_gate_cannot_pass_without_shadow_states() -> None:
@@ -521,6 +531,8 @@ def test_paired_runner_propagates_failed_acceptance_gate() -> None:
     assert "submodule_diff_sha256_before" in runner
     assert "submodule_gitlink_before" in runner
     assert "reviewed_source_diff_sha256_before" in runner
+    assert "reviewed_source_tree_sha256_before" in runner
+    assert "strictly increasing execution order" in runner
     assert '"${submodule_dirty}" != "false"' in runner
     assert '"${submodule_commit}" != "${submodule_gitlink}"' in runner
     assert "capture_source_attestation" in runner
@@ -542,6 +554,8 @@ def test_paired_runner_propagates_failed_acceptance_gate() -> None:
     assert "readiness_seed_args" in canary_runner
     assert "submodule_gitlink_before" in canary_runner
     assert "reviewed_source_diff_sha256_before" in canary_runner
+    assert "reviewed_source_tree_sha256_before" in canary_runner
+    assert "strictly increasing execution order" in canary_runner
     assert '"${submodule_dirty}" != "false"' in canary_runner
     assert "s/^Artifacts: //p" in runner
     assert "s/^Artifacts: //p" in canary_runner
@@ -553,6 +567,7 @@ def test_paired_runner_propagates_failed_acceptance_gate() -> None:
     assert "local fields=(" in fixture_runner
     assert "submodule_gitlink_before" in fixture_runner
     assert "reviewed_source_diff_sha256_before" in fixture_runner
+    assert "reviewed_source_tree_sha256_before" in fixture_runner
     assert '"${submodule_dirty}" != "false"' in fixture_runner
     assert "prepare_reviewed_llm_pysc2_runtime.py" in fixture_runner
     assert 'export RTSCORTEX_REVIEWED_SOURCE_ROOT="${reviewed_source_root}"' in fixture_runner
@@ -819,6 +834,50 @@ def test_formal_runner_rejects_canary_with_different_evaluation_seed_set() -> No
         baseline_sha256="baseline",
         expected_git_sha="expected",
         readiness_evidence=_readiness(evaluation_seeds=(3, 4, 6)),
+    )
+    held_out = [replace(metric, seed=metric.seed + 3) for metric in _strict_matrix()]
+
+    comparison = _comparison(
+        held_out,
+        baseline_sha256="baseline",
+        expected_git_sha="expected",
+        counterfactual_canary=canary,
+        expected_seeds=(3, 4, 5),
+    )
+
+    assert comparison["gates"]["counterfactual_canary_accepted"] is False
+
+
+def test_formal_runner_rejects_canary_with_different_evaluation_seed_order() -> None:
+    behavior = replace(
+        _metrics(
+            mode="causal_canary",
+            seed=3,
+            arm="active",
+            before="baseline",
+            after="after",
+            repeated_errors=0,
+        ),
+        active_hard_block_keys=("counterfactual:shared",),
+        active_hard_block_records=(("counterfactual:shared", 100, "a" * 64),),
+    )
+    shadow = replace(
+        _metrics(
+            mode="causal_canary",
+            seed=3,
+            arm="shadow",
+            before="baseline",
+            after="baseline",
+            repeated_errors=0,
+        ),
+        resolved_counterfactual_keys=("counterfactual:shared",),
+    )
+    canary = build_canary_report(
+        behavior,
+        shadow,
+        baseline_sha256="baseline",
+        expected_git_sha="expected",
+        readiness_evidence=_readiness(evaluation_seeds=(5, 3, 4)),
     )
     held_out = [replace(metric, seed=metric.seed + 3) for metric in _strict_matrix()]
 
@@ -1625,6 +1684,8 @@ def _metrics_for_events(
         "reviewed_source_commit_after": "gitlink",
         "reviewed_source_diff_sha256_before": "reviewed",
         "reviewed_source_diff_sha256_after": "reviewed",
+        "reviewed_source_tree_sha256_before": "reviewed-tree",
+        "reviewed_source_tree_sha256_after": "reviewed-tree",
     }
     if source_overrides:
         row.update(source_overrides)

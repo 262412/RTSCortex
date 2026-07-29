@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -56,13 +57,15 @@ def prepare_reviewed_source(
         check=True,
         capture_output=True,
     ).stdout
+    reviewed_tree = reviewed_source_tree_manifest(target)
     manifest = {
-        "schema_version": "1.0",
+        "schema_version": "1.1",
         "artifact_kind": "reviewed-llm-pysc2-runtime",
         "source_gitlink": expected_gitlink,
         "patch_count": len(patches),
         "patch_set_sha256": patch_set_sha256,
         "reviewed_diff_sha256": hashlib.sha256(reviewed_diff).hexdigest(),
+        **reviewed_tree,
         "patches": patch_records,
     }
     (output_root / "reviewed-source.json").write_text(
@@ -89,6 +92,72 @@ def _sha256_json(payload: object) -> str:
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
+
+
+def reviewed_source_tree_manifest(repository: Path) -> dict[str, object]:
+    """Hash every runtime-visible file, including ignored and untracked files."""
+
+    repository = repository.resolve()
+    entries: list[dict[str, object]] = []
+    for current_root, directory_names, file_names in os.walk(
+        repository,
+        followlinks=False,
+    ):
+        root = Path(current_root)
+        directory_names[:] = sorted(name for name in directory_names if name != ".git")
+        for name in tuple(directory_names):
+            path = root / name
+            if not path.is_symlink():
+                continue
+            entries.append(_tree_entry(repository, path))
+            directory_names.remove(name)
+        for name in sorted(file_names):
+            path = root / name
+            if path.name == ".git":
+                continue
+            entries.append(_tree_entry(repository, path))
+    entries.sort(key=lambda entry: str(entry["path"]))
+    untracked = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repository),
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            "-z",
+        ],
+        check=True,
+        capture_output=True,
+    ).stdout.split(b"\0")
+    untracked_paths = sorted(
+        path.decode("utf-8", errors="surrogateescape") for path in untracked if path
+    )
+    return {
+        "reviewed_tree_sha256": _sha256_json(entries),
+        "reviewed_tree_file_count": len(entries),
+        "reviewed_untracked_file_count": len(untracked_paths),
+        "reviewed_untracked_paths": untracked_paths,
+    }
+
+
+def _tree_entry(repository: Path, path: Path) -> dict[str, object]:
+    relative = path.relative_to(repository).as_posix()
+    if path.is_symlink():
+        target = os.readlink(path)
+        return {
+            "path": relative,
+            "kind": "symlink",
+            "size": len(target.encode()),
+            "sha256": hashlib.sha256(target.encode()).hexdigest(),
+        }
+    content = path.read_bytes()
+    return {
+        "path": relative,
+        "kind": "file",
+        "size": len(content),
+        "sha256": hashlib.sha256(content).hexdigest(),
+    }
 
 
 def main() -> None:

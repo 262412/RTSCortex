@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, cast
 
+from rtscortex.playbook.conditions import condition_matches
 from rtscortex.playbook.lifecycle import PlaybookRuleLifecycle
 from rtscortex.playbook.models import (
     PlaybookCondition,
@@ -296,33 +297,7 @@ def _matches_rule_situation(rule: PlaybookRule, state: dict[str, object]) -> boo
     conditions = [
         condition for condition in rule.conditions if condition.field in _SITUATION_FIELDS
     ]
-    return bool(conditions) and all(_matches(condition, state) for condition in conditions)
-
-
-def _matches(condition: PlaybookCondition, state: dict[str, object]) -> bool:
-    if condition.field not in state:
-        return False
-    actual = state[condition.field]
-    expected = condition.value
-    if condition.operator is PlaybookConditionOperator.EQ:
-        return actual == expected
-    if condition.operator is PlaybookConditionOperator.IN:
-        return isinstance(expected, tuple) and actual in expected
-    if condition.operator is PlaybookConditionOperator.CONTAINS:
-        return isinstance(actual, (tuple, list, set)) and expected in actual
-    if condition.operator is PlaybookConditionOperator.GTE:
-        return (
-            isinstance(actual, (int, float))
-            and isinstance(expected, (int, float))
-            and actual >= expected
-        )
-    if condition.operator is PlaybookConditionOperator.LTE:
-        return (
-            isinstance(actual, (int, float))
-            and isinstance(expected, (int, float))
-            and actual <= expected
-        )
-    return False
+    return bool(conditions) and all(condition_matches(condition, state) for condition in conditions)
 
 
 def _core_condition_values(

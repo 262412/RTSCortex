@@ -7,6 +7,7 @@ import json
 from collections.abc import Sequence
 from datetime import UTC, datetime
 
+from rtscortex.playbook.conditions import condition_matches
 from rtscortex.playbook.models import (
     PlaybookCondition,
     PlaybookConditionOperator,
@@ -111,13 +112,11 @@ def rule_is_unexpired(rule: PlaybookRule, now: datetime) -> bool:
 
 
 def _condition_matches_static(condition: PlaybookCondition, actual: str) -> bool:
-    expected = condition.value
-    if condition.operator is PlaybookConditionOperator.EQ:
-        return str(expected).casefold() == actual.casefold()
-    if condition.operator is PlaybookConditionOperator.IN:
-        values = expected if isinstance(expected, tuple) else (str(expected),)
-        return actual.casefold() in {str(value).casefold() for value in values}
-    if condition.operator is PlaybookConditionOperator.CONTAINS:
-        return str(expected).casefold() in actual.casefold()
+    if condition.operator in {
+        PlaybookConditionOperator.EQ,
+        PlaybookConditionOperator.IN,
+        PlaybookConditionOperator.CONTAINS,
+    }:
+        return condition_matches(condition, {condition.field: actual})
     # Invalid static operators remain selectable so readiness must reject them.
     return True

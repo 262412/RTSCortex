@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export PYTHONDONTWRITEBYTECODE=1
 
 if [[ $# -ne 6 && $# -ne 8 ]]; then
   echo "usage: $0 <baseline-playbook.sqlite3> <run-set-dir> --expected-git-sha <sha> --counterfactual-canary <json> [--seeds 3,4,5]" >&2
@@ -34,6 +35,11 @@ for seed in "${seeds[@]}"; do
   fi
   unique_seeds["${seed}"]=1
 done
+sorted_seed_csv="$(printf '%s\n' "${seeds[@]}" | sort -n | paste -sd, -)"
+if [[ "${seed_csv}" != "${sorted_seed_csv}" ]]; then
+  echo "held-out seeds must be supplied in strictly increasing execution order" >&2
+  exit 2
+fi
 frozen_config="${repo_dir}/configs/experiments/live_simple64_hima_protoss_ensemble_cortex_v0_5_frozen_playbook_natural_terminal.yaml"
 evolving_config="${repo_dir}/configs/experiments/live_simple64_hima_protoss_ensemble_cortex_v0_5_natural_terminal.yaml"
 shadow_config="${repo_dir}/configs/experiments/live_simple64_hima_protoss_ensemble_cortex_v0_5_shadow_calibration_natural_terminal.yaml"
@@ -135,6 +141,10 @@ reviewed_llm_pysc2="${reviewed_source_root}/third_party/LLM-PySC2"
 reviewed_source_diff_sha256="$(
   git -C "${reviewed_llm_pysc2}" diff --binary | sha256sum | awk '{print $1}'
 )"
+reviewed_source_tree_sha256="$(
+  uv run python -m scripts.hash_reviewed_source_tree \
+    "${reviewed_llm_pysc2}" --field reviewed_tree_sha256
+)"
 
 capture_source_attestation() {
   source_git_head="$(git rev-parse HEAD)"
@@ -147,6 +157,10 @@ capture_source_attestation() {
   source_reviewed_diff_sha256="$(
     git -C "${reviewed_llm_pysc2}" diff --binary | sha256sum | awk '{print $1}'
   )"
+  source_reviewed_tree_sha256="$(
+    uv run python -m scripts.hash_reviewed_source_tree \
+      "${reviewed_llm_pysc2}" --field reviewed_tree_sha256
+  )"
 }
 
 source_matches_baseline() {
@@ -158,7 +172,8 @@ source_matches_baseline() {
     && [[ "${source_submodule_commit}" == "${source_submodule_gitlink}" ]] \
     && [[ "${source_submodule_diff_sha256}" == "${submodule_diff_sha256}" ]] \
     && [[ "${source_reviewed_commit}" == "${submodule_gitlink}" ]] \
-    && [[ "${source_reviewed_diff_sha256}" == "${reviewed_source_diff_sha256}" ]]
+    && [[ "${source_reviewed_diff_sha256}" == "${reviewed_source_diff_sha256}" ]] \
+    && [[ "${source_reviewed_tree_sha256}" == "${reviewed_source_tree_sha256}" ]]
 }
 
 uv run python scripts/run_recovery_acceptance_canary.py \
@@ -181,10 +196,11 @@ uv run python scripts/run_recovery_acceptance_canary.py \
   echo "counterfactual_canary=${counterfactual_canary}"
   echo "reviewed_source_manifest=${reviewed_source_manifest}"
   echo "reviewed_source_manifest_sha256=${reviewed_source_manifest_sha256}"
+  echo "reviewed_source_tree_sha256=${reviewed_source_tree_sha256}"
 } > "${run_set_dir}/experiment-metadata.txt"
 
 status_file="${run_set_dir}/experiment-status.tsv"
-printf "experiment_kind\tmode\tseed\tarm\tsubject_arm\tarm_order\texit_code\trun_dir\tplaybook_before_sha256\tplaybook_after_sha256\tplaybook_before_snapshot\tplaybook_after_snapshot\tgit_head_before\tgit_head_after\tsuperproject_dirty_before\tsuperproject_dirty_after\tsubmodule_commit_before\tsubmodule_commit_after\tsubmodule_dirty_before\tsubmodule_dirty_after\tsubmodule_gitlink_before\tsubmodule_gitlink_after\tsubmodule_diff_sha256_before\tsubmodule_diff_sha256_after\treviewed_source_commit_before\treviewed_source_commit_after\treviewed_source_diff_sha256_before\treviewed_source_diff_sha256_after\n" \
+printf "experiment_kind\tmode\tseed\tarm\tsubject_arm\tarm_order\texit_code\trun_dir\tplaybook_before_sha256\tplaybook_after_sha256\tplaybook_before_snapshot\tplaybook_after_snapshot\tgit_head_before\tgit_head_after\tsuperproject_dirty_before\tsuperproject_dirty_after\tsubmodule_commit_before\tsubmodule_commit_after\tsubmodule_dirty_before\tsubmodule_dirty_after\tsubmodule_gitlink_before\tsubmodule_gitlink_after\tsubmodule_diff_sha256_before\tsubmodule_diff_sha256_after\treviewed_source_commit_before\treviewed_source_commit_after\treviewed_source_diff_sha256_before\treviewed_source_diff_sha256_after\treviewed_source_tree_sha256_before\treviewed_source_tree_sha256_after\n" \
   > "${status_file}"
 overall_status=0
 
@@ -222,6 +238,7 @@ run_arm() {
   local submodule_diff_before="${source_submodule_diff_sha256}"
   local reviewed_commit_before="${source_reviewed_commit}"
   local reviewed_diff_before="${source_reviewed_diff_sha256}"
+  local reviewed_tree_before="${source_reviewed_tree_sha256}"
   local before_sha256 log_path run_status run_dir after_sha256 before_snapshot after_snapshot
   before_sha256="$(sha256sum "${working_playbook}" | awk '{print $1}')"
   before_snapshot="${arm_dir}/seed-${seed}.before.sqlite3"
@@ -249,6 +266,7 @@ run_arm() {
   local submodule_diff_after="${source_submodule_diff_sha256}"
   local reviewed_commit_after="${source_reviewed_commit}"
   local reviewed_diff_after="${source_reviewed_diff_sha256}"
+  local reviewed_tree_after="${source_reviewed_tree_sha256}"
   if ! source_matches_baseline; then
     echo "source attestation changed during ${mode}/${arm}/seed-${seed}" >&2
     run_status=86
@@ -273,6 +291,7 @@ run_arm() {
     "${submodule_diff_before}" "${submodule_diff_after}"
     "${reviewed_commit_before}" "${reviewed_commit_after}"
     "${reviewed_diff_before}" "${reviewed_diff_after}"
+    "${reviewed_tree_before}" "${reviewed_tree_after}"
   )
   (
     IFS=$'\t'
@@ -308,6 +327,7 @@ run_shadow_calibration() {
   local submodule_diff_before="${source_submodule_diff_sha256}"
   local reviewed_commit_before="${source_reviewed_commit}"
   local reviewed_diff_before="${source_reviewed_diff_sha256}"
+  local reviewed_tree_before="${source_reviewed_tree_sha256}"
   local before_sha256 log_path run_status run_dir after_sha256 before_snapshot after_snapshot
   before_sha256="$(sha256sum "${shadow_playbook}" | awk '{print $1}')"
   before_snapshot="${arm_dir}/seed-${seed}.before.sqlite3"
@@ -335,6 +355,7 @@ run_shadow_calibration() {
   local submodule_diff_after="${source_submodule_diff_sha256}"
   local reviewed_commit_after="${source_reviewed_commit}"
   local reviewed_diff_after="${source_reviewed_diff_sha256}"
+  local reviewed_tree_after="${source_reviewed_tree_sha256}"
   if ! source_matches_baseline; then
     echo "source attestation changed during ${mode}/shadow-${subject_arm}/seed-${seed}" >&2
     run_status=86
@@ -359,6 +380,7 @@ run_shadow_calibration() {
     "${submodule_diff_before}" "${submodule_diff_after}"
     "${reviewed_commit_before}" "${reviewed_commit_after}"
     "${reviewed_diff_before}" "${reviewed_diff_after}"
+    "${reviewed_tree_before}" "${reviewed_tree_after}"
   )
   (
     IFS=$'\t'
@@ -413,6 +435,7 @@ fi
   echo "final_submodule_diff_sha256=${source_submodule_diff_sha256}"
   echo "final_reviewed_source_commit=${source_reviewed_commit}"
   echo "final_reviewed_source_diff_sha256=${source_reviewed_diff_sha256}"
+  echo "final_reviewed_source_tree_sha256=${source_reviewed_tree_sha256}"
 } >> "${run_set_dir}/experiment-metadata.txt"
 
 set +e

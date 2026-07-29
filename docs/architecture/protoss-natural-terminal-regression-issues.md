@@ -1745,6 +1745,40 @@ Two limitations are deliberately still visible:
   - a canary containing Tactical readiness category plus a `strategy` Runtime
     event fails `rule_evaluation_kind_consistent`.
 
+#### 2026-07-29 final pre-24-run contract closure
+
+- **Status:** implemented in code and deterministic tests. Because these changes
+  create a new Git revision, the production Active/Shadow canary must be rerun
+  against that exact revision before the formal 24-run can start.
+- **Static condition parity:**
+  - readiness, Guard, Store retrieval and promotion replay now use one shared
+    condition evaluator;
+  - string `EQ`, `IN` and `CONTAINS` use identical case-insensitive semantics;
+  - unsupported static operators remain visible to readiness and fail closed
+    before Runtime construction.
+- **Reviewed Bridge source attestation:**
+  - the reviewed-source manifest now hashes every runtime-visible file below
+    the isolated Bridge tree, including tracked, untracked and ignored files;
+  - fixture canary, production canary and formal runners record the complete
+    tree hash before and after every arm;
+  - analyzers require the tree hashes to be present, unchanged and identical
+    across matched runs;
+  - bytecode generation is disabled for audited runs so interpreter caches
+    cannot mutate the reviewed tree during an arm.
+- **Seed execution order:**
+  - production canary and formal runners require three distinct held-out seeds
+    in strictly increasing order;
+  - the canary artifact and readiness evidence must preserve that exact ordered
+    seed tuple, not merely the same set;
+  - sequential carry analysis follows the declared execution order.
+- **Acceptance criteria:**
+  - readiness and Guard agree for mixed-case `EQ`, `IN` and string
+    `CONTAINS`;
+  - adding or modifying any untracked or ignored file changes the reviewed
+    source fingerprint and rejects the run;
+  - a canary with a permuted held-out seed tuple is rejected;
+  - direct analyzer invocation with noncanonical seed order fails closed.
+
 ## Repair order
 
 1. Freeze characterization tests and add the cross-layer `OperationKey`,

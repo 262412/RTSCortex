@@ -11,9 +11,8 @@ from typing import Literal, cast
 
 from rtscortex.cortex.models import ExecutableCandidate, SituationAssessment
 from rtscortex.cortex.strategic import StrategicIntent
+from rtscortex.playbook.conditions import condition_matches
 from rtscortex.playbook.models import (
-    PlaybookCondition,
-    PlaybookConditionOperator,
     PlaybookContext,
     PlaybookRoleId,
     PlaybookRule,
@@ -257,7 +256,7 @@ def _evaluate(
             rule.status in {PlaybookRuleStatus.LEGACY, PlaybookRuleStatus.ACTIVE}
             or rule.status is PlaybookRuleStatus.CANDIDATE
         )
-        and all(_matches(condition, values) for condition in rule.conditions)
+        and all(condition_matches(condition, values) for condition in rule.conditions)
     ]
     required = {
         _action_key(action)
@@ -383,27 +382,3 @@ def _action_key(action_name: str) -> str:
             if key.endswith(suffix):
                 return key[: -len(suffix)]
     return key
-
-
-def _matches(condition: PlaybookCondition, values: Mapping[str, object]) -> bool:
-    actual = values[condition.field]
-    expected = condition.value
-    if condition.operator is PlaybookConditionOperator.EQ:
-        return actual == expected
-    if condition.operator is PlaybookConditionOperator.IN:
-        return isinstance(expected, tuple) and actual in expected
-    if condition.operator is PlaybookConditionOperator.CONTAINS:
-        return isinstance(actual, (tuple, list, set)) and expected in actual
-    if condition.operator is PlaybookConditionOperator.GTE:
-        return (
-            isinstance(actual, (int, float))
-            and isinstance(expected, (int, float))
-            and actual >= expected
-        )
-    if condition.operator is PlaybookConditionOperator.LTE:
-        return (
-            isinstance(actual, (int, float))
-            and isinstance(expected, (int, float))
-            and actual <= expected
-        )
-    return False

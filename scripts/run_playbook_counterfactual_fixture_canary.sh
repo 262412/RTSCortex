@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export PYTHONDONTWRITEBYTECODE=1
 
 if [[ $# -ne 5 ]]; then
   echo "usage: $0 <run-set-dir> --expected-git-sha <sha> --seed <seed>" >&2
@@ -73,10 +74,14 @@ reviewed_llm_pysc2="${reviewed_source_root}/third_party/LLM-PySC2"
 reviewed_source_diff_sha256="$(
   git -C "${reviewed_llm_pysc2}" diff --binary | sha256sum | awk '{print $1}'
 )"
+reviewed_source_tree_sha256="$(
+  uv run python -m scripts.hash_reviewed_source_tree \
+    "${reviewed_llm_pysc2}" --field reviewed_tree_sha256
+)"
 
 printf '{"accepted":false,"skipped":true,"reason":"bounded fixture canary does not claim recovery acceptance"}\n' \
   > "${recovery_placeholder}"
-printf "experiment_kind\tmode\tseed\tarm\tsubject_arm\tarm_order\texit_code\trun_dir\tplaybook_before_sha256\tplaybook_after_sha256\tplaybook_before_snapshot\tplaybook_after_snapshot\tgit_head_before\tgit_head_after\tsuperproject_dirty_before\tsuperproject_dirty_after\tsubmodule_commit_before\tsubmodule_commit_after\tsubmodule_dirty_before\tsubmodule_dirty_after\tsubmodule_gitlink_before\tsubmodule_gitlink_after\tsubmodule_diff_sha256_before\tsubmodule_diff_sha256_after\treviewed_source_commit_before\treviewed_source_commit_after\treviewed_source_diff_sha256_before\treviewed_source_diff_sha256_after\n" \
+printf "experiment_kind\tmode\tseed\tarm\tsubject_arm\tarm_order\texit_code\trun_dir\tplaybook_before_sha256\tplaybook_after_sha256\tplaybook_before_snapshot\tplaybook_after_snapshot\tgit_head_before\tgit_head_after\tsuperproject_dirty_before\tsuperproject_dirty_after\tsubmodule_commit_before\tsubmodule_commit_after\tsubmodule_dirty_before\tsubmodule_dirty_after\tsubmodule_gitlink_before\tsubmodule_gitlink_after\tsubmodule_diff_sha256_before\tsubmodule_diff_sha256_after\treviewed_source_commit_before\treviewed_source_commit_after\treviewed_source_diff_sha256_before\treviewed_source_diff_sha256_after\treviewed_source_tree_sha256_before\treviewed_source_tree_sha256_after\n" \
   > "${status_file}"
 
 run_arm() {
@@ -103,8 +108,14 @@ run_arm() {
   reviewed_diff_before="$(
     git -C "${reviewed_llm_pysc2}" diff --binary | sha256sum | awk '{print $1}'
   )"
+  local reviewed_tree_before
+  reviewed_tree_before="$(
+    uv run python -m scripts.hash_reviewed_source_tree \
+      "${reviewed_llm_pysc2}" --field reviewed_tree_sha256
+  )"
   if [[ "${reviewed_commit_before}" != "${submodule_gitlink}" \
-    || "${reviewed_diff_before}" != "${reviewed_source_diff_sha256}" ]]; then
+    || "${reviewed_diff_before}" != "${reviewed_source_diff_sha256}" \
+    || "${reviewed_tree_before}" != "${reviewed_source_tree_sha256}" ]]; then
     echo "reviewed Worker source changed before fixture ${arm}/seed-${seed}" >&2
     exit 2
   fi
@@ -146,8 +157,14 @@ run_arm() {
   reviewed_diff_after="$(
     git -C "${reviewed_llm_pysc2}" diff --binary | sha256sum | awk '{print $1}'
   )"
+  local reviewed_tree_after
+  reviewed_tree_after="$(
+    uv run python -m scripts.hash_reviewed_source_tree \
+      "${reviewed_llm_pysc2}" --field reviewed_tree_sha256
+  )"
   if [[ "${reviewed_commit_after}" != "${submodule_gitlink}" \
-    || "${reviewed_diff_after}" != "${reviewed_source_diff_sha256}" ]]; then
+    || "${reviewed_diff_after}" != "${reviewed_source_diff_sha256}" \
+    || "${reviewed_tree_after}" != "${reviewed_source_tree_sha256}" ]]; then
     echo "reviewed Worker source changed during fixture ${arm}/seed-${seed}" >&2
     run_status=86
   fi
@@ -161,6 +178,7 @@ run_arm() {
     "${submodule_diff_sha256}" "${submodule_diff_after}"
     "${reviewed_commit_before}" "${reviewed_commit_after}"
     "${reviewed_diff_before}" "${reviewed_diff_after}"
+    "${reviewed_tree_before}" "${reviewed_tree_after}"
   )
   (
     IFS=$'\t'
