@@ -10,6 +10,7 @@ import httpx
 from rtscortex.api import create_app
 from rtscortex.console import ConsoleSession, LiveConsoleHub
 from rtscortex.contracts import (
+    ActionCommand,
     ActionSource,
     EpisodeOutcome,
     EpisodeResult,
@@ -22,6 +23,7 @@ from rtscortex.contracts import (
 from rtscortex.memory import EventStore
 from rtscortex.providers import FakeProvider
 from rtscortex.runtime import RuntimeEngine
+from rtscortex.runtime.engine import CommandStatus
 from tests.helpers import make_config, make_observation
 
 
@@ -48,27 +50,67 @@ def test_versioned_api_health_and_tick(tmp_path: Path) -> None:
                 )
                 assert response.status_code == 200
                 assert response.json()["commands"][0]["name"] == "Attack_Unit"
-                command_id = response.json()["commands"][0]["command_id"]
+                build_command = ActionCommand(
+                    command_id="build-api-command",
+                    actor="Builder/Builder-Probe-1",
+                    name="Build_Pylon_Screen",
+                    arguments=[[48, 56]],
+                    source=ActionSource.PLANNER,
+                    ttl_game_loops=112,
+                    created_game_loop=0,
+                )
+                runtime._set_command_lifecycle(
+                    build_command,
+                    CommandStatus.PENDING,
+                    run_id="run-1",
+                    episode_id="episode-1",
+                    step_id=0,
+                    game_loop=0,
+                )
+                runtime._set_command_lifecycle(
+                    build_command,
+                    CommandStatus.DISPATCHED,
+                    run_id="run-1",
+                    episode_id="episode-1",
+                    step_id=0,
+                    game_loop=0,
+                )
+                placement_event = PlacementLedgerEvent(
+                    run_id="run-1",
+                    episode_id="episode-1",
+                    step_id=0,
+                    command_id=build_command.command_id,
+                    action_name=build_command.name,
+                    transition_id="placement-transition:" + "a" * 64,
+                    builder_tag="0xb1",
+                    builder_lease_state="acquired",
+                    transition=PlacementLedgerTransition(
+                        reservation_id="placement:test",
+                        structure_type="Pylon",
+                        footprint_cells=[(21, 23), (21, 24), (22, 23), (22, 24)],
+                        previous_state="unreserved",
+                        next_state="reserved",
+                        game_loop=0,
+                    ),
+                )
                 placement = await client.post(
                     "/v1/placement/transition",
-                    json=PlacementLedgerEvent(
-                        run_id="run-1",
-                        episode_id="episode-1",
-                        step_id=0,
-                        command_id=command_id,
-                        action_name="Attack_Unit",
-                        transition_id="placement-transition:" + "a" * 64,
-                        transition=PlacementLedgerTransition(
-                            reservation_id="placement:test",
-                            structure_type="Pylon",
-                            footprint_cells=[(1, 1)],
-                            previous_state="unreserved",
-                            next_state="reserved",
-                            game_loop=0,
-                        ),
-                    ).model_dump(mode="json"),
+                    json=placement_event.model_dump(mode="json"),
                 )
                 assert placement.json() == {"status": "recorded"}
+                retry = await client.post(
+                    "/v1/placement/transition",
+                    json=placement_event.model_dump(mode="json"),
+                )
+                assert retry.json() == {"status": "already_recorded"}
+                conflict_payload = placement_event.model_dump(mode="json")
+                conflict_payload["transition"]["footprint_cells"] = [[99, 99]]
+                conflict = await client.post(
+                    "/v1/placement/transition",
+                    json=conflict_payload,
+                )
+                assert conflict.status_code == 409
+                assert "different payload" in conflict.json()["detail"]
                 with sqlite3.connect(tmp_path / "events.sqlite3") as connection:
                     durable_count = connection.execute(
                         """
@@ -86,7 +128,8 @@ def test_versioned_api_health_and_tick(tmp_path: Path) -> None:
                     "placement_ledger_transition",
                 )
                 assert len(placement_events) == 1
-                assert placement_events[0].payload["command_id"] == command_id
+                assert placement_events[0].payload["command_id"] == build_command.command_id
+                command_id = response.json()["commands"][0]["command_id"]
                 execution = await client.post(
                     "/v1/execution",
                     json=ExecutionReport(

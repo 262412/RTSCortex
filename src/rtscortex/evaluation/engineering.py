@@ -9,11 +9,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from rtscortex.evaluation.placement import (
+from rtscortex.memory import StoredEvent
+from rtscortex.placement import (
     CANONICAL_PLACEMENT_SPECS,
     canonical_footprint_cells,
 )
-from rtscortex.memory import StoredEvent
 
 ENGINEERING_GATES_FILENAME = "engineering-gates.json"
 REQUIRED_ENGINEERING_GATES = (

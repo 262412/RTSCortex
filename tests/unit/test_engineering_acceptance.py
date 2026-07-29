@@ -9,11 +9,11 @@ from rtscortex.evaluation.engineering import (
     EngineeringAccumulator,
     build_engineering_gate_report,
 )
-from rtscortex.evaluation.placement import (
+from rtscortex.memory import StoredEvent
+from rtscortex.placement import (
     CANONICAL_PLACEMENT_SPECS,
     canonical_footprint_cells,
 )
-from rtscortex.memory import StoredEvent
 
 
 def _event(

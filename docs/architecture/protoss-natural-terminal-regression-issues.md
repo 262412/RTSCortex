@@ -1441,6 +1441,50 @@ Two limitations are deliberately still visible:
   - a successful Placement transition HTTP acknowledgement is observable from
     a separate SQLite connection and from the flushed JSONL journal.
 
+#### 2026-07-29 persistent Placement idempotency follow-up
+
+- **Status:** the remaining pre-canary Placement retry and protocol-integrity
+  findings are corrected in code and deterministic restart/API tests. The
+  Active/Shadow causal canary remains the next empirical gate.
+- **Evidence, impact and root cause:**
+  1. Runtime deduplicated `transition_id` values in a process-local set. The
+     set was neither checkpointed nor recovered from the journal, and was not
+     episode-scoped. A committed request whose HTTP acknowledgement was lost
+     could be written twice after restart, while a long-lived Runtime retained
+     IDs from previous episodes;
+  2. the generic events table had no unique durable identity for Placement
+     transitions. The transition ID lived only inside `payload_json`, so the
+     SQLite commit boundary could not distinguish a safe retry from a
+     conflicting request;
+  3. Placement requests were not checked against the active Runtime
+     run/episode before deduplication, allowing stale Worker context to write
+     evidence into the wrong episode;
+  4. the endpoint accepted any command whose event action matched the command,
+     including a non-build `Attack_Unit` carrying a Pylon ledger transition.
+- **Implemented correction:**
+  - SQLite now owns a `placement_transition_idempotency` table keyed by
+    `(run_id, episode_id, transition_id)` and stores the canonical event ID and
+    payload hash. The writer inserts the key and event in one transaction;
+  - identical retries return `already_recorded` without a second event.
+    Same-key/different-payload retries return HTTP 409 and leave the durable
+    writer healthy. Existing Placement events are backfilled on store open;
+  - Runtime validates the active run/episode before any retry lookup. New
+    transitions then require a recoverable command lifecycle, a canonical
+    `Build_*` action and the structure type defined by the shared placement
+    registry;
+  - the process-local transition-ID set is removed. Idempotency survives
+    Runtime restart, lost acknowledgement and episode changes at the EventStore
+    transaction boundary.
+- **Acceptance criteria:**
+  - same-process, post-restart and lost-ACK retries produce exactly one durable
+    event and return the original event identity;
+  - conflicting payloads for one scoped key are rejected;
+  - the same transition ID is independent across distinct run/episode scopes;
+  - wrong-run, wrong-episode and stale-previous-episode requests are rejected
+    before idempotency lookup;
+  - non-build actions and action/structure mismatches cannot enter the
+    Placement ledger.
+
 ## Repair order
 
 1. Freeze characterization tests and add the cross-layer `OperationKey`,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import queue
 import sqlite3
@@ -12,7 +13,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel
 
@@ -68,6 +69,16 @@ class EventStorePerformance:
     journal_bytes: int
 
 
+class IdempotencyConflictError(RuntimeError):
+    """A durable idempotency key was retried with a different payload."""
+
+
+@dataclass(frozen=True)
+class PlacementTransitionAppendResult:
+    status: Literal["recorded", "already_recorded"]
+    event_id: int
+
+
 @dataclass(frozen=True)
 class _FlushBarrier:
     completed: threading.Event
@@ -84,6 +95,16 @@ class _SnapshotRecord:
 
 
 @dataclass
+class _IdempotentPlacementRecord:
+    record: StoredEvent
+    transition_id: str
+    payload_hash: str
+    completed: threading.Event
+    result: PlacementTransitionAppendResult | None = None
+    error: BaseException | None = None
+
+
+@dataclass
 class _SubscriberWorker:
     callback: Callable[[StoredEvent], None]
     queue: queue.Queue[StoredEvent | None]
@@ -95,6 +116,33 @@ def _json_payload(payload: BaseModel | dict[str, Any]) -> dict[str, Any]:
     if isinstance(payload, BaseModel):
         return payload.model_dump(mode="json")
     return payload
+
+
+def _placement_payload_hash(
+    *,
+    run_id: str,
+    episode_id: str,
+    step_id: int,
+    payload: dict[str, Any],
+) -> str:
+    encoded = json.dumps(
+        {
+            "run_id": run_id,
+            "episode_id": episode_id,
+            "step_id": step_id,
+            "event_type": "placement_ledger_transition",
+            "payload": payload,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _require_matching_transition_id(payload: dict[str, Any], transition_id: str) -> None:
+    if not transition_id or payload.get("transition_id") != transition_id:
+        raise ValueError("placement payload transition_id does not match idempotency key")
 
 
 class EventStore:
@@ -135,6 +183,7 @@ class EventStore:
         self._connection = sqlite3.connect(database_path, check_same_thread=False)
         self._connection.row_factory = sqlite3.Row
         self._initialize()
+        self._backfill_placement_transition_idempotency()
         self._reader_connection = sqlite3.connect(database_path, check_same_thread=False)
         self._reader_connection.row_factory = sqlite3.Row
         self._reader_connection.execute("PRAGMA busy_timeout=5000")
@@ -144,7 +193,7 @@ class EventStore:
         )
         self._reconcile_journal()
         self._write_queue: queue.Queue[
-            StoredEvent | _SnapshotRecord | _FlushBarrier | _StopWriter
+            StoredEvent | _SnapshotRecord | _IdempotentPlacementRecord | _FlushBarrier | _StopWriter
         ] = queue.Queue(maxsize=writer_queue_size)
         self._writer_error: BaseException | None = None
         self._closed = False
@@ -211,10 +260,71 @@ class EventStore:
                 payload_json TEXT NOT NULL,
                 PRIMARY KEY (run_id, episode_id, snapshot_type)
             );
+            CREATE TABLE IF NOT EXISTS placement_transition_idempotency (
+                run_id TEXT NOT NULL,
+                episode_id TEXT NOT NULL,
+                transition_id TEXT NOT NULL,
+                event_id INTEGER NOT NULL,
+                payload_hash TEXT NOT NULL,
+                PRIMARY KEY (run_id, episode_id, transition_id)
+            );
             """
         )
         self._connection.execute("PRAGMA journal_mode=WAL")
         self._connection.execute("PRAGMA busy_timeout=5000")
+        self._connection.commit()
+
+    def _backfill_placement_transition_idempotency(self) -> None:
+        """Migrate durable transitions written before the idempotency table existed."""
+
+        rows = self._connection.execute(
+            """
+            SELECT event_id, run_id, episode_id, step_id, payload_json
+            FROM events
+            WHERE event_type = 'placement_ledger_transition'
+            ORDER BY event_id
+            """
+        ).fetchall()
+        for row in rows:
+            payload = json.loads(str(row["payload_json"]))
+            transition_id = payload.get("transition_id")
+            if not isinstance(transition_id, str) or not transition_id:
+                continue
+            payload_hash = _placement_payload_hash(
+                run_id=str(row["run_id"]),
+                episode_id=str(row["episode_id"]),
+                step_id=int(row["step_id"]),
+                payload=payload,
+            )
+            existing = self._connection.execute(
+                """
+                SELECT event_id, payload_hash
+                FROM placement_transition_idempotency
+                WHERE run_id = ? AND episode_id = ? AND transition_id = ?
+                """,
+                (str(row["run_id"]), str(row["episode_id"]), transition_id),
+            ).fetchone()
+            if existing is not None:
+                if str(existing["payload_hash"]) != payload_hash:
+                    raise RuntimeError(
+                        "conflicting durable placement transitions already exist for "
+                        f"{row['run_id']!r}/{row['episode_id']!r}/{transition_id!r}"
+                    )
+                continue
+            self._connection.execute(
+                """
+                INSERT INTO placement_transition_idempotency (
+                    run_id, episode_id, transition_id, event_id, payload_hash
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    str(row["run_id"]),
+                    str(row["episode_id"]),
+                    transition_id,
+                    int(row["event_id"]),
+                    payload_hash,
+                ),
+            )
         self._connection.commit()
 
     def append_event(
@@ -274,6 +384,100 @@ class EventStore:
         )
         self.flush()
         return record
+
+    def placement_transition_retry_status(
+        self,
+        *,
+        run_id: str,
+        episode_id: str,
+        step_id: int,
+        transition_id: str,
+        payload: BaseModel | dict[str, Any],
+    ) -> Literal["new", "already_recorded"]:
+        """Check a durable retry without relying on Runtime process memory."""
+
+        normalized = _json_payload(payload)
+        _require_matching_transition_id(normalized, transition_id)
+        payload_hash = _placement_payload_hash(
+            run_id=run_id,
+            episode_id=episode_id,
+            step_id=step_id,
+            payload=normalized,
+        )
+        with self._reader_lock:
+            row = self._reader_connection.execute(
+                """
+                SELECT payload_hash
+                FROM placement_transition_idempotency
+                WHERE run_id = ? AND episode_id = ? AND transition_id = ?
+                """,
+                (run_id, episode_id, transition_id),
+            ).fetchone()
+        if row is None:
+            return "new"
+        if str(row["payload_hash"]) != payload_hash:
+            raise IdempotencyConflictError(
+                "placement transition idempotency key was retried with a different payload"
+            )
+        return "already_recorded"
+
+    def append_placement_transition(
+        self,
+        *,
+        run_id: str,
+        episode_id: str,
+        step_id: int,
+        transition_id: str,
+        payload: BaseModel | dict[str, Any],
+    ) -> PlacementTransitionAppendResult:
+        """Atomically commit one placement event and its persistent retry identity."""
+
+        append_started = time.perf_counter_ns()
+        normalized = _json_payload(payload)
+        _require_matching_transition_id(normalized, transition_id)
+        payload_hash = _placement_payload_hash(
+            run_id=run_id,
+            episode_id=episode_id,
+            step_id=step_id,
+            payload=normalized,
+        )
+        self._raise_writer_error()
+        if self._closed:
+            raise RuntimeError("event store is closed")
+        with self._id_lock:
+            event_id = self._next_event_id
+            self._next_event_id += 1
+            record = StoredEvent(
+                event_id=event_id,
+                run_id=run_id,
+                episode_id=episode_id,
+                step_id=step_id,
+                event_type="placement_ledger_transition",
+                created_at=datetime.now(UTC).isoformat(),
+                payload=normalized,
+            )
+            pending = _IdempotentPlacementRecord(
+                record=record,
+                transition_id=transition_id,
+                payload_hash=payload_hash,
+                completed=threading.Event(),
+            )
+            self._event_enqueued_ns[event_id] = time.perf_counter_ns()
+            self._enqueue(pending)
+        self._max_queue_depth = max(self._max_queue_depth, self._write_queue.qsize())
+        if not pending.completed.wait(timeout=30):
+            raise TimeoutError(
+                "event writer did not acknowledge the placement idempotency transaction"
+            )
+        if pending.error is not None:
+            raise pending.error
+        if pending.result is None:
+            raise RuntimeError("placement idempotency transaction returned no result")
+        if pending.result.status == "recorded":
+            self._enqueued_events += 1
+            self._publish(record)
+        self._append_latency_ns += time.perf_counter_ns() - append_started
+        return pending.result
 
     def performance_snapshot(self) -> EventStorePerformance:
         mean_ms = (
@@ -359,7 +563,9 @@ class EventStore:
 
     def _enqueue(
         self,
-        item: StoredEvent | _SnapshotRecord | _FlushBarrier | _StopWriter,
+        item: (
+            StoredEvent | _SnapshotRecord | _IdempotentPlacementRecord | _FlushBarrier | _StopWriter
+        ),
     ) -> None:
         """Bound memory while applying explicit backpressure to durable events."""
 
@@ -397,6 +603,14 @@ class EventStore:
                     continue
                 self._write_batch(connection, journal, batch)
                 batch.clear()
+                if isinstance(item, _IdempotentPlacementRecord):
+                    try:
+                        self._write_idempotent_placement(connection, journal, item)
+                    except BaseException as error:
+                        item.error = error
+                        item.completed.set()
+                        raise
+                    continue
                 if isinstance(item, _SnapshotRecord):
                     self._write_snapshot(connection, item.snapshot)
                     continue
@@ -413,6 +627,9 @@ class EventStore:
                 except queue.Empty:
                     break
                 if isinstance(pending, _FlushBarrier):
+                    pending.completed.set()
+                elif isinstance(pending, _IdempotentPlacementRecord):
+                    pending.error = error
                     pending.completed.set()
         finally:
             journal.close()
@@ -459,6 +676,90 @@ class EventStore:
             journal.write(json.dumps(record.__dict__, ensure_ascii=False, sort_keys=True) + "\n")
         journal.flush()
         self._written_events += len(records)
+
+    def _write_idempotent_placement(
+        self,
+        connection: sqlite3.Connection,
+        journal: Any,
+        pending: _IdempotentPlacementRecord,
+    ) -> None:
+        record = pending.record
+        existing = connection.execute(
+            """
+            SELECT event_id, payload_hash
+            FROM placement_transition_idempotency
+            WHERE run_id = ? AND episode_id = ? AND transition_id = ?
+            """,
+            (record.run_id, record.episode_id, pending.transition_id),
+        ).fetchone()
+        if existing is not None:
+            self._event_enqueued_ns.pop(record.event_id, None)
+            if str(existing[1]) != pending.payload_hash:
+                pending.error = IdempotencyConflictError(
+                    "placement transition idempotency key was retried with a different payload"
+                )
+            else:
+                pending.result = PlacementTransitionAppendResult(
+                    status="already_recorded",
+                    event_id=int(existing[0]),
+                )
+            pending.completed.set()
+            return
+        encoded_payload = json.dumps(
+            record.payload,
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                INSERT INTO placement_transition_idempotency (
+                    run_id, episode_id, transition_id, event_id, payload_hash
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    record.run_id,
+                    record.episode_id,
+                    pending.transition_id,
+                    record.event_id,
+                    pending.payload_hash,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO events (
+                    event_id, run_id, episode_id, step_id,
+                    event_type, created_at, payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.event_id,
+                    record.run_id,
+                    record.episode_id,
+                    record.step_id,
+                    record.event_type,
+                    record.created_at,
+                    encoded_payload,
+                ),
+            )
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        journal.write(json.dumps(record.__dict__, ensure_ascii=False, sort_keys=True) + "\n")
+        journal.flush()
+        now = time.perf_counter_ns()
+        enqueued = self._event_enqueued_ns.pop(record.event_id, now)
+        lag = now - enqueued
+        self._writer_lag_ns_max = max(self._writer_lag_ns_max, lag)
+        self._writer_lag_samples_ns.append(lag)
+        self._written_events += 1
+        pending.result = PlacementTransitionAppendResult(
+            status="recorded",
+            event_id=record.event_id,
+        )
+        pending.completed.set()
 
     @staticmethod
     def _write_snapshot(

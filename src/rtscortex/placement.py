@@ -1,4 +1,4 @@
-"""Canonical build-placement geometry used by acceptance auditing."""
+"""Canonical build-placement geometry shared by Runtime and acceptance."""
 
 from __future__ import annotations
 

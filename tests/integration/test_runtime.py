@@ -20,6 +20,8 @@ from rtscortex.contracts import (
     ExecutionStage,
     ExecutionStatus,
     IdleReason,
+    PlacementLedgerEvent,
+    PlacementLedgerTransition,
 )
 from rtscortex.contracts.interfaces import ResponseT
 from rtscortex.evaluation import run_mock_episode
@@ -1192,6 +1194,209 @@ def test_execution_report_is_idempotent_and_conflicting_terminal_fails(
             await runtime.close()
 
     asyncio.run(execute())
+
+
+def test_placement_transition_retry_after_runtime_restart_is_idempotent(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "events.sqlite3"
+    journal = tmp_path / "events.jsonl"
+    observation = make_observation()
+    command = _build_command()
+    event = _placement_event()
+
+    async def execute() -> None:
+        first = RuntimeEngine(
+            config=make_config(tmp_path, variant="planner_only"),
+            store=EventStore(database, journal),
+            provider=FakeProvider(),
+        )
+        await first._activate_episode(observation)
+        first._set_command_lifecycle(
+            command,
+            CommandStatus.PENDING,
+            run_id=observation.run_id,
+            episode_id=observation.episode_id,
+            step_id=observation.step_id,
+            game_loop=observation.game_loop,
+        )
+        first._set_command_lifecycle(
+            command,
+            CommandStatus.DISPATCHED,
+            run_id=observation.run_id,
+            episode_id=observation.episode_id,
+            step_id=observation.step_id,
+            game_loop=observation.game_loop,
+        )
+        assert first.record_placement_transition(event) == "recorded"
+        await first.close()
+
+        recovered_store = EventStore(database, journal)
+        recovered = RuntimeEngine(
+            config=make_config(tmp_path, variant="planner_only"),
+            store=recovered_store,
+            provider=FakeProvider(),
+        )
+        try:
+            await recovered._activate_episode(
+                observation.model_copy(update={"step_id": 1, "game_loop": 1})
+            )
+            assert recovered.record_placement_transition(event) == "already_recorded"
+            assert (
+                len(
+                    recovered_store.events_of_type(
+                        observation.run_id,
+                        observation.episode_id,
+                        "placement_ledger_transition",
+                    )
+                )
+                == 1
+            )
+        finally:
+            await recovered.close()
+
+    asyncio.run(execute())
+
+
+def test_placement_transition_rejects_wrong_run(tmp_path: Path) -> None:
+    runtime, _ = _runtime_with_build_command(tmp_path)
+    try:
+        with pytest.raises(RuntimeError, match="active runtime episode"):
+            runtime.record_placement_transition(_placement_event(run_id="wrong-run"))
+    finally:
+        asyncio.run(runtime.close())
+
+
+def test_placement_transition_rejects_wrong_episode(tmp_path: Path) -> None:
+    runtime, observation = _runtime_with_build_command(tmp_path)
+    del observation
+    try:
+        with pytest.raises(RuntimeError, match="active runtime episode"):
+            runtime.record_placement_transition(_placement_event(episode_id="wrong-episode"))
+    finally:
+        asyncio.run(runtime.close())
+
+
+def test_stale_previous_episode_transition_is_rejected(tmp_path: Path) -> None:
+    store = EventStore(tmp_path / "events.sqlite3", tmp_path / "events.jsonl")
+    runtime = RuntimeEngine(
+        config=make_config(tmp_path, variant="planner_only"),
+        store=store,
+        provider=FakeProvider(),
+    )
+
+    async def execute() -> None:
+        try:
+            await runtime._activate_episode(make_observation(episode_id="episode-1"))
+            await runtime._activate_episode(make_observation(episode_id="episode-2"))
+            with pytest.raises(RuntimeError, match="active runtime episode"):
+                runtime.record_placement_transition(_placement_event(episode_id="episode-1"))
+        finally:
+            await runtime.close()
+
+    asyncio.run(execute())
+
+
+def test_nonbuild_command_cannot_submit_placement_transition(tmp_path: Path) -> None:
+    runtime = RuntimeEngine(
+        config=make_config(tmp_path, variant="planner_only"),
+        store=EventStore(tmp_path / "events.sqlite3", tmp_path / "events.jsonl"),
+        provider=FakeProvider(),
+    )
+
+    async def execute() -> None:
+        try:
+            batch = await runtime.tick(make_observation())
+            attack = batch.commands[0]
+            event = _placement_event(
+                command_id=attack.command_id,
+                action_name="Attack_Unit",
+            )
+            with pytest.raises(RuntimeError, match="not a canonical build"):
+                runtime.record_placement_transition(event)
+        finally:
+            await runtime.close()
+
+    asyncio.run(execute())
+
+
+def test_placement_structure_must_match_canonical_build_action(tmp_path: Path) -> None:
+    runtime, _ = _runtime_with_build_command(tmp_path)
+    try:
+        with pytest.raises(RuntimeError, match="structure does not match"):
+            runtime.record_placement_transition(_placement_event(structure_type="Gateway"))
+    finally:
+        asyncio.run(runtime.close())
+
+
+def _build_command(command_id: str = "build-command") -> ActionCommand:
+    return ActionCommand(
+        command_id=command_id,
+        actor="Builder/Builder-Probe-1",
+        name="Build_Pylon_Screen",
+        arguments=[[48, 56]],
+        source=ActionSource.PLANNER,
+        ttl_game_loops=112,
+        created_game_loop=0,
+    )
+
+
+def _placement_event(
+    *,
+    run_id: str = "run-1",
+    episode_id: str = "episode-1",
+    command_id: str = "build-command",
+    action_name: str = "Build_Pylon_Screen",
+    structure_type: str = "Pylon",
+) -> PlacementLedgerEvent:
+    return PlacementLedgerEvent(
+        run_id=run_id,
+        episode_id=episode_id,
+        step_id=0,
+        command_id=command_id,
+        action_name=action_name,
+        transition_id="placement-transition:" + "a" * 64,
+        builder_tag="0xb1",
+        builder_lease_state="acquired",
+        transition=PlacementLedgerTransition(
+            reservation_id="placement:test",
+            structure_type=structure_type,
+            footprint_cells=[(21, 23), (21, 24), (22, 23), (22, 24)],
+            previous_state="unreserved",
+            next_state="reserved",
+            game_loop=0,
+        ),
+    )
+
+
+def _runtime_with_build_command(
+    tmp_path: Path,
+) -> tuple[RuntimeEngine, Any]:
+    runtime = RuntimeEngine(
+        config=make_config(tmp_path, variant="planner_only"),
+        store=EventStore(tmp_path / "events.sqlite3", tmp_path / "events.jsonl"),
+        provider=FakeProvider(),
+    )
+    observation = make_observation()
+    asyncio.run(runtime._activate_episode(observation))
+    command = _build_command()
+    runtime._set_command_lifecycle(
+        command,
+        CommandStatus.PENDING,
+        run_id=observation.run_id,
+        episode_id=observation.episode_id,
+        step_id=observation.step_id,
+        game_loop=observation.game_loop,
+    )
+    runtime._set_command_lifecycle(
+        command,
+        CommandStatus.DISPATCHED,
+        run_id=observation.run_id,
+        episode_id=observation.episode_id,
+        step_id=observation.step_id,
+        game_loop=observation.game_loop,
+    )
+    return runtime, observation
 
 
 def test_execution_report_must_match_dispatched_command_identity(tmp_path: Path) -> None:

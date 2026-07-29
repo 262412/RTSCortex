@@ -5,8 +5,15 @@ import sqlite3
 import threading
 from pathlib import Path
 
+import pytest
+
 from rtscortex.contracts import EpisodeOutcome, EpisodeResult, EpisodeSummary
-from rtscortex.memory import DisabledMemoryRetriever, EventStore, read_event_log
+from rtscortex.memory import (
+    DisabledMemoryRetriever,
+    EventStore,
+    IdempotencyConflictError,
+    read_event_log,
+)
 
 
 def test_event_store_persists_events_lessons_and_episode(tmp_path: Path) -> None:
@@ -80,6 +87,172 @@ def test_append_durable_event_waits_for_sqlite_and_journal_barrier(tmp_path: Pat
     assert row == (record.event_id, "placement_ledger_transition")
     assert f'"event_id": {record.event_id}' in journal.read_text(encoding="utf-8")
     store.close()
+
+
+def test_placement_transition_retry_is_idempotent(tmp_path: Path) -> None:
+    store = EventStore(tmp_path / "events.sqlite3", tmp_path / "events.jsonl")
+    payload = _placement_payload("placement-transition:retry")
+
+    first = store.append_placement_transition(
+        run_id="run",
+        episode_id="episode",
+        step_id=1,
+        transition_id="placement-transition:retry",
+        payload=payload,
+    )
+    second = store.append_placement_transition(
+        run_id="run",
+        episode_id="episode",
+        step_id=1,
+        transition_id="placement-transition:retry",
+        payload=payload,
+    )
+
+    assert first.status == "recorded"
+    assert second.status == "already_recorded"
+    assert second.event_id == first.event_id
+    assert len(store.events_of_type("run", "episode", "placement_ledger_transition")) == 1
+    store.close()
+
+
+def test_lost_ack_retry_creates_one_durable_event(tmp_path: Path) -> None:
+    database = tmp_path / "events.sqlite3"
+    journal = tmp_path / "events.jsonl"
+    payload = _placement_payload("placement-transition:lost-ack")
+    first = EventStore(database, journal)
+    first.append_placement_transition(
+        run_id="run",
+        episode_id="episode",
+        step_id=1,
+        transition_id="placement-transition:lost-ack",
+        payload=payload,
+    )
+    first.close()
+
+    recovered = EventStore(database, journal)
+    retry = recovered.append_placement_transition(
+        run_id="run",
+        episode_id="episode",
+        step_id=1,
+        transition_id="placement-transition:lost-ack",
+        payload=payload,
+    )
+
+    assert retry.status == "already_recorded"
+    assert len(recovered.events_of_type("run", "episode", "placement_ledger_transition")) == 1
+    recovered.close()
+    assert (
+        sum(event.event_type == "placement_ledger_transition" for event in read_event_log(journal))
+        == 1
+    )
+
+
+def test_existing_placement_events_backfill_idempotency_on_restart(tmp_path: Path) -> None:
+    database = tmp_path / "events.sqlite3"
+    journal = tmp_path / "events.jsonl"
+    transition_id = "placement-transition:legacy"
+    payload = _placement_payload(transition_id)
+    legacy = EventStore(database, journal)
+    legacy.append_durable_event(
+        run_id="run",
+        episode_id="episode",
+        step_id=1,
+        event_type="placement_ledger_transition",
+        payload=payload,
+    )
+    legacy.close()
+
+    recovered = EventStore(database, journal)
+    retry = recovered.append_placement_transition(
+        run_id="run",
+        episode_id="episode",
+        step_id=1,
+        transition_id=transition_id,
+        payload=payload,
+    )
+
+    assert retry.status == "already_recorded"
+    assert len(recovered.events_of_type("run", "episode", "placement_ledger_transition")) == 1
+    recovered.close()
+
+
+def test_conflicting_payload_for_same_transition_id_is_rejected(tmp_path: Path) -> None:
+    store = EventStore(tmp_path / "events.sqlite3", tmp_path / "events.jsonl")
+    transition_id = "placement-transition:conflict"
+    store.append_placement_transition(
+        run_id="run",
+        episode_id="episode",
+        step_id=1,
+        transition_id=transition_id,
+        payload=_placement_payload(transition_id),
+    )
+
+    with pytest.raises(IdempotencyConflictError, match="different payload"):
+        store.append_placement_transition(
+            run_id="run",
+            episode_id="episode",
+            step_id=1,
+            transition_id=transition_id,
+            payload={
+                **_placement_payload(transition_id),
+                "footprint_cells": [[99, 99]],
+            },
+        )
+
+    assert len(store.events_of_type("run", "episode", "placement_ledger_transition")) == 1
+    next_transition_id = "placement-transition:after-conflict"
+    next_result = store.append_placement_transition(
+        run_id="run",
+        episode_id="episode",
+        step_id=2,
+        transition_id=next_transition_id,
+        payload=_placement_payload(next_transition_id),
+    )
+    assert next_result.status == "recorded"
+    assert len(store.events_of_type("run", "episode", "placement_ledger_transition")) == 2
+    store.close()
+
+
+def test_transition_idempotency_is_scoped_by_run_and_episode(tmp_path: Path) -> None:
+    store = EventStore(tmp_path / "events.sqlite3", tmp_path / "events.jsonl")
+    transition_id = "placement-transition:scoped"
+    for run_id, episode_id in (
+        ("run-a", "episode-1"),
+        ("run-a", "episode-2"),
+        ("run-b", "episode-1"),
+    ):
+        result = store.append_placement_transition(
+            run_id=run_id,
+            episode_id=episode_id,
+            step_id=1,
+            transition_id=transition_id,
+            payload=_placement_payload(transition_id),
+        )
+        assert result.status == "recorded"
+
+    assert len(store.events_of_type("run-a", "episode-1", "placement_ledger_transition")) == 1
+    assert len(store.events_of_type("run-a", "episode-2", "placement_ledger_transition")) == 1
+    assert len(store.events_of_type("run-b", "episode-1", "placement_ledger_transition")) == 1
+    store.close()
+
+
+def _placement_payload(transition_id: str) -> dict[str, object]:
+    return {
+        "command_id": "build-one",
+        "action_name": "Build_Pylon_Screen",
+        "transition_id": transition_id,
+        "builder_tag": "0xb1",
+        "builder_lease_state": "acquired",
+        "reservation_id": "placement:one",
+        "structure_type": "Pylon",
+        "footprint_cells": [[21, 23], [21, 24], [22, 23], [22, 24]],
+        "previous_state": "unreserved",
+        "next_state": "reserved",
+        "failure_class": None,
+        "actor_failure": False,
+        "game_loop": 1,
+        "release_reason": None,
+    }
 
 
 def test_episode_summaries_persist_with_run_isolation(tmp_path: Path) -> None:

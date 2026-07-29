@@ -9,7 +9,7 @@ import json
 import time
 from dataclasses import asdict, dataclass
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 
 from rtscortex.agents import (
     ActionModule,
@@ -42,6 +42,7 @@ from rtscortex.contracts.interfaces import (
     ModuleResult,
 )
 from rtscortex.memory import EventStore
+from rtscortex.placement import CANONICAL_PLACEMENT_SPECS
 from rtscortex.progress import (
     PROTOSS_SIMPLE64_ACTION_SPECS,
     GoalProgressReport,
@@ -191,7 +192,6 @@ class RuntimeEngine:
         self._command_states: dict[str, CommandLifecycle] = {}
         self._reported_command_reasons: set[tuple[str, str]] = set()
         self._terminal_execution_fingerprints: dict[str, str] = {}
-        self._placement_transition_ids: set[str] = set()
         self._episode_result_fingerprint: str | None = None
         self._last_decision: ActionBatch | None = None
         self._decision_by_command_id: dict[str, ActionBatch] = {}
@@ -1468,36 +1468,69 @@ class RuntimeEngine:
             allowed_from={CommandStatus.DISPATCHED},
         )
 
-    def record_placement_transition(self, event: PlacementLedgerEvent) -> None:
+    def record_placement_transition(
+        self,
+        event: PlacementLedgerEvent,
+    ) -> Literal["recorded", "already_recorded"]:
         """Persist one placement state change independently of command terminal state."""
 
-        if event.transition_id in self._placement_transition_ids:
-            return
+        if self._episode_key != (event.run_id, event.episode_id):
+            raise RuntimeError(
+                "placement transition does not match the active runtime episode: "
+                f"{event.run_id!r}/{event.episode_id!r}"
+            )
+        spec = CANONICAL_PLACEMENT_SPECS.get(event.action_name)
+        if spec is None or not event.action_name.startswith("Build_"):
+            raise RuntimeError(
+                f"placement transition action is not a canonical build: {event.action_name!r}"
+            )
+        if event.transition.structure_type != spec.structure_type:
+            raise RuntimeError(
+                "placement transition structure does not match canonical build action: "
+                f"{event.transition.structure_type!r} != {spec.structure_type!r}"
+            )
+        payload = {
+            "command_id": event.command_id,
+            "action_name": event.action_name,
+            "transition_id": event.transition_id,
+            "builder_tag": event.builder_tag,
+            "builder_lease_state": event.builder_lease_state,
+            **event.transition.model_dump(mode="json"),
+        }
+        retry_status = self.store.placement_transition_retry_status(
+            run_id=event.run_id,
+            episode_id=event.episode_id,
+            step_id=event.step_id,
+            transition_id=event.transition_id,
+            payload=payload,
+        )
+        if retry_status == "already_recorded":
+            return retry_status
         lifecycle = self._command_states.get(event.command_id)
         if lifecycle is None:
             raise RuntimeError(
                 f"placement transition references unknown command {event.command_id!r}"
+            )
+        if (
+            not lifecycle.command.name.startswith("Build_")
+            or lifecycle.command.name not in CANONICAL_PLACEMENT_SPECS
+        ):
+            raise RuntimeError(
+                f"placement transition command is not a canonical build: {lifecycle.command.name!r}"
             )
         if lifecycle.command.name != event.action_name:
             raise RuntimeError(
                 f"placement transition action {event.action_name!r} does not match "
                 f"command {lifecycle.command.name!r}"
             )
-        self.store.append_durable_event(
+        result = self.store.append_placement_transition(
             run_id=event.run_id,
             episode_id=event.episode_id,
             step_id=event.step_id,
-            event_type="placement_ledger_transition",
-            payload={
-                "command_id": event.command_id,
-                "action_name": event.action_name,
-                "transition_id": event.transition_id,
-                "builder_tag": event.builder_tag,
-                "builder_lease_state": event.builder_lease_state,
-                **event.transition.model_dump(mode="json"),
-            },
+            transition_id=event.transition_id,
+            payload=payload,
         )
-        self._placement_transition_ids.add(event.transition_id)
+        return result.status
 
     def _record_execution_from(
         self,

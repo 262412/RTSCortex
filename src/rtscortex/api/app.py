@@ -18,6 +18,7 @@ from rtscortex.contracts import (
     ObservationEnvelope,
     PlacementLedgerEvent,
 )
+from rtscortex.memory import IdempotencyConflictError
 from rtscortex.runtime import RuntimeEngine
 
 
@@ -63,8 +64,13 @@ def create_app(
     @app.post("/v1/placement/transition")
     async def placement_transition(event: PlacementLedgerEvent) -> dict[str, str]:
         _require_current_protocol(event.protocol_version)
-        engine.record_placement_transition(event)
-        return {"status": "recorded"}
+        try:
+            status = engine.record_placement_transition(event)
+        except IdempotencyConflictError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        except RuntimeError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        return {"status": status}
 
     @app.post("/v1/episode/end")
     async def end_episode(result: EpisodeResult) -> dict[str, str]:
