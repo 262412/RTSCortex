@@ -211,6 +211,7 @@ class CortexPlaybookSettings(SettingsModel):
     max_hard_rules: int = Field(default=8, ge=1, le=8)
     max_soft_rules: int = Field(default=8, ge=1, le=8)
     allow_canary_fixture: bool = False
+    hard_readiness_required: bool = False
 
 
 class CortexSettings(SettingsModel):

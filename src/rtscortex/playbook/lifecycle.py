@@ -8,9 +8,11 @@ from rtscortex.playbook.models import (
     PlaybookRule,
     PlaybookRuleCategory,
     PlaybookRuleEffect,
+    PlaybookRuleKind,
     PlaybookRuleStatus,
     PlaybookRuleStrength,
 )
+from rtscortex.playbook.semantics import evaluation_kind
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,22 +124,17 @@ class PlaybookRuleLifecycle:
         *,
         current_code_revision: str,
     ) -> PlaybookRule:
-        execution_rule = rule.category in {
-            PlaybookRuleCategory.ENGINE_INVARIANT,
-            PlaybookRuleCategory.EXECUTION_GUARD,
-            PlaybookRuleCategory.TACTICAL_RESPONSE,
-        }
+        execution_rule = evaluation_kind(rule.category) is PlaybookRuleKind.EXECUTION_GUARD
         if execution_rule and rule.code_revision != current_code_revision:
             return rule.model_copy(update={"status": PlaybookRuleStatus.SUSPENDED})
         return rule
 
 
 def _is_strategic_blocking_rule(rule: PlaybookRule) -> bool:
-    return rule.category in {
-        PlaybookRuleCategory.RACE_MACRO,
-        PlaybookRuleCategory.MATCHUP_STRATEGY,
-        PlaybookRuleCategory.MAP_SPECIFIC,
-    } and rule.effect in {PlaybookRuleEffect.REQUIRE, PlaybookRuleEffect.FORBID}
+    return evaluation_kind(rule.category) is PlaybookRuleKind.STRATEGY and rule.effect in {
+        PlaybookRuleEffect.REQUIRE,
+        PlaybookRuleEffect.FORBID,
+    }
 
 
 def _is_specific_rule(rule: PlaybookRule) -> bool:

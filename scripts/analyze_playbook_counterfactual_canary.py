@@ -9,6 +9,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Literal
 
+from rtscortex.playbook import PlaybookRuleCategory, evaluation_kind
 from scripts.analyze_playbook_experiment import RunMetrics, _run_metrics
 
 
@@ -46,14 +47,37 @@ def build_canary_report(
     ]
     first_unmatched_loop = min((record[1] for record in unmatched), default=None)
     first_state_hash_divergence = min(divergent_epochs, default=first_unmatched_loop)
+    approved_kinds, readiness_kind_contract_valid = _approved_evaluation_kinds(readiness_evidence)
+    observed_kinds = (("behavior", *record) for record in behavior.hard_rule_kind_records)
+    observed_kind_records = [
+        *observed_kinds,
+        *(("shadow", *record) for record in shadow.hard_rule_kind_records),
+    ]
+    rule_kind_mismatches = [
+        {
+            "arm": arm,
+            "rule_id": rule_id,
+            "observed": observed_kind,
+            "expected": approved_kinds.get(rule_id),
+        }
+        for arm, rule_id, observed_kind in observed_kind_records
+        if approved_kinds.get(rule_id) != observed_kind
+    ]
+    rule_kind_contract_valid = (
+        readiness_kind_contract_valid and bool(observed_kind_records) and not rule_kind_mismatches
+    )
     readiness_valid = (
-        readiness_evidence.get("canary_runnable") is True
+        readiness_evidence.get("schema_version") == "1.1"
+        and readiness_evidence.get("canary_runnable") is True
         and readiness_evidence.get("baseline_sha256") == baseline_sha256
         and readiness_evidence.get("expected_git_sha") == expected_git_sha
         and int(readiness_evidence.get("context_applicable_blocking_hard_count", 0)) >= 1
-        and bool(readiness_evidence.get("approved_blocking_rule_ids"))
+        and bool(readiness_evidence.get("approved_hard_rule_ids"))
+        and readiness_evidence.get("approved_hard_rule_ids")
+        == readiness_evidence.get("runtime_selected_hard_rule_ids")
         and isinstance(readiness_evidence.get("approved_rule_set_sha256"), str)
-        and not bool(readiness_evidence.get("rejected_context_applicable_blocking_hard_rule_ids"))
+        and not bool(readiness_evidence.get("rejected_runtime_hard_rule_ids"))
+        and readiness_evidence.get("hard_rule_limit_exceeded") is False
         and (
             bool(readiness_evidence.get("canary_fixture_rule_ids"))
             if canary_kind == "fixture"
@@ -89,6 +113,7 @@ def build_canary_report(
         ): matched_count > 0,
         "all_active_hard_blocks_matched": not unmatched,
         "matched_prestate_identity": not divergent_epochs,
+        "rule_evaluation_kind_consistent": rule_kind_contract_valid,
         "analysis_memory_budget_respected": (
             behavior.analysis_evidence_overflow_count == 0
             and shadow.analysis_evidence_overflow_count == 0
@@ -117,6 +142,7 @@ def build_canary_report(
         ],
         "first_unmatched_game_loop": first_unmatched_loop,
         "first_state_hash_divergence_game_loop": first_state_hash_divergence,
+        "rule_kind_mismatches": rule_kind_mismatches,
         "analysis_memory": {
             "behavior_peak_rss_kib": behavior.analysis_peak_rss_kib,
             "shadow_peak_rss_kib": shadow.analysis_peak_rss_kib,
@@ -132,6 +158,36 @@ def build_canary_report(
         "gates": gates,
         "accepted": all(gates.values()),
     }
+
+
+def _approved_evaluation_kinds(
+    readiness_evidence: dict[str, Any],
+) -> tuple[dict[str, str], bool]:
+    approved_ids = {
+        str(rule_id) for rule_id in readiness_evidence.get("approved_hard_rule_ids", ())
+    }
+    audits = readiness_evidence.get("rules")
+    if not approved_ids or not isinstance(audits, list):
+        return {}, False
+    approved_kinds: dict[str, str] = {}
+    valid = True
+    for audit in audits:
+        if not isinstance(audit, dict) or str(audit.get("rule_id")) not in approved_ids:
+            continue
+        rule_id = str(audit["rule_id"])
+        try:
+            expected = evaluation_kind(PlaybookRuleCategory(str(audit.get("category"))))
+        except ValueError:
+            valid = False
+            continue
+        expected_qualification = "execution" if expected.value == "execution_guard" else "strategic"
+        if (
+            audit.get("evaluation_kind") != expected.value
+            or audit.get("qualification_kind") != expected_qualification
+        ):
+            valid = False
+        approved_kinds[rule_id] = expected.value
+    return approved_kinds, valid and set(approved_kinds) == approved_ids
 
 
 def main() -> None:

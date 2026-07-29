@@ -130,6 +130,7 @@ class RunMetrics:
     metric_state_retention_limit: int = MAX_METRIC_STATE_KEYS
     active_hard_block_records: tuple[tuple[str, int, str], ...] = ()
     counterfactual_state_records: tuple[tuple[int, str, str], ...] = ()
+    hard_rule_kind_records: tuple[tuple[str, str], ...] = ()
 
 
 def main() -> None:
@@ -409,6 +410,16 @@ def _run_metrics(
         and isinstance(evaluation.get("behavior_before_hash"), str)
         and isinstance(evaluation.get("decision_epoch"), int)
     ]
+    hard_rule_kind_records = tuple(
+        sorted(
+            {
+                (str(evaluation["rule_id"]), str(evaluation["rule_kind"]))
+                for evaluation in hard_evaluations
+                if isinstance(evaluation.get("rule_id"), str)
+                and isinstance(evaluation.get("rule_kind"), str)
+            }
+        )
+    )
     terminal_report_count = sum(terminal_counts.values())
     dispatched_ids = set(dispatch_counts)
     terminal_ids = set(terminal_counts)
@@ -588,6 +599,7 @@ def _run_metrics(
         metric_state_retention_limit=metric_state_budget.limit,
         active_hard_block_records=active_hard_block_records,
         counterfactual_state_records=counterfactual_state_records,
+        hard_rule_kind_records=hard_rule_kind_records,
     )
 
 
@@ -663,8 +675,12 @@ def counterfactual_canary_is_valid(
         and readiness.get("baseline_sha256") == baseline_sha256
         and readiness.get("expected_git_sha") == expected_git_sha
         and set(readiness.get("evaluation_seed_ids", ())) == set(expected_evaluation_seeds)
-        and bool(readiness.get("approved_blocking_rule_ids"))
-        and not bool(readiness.get("rejected_context_applicable_blocking_hard_rule_ids"))
+        and readiness.get("schema_version") == "1.1"
+        and bool(readiness.get("approved_hard_rule_ids"))
+        and readiness.get("approved_hard_rule_ids")
+        == readiness.get("runtime_selected_hard_rule_ids")
+        and not bool(readiness.get("rejected_runtime_hard_rule_ids"))
+        and readiness.get("hard_rule_limit_exceeded") is False
         and artifact.get("approved_rule_set_sha256") == readiness.get("approved_rule_set_sha256")
         and (
             approved_rule_set_sha256 is None

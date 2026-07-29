@@ -18,12 +18,11 @@ from rtscortex.playbook.models import (
     PlaybookRoleId,
     PlaybookRule,
     PlaybookRuleApplication,
-    PlaybookRuleCategory,
     PlaybookRuleEffect,
-    PlaybookRuleKind,
     PlaybookRuleStatus,
     PlaybookRuleStrength,
 )
+from rtscortex.playbook.semantics import evaluation_kind
 
 
 @dataclass(frozen=True, slots=True)
@@ -322,7 +321,7 @@ def _evaluate(
                     game_loop=game_loop,
                     target_kind=target_kind,
                     target_id=target_id,
-                    rule_kind=_rule_kind(rule),
+                    rule_kind=evaluation_kind(rule.category),
                     action_name=action_name,
                     role=cast(PlaybookRoleId, role),
                     counterfactual_key=counterfactual_key,
@@ -375,18 +374,6 @@ def _counterfactual_key(
         separators=(",", ":"),
     )
     return f"counterfactual:{hashlib.sha256(payload.encode()).hexdigest()}"
-
-
-def _rule_kind(rule: PlaybookRule) -> PlaybookRuleKind:
-    return (
-        PlaybookRuleKind.EXECUTION_GUARD
-        if rule.category
-        in {
-            PlaybookRuleCategory.ENGINE_INVARIANT,
-            PlaybookRuleCategory.EXECUTION_GUARD,
-        }
-        else PlaybookRuleKind.STRATEGY
-    )
 
 
 def _action_key(action_name: str) -> str:

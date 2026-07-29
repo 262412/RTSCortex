@@ -56,6 +56,7 @@ cortex:
     learning_mode: frozen
     rule_mode: shadow
     allow_canary_fixture: true
+    hard_readiness_required: true
 reflex:
   enabled: true
   low_health_threshold: 0.25

@@ -46,7 +46,17 @@ from rtscortex.cortex import (
 )
 from rtscortex.evaluation import compute_cortex_observability
 from rtscortex.memory import EventStore
-from rtscortex.playbook import CortexPlaybookReviewer, PlaybookStore
+from rtscortex.playbook import (
+    CortexPlaybookReviewer,
+    PlaybookRule,
+    PlaybookRuleApplication,
+    PlaybookRuleCategory,
+    PlaybookRuleEffect,
+    PlaybookRuleKind,
+    PlaybookRuleStatus,
+    PlaybookRuleStrength,
+    PlaybookStore,
+)
 from rtscortex.policy.hima import (
     HIMA_ADAPTER_VERSION,
     HIMA_PARSER_VERSION,
@@ -356,6 +366,108 @@ def test_cortex_runtime_dispatches_proactive_tactical_focus_fire(tmp_path: Path)
     assert lineage.strategic_intent_id is not None
     assert lineage.arbiter_mode == "shadow"
     assert lineage.intent_decision == "selected"
+    asyncio.run(runtime.close())
+
+
+def test_tactical_response_terminal_resolution_uses_execution_evidence(
+    tmp_path: Path,
+) -> None:
+    base = _config(tmp_path, macro=False)
+    config = base.model_copy(
+        update={
+            "cortex": base.cortex.model_copy(
+                update={"playbook": CortexPlaybookSettings(rule_mode="shadow")}
+            )
+        }
+    )
+    store = _store(tmp_path)
+    runtime = CortexRuntimeEngine(
+        config=config,
+        store=store,
+        provider=FakeProvider(),
+    )
+    rule = PlaybookRule(
+        rule_id="tactical-hard-rule",
+        canonical_key="tactical-hard-rule",
+        category=PlaybookRuleCategory.TACTICAL_RESPONSE,
+        conditions=(),
+        effect=PlaybookRuleEffect.FORBID,
+        strength=PlaybookRuleStrength.HARD,
+        status=PlaybookRuleStatus.ACTIVE,
+        action_names=("Attack_Unit",),
+        confidence=1.0,
+    )
+    candidate_id = f"candidate:{'a' * 64}"
+    runtime._playbook_rules = (rule,)
+    observation = _macro_observation(step_id=0, game_loop=100)
+    runtime._record_playbook_applications(
+        observation,
+        (
+            PlaybookRuleApplication(
+                application_id=f"rule-application:{'b' * 64}",
+                rule_id=rule.rule_id,
+                run_id=observation.run_id,
+                episode_id=observation.episode_id,
+                step_id=observation.step_id,
+                game_loop=observation.game_loop,
+                target_kind="candidate",
+                target_id=candidate_id,
+                action_name="Attack_Unit",
+                role="focus_fire",
+                counterfactual_key=f"counterfactual:{'c' * 64}",
+                counterfactual_signature="d" * 64,
+                behavior_before_hash="e" * 64,
+                decision_epoch=observation.game_loop,
+                matched=True,
+                blocked=False,
+                reason="shadow_would_block",
+            ),
+        ),
+    )
+    evaluation_id, evaluation = next(iter(runtime._pending_playbook_rule_evaluations.items()))
+    assert evaluation.rule_kind is PlaybookRuleKind.EXECUTION_GUARD
+    assert evaluation.strategic_outcome_window_end_game_loop is None
+    runtime._pending_playbook_rule_evaluations[evaluation_id] = evaluation.model_copy(
+        update={"counterfactual_observable": True}
+    )
+    command_id = "tactical-command"
+    lineage = CommandLineage(
+        command_id=command_id,
+        intent_id="tactical-intent",
+        candidate_id=candidate_id,
+        selection_id=f"selection:{'f' * 64}",
+        source_role=CortexRole.TACTICAL,
+        source_id="test",
+        source_version="1",
+        executor_id="test",
+        executor_version="1",
+        selected_game_loop=100,
+    )
+    runtime._resolve_playbook_rule_evaluations(
+        ExecutionReport(
+            run_id=observation.run_id,
+            episode_id=observation.episode_id,
+            step_id=1,
+            command_id=command_id,
+            success=True,
+            action_name="Attack_Unit",
+            actor="CombatGroup/Adept-1",
+            source=ActionSource.REFLEX,
+            status=ExecutionStatus.SUCCEEDED,
+            execution_stage=ExecutionStage.EFFECT_VERIFICATION,
+        ),
+        lineage,
+    )
+
+    resolved = store.events_of_type(
+        observation.run_id,
+        observation.episode_id,
+        "playbook_rule_evaluated",
+    )[-1]
+    assert resolved.payload["rule_kind"] == "execution_guard"
+    assert resolved.payload["execution_false_block"] is True
+    assert resolved.payload["strategic_regret"] is None
+    assert runtime._terminal_strategy_rule_evaluations == {}
     asyncio.run(runtime.close())
 
 

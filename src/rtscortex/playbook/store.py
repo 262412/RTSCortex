@@ -27,6 +27,10 @@ from rtscortex.playbook.models import (
     PlaybookSelection,
     StrategicConsequenceType,
 )
+from rtscortex.playbook.selection import (
+    rule_is_unexpired,
+    runtime_hard_rule_candidates,
+)
 
 
 class PlaybookStore:
@@ -184,17 +188,30 @@ class PlaybookStore:
         context: PlaybookContext | None = None,
         max_hard: int = 8,
         max_soft: int = 8,
+        approved_hard_rule_ids: tuple[str, ...] | None = None,
     ) -> tuple[PlaybookRule, ...]:
         rules = self.rules()
+        hard_candidates = runtime_hard_rule_candidates(
+            rules,
+            agent_race=context.agent_race if context is not None else None,
+            opponent_race=context.opponent_race if context is not None else None,
+            map_name=context.map_name if context is not None else None,
+        )
+        hard = hard_candidates[:max_hard]
+        if approved_hard_rule_ids is not None:
+            selected_ids = tuple(rule.rule_id for rule in hard)
+            if len(hard_candidates) > max_hard:
+                raise RuntimeError(
+                    "Runtime hard-rule candidate count exceeds the approved max_hard_rules"
+                )
+            if selected_ids != approved_hard_rule_ids:
+                raise RuntimeError(
+                    "Runtime hard-rule selection differs from the readiness-approved rule IDs"
+                )
         if context is not None:
             rules = [rule for rule in rules if _rule_matches_context(rule, context)]
         active = [rule for rule in rules if rule.status is PlaybookRuleStatus.ACTIVE]
-        now = datetime.now(UTC)
-        active = [rule for rule in active if _rule_is_unexpired(rule, now)]
-        hard = sorted(
-            (rule for rule in active if rule.strength is PlaybookRuleStrength.HARD),
-            key=lambda rule: (-rule.confidence, rule.rule_id),
-        )[:max_hard]
+        active = [rule for rule in active if rule_is_unexpired(rule, datetime.now(UTC))]
         soft = sorted(
             (rule for rule in active if rule.strength is PlaybookRuleStrength.SOFT),
             key=lambda rule: (-rule.confidence, rule.rule_id),
@@ -584,12 +601,3 @@ def _merge_rule_evidence(existing: PlaybookRule, incoming: PlaybookRule) -> Play
             "evidence": {**existing.evidence, **incoming.evidence},
         }
     )
-
-
-def _rule_is_unexpired(rule: PlaybookRule, now: datetime) -> bool:
-    expires_at = rule.expires_at
-    if expires_at is None:
-        return True
-    if expires_at.tzinfo is None:
-        expires_at = expires_at.replace(tzinfo=UTC)
-    return expires_at.astimezone(UTC) > now

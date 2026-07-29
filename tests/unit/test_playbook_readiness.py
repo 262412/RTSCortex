@@ -14,11 +14,13 @@ from rtscortex.playbook import (
     PlaybookRule,
     PlaybookRuleCategory,
     PlaybookRuleEffect,
+    PlaybookRuleKind,
     PlaybookRuleStatus,
     PlaybookRuleStrength,
     PlaybookStore,
     analyze_hard_readiness_database,
     create_canary_fixture,
+    evaluation_kind,
     qualify_hard_rule,
 )
 
@@ -207,7 +209,40 @@ def test_qualification_creates_disjoint_hard_child_without_mutating_parent(
     )
     assert report.context_applicable_blocking_hard_count == 1
     assert report.reachable_blocking_hard_count == 1
+    assert report.approved_hard_rule_ids == (child.rule_id,)
+    assert report.runtime_selected_hard_rule_ids == (child.rule_id,)
     assert report.canary_runnable is True
+
+
+def test_tactical_response_qualification_kind_matches_shared_evaluation_kind(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "playbook.sqlite3"
+    manifest = tmp_path / "qualification.json"
+    parent = _soft_rule().model_copy(
+        update={
+            "rule_id": "tactical-soft-rule",
+            "canonical_key": "tactical-soft-rule",
+            "category": PlaybookRuleCategory.TACTICAL_RESPONSE,
+        }
+    )
+    _write_store(database, parent)
+    _qualification_manifest(manifest, database, parent)
+    store = PlaybookStore(database)
+    try:
+        child = qualify_hard_rule(
+            store,
+            parent_rule_id=parent.rule_id,
+            expected_git_sha=GIT_SHA,
+            sc2_patch="4.10",
+            qualification_manifest_path=manifest,
+            evaluation_seed_ids=(3, 4, 5),
+        )
+    finally:
+        store.close()
+
+    assert child.qualification_kind == "execution"
+    assert evaluation_kind(child.category) is PlaybookRuleKind.EXECUTION_GUARD
 
 
 def test_qualification_rejects_reused_evaluation_seed(tmp_path: Path) -> None:
@@ -460,6 +495,7 @@ def test_one_valid_rule_does_not_hide_stale_active_hard_rule(tmp_path: Path) -> 
                 "rule_id": "stale-hard",
                 "canonical_key": "stale-hard",
                 "code_revision": "b" * 40,
+                "effect": PlaybookRuleEffect.REQUIRE,
             }
         )
         store.upsert_rule(stale)
@@ -476,9 +512,106 @@ def test_one_valid_rule_does_not_hide_stale_active_hard_rule(tmp_path: Path) -> 
         evaluation_seed_ids=(3, 4, 5),
     )
 
-    assert report.reachable_blocking_hard_count == 1
-    assert report.approved_blocking_rule_ids == (child.rule_id,)
+    assert report.reachable_blocking_hard_count == 0
+    assert report.approved_hard_rule_ids == ()
+    assert report.approved_blocking_rule_ids == ()
+    assert report.rejected_runtime_hard_rule_ids == ("stale-hard",)
     assert report.rejected_context_applicable_blocking_hard_rule_ids == ("stale-hard",)
+    assert "code_revision_mismatch" in report.rejection_reasons["stale-hard"]
+    assert "effect_is_require_not_forbid" in report.rejection_reasons["stale-hard"]
+    assert report.canary_runnable is False
+
+
+@pytest.mark.parametrize(
+    "effect",
+    (
+        PlaybookRuleEffect.REQUIRE,
+        PlaybookRuleEffect.PREFER,
+        PlaybookRuleEffect.AVOID,
+    ),
+)
+def test_non_forbid_active_hard_rule_cannot_bypass_readiness(
+    tmp_path: Path,
+    effect: PlaybookRuleEffect,
+) -> None:
+    database = tmp_path / "playbook.sqlite3"
+    fixture = create_canary_fixture(
+        database,
+        expected_git_sha=GIT_SHA,
+        sc2_patch="4.10",
+    )
+    extra = fixture.model_copy(
+        update={
+            "rule_id": f"hard-{effect.value}",
+            "canonical_key": f"hard-{effect.value}",
+            "effect": effect,
+            "code_revision": "b" * 40,
+        }
+    )
+    store = PlaybookStore(database)
+    try:
+        store.upsert_rule(extra)
+    finally:
+        store.close()
+
+    report = analyze_hard_readiness_database(
+        database,
+        expected_git_sha=GIT_SHA,
+        sc2_patch="4.10",
+        agent_race="protoss",
+        opponent_race="zerg",
+        map_name="Simple64",
+        evaluation_seed_ids=(0,),
+        allow_canary_fixture=True,
+    )
+
+    assert report.canary_runnable is False
+    assert report.approved_hard_rule_ids == ()
+    assert f"hard-{effect.value}" in report.rejected_runtime_hard_rule_ids
+    assert (
+        f"effect_is_{effect.value}_not_forbid" in report.rejection_reasons[f"hard-{effect.value}"]
+    )
+
+
+def test_max_hard_selection_matches_readiness_and_overflow_fails_closed(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "playbook.sqlite3"
+    first = create_canary_fixture(
+        database,
+        expected_git_sha=GIT_SHA,
+        sc2_patch="4.10",
+    )
+    second = first.model_copy(
+        update={
+            "rule_id": "second-valid-hard",
+            "canonical_key": "second-valid-hard",
+            "confidence": 0.99,
+        }
+    )
+    store = PlaybookStore(database)
+    try:
+        store.upsert_rule(second)
+    finally:
+        store.close()
+
+    report = analyze_hard_readiness_database(
+        database,
+        expected_git_sha=GIT_SHA,
+        sc2_patch="4.10",
+        agent_race="protoss",
+        opponent_race="zerg",
+        map_name="Simple64",
+        evaluation_seed_ids=(0,),
+        allow_canary_fixture=True,
+        max_hard_rules=1,
+    )
+
+    assert report.hard_rule_limit_exceeded is True
+    assert report.runtime_candidate_hard_rule_ids == (first.rule_id, second.rule_id)
+    assert report.runtime_selected_hard_rule_ids == (first.rule_id,)
+    assert report.approved_hard_rule_ids == ()
+    assert set(report.rejected_runtime_hard_rule_ids) == {first.rule_id, second.rule_id}
     assert report.canary_runnable is False
 
 

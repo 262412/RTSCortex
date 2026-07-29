@@ -18,9 +18,17 @@ from rtscortex.playbook.models import (
     PlaybookRule,
     PlaybookRuleCategory,
     PlaybookRuleEffect,
+    PlaybookRuleKind,
     PlaybookRuleStatus,
     PlaybookRuleStrength,
 )
+from rtscortex.playbook.selection import (
+    hard_rule_set_sha256,
+    rule_matches_static_context,
+    runtime_hard_rule_candidates,
+    select_runtime_hard_rules,
+)
+from rtscortex.playbook.semantics import evaluation_kind
 from rtscortex.playbook.store import PlaybookStore
 from rtscortex.policy.capabilities import DEFAULT_RUNTIME_CAPABILITIES
 from rtscortex.races import race_profile
@@ -52,6 +60,8 @@ class PlaybookRuleReadiness(ContractModel):
     rule_id: str
     parent_rule_id: str | None = None
     category: PlaybookRuleCategory
+    evaluation_kind: PlaybookRuleKind
+    qualification_kind: Literal["execution", "strategic"] | None = None
     status: PlaybookRuleStatus
     strength: PlaybookRuleStrength
     effect: PlaybookRuleEffect
@@ -129,7 +139,7 @@ class PlaybookStrategicABQualificationArtifact(ContractModel):
 class PlaybookHardReadinessReport(ContractModel):
     """Machine-readable preflight artifact emitted before any GPU or SC2 work."""
 
-    schema_version: str = "1.0"
+    schema_version: Literal["1.1"] = "1.1"
     baseline_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     expected_git_sha: str = Field(pattern=r"^[0-9a-f]{40}$")
     sc2_patch: str = Field(min_length=1)
@@ -137,13 +147,19 @@ class PlaybookHardReadinessReport(ContractModel):
     opponent_race: str = Field(min_length=1)
     map_name: str = Field(min_length=1)
     evaluation_seed_ids: tuple[int, ...] = ()
+    max_hard_rules: int = Field(ge=1)
     active_soft_count: int = Field(ge=0)
     active_hard_count: int = Field(ge=0)
+    runtime_candidate_hard_rule_ids: tuple[str, ...] = ()
+    runtime_selected_hard_rule_ids: tuple[str, ...] = ()
+    hard_rule_limit_exceeded: bool = False
     active_blocking_hard_count: int = Field(ge=0)
     context_applicable_blocking_hard_count: int = Field(ge=0)
     reachable_blocking_hard_count: int = Field(ge=0)
+    approved_hard_rule_ids: tuple[str, ...] = ()
     approved_blocking_rule_ids: tuple[str, ...] = ()
     approved_rule_set_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    rejected_runtime_hard_rule_ids: tuple[str, ...] = ()
     rejected_context_applicable_blocking_hard_rule_ids: tuple[str, ...] = ()
     canary_fixture_rule_ids: tuple[str, ...] = ()
     canary_runnable: bool
@@ -162,8 +178,9 @@ def analyze_hard_readiness(
     map_name: str,
     evaluation_seed_ids: Sequence[int] = (),
     allow_canary_fixture: bool = False,
+    max_hard_rules: int = 8,
 ) -> PlaybookHardReadinessReport:
-    """Classify every rule and require one context-applicable blocking hard rule."""
+    """Approve the exact hard-rule set the Runtime will load."""
 
     normalized_race = agent_race.casefold()
     profile = race_profile(normalized_race).data
@@ -176,16 +193,34 @@ def analyze_hard_readiness(
     evaluation_seeds = tuple(dict.fromkeys(int(seed) for seed in evaluation_seed_ids))
     active = [rule for rule in rules if rule.status is PlaybookRuleStatus.ACTIVE]
     active_hard = [rule for rule in active if rule.strength is PlaybookRuleStrength.HARD]
-    blocking = [rule for rule in active_hard if rule.effect is PlaybookRuleEffect.FORBID]
+    blocking_effects = {
+        PlaybookRuleEffect.FORBID,
+        PlaybookRuleEffect.REQUIRE,
+    }
+    blocking = [rule for rule in active_hard if rule.effect in blocking_effects]
     context = {
         "agent_race": normalized_race,
         "opponent_race": opponent_race.casefold(),
         "map_name": map_name,
     }
+    runtime_candidates = runtime_hard_rule_candidates(
+        rules,
+        agent_race=normalized_race,
+        opponent_race=opponent_race.casefold(),
+        map_name=map_name,
+    )
+    runtime_selected = select_runtime_hard_rules(
+        rules,
+        agent_race=normalized_race,
+        opponent_race=opponent_race.casefold(),
+        map_name=map_name,
+        max_hard=max_hard_rules,
+    )
+    hard_rule_limit_exceeded = len(runtime_candidates) > max_hard_rules
     context_applicable = [rule for rule in blocking if _context_is_applicable(rule, context)]
     rejection_reasons: dict[str, tuple[str, ...]] = {}
-    reachable: list[PlaybookRule] = []
-    rejected_relevant_blockers: list[str] = []
+    individually_approved: list[PlaybookRule] = []
+    rejected_runtime_hard_rules: list[str] = []
     fixture_rule_ids: list[str] = []
     rule_audits: list[PlaybookRuleReadiness] = []
     rules_by_id = {rule.rule_id: rule for rule in rules}
@@ -203,17 +238,14 @@ def analyze_hard_readiness(
             allow_canary_fixture=allow_canary_fixture,
             rules_by_id=rules_by_id,
         )
+        if hard_rule_limit_exceeded and rule in runtime_candidates:
+            reasons = (*reasons, "runtime_hard_rule_limit_exceeded")
         if reasons:
             rejection_reasons[rule.rule_id] = reasons
-        elif rule in context_applicable:
-            reachable.append(rule)
-        if (
-            rule in blocking
-            and _rule_target_is_reachable(rule, reachable_actions)
-            and (_context_is_applicable(rule, context) or _has_invalid_static_operator(rule))
-            and reasons
-        ):
-            rejected_relevant_blockers.append(rule.rule_id)
+        elif rule in runtime_selected:
+            individually_approved.append(rule)
+        if rule in runtime_candidates and reasons:
+            rejected_runtime_hard_rules.append(rule.rule_id)
         strategic_regret = rule.evidence.get("strategic_regret_count")
         strategic_ab_manifest = rule.evidence.get("strategic_ab_manifest")
         rule_audits.append(
@@ -221,6 +253,8 @@ def analyze_hard_readiness(
                 rule_id=rule.rule_id,
                 parent_rule_id=rule.parent_rule_id,
                 category=rule.category,
+                evaluation_kind=evaluation_kind(rule.category),
+                qualification_kind=rule.qualification_kind,
                 status=rule.status,
                 strength=rule.strength,
                 effect=rule.effect,
@@ -263,12 +297,21 @@ def analyze_hard_readiness(
                 rejection_reasons=reasons,
             )
         )
-    approved_rule_ids = tuple(sorted(rule.rule_id for rule in reachable))
-    approved_rule_set_sha256 = _sha256_json(
-        {
-            "baseline_sha256": baseline_sha256,
-            "approved_blocking_rule_ids": approved_rule_ids,
-        }
+    exact_selection_approved = (
+        not hard_rule_limit_exceeded
+        and not rejected_runtime_hard_rules
+        and {rule.rule_id for rule in individually_approved}
+        == {rule.rule_id for rule in runtime_selected}
+    )
+    approved_hard_rules = tuple(runtime_selected) if exact_selection_approved else ()
+    approved_hard_rule_ids = tuple(rule.rule_id for rule in approved_hard_rules)
+    approved_blocking_rule_ids = tuple(
+        rule.rule_id for rule in approved_hard_rules if rule.effect in blocking_effects
+    )
+    approved_rule_set_sha256 = hard_rule_set_sha256(
+        baseline_sha256=baseline_sha256,
+        max_hard_rules=max_hard_rules,
+        rules=approved_hard_rules,
     )
     return PlaybookHardReadinessReport(
         baseline_sha256=baseline_sha256,
@@ -278,18 +321,32 @@ def analyze_hard_readiness(
         opponent_race=opponent_race.casefold(),
         map_name=map_name,
         evaluation_seed_ids=evaluation_seeds,
+        max_hard_rules=max_hard_rules,
         active_soft_count=sum(rule.strength is PlaybookRuleStrength.SOFT for rule in active),
         active_hard_count=len(active_hard),
+        runtime_candidate_hard_rule_ids=tuple(rule.rule_id for rule in runtime_candidates),
+        runtime_selected_hard_rule_ids=tuple(rule.rule_id for rule in runtime_selected),
+        hard_rule_limit_exceeded=hard_rule_limit_exceeded,
         active_blocking_hard_count=len(blocking),
         context_applicable_blocking_hard_count=len(context_applicable),
-        reachable_blocking_hard_count=len(reachable),
-        approved_blocking_rule_ids=approved_rule_ids,
+        reachable_blocking_hard_count=len(approved_blocking_rule_ids),
+        approved_hard_rule_ids=approved_hard_rule_ids,
+        approved_blocking_rule_ids=approved_blocking_rule_ids,
         approved_rule_set_sha256=approved_rule_set_sha256,
+        rejected_runtime_hard_rule_ids=tuple(sorted(rejected_runtime_hard_rules)),
         rejected_context_applicable_blocking_hard_rule_ids=tuple(
-            sorted(rejected_relevant_blockers)
+            sorted(
+                rule_id
+                for rule_id in rejected_runtime_hard_rules
+                if rules_by_id[rule_id].effect in blocking_effects
+            )
         ),
         canary_fixture_rule_ids=tuple(sorted(fixture_rule_ids)),
-        canary_runnable=bool(reachable) and not rejected_relevant_blockers,
+        canary_runnable=(
+            exact_selection_approved
+            and bool(approved_hard_rule_ids)
+            and bool(approved_blocking_rule_ids)
+        ),
         rejection_reasons=rejection_reasons,
         rules=tuple(rule_audits),
     )
@@ -305,6 +362,7 @@ def analyze_hard_readiness_database(
     map_name: str,
     evaluation_seed_ids: Sequence[int] = (),
     allow_canary_fixture: bool = False,
+    max_hard_rules: int = 8,
 ) -> PlaybookHardReadinessReport:
     """Read one immutable baseline and return its readiness report."""
 
@@ -324,7 +382,76 @@ def analyze_hard_readiness_database(
         map_name=map_name,
         evaluation_seed_ids=evaluation_seed_ids,
         allow_canary_fixture=allow_canary_fixture,
+        max_hard_rules=max_hard_rules,
     )
+
+
+def load_hard_readiness_report(path: Path) -> PlaybookHardReadinessReport:
+    """Load one fail-closed Runtime approval artifact."""
+
+    try:
+        return PlaybookHardReadinessReport.model_validate_json(
+            path.expanduser().resolve().read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError) as error:
+        raise RuntimeError(f"invalid Playbook hard-readiness artifact {path}: {error}") from error
+
+
+def validate_runtime_hard_rule_approval(
+    report: PlaybookHardReadinessReport,
+    rules: Sequence[PlaybookRule],
+    *,
+    agent_race: str,
+    opponent_race: str,
+    map_name: str,
+    evaluation_seed: int,
+    max_hard_rules: int,
+    allow_canary_fixture: bool,
+) -> tuple[str, ...]:
+    """Require the Runtime hard-rule set to equal the approved set exactly."""
+
+    candidates = runtime_hard_rule_candidates(
+        rules,
+        agent_race=agent_race,
+        opponent_race=opponent_race,
+        map_name=map_name,
+    )
+    selected = candidates[:max_hard_rules]
+    candidate_ids = tuple(rule.rule_id for rule in candidates)
+    selected_ids = tuple(rule.rule_id for rule in selected)
+    expected_hash = hard_rule_set_sha256(
+        baseline_sha256=report.baseline_sha256,
+        max_hard_rules=max_hard_rules,
+        rules=selected,
+    )
+    fixture_ids = tuple(
+        rule.rule_id for rule in selected if rule.evidence.get("canary_fixture") is True
+    )
+    checks = {
+        "canary_runnable": report.canary_runnable is True,
+        "agent_race": report.agent_race.casefold() == agent_race.casefold(),
+        "opponent_race": report.opponent_race.casefold() == opponent_race.casefold(),
+        "map_name": report.map_name == map_name,
+        "evaluation_seed": evaluation_seed in report.evaluation_seed_ids,
+        "max_hard_rules": report.max_hard_rules == max_hard_rules,
+        "hard_rule_limit": len(candidates) <= max_hard_rules,
+        "runtime_candidate_ids": report.runtime_candidate_hard_rule_ids == candidate_ids,
+        "runtime_selected_ids": report.runtime_selected_hard_rule_ids == selected_ids,
+        "approved_hard_rule_ids": report.approved_hard_rule_ids == selected_ids,
+        "no_rejected_runtime_hard_rules": not report.rejected_runtime_hard_rule_ids,
+        "approved_rule_set_sha256": report.approved_rule_set_sha256 == expected_hash,
+        "canary_fixture_scope": (
+            set(report.canary_fixture_rule_ids) == set(fixture_ids)
+            if allow_canary_fixture
+            else not report.canary_fixture_rule_ids and not fixture_ids
+        ),
+    }
+    failures = [name for name, accepted in checks.items() if not accepted]
+    if failures:
+        raise RuntimeError(
+            "Runtime hard-rule selection does not match readiness approval: " + ", ".join(failures)
+        )
+    return selected_ids
 
 
 def qualify_hard_rule(
@@ -377,12 +504,7 @@ def qualify_hard_rule(
     )
     qualification_kind: Literal["execution", "strategic"] = (
         "execution"
-        if parent.category
-        in {
-            PlaybookRuleCategory.ENGINE_INVARIANT,
-            PlaybookRuleCategory.EXECUTION_GUARD,
-            PlaybookRuleCategory.TACTICAL_RESPONSE,
-        }
+        if evaluation_kind(parent.category) is PlaybookRuleKind.EXECUTION_GUARD
         else "strategic"
     )
     strategic_ab_manifest: PlaybookStrategicABQualificationArtifact | None = None
@@ -556,12 +678,19 @@ def _hard_rejection_reasons(
 ) -> tuple[str, ...]:
     fixture = rule.evidence.get("canary_fixture") is True
     reasons: list[str] = []
+    expected_qualification_kind = (
+        "execution"
+        if evaluation_kind(rule.category) is PlaybookRuleKind.EXECUTION_GUARD
+        else "strategic"
+    )
     if rule.status is not PlaybookRuleStatus.ACTIVE:
         reasons.append(f"status_is_{rule.status.value}")
     if rule.strength is not PlaybookRuleStrength.HARD:
         reasons.append(f"strength_is_{rule.strength.value}")
     if rule.effect is not PlaybookRuleEffect.FORBID:
         reasons.append(f"effect_is_{rule.effect.value}_not_forbid")
+    if rule.qualification_kind != expected_qualification_kind:
+        reasons.append("qualification_kind_mismatch")
     if not _context_is_applicable(rule, context):
         reasons.append("context_not_applicable")
     if not _rule_target_is_reachable(rule, reachable_actions):
@@ -642,23 +771,7 @@ def _hard_rejection_reasons(
 
 
 def _context_is_applicable(rule: PlaybookRule, context: dict[str, str]) -> bool:
-    return all(
-        condition.field not in _STATIC_CONTEXT_FIELDS
-        or _condition_matches_static(condition, context[condition.field])
-        for condition in rule.conditions
-    )
-
-
-def _condition_matches_static(condition: PlaybookCondition, actual: str) -> bool:
-    expected = condition.value
-    if condition.operator is PlaybookConditionOperator.EQ:
-        return str(expected).casefold() == actual.casefold()
-    if condition.operator is PlaybookConditionOperator.IN:
-        values = expected if isinstance(expected, tuple) else (str(expected),)
-        return actual.casefold() in {str(value).casefold() for value in values}
-    if condition.operator is PlaybookConditionOperator.CONTAINS:
-        return str(expected).casefold() in actual.casefold()
-    return False
+    return rule_matches_static_context(rule, context)
 
 
 def _invalid_static_operators(rule: PlaybookRule) -> tuple[PlaybookCondition, ...]:
@@ -668,10 +781,6 @@ def _invalid_static_operators(rule: PlaybookRule) -> tuple[PlaybookCondition, ..
         if condition.field in _STATIC_CONTEXT_FIELDS
         and condition.operator not in _STATIC_CONTEXT_OPERATORS
     )
-
-
-def _has_invalid_static_operator(rule: PlaybookRule) -> bool:
-    return bool(_invalid_static_operators(rule))
 
 
 def _rule_target_is_reachable(rule: PlaybookRule, reachable_actions: set[str]) -> bool:
@@ -698,12 +807,6 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
-
-
-def _sha256_json(payload: object) -> str:
-    return hashlib.sha256(
-        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
 
 
 def _load_qualification_manifest(path: Path) -> PlaybookHardQualificationManifest:
@@ -834,7 +937,7 @@ def _qualification_evidence_reasons(
         reasons.append("qualification_manifest_hash_unbound")
     strategic_payload = rule.evidence.get("strategic_ab_manifest")
     strategic_sha256 = rule.evidence.get("strategic_ab_evidence_sha256")
-    if rule.qualification_kind == "strategic":
+    if evaluation_kind(rule.category) is PlaybookRuleKind.STRATEGY:
         if not isinstance(strategic_payload, dict):
             reasons.append("missing_strategic_ab_manifest")
         else:

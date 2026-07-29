@@ -48,9 +48,12 @@ from rtscortex.playbook.readiness import (
     analyze_hard_readiness_database,
     contains_canary_fixture,
     create_canary_fixture,
+    load_hard_readiness_report,
     qualify_hard_rule,
+    validate_runtime_hard_rule_approval,
 )
 from rtscortex.playbook.reviewer import CortexPlaybookReviewer
+from rtscortex.playbook.semantics import evaluation_kind
 from rtscortex.playbook.store import PlaybookStore
 
 __all__ = [
@@ -99,5 +102,8 @@ __all__ = [
     "candidate_signature",
     "contains_canary_fixture",
     "create_canary_fixture",
+    "evaluation_kind",
+    "load_hard_readiness_report",
     "qualify_hard_rule",
+    "validate_runtime_hard_rule_approval",
 ]

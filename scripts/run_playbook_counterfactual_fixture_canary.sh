@@ -61,6 +61,7 @@ uv run rtscortex playbook hard-readiness \
   --evaluation-seed "${seed}" \
   --allow-canary-fixture \
   --output "${readiness_evidence}"
+export RTSCORTEX_PLAYBOOK_HARD_READINESS_PATH="${readiness_evidence}"
 
 uv run python scripts/prepare_reviewed_llm_pysc2_runtime.py \
   --source third_party/LLM-PySC2 \

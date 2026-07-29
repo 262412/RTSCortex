@@ -94,6 +94,7 @@ uv run rtscortex playbook hard-readiness \
   --sc2-patch "4.10" \
   "${readiness_seed_args[@]}" \
   --output "${readiness_evidence}"
+export RTSCORTEX_PLAYBOOK_HARD_READINESS_PATH="${readiness_evidence}"
 
 uv run python - \
   "${counterfactual_canary}" \

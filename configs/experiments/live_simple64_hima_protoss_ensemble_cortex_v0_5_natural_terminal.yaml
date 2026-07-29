@@ -82,6 +82,7 @@ cortex:
     rule_mode: active
     max_hard_rules: 8
     max_soft_rules: 8
+    hard_readiness_required: true
 reflex:
   enabled: true
   low_health_threshold: 0.25

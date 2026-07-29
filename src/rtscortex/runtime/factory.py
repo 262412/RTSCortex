@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from pathlib import Path
 from typing import Literal, cast
 
@@ -18,6 +19,8 @@ from rtscortex.playbook import (
     CortexPlaybookReviewer,
     PlaybookStore,
     contains_canary_fixture,
+    load_hard_readiness_report,
+    validate_runtime_hard_rule_approval,
 )
 from rtscortex.policy.hima.live import HIMALivePolicyClient
 from rtscortex.providers import FakeProvider, OpenAICompatibleProvider
@@ -33,6 +36,7 @@ from rtscortex.runtime.hima_sidecar import (
 from rtscortex.runtime.scripted_macro import ScriptedMacroPolicyClient
 
 _UDS_PATH_LIMIT = 100
+_HARD_READINESS_ENV = "RTSCORTEX_PLAYBOOK_HARD_READINESS_PATH"
 
 
 def build_runtime(config: ExperimentConfig, run_dir: Path) -> RuntimeEngine:
@@ -113,6 +117,30 @@ def _build_cortex_runtime(
         raise RuntimeError(
             "canary fixture Playbook requires cortex.playbook.allow_canary_fixture=true"
         )
+    approved_hard_rule_ids: tuple[str, ...] | None = None
+    readiness_path = os.environ.get(_HARD_READINESS_ENV)
+    if config.cortex.playbook.hard_readiness_required and not readiness_path:
+        if playbook_store is not None:
+            playbook_store.close()
+        raise RuntimeError(f"active Playbook config requires {_HARD_READINESS_ENV}")
+    if readiness_path:
+        if playbook_store is None:
+            raise RuntimeError("hard-readiness approval requires an enabled Playbook")
+        try:
+            report = load_hard_readiness_report(Path(readiness_path))
+            approved_hard_rule_ids = validate_runtime_hard_rule_approval(
+                report,
+                playbook_store.rules(),
+                agent_race=config.environment.agent_race,
+                opponent_race=config.environment.opponent_race,
+                map_name=config.environment.scenario,
+                evaluation_seed=config.run.seed,
+                max_hard_rules=config.cortex.playbook.max_hard_rules,
+                allow_canary_fixture=config.cortex.playbook.allow_canary_fixture,
+            )
+        except BaseException:
+            playbook_store.close()
+            raise
     playbook_reviewer = (
         CortexPlaybookReviewer(
             playbook_store,
@@ -130,6 +158,7 @@ def _build_cortex_runtime(
         macro_startup_failure=macro_startup_failure,
         playbook_store=playbook_store,
         playbook_reviewer=playbook_reviewer,
+        approved_hard_rule_ids=approved_hard_rule_ids,
     )
 
 

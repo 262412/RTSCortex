@@ -19,16 +19,30 @@ def _readiness(
     fixture: bool = False,
     evaluation_seeds: tuple[int, ...] = (0, 1, 2),
 ) -> dict[str, object]:
+    rule_id = "fixture-rule" if fixture else "production-rule"
     return {
+        "schema_version": "1.1",
         "baseline_sha256": "baseline",
         "expected_git_sha": "expected",
         "evaluation_seed_ids": list(evaluation_seeds),
         "context_applicable_blocking_hard_count": 1,
-        "approved_blocking_rule_ids": ["fixture-rule" if fixture else "production-rule"],
+        "runtime_selected_hard_rule_ids": [rule_id],
+        "approved_hard_rule_ids": [rule_id],
+        "approved_blocking_rule_ids": [rule_id],
         "approved_rule_set_sha256": "approved-rule-set",
+        "rejected_runtime_hard_rule_ids": [],
         "rejected_context_applicable_blocking_hard_rule_ids": [],
+        "hard_rule_limit_exceeded": False,
         "canary_fixture_rule_ids": ["fixture-rule"] if fixture else [],
         "canary_runnable": True,
+        "rules": [
+            {
+                "rule_id": rule_id,
+                "category": "execution_guard",
+                "evaluation_kind": "execution_guard",
+                "qualification_kind": "execution",
+            }
+        ],
     }
 
 
@@ -81,6 +95,7 @@ def _metrics(
         sampled_drop_supported=False,
         playbook_before_sha256=before,
         playbook_after_sha256=after,
+        hard_rule_kind_records=(("production-rule", "execution_guard"),),
     )
 
 
@@ -502,6 +517,7 @@ def test_paired_runner_propagates_failed_acceptance_gate() -> None:
         "run_recovery_acceptance_canary.py"
     )
     assert 'export RTSCORTEX_REVIEWED_SOURCE_ROOT="${reviewed_source_root}"' in runner
+    assert 'export RTSCORTEX_PLAYBOOK_HARD_READINESS_PATH="${readiness_evidence}"' in runner
     assert "submodule_diff_sha256_before" in runner
     assert "submodule_gitlink_before" in runner
     assert "reviewed_source_diff_sha256_before" in runner
@@ -520,6 +536,7 @@ def test_paired_runner_propagates_failed_acceptance_gate() -> None:
         canary_runner.index("run_recovery_acceptance_canary.py")
     )
     assert 'export RTSCORTEX_REVIEWED_SOURCE_ROOT="${reviewed_source_root}"' in canary_runner
+    assert 'export RTSCORTEX_PLAYBOOK_HARD_READINESS_PATH="${readiness_evidence}"' in canary_runner
     assert "--execution-seed" in canary_runner
     assert "--evaluation-seeds" in canary_runner
     assert "readiness_seed_args" in canary_runner
@@ -539,6 +556,7 @@ def test_paired_runner_propagates_failed_acceptance_gate() -> None:
     assert '"${submodule_dirty}" != "false"' in fixture_runner
     assert "prepare_reviewed_llm_pysc2_runtime.py" in fixture_runner
     assert 'export RTSCORTEX_REVIEWED_SOURCE_ROOT="${reviewed_source_root}"' in fixture_runner
+    assert 'export RTSCORTEX_PLAYBOOK_HARD_READINESS_PATH="${readiness_evidence}"' in fixture_runner
 
 
 def test_active_intent_cannot_be_resolved_by_different_shadow_target() -> None:
@@ -666,6 +684,63 @@ def test_formal_comparison_accepts_complete_counterfactual_canary() -> None:
 
     assert canary["accepted"] is True
     assert comparison["gates"]["counterfactual_canary_accepted"] is True
+
+
+def test_tactical_response_kind_mismatch_rejects_counterfactual_canary() -> None:
+    behavior = replace(
+        _metrics(
+            mode="causal_canary",
+            seed=0,
+            arm="active",
+            before="baseline",
+            after="after",
+            repeated_errors=0,
+        ),
+        active_hard_block_keys=("counterfactual:shared",),
+        active_hard_block_records=(("counterfactual:shared", 100, "a" * 64),),
+        counterfactual_state_records=((100, "s" * 64, "a" * 64),),
+        hard_rule_kind_records=(("production-rule", "strategy"),),
+    )
+    shadow = replace(
+        _metrics(
+            mode="causal_canary",
+            seed=0,
+            arm="shadow",
+            before="baseline",
+            after="baseline",
+            repeated_errors=0,
+        ),
+        resolved_counterfactual_keys=("counterfactual:shared",),
+        counterfactual_state_records=((100, "s" * 64, "a" * 64),),
+    )
+    readiness = _readiness()
+    readiness["rules"] = [
+        {
+            "rule_id": "production-rule",
+            "category": "tactical_response",
+            "evaluation_kind": "execution_guard",
+            "qualification_kind": "execution",
+        }
+    ]
+
+    canary = build_canary_report(
+        behavior,
+        shadow,
+        baseline_sha256="baseline",
+        expected_git_sha="expected",
+        readiness_evidence=readiness,
+    )
+
+    assert canary["gates"]["rule_evaluation_kind_consistent"] is False
+    assert canary["rule_kind_mismatches"] == [
+        {
+            "arm": "behavior",
+            "rule_id": "production-rule",
+            "observed": "strategy",
+            "expected": "execution_guard",
+        }
+    ]
+    assert canary["accepted"] is False
 
 
 def test_production_canary_uses_full_held_out_seed_set() -> None:
@@ -960,6 +1035,7 @@ def test_formal_comparison_rejects_fixture_counterfactual_canary() -> None:
         active_hard_block_keys=("counterfactual:shared",),
         active_hard_block_records=(("counterfactual:shared", 100, "a" * 64),),
         counterfactual_state_records=((100, "s" * 64, "a" * 64),),
+        hard_rule_kind_records=(("fixture-rule", "execution_guard"),),
     )
     shadow = replace(
         _metrics(
@@ -972,6 +1048,7 @@ def test_formal_comparison_rejects_fixture_counterfactual_canary() -> None:
         ),
         shadow_would_block_keys=("counterfactual:shared",),
         counterfactual_state_records=((100, "s" * 64, "a" * 64),),
+        hard_rule_kind_records=(("fixture-rule", "execution_guard"),),
     )
     fixture = build_canary_report(
         behavior,

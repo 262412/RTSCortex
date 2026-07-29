@@ -81,13 +81,13 @@ from rtscortex.playbook import (
     PlaybookQuery,
     PlaybookRule,
     PlaybookRuleApplication,
-    PlaybookRuleCategory,
     PlaybookRuleEvaluation,
     PlaybookRuleKind,
     PlaybookSelection,
     PlaybookStore,
     RecentTerminalFeedback,
     candidate_signature,
+    evaluation_kind,
 )
 from rtscortex.policy.hima import (
     HIMAInputContext,
@@ -193,6 +193,7 @@ class CortexRuntimeEngine(RuntimeEngine):
         macro_startup_failure: Exception | None = None,
         playbook_store: PlaybookStore | None = None,
         playbook_reviewer: CortexPlaybookReviewer | None = None,
+        approved_hard_rule_ids: tuple[str, ...] | None = None,
         situation_provider: SituationProvider | None = None,
         shadow_situation_provider: SituationProvider | None = None,
         tactical_provider: TacticalPolicyProvider | None = None,
@@ -239,6 +240,7 @@ class CortexRuntimeEngine(RuntimeEngine):
         self._macro_proposal: MacroPolicyProposal | None = None
         self._playbook_store = playbook_store
         self._playbook_reviewer = playbook_reviewer
+        self._approved_hard_rule_ids = approved_hard_rule_ids
         self._playbook_selection: PlaybookSelection | None = None
         self._playbook_selection_fingerprint: tuple[str, ...] | None = None
         self._playbook_rules: tuple[PlaybookRule, ...] = ()
@@ -2799,7 +2801,7 @@ class CortexRuntimeEngine(RuntimeEngine):
                 game_loop=application.game_loop,
                 target_kind=application.target_kind,
                 target_id=application.target_id,
-                rule_kind=application.rule_kind or self._playbook_rule_kind(rule),
+                rule_kind=application.rule_kind or evaluation_kind(rule.category),
                 action_name=application.action_name,
                 role=application.role,
                 counterfactual_key=(
@@ -2812,7 +2814,7 @@ class CortexRuntimeEngine(RuntimeEngine):
                 counterfactual_observable=False,
                 strategic_outcome_window_end_game_loop=(
                     application.game_loop + 448
-                    if (application.rule_kind or self._playbook_rule_kind(rule))
+                    if (application.rule_kind or evaluation_kind(rule.category))
                     is PlaybookRuleKind.STRATEGY
                     else None
                 ),
@@ -2860,18 +2862,6 @@ class CortexRuntimeEngine(RuntimeEngine):
             reason = event.payload.get("reason")
             if rule_id in fixture_rule_ids and reason in {"shadow_would_block", "rule_blocked"}:
                 self._consumed_canary_fixture_rule_ids.add(str(rule_id))
-
-    @staticmethod
-    def _playbook_rule_kind(rule: PlaybookRule) -> PlaybookRuleKind:
-        return (
-            PlaybookRuleKind.EXECUTION_GUARD
-            if rule.category
-            in {
-                PlaybookRuleCategory.ENGINE_INVARIANT,
-                PlaybookRuleCategory.EXECUTION_GUARD,
-            }
-            else PlaybookRuleKind.STRATEGY
-        )
 
     @staticmethod
     def _playbook_counterfactual_key(
@@ -3809,6 +3799,7 @@ class CortexRuntimeEngine(RuntimeEngine):
             context=context,
             max_hard=self.config.cortex.playbook.max_hard_rules,
             max_soft=self.config.cortex.playbook.max_soft_rules,
+            approved_hard_rule_ids=self._approved_hard_rule_ids,
         )
         query = PlaybookQuery(
             context=context,
@@ -3831,6 +3822,7 @@ class CortexRuntimeEngine(RuntimeEngine):
                 "hit_count": len(selection.hits),
                 "hits": [hit.model_dump(mode="json") for hit in selection.hits],
                 "executable_rule_count": len(self._playbook_rules),
+                "approved_hard_rule_ids": list(self._approved_hard_rule_ids or ()),
             },
         )
 

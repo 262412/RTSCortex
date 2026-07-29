@@ -755,6 +755,101 @@ def test_playbook_guard_rule_cap_is_applied_after_context_filter(tmp_path: Path)
     store.close()
 
 
+def test_tactical_response_guard_uses_execution_evaluation_kind() -> None:
+    rule = PlaybookRule(
+        rule_id="rule:tactical-kind",
+        canonical_key="tactical-kind",
+        category=PlaybookRuleCategory.TACTICAL_RESPONSE,
+        conditions=(),
+        effect=PlaybookRuleEffect.PREFER,
+        strength=PlaybookRuleStrength.HARD,
+        status=PlaybookRuleStatus.ACTIVE,
+        role_ids=("offense",),
+        confidence=1.0,
+    )
+    situation = SituationAssessment(
+        assessment_id="assessment:tactical-kind",
+        run_id="run",
+        episode_id="episode",
+        step_id=1,
+        game_loop=100,
+        valid_until_game_loop=116,
+        phase=GamePhase.COMBAT,
+        threat_level=ThreatLevel.LOW,
+        economy_status=EconomyStatus.STABLE,
+        army_readiness=ArmyReadiness.READY,
+        source_kind="deterministic",
+        source_id="test",
+        source_version="1",
+    )
+    intent = StrategicIntent(
+        intent_id="intent:tactical-kind",
+        continuity_key="offense:push",
+        run_id="run",
+        episode_id="episode",
+        step_id=1,
+        created_game_loop=100,
+        role=RoleId.OFFENSE,
+        objective="advance",
+        desired_effect="engage the enemy",
+        action_names=("Move_Minimap",),
+        semantic_target_key="enemy:last-known",
+        resource_claim=ResourceClaim(reservation_game_loops=16),
+        source_id="test",
+        source_version="1",
+    )
+
+    result = PlaybookIntentGuard().evaluate(
+        intent,
+        context=PlaybookContext(
+            agent_race="protoss",
+            opponent_race="zerg",
+            phase=GamePhase.COMBAT,
+            map_name="Simple64",
+        ),
+        situation=situation,
+        rules=(rule,),
+        game_loop=100,
+        mode="active",
+    )
+
+    assert result.applications[0].rule_kind is PlaybookRuleKind.EXECUTION_GUARD
+
+
+def test_approved_hard_rule_set_is_stable_across_dynamic_phase(
+    tmp_path: Path,
+) -> None:
+    store = PlaybookStore(tmp_path / "playbook.sqlite3")
+    rule = PlaybookRule(
+        rule_id="rule:hard:early",
+        canonical_key="hard:early",
+        category=PlaybookRuleCategory.EXECUTION_GUARD,
+        conditions=(
+            PlaybookCondition(field="agent_race", value="protoss"),
+            PlaybookCondition(field="phase", value=GamePhase.EARLY.value),
+        ),
+        effect=PlaybookRuleEffect.FORBID,
+        strength=PlaybookRuleStrength.HARD,
+        status=PlaybookRuleStatus.ACTIVE,
+        action_names=("Build_Pylon_Screen",),
+        confidence=0.95,
+    )
+    store.upsert_rule(rule)
+
+    selected = store.rules_for_guard(
+        context=PlaybookContext(
+            agent_race="protoss",
+            opponent_race="zerg",
+            phase=GamePhase.COMBAT,
+            map_name="Simple64",
+        ),
+        approved_hard_rule_ids=(rule.rule_id,),
+    )
+
+    assert selected == (rule,)
+    store.close()
+
+
 def test_playbook_promotes_repeated_producer_failure_as_compact_execution_rule(
     tmp_path: Path,
 ) -> None:

@@ -13,13 +13,18 @@ from rtscortex.config import (
     CortexMacroSettings,
     CortexPlaybookSettings,
     CortexSettings,
+    EnvironmentSettings,
     ExperimentConfig,
     ProviderSettings,
     RunSettings,
     load_config,
 )
 from rtscortex.contracts import EconomyState, ObservationEnvelope, SC2State
-from rtscortex.playbook import create_canary_fixture
+from rtscortex.playbook import (
+    PlaybookStore,
+    analyze_hard_readiness_database,
+    create_canary_fixture,
+)
 from rtscortex.policy.hima import HIMA_PINNED_REVISIONS
 from rtscortex.providers import FakeProvider
 from rtscortex.runtime import factory
@@ -136,6 +141,136 @@ def test_runtime_allows_canary_fixture_only_with_explicit_config_opt_in(
     runtime = factory.build_runtime(config, tmp_path / "run")
 
     asyncio.run(runtime.close())
+
+
+def test_runtime_hard_rule_ids_equal_readiness_approval(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "fixture.sqlite3"
+    fixture = create_canary_fixture(database, expected_git_sha="a" * 40, sc2_patch="4.10")
+    report = analyze_hard_readiness_database(
+        database,
+        expected_git_sha="a" * 40,
+        sc2_patch="4.10",
+        agent_race="protoss",
+        opponent_race="zerg",
+        map_name="Simple64",
+        evaluation_seed_ids=(0,),
+        allow_canary_fixture=True,
+    )
+    readiness_path = tmp_path / "readiness.json"
+    readiness_path.write_text(report.model_dump_json(indent=2), encoding="utf-8")
+    monkeypatch.setenv("RTSCORTEX_PLAYBOOK_HARD_READINESS_PATH", str(readiness_path))
+    config = ExperimentConfig(
+        agent=AgentSettings(variant="cortex"),
+        environment=EnvironmentSettings(
+            agent_race="protoss",
+            opponent_race="zerg",
+            scenario="Simple64",
+        ),
+        cortex=CortexSettings(
+            playbook=CortexPlaybookSettings(
+                enabled=True,
+                database_path=database,
+                learning_mode="frozen",
+                rule_mode="active",
+                allow_canary_fixture=True,
+                hard_readiness_required=True,
+            )
+        ),
+    )
+
+    runtime = factory.build_runtime(config, tmp_path / "run")
+
+    assert isinstance(runtime, CortexRuntimeEngine)
+    assert runtime._approved_hard_rule_ids == (fixture.rule_id,)
+    asyncio.run(runtime.close())
+
+
+def test_additional_hard_rule_invalidates_existing_runtime_approval(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "fixture.sqlite3"
+    fixture = create_canary_fixture(database, expected_git_sha="a" * 40, sc2_patch="4.10")
+    report = analyze_hard_readiness_database(
+        database,
+        expected_git_sha="a" * 40,
+        sc2_patch="4.10",
+        agent_race="protoss",
+        opponent_race="zerg",
+        map_name="Simple64",
+        evaluation_seed_ids=(0,),
+        allow_canary_fixture=True,
+    )
+    readiness_path = tmp_path / "readiness.json"
+    readiness_path.write_text(report.model_dump_json(indent=2), encoding="utf-8")
+    store = PlaybookStore(database)
+    try:
+        store.upsert_rule(
+            fixture.model_copy(
+                update={
+                    "rule_id": "unexpected-hard-rule",
+                    "canonical_key": "unexpected-hard-rule",
+                    "confidence": 0.99,
+                }
+            )
+        )
+    finally:
+        store.close()
+    monkeypatch.setenv("RTSCORTEX_PLAYBOOK_HARD_READINESS_PATH", str(readiness_path))
+    config = ExperimentConfig(
+        agent=AgentSettings(variant="cortex"),
+        environment=EnvironmentSettings(
+            agent_race="protoss",
+            opponent_race="zerg",
+            scenario="Simple64",
+        ),
+        cortex=CortexSettings(
+            playbook=CortexPlaybookSettings(
+                enabled=True,
+                database_path=database,
+                learning_mode="frozen",
+                rule_mode="active",
+                allow_canary_fixture=True,
+                hard_readiness_required=True,
+            )
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="does not match readiness approval"):
+        factory.build_runtime(config, tmp_path / "run")
+
+
+def test_required_hard_readiness_artifact_cannot_be_omitted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("RTSCORTEX_PLAYBOOK_HARD_READINESS_PATH", raising=False)
+    database = tmp_path / "fixture.sqlite3"
+    create_canary_fixture(database, expected_git_sha="a" * 40, sc2_patch="4.10")
+    config = ExperimentConfig(
+        agent=AgentSettings(variant="cortex"),
+        environment=EnvironmentSettings(
+            agent_race="protoss",
+            opponent_race="zerg",
+            scenario="Simple64",
+        ),
+        cortex=CortexSettings(
+            playbook=CortexPlaybookSettings(
+                enabled=True,
+                database_path=database,
+                learning_mode="frozen",
+                rule_mode="active",
+                allow_canary_fixture=True,
+                hard_readiness_required=True,
+            )
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="RTSCORTEX_PLAYBOOK_HARD_READINESS_PATH"):
+        factory.build_runtime(config, tmp_path / "run")
 
 
 def test_build_hima_sidecar_uses_pinned_local_snapshot_and_short_uds(

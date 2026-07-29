@@ -1606,9 +1606,9 @@ Two limitations are deliberately still visible:
     `--evaluation-seeds` set. The execution seed must be a member of that
     three-seed set. Its schema-v1.1 artifact records both values, and the
     formal runner requires an exact set match;
-  - readiness emits `approved_blocking_rule_ids` and an
-    `approved_rule_set_sha256` bound to the baseline hash. If any
-    context-applicable, action/role-reachable active hard forbid rule has a
+  - readiness emits the complete ordered `approved_hard_rule_ids` and an
+    `approved_rule_set_sha256` bound to the baseline hash, selector cap and
+    complete rule semantics. If any Runtime-selectable active hard rule has a
     rejection reason, the whole baseline exits 2. The production canary and
     formal matrix bind the same approved-set hash;
   - qualification accepts a typed
@@ -1657,6 +1657,93 @@ Two limitations are deliberately still visible:
   - all 23 reviewed patches apply to an isolated copy of the recorded gitlink,
     the Worker imports LLM-PySC2 from that copy, and the tracked submodule
     remains clean before and after every arm.
+
+#### 2026-07-29 Runtime hard-rule selection identity closure
+
+- **Status:** implemented in code and deterministic tests; the production
+  baseline still needs a real qualified hard rule before a live canary can run.
+- **Evidence and impact:**
+  1. readiness previously treated only `HARD + FORBID` as executable blocking
+     behavior, while Guard also executes `HARD + REQUIRE`, `PREFER` and
+     `AVOID`;
+  2. Runtime independently selected the highest-confidence hard rules after a
+     dynamic context filter and `max_hard_rules` truncation. It did not consume
+     the readiness-approved IDs or hash;
+  3. one valid FORBID could therefore make readiness pass while an unqualified
+     REQUIRE blocked actions, or while a higher-confidence rule displaced the
+     audited rule from Runtime's capped set.
+- **Root cause:** readiness and Runtime used separate selectors, separate
+  blocking-effect definitions and no startup identity handshake. The approved
+  hash described a readiness subset rather than the complete hard behavior
+  loaded by Guard.
+- **Implemented correction:**
+  - one shared selector now defines the statically applicable, unexpired,
+    confidence-ordered active hard candidate set for the complete match;
+  - dynamic phase/threat/economy conditions remain Guard predicates and no
+    longer cause the loaded hard set to change between ticks;
+  - readiness audits every Runtime candidate, treats REQUIRE as blocking, and
+    rejects every unqualified hard REQUIRE/PREFER/AVOID;
+  - more candidates than `max_hard_rules` is a hard readiness failure rather
+    than silent truncation;
+  - schema v1.1 records candidate IDs, selected IDs, complete approved hard
+    IDs, rejected Runtime IDs, max-hard and a semantic rule-set hash;
+  - formal configs require
+    `RTSCORTEX_PLAYBOOK_HARD_READINESS_PATH`. Factory validates race,
+    opponent, map, evaluation seed, max-hard, IDs and semantic hash before
+    Runtime construction;
+  - every Runtime refresh passes the approved ordered IDs back into the shared
+    selector. Any added, removed, expired, reordered, overflowed or mutated
+    hard rule raises an integrity error before Guard can execute it;
+  - canary and 24-run analyzers require schema v1.1, exact
+    `approved_hard_rule_ids == runtime_selected_hard_rule_ids`, zero rejected
+    Runtime hard rules and no selector overflow.
+- **Acceptance criteria:**
+  - stale active hard REQUIRE makes readiness exit 2;
+  - hard PREFER or AVOID cannot hide behind one valid FORBID;
+  - Runtime-loaded ordered hard IDs equal the readiness-approved ordered IDs;
+  - candidate count above max-hard fails before Recovery, SC2 or GPU startup;
+  - adding, removing, expiring, reordering or changing any approved hard rule
+    invalidates the readiness artifact;
+  - Active and matched Shadow load the same complete hard-rule identity.
+
+#### 2026-07-29 Tactical Response evaluation-kind contract closure
+
+- **Status:** implemented in code and deterministic cross-layer tests.
+- **Evidence and impact:**
+  1. hard qualification and revision invalidation classified
+     `TACTICAL_RESPONSE` with engine/execution guards as execution evidence;
+  2. Guard and Runtime each maintained a separate category mapping which
+     omitted `TACTICAL_RESPONSE`, so the emitted evaluation kind became
+     `strategy`;
+  3. the same qualified hard rule could therefore enter a baseline without
+     strategic A/B evidence, then wait for strategic consequence/regret
+     resolution during its production canary. This could admit insufficient
+     evidence or leave an otherwise valid execution counterfactual unresolved.
+- **Root cause:** category-to-evaluation-kind semantics were duplicated across
+  qualification, lifecycle, Guard and Runtime. The analyzer trusted the
+  Runtime event without comparing it with the readiness rule category.
+- **Implemented correction:**
+  - `evaluation_kind()` is now the sole category classifier;
+  - `ENGINE_INVARIANT`, `EXECUTION_GUARD` and `TACTICAL_RESPONSE` are
+    execution rules; race macro, matchup strategy and map-specific rules are
+    strategy rules;
+  - qualification, revision invalidation, strategic promotion gates, Guard
+    applications, Runtime evaluation creation and terminal resolution all use
+    the shared classifier;
+  - readiness records both the expected evaluation kind and the persisted
+    qualification kind, and rejects any mismatch;
+  - canary analysis derives the expected kind from the readiness category
+    using the same classifier, compares it with Active and Shadow event
+    records, and fails the formal gate on an unapproved or mismatched kind.
+- **Acceptance criteria:**
+  - Tactical Response hard qualification uses execution evidence without
+    requiring strategic A/B;
+  - strategic categories still require paired strategic A/B evidence;
+  - Tactical Response Guard applications emit `execution_guard`;
+  - a succeeded observable Tactical counterfactual resolves
+    `execution_false_block` and never enters the strategic-regret queue;
+  - a canary containing Tactical readiness category plus a `strategy` Runtime
+    event fails `rule_evaluation_kind_consistent`.
 
 ## Repair order
 

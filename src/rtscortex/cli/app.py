@@ -369,6 +369,7 @@ def playbook_hard_readiness(
         map_name=config.environment.scenario,
         evaluation_seed_ids=tuple(evaluation_seeds or ()),
         allow_canary_fixture=allow_canary_fixture,
+        max_hard_rules=config.cortex.playbook.max_hard_rules,
     )
     _write_readiness_report(report, output)
     typer.echo(report.model_dump_json(indent=2))
