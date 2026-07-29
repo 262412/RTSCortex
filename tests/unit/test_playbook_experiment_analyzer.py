@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+from collections import Counter
 from dataclasses import replace
 from pathlib import Path
 
@@ -585,6 +586,126 @@ def test_analysis_evidence_overflow_rejects_formal_comparison() -> None:
     assert comparison["accepted"] is False
 
 
+def test_unique_command_tracking_is_hard_bounded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events = [
+        StoredEvent(
+            event_id=index,
+            run_id="run",
+            episode_id="episode",
+            step_id=index,
+            event_type="execution",
+            created_at=f"2026-07-28T00:00:0{index}+00:00",
+            payload={"command_id": f"command-{index}"},
+        )
+        for index in range(1, 4)
+    ]
+
+    metrics = _metrics_for_events(
+        tmp_path,
+        monkeypatch,
+        events,
+        metric_state_limit=2,
+    )
+
+    assert metrics.terminal_report_count == 2
+    assert metrics.metric_state_retained_key_count == 2
+    assert metrics.metric_state_retention_limit == 2
+    assert metrics.analysis_evidence_overflow_count == 1
+
+
+def test_unique_operation_tracking_is_hard_bounded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events = [
+        StoredEvent(
+            event_id=index,
+            run_id="run",
+            episode_id="episode",
+            step_id=index,
+            event_type="command_lineage",
+            created_at=f"2026-07-28T00:00:0{index}+00:00",
+            payload={"lineage": {"operation_id": f"operation-{index}"}},
+        )
+        for index in range(1, 4)
+    ]
+
+    metrics = _metrics_for_events(
+        tmp_path,
+        monkeypatch,
+        events,
+        metric_state_limit=2,
+    )
+
+    assert metrics.lineaged_operation_count == 2
+    assert metrics.metric_state_retained_key_count == 2
+    assert metrics.analysis_evidence_overflow_count == 1
+
+
+def test_metric_state_overflow_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed = _metrics_for_events(
+        tmp_path,
+        monkeypatch,
+        [
+            StoredEvent(
+                event_id=index,
+                run_id="run",
+                episode_id="episode",
+                step_id=index,
+                event_type="strategic_consequence_attributed",
+                created_at=f"2026-07-28T00:00:0{index}+00:00",
+                payload={
+                    "consequence_type": "threat_unanswered",
+                    "role": "defense",
+                    "semantic_action": "Attack_Unit",
+                    "condition": {"index": index},
+                },
+            )
+            for index in range(1, 3)
+        ],
+        metric_state_limit=1,
+    )
+    metrics = _strict_matrix()
+    metrics[0] = replace(
+        metrics[0],
+        analysis_evidence_overflow_count=observed.analysis_evidence_overflow_count,
+    )
+
+    comparison = _comparison(metrics, baseline_sha256="baseline")
+
+    assert observed.analysis_evidence_overflow_count > 0
+    assert comparison["gates"]["analysis_memory_budget_respected"] is False
+    assert comparison["accepted"] is False
+
+
+def test_analysis_memory_budget_covers_all_retained_state() -> None:
+    budget = analyzer._MetricStateBudget(limit=5)
+    terminal: Counter[str] = Counter()
+    dispatch: Counter[str] = Counter()
+    consequences: Counter[str] = Counter()
+    signatures: Counter[str] = Counter()
+    operations: set[str] = set()
+
+    budget.increment(terminal, "command-terminal")
+    budget.increment(dispatch, "command-dispatch")
+    budget.increment(consequences, "threat_unanswered")
+    budget.increment(signatures, "signature")
+    budget.add(operations, "operation")
+    budget.increment(terminal, "command-overflow")
+    budget.add(operations, "operation-overflow")
+
+    assert budget.retained_key_count == 5
+    assert budget.overflow_count == 2
+    assert "command-overflow" not in terminal
+    assert "operation-overflow" not in operations
+
+
 def test_formal_comparison_rejects_source_mismatched_counterfactual_canary() -> None:
     comparison = _comparison(
         _strict_matrix(),
@@ -1073,6 +1194,33 @@ def _metrics_for_rule_evaluations(
             "playbook_before_sha256": "before",
             "playbook_after_sha256": "after",
         }
+    )
+
+
+def _metrics_for_events(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    events: list[StoredEvent],
+    *,
+    metric_state_limit: int,
+) -> RunMetrics:
+    run_dir = tmp_path / f"run-{len(list(tmp_path.iterdir()))}"
+    run_dir.mkdir()
+    (run_dir / "events.jsonl").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr(analyzer, "read_event_log", lambda _: iter(events))
+    return analyzer._run_metrics(
+        {
+            "mode": "independent_paired",
+            "seed": "0",
+            "arm": "frozen",
+            "exit_code": "0",
+            "run_dir": str(run_dir),
+            "playbook_before_snapshot": str(tmp_path / "before.sqlite3"),
+            "playbook_after_snapshot": str(tmp_path / "after.sqlite3"),
+            "playbook_before_sha256": "before",
+            "playbook_after_sha256": "after",
+        },
+        metric_state_limit=metric_state_limit,
     )
 
 

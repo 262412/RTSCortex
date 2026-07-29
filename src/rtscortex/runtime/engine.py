@@ -1483,7 +1483,7 @@ class RuntimeEngine:
                 f"placement transition action {event.action_name!r} does not match "
                 f"command {lifecycle.command.name!r}"
             )
-        self.store.append_event(
+        self.store.append_durable_event(
             run_id=event.run_id,
             episode_id=event.episode_id,
             step_id=event.step_id,

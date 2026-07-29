@@ -254,6 +254,27 @@ class EventStore:
         self._append_latency_ns += time.perf_counter_ns() - append_started
         return record
 
+    def append_durable_event(
+        self,
+        *,
+        run_id: str,
+        episode_id: str,
+        step_id: int,
+        event_type: str,
+        payload: BaseModel | dict[str, Any],
+    ) -> StoredEvent:
+        """Append one low-frequency event and wait for its durability barrier."""
+
+        record = self.append_event(
+            run_id=run_id,
+            episode_id=episode_id,
+            step_id=step_id,
+            event_type=event_type,
+            payload=payload,
+        )
+        self.flush()
+        return record
+
     def performance_snapshot(self) -> EventStorePerformance:
         mean_ms = (
             0.0

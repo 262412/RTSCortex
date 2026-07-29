@@ -1386,6 +1386,61 @@ Two limitations are deliberately still visible:
   - retained evidence and rule evaluations remain within their configured
     bounds, otherwise formal acceptance fails.
 
+#### 2026-07-29 Builder Lease and placement-evidence audit follow-up
+
+- **Status:** the one P0 false-pass, two P1 pre-experiment defects and the
+  persistence edge identified by the latest review are corrected in code and
+  deterministic tests. The 24-run experiment is still pending, so SCX-PT-039
+  remains open.
+- **Evidence, impact and root cause:**
+  1. the accepted-build audit treated a ledger chain with no `builder_tag` as a
+     complete lease. Terminal effect evidence only proved that some builder was
+     observed and was never joined to the ledger builder. A missing lease, a
+     builder substitution mid-chain or a ledger/effect identity mismatch could
+     therefore satisfy placement coverage;
+  2. the ledger checked only that self-reported cells stayed immutable and did
+     not overlap another self-reported reservation. It did not independently
+     derive structure type and footprint from the build action and emitted
+     world target, so an internally consistent one-cell Gateway or a Terran
+     footprint without add-on clearance could pass;
+  3. retained engineering events and rule evaluations were bounded, but
+     terminal/dispatch command counters, consequence/signature counters and
+     unique operation IDs were not. Analyzer memory remained linear in unique
+     identities and could fail before producing a fail-closed overflow report;
+  4. the Runtime acknowledged `/v1/placement/transition` after enqueueing the
+     event but before the background writer committed it. A simultaneous
+     Worker/Runtime failure in that interval could lose the most recent
+     transition.
+- **Implemented correction:**
+  - every accepted build now requires a non-empty effect builder tag, the same
+    tag on every ledger transition, an `acquired` state on the initial reserve
+    transition and a matching `released` state later in the chain.
+    `builder_lease_complete` is a required engineering gate;
+  - the acceptance layer has a canonical three-race placement registry. It
+    recomputes exact world-grid cells from `action_name` and
+    `emitted_target_position`, including the two-column Terran add-on
+    reservation, then requires ledger structure/cells and EffectVerifier
+    width/height/cells to match. A contract test locks this registry to the
+    Bridge `BUILD_SPECS`, and
+    `placement_ledger_canonical_footprint_complete` is a required gate;
+  - all command-, operation-, consequence- and signature-keyed analyzer state
+    shares one fixed key budget. Any excess increments
+    `analysis_evidence_overflow_count`, causing
+    `analysis_memory_budget_respected` and the formal comparison to fail;
+  - Placement transitions use a low-frequency `append_durable_event` path.
+    The Runtime waits for the SQLite commit and JSONL writer barrier before
+    returning the HTTP acknowledgement or allowing a later terminal report.
+- **Acceptance criteria:**
+  - a missing, empty, changed or effect-mismatched builder tag fails accepted
+    build coverage;
+  - ledger structure and cells equal the canonical action footprint and the
+    EffectVerifier footprint for every accepted build;
+  - Terran add-on clearance is part of the audited reservation;
+  - every retained keyed metric is covered by a fixed budget and any overflow
+    rejects formal acceptance;
+  - a successful Placement transition HTTP acknowledgement is observable from
+    a separate SQLite connection and from the flushed JSONL journal.
+
 ## Repair order
 
 1. Freeze characterization tests and add the cross-layer `OperationKey`,
@@ -1426,8 +1481,10 @@ build effect confirmation >= 90%
 build failure/timeout <= 10%
 validated placement target equals emitted and verified target = 100%
 accepted build builder-tag provenance = 100%
+accepted build Builder Lease acquisition, identity and release = 100%
 authoritative placement ledger evidence is present and transitions are legal
 accepted-build placement ledger coverage = 100%
+ledger and EffectVerifier cells equal canonical action footprint = 100%
 terminal placement orphan reservations = 0
 placement structure, footprint and command identity remain immutable
 placement transition game loops are monotonic

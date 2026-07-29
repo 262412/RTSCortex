@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 import threading
 from pathlib import Path
 
@@ -51,6 +52,34 @@ def test_event_store_persists_events_lessons_and_episode(tmp_path: Path) -> None
 def test_semantic_memory_is_explicitly_disabled() -> None:
     hits = asyncio.run(DisabledMemoryRetriever().search("enemy strategy"))
     assert hits == []
+
+
+def test_append_durable_event_waits_for_sqlite_and_journal_barrier(tmp_path: Path) -> None:
+    database = tmp_path / "events.sqlite3"
+    journal = tmp_path / "events.jsonl"
+    store = EventStore(
+        database,
+        journal,
+        flush_event_limit=10_000,
+        flush_interval_seconds=60.0,
+    )
+
+    record = store.append_durable_event(
+        run_id="run",
+        episode_id="episode",
+        step_id=1,
+        event_type="placement_ledger_transition",
+        payload={"transition_id": "placement-transition:test"},
+    )
+
+    with sqlite3.connect(database) as connection:
+        row = connection.execute(
+            "SELECT event_id, event_type FROM events WHERE event_id = ?",
+            (record.event_id,),
+        ).fetchone()
+    assert row == (record.event_id, "placement_ledger_transition")
+    assert f'"event_id": {record.event_id}' in journal.read_text(encoding="utf-8")
+    store.close()
 
 
 def test_episode_summaries_persist_with_run_isolation(tmp_path: Path) -> None:

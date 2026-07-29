@@ -2,10 +2,16 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from rtscortex_llm_pysc2.extractor import BUILD_SPECS
+
 from rtscortex.evaluation.engineering import (
     REQUIRED_ENGINEERING_GATES,
     EngineeringAccumulator,
     build_engineering_gate_report,
+)
+from rtscortex.evaluation.placement import (
+    CANONICAL_PLACEMENT_SPECS,
+    canonical_footprint_cells,
 )
 from rtscortex.memory import StoredEvent
 
@@ -453,29 +459,36 @@ def _ledger_transition(
     command_id: str | None = None,
     previous_state: str = "unreserved",
     game_loop: int | None = None,
+    action_name: str | None = None,
+    builder_tag: str | None = "0xb1",
+    builder_lease_state: str | None = None,
 ) -> StoredEvent:
     resolved_command_id = command_id or f"command:{reservation_id}"
+    resolved_lease_state = (
+        builder_lease_state
+        if builder_lease_state is not None
+        else "acquired"
+        if next_state == "reserved" and builder_tag
+        else "released"
+        if builder_tag
+        and next_state
+        in {
+            "occupied",
+            "released",
+            "temporary_suppressed",
+            "permanent_invalid",
+        }
+        else None
+    )
     return _event(
         event_id,
         "placement_ledger_transition",
         {
             "command_id": resolved_command_id,
-            "action_name": f"Build_{structure_type}_Screen",
+            "action_name": action_name or f"Build_{structure_type}_Screen",
             "transition_id": f"placement-transition:{event_id:064x}",
-            "builder_tag": "0xb1",
-            "builder_lease_state": (
-                "acquired"
-                if next_state == "reserved"
-                else "released"
-                if next_state
-                in {
-                    "occupied",
-                    "released",
-                    "temporary_suppressed",
-                    "permanent_invalid",
-                }
-                else None
-            ),
+            "builder_tag": builder_tag,
+            "builder_lease_state": resolved_lease_state,
             "reservation_id": reservation_id,
             "structure_type": structure_type,
             "footprint_cells": cells,
@@ -495,13 +508,23 @@ def _accepted_build(
     command_id: str,
     reservation_id: str,
     status: str = "succeeded",
+    action_name: str = "Build_Pylon_Screen",
+    builder_tag: str | None = "0xb1",
+    target_position: tuple[float, float] = (22.0, 24.0),
+    occupied_grid_cells: list[list[int]] | None = None,
 ) -> StoredEvent:
+    spec = CANONICAL_PLACEMENT_SPECS[action_name]
+    cells = (
+        sorted(canonical_footprint_cells(target_position, spec))
+        if occupied_grid_cells is None
+        else occupied_grid_cells
+    )
     return _event(
         event_id,
         "execution",
         {
             "command_id": command_id,
-            "action_name": "Build_Pylon_Screen",
+            "action_name": action_name,
             "status": status,
             "execution_stage": "effect_verification",
             "primitive_trace": [
@@ -513,10 +536,13 @@ def _accepted_build(
             "effect_evidence": {
                 "effect_kind": "build",
                 "reservation_id": reservation_id,
-                "target_position": [22.0, 24.0],
-                "validated_target_position": [22.0, 24.0],
-                "emitted_target_position": [22.0, 24.0],
-                "builder_tag": "0xb1",
+                "target_position": list(target_position),
+                "validated_target_position": list(target_position),
+                "emitted_target_position": list(target_position),
+                "builder_tag": builder_tag,
+                "footprint_width": spec.footprint + (2 if spec.reserves_addon_space else 0),
+                "footprint_height": spec.footprint,
+                "occupied_grid_cells": cells,
                 "build_started": True,
             },
         },
@@ -656,3 +682,200 @@ def test_terminal_episode_rejects_orphan_reservation(tmp_path: Path) -> None:
 
     assert report["diagnostics"]["orphan_reservation_count"] == 1
     assert report["gates"]["placement_ledger_terminal_complete"]["passed"] is False
+
+
+def test_accepted_build_without_ledger_lease_fails_coverage(tmp_path: Path) -> None:
+    events = _complete_pylon_chain(builder_tag=None)
+
+    report = build_engineering_gate_report(
+        [*events, _accepted_build(4, command_id="build-one", reservation_id="placement:one")],
+        run_dir=tmp_path,
+        natural_run_baseline_bytes_per_loop=100.0,
+    )
+
+    assert report["diagnostics"]["builder_lease_complete_count"] == 0
+    assert report["metrics"]["placement_ledger_coverage"] == 0.0
+    assert report["gates"]["builder_lease_complete"]["passed"] is False
+
+
+def test_ledger_builder_must_match_effect_builder(tmp_path: Path) -> None:
+    events = _complete_pylon_chain(builder_tag="0xb2")
+
+    report = build_engineering_gate_report(
+        [*events, _accepted_build(4, command_id="build-one", reservation_id="placement:one")],
+        run_dir=tmp_path,
+        natural_run_baseline_bytes_per_loop=100.0,
+    )
+
+    assert report["diagnostics"]["builder_lease_complete_count"] == 0
+    assert report["gates"]["builder_lease_complete"]["passed"] is False
+
+
+def test_ledger_builder_tag_cannot_change_mid_chain(tmp_path: Path) -> None:
+    events = _complete_pylon_chain(builder_tag="0xb1")
+    events[1].payload["builder_tag"] = "0xb2"
+
+    report = build_engineering_gate_report(
+        [*events, _accepted_build(4, command_id="build-one", reservation_id="placement:one")],
+        run_dir=tmp_path,
+        natural_run_baseline_bytes_per_loop=100.0,
+    )
+
+    assert report["diagnostics"]["builder_lease_complete_count"] == 0
+    assert report["gates"]["builder_lease_complete"]["passed"] is False
+
+
+def test_empty_builder_tag_does_not_count_as_lease(tmp_path: Path) -> None:
+    events = _complete_pylon_chain(builder_tag="")
+
+    report = build_engineering_gate_report(
+        [
+            *events,
+            _accepted_build(
+                4,
+                command_id="build-one",
+                reservation_id="placement:one",
+                builder_tag="",
+            ),
+        ],
+        run_dir=tmp_path,
+        natural_run_baseline_bytes_per_loop=100.0,
+    )
+
+    assert report["diagnostics"]["builder_lease_complete_count"] == 0
+    assert report["gates"]["builder_lease_complete"]["passed"] is False
+
+
+def test_ledger_cells_must_match_canonical_action_footprint(tmp_path: Path) -> None:
+    events = _complete_pylon_chain(
+        builder_tag="0xb1",
+        cells=[[22, 24]],
+    )
+
+    report = build_engineering_gate_report(
+        [*events, _accepted_build(4, command_id="build-one", reservation_id="placement:one")],
+        run_dir=tmp_path,
+        natural_run_baseline_bytes_per_loop=100.0,
+    )
+
+    assert report["diagnostics"]["canonical_footprint_mismatch_count"] == 1
+    assert report["gates"]["placement_ledger_canonical_footprint_complete"]["passed"] is False
+
+
+def test_ledger_structure_type_must_match_build_action(tmp_path: Path) -> None:
+    events = _complete_pylon_chain(
+        builder_tag="0xb1",
+        structure_type="Gateway",
+    )
+
+    report = build_engineering_gate_report(
+        [*events, _accepted_build(4, command_id="build-one", reservation_id="placement:one")],
+        run_dir=tmp_path,
+        natural_run_baseline_bytes_per_loop=100.0,
+    )
+
+    assert report["diagnostics"]["canonical_footprint_mismatch_count"] == 1
+    assert report["gates"]["placement_ledger_canonical_footprint_complete"]["passed"] is False
+
+
+def test_ledger_cells_must_match_effect_evidence_cells(tmp_path: Path) -> None:
+    events = _complete_pylon_chain(builder_tag="0xb1")
+
+    report = build_engineering_gate_report(
+        [
+            *events,
+            _accepted_build(
+                4,
+                command_id="build-one",
+                reservation_id="placement:one",
+                occupied_grid_cells=[[22, 24]],
+            ),
+        ],
+        run_dir=tmp_path,
+        natural_run_baseline_bytes_per_loop=100.0,
+    )
+
+    assert report["diagnostics"]["canonical_footprint_mismatch_count"] == 1
+    assert report["gates"]["placement_ledger_canonical_footprint_complete"]["passed"] is False
+
+
+def test_terran_addon_cells_are_verified_not_only_self_reported(tmp_path: Path) -> None:
+    action_name = "Build_Barracks_Screen"
+    spec = CANONICAL_PLACEMENT_SPECS[action_name]
+    canonical_cells = sorted(canonical_footprint_cells((22.0, 24.0), spec))
+    events = _complete_pylon_chain(
+        builder_tag="0xb1",
+        cells=[list(cell) for cell in canonical_cells[:-1]],
+        structure_type="Barracks",
+        action_name=action_name,
+    )
+
+    report = build_engineering_gate_report(
+        [
+            *events,
+            _accepted_build(
+                4,
+                command_id="build-one",
+                reservation_id="placement:one",
+                action_name=action_name,
+            ),
+        ],
+        run_dir=tmp_path,
+        natural_run_baseline_bytes_per_loop=100.0,
+    )
+
+    assert len(canonical_cells) == 15
+    assert report["diagnostics"]["canonical_footprint_mismatch_count"] == 1
+    assert report["gates"]["placement_ledger_canonical_footprint_complete"]["passed"] is False
+
+
+def test_acceptance_placement_specs_match_bridge_build_specs() -> None:
+    assert set(CANONICAL_PLACEMENT_SPECS) == set(BUILD_SPECS)
+    for action_name, bridge_spec in BUILD_SPECS.items():
+        acceptance_spec = CANONICAL_PLACEMENT_SPECS[action_name]
+        assert acceptance_spec.structure_type == bridge_spec.target_structure
+        assert acceptance_spec.footprint == bridge_spec.footprint
+        assert acceptance_spec.reserves_addon_space == bridge_spec.reserves_addon_space
+
+
+def _complete_pylon_chain(
+    *,
+    builder_tag: str | None,
+    cells: list[list[int]] | None = None,
+    structure_type: str = "Pylon",
+    action_name: str = "Build_Pylon_Screen",
+) -> list[StoredEvent]:
+    resolved_cells = cells or [[21, 23], [22, 23], [21, 24], [22, 24]]
+    return [
+        _ledger_transition(
+            1,
+            reservation_id="placement:one",
+            structure_type=structure_type,
+            cells=resolved_cells,
+            command_id="build-one",
+            action_name=action_name,
+            builder_tag=builder_tag,
+        ),
+        _ledger_transition(
+            2,
+            reservation_id="placement:one",
+            structure_type=structure_type,
+            cells=resolved_cells,
+            command_id="build-one",
+            previous_state="reserved",
+            next_state="occupied",
+            action_name=action_name,
+            builder_tag=builder_tag,
+        ),
+        _ledger_transition(
+            3,
+            reservation_id="placement:one",
+            structure_type=structure_type,
+            cells=resolved_cells,
+            command_id="build-one",
+            previous_state="occupied",
+            next_state="released",
+            action_name=action_name,
+            builder_tag=builder_tag,
+        ),
+    ]

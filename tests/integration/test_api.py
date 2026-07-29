@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -68,6 +69,17 @@ def test_versioned_api_health_and_tick(tmp_path: Path) -> None:
                     ).model_dump(mode="json"),
                 )
                 assert placement.json() == {"status": "recorded"}
+                with sqlite3.connect(tmp_path / "events.sqlite3") as connection:
+                    durable_count = connection.execute(
+                        """
+                        SELECT COUNT(*) FROM events
+                        WHERE event_type = 'placement_ledger_transition'
+                        """
+                    ).fetchone()
+                assert durable_count == (1,)
+                assert "placement_ledger_transition" in (tmp_path / "events.jsonl").read_text(
+                    encoding="utf-8"
+                )
                 placement_events = runtime.store.events_of_type(
                     "run-1",
                     "episode-1",

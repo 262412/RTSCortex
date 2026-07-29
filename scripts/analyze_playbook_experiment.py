@@ -32,6 +32,35 @@ _ERROR_CONSEQUENCES = frozenset(
     }
 )
 MAX_RULE_EVALUATIONS = 100_000
+MAX_METRIC_STATE_KEYS = 100_000
+
+
+@dataclass
+class _MetricStateBudget:
+    """Bound all command-, operation-, and signature-keyed analyzer state."""
+
+    limit: int = MAX_METRIC_STATE_KEYS
+    retained_key_count: int = 0
+    overflow_count: int = 0
+
+    def increment(self, values: Counter[str], key: str) -> None:
+        if key in values:
+            values[key] += 1
+            return
+        if self.retained_key_count >= self.limit:
+            self.overflow_count += 1
+            return
+        values[key] = 1
+        self.retained_key_count += 1
+
+    def add(self, values: set[str], key: str) -> None:
+        if key in values:
+            return
+        if self.retained_key_count >= self.limit:
+            self.overflow_count += 1
+            return
+        values.add(key)
+        self.retained_key_count += 1
 
 
 @dataclass(frozen=True)
@@ -96,6 +125,8 @@ class RunMetrics:
     analysis_peak_rss_kib: int = 0
     analysis_rss_per_10k_game_loops: float = 0.0
     analysis_evidence_overflow_count: int = 0
+    metric_state_retained_key_count: int = 0
+    metric_state_retention_limit: int = MAX_METRIC_STATE_KEYS
     active_hard_block_records: tuple[tuple[str, int, str], ...] = ()
     counterfactual_state_records: tuple[tuple[int, str, str], ...] = ()
 
@@ -144,6 +175,7 @@ def _run_metrics(
     natural_run_baseline_bytes_per_loop: float | None = None,
     expected_git_sha: str | None = None,
     recovery_evidence: dict[str, Any] | None = None,
+    metric_state_limit: int = MAX_METRIC_STATE_KEYS,
 ) -> RunMetrics:
     run_dir_value = row.get("run_dir", "").strip()
     run_dir = (
@@ -170,6 +202,7 @@ def _run_metrics(
     event_count = 0
     performance: dict[str, Any] = {}
     engineering_accumulator = EngineeringAccumulator()
+    metric_state_budget = _MetricStateBudget(limit=metric_state_limit)
     if journal.is_file():
         for event in read_event_log(journal):
             engineering_accumulator.ingest(event)
@@ -188,7 +221,7 @@ def _run_metrics(
                 episode_result = event.payload
             elif event.event_type == "execution":
                 command_id = str(event.payload.get("command_id"))
-                terminal_counts[command_id] += 1
+                metric_state_budget.increment(terminal_counts, command_id)
                 candidate_outside_dispatch += (
                     event.payload.get("failure_code") == "candidate_outside_dispatch"
                 )
@@ -198,17 +231,23 @@ def _run_metrics(
             ):
                 command = event.payload.get("command")
                 if isinstance(command, dict):
-                    dispatch_counts[str(command.get("command_id"))] += 1
+                    metric_state_budget.increment(
+                        dispatch_counts,
+                        str(command.get("command_id")),
+                    )
             elif event.event_type == "command_lineage":
                 lineage = event.payload.get("lineage", event.payload)
                 operation_id = lineage.get("operation_id") if isinstance(lineage, dict) else None
                 if isinstance(operation_id, str):
-                    lineaged_operation_ids.add(operation_id)
+                    metric_state_budget.add(lineaged_operation_ids, operation_id)
             elif event.event_type == "strategic_consequence_attributed":
                 consequence_type = str(event.payload.get("consequence_type", "unknown"))
-                consequences[consequence_type] += 1
+                metric_state_budget.increment(consequences, consequence_type)
                 if consequence_type in _ERROR_CONSEQUENCES:
-                    error_signatures[_consequence_signature(event.payload)] += 1
+                    metric_state_budget.increment(
+                        error_signatures,
+                        _consequence_signature(event.payload),
+                    )
             elif event.event_type == "playbook_rule_applied":
                 playbook_applications += 1
                 playbook_nonzero_score_applications += (
@@ -417,7 +456,9 @@ def _run_metrics(
     )
     peak_rss_kib = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
     analysis_evidence_overflow_count = (
-        engineering_accumulator.retention_overflow_count + rule_evaluation_overflow_count
+        engineering_accumulator.retention_overflow_count
+        + rule_evaluation_overflow_count
+        + metric_state_budget.overflow_count
     )
     return RunMetrics(
         mode=row["mode"],
@@ -502,6 +543,8 @@ def _run_metrics(
             peak_rss_kib * 10_000 / max_game_loop if max_game_loop else 0.0
         ),
         analysis_evidence_overflow_count=analysis_evidence_overflow_count,
+        metric_state_retained_key_count=metric_state_budget.retained_key_count,
+        metric_state_retention_limit=metric_state_budget.limit,
         active_hard_block_records=active_hard_block_records,
         counterfactual_state_records=counterfactual_state_records,
     )

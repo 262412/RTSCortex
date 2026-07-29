@@ -9,6 +9,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from rtscortex.evaluation.placement import (
+    CANONICAL_PLACEMENT_SPECS,
+    canonical_footprint_cells,
+)
 from rtscortex.memory import StoredEvent
 
 ENGINEERING_GATES_FILENAME = "engineering-gates.json"
@@ -24,9 +28,11 @@ REQUIRED_ENGINEERING_GATES = (
     "build_failure_rate",
     "placement_identity_complete",
     "builder_provenance_complete",
+    "builder_lease_complete",
     "placement_ledger_evidence_present",
     "placement_ledger_coverage",
     "placement_ledger_transitions_valid",
+    "placement_ledger_canonical_footprint_complete",
     "placement_ledger_terminal_complete",
     "cross_type_footprint_overlap_zero",
     "nonspatial_quarantine_zero",
@@ -265,9 +271,19 @@ def build_engineering_gate_report(
         "builder_provenance_complete": (
             None if build_count == 0 else builder_complete == build_count
         ),
+        "builder_lease_complete": (
+            None
+            if build_count == 0
+            else int(ledger["builder_lease_complete_count"] or 0) == build_count
+        ),
         "placement_ledger_evidence_present": int(ledger["transition_count"] or 0) > 0,
         "placement_ledger_coverage": ledger["coverage"],
         "placement_ledger_transitions_valid": int(ledger["invalid_transition_count"] or 0) == 0,
+        "placement_ledger_canonical_footprint_complete": (
+            None
+            if build_count == 0
+            else int(ledger["canonical_footprint_complete_count"] or 0) == build_count
+        ),
         "placement_ledger_terminal_complete": int(ledger["orphan_reservation_count"] or 0) == 0,
         "cross_type_footprint_overlap_zero": int(ledger["overlap_count"] or 0) == 0,
         "nonspatial_quarantine_zero": int(ledger["nonspatial_quarantine_count"] or 0) == 0,
@@ -545,6 +561,8 @@ def _placement_ledger_audit(
             if payload.get("actor_failure") is True or payload.get("failure_class") == "nonspatial":
                 nonspatial_quarantines += 1
     complete_builds = 0
+    complete_builder_leases = 0
+    complete_canonical_footprints = 0
     for _, report in accepted_builds:
         command_id = report.get("command_id")
         evidence = _evidence(report)
@@ -566,12 +584,29 @@ def _placement_ledger_audit(
             "temporary_suppressed",
             "permanent_invalid",
         }
-        builder_bound = any(isinstance(item.get("builder_tag"), str) for item in chain)
-        lease_complete = not builder_bound or (
-            chain[0].get("builder_lease_state") == "acquired"
-            and any(item.get("builder_lease_state") == "released" for item in chain[1:])
+        effect_builder = evidence.get("builder_tag")
+        lease_complete = (
+            isinstance(effect_builder, str)
+            and bool(effect_builder)
+            and chain[0].get("builder_tag") == effect_builder
+            and chain[0].get("builder_lease_state") == "acquired"
+            and all(item.get("builder_tag") == effect_builder for item in chain)
+            and any(
+                item.get("builder_tag") == effect_builder
+                and item.get("builder_lease_state") == "released"
+                for item in chain[1:]
+            )
         )
-        if starts_reserved and terminal_complete and lease_complete and (not confirmed or occupied):
+        canonical_complete = _canonical_placement_complete(report, chain)
+        complete_builder_leases += lease_complete
+        complete_canonical_footprints += canonical_complete
+        if (
+            starts_reserved
+            and terminal_complete
+            and lease_complete
+            and canonical_complete
+            and (not confirmed or occupied)
+        ):
             complete_builds += 1
     accepted_build_count = len(accepted_builds)
     return {
@@ -581,9 +616,58 @@ def _placement_ledger_audit(
         "invalid_redispatch_count": invalid_redispatches,
         "nonspatial_quarantine_count": nonspatial_quarantines,
         "accepted_build_ledger_count": complete_builds,
+        "builder_lease_complete_count": complete_builder_leases,
+        "canonical_footprint_complete_count": complete_canonical_footprints,
+        "canonical_footprint_mismatch_count": (
+            accepted_build_count - complete_canonical_footprints
+        ),
         "orphan_reservation_count": len(active),
         "coverage": (None if accepted_build_count == 0 else complete_builds / accepted_build_count),
     }
+
+
+def _canonical_placement_complete(
+    report: dict[str, Any],
+    chain: Sequence[dict[str, Any]],
+) -> bool:
+    action_name = report.get("action_name")
+    spec = CANONICAL_PLACEMENT_SPECS.get(action_name) if isinstance(action_name, str) else None
+    evidence = _evidence(report)
+    emitted = _world_position(evidence.get("emitted_target_position"))
+    effect_cells = _grid_cells(evidence.get("occupied_grid_cells"))
+    if spec is None or emitted is None or effect_cells is None:
+        return False
+    expected_cells = canonical_footprint_cells(emitted, spec)
+    expected_width = spec.footprint + (2 if spec.reserves_addon_space else 0)
+    return (
+        evidence.get("footprint_width") == expected_width
+        and evidence.get("footprint_height") == spec.footprint
+        and effect_cells == expected_cells
+        and all(
+            item.get("structure_type") == spec.structure_type
+            and _grid_cells(item.get("footprint_cells")) == expected_cells
+            for item in chain
+        )
+    )
+
+
+def _world_position(value: Any) -> tuple[float, float] | None:
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        return None
+    try:
+        return float(value[0]), float(value[1])
+    except (TypeError, ValueError):
+        return None
+
+
+def _grid_cells(value: Any) -> frozenset[tuple[int, int]] | None:
+    if not isinstance(value, list):
+        return None
+    try:
+        cells = frozenset((int(cell[0]), int(cell[1])) for cell in value)
+    except (IndexError, TypeError, ValueError):
+        return None
+    return cells if cells else None
 
 
 def _repeated_retreat_arrivals(events: Sequence[StoredEvent]) -> int:
