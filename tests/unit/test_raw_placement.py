@@ -344,6 +344,68 @@ def test_expansion_rejects_unpathable_full_map_footprint() -> None:
     assert service.active_reservation_count == 0
 
 
+def test_target_state_revision_normalizes_foreign_boolean_scalars(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    foreign_bool = type("bool", (), {"__bool__": lambda self: True})
+    service = RawPlacementService(unit_names={})
+    observation = SimpleNamespace(
+        raw_units=[],
+        feature_units=[],
+        feature_screen=object(),
+    )
+    monkeypatch.setattr(
+        extractor_module,
+        "world_build_target_is_legal",
+        lambda *args, **kwargs: foreign_bool(),
+    )
+
+    revision = service._target_state_revision(
+        observation,
+        "Build_Pylon_Screen",
+        (30.0, 25.0),
+        anchor_tag=None,
+    )
+
+    assert len(revision) == 64
+
+
+def test_builder_approach_does_not_route_through_dynamic_structure_occupancy() -> None:
+    class Grid:
+        def __init__(self, value: int, size: int = 16) -> None:
+            self.shape = (size, size)
+            self.rows = [[value] * size for _ in range(size)]
+
+        def __getitem__(self, index: int) -> list[int]:
+            return self.rows[index]
+
+    pathable = Grid(1)
+    player_relative = Grid(0)
+    for y in range(16):
+        player_relative[y][7] = 1
+    builder = SimpleNamespace(
+        tag=0xB1,
+        unit_type=2,
+        alliance=1,
+        is_on_screen=True,
+        x=3,
+        y=8,
+        radius=0.375,
+    )
+
+    reachable = extractor_module._builder_reachable_cells(
+        pathable,
+        player_relative,
+        [builder],
+        {2: "Probe"},
+        16,
+        builder_tags=(0xB1,),
+    )
+
+    assert (6, 8) in reachable
+    assert (8, 8) not in reachable
+
+
 def test_raw_placement_service_quarantines_pre_dispatch_world_target() -> None:
     service = RawPlacementService(unit_names={})
 

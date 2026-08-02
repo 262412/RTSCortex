@@ -1256,13 +1256,15 @@ class RawPlacementService:
         ):
             from rtscortex_llm_pysc2.extractor import world_build_target_is_legal
 
-            exact_world_legal = world_build_target_is_legal(
-                observation,
-                action_name,
-                target,
-                preferred_anchor_tag=anchor_tag,
-                unit_names=self.unit_names,
-                world_to_minimap_transform=self._world_to_minimap_transform,
+            exact_world_legal = bool(
+                world_build_target_is_legal(
+                    observation,
+                    action_name,
+                    target,
+                    preferred_anchor_tag=anchor_tag,
+                    unit_names=self.unit_names,
+                    world_to_minimap_transform=self._world_to_minimap_transform,
+                )
             )
         payload = {
             "action_name": action_name,

@@ -2478,6 +2478,7 @@ def _build_screen_candidates(
         if action_name in {"Build_CreepTumor_Queen_Screen", TUMOR_CONTROLLER_ACTION}
         else _builder_reachable_cells(
             pathable,
+            player_relative,
             feature_units,
             unit_names,
             screen_size,
@@ -2664,6 +2665,7 @@ def _build_screen_position_is_legal(
         if spec.target_structure == "CreepTumorQueen"
         else _builder_reachable_cells(
             pathable,
+            player_relative,
             _value(observation, "feature_units", ()),
             unit_names,
             screen_size,
@@ -2794,6 +2796,7 @@ def _valid_build_positions(
 
 def _builder_reachable_cells(
     pathable: Any,
+    player_relative: Any,
     feature_units: Sequence[Any],
     unit_names: Mapping[int, str],
     screen_size: int,
@@ -2803,8 +2806,8 @@ def _builder_reachable_cells(
     """Return screen cells reachable from visible worker builders."""
 
     allowed_tags = None if builder_tags is None else {int(tag) for tag in builder_tags}
-    starts = {
-        (int(_value(unit, "x", 0)), int(_value(unit, "y", 0)))
+    builders = [
+        unit
         for unit in feature_units
         if int(_value(unit, "alliance", 0)) == 1
         and bool(_value(unit, "is_on_screen", True))
@@ -2813,8 +2816,8 @@ def _builder_reachable_cells(
             if allowed_tags is not None
             else _unit_name(unit, unit_names) in {"Probe", "SCV", "Drone"}
         )
-    }
-    if allowed_tags is not None and not starts:
+    ]
+    if allowed_tags is not None and not builders:
         selected_workers = [
             unit
             for unit in feature_units
@@ -2824,22 +2827,33 @@ def _builder_reachable_cells(
             and _unit_name(unit, unit_names) in {"Probe", "SCV", "Drone"}
         ]
         if len(selected_workers) == 1:
-            starts = {
-                (
-                    int(_value(selected_workers[0], "x", 0)),
-                    int(_value(selected_workers[0], "y", 0)),
-                )
-            }
+            builders = selected_workers
+    starts = {(int(_value(unit, "x", 0)), int(_value(unit, "y", 0))) for unit in builders}
     if not starts:
         return frozenset() if builder_tags is not None else None
 
     ratio = max(1, int(screen_size / SCREEN_WORLD_GRID))
+    builder_footprints: set[tuple[int, int]] = set()
+    for builder in builders:
+        center_x = int(_value(builder, "x", 0))
+        center_y = int(_value(builder, "y", 0))
+        radius = max(1, math.ceil(float(_value(builder, "radius", 0.375)) * ratio))
+        builder_footprints.update(
+            (center_x + dx, center_y + dy)
+            for dx in range(-radius, radius + 1)
+            for dy in range(-radius, radius + 1)
+            if dx * dx + dy * dy <= radius * radius
+        )
+
+    def traversable(x: int, y: int) -> bool:
+        return pathable[y][x] == 1 and (player_relative[y][x] == 0 or (x, y) in builder_footprints)
+
     frontier: list[tuple[int, int]] = []
     for start_x, start_y in sorted(starts):
         if (
             0 <= start_x < screen_size
             and 0 <= start_y < screen_size
-            and pathable[start_y][start_x] == 1
+            and traversable(start_x, start_y)
         ):
             frontier.append((start_x, start_y))
             continue
@@ -2851,7 +2865,7 @@ def _builder_reachable_cells(
                 if max(abs(dx), abs(dy)) == radius
                 and 0 <= start_x + dx < screen_size
                 and 0 <= start_y + dy < screen_size
-                and pathable[start_y + dy][start_x + dx] == 1
+                and traversable(start_x + dx, start_y + dy)
             )
             if nearby:
                 frontier.extend(nearby)
@@ -2877,7 +2891,7 @@ def _builder_reachable_cells(
                 neighbor in reachable
                 or not 0 <= neighbor[0] < screen_size
                 or not 0 <= neighbor[1] < screen_size
-                or pathable[neighbor[1]][neighbor[0]] != 1
+                or not traversable(neighbor[0], neighbor[1])
             ):
                 continue
             reachable.add(neighbor)
