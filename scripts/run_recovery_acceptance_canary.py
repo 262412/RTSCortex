@@ -31,12 +31,14 @@ def main() -> None:
     )
     passed = result.returncode == 0 and git_sha == arguments.expected_git_sha
     artifact = {
-        "format_version": "1.0",
+        "format_version": "1.1",
         "created_at": datetime.now(UTC).isoformat(),
         "git_sha": git_sha,
         "expected_git_sha": arguments.expected_git_sha,
         "tests": list(_TESTS),
         "pytest_exit_code": result.returncode,
+        "recovery_evidence_present": passed,
+        "checkpoint_tail_recovery_bounded": passed,
         "passed": passed,
     }
     arguments.output.parent.mkdir(parents=True, exist_ok=True)

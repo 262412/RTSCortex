@@ -46,7 +46,7 @@ from rtscortex.cortex import (
     SituationAssessment,
     TacticalIntent,
 )
-from rtscortex.evaluation import compute_cortex_observability
+from rtscortex.evaluation import build_engineering_gate_report, compute_cortex_observability
 from rtscortex.memory import EventStore
 from rtscortex.playbook import (
     CortexPlaybookReviewer,
@@ -76,6 +76,7 @@ from rtscortex.policy.models import (
 )
 from rtscortex.providers import FakeProvider
 from rtscortex.runtime import CortexRuntimeEngine
+from rtscortex.runtime.engine import CommandStatus
 
 
 class _FakeMacroClient:
@@ -330,6 +331,84 @@ def test_global_defense_cap_blocks_seventh_planner_dispatch_regardless_of_role(
         "defense_inventory_cap_blocked",
     )
     assert [event.payload["command_id"] for event in blocked] == [command.command_id]
+    asyncio.run(runtime.close())
+
+
+def test_unselected_same_tick_pending_phoenix_does_not_reserve_inventory(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    runtime = CortexRuntimeEngine(
+        config=_config(tmp_path, macro=False),
+        store=store,
+        provider=FakeProvider(),
+    )
+    observation = ObservationEnvelope(
+        run_id="cortex-run",
+        episode_id="episode-1",
+        step_id=7,
+        game_loop=112,
+        state=SC2State(),
+    )
+    unselected = ActionCommand(
+        command_id="unselected-phoenix",
+        actor="Developer/Stargate-1",
+        name="Train_Phoenix",
+        created_game_loop=112,
+        ttl_game_loops=16,
+        source=ActionSource.PLANNER,
+    )
+    runtime._transition_command(unselected, CommandStatus.PENDING, observation)
+
+    outcome, inventory = runtime._apply_defense_inventory_guard([], observation)
+
+    assert outcome.accepted == []
+    phoenix = next(item for item in inventory if item["item_type"] == "Phoenix")
+    assert phoenix["reserved"] == 0
+    assert phoenix["effective_count"] == 0
+    assert phoenix["decision"] == "within_cap"
+    asyncio.run(runtime.close())
+
+
+def test_retained_phoenix_dispatch_still_atomically_blocks_seventh(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    runtime = CortexRuntimeEngine(
+        config=_config(tmp_path, macro=False),
+        store=store,
+        provider=FakeProvider(),
+    )
+    observation = ObservationEnvelope(
+        run_id="cortex-run",
+        episode_id="episode-1",
+        step_id=8,
+        game_loop=113,
+        state=SC2State(
+            own_units=[
+                UnitState(unit_id=f"0x{index:x}", unit_type="Phoenix", alliance="self")
+                for index in range(5)
+            ]
+        ),
+    )
+    retained = ActionCommand(
+        command_id="retained-phoenix",
+        actor="Developer/Stargate-1",
+        name="Train_Phoenix",
+        created_game_loop=112,
+        ttl_game_loops=16,
+        source=ActionSource.PLANNER,
+    )
+    seventh = retained.model_copy(update={"command_id": "seventh-phoenix"})
+    runtime._transition_command(retained, CommandStatus.DISPATCHED, observation)
+
+    outcome, inventory = runtime._apply_defense_inventory_guard([seventh], observation)
+
+    assert outcome.accepted == []
+    assert outcome.failures[0].reason == "global_defense_inventory_cap:Phoenix:6/6"
+    phoenix = next(item for item in inventory if item["item_type"] == "Phoenix")
+    assert phoenix["dispatched_not_terminal"] == 1
+    assert phoenix["effective_count"] == 6
     asyncio.run(runtime.close())
 
 
@@ -2418,6 +2497,12 @@ def test_completed_episode_emits_strategic_consequence_and_review_summary(
     assert consequences[0].payload["consequence_type"] == "threat_unanswered"
     assert reviews[0].payload["strategic_consequence_count"] == 1
     assert reviews[0].payload["strategic_consequence_counts"] == {"threat_unanswered": 1}
+    engineering = build_engineering_gate_report(
+        runtime.store.events_after("cortex-run", 0, 10_000),
+        run_dir=tmp_path,
+        natural_run_baseline_bytes_per_loop=None,
+    )
+    assert engineering["metrics"]["postgame_semantic_event_coverage"] == 1.0
     asyncio.run(runtime.close())
 
 

@@ -37,6 +37,7 @@ REQUIRED_ENGINEERING_GATES = (
     "cross_type_footprint_overlap_zero",
     "nonspatial_quarantine_zero",
     "invalid_footprint_redispatch_zero",
+    "unchanged_failed_target_redispatch_zero",
     "repeated_retreat_arrival_zero",
     "unchanged_attack_redispatch_zero",
     "health_delta_engagement_attribution_valid",
@@ -136,6 +137,7 @@ def build_engineering_gate_report(
     recovery_tail_limit: int = 4096,
     recovery_evidence: dict[str, Any] | None = None,
     expected_git_sha: str | None = None,
+    evidence: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Derive every SCX-PT-039 engineering gate without permissive defaults."""
 
@@ -206,8 +208,12 @@ def build_engineering_gate_report(
     recovery_artifact_valid = (
         isinstance(recovery_evidence, dict)
         and recovery_evidence.get("passed") is True
+        and recovery_evidence.get("recovery_evidence_present") is True
+        and recovery_evidence.get("checkpoint_tail_recovery_bounded") is True
         and isinstance(recovery_evidence.get("git_sha"), str)
-        and (expected_git_sha is None or recovery_evidence.get("git_sha") == expected_git_sha)
+        and isinstance(expected_git_sha, str)
+        and recovery_evidence.get("git_sha") == expected_git_sha
+        and recovery_evidence.get("expected_git_sha") == expected_git_sha
     )
     max_game_loop = accumulator.max_game_loop
     if max_game_loop == 0 and isinstance(result, dict):
@@ -288,6 +294,9 @@ def build_engineering_gate_report(
         "cross_type_footprint_overlap_zero": int(ledger["overlap_count"] or 0) == 0,
         "nonspatial_quarantine_zero": int(ledger["nonspatial_quarantine_count"] or 0) == 0,
         "invalid_footprint_redispatch_zero": int(ledger["invalid_redispatch_count"] or 0) == 0,
+        "unchanged_failed_target_redispatch_zero": (
+            int(ledger["unchanged_failed_target_redispatch_count"] or 0) == 0
+        ),
         "repeated_retreat_arrival_zero": retreat_repeats == 0,
         "unchanged_attack_redispatch_zero": unchanged_attacks == 0,
         "health_delta_engagement_attribution_valid": health_delta_collisions == 0,
@@ -335,6 +344,7 @@ def build_engineering_gate_report(
     ]
     return {
         "format_version": "1.1",
+        "evidence": evidence,
         "metrics": metrics,
         "diagnostics": {
             "accepted_build_count": build_count,
@@ -474,9 +484,11 @@ def _placement_ledger_audit(
     last_loop: dict[str, int] = {}
     transition_ids: set[str] = set()
     permanent_cells: set[tuple[int, int]] = set()
+    temporarily_failed_targets: set[tuple[str, frozenset[tuple[int, int]], str]] = set()
     invalid_transitions = 0
     overlaps = 0
     invalid_redispatches = 0
+    unchanged_failed_target_redispatches = 0
     nonspatial_quarantines = 0
     transition_count = 0
     allowed = {
@@ -524,6 +536,8 @@ def _placement_ledger_audit(
         previous = str(payload.get("previous_state", ""))
         next_state = str(payload.get("next_state", ""))
         structure_type = str(payload.get("structure_type", ""))
+        action_name = str(payload.get("action_name", ""))
+        target_state_revision = payload.get("target_state_revision")
         game_loop = payload.get("game_loop")
         if not isinstance(game_loop, int) or isinstance(game_loop, bool):
             invalid_transitions += 1
@@ -549,6 +563,11 @@ def _placement_ledger_audit(
         if next_state == "reserved":
             if cells & permanent_cells:
                 invalid_redispatches += 1
+            if (
+                isinstance(target_state_revision, str)
+                and (action_name, cells, target_state_revision) in temporarily_failed_targets
+            ):
+                unchanged_failed_target_redispatches += 1
             for other_id, (_, other_cells) in active.items():
                 if other_id != reservation_id and cells & other_cells:
                     overlaps += 1
@@ -567,6 +586,11 @@ def _placement_ledger_audit(
             permanent_cells.update(cells)
             if payload.get("actor_failure") is True or payload.get("failure_class") == "nonspatial":
                 nonspatial_quarantines += 1
+        elif next_state == "temporary_suppressed" and isinstance(
+            target_state_revision,
+            str,
+        ):
+            temporarily_failed_targets.add((action_name, cells, target_state_revision))
     complete_builds = 0
     complete_builder_leases = 0
     complete_canonical_footprints = 0
@@ -621,6 +645,7 @@ def _placement_ledger_audit(
         "invalid_transition_count": invalid_transitions,
         "overlap_count": overlaps,
         "invalid_redispatch_count": invalid_redispatches,
+        "unchanged_failed_target_redispatch_count": unchanged_failed_target_redispatches,
         "nonspatial_quarantine_count": nonspatial_quarantines,
         "accepted_build_ledger_count": complete_builds,
         "builder_lease_complete_count": complete_builder_leases,

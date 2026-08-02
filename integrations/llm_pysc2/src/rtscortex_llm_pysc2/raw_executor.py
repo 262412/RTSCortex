@@ -10,7 +10,7 @@ from typing import Any, Optional
 
 from rtscortex_llm_pysc2.broker import PrimitiveDispatch, SharedDecisionBroker
 from rtscortex_llm_pysc2.coordinator import BridgeDecision
-from rtscortex_llm_pysc2.extractor import raw_build_eligibility
+from rtscortex_llm_pysc2.extractor import production_dispatch_failure, raw_build_eligibility
 from rtscortex_llm_pysc2.observation import split_actor
 from rtscortex_llm_pysc2.production import production_spec
 from rtscortex_llm_pysc2.raw_placement import RawPlacementFailure, RawPlacementService
@@ -337,6 +337,21 @@ class RawActionExecutor:
                 action = function("now", [builder_tag], raw_target)
                 resolved_arguments = (raw_target,)
         elif (production := production_spec(name)) is not None:
+            function = getattr(
+                actions.RAW_FUNCTIONS,
+                f"Train_{production.unit_type}_quick",
+            )
+            contract_failure = production_dispatch_failure(
+                observation,
+                name,
+                unit_names=self.unit_names,
+                required_function_id=int(function.id),
+            )
+            if contract_failure is not None:
+                raise _RawDispatchFailure(
+                    "production_contract_invalidated",
+                    contract_failure,
+                )
             producer_tag = _source_tag(
                 observation,
                 self.unit_names,
@@ -350,10 +365,6 @@ class RawActionExecutor:
                     "production_source_unavailable",
                     f"{name} has no completed idle {production.producer_type}",
                 )
-            function = getattr(
-                actions.RAW_FUNCTIONS,
-                f"Train_{production.unit_type}_quick",
-            )
             action = function("now", [producer_tag])
         elif (research := research_spec(name)) is not None:
             producer_tag = _source_tag(
@@ -480,11 +491,15 @@ def _source_tag(
     producer_types: Sequence[str],
 ) -> Optional[int]:
     wanted = set(producer_types)
-    for unit in _value(observation, "raw_units", ()):
+    raw_units = list(_value(observation, "raw_units", ()))
+    percent_scale = any(_raw_build_progress(unit) > 1.0 for unit in raw_units)
+    for unit in raw_units:
         if int(_value(unit, "alliance", 0)) != 1:
             continue
         name = _unit_name(unit, unit_names)
-        if name not in wanted or _build_progress(unit) < 1.0:
+        progress = _raw_build_progress(unit)
+        normalized_progress = progress / 100.0 if percent_scale else progress
+        if name not in wanted or normalized_progress < 1.0:
             continue
         if int(_value(unit, "order_length", 0)) != 0:
             continue
@@ -558,6 +573,10 @@ def _unit_name(unit: Any, unit_names: Mapping[int, str]) -> str:
 def _build_progress(unit: Any) -> float:
     value = float(_value(unit, "build_progress", 0.0))
     return value / 100.0 if value > 1.0 else value
+
+
+def _raw_build_progress(unit: Any) -> float:
+    return float(_value(unit, "build_progress", 0.0))
 
 
 def _game_loop(observation: Any) -> int:

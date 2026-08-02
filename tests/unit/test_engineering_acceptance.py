@@ -321,6 +321,47 @@ def test_preacceptance_invalid_footprint_redispatch_fails_gate(tmp_path: Path) -
     assert report["gates"]["invalid_footprint_redispatch_zero"]["passed"] is False
 
 
+def test_unchanged_temporarily_failed_target_redispatch_fails_gate(tmp_path: Path) -> None:
+    events = [
+        _ledger_transition(
+            1,
+            reservation_id="placement:first",
+            structure_type="Assimilator",
+            cells=[[30, 30]],
+            action_name="Build_Assimilator_Near",
+            target_state_revision="state-a",
+        ),
+        _ledger_transition(
+            2,
+            reservation_id="placement:first",
+            structure_type="Assimilator",
+            cells=[[30, 30]],
+            action_name="Build_Assimilator_Near",
+            previous_state="reserved",
+            next_state="temporary_suppressed",
+            failure_class="spatial_retryable",
+            target_state_revision="state-a",
+        ),
+        _ledger_transition(
+            3,
+            reservation_id="placement:second",
+            structure_type="Assimilator",
+            cells=[[30, 30]],
+            action_name="Build_Assimilator_Near",
+            target_state_revision="state-a",
+        ),
+    ]
+
+    report = build_engineering_gate_report(
+        events,
+        run_dir=tmp_path,
+        natural_run_baseline_bytes_per_loop=100.0,
+    )
+
+    assert report["diagnostics"]["unchanged_failed_target_redispatch_count"] == 1
+    assert report["gates"]["unchanged_failed_target_redispatch_zero"]["passed"] is False
+
+
 def test_placement_ledger_rejects_declared_state_that_does_not_match_history(
     tmp_path: Path,
 ) -> None:
@@ -467,6 +508,7 @@ def _ledger_transition(
     action_name: str | None = None,
     builder_tag: str | None = "0xb1",
     builder_lease_state: str | None = None,
+    target_state_revision: str | None = None,
 ) -> StoredEvent:
     resolved_command_id = command_id or f"command:{reservation_id}"
     resolved_lease_state = (
@@ -503,6 +545,7 @@ def _ledger_transition(
             "actor_failure": actor_failure,
             "game_loop": event_id if game_loop is None else game_loop,
             "release_reason": failure_class,
+            "target_state_revision": target_state_revision,
         },
     )
 

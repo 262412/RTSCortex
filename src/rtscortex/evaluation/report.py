@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -94,6 +96,7 @@ def write_run_reports(
     run_dir: Path,
     *,
     natural_run_baseline_bytes_per_loop: float | None = None,
+    qualification_evidence_path: Path | None = None,
 ) -> RunReportArtifacts:
     """Idempotently derive the Markdown timeline and JSON summary from a journal."""
 
@@ -103,10 +106,28 @@ def write_run_reports(
     engineering_gates_path = resolved_run_dir / ENGINEERING_GATES_FILENAME
     timeline = render_timeline(events)
     summary = _build_run_summary(events)
+    recovery_evidence: dict[str, Any] | None = None
+    expected_git_sha: str | None = None
+    evidence: dict[str, Any] | None = None
+    if qualification_evidence_path is not None:
+        if natural_run_baseline_bytes_per_loop is not None:
+            raise ReportError(
+                "qualification evidence and an untraceable numeric disk baseline "
+                "cannot be supplied together"
+            )
+        (
+            natural_run_baseline_bytes_per_loop,
+            recovery_evidence,
+            expected_git_sha,
+            evidence,
+        ) = _load_qualification_evidence(qualification_evidence_path)
     engineering = build_engineering_gate_report(
         events,
         run_dir=resolved_run_dir,
         natural_run_baseline_bytes_per_loop=natural_run_baseline_bytes_per_loop,
+        recovery_evidence=recovery_evidence,
+        expected_git_sha=expected_git_sha,
+        evidence=evidence,
     )
     try:
         timeline_path.write_text(timeline, encoding="utf-8")
@@ -127,6 +148,106 @@ def write_run_reports(
         summary_path=summary_path,
         engineering_gates_path=engineering_gates_path,
     )
+
+
+def _load_qualification_evidence(
+    manifest_path: Path,
+) -> tuple[float | None, dict[str, Any] | None, str, dict[str, Any]]:
+    resolved_manifest = manifest_path.expanduser().resolve()
+    manifest = _read_json_object(resolved_manifest, label="qualification evidence manifest")
+    if manifest.get("format_version") != "1.0":
+        raise ReportError("qualification evidence manifest has an unsupported format_version")
+    if manifest.get("evidence_kind") != "three-seed-qualification":
+        raise ReportError("qualification evidence manifest has the wrong evidence_kind")
+    expected_git_sha = str(manifest.get("expected_git_sha", ""))
+    if re.fullmatch(r"[0-9a-f]{40}", expected_git_sha) is None:
+        raise ReportError("qualification evidence expected_git_sha must be a full Git SHA")
+    diagnostic_only = manifest.get("diagnostic_only")
+    if not isinstance(diagnostic_only, bool):
+        raise ReportError("qualification evidence diagnostic_only must be explicit")
+
+    recovery_path, recovery_sha = _verified_evidence_file(
+        resolved_manifest,
+        manifest.get("recovery_evidence"),
+        label="recovery evidence",
+    )
+    recovery = _read_json_object(recovery_path, label="recovery evidence")
+    if (
+        recovery.get("format_version") != "1.1"
+        or recovery.get("git_sha") != expected_git_sha
+        or recovery.get("expected_git_sha") != expected_git_sha
+    ):
+        raise ReportError("recovery evidence is not bound to expected_git_sha")
+
+    baseline_path, baseline_sha = _verified_evidence_file(
+        resolved_manifest,
+        manifest.get("natural_run_baseline"),
+        label="natural run baseline",
+    )
+    baseline = _read_json_object(baseline_path, label="natural run baseline")
+    source_issue = baseline.get("source_issue")
+    baseline_value = baseline.get("natural_run_bytes_per_game_loop")
+    if not isinstance(source_issue, str) or not source_issue.strip():
+        raise ReportError("natural run baseline has no source_issue")
+    if not isinstance(baseline_value, (int, float)) or float(baseline_value) <= 0:
+        raise ReportError("natural run baseline has no positive bytes-per-game-loop value")
+
+    evidence = {
+        "manifest_path": str(resolved_manifest),
+        "evidence_kind": "three-seed-qualification",
+        "diagnostic_only": diagnostic_only,
+        "expected_git_sha": expected_git_sha,
+        "recovery_evidence": {
+            "path": str(recovery_path),
+            "sha256": recovery_sha,
+        },
+        "natural_run_baseline": {
+            "path": str(baseline_path),
+            "sha256": baseline_sha,
+            "source_issue": source_issue,
+            "bytes_per_game_loop": float(baseline_value),
+        },
+    }
+    if diagnostic_only:
+        return None, None, expected_git_sha, evidence
+    return float(baseline_value), recovery, expected_git_sha, evidence
+
+
+def _verified_evidence_file(
+    manifest_path: Path,
+    reference: Any,
+    *,
+    label: str,
+) -> tuple[Path, str]:
+    if not isinstance(reference, dict):
+        raise ReportError(f"qualification evidence has no {label} reference")
+    raw_path = reference.get("path")
+    expected_sha = reference.get("sha256")
+    if not isinstance(raw_path, str) or not raw_path:
+        raise ReportError(f"{label} path is missing")
+    if not isinstance(expected_sha, str) or re.fullmatch(r"[0-9a-f]{64}", expected_sha) is None:
+        raise ReportError(f"{label} sha256 is missing or invalid")
+    path = Path(raw_path).expanduser()
+    if not path.is_absolute():
+        path = manifest_path.parent / path
+    path = path.resolve()
+    try:
+        observed_sha = hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError as error:
+        raise ReportError(f"Could not read {label} {path}: {error}") from error
+    if observed_sha != expected_sha:
+        raise ReportError(f"{label} sha256 does not match its manifest attestation")
+    return path, observed_sha
+
+
+def _read_json_object(path: Path, *, label: str) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ReportError(f"Could not read {label} {path}: {error}") from error
+    if not isinstance(payload, dict):
+        raise ReportError(f"{label} must contain one JSON object")
+    return payload
 
 
 def _read_run_events(run_dir: Path) -> tuple[Path, list[StoredEvent]]:
