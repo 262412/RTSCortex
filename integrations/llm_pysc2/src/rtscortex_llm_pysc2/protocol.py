@@ -9,6 +9,8 @@ from typing import Any, Optional, cast
 
 import httpx
 
+from rtscortex_llm_pysc2.performance import PhaseProfiler
+
 
 class PlacementTransitionDeliveryError(RuntimeError):
     """The exact transition remains durable and may be retried after restart."""
@@ -115,6 +117,7 @@ class RuntimeClient:
         placement_outbox_limit: int = 64,
         placement_timeout_seconds: float = 2.0,
         client: Optional[httpx.Client] = None,
+        profiler: Optional[PhaseProfiler] = None,
     ) -> None:
         if placement_retry_attempts < 1:
             raise ValueError("placement retry attempts must be positive")
@@ -126,6 +129,8 @@ class RuntimeClient:
             transport=transport,
             timeout=timeout_seconds,
         )
+        self.profiler = profiler or PhaseProfiler()
+        self._tick_count = 0
         self._placement_retry_attempts = placement_retry_attempts
         self._placement_timeout_seconds = placement_timeout_seconds
         self._placement_outbox = (
@@ -150,14 +155,54 @@ class RuntimeClient:
         return payload
 
     def tick(self, observation: dict[str, Any]) -> dict[str, Any]:
-        response = self.client.post("/v1/tick", json=observation)
+        with self.profiler.measure("json_encode"):
+            encoded = json.dumps(observation, ensure_ascii=False, separators=(",", ":"))
+        with self.profiler.measure("request_transport"):
+            response = self.client.post(
+                "/v1/tick",
+                content=encoded.encode(),
+                headers={"content-type": "application/json"},
+            )
         response.raise_for_status()
-        payload = cast(dict[str, Any], response.json())
+        runtime_tick_ms = response.headers.get("x-rtscortex-runtime-tick-ms")
+        if runtime_tick_ms is not None:
+            self.profiler.observe_milliseconds("runtime_tick", float(runtime_tick_ms))
+        with self.profiler.measure("response_decode"):
+            payload = cast(dict[str, Any], json.loads(response.content))
         # A restarted Runtime reconstructs episode and command lifecycle state
         # during tick. Only then is it safe to replay a transition whose ACK
         # was lost by the previous Worker process.
         self.retry_placement_transitions()
+        self._tick_count += 1
+        if self._tick_count % 64 == 0:
+            self.performance_profile(
+                run_id=str(observation["run_id"]),
+                episode_id=str(observation["episode_id"]),
+                step_id=int(observation["step_id"]),
+                game_loop=int(observation["game_loop"]),
+            )
         return payload
+
+    def performance_profile(
+        self,
+        *,
+        run_id: str,
+        episode_id: str,
+        step_id: int,
+        game_loop: int,
+    ) -> None:
+        response = self.client.post(
+            "/v1/performance",
+            json={
+                "protocol_version": "1.1",
+                "run_id": run_id,
+                "episode_id": episode_id,
+                "step_id": step_id,
+                "game_loop": game_loop,
+                "phases": self.profiler.snapshot(),
+            },
+        )
+        response.raise_for_status()
 
     def execution(self, report: dict[str, Any]) -> None:
         response = self.client.post("/v1/execution", json=report)
@@ -216,6 +261,12 @@ class RuntimeClient:
         ) from last_error
 
     def end_episode(self, result: dict[str, Any]) -> None:
+        self.performance_profile(
+            run_id=str(result["run_id"]),
+            episode_id=str(result["episode_id"]),
+            step_id=int(result["steps"]),
+            game_loop=int(result["steps"]),
+        )
         response = self.client.post("/v1/episode/end", json=result)
         response.raise_for_status()
 

@@ -330,7 +330,6 @@ class CortexRuntimeEngine(RuntimeEngine):
     async def tick(self, observation: ObservationEnvelope) -> ActionBatch:
         tick_started = time.perf_counter()
         await self._activate_episode(observation)
-        self._record_defense_inventory(observation)
         self._strategic_by_legacy_intent = {}
         self._pending_strategic_arbitration = None
         self.store.append_event(
@@ -502,8 +501,19 @@ class CortexRuntimeEngine(RuntimeEngine):
         )
         outcome = self.validator.validate(arbitration.selected, observation)
         rejected_commands.extend(self._apply_validation_failures(outcome.failures, observation))
+        defense_outcome, defense_inventory = self._apply_defense_inventory_guard(
+            outcome.accepted,
+            observation,
+        )
+        rejected_commands.extend(
+            self._apply_validation_failures(defense_outcome.failures, observation)
+        )
+        self._record_defense_inventory(
+            observation,
+            unit_evaluations=defense_inventory,
+        )
         accepted_commands: list[ActionCommand] = []
-        for command in outcome.accepted:
+        for command in defense_outcome.accepted:
             prepared_command = self._bind_dispatch_attempt(prepared_by_id[command.command_id])
             prepared_by_id[command.command_id] = prepared_command
             accepted_commands.append(prepared_command.command)
@@ -719,6 +729,135 @@ class CortexRuntimeEngine(RuntimeEngine):
             accepted=accepted,
             rejected=[f"{failure.command.command_id}: {failure.reason}" for failure in failures],
             failures=failures,
+        )
+
+    def _apply_defense_inventory_guard(
+        self,
+        commands: list[ActionCommand],
+        observation: ObservationEnvelope,
+    ) -> tuple[ValidationOutcome, tuple[dict[str, object], ...]]:
+        """Apply race-wide defense unit caps at the final dispatch boundary."""
+
+        current_ids = {command.command_id for command in commands}
+        lifecycle_counts: dict[tuple[str, CommandStatus], int] = {}
+        for lifecycle in self._command_states.values():
+            if lifecycle.command.command_id in current_ids or lifecycle.status not in {
+                CommandStatus.PENDING,
+                CommandStatus.DEFERRED,
+                CommandStatus.DISPATCHED,
+            }:
+                continue
+            key = (lifecycle.command.name, lifecycle.status)
+            lifecycle_counts[key] = lifecycle_counts.get(key, 0) + 1
+
+        accepted: list[ActionCommand] = []
+        failures: list[ValidationFailure] = []
+        selected: dict[str, int] = {}
+        inventory: dict[str, dict[str, int]] = {}
+        for item_type, cap in self._race_profile.data.defense_unit_saturation_limits.items():
+            action_name = f"Train_{item_type}"
+            queue = [
+                item
+                for item in observation.state.production_queue
+                if item.name in {item_type, action_name}
+            ]
+            constructing = sum(item.progress > 0.0 for item in queue)
+            queued = len(queue) - constructing
+            dispatched = lifecycle_counts.get((action_name, CommandStatus.DISPATCHED), 0)
+            inventory[item_type] = {
+                "completed": sum(
+                    unit.unit_type == item_type and unit.health_fraction > 0.0
+                    for unit in observation.state.own_units
+                ),
+                "constructing_or_training": constructing,
+                "queued": queued,
+                "reserved": sum(
+                    lifecycle_counts.get((action_name, status), 0)
+                    for status in (CommandStatus.PENDING, CommandStatus.DEFERRED)
+                ),
+                "dispatched_not_terminal": dispatched,
+                "dispatches_not_already_observed": max(0, dispatched - len(queue)),
+                "hard_cap": cap,
+            }
+
+        for command in sorted(commands, key=lambda item: (-item.priority, item.command_id)):
+            item_type = command.name.removeprefix("Train_")
+            counts = inventory.get(item_type) if command.name.startswith("Train_") else None
+            if counts is None:
+                accepted.append(command)
+                continue
+            effective = (
+                counts["completed"]
+                + counts["constructing_or_training"]
+                + counts["queued"]
+                + counts["reserved"]
+                + counts["dispatches_not_already_observed"]
+                + selected.get(item_type, 0)
+            )
+            cap = counts["hard_cap"]
+            if effective >= cap:
+                reason = f"global_defense_inventory_cap:{item_type}:{effective}/{cap}"
+                failures.append(
+                    ValidationFailure(
+                        command=command,
+                        reason=reason,
+                        disposition=ValidationDisposition.OBSOLETE,
+                    )
+                )
+                self._record_cortex_event(
+                    observation,
+                    "defense_inventory_cap_blocked",
+                    {
+                        "command_id": command.command_id,
+                        "action_name": command.name,
+                        "source": command.source.value,
+                        "item_type": item_type,
+                        "effective_count": effective,
+                        "hard_cap": cap,
+                        "reason": reason,
+                    },
+                )
+                continue
+            selected[item_type] = selected.get(item_type, 0) + 1
+            accepted.append(command)
+
+        evaluations: list[dict[str, object]] = []
+        for item_type, counts in inventory.items():
+            current_batch_selected = selected.get(item_type, 0)
+            effective = (
+                counts["completed"]
+                + counts["constructing_or_training"]
+                + counts["queued"]
+                + counts["reserved"]
+                + counts["dispatches_not_already_observed"]
+                + current_batch_selected
+            )
+            cap = counts["hard_cap"]
+            evaluations.append(
+                {
+                    "item_type": item_type,
+                    "action_name": f"Train_{item_type}",
+                    **counts,
+                    "current_batch_selected": current_batch_selected,
+                    "effective_count": effective,
+                    "decision": (
+                        "over_cap"
+                        if effective > cap
+                        else "at_cap"
+                        if effective == cap
+                        else "within_cap"
+                    ),
+                }
+            )
+        return (
+            ValidationOutcome(
+                accepted=accepted,
+                rejected=[
+                    f"{failure.command.command_id}: {failure.reason}" for failure in failures
+                ],
+                failures=failures,
+            ),
+            tuple(evaluations),
         )
 
     def _structure_target_for_action(self, action_name: str) -> str | None:
@@ -3747,7 +3886,12 @@ class CortexRuntimeEngine(RuntimeEngine):
             payload=payload,
         )
 
-    def _record_defense_inventory(self, observation: ObservationEnvelope) -> None:
+    def _record_defense_inventory(
+        self,
+        observation: ObservationEnvelope,
+        *,
+        unit_evaluations: tuple[dict[str, object], ...] = (),
+    ) -> None:
         active_commands = tuple(
             (lifecycle.command.name, lifecycle.status.value)
             for lifecycle in self._command_states.values()
@@ -3758,10 +3902,20 @@ class CortexRuntimeEngine(RuntimeEngine):
                 CommandStatus.DISPATCHED,
             }
         )
-        for payload in self._role_agents.defense_inventory_evaluations(
+        role_evaluations = self._role_agents.defense_inventory_evaluations(
             observation,
             active_commands=active_commands,
-        ):
+        )
+        capped_unit_types = {str(payload["item_type"]) for payload in unit_evaluations}
+        evaluations = (
+            *(
+                payload
+                for payload in role_evaluations
+                if payload["item_type"] not in capped_unit_types
+            ),
+            *unit_evaluations,
+        )
+        for payload in evaluations:
             item_type = str(payload["item_type"])
             signature = json.dumps(payload, sort_keys=True, separators=(",", ":"))
             if self._last_defense_inventory_signatures.get(item_type) == signature:

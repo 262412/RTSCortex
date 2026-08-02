@@ -547,6 +547,23 @@ def _render_episode(
     summary = _last_model(events, "episode_summary", EpisodeSummary)
     observations = [event for event in events if event.event_type == "observation"]
     decisions = [event for event in events if event.event_type == "decision"]
+    retention_summary = next(
+        (
+            event.payload
+            for event in reversed(events)
+            if event.event_type == "event_retention_summary"
+        ),
+        {},
+    )
+    retention_counts = retention_summary.get("event_counts", {})
+
+    def logical_count(event_type: str, retained_count: int) -> int:
+        counts = retention_counts.get(event_type)
+        if not isinstance(counts, dict):
+            return retained_count
+        raw = counts.get("raw")
+        return raw if isinstance(raw, int) and not isinstance(raw, bool) else retained_count
+
     legacy_plans = [event for event in events if event.event_type == "plan_accepted"]
     macro_plan_events = [
         event
@@ -563,7 +580,13 @@ def _render_episode(
         for event in events
         if event.event_type == "module_result" and event.payload.get("model_call") is True
     ]
-    rejected = sum(len(_payload_list(event, "batch", "rejected_commands")) for event in decisions)
+    decision_aggregates = retention_summary.get("aggregates", {}).get("decision", {})
+    rejected = (
+        int(decision_aggregates["rejected_command_count"])
+        if isinstance(decision_aggregates, dict)
+        and isinstance(decision_aggregates.get("rejected_command_count"), int)
+        else sum(len(_payload_list(event, "batch", "rejected_commands")) for event in decisions)
+    )
     successful_executions = sum(event.payload.get("success") is True for event in executions)
     execution_metrics = compute_execution_metrics(events)
     cortex_metrics = compute_cortex_observability(events)
@@ -606,7 +629,8 @@ def _render_episode(
         ),
         "|---:|---:|---:|---:|---:|---:|---:|",
         (
-            f"| {len(observations)} | {len(decisions)} | {len(plans)} | {execution_rate} | "
+            f"| {logical_count('observation', len(observations))} | "
+            f"{logical_count('decision', len(decisions))} | {len(plans)} | {execution_rate} | "
             f"{rejected} | {model_call_count} | {total_tokens} |"
         ),
     ]
@@ -733,6 +757,16 @@ def _render_event(
         return _render_execution(event, command_index)
     if event.event_type == "module_result":
         return _render_module_result(event)
+    if event.event_type == "event_retention_summary":
+        raw = event.payload.get("raw_logical_count", 0)
+        retained = event.payload.get("retained_count", 0)
+        suppressed = event.payload.get("suppressed_count", 0)
+        interval = event.payload.get("checkpoint_interval", "unknown")
+        return [
+            f"- Event {event.event_id} · Event retention kept `{retained}/{raw}` "
+            f"high-frequency states and suppressed `{suppressed}` duplicates; "
+            f"full checkpoint interval `{interval}`."
+        ]
     if event.event_type == "planner_cycle":
         status = _inline(event.payload.get("status", "unknown"))
         latency = _milliseconds(event.payload.get("latency_ms"))

@@ -96,12 +96,20 @@ git -C third_party/LLM-PySC2 apply --check \
   ../../integrations/llm_pysc2/patches/0023-skip-feature-action-printing-in-raw-mode.patch
 git -C third_party/LLM-PySC2 apply \
   ../../integrations/llm_pysc2/patches/0023-skip-feature-action-printing-in-raw-mode.patch
+git -C third_party/LLM-PySC2 apply --check \
+  ../../integrations/llm_pysc2/patches/0024-route-managed-logs-and-profile-env-step.patch
+git -C third_party/LLM-PySC2 apply \
+  ../../integrations/llm_pysc2/patches/0024-route-managed-logs-and-profile-env-step.patch
 ```
 
 After the live run, restore the clean pinned checkout by reversing exactly these reviewed
 patches in reverse order:
 
 ```bash
+git -C third_party/LLM-PySC2 apply --reverse --check \
+  ../../integrations/llm_pysc2/patches/0024-route-managed-logs-and-profile-env-step.patch
+git -C third_party/LLM-PySC2 apply --reverse \
+  ../../integrations/llm_pysc2/patches/0024-route-managed-logs-and-profile-env-step.patch
 git -C third_party/LLM-PySC2 apply --reverse --check \
   ../../integrations/llm_pysc2/patches/0023-skip-feature-action-printing-in-raw-mode.patch
 git -C third_party/LLM-PySC2 apply --reverse \
@@ -198,6 +206,11 @@ git -C third_party/LLM-PySC2 apply --reverse \
 
 Do not configure Git to ignore dirty submodules: that would also hide accidental upstream
 edits or gitlink drift.
+
+`0024-route-managed-logs-and-profile-env-step.patch` requires the managed supervisor's
+absolute `RTSCORTEX_LLM_LOG_DIR`, routes all logger outputs and copied templates beneath that
+run-owned root, and reports the PySC2 environment-step duration to the Bridge profiler. It
+prevents runtime writes from changing the attested reviewed source tree.
 
 `0001-return-noop-while-awaiting-runtime.patch` changes one branch in `MainAgent.step`.
 The upstream implementation currently spins inside its bounded `while` loop while an

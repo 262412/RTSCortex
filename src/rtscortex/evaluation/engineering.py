@@ -444,11 +444,13 @@ def _build_started(payload: dict[str, Any]) -> bool:
 
 def _placement_identity_complete(payload: dict[str, Any]) -> bool:
     evidence = _evidence(payload)
-    validated = evidence.get("validated_target_position")
+    requested = evidence.get("requested_target_position")
+    validated = evidence.get("final_validated_target_position")
     emitted = evidence.get("emitted_target_position")
-    verified = evidence.get("target_position")
+    verified = evidence.get("verified_target_position")
     return (
-        isinstance(validated, (list, tuple))
+        isinstance(requested, (list, tuple))
+        and isinstance(validated, (list, tuple))
         and isinstance(emitted, (list, tuple))
         and isinstance(verified, (list, tuple))
         and tuple(validated) == tuple(emitted) == tuple(verified)
@@ -483,6 +485,11 @@ def _placement_ledger_audit(
         ("unreserved", "temporary_suppressed"),
         ("unreserved", "released"),
         ("reserved", "occupied"),
+        ("reserved", "build_started"),
+        ("build_started", "occupied"),
+        ("build_started", "permanent_invalid"),
+        ("build_started", "temporary_suppressed"),
+        ("build_started", "released"),
         ("reserved", "permanent_invalid"),
         ("reserved", "temporary_suppressed"),
         ("reserved", "released"),
@@ -777,6 +784,7 @@ def _defense_inventory_audit(
         "queued",
         "reserved",
         "dispatched_not_terminal",
+        "current_batch_selected",
         "effective_count",
         "hard_cap",
     )
@@ -798,8 +806,16 @@ def _defense_inventory_audit(
         queued = int(item["queued"])
         reserved = int(item["reserved"])
         dispatched = int(item["dispatched_not_terminal"])
+        current_batch_selected = int(item["current_batch_selected"])
         unobserved_dispatches = max(0, dispatched - constructing - queued)
-        expected = completed + constructing + queued + reserved + unobserved_dispatches
+        expected = (
+            completed
+            + constructing
+            + queued
+            + reserved
+            + unobserved_dispatches
+            + current_batch_selected
+        )
         hard_cap = int(item["hard_cap"])
         expected_decision = (
             "over_cap"

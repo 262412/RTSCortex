@@ -301,8 +301,11 @@ class EffectEvidence(ContractModel):
     ) = None
     target_type: str | None = None
     target_position: tuple[float, float] | None = None
+    requested_target_position: tuple[float, float] | None = None
+    final_validated_target_position: tuple[float, float] | None = None
     validated_target_position: tuple[float, float] | None = None
     emitted_target_position: tuple[float, float] | None = None
+    verified_target_position: tuple[float, float] | None = None
     target_tag: str | None = None
     actor_tag: str | None = None
     actor_tags: list[str] = Field(default_factory=list)

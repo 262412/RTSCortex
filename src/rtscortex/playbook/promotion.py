@@ -90,14 +90,14 @@ class PlaybookPromotionSweep:
         unavailable_runs: set[str] = set()
         matched_counts: dict[str, int] = {}
         rejected: dict[str, str] = {}
-        situation_cache: dict[str, tuple[dict[str, object], ...] | None] = {}
+        situation_cache: dict[str, tuple[tuple[dict[str, object], int], ...] | None] = {}
 
         for rule in candidates:
             preliminary_error = _preliminary_rejection(rule)
             if preliminary_error is not None:
                 rejected[rule.rule_id] = preliminary_error
                 continue
-            states: list[dict[str, object]] = []
+            states: list[tuple[dict[str, object], int]] = []
             for run_id in dict.fromkeys(rule.source_run_ids):
                 if run_id not in situation_cache:
                     situation_cache[run_id] = self._load_situations(run_id)
@@ -106,7 +106,9 @@ class PlaybookPromotionSweep:
                     unavailable_runs.add(run_id)
                     continue
                 states.extend(run_states)
-            matched_count = sum(_matches_rule_situation(rule, state) for state in states)
+            matched_count = sum(
+                count for state, count in states if _matches_rule_situation(rule, state)
+            )
             matched_counts[rule.rule_id] = matched_count
             updated = rule
             if matched_count > rule.shadow_state_count:
@@ -249,7 +251,7 @@ class PlaybookPromotionSweep:
             consolidated.append(rule.rule_id)
         return tuple(dict.fromkeys(consolidated))
 
-    def _load_situations(self, run_id: str) -> tuple[dict[str, object], ...] | None:
+    def _load_situations(self, run_id: str) -> tuple[tuple[dict[str, object], int], ...] | None:
         run_directory = self.run_directories.get(run_id, self.run_root / run_id)
         database_path = run_directory / "events.sqlite3"
         if not database_path.is_file():
@@ -267,17 +269,56 @@ class PlaybookPromotionSweep:
                 ORDER BY event_id
                 """
             ).fetchall()
+            retention_row = connection.execute(
+                """
+                SELECT payload_json
+                FROM events
+                WHERE event_type = 'event_retention_summary'
+                ORDER BY event_id DESC
+                LIMIT 1
+                """
+            ).fetchone()
         finally:
             connection.close()
-        situations: list[dict[str, object]] = []
+        retained_states = _retained_situation_states(retention_row)
+        if retained_states is not None:
+            return retained_states
+        situations: list[tuple[dict[str, object], int]] = []
         for row in rows:
             try:
                 payload = json.loads(str(row[0]))
             except (TypeError, ValueError):
                 continue
             if isinstance(payload, dict):
-                situations.append(payload)
+                situations.append((payload, 1))
         return tuple(situations)
+
+
+def _retained_situation_states(
+    row: tuple[object, ...] | None,
+) -> tuple[tuple[dict[str, object], int], ...] | None:
+    if row is None:
+        return None
+    try:
+        summary = json.loads(str(row[0]))
+    except (TypeError, ValueError):
+        return None
+    aggregates = summary.get("aggregates") if isinstance(summary, dict) else None
+    situation = aggregates.get("situation_assessed") if isinstance(aggregates, dict) else None
+    state_counts = situation.get("state_counts") if isinstance(situation, dict) else None
+    if not isinstance(state_counts, dict):
+        return None
+    states: list[tuple[dict[str, object], int]] = []
+    for encoded_state, raw_count in state_counts.items():
+        if not isinstance(encoded_state, str) or not isinstance(raw_count, int) or raw_count < 1:
+            continue
+        try:
+            state = json.loads(encoded_state)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(state, dict):
+            states.append((state, raw_count))
+    return tuple(states)
 
 
 def _preliminary_rejection(rule: PlaybookRule) -> str | None:

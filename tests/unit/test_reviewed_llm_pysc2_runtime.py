@@ -123,3 +123,15 @@ def test_reviewed_tree_attestation_includes_untracked_and_ignored_files(
     baseline_file_count = baseline["reviewed_tree_file_count"]
     assert isinstance(baseline_file_count, int)
     assert ignored["reviewed_tree_file_count"] == baseline_file_count + 2
+
+
+def test_managed_log_patch_never_targets_the_reviewed_source_tree() -> None:
+    patch = (
+        Path("integrations/llm_pysc2/patches")
+        / "0024-route-managed-logs-and-profile-env-step.patch"
+    ).read_text(encoding="utf-8")
+
+    assert patch.count("RTSCORTEX_LLM_LOG_DIR") >= 4
+    added_lines = [line[1:] for line in patch.splitlines() if line.startswith("+")]
+    assert not any("../../llm_log" in line for line in added_lines)
+    assert "record_environment_step(environment_step_seconds)" in patch

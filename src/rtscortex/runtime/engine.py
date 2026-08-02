@@ -1462,6 +1462,45 @@ class RuntimeEngine:
             payload=payload,
         )
 
+    def record_performance_profile(self, payload: dict[str, object]) -> None:
+        """Persist cumulative worker phases together with event-store persistence cost."""
+
+        run_id = payload.get("run_id")
+        episode_id = payload.get("episode_id")
+        step_id = payload.get("step_id")
+        game_loop = payload.get("game_loop")
+        phases = payload.get("phases")
+        if (
+            not isinstance(run_id, str)
+            or not isinstance(episode_id, str)
+            or not isinstance(step_id, int)
+            or isinstance(step_id, bool)
+            or not isinstance(game_loop, int)
+            or isinstance(game_loop, bool)
+            or not isinstance(phases, dict)
+        ):
+            raise ValueError("invalid runtime performance profile payload")
+        performance = self.store.performance_snapshot()
+        enriched_phases = dict(phases)
+        enriched_phases["event_emission_persistence"] = {
+            "count": performance.enqueued_events,
+            "total_ms": performance.append_latency_ms_mean * performance.enqueued_events,
+            "mean_ms": performance.append_latency_ms_mean,
+            "max_ms": performance.writer_lag_ms_max,
+            "writer_lag_ms_p95": performance.writer_lag_ms_p95,
+        }
+        self.store.append_event(
+            run_id=run_id,
+            episode_id=episode_id,
+            step_id=step_id,
+            event_type="runtime_phase_profile",
+            payload={
+                **payload,
+                "game_loop": game_loop,
+                "phases": enriched_phases,
+            },
+        )
+
     def record_execution(self, report: ExecutionReport) -> None:
         self._record_execution_from(
             report,
@@ -1684,6 +1723,11 @@ class RuntimeEngine:
                 },
             )
         self.store.flush()
+        self.store.append_retention_summary(
+            run_id=result.run_id,
+            episode_id=result.episode_id,
+            step_id=result.steps,
+        )
         self.store.append_event(
             run_id=result.run_id,
             episode_id=result.episode_id,

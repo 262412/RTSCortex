@@ -291,6 +291,45 @@ def compute_cortex_observability(
             if isinstance(latency, int | float) and not isinstance(latency, bool):
                 macro_latencies.append(float(latency))
 
+    retention = next(
+        (
+            event.payload
+            for event in reversed(events)
+            if event.event_type == "event_retention_summary"
+        ),
+        None,
+    )
+    if isinstance(retention, dict):
+        retained_counts = retention.get("event_counts")
+        if isinstance(retained_counts, dict):
+            for event_type, raw_counts in retained_counts.items():
+                if event_type in CORTEX_EVENT_TYPES and isinstance(raw_counts, dict):
+                    raw = raw_counts.get("raw")
+                    if isinstance(raw, int) and not isinstance(raw, bool):
+                        event_counts[event_type] = raw
+        aggregates = retention.get("aggregates")
+        situation = aggregates.get("situation_assessed") if isinstance(aggregates, dict) else None
+        if isinstance(situation, dict):
+            levels = situation.get("threat_level_counts")
+            evidence_counts = situation.get("threat_evidence_counts")
+            if isinstance(levels, dict):
+                threat_levels = Counter({str(key): int(value) for key, value in levels.items()})
+            if isinstance(evidence_counts, dict):
+                threat_evidence = Counter(
+                    {str(key): int(value) for key, value in evidence_counts.items()}
+                )
+            threat_observations = int(situation.get("logical_count", threat_observations))
+            threat_observations_with_evidence = int(
+                situation.get(
+                    "threat_with_evidence_count",
+                    threat_observations_with_evidence,
+                )
+            )
+            max_threat_score = max(
+                max_threat_score,
+                float(situation.get("max_threat_score", 0.0)),
+            )
+
     dispatched = _dispatched_command_ids(events)
     lineage_counts: Counter[str] = Counter()
     valid_lineage_counts: Counter[str] = Counter()

@@ -462,6 +462,103 @@ def test_stale_report_cannot_mutate_new_retreat_commitment() -> None:
     assert current.phase == "retreating"
 
 
+def test_retreat_arrival_is_idempotent_across_state_recreation() -> None:
+    base = _observation()
+    actor = "CombatGroup7/Adept-1"
+    observation = base.model_copy(
+        update={
+            "state": base.state.model_copy(
+                update={
+                    "own_units": [
+                        UnitState(
+                            unit_id="0x10",
+                            unit_type="Adept",
+                            alliance="self",
+                            position=(50.0, 50.0),
+                            health_fraction=0.2,
+                            actor_scopes=(actor,),
+                        )
+                    ],
+                    "own_structures": [
+                        UnitState(
+                            unit_id="0x12",
+                            unit_type="Nexus",
+                            alliance="self",
+                            position=(10.0, 10.0),
+                        )
+                    ],
+                }
+            ),
+            "available_actions": [
+                AvailableAction(
+                    name="Move_Minimap",
+                    argument_names=["minimap"],
+                    argument_types=[ActionArgumentType.POSITION],
+                    actor_scopes=[actor],
+                    argument_candidates=[[[12, 12]]],
+                )
+            ],
+        }
+    )
+    assessment = DeterministicSituationAnalyzer().assess(observation)
+    agent = DeterministicTacticalAgent(
+        retreat_health_threshold=0.3,
+        minimum_advance_army_supply=4,
+    )
+    operation_id = f"operation:{'a' * 64}"
+
+    def dispatch_and_arrive(command_id: str, operation: str) -> dict[str, object] | None:
+        command = ActionCommand(
+            command_id=command_id,
+            operation_id=operation,
+            attempt_id=f"attempt:{command_id[-1] * 64}",
+            actor=actor,
+            name="Move_Minimap",
+            arguments=[[12, 12]],
+            created_game_loop=observation.game_loop,
+            ttl_game_loops=8,
+            source=ActionSource.PLANNER,
+        )
+        agent.record_dispatch(
+            command,
+            responsibility="retreat",
+            observation=observation,
+            situation=assessment,
+        )
+        return agent.record_execution(
+            ExecutionReport(
+                run_id=observation.run_id,
+                episode_id=observation.episode_id,
+                step_id=observation.step_id,
+                command_id=command.command_id,
+                operation_id=command.operation_id,
+                attempt_id=command.attempt_id,
+                success=True,
+                action_name="Move_Minimap",
+                actor=actor,
+                source=ActionSource.PLANNER,
+                requested_arguments=[[12, 12]],
+                resolved_arguments=[[12, 12]],
+                status=ExecutionStatus.SUCCEEDED,
+                execution_stage=ExecutionStage.EFFECT_VERIFICATION,
+            ),
+            game_loop=observation.game_loop + 8,
+        )
+
+    first = dispatch_and_arrive("retreat-1", operation_id)
+    agent._retreat_by_actor.clear()
+    repeated = dispatch_and_arrive("retreat-2", operation_id)
+    distinct = dispatch_and_arrive("retreat-3", f"operation:{'b' * 64}")
+
+    assert first is not None and first["state"] == "retreat_arrived"
+    assert repeated is None
+    assert distinct is not None and distinct["state"] == "retreat_arrived"
+
+    next_episode = observation.model_copy(update={"episode_id": "next-episode"})
+    agent.evaluate(next_episode, DeterministicSituationAnalyzer().assess(next_episode))
+    assert agent._retreat_arrival_commitments == set()
+
+
 def test_undispatched_retreat_does_not_start_cooldown() -> None:
     base = _observation()
     actor = "CombatGroup7/Adept-1"
@@ -1559,6 +1656,74 @@ def test_situation_threat_uses_alerts_force_ratio_and_hysteresis() -> None:
     threat_fact = next(fact for fact in first.facts if fact.name == "threat_level")
     assert threat_fact.source == "stateful_threat_rules"
     assert any(item.startswith("score:") for item in threat_fact.evidence)
+
+
+def test_critical_threat_is_not_overwritten_by_high_inside_hold_window() -> None:
+    base = _observation()
+    analyzer = DeterministicSituationAnalyzer(threat_hysteresis_game_loops=32)
+    own_structure = UnitState(
+        unit_id="0xnexus",
+        unit_type="Nexus",
+        alliance="self",
+        position=(10.0, 10.0),
+    )
+    high = base.model_copy(
+        update={
+            "state": base.state.model_copy(
+                update={
+                    "own_structures": [own_structure],
+                    "own_units": [
+                        UnitState(
+                            unit_id="0xstalker",
+                            unit_type="Stalker",
+                            alliance="self",
+                            position=(12.0, 10.0),
+                        )
+                    ],
+                    "visible_enemies": [
+                        UnitState(
+                            unit_id="0xroach",
+                            unit_type="Roach",
+                            alliance="enemy",
+                            position=(14.0, 10.0),
+                        )
+                    ],
+                }
+            )
+        }
+    )
+    critical = high.model_copy(
+        update={
+            "step_id": high.step_id + 1,
+            "game_loop": high.game_loop + 8,
+            "alerts": ["unit_under_attack"],
+            "state": high.state.model_copy(update={"own_units": []}),
+        }
+    )
+    high_again = high.model_copy(
+        update={
+            "step_id": high.step_id + 2,
+            "game_loop": high.game_loop + 16,
+        }
+    )
+    critical_again = critical.model_copy(
+        update={
+            "step_id": high.step_id + 3,
+            "game_loop": high.game_loop + 24,
+        }
+    )
+
+    levels = [
+        analyzer.assess(observation).threat_level
+        for observation in (high, critical, high_again, critical_again)
+    ]
+
+    assert levels == [
+        ThreatLevel.HIGH,
+        ThreatLevel.CRITICAL,
+        ThreatLevel.CRITICAL,
+        ThreatLevel.CRITICAL,
+    ]
 
 
 def test_zero_townhalls_with_living_enemy_is_terminal_combat_crisis() -> None:

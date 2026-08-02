@@ -19,6 +19,56 @@ from pydantic import BaseModel
 
 from rtscortex.contracts import EpisodeResult, EpisodeSummary
 
+_HIGH_FREQUENCY_EVENT_TYPES = frozenset(
+    {
+        "observation",
+        "situation_assessed",
+        "situation_shadow_assessed",
+        "decision",
+        "candidate_set_built",
+        "intent_emitted",
+        "role_intent_emitted",
+        "intent_arbitrated",
+    }
+)
+_IDENTITY_SENSITIVE_EVENT_TYPES = frozenset(
+    {
+        "candidate_set_built",
+        "intent_emitted",
+        "role_intent_emitted",
+        "intent_arbitrated",
+    }
+)
+_RETENTION_CHECKPOINT_INTERVAL = 64
+_RETENTION_CHECKPOINT_GAME_LOOPS = 224
+_VOLATILE_STATE_KEYS = frozenset(
+    {
+        "protocol_version",
+        "run_id",
+        "episode_id",
+        "step_id",
+        "game_loop",
+        "created_at",
+        "created_game_loop",
+        "selected_game_loop",
+        "latency_ms",
+        "tick_latency_ms",
+        "planner_latency_ms",
+        "reflex_latency_ms",
+    }
+)
+_VOLATILE_DECISION_ID_KEYS = frozenset(
+    {
+        "decision_id",
+        "command_id",
+        "operation_id",
+        "attempt_id",
+        "intent_id",
+        "candidate_id",
+        "selection_id",
+    }
+)
+
 
 @dataclass(frozen=True)
 class StoredEvent:
@@ -145,6 +195,75 @@ def _require_matching_transition_id(payload: dict[str, Any], transition_id: str)
         raise ValueError("placement payload transition_id does not match idempotency key")
 
 
+def _retention_fingerprint(event_type: str, payload: dict[str, Any]) -> str:
+    drop_identity = event_type not in _IDENTITY_SENSITIVE_EVENT_TYPES
+
+    def normalize(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {
+                key: normalize(item)
+                for key, item in sorted(value.items())
+                if key not in _VOLATILE_STATE_KEYS
+                and (not drop_identity or key not in _VOLATILE_DECISION_ID_KEYS)
+            }
+        if isinstance(value, list):
+            return [normalize(item) for item in value]
+        return value
+
+    encoded = json.dumps(
+        normalize(payload),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _update_retention_aggregates(
+    aggregates: dict[str, Any],
+    event_type: str,
+    payload: dict[str, Any],
+) -> None:
+    event = aggregates.setdefault(event_type, {})
+    event["logical_count"] = int(event.get("logical_count", 0)) + 1
+    if event_type == "decision":
+        raw_batch = payload.get("batch")
+        batch: dict[str, Any] = raw_batch if isinstance(raw_batch, dict) else payload
+        commands = batch.get("commands", [])
+        rejected = batch.get("rejected_commands", [])
+        event["command_count"] = int(event.get("command_count", 0)) + (
+            len(commands) if isinstance(commands, list) else 0
+        )
+        event["rejected_command_count"] = int(event.get("rejected_command_count", 0)) + (
+            len(rejected) if isinstance(rejected, list) else 0
+        )
+    if event_type not in {"situation_assessed", "situation_shadow_assessed"}:
+        return
+    raw_assessment = payload.get("assessment")
+    assessment: dict[str, Any] = raw_assessment if isinstance(raw_assessment, dict) else payload
+    level = str(assessment.get("threat_level", "unknown"))
+    levels = event.setdefault("threat_level_counts", {})
+    levels[level] = int(levels.get(level, 0)) + 1
+    evidence = assessment.get("threat_evidence", [])
+    if isinstance(evidence, (list, tuple)) and evidence:
+        event["threat_with_evidence_count"] = int(event.get("threat_with_evidence_count", 0)) + 1
+        evidence_counts = event.setdefault("threat_evidence_counts", {})
+        for item in evidence:
+            if isinstance(item, str):
+                evidence_counts[item] = int(evidence_counts.get(item, 0)) + 1
+    score = assessment.get("threat_score")
+    if isinstance(score, (int, float)) and not isinstance(score, bool):
+        event["max_threat_score"] = max(float(event.get("max_threat_score", 0.0)), float(score))
+    state = {
+        key: assessment[key]
+        for key in ("phase", "threat_level", "economy_status", "army_readiness")
+        if key in assessment
+    }
+    state_key = json.dumps(state, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    state_counts = event.setdefault("state_counts", {})
+    state_counts[state_key] = int(state_counts.get(state_key, 0)) + 1
+
+
 class EventStore:
     """Store runtime events in SQLite and mirror each event to JSONL."""
 
@@ -174,6 +293,11 @@ class EventStore:
         self._metadata_lock = threading.Lock()
         self._reader_lock = threading.Lock()
         self._subscriber_lock = threading.Lock()
+        self._retention_lock = threading.Lock()
+        self._retention_counts: dict[tuple[str, str, str], dict[str, int]] = {}
+        self._retention_fingerprints: dict[tuple[str, str, str], str] = {}
+        self._retention_checkpoint_game_loops: dict[tuple[str, str, str], int] = {}
+        self._retention_aggregates: dict[tuple[str, str], dict[str, Any]] = {}
         self._subscribers: dict[int, _SubscriberWorker] = {}
         self._next_subscriber_id = 0
         self._flush_event_limit = flush_event_limit
@@ -342,6 +466,21 @@ class EventStore:
         self._raise_writer_error()
         if self._closed:
             raise RuntimeError("event store is closed")
+        if event_type in _HIGH_FREQUENCY_EVENT_TYPES and not self._retain_high_frequency_event(
+            run_id=run_id,
+            episode_id=episode_id,
+            event_type=event_type,
+            payload=normalized,
+        ):
+            return StoredEvent(
+                event_id=0,
+                run_id=run_id,
+                episode_id=episode_id,
+                step_id=step_id,
+                event_type=event_type,
+                created_at=created_at,
+                payload=normalized,
+            )
         with self._id_lock:
             event_id = self._next_event_id
             self._next_event_id += 1
@@ -503,7 +642,7 @@ class EventStore:
             writer_lag_ms_p95=lag_p95_ns / 1_000_000,
             writer_lag_ms_max=self._writer_lag_ns_max / 1_000_000,
             blocked_append_count=self._blocked_append_count,
-            sampled_drop_supported=False,
+            sampled_drop_supported=True,
             subscriber_dropped_events=sum(
                 subscriber.dropped_events for subscriber in self._subscribers.values()
             ),
@@ -512,6 +651,104 @@ class EventStore:
             subscriber_callbacks_under_durable_lock=0,
             journal_bytes=(self.journal_path.stat().st_size if self.journal_path.exists() else 0),
         )
+
+    def append_retention_summary(
+        self,
+        *,
+        run_id: str,
+        episode_id: str,
+        step_id: int,
+    ) -> StoredEvent:
+        """Persist the logical/retained/suppressed accounting for one episode."""
+
+        with self._retention_lock:
+            event_counts = {
+                event_type: dict(counts)
+                for (candidate_run, candidate_episode, event_type), counts in sorted(
+                    self._retention_counts.items()
+                )
+                if candidate_run == run_id and candidate_episode == episode_id
+            }
+            aggregates = json.loads(
+                json.dumps(self._retention_aggregates.get((run_id, episode_id), {}))
+            )
+        raw_total = sum(item["raw"] for item in event_counts.values())
+        retained_total = sum(item["retained"] for item in event_counts.values())
+        payload = {
+            "policy": "change_based_with_periodic_full_checkpoint",
+            "checkpoint_interval": _RETENTION_CHECKPOINT_INTERVAL,
+            "checkpoint_game_loops": _RETENTION_CHECKPOINT_GAME_LOOPS,
+            "lossless_event_classes": [
+                "execution",
+                "command_lifecycle",
+                "command_lineage",
+                "executor_selection",
+                "placement_ledger_transition",
+                "retreat_commitment",
+                "defense_inventory",
+                "postgame",
+                "recovery",
+                "attestation",
+                "performance",
+            ],
+            "event_counts": event_counts,
+            "aggregates": aggregates,
+            "raw_logical_count": raw_total,
+            "retained_count": retained_total,
+            "suppressed_count": raw_total - retained_total,
+        }
+        return self.append_event(
+            run_id=run_id,
+            episode_id=episode_id,
+            step_id=step_id,
+            event_type="event_retention_summary",
+            payload=payload,
+        )
+
+    def _retain_high_frequency_event(
+        self,
+        *,
+        run_id: str,
+        episode_id: str,
+        event_type: str,
+        payload: dict[str, Any],
+    ) -> bool:
+        key = (run_id, episode_id, event_type)
+        fingerprint = _retention_fingerprint(event_type, payload)
+        raw_game_loop = payload.get("game_loop")
+        game_loop = (
+            int(raw_game_loop)
+            if isinstance(raw_game_loop, int) and not isinstance(raw_game_loop, bool)
+            else None
+        )
+        with self._retention_lock:
+            counts = self._retention_counts.setdefault(
+                key,
+                {"raw": 0, "retained": 0, "suppressed": 0},
+            )
+            counts["raw"] += 1
+            logical_count = counts["raw"]
+            retain = (
+                counts["retained"] == 0
+                or fingerprint != self._retention_fingerprints.get(key)
+                or (logical_count - 1) % _RETENTION_CHECKPOINT_INTERVAL == 0
+                or game_loop is not None
+                and game_loop - self._retention_checkpoint_game_loops.get(key, game_loop)
+                >= _RETENTION_CHECKPOINT_GAME_LOOPS
+            )
+            self._retention_fingerprints[key] = fingerprint
+            if retain:
+                counts["retained"] += 1
+                if game_loop is not None:
+                    self._retention_checkpoint_game_loops[key] = game_loop
+            else:
+                counts["suppressed"] += 1
+            _update_retention_aggregates(
+                self._retention_aggregates.setdefault((run_id, episode_id), {}),
+                event_type,
+                payload,
+            )
+            return retain
 
     def record_snapshot(
         self,

@@ -519,6 +519,7 @@ def test_build_effect_uses_raw_placement_service_target_as_single_authority() ->
     verifier.track(command)
     verifier.prepare(command.command_id, baseline, 0xABC)
     verifier.accept_primitive(command.command_id, game_loop=104)
+    placement_service.release_command(command.command_id, game_loop=105)
 
     verdicts = verifier.observe(
         _observation(
@@ -531,8 +532,11 @@ def test_build_effect_uses_raw_placement_service_target_as_single_authority() ->
     assert [verdict.success for verdict in verdicts] == [True]
     assert verdicts[0].evidence is not None
     assert verdicts[0].evidence["target_position"] == (32.0, 30.0)
-    assert verdicts[0].evidence["validated_target_position"] == (31.875, 30.0)
+    assert verdicts[0].evidence["requested_target_position"] == (31.875, 30.0)
+    assert verdicts[0].evidence["final_validated_target_position"] == (32.0, 30.0)
+    assert verdicts[0].evidence["validated_target_position"] == (32.0, 30.0)
     assert verdicts[0].evidence["emitted_target_position"] == (32.0, 30.0)
+    assert verdicts[0].evidence["verified_target_position"] == (32.0, 30.0)
 
 
 def test_build_effect_uses_world_target_after_camera_moves() -> None:

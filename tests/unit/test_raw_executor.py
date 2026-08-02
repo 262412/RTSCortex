@@ -327,3 +327,41 @@ def test_raw_nexus_uses_resource_clearance_position_not_resource_centroid() -> N
     assert dispatch is not None
     assert int(dispatch.action.function) == 34
     assert dispatch.resolved_arguments == ([80, 80],)
+
+
+def test_raw_executor_exposes_queued_inflight_and_outstanding_work_separately() -> None:
+    broker = _Broker()
+    executor = RawActionExecutor(cast(Any, broker), unit_names={1: "Adept"})
+    command = RoutedCommand(
+        command_id="move-outstanding",
+        actor="CombatGroup7/Adept-1",
+        team_name="Adept-1",
+        name="Move_Minimap",
+        rendered_action="",
+        requested_arguments=([48, 16],),
+    )
+    executor.enqueue(_decision(command))
+
+    assert executor.queued_count == 1
+    assert executor.effect_inflight_count == 0
+    assert executor.outstanding_work is True
+
+    dispatch = executor.next_dispatch(
+        SimpleNamespace(raw_units=[_unit(0xA1, 1)], game_loop=[100]),
+        {"CombatGroup7": _agent("Adept-1", [0xA1])},
+    )
+
+    assert dispatch is not None
+    assert executor.queued_count == 0
+    assert executor.effect_inflight_count == 1
+    assert executor.outstanding_work is True
+
+    executor.observe_reports(
+        [{"command_id": command.command_id, "status": "succeeded"}],
+        {},
+        game_loop=104,
+    )
+
+    assert executor.queued_count == 0
+    assert executor.effect_inflight_count == 0
+    assert executor.outstanding_work is False

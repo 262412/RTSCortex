@@ -9,19 +9,23 @@ from typing import Any, Optional
 
 from rtscortex_llm_pysc2.addon_effect_verifier import AddonEffectVerifier
 from rtscortex_llm_pysc2.combat_effect_verifier import CombatEffectVerifier
+from rtscortex_llm_pysc2.effect_lifecycle import (
+    DEFAULT_ACTION_EFFECT_TIMEOUT_GAME_LOOPS as DEFAULT_ACTION_EFFECT_TIMEOUT_GAME_LOOPS,
+)
+from rtscortex_llm_pysc2.effect_lifecycle import (
+    POST_ORDER_EFFECT_GRACE_GAME_LOOPS,
+    build_effect_max_lifetime,
+)
 from rtscortex_llm_pysc2.effect_types import EffectVerdict
 from rtscortex_llm_pysc2.extractor import BUILD_RAW_FUNCTION_IDS, BUILD_SPECS
 from rtscortex_llm_pysc2.inject_effect_verifier import InjectEffectVerifier
 from rtscortex_llm_pysc2.morph_effect_verifier import MorphEffectVerifier
 from rtscortex_llm_pysc2.mule_effect_verifier import MuleEffectVerifier
 from rtscortex_llm_pysc2.production_effect_verifier import ProductionEffectVerifier
-from rtscortex_llm_pysc2.raw_placement import RawPlacementService
+from rtscortex_llm_pysc2.raw_placement import RawPlacementReservation, RawPlacementService
 from rtscortex_llm_pysc2.research_effect_verifier import ResearchEffectVerifier
 from rtscortex_llm_pysc2.routing import RoutedCommand
 
-DEFAULT_ACTION_EFFECT_TIMEOUT_GAME_LOOPS = 112
-ACTIVE_BUILD_ORDER_TIMEOUT_MULTIPLIER = 4
-NEXUS_ACTIVE_BUILD_ORDER_TIMEOUT_MULTIPLIER = 12
 # PySC2 projects SC2's concrete Move ability (16) to Move_Move_pt. The generic
 # smart-move function 13 represents a different ability and never appears in
 # the raw unit order stream for normal movement.
@@ -31,7 +35,6 @@ MOVE_MINIMAP_ARRIVAL_RADIUS = 4.0
 MOVE_GAME_LOOPS_PER_MINIMAP_UNIT = 10.0
 MOVE_SETTLEMENT_GRACE_GAME_LOOPS = 32
 MOVE_ORDER_ACQUISITION_TIMEOUT_GAME_LOOPS = 16
-POST_ORDER_EFFECT_GRACE_GAME_LOOPS = 32
 
 
 @dataclass(frozen=True)
@@ -81,6 +84,7 @@ class _PendingBuild:
     builder_approach_seen: bool = False
     target_occupancy_seen: bool = False
     active_order_extension: bool = False
+    reservation_snapshot: RawPlacementReservation | None = None
 
 
 @dataclass
@@ -293,6 +297,8 @@ class ActionEffectVerifier:
 
         pending = self._get(command_id)
         pending.builder_tag = None if builder_tag is None else int(builder_tag)
+        if self.placement_service is not None:
+            pending.reservation_snapshot = self.placement_service.command_target(command_id)
         self._resolve_target(pending, observation)
         pending.baseline = self._evidence(pending, observation)
         pending.latest = pending.baseline
@@ -900,21 +906,22 @@ class ActionEffectVerifier:
         structure: Optional[_StructureEvidence],
     ) -> dict[str, Any]:
         baseline = pending.baseline
-        reservation = (
-            None
-            if self.placement_service is None
-            else self.placement_service.command_target(pending.command.command_id)
-        )
+        reservation = pending.reservation_snapshot
         return {
             "effect_kind": "build",
             "target_type": pending.target_structure,
             "target_position": pending.target_position,
+            "requested_target_position": (
+                None if reservation is None else reservation.requested_world_target
+            ),
+            "final_validated_target_position": (
+                None if reservation is None else reservation.final_validated_world_target
+            ),
             "validated_target_position": (
-                None
-                if reservation is None
-                else reservation.requested_world_target or reservation.world_target
+                None if reservation is None else reservation.final_validated_world_target
             ),
             "emitted_target_position": (None if reservation is None else reservation.world_target),
+            "verified_target_position": pending.target_position,
             "target_tag": None if pending.target_tag is None else hex(pending.target_tag),
             "builder_tag": None if pending.builder_tag is None else hex(pending.builder_tag),
             "reservation_id": None if reservation is None else reservation.reservation_id,
@@ -995,6 +1002,20 @@ class ActionEffectVerifier:
         pending.build_started = True
         pending.build_start_confirmation_kind = confirmation_kind
         pending.build_start_confirmed_game_loop = current.game_loop
+        if self.placement_service is not None:
+            accepted = pending.accepted_game_loop or current.game_loop
+            self.placement_service.mark_build_started(
+                pending.command.command_id,
+                game_loop=current.game_loop,
+                expires_game_loop=(
+                    accepted
+                    + build_effect_max_lifetime(
+                        self.timeout_game_loops,
+                        pending.command.name,
+                    )
+                    + POST_ORDER_EFFECT_GRACE_GAME_LOOPS
+                ),
+            )
 
     def _update_supporting_build_start_evidence(
         self,
@@ -1035,15 +1056,7 @@ class ActionEffectVerifier:
             )
 
     def _active_order_timeout(self, pending: _PendingBuild) -> int:
-        multiplier = (
-            NEXUS_ACTIVE_BUILD_ORDER_TIMEOUT_MULTIPLIER
-            if (
-                (spec := BUILD_SPECS.get(pending.command.name)) is not None
-                and spec.placement_kind == "expansion"
-            )
-            else ACTIVE_BUILD_ORDER_TIMEOUT_MULTIPLIER
-        )
-        return self.timeout_game_loops * multiplier
+        return build_effect_max_lifetime(self.timeout_game_loops, pending.command.name)
 
     def _get(self, command_id: str) -> _PendingBuild:
         try:
@@ -1262,8 +1275,7 @@ def _builder_change(
         return f"builder {hex(baseline.tag)} missing from current observation"
     return (
         f"builder {hex(baseline.tag)} status {baseline.status}->{current.status}, "
-        f"orders {list(baseline.orders)}->{list(current.orders)}, "
-        f"selected {baseline.selected}->{current.selected}"
+        f"orders {list(baseline.orders)}->{list(current.orders)}"
     )
 
 
@@ -1275,11 +1287,9 @@ def _diagnosis(
     order_seen: bool,
 ) -> str:
     if baseline.builder is None:
-        return "builder tag was unavailable at dispatch; worker selection could not be verified"
-    if not baseline.builder.selected:
-        return "builder was not selected when the build primitive was dispatched"
+        return "builder tag was unavailable at RAW dispatch"
     if current.builder is None:
-        return "selected builder disappeared before construction became visible"
+        return "RAW builder disappeared before construction became visible"
 
     expected_order = BUILD_RAW_FUNCTION_IDS.get(target_structure)
     if expected_order is not None and expected_order in current.builder.orders:

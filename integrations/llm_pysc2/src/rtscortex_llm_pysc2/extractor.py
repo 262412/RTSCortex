@@ -59,6 +59,13 @@ class BuildSpec:
 
 
 @dataclass(frozen=True)
+class RawBuildEligibility:
+    eligible: bool
+    failure_code: str | None = None
+    reason: str | None = None
+
+
+@dataclass(frozen=True)
 class ScreenCandidateProvenance:
     """Bridge-private link from an observed screen candidate to world space."""
 
@@ -1624,18 +1631,49 @@ def _build_prerequisites_satisfied(
     spec: BuildSpec,
     unit_names: Mapping[int, str],
 ) -> bool:
+    return raw_build_eligibility(observation, spec, unit_names).eligible
+
+
+def raw_build_eligibility(
+    observation: Any,
+    action_or_spec: str | BuildSpec,
+    unit_names: Mapping[int, str],
+) -> RawBuildEligibility:
+    """Check RAW build costs and completed tech without UI action availability."""
+
+    spec = BUILD_SPECS[action_or_spec] if isinstance(action_or_spec, str) else action_or_spec
     player = _value(observation, "player_common", _value(observation, "player", None))
-    if player is not None:
-        if int(_value(player, "minerals", 0)) < spec.mineral_cost:
-            return False
-        if int(_value(player, "vespene", 0)) < spec.vespene_cost:
-            return False
+    # Synthetic geometry-only callers do not expose economy state. Live RAW
+    # observations always do, and therefore always take the complete contract.
+    if player is None:
+        return RawBuildEligibility(True)
+    minerals = int(_value(player, "minerals", 0))
+    vespene = int(_value(player, "vespene", 0))
+    if minerals < spec.mineral_cost:
+        return RawBuildEligibility(
+            False,
+            "build_insufficient_minerals",
+            f"{spec.target_structure} requires {spec.mineral_cost} minerals; observed {minerals}",
+        )
+    if vespene < spec.vespene_cost:
+        return RawBuildEligibility(
+            False,
+            "build_insufficient_vespene",
+            f"{spec.target_structure} requires {spec.vespene_cost} vespene; observed {vespene}",
+        )
     completed = {
         _unit_name(unit, unit_names)
         for unit in _value(observation, "raw_units", ())
         if int(_value(unit, "alliance", 0)) == 1 and _build_progress(unit) >= 1.0
     }
-    return all(prerequisite in completed for prerequisite in spec.prerequisites)
+    missing = tuple(item for item in spec.prerequisites if item not in completed)
+    if missing:
+        return RawBuildEligibility(
+            False,
+            "build_missing_prerequisite",
+            f"{spec.target_structure} requires completed {', '.join(missing)}",
+        )
+    return RawBuildEligibility(True)
 
 
 def _gas_structure_candidates(

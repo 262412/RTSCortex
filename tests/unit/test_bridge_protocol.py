@@ -189,7 +189,7 @@ def test_coordinator_defers_build_report_until_raw_state_confirms_effect() -> No
     assert [
         transition["next_state"]
         for transition in reports[0]["effect_evidence"]["placement_ledger_transitions"]
-    ] == ["reserved", "occupied", "released"]
+    ] == ["reserved", "build_started", "occupied", "released"]
     assert placement_service.command_target("command-pylon") is None
     assert runtime.execution_reports == reports
     assert coordinator.observe_effects(_raw_effect_observation(game_loop=268, minerals=175)) == []

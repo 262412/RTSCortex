@@ -627,6 +627,7 @@ class LiveProcessSupervisor:
                 "RTSCORTEX_SCENARIO": self.scenario,
                 "RTSCORTEX_SEED": str(self.seed),
                 "RTSCORTEX_WORKER_METRICS_PATH": str(self._worker_metrics_path),
+                "RTSCORTEX_LLM_LOG_DIR": str((self.run_dir / "llm-log").resolve()),
                 "PYGAME_HIDE_SUPPORT_PROMPT": "1",
             }
         )

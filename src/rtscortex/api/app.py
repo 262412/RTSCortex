@@ -1,5 +1,6 @@
 """FastAPI transport for environment workers."""
 
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Annotated
@@ -51,9 +52,20 @@ def create_app(
         }
 
     @app.post("/v1/tick", response_model=ActionBatch)
-    async def tick(observation: ObservationEnvelope) -> ActionBatch:
+    async def tick(observation: ObservationEnvelope, response: Response) -> ActionBatch:
         _require_current_protocol(observation.protocol_version)
-        return await engine.tick(observation)
+        started = time.perf_counter()
+        batch = await engine.tick(observation)
+        response.headers["X-RTSCortex-Runtime-Tick-Ms"] = (
+            f"{(time.perf_counter() - started) * 1_000:.6f}"
+        )
+        return batch
+
+    @app.post("/v1/performance")
+    async def performance(payload: dict[str, object]) -> dict[str, str]:
+        _require_current_protocol(str(payload.get("protocol_version", "")))
+        engine.record_performance_profile(payload)
+        return {"status": "recorded"}
 
     @app.post("/v1/execution")
     async def execution(report: ExecutionReport) -> dict[str, str]:

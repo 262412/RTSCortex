@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import socket
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -30,6 +31,7 @@ from rtscortex.runtime.live import (
     WorkerProcessError,
     ensure_console_port_available,
 )
+from scripts.prepare_reviewed_llm_pysc2_runtime import reviewed_source_tree_manifest
 from tests.helpers import make_config
 
 SUCCESS_WORKER = """
@@ -158,6 +160,20 @@ assert os.environ["RTSCORTEX_CONSOLE_RGB_MINIMAP_SIZE"] == "128"
     + SUCCESS_WORKER
 )
 
+LOG_ROOT_SUCCESS_WORKER = (
+    """
+import os
+from pathlib import Path
+
+log_root = Path(os.environ["RTSCORTEX_LLM_LOG_DIR"])
+assert log_root.is_absolute()
+assert log_root == Path(os.environ["RTSCORTEX_EXPECTED_LOG_ROOT"])
+log_root.mkdir(parents=True, exist_ok=True)
+(log_root / "managed.log").write_text("managed\\n", encoding="utf-8")
+"""
+    + SUCCESS_WORKER
+)
+
 
 def _supervisor(
     tmp_path: Path,
@@ -241,6 +257,52 @@ def test_supervisor_waits_for_server_and_returns_reported_result(tmp_path: Path)
         "episode_result",
         "episode_summary",
     ]
+
+
+def test_supervisor_routes_bridge_logs_to_the_absolute_run_directory(tmp_path: Path) -> None:
+    reviewed_source = tmp_path / "reviewed-source"
+    reviewed_source.mkdir()
+    subprocess.run(["git", "init", "--quiet", str(reviewed_source)], check=True)
+    (reviewed_source / "reviewed.py").write_text("VALUE = 1\n", encoding="utf-8")
+    before = reviewed_source_tree_manifest(reviewed_source)
+    supervisor = _supervisor(tmp_path, LOG_ROOT_SUCCESS_WORKER)
+    expected = (supervisor.run_dir / "llm-log").resolve()
+    supervisor.worker_environment["RTSCORTEX_EXPECTED_LOG_ROOT"] = str(expected)
+
+    result = asyncio.run(supervisor.run())
+
+    assert result.outcome is EpisodeOutcome.VICTORY
+    assert (expected / "managed.log").read_text(encoding="utf-8") == "managed\n"
+    assert reviewed_source_tree_manifest(reviewed_source) == before
+
+
+def test_runtime_persists_worker_profile_with_event_store_phase(tmp_path: Path) -> None:
+    runtime = build_runtime(make_config(tmp_path), tmp_path / "profile-artifacts")
+    runtime.record_performance_profile(
+        {
+            "protocol_version": "1.1",
+            "run_id": "profile-run",
+            "episode_id": "episode-0",
+            "step_id": 4,
+            "game_loop": 64,
+            "phases": {
+                "observation_extraction": {
+                    "count": 4,
+                    "total_ms": 8.0,
+                    "mean_ms": 2.0,
+                    "max_ms": 3.0,
+                }
+            },
+        }
+    )
+    runtime.store.flush()
+
+    event = runtime.store.last_event("profile-run", "episode-0", "runtime_phase_profile")
+
+    assert event is not None
+    assert event.payload["phases"]["observation_extraction"]["count"] == 4
+    assert "event_emission_persistence" in event.payload["phases"]
+    asyncio.run(runtime.close())
 
 
 def test_supervisor_ownership_collision_fails_before_runtime_start(

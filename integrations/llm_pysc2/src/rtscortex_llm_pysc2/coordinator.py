@@ -59,7 +59,12 @@ class BridgeCoordinator:
         snapshot: Mapping[str, Any],
         agent_team_order: Mapping[str, Sequence[str]],
     ) -> BridgeDecision:
-        observation = self.mapper.map(snapshot)
+        profiler = getattr(self.runtime, "profiler", None)
+        if profiler is None:
+            observation = self.mapper.map(snapshot)
+        else:
+            with profiler.measure("observation_extraction"):
+                observation = self.mapper.map(snapshot)
         service = self.effect_verifier.placement_service
         if service is not None:
             service.set_runtime_context(

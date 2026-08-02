@@ -9,6 +9,8 @@ from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Any, Optional
 
+from rtscortex_llm_pysc2.effect_lifecycle import build_reservation_expiry
+
 
 @dataclass(frozen=True)
 class RawPlacement:
@@ -25,6 +27,7 @@ class RawPlacementReservation:
     builder_tag: int | None
     ability_name: str
     requested_world_target: tuple[float, float] | None
+    final_validated_world_target: tuple[float, float]
     world_target: tuple[float, float]
     anchor_tag: int | None
     placement_revision: str
@@ -150,8 +153,12 @@ class RawPlacementService:
         *,
         unit_names: Mapping[int, str],
         transition_sink: Callable[[dict[str, Any]], None] | None = None,
+        effect_timeout_game_loops: int = 112,
     ) -> None:
+        if effect_timeout_game_loops < 1:
+            raise ValueError("effect_timeout_game_loops must be positive")
         self.unit_names = {int(key): str(value) for key, value in unit_names.items()}
+        self.effect_timeout_game_loops = int(effect_timeout_game_loops)
         self._known_resources: dict[int, dict[str, Any]] = {}
         self._suppressed_clusters: set[int] = set()
         self._suppressed_resource_tags: set[int] = set()
@@ -318,10 +325,20 @@ class RawPlacementService:
             BUILD_SPECS,
             _gas_structure_candidates,
             build_screen_candidates,
+            raw_build_eligibility,
             screen_candidate_provenance,
         )
 
         spec = BUILD_SPECS[action_name]
+        eligibility = raw_build_eligibility(observation, spec, self.unit_names)
+        if not eligibility.eligible:
+            assert eligibility.failure_code is not None
+            self._remember_diagnostic(action_name, eligibility.failure_code)
+            return RawPlacementCandidates(
+                argument_candidates=[],
+                screen_provenance=[],
+                unavailable_reason=eligibility.failure_code,
+            )
         game_loop = _game_loop(observation)
         self._expire_temporary_suppressions(game_loop)
         if spec.placement_kind == "screen":
@@ -406,11 +423,19 @@ class RawPlacementService:
     ) -> RawPlacementReservation:
         from rtscortex_llm_pysc2.extractor import (
             BUILD_SPECS,
+            raw_build_eligibility,
             resolve_screen_build_world_target,
             screen_to_world_target,
         )
 
         spec = BUILD_SPECS[action_name]
+        eligibility = raw_build_eligibility(observation, spec, self.unit_names)
+        if not eligibility.eligible:
+            assert eligibility.failure_code is not None
+            raise RawPlacementFailure(
+                eligibility.failure_code,
+                eligibility.reason or eligibility.failure_code,
+            )
         game_loop = _game_loop(observation)
         current_revision = _placement_revision(observation)
         self._expire_temporary_suppressions(game_loop)
@@ -506,11 +531,11 @@ class RawPlacementService:
                     "invalid_geyser_tag",
                     f"{action_name} target {hex(anchor)} is not a visible neutral geyser",
                 )
-            requested_target = None
             emitted = (
                 float(_value(target_unit, "x", 0.0)),
                 float(_value(target_unit, "y", 0.0)),
             )
+            requested_target = emitted
             anchor_tag = anchor
         else:
             anchor = _tag_argument(requested_arguments, action_name=action_name)
@@ -528,7 +553,10 @@ class RawPlacementService:
                     "no_legal_placement",
                     f"{action_name} anchor {hex(anchor)} has no legal world placement",
                 )
-            requested_target = None
+            requested_target = (
+                float(expansion_target[0]),
+                float(expansion_target[1]),
+            )
             emitted = (float(round(expansion_target[0])), float(round(expansion_target[1])))
             anchor_tag = cluster_id
         reservation = RawPlacementReservation(
@@ -538,6 +566,7 @@ class RawPlacementService:
             builder_tag=normalized_builder,
             ability_name=ability_name or action_name,
             requested_world_target=requested_target,
+            final_validated_world_target=emitted,
             world_target=emitted,
             anchor_tag=anchor_tag,
             placement_revision=current_revision,
@@ -552,7 +581,13 @@ class RawPlacementService:
             placement_state="reserved",
             episode_id=episode_id,
             expires_game_loop=(
-                int(expires_game_loop) if expires_game_loop is not None else game_loop + 224
+                int(expires_game_loop)
+                if expires_game_loop is not None
+                else build_reservation_expiry(
+                    game_loop,
+                    action_name,
+                    base_timeout_game_loops=self.effect_timeout_game_loops,
+                )
             ),
         )
         self._command_targets[command_id] = reservation
@@ -678,6 +713,37 @@ class RawPlacementService:
             release_reason="effect_confirmed",
         )
         self._release_builder_lease(placement)
+
+    def mark_build_started(
+        self,
+        command_id: str,
+        *,
+        game_loop: int,
+        expires_game_loop: int,
+    ) -> None:
+        """Renew active placement ownership when RAW order/effect evidence appears."""
+
+        placement = self._command_targets.get(command_id)
+        if placement is None:
+            return
+        renewed = replace(
+            placement,
+            placement_state="build_started",
+            expires_game_loop=max(placement.expires_game_loop, int(expires_game_loop)),
+        )
+        self._command_targets[command_id] = renewed
+        if placement.placement_state == "reserved":
+            self._record_transition(
+                command_id,
+                reservation=placement,
+                previous_state="reserved",
+                next_state="build_started",
+                game_loop=self._resolved_transition_loop(
+                    placement.reservation_id,
+                    game_loop,
+                ),
+                release_reason="build_start_observed",
+            )
 
     def release_command(
         self,

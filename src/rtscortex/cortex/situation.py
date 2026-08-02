@@ -523,19 +523,29 @@ class DeterministicSituationAnalyzer:
             evidence.extend(damage_evidence)
 
         computed = _threat_level_for_score(score)
-        if computed in {ThreatLevel.HIGH, ThreatLevel.CRITICAL}:
+        held = self._held_threat_level
+        within_hold = (
+            held in {ThreatLevel.HIGH, ThreatLevel.CRITICAL}
+            and self._threat_hold_until_game_loop is not None
+            and observation.game_loop <= self._threat_hold_until_game_loop
+        )
+        if _threat_severity(computed) > _threat_severity(held):
             self._held_threat_level = computed
             self._threat_hold_until_game_loop = (
                 observation.game_loop + self.threat_hysteresis_game_loops
             )
-        elif (
-            self._held_threat_level in {ThreatLevel.HIGH, ThreatLevel.CRITICAL}
-            and self._threat_hold_until_game_loop is not None
-            and observation.game_loop <= self._threat_hold_until_game_loop
-        ):
-            computed = self._held_threat_level
+        elif within_hold and _threat_severity(computed) < _threat_severity(held):
+            computed = held
             score = max(score, 4.0 if computed is ThreatLevel.HIGH else 7.0)
             evidence.append(f"hysteresis:{computed.value}")
+        elif computed in {ThreatLevel.HIGH, ThreatLevel.CRITICAL}:
+            # A stable same-severity observation refreshes the hold. A lower
+            # observation never does, so downgrade requires persistence through
+            # the original window.
+            self._held_threat_level = computed
+            self._threat_hold_until_game_loop = (
+                observation.game_loop + self.threat_hysteresis_game_loops
+            )
         else:
             self._held_threat_level = computed
             self._threat_hold_until_game_loop = None
@@ -574,6 +584,17 @@ def _threat_level_for_score(score: float) -> ThreatLevel:
     if score > 0.0:
         return ThreatLevel.LOW
     return ThreatLevel.NONE
+
+
+def _threat_severity(level: ThreatLevel | None) -> int:
+    if level is None:
+        return -1
+    return {
+        ThreatLevel.NONE: 0,
+        ThreatLevel.LOW: 1,
+        ThreatLevel.HIGH: 2,
+        ThreatLevel.CRITICAL: 3,
+    }[level]
 
 
 def _resource_pressure(

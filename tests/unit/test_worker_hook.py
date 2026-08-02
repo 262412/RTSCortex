@@ -33,6 +33,7 @@ from rtscortex_llm_pysc2.routing import RoutedActionBatch, RoutedCommand
 from rtscortex_llm_pysc2.worker import (
     ExpansionScoutController,
     GasWorkerController,
+    RawDecisionScheduler,
     RTSCortexLLMAgent,
     RTSCortexMainAgent,
     WorkerSettings,
@@ -81,6 +82,40 @@ from rtscortex_llm_pysc2.worker import (
 )
 
 from rtscortex.contracts import ObservationEnvelope
+
+
+def test_raw_decision_scheduler_separates_effect_polling_from_runtime_ticks() -> None:
+    scheduler = RawDecisionScheduler(
+        stable_interval_game_loops=16,
+        outstanding_interval_game_loops=64,
+    )
+
+    assert scheduler.should_decide(game_loop=0, queued_count=0, inflight_count=0)
+    scheduler.record_decision(game_loop=0, emergency_signature=())
+    assert not scheduler.should_decide(game_loop=8, queued_count=0, inflight_count=0)
+    assert scheduler.should_decide(game_loop=16, queued_count=0, inflight_count=0)
+
+    scheduler.record_decision(game_loop=16, emergency_signature=())
+    assert not scheduler.should_decide(game_loop=32, queued_count=0, inflight_count=1)
+    assert scheduler.should_decide(
+        game_loop=33,
+        queued_count=0,
+        inflight_count=1,
+        terminal_feedback=True,
+    )
+    scheduler.record_decision(game_loop=33, emergency_signature=())
+    assert scheduler.should_decide(
+        game_loop=34,
+        queued_count=0,
+        inflight_count=1,
+        emergency_signature=("unit_under_attack",),
+    )
+    assert not scheduler.should_decide(
+        game_loop=128,
+        queued_count=1,
+        inflight_count=0,
+        terminal_feedback=True,
+    )
 
 
 def test_outbound_primitive_argument_validator_uses_half_open_bounds() -> None:

@@ -10,6 +10,7 @@ from typing import Any, Optional
 
 from rtscortex_llm_pysc2.broker import PrimitiveDispatch, SharedDecisionBroker
 from rtscortex_llm_pysc2.coordinator import BridgeDecision
+from rtscortex_llm_pysc2.extractor import raw_build_eligibility
 from rtscortex_llm_pysc2.observation import split_actor
 from rtscortex_llm_pysc2.production import production_spec
 from rtscortex_llm_pysc2.raw_placement import RawPlacementFailure, RawPlacementService
@@ -34,6 +35,13 @@ _WARP_RAW_FUNCTIONS = {
     "Warp_Zealot_Near": "TrainWarp_Zealot_pt",
     "Warp_Stalker_Near": "TrainWarp_Stalker_pt",
 }
+_NONSPATIAL_BUILD_FAILURE_CODES = frozenset(
+    {
+        "build_insufficient_minerals",
+        "build_insufficient_vespene",
+        "build_missing_prerequisite",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -69,7 +77,27 @@ class RawActionExecutor:
 
     @property
     def pending_commands(self) -> int:
+        """Deprecated queue-only count; use the explicit lifecycle properties."""
+
+        return self.queued_count
+
+    @property
+    def queued_count(self) -> int:
+        """Commands accepted from Runtime but not yet translated."""
+
         return len(self._commands)
+
+    @property
+    def effect_inflight_count(self) -> int:
+        """Commands dispatched and awaiting terminal effect feedback."""
+
+        return len(self._inflight)
+
+    @property
+    def outstanding_work(self) -> bool:
+        """Whether queueing or effect verification still owns command work."""
+
+        return bool(self._commands or self._inflight)
 
     def enqueue(self, decision: BridgeDecision) -> None:
         """Preserve Runtime ActionBatch order across per-agent routes."""
@@ -180,7 +208,10 @@ class RawActionExecutor:
                 self._inflight[command.command_id] = dispatch
                 return dispatch
             except _RawDispatchFailure as error:
-                if command.name in _BUILD_RAW_FUNCTIONS:
+                if (
+                    command.name in _BUILD_RAW_FUNCTIONS
+                    and error.code not in _NONSPATIAL_BUILD_FAILURE_CODES
+                ):
                     self._quarantine_command(
                         command,
                         failure_code=error.code,
@@ -260,6 +291,13 @@ class RawActionExecutor:
             function = getattr(actions.RAW_FUNCTIONS, _CONTROL_RAW_FUNCTIONS[name])
             action = function("now", list(actor_tags))
         elif name in _BUILD_RAW_FUNCTIONS:
+            eligibility = raw_build_eligibility(observation, name, self.unit_names)
+            if not eligibility.eligible:
+                assert eligibility.failure_code is not None
+                raise _RawDispatchFailure(
+                    eligibility.failure_code,
+                    eligibility.reason or eligibility.failure_code,
+                )
             if name.endswith("_Screen") and (
                 command.placement_candidate_id is None or command.placement_revision is None
             ):

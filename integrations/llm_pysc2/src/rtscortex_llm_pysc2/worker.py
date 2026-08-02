@@ -64,6 +64,8 @@ BUILD_TRANSLATOR_RETRY_FAILURE_CODES = frozenset(
 )
 DEFAULT_OBSERVATION_GAP_WATCHDOG_GAME_LOOPS = 448
 DEFAULT_OBSERVATION_GAP_HARD_LIMIT_GAME_LOOPS = 1792
+DEFAULT_RAW_STABLE_DECISION_INTERVAL_GAME_LOOPS = 16
+DEFAULT_RAW_OUTSTANDING_DECISION_INTERVAL_GAME_LOOPS = 64
 
 
 class _SourceActionSpec(Protocol):
@@ -220,6 +222,65 @@ class WorkerSettings:
             console_frame_fps=console_frame_fps,
             console_jpeg_quality=console_jpeg_quality,
         )
+
+
+@dataclass
+class RawDecisionScheduler:
+    """Schedule Runtime decisions independently from per-loop effect polling."""
+
+    stable_interval_game_loops: int = DEFAULT_RAW_STABLE_DECISION_INTERVAL_GAME_LOOPS
+    outstanding_interval_game_loops: int = DEFAULT_RAW_OUTSTANDING_DECISION_INTERVAL_GAME_LOOPS
+    last_decision_game_loop: int | None = None
+    last_emergency_signature: tuple[str, ...] | None = None
+    _terminal_feedback_pending: bool = False
+    _emergency_pending: bool = False
+
+    def __post_init__(self) -> None:
+        if self.stable_interval_game_loops < 1:
+            raise ValueError("stable_interval_game_loops must be positive")
+        if self.outstanding_interval_game_loops < self.stable_interval_game_loops:
+            raise ValueError("outstanding_interval_game_loops must be at least the stable interval")
+
+    def should_decide(
+        self,
+        *,
+        game_loop: int,
+        queued_count: int,
+        inflight_count: int,
+        terminal_feedback: bool = False,
+        emergency_signature: tuple[str, ...] = (),
+    ) -> bool:
+        if terminal_feedback:
+            self._terminal_feedback_pending = True
+        if (
+            self.last_emergency_signature is not None
+            and emergency_signature != self.last_emergency_signature
+            and emergency_signature
+        ):
+            self._emergency_pending = True
+        if queued_count:
+            return False
+        if self.last_decision_game_loop is None:
+            return True
+        if self._terminal_feedback_pending or self._emergency_pending:
+            return True
+        interval = (
+            self.outstanding_interval_game_loops
+            if inflight_count
+            else self.stable_interval_game_loops
+        )
+        return int(game_loop) - self.last_decision_game_loop >= interval
+
+    def record_decision(
+        self,
+        *,
+        game_loop: int,
+        emergency_signature: tuple[str, ...],
+    ) -> None:
+        self.last_decision_game_loop = int(game_loop)
+        self.last_emergency_signature = emergency_signature
+        self._terminal_feedback_pending = False
+        self._emergency_pending = False
 
 
 class ExpansionScoutController:
@@ -1542,6 +1603,7 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
         placement_service = RawPlacementService(
             unit_names=unit_names,
             transition_sink=self.runtime_client.placement_transition,
+            effect_timeout_game_loops=self.worker_settings.action_effect_timeout_game_loops,
         )
         coordinator = BridgeCoordinator(
             self.runtime_client,
@@ -1610,6 +1672,7 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
             unit_names=unit_names,
             placement_service=placement_service,
         )
+        self.raw_decision_scheduler = RawDecisionScheduler()
         self._rtscortex_accept_visible_team_unit = True
         self._rtscortex_exact_single_unit_selection = True
         self._rtscortex_transport_noop_without_actor_selection = True
@@ -1800,7 +1863,8 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
 
         self._submit_console_frame(obs)
         self._settle_previous_primitive(obs)
-        effect_reports = self.decision_broker.observe_effects(obs.observation)
+        with self.runtime_client.profiler.measure("effect_verification"):
+            effect_reports = self.decision_broker.observe_effects(obs.observation)
         self.raw_executor.observe_reports(
             effect_reports,
             self.agents,
@@ -1817,15 +1881,27 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
             self.agents,
         )
 
-        if self.raw_executor.pending_commands == 0:
+        emergency_signature = _raw_emergency_signature(obs.observation)
+        if self.raw_decision_scheduler.should_decide(
+            game_loop=game_loop,
+            queued_count=self.raw_executor.queued_count,
+            inflight_count=self.raw_executor.effect_inflight_count,
+            terminal_feedback=bool(effect_reports),
+            emergency_signature=emergency_signature,
+        ):
             decision = self.decision_broker.decide_direct(
                 obs,
                 self.agents,
                 step_id=int(self.steps),
             )
             self.raw_executor.enqueue(decision)
+            self.raw_decision_scheduler.record_decision(
+                game_loop=game_loop,
+                emergency_signature=emergency_signature,
+            )
 
-        dispatch = self.raw_executor.next_dispatch(obs.observation, self.agents)
+        with self.runtime_client.profiler.measure("raw_translate_dispatch"):
+            dispatch = self.raw_executor.next_dispatch(obs.observation, self.agents)
         if dispatch is not None:
             resolved = list(dispatch.resolved_arguments)
             if resolved:
@@ -1864,6 +1940,14 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
         if self.game_clock is not None:
             self.game_clock.wait_for_step()
         return action
+
+    def record_environment_step(self, elapsed_seconds: float) -> None:
+        """Receive the patched PySC2 run-loop environment-step duration."""
+
+        self.runtime_client.profiler.observe_milliseconds(
+            "pysc2_environment_step",
+            float(elapsed_seconds) * 1_000,
+        )
 
     def _validated_outbound_action(
         self,
@@ -4407,6 +4491,30 @@ def _single_position(arguments: Any) -> Optional[tuple[float, float]]:
         ):
             return float(value[0]), float(value[1])
     return None
+
+
+def _raw_emergency_signature(observation: Any) -> tuple[str, ...]:
+    """Return stable emergency edges that justify an early Runtime decision."""
+
+    alerts = tuple(
+        sorted(
+            {
+                str(_observation_value(alert, "name", alert))
+                for alert in _observation_value(observation, "alerts", ())
+            }
+        )
+    )
+    raw_units = _observation_value(observation, "raw_units", ())
+    critical_own_units = sum(
+        1
+        for unit in raw_units
+        if int(_observation_value(unit, "alliance", 0)) == 1
+        and float(_observation_value(unit, "health_max", 0.0)) > 0.0
+        and float(_observation_value(unit, "health", 0.0))
+        / float(_observation_value(unit, "health_max", 1.0))
+        <= 0.3
+    )
+    return (*alerts, *((f"critical_own_units:{critical_own_units}",) if critical_own_units else ()))
 
 
 def _observation_game_loop(observation: Any) -> int:

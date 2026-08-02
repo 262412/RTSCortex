@@ -172,6 +172,8 @@ class DeterministicTacticalAgent:
         self._target_failures: dict[tuple[str, str], _TargetFailureState] = {}
         self._actor_failures: dict[str, _ActorFailureState] = {}
         self._retreat_by_actor: dict[str, _ActorRetreatState] = {}
+        self._retreat_arrival_commitments: set[str] = set()
+        self._retreat_cooldown_by_commitment: dict[str, int] = {}
         self._offense_by_actor: dict[str, _ActorOffenseState] = {}
         self._known_enemy_structures: dict[str, tuple[float, float]] = {}
 
@@ -460,6 +462,11 @@ class DeterministicTacticalAgent:
                 threat_signature=state.threat_signature,
                 destination=state.destination,
             ).commitment_id
+            state.arrival_emitted = state.commitment_id in self._retreat_arrival_commitments
+            state.cooldown_until_game_loop = max(
+                state.cooldown_until_game_loop,
+                self._retreat_cooldown_by_commitment.get(state.commitment_id, 0),
+            )
         elif isinstance(state, _ActorEngagementState):
             engagement_actor_tags = tuple(int(tag, 0) for tag in state.actor_tags)
             state.engagement_id = EngagementKey(
@@ -509,7 +516,13 @@ class DeterministicTacticalAgent:
             return None
         if report.status is ExecutionStatus.SUCCEEDED:
             if retreat is not None:
-                if retreat.phase == "arrived" and retreat.arrival_emitted:
+                commitment_id = retreat.commitment_id
+                if (
+                    retreat.phase == "arrived"
+                    and retreat.arrival_emitted
+                    or commitment_id is not None
+                    and commitment_id in self._retreat_arrival_commitments
+                ):
                     return None
                 retreat.phase = "arrived"
                 retreat.arrival_emitted = True
@@ -517,6 +530,11 @@ class DeterministicTacticalAgent:
                     retreat.cooldown_until_game_loop,
                     game_loop + self.retreat_cooldown_game_loops,
                 )
+                if commitment_id is not None:
+                    self._retreat_arrival_commitments.add(commitment_id)
+                    self._retreat_cooldown_by_commitment[commitment_id] = (
+                        retreat.cooldown_until_game_loop
+                    )
                 return {
                     "actor": actor,
                     "state": "retreat_arrived",
@@ -735,7 +753,13 @@ class DeterministicTacticalAgent:
             )
             threat_signature = _threat_signature(assessment, enemies)
             recovered = actor_durability >= self.retreat_exit_health_threshold
-            if state is not None and recovered and not overwhelmed:
+            if (
+                state is not None
+                and recovered
+                and not overwhelmed
+                and state.phase == "arrived"
+                and observation.game_loop >= state.cooldown_until_game_loop
+            ):
                 del self._retreat_by_actor[actor]
                 state = None
 
@@ -747,7 +771,6 @@ class DeterministicTacticalAgent:
             if state is not None and at_home:
                 if state.phase != "arrived":
                     state.phase = "arrived"
-                    state.arrival_emitted = False
                 state.cooldown_until_game_loop = max(
                     state.cooldown_until_game_loop,
                     observation.game_loop + self.retreat_cooldown_game_loops,
@@ -798,6 +821,8 @@ class DeterministicTacticalAgent:
         self._target_failures.clear()
         self._actor_failures.clear()
         self._retreat_by_actor.clear()
+        self._retreat_arrival_commitments.clear()
+        self._retreat_cooldown_by_commitment.clear()
         self._offense_by_actor.clear()
         self._known_enemy_structures.clear()
 

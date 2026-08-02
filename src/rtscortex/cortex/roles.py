@@ -882,6 +882,7 @@ def _inventory_payload(
         "reserved": reserved,
         "dispatched_not_terminal": dispatched_not_terminal,
         "dispatches_not_already_observed": dispatches_not_already_observed,
+        "current_batch_selected": 0,
         "effective_count": effective_count,
         "hard_cap": hard_cap,
         "decision": (

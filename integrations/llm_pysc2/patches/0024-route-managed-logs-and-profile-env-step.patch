@@ -1,0 +1,85 @@
+--- a/llm_pysc2/agents/llm_pysc2_agent.py
++++ b/llm_pysc2/agents/llm_pysc2_agent.py
+@@ -134,8 +134,11 @@
+     # log
+     current_dir = os.path.dirname(os.path.abspath(__file__))
+     self.current_dir = current_dir
+-    self.log_dir_path = f"{current_dir}/../../llm_log/{self.start_time}-{self.log_id}"
+-    self.history_func_path = f"{current_dir}/../../llm_log/{self.start_time}-{self.log_id}/{self.name}/a_his.txt"
++    base_log_dir = os.environ.get("RTSCORTEX_LLM_LOG_DIR")
++    if not base_log_dir or not os.path.isabs(base_log_dir):
++      raise RuntimeError("RTSCORTEX_LLM_LOG_DIR must be an absolute path")
++    self.log_dir_path = os.path.join(base_log_dir, f"{self.start_time}-{self.log_id}")
++    self.history_func_path = os.path.join(self.log_dir_path, self.name, "a_his.txt")
+     logger.success(f"[ID {self.log_id}] Agent {self.name} successfully initialized!")
+ 
+   # check if team_unit_tag_list contains all necessary unit
+@@ -238,7 +241,7 @@
+ 
+       if not os.path.exists(self.log_dir_path + f"/{self.name}"):
+         os.mkdir(self.log_dir_path + f"/{self.name}")
+-        copyfile(self.current_dir + f"/../../llm_log/log_show.py", self.log_dir_path + f"/{self.name}/log_show.py")
++        copyfile(os.path.join(self.current_dir, "..", "lib", "log_show.py"), os.path.join(self.log_dir_path, self.name, "log_show.py"))
+       if not os.path.exists(self.log_dir_path + f"/{self.name}/o.txt"):
+         with open(self.log_dir_path + f"/{self.name}/o.txt", "w") as f:
+           f.write('')
+--- a/llm_pysc2/agents/llm_pysc2_agent_main.py
++++ b/llm_pysc2/agents/llm_pysc2_agent_main.py
+@@ -117,27 +117,29 @@
+     global llm_pysc2_global_log_id
+ 
+     time.sleep(random.random())
+-    base_log_dir = f"{os.path.dirname(os.path.abspath(__file__))}/../../llm_log"
+-    if not os.path.exists(base_log_dir):
+-      os.mkdir(base_log_dir)
+-    if not os.path.exists(base_log_dir + f"/log_show.py"):
+-      copyfile(f"{os.path.dirname(os.path.abspath(__file__))}/../lib/log_show.py", base_log_dir + f"/log_show.py")
+-    if not os.path.exists(base_log_dir + f"/log_analyse.py"):
+-      copyfile(f"{os.path.dirname(os.path.abspath(__file__))}/../lib/log_analyse.py", base_log_dir + f"/log_analyse.py")
++    base_log_dir = os.environ.get("RTSCORTEX_LLM_LOG_DIR")
++    if not base_log_dir or not os.path.isabs(base_log_dir):
++      raise RuntimeError("RTSCORTEX_LLM_LOG_DIR must be an absolute path")
++    os.makedirs(base_log_dir, exist_ok=True)
++    library_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "lib"))
++    if not os.path.exists(os.path.join(base_log_dir, "log_show.py")):
++      copyfile(os.path.join(library_dir, "log_show.py"), os.path.join(base_log_dir, "log_show.py"))
++    if not os.path.exists(os.path.join(base_log_dir, "log_analyse.py")):
++      copyfile(os.path.join(library_dir, "log_analyse.py"), os.path.join(base_log_dir, "log_analyse.py"))
+ 
+     self.log_id = 0
+     while True:
+       self.log_id += 1
+-      self.log_dir_path = f"{os.path.dirname(os.path.abspath(__file__))}/../../llm_log/{self.start_time}-{self.log_id}"
++      self.log_dir_path = os.path.join(base_log_dir, f"{self.start_time}-{self.log_id}")
+       try:
+         os.mkdir(self.log_dir_path)
+       except FileExistsError:
+         continue
+       llm_pysc2_global_log_id = max(llm_pysc2_global_log_id, self.log_id)
+-      self.log_error_path = self.log_dir_path + f"/log_error.txt"
+-      self.log_success_path = self.log_dir_path + f"/log_success.txt"
+-      self.log_debug_path = self.log_dir_path + f"/log_debug.txt"
+-      self.log_info_path = self.log_dir_path + f"/log_info.txt"
++      self.log_error_path = os.path.join(self.log_dir_path, "log_error.txt")
++      self.log_success_path = os.path.join(self.log_dir_path, "log_success.txt")
++      self.log_debug_path = os.path.join(self.log_dir_path, "log_debug.txt")
++      self.log_info_path = os.path.join(self.log_dir_path, "log_info.txt")
+       break
+ 
+     if not os.path.exists(self.log_error_path):
+--- a/pysc2/env/run_loop.py
++++ b/pysc2/env/run_loop.py
+@@ -45,7 +45,13 @@
+           return
+         if timesteps[0].last():
+           break
++        environment_step_started = time.perf_counter()
+         timesteps = env.step(actions)
++        environment_step_seconds = time.perf_counter() - environment_step_started
++        for agent in agents:
++          record_environment_step = getattr(agent, "record_environment_step", None)
++          if record_environment_step is not None:
++            record_environment_step(environment_step_seconds)
+   except KeyboardInterrupt:
+     pass
+   finally:

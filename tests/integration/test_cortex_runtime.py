@@ -20,6 +20,7 @@ from rtscortex.config import (
 from rtscortex.contracts import (
     ActionArgumentType,
     ActionBatch,
+    ActionCommand,
     ActionSource,
     AvailableAction,
     EconomyState,
@@ -29,6 +30,7 @@ from rtscortex.contracts import (
     ExecutionStage,
     ExecutionStatus,
     ObservationEnvelope,
+    ProductionItem,
     SC2State,
     UnitState,
 )
@@ -263,6 +265,72 @@ def _macro_observation(*, step_id: int, game_loop: int, pylon: bool = False) -> 
 
 def _store(tmp_path: Path) -> EventStore:
     return EventStore(tmp_path / "events.sqlite3", tmp_path / "events.jsonl")
+
+
+@pytest.mark.parametrize("unit_type", ["Phoenix", "VoidRay"])
+def test_global_defense_cap_blocks_seventh_planner_dispatch_regardless_of_role(
+    tmp_path: Path,
+    unit_type: str,
+) -> None:
+    store = _store(tmp_path)
+    runtime = CortexRuntimeEngine(
+        config=_config(tmp_path, macro=False),
+        store=store,
+        provider=FakeProvider(),
+    )
+    observation = ObservationEnvelope(
+        run_id="cortex-run",
+        episode_id="episode-1",
+        step_id=7,
+        game_loop=112,
+        state=SC2State(
+            own_units=[
+                UnitState(
+                    unit_id=f"0x{index + 1:x}",
+                    unit_type=unit_type,
+                    alliance="self",
+                )
+                for index in range(5)
+            ],
+            production_queue=[ProductionItem(name=unit_type, progress=0.5)],
+        ),
+    )
+    command = ActionCommand(
+        command_id=f"macro-{unit_type.casefold()}",
+        actor="Developer/Stargate-1",
+        name=f"Train_{unit_type}",
+        created_game_loop=112,
+        ttl_game_loops=16,
+        source=ActionSource.PLANNER,
+    )
+
+    outcome, inventory = runtime._apply_defense_inventory_guard([command], observation)
+    store.flush()
+
+    assert outcome.accepted == []
+    assert outcome.failures[0].reason == f"global_defense_inventory_cap:{unit_type}:6/6"
+    matching = next(item for item in inventory if item["item_type"] == unit_type)
+    assert matching == {
+        "item_type": unit_type,
+        "action_name": f"Train_{unit_type}",
+        "completed": 5,
+        "constructing_or_training": 1,
+        "queued": 0,
+        "reserved": 0,
+        "dispatched_not_terminal": 0,
+        "dispatches_not_already_observed": 0,
+        "hard_cap": 6,
+        "current_batch_selected": 0,
+        "effective_count": 6,
+        "decision": "at_cap",
+    }
+    blocked = store.events_of_type(
+        observation.run_id,
+        observation.episode_id,
+        "defense_inventory_cap_blocked",
+    )
+    assert [event.payload["command_id"] for event in blocked] == [command.command_id]
+    asyncio.run(runtime.close())
 
 
 def test_cortex_runtime_records_three_specialist_race_brain_cycle(tmp_path: Path) -> None:

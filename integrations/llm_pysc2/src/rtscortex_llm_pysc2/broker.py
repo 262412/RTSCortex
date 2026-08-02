@@ -378,12 +378,22 @@ class SharedDecisionBroker:
         final dispatch. No camera, selection or translator queue participates.
         """
 
-        snapshot = self.extractor.extract(
-            timestep,
-            agents,
-            {name: "RTSCortex raw-action observation" for name in agents},
-            step_id=step_id,
-        )
+        profiler = getattr(self.coordinator.runtime, "profiler", None)
+        if profiler is None:
+            snapshot = self.extractor.extract(
+                timestep,
+                agents,
+                {name: "RTSCortex raw-action observation" for name in agents},
+                step_id=step_id,
+            )
+        else:
+            with profiler.measure("observation_extraction"):
+                snapshot = self.extractor.extract(
+                    timestep,
+                    agents,
+                    {name: "RTSCortex raw-action observation" for name in agents},
+                    step_id=step_id,
+                )
         team_order = {name: current_team_order(agent) for name, agent in agents.items()}
         decision = self.coordinator.decide(snapshot, team_order)
         with self._condition:

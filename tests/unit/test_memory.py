@@ -61,6 +61,52 @@ def test_semantic_memory_is_explicitly_disabled() -> None:
     assert hits == []
 
 
+def test_high_frequency_retention_is_change_based_bounded_and_accounted(
+    tmp_path: Path,
+) -> None:
+    store = EventStore(tmp_path / "events.sqlite3", tmp_path / "events.jsonl")
+    for step_id in range(200):
+        store.append_event(
+            run_id="run",
+            episode_id="episode",
+            step_id=step_id,
+            event_type="observation",
+            payload={"step_id": step_id, "game_loop": step_id, "state": {"minerals": 50}},
+        )
+        store.append_event(
+            run_id="run",
+            episode_id="episode",
+            step_id=step_id,
+            event_type="execution",
+            payload={"command_id": f"command-{step_id}"},
+        )
+    store.append_event(
+        run_id="run",
+        episode_id="episode",
+        step_id=200,
+        event_type="observation",
+        payload={"step_id": 200, "game_loop": 200, "state": {"minerals": 75}},
+    )
+    store.append_retention_summary(run_id="run", episode_id="episode", step_id=200)
+    store.flush()
+
+    observations = store.events_of_type("run", "episode", "observation")
+    executions = store.events_of_type("run", "episode", "execution")
+    summary = store.last_event("run", "episode", "event_retention_summary")
+
+    assert len(observations) == 5  # first + loops 64/128/192 + immediate change
+    assert len(executions) == 200
+    assert summary is not None
+    assert summary.payload["event_counts"]["observation"] == {
+        "raw": 201,
+        "retained": 5,
+        "suppressed": 196,
+    }
+    assert summary.payload["aggregates"]["observation"]["logical_count"] == 201
+    assert store.performance_snapshot().sampled_drop_supported is True
+    store.close()
+
+
 def test_append_durable_event_waits_for_sqlite_and_journal_barrier(tmp_path: Path) -> None:
     database = tmp_path / "events.sqlite3"
     journal = tmp_path / "events.jsonl"

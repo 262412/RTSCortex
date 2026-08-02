@@ -1245,6 +1245,11 @@ def test_promotion_sweep_replays_multi_seed_states_and_activates_soft_rule(
                     "army_readiness": "engaged",
                 },
             )
+        event_store.append_retention_summary(
+            run_id=run_id,
+            episode_id="episode",
+            step_id=30,
+        )
         event_store.close()
 
     sweep = PlaybookPromotionSweep(playbook, run_root=tmp_path).run()
@@ -1351,6 +1356,11 @@ def test_promotion_sweep_consolidates_fragmented_typed_strategy_evidence(
                     "army_readiness": "engaged",
                 },
             )
+        event_store.append_retention_summary(
+            run_id=run_id,
+            episode_id="episode",
+            step_id=30,
+        )
         event_store.close()
 
     sweep = PlaybookPromotionSweep(playbook, run_root=tmp_path).run()
