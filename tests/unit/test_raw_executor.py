@@ -6,6 +6,7 @@ from typing import Any, cast
 import pytest
 from rtscortex_llm_pysc2.coordinator import BridgeDecision
 from rtscortex_llm_pysc2.raw_executor import RawActionExecutor
+from rtscortex_llm_pysc2.raw_placement import _placement_candidate_id, _placement_revision
 from rtscortex_llm_pysc2.routing import RoutedActionBatch, RoutedCommand
 
 pytest.importorskip("pysc2.lib.actions")
@@ -199,6 +200,81 @@ def test_raw_executor_rejects_missing_actor_without_emitting_action() -> None:
     assert broker.settled == [("missing-actor", False)]
 
 
+def test_raw_executor_revalidates_completed_adept_prerequisite() -> None:
+    command = RoutedCommand(
+        command_id="adept-final-contract",
+        actor="Developer/Empty",
+        team_name="Empty",
+        name="Train_Adept",
+        rendered_action="",
+    )
+    player = SimpleNamespace(
+        minerals=500,
+        vespene=500,
+        food_used=10,
+        food_cap=20,
+    )
+    gateway = _unit(0xD1, 3)
+    core = _unit(0xC1, 4)
+    core.build_progress = 1
+    broker = _Broker()
+    executor = RawActionExecutor(
+        cast(Any, broker),
+        unit_names={3: "Gateway", 4: "CyberneticsCore"},
+    )
+    executor.enqueue(_decision(command))
+
+    assert (
+        executor.next_dispatch(
+            SimpleNamespace(
+                raw_units=[gateway, core],
+                player_common=player,
+                game_loop=[100],
+            ),
+            {"Developer": _agent("Empty", [])},
+        )
+        is None
+    )
+    assert broker.settled == [("adept-final-contract", False)]
+
+    core.build_progress = 100
+    completed_observation = SimpleNamespace(
+        raw_units=[gateway, core],
+        player_common=player,
+        available_actions=[],
+        game_loop=[101],
+    )
+    broker = _Broker()
+    executor = RawActionExecutor(
+        cast(Any, broker),
+        unit_names={3: "Gateway", 4: "CyberneticsCore"},
+    )
+    executor.enqueue(_decision(command))
+    assert (
+        executor.next_dispatch(
+            completed_observation,
+            {"Developer": _agent("Empty", [])},
+        )
+        is None
+    )
+    assert broker.settled == [("adept-final-contract", False)]
+
+    completed_observation.available_actions = [54]
+    broker = _Broker()
+    executor = RawActionExecutor(
+        cast(Any, broker),
+        unit_names={3: "Gateway", 4: "CyberneticsCore"},
+    )
+    executor.enqueue(_decision(command))
+    dispatch = executor.next_dispatch(
+        completed_observation,
+        {"Developer": _agent("Empty", [])},
+    )
+
+    assert dispatch is not None
+    assert dispatch.producer_tag == 0xD1
+
+
 def test_raw_executor_does_not_quarantine_build_when_builder_is_missing() -> None:
     broker = _Broker()
     executor = RawActionExecutor(cast(Any, broker), unit_names={2: "Probe"})
@@ -229,6 +305,8 @@ def test_raw_executor_does_not_quarantine_build_when_builder_is_missing() -> Non
 def test_failed_build_effect_temporarily_suppresses_emitted_world_target() -> None:
     broker = _Broker()
     executor = RawActionExecutor(cast(Any, broker), unit_names={2: "Probe"})
+    observation = SimpleNamespace(raw_units=[_unit(0xB1, 2)], game_loop=[100])
+    placement_revision = _placement_revision(observation)
     command = RoutedCommand(
         command_id="build-failed",
         actor="Builder/Builder-Probe-1",
@@ -238,12 +316,21 @@ def test_failed_build_effect_temporarily_suppresses_emitted_world_target() -> No
         requested_arguments=([65, 65],),
         screen_world_target=(22.25, 24.5),
         screen_anchor_tag=0xB1,
+        placement_candidate_id=_placement_candidate_id(
+            "Build_Pylon_Screen",
+            (22.25, 24.5),
+            0xB1,
+            placement_revision,
+            2,
+            False,
+        ),
+        placement_revision=placement_revision,
     )
     agents = {"Builder": _agent("Builder-Probe-1", [0xB1])}
     executor.enqueue(_decision(command))
     assert (
         executor.next_dispatch(
-            SimpleNamespace(raw_units=[_unit(0xB1, 2)], game_loop=[100]),
+            observation,
             agents,
         )
         is not None
@@ -267,7 +354,7 @@ def test_failed_build_effect_temporarily_suppresses_emitted_world_target() -> No
         radius=1.5,
         game_loop=212,
     )
-    assert not executor.placement_service.is_quarantined(
+    assert executor.placement_service.is_quarantined(
         "Build_Pylon_Screen",
         (22.0, 24.0),
         radius=1.5,

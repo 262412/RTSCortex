@@ -741,11 +741,10 @@ class CortexRuntimeEngine(RuntimeEngine):
         current_ids = {command.command_id for command in commands}
         lifecycle_counts: dict[tuple[str, CommandStatus], int] = {}
         for lifecycle in self._command_states.values():
-            if lifecycle.command.command_id in current_ids or lifecycle.status not in {
-                CommandStatus.PENDING,
-                CommandStatus.DEFERRED,
-                CommandStatus.DISPATCHED,
-            }:
+            if (
+                lifecycle.command.command_id in current_ids
+                or lifecycle.status is not CommandStatus.DISPATCHED
+            ):
                 continue
             key = (lifecycle.command.name, lifecycle.status)
             lifecycle_counts[key] = lifecycle_counts.get(key, 0) + 1
@@ -3895,12 +3894,7 @@ class CortexRuntimeEngine(RuntimeEngine):
         active_commands = tuple(
             (lifecycle.command.name, lifecycle.status.value)
             for lifecycle in self._command_states.values()
-            if lifecycle.status
-            in {
-                CommandStatus.PENDING,
-                CommandStatus.DEFERRED,
-                CommandStatus.DISPATCHED,
-            }
+            if lifecycle.status is CommandStatus.DISPATCHED
         )
         role_evaluations = self._role_agents.defense_inventory_evaluations(
             observation,

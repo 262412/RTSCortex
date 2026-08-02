@@ -500,12 +500,23 @@ def _echo_report_artifacts(artifacts: RunReportArtifacts) -> None:
     typer.echo(f"Engineering gates: {artifacts.engineering_gates_path}")
 
 
-def _write_run_reports_best_effort(run_dir: Path) -> None:
+def _write_run_reports_best_effort(
+    run_dir: Path,
+    *,
+    qualification_evidence_path: Path | None = None,
+) -> None:
     journal_path = run_dir / "events.jsonl"
     try:
         if not journal_path.is_file() or journal_path.stat().st_size == 0:
             return
-        artifacts = write_run_reports(run_dir)
+        artifacts = (
+            write_run_reports(run_dir)
+            if qualification_evidence_path is None
+            else write_run_reports(
+                run_dir,
+                qualification_evidence_path=qualification_evidence_path,
+            )
+        )
     except Exception as error:
         typer.echo(f"Warning: could not generate run reports: {error}", err=True)
         return
@@ -554,6 +565,15 @@ def run_experiment(
     console_port: Annotated[
         int | None,
         typer.Option("--console-port", min=1, max=65_535),
+    ] = None,
+    qualification_evidence: Annotated[
+        Path | None,
+        typer.Option(
+            "--qualification-evidence",
+            exists=True,
+            dir_okay=False,
+            help="SHA-bound recovery and natural-run baseline manifest.",
+        ),
     ] = None,
 ) -> None:
     """Run one configured episode."""
@@ -662,19 +682,31 @@ def run_experiment(
             typer.echo(f"Run directory: {run_dir}")
         output = asyncio.run(execute())
     except WorkerProcessError as error:
-        _write_run_reports_best_effort(run_dir)
+        _write_run_reports_best_effort(
+            run_dir,
+            qualification_evidence_path=qualification_evidence,
+        )
         typer.echo(error.result.model_dump_json(indent=2), err=True)
         typer.echo(f"Artifacts: {run_dir}", err=True)
         raise typer.Exit(code=1) from error
     except LiveEnvironmentError as error:
-        _write_run_reports_best_effort(run_dir)
+        _write_run_reports_best_effort(
+            run_dir,
+            qualification_evidence_path=qualification_evidence,
+        )
         typer.echo(f"Live run failed: {error}", err=True)
         typer.echo(f"Artifacts: {run_dir}", err=True)
         raise typer.Exit(code=1) from error
     except BaseException:
-        _write_run_reports_best_effort(run_dir)
+        _write_run_reports_best_effort(
+            run_dir,
+            qualification_evidence_path=qualification_evidence,
+        )
         raise
-    _write_run_reports_best_effort(run_dir)
+    _write_run_reports_best_effort(
+        run_dir,
+        qualification_evidence_path=qualification_evidence,
+    )
     typer.echo(output)
     typer.echo(f"Artifacts: {run_dir}")
 
@@ -754,11 +786,22 @@ def evaluate(
 @app.command()
 def report(
     run_dir: Annotated[Path, typer.Argument(exists=True, file_okay=False)],
+    qualification_evidence: Annotated[
+        Path | None,
+        typer.Option(
+            "--qualification-evidence",
+            exists=True,
+            dir_okay=False,
+        ),
+    ] = None,
 ) -> None:
     """Generate readable Markdown and machine-readable JSON run reports."""
 
     try:
-        artifacts = write_run_reports(run_dir)
+        artifacts = write_run_reports(
+            run_dir,
+            qualification_evidence_path=qualification_evidence,
+        )
     except ReportError as error:
         raise typer.BadParameter(str(error), param_hint="RUN_DIR") from error
     _echo_report_artifacts(artifacts)

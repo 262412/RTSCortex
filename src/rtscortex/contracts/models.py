@@ -267,6 +267,7 @@ class PlacementLedgerTransition(ContractModel):
     actor_failure: bool = False
     game_loop: int = Field(ge=0)
     release_reason: str | None = None
+    target_state_revision: str | None = None
 
 
 class PlacementLedgerEvent(ContractModel):

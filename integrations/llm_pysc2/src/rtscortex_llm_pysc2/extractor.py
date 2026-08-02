@@ -405,11 +405,13 @@ def production_source_tag(
     if not source_names and len(source_types) != 1:
         return None
     raw_units = list(_value(observation, "raw_units", ()))
+    percent_build_progress = _raw_units_use_percent_build_progress(raw_units)
     prerequisites = spec.prerequisites if spec is not None else ()
     completed_structures = {
         _unit_name(unit, unit_names)
         for unit in raw_units
-        if int(_value(unit, "alliance", 0)) == 1 and _build_progress(unit) >= 1.0
+        if int(_value(unit, "alliance", 0)) == 1
+        and _normalized_build_progress(unit, percent_scale=percent_build_progress) >= 1.0
     }
     if not set(prerequisites).issubset(completed_structures):
         return None
@@ -444,7 +446,7 @@ def production_source_tag(
             if source_names
             else int(_value(unit, "unit_type", 0)) == source_type
         )
-        and _build_progress(unit) >= 1.0
+        and _normalized_build_progress(unit, percent_scale=percent_build_progress) >= 1.0
         and _health_fraction(unit) >= MIN_PRODUCTION_SOURCE_HEALTH_FRACTION
         and (not requires_idle or int(_value(unit, "active", 0)) == 0)
         and float(_value(unit, "energy", 0.0)) >= minimum_energy
@@ -484,6 +486,45 @@ def _production_cost_is_available(
     )
 
 
+def production_dispatch_failure(
+    observation: Any,
+    action_name: str,
+    *,
+    unit_names: Mapping[int, str],
+    required_function_id: int | None = None,
+) -> str | None:
+    """Revalidate production prerequisites and capability at final dispatch."""
+
+    spec = production_spec(action_name)
+    if spec is None:
+        return None
+    if not _production_cost_is_available(
+        observation,
+        spec.minerals,
+        spec.vespene,
+        spec.supply,
+    ):
+        return f"{action_name} resources or supply are no longer sufficient"
+    raw_units = list(_value(observation, "raw_units", ()))
+    percent_scale = _raw_units_use_percent_build_progress(raw_units)
+    completed = {
+        _unit_name(unit, unit_names)
+        for unit in raw_units
+        if int(_value(unit, "alliance", 0)) == 1
+        and _normalized_build_progress(unit, percent_scale=percent_scale) >= 1.0
+    }
+    missing = tuple(name for name in spec.prerequisites if name not in completed)
+    if missing:
+        return f"{action_name} requires completed {', '.join(missing)}"
+    if required_function_id is not None:
+        available = _value(observation, "available_actions", None)
+        if available is not None and int(required_function_id) not in {
+            int(value) for value in available
+        }:
+            return f"{action_name} is not currently available at final dispatch"
+    return None
+
+
 def nexus_placement_footprint_is_visible(
     observation: Any,
     position: Sequence[int | float],
@@ -511,6 +552,144 @@ def nexus_placement_footprint_is_visible(
         for y in range(minimum_y, maximum_y + 1)
         for x in range(minimum_x, maximum_x + 1)
     )
+
+
+def world_build_target_is_legal(
+    observation: Any,
+    action_name: str,
+    world_target: tuple[float, float],
+    *,
+    preferred_anchor_tag: int | None = None,
+    unit_names: Mapping[int, str],
+    builder_tags: Collection[int] = (),
+    world_to_minimap_transform: tuple[float, float, float, float, float] | None = None,
+) -> bool:
+    """Validate the exact world target against the current feature-layer state."""
+
+    spec = BUILD_SPECS.get(action_name)
+    if spec is None:
+        return False
+    feature_screen = _value(observation, "feature_screen", None)
+    if feature_screen is not None:
+        projected = _world_to_screen_target(
+            observation,
+            world_target,
+            preferred_anchor_tag=preferred_anchor_tag,
+        )
+        dimensions = _screen_dimensions(observation)
+        if (
+            projected is not None
+            and dimensions is not None
+            and 0 <= projected[0] < dimensions[1]
+            and 0 <= projected[1] < dimensions[0]
+        ):
+            if spec.placement_kind == "expansion" and not (
+                nexus_placement_footprint_is_visible(observation, projected)
+            ):
+                return False
+            return _build_screen_position_is_legal(
+                observation,
+                spec,
+                projected,
+                unit_names=unit_names,
+                builder_tags=builder_tags or None,
+            )
+    if spec.placement_kind == "expansion" and world_to_minimap_transform is not None:
+        return _world_minimap_build_target_is_legal(
+            observation,
+            spec,
+            world_target,
+            world_to_minimap_transform=world_to_minimap_transform,
+            builder_tags=builder_tags,
+        )
+    # Geometry-only tests omit all live observation state. A live dispatch
+    # without a current screen or full-map transform must fail closed.
+    return _value(observation, "player_common", _value(observation, "player", None)) is None
+
+
+def _world_minimap_build_target_is_legal(
+    observation: Any,
+    spec: BuildSpec,
+    world_target: tuple[float, float],
+    *,
+    world_to_minimap_transform: tuple[float, float, float, float, float],
+    builder_tags: Collection[int],
+) -> bool:
+    feature_minimap = _value(observation, "feature_minimap", None)
+    buildable = _value(feature_minimap, "buildable", None)
+    pathable = _value(feature_minimap, "pathable", None)
+    visibility = _value(feature_minimap, "visibility_map", None)
+    player_relative = _value(feature_minimap, "player_relative", None)
+    dimensions = _plane_dimensions(buildable)
+    if dimensions is None or any(
+        _plane_dimensions(plane) != dimensions for plane in (pathable, visibility, player_relative)
+    ):
+        return False
+    height, width = dimensions
+    scale, x_offset, y_offset, world_range, _ = world_to_minimap_transform
+    center_x = (float(world_target[0]) + x_offset) * scale
+    center_y = (world_range - float(world_target[1]) + y_offset) * scale
+    half_extent = float(spec.footprint) * scale / 2
+    min_x, max_x = math.ceil(center_x - half_extent), math.floor(center_x + half_extent)
+    min_y, max_y = math.ceil(center_y - half_extent), math.floor(center_y + half_extent)
+    if min_x <= 0 or min_y <= 0 or max_x >= width or max_y >= height:
+        return False
+    footprint = {(x, y) for y in range(min_y, max_y + 1) for x in range(min_x, max_x + 1)}
+    if any(
+        int(visibility[y][x]) != 2
+        or int(buildable[y][x]) != 1
+        or int(pathable[y][x]) != 1
+        or int(player_relative[y][x]) != 0
+        for x, y in footprint
+    ):
+        return False
+    if not builder_tags:
+        return True
+    wanted_builders = {int(tag) for tag in builder_tags}
+    starts = {
+        (
+            int(round((float(_value(unit, "x", 0.0)) + x_offset) * scale)),
+            int(round((world_range - float(_value(unit, "y", 0.0)) + y_offset) * scale)),
+        )
+        for unit in _value(observation, "raw_units", ())
+        if int(_value(unit, "alliance", 0)) == 1 and int(_value(unit, "tag", 0)) in wanted_builders
+    }
+    starts = {
+        point
+        for point in starts
+        if 0 <= point[0] < width
+        and 0 <= point[1] < height
+        and int(pathable[point[1]][point[0]]) == 1
+    }
+    if not starts:
+        return False
+    approach = {
+        (x, y)
+        for y in range(min_y - 1, max_y + 2)
+        for x in range(min_x - 1, max_x + 2)
+        if 0 <= x < width
+        and 0 <= y < height
+        and (x, y) not in footprint
+        and int(pathable[y][x]) == 1
+    }
+    frontier = list(starts)
+    reached = set(starts)
+    while frontier:
+        x, y = frontier.pop()
+        if (x, y) in approach:
+            return True
+        for neighbor in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)):
+            neighbor_x, neighbor_y = neighbor
+            if (
+                neighbor in reached
+                or neighbor in footprint
+                or not (0 <= neighbor_x < width and 0 <= neighbor_y < height)
+                or int(pathable[neighbor_y][neighbor_x]) != 1
+            ):
+                continue
+            reached.add(neighbor)
+            frontier.append(neighbor)
+    return False
 
 
 class TimeStepExtractor:
@@ -663,9 +842,11 @@ class TimeStepExtractor:
             raise ValueError("PySC2 observation has no player data")
 
         raw_units = list(_value(observation, "raw_units", ()))
+        percent_build_progress = _raw_units_use_percent_build_progress(raw_units)
         self.observe_expansion_resources(observation, agents)
         self.placement_service.reset_diagnostics()
         minimap_transform = _world_to_minimap_transform(agents)
+        self.placement_service.set_world_to_minimap_transform(minimap_transform)
         teams = _extract_team_actions(
             agents,
             fallback_observation=observation,
@@ -694,7 +875,12 @@ class TimeStepExtractor:
                 unit_names=self.unit_names,
             ),
             "units": [
-                self._extract_unit(unit, minimap_transform=minimap_transform) for unit in raw_units
+                self._extract_unit(
+                    unit,
+                    minimap_transform=minimap_transform,
+                    percent_build_progress=percent_build_progress,
+                )
+                for unit in raw_units
             ],
             "upgrades": [
                 self.upgrade_names.get(int(value), f"upgrade:{int(value)}")
@@ -733,6 +919,7 @@ class TimeStepExtractor:
         unit: Any,
         *,
         minimap_transform: Optional[tuple[float, float, float, float, float]],
+        percent_build_progress: bool,
     ) -> dict[str, Any]:
         unit_type = int(_value(unit, "unit_type", 0))
         is_structure = unit_type in self.building_types
@@ -747,9 +934,10 @@ class TimeStepExtractor:
         status = "idle" if order_length == 0 else "active"
         build_progress = _value(unit, "build_progress", None)
         if is_structure and build_progress is not None:
-            normalized_progress = float(build_progress)
-            if normalized_progress > 1.0:
-                normalized_progress /= 100.0
+            normalized_progress = _normalized_build_progress(
+                unit,
+                percent_scale=percent_build_progress,
+            )
             if normalized_progress < 1.0:
                 status = "constructing"
         minimap_position = None
@@ -1199,10 +1387,13 @@ def _available_team_actions(
 
 
 def _completed_own_structures(observation: Any, unit_names: Mapping[int, str]) -> set[str]:
+    raw_units = list(_value(observation, "raw_units", ()))
+    percent_scale = _raw_units_use_percent_build_progress(raw_units)
     return {
         _unit_name(unit, unit_names)
-        for unit in _value(observation, "raw_units", ())
-        if int(_value(unit, "alliance", 0)) == 1 and _build_progress(unit) >= 1.0
+        for unit in raw_units
+        if int(_value(unit, "alliance", 0)) == 1
+        and _normalized_build_progress(unit, percent_scale=percent_scale) >= 1.0
     }
 
 
@@ -1661,10 +1852,13 @@ def raw_build_eligibility(
             "build_insufficient_vespene",
             f"{spec.target_structure} requires {spec.vespene_cost} vespene; observed {vespene}",
         )
+    raw_units = list(_value(observation, "raw_units", ()))
+    percent_scale = _raw_units_use_percent_build_progress(raw_units)
     completed = {
         _unit_name(unit, unit_names)
-        for unit in _value(observation, "raw_units", ())
-        if int(_value(unit, "alliance", 0)) == 1 and _build_progress(unit) >= 1.0
+        for unit in raw_units
+        if int(_value(unit, "alliance", 0)) == 1
+        and _normalized_build_progress(unit, percent_scale=percent_scale) >= 1.0
     }
     missing = tuple(item for item in spec.prerequisites if item not in completed)
     if missing:
@@ -1683,12 +1877,13 @@ def _gas_structure_candidates(
     target_structure: str,
 ) -> list[int]:
     raw_units = list(_value(observation, "raw_units", ()))
+    percent_scale = _raw_units_use_percent_build_progress(raw_units)
     townhalls = [
         unit
         for unit in raw_units
         if int(_value(unit, "alliance", 0)) == 1
         and _unit_name(unit, unit_names).casefold() in TOWNHALL_NAMES
-        and _build_progress(unit) >= 1.0
+        and _normalized_build_progress(unit, percent_scale=percent_scale) >= 1.0
     ]
     gas_structures = [
         unit
@@ -1706,6 +1901,7 @@ def _gas_structure_candidates(
         if (
             tag <= 0
             or int(_value(unit, "alliance", 0)) != 3
+            or int(_value(unit, "display_type", 1)) != 1
             or not _is_gas(_unit_name(unit, unit_names))
         ):
             continue
@@ -1984,6 +2180,17 @@ def _is_mineral(name: str) -> bool:
 def _build_progress(unit: Any) -> float:
     progress = float(_value(unit, "build_progress", 0.0))
     return progress / 100.0 if progress > 1.0 else progress
+
+
+def _raw_units_use_percent_build_progress(raw_units: Sequence[Any]) -> bool:
+    """Infer PySC2 RAW's integer percent scale without breaking normalized fixtures."""
+
+    return any(float(_value(unit, "build_progress", 0.0)) > 1.0 for unit in raw_units)
+
+
+def _normalized_build_progress(unit: Any, *, percent_scale: bool) -> float:
+    progress = float(_value(unit, "build_progress", 0.0))
+    return progress / 100.0 if percent_scale else progress
 
 
 def _health_fraction(unit: Any) -> float:
@@ -2271,6 +2478,7 @@ def _build_screen_candidates(
         if action_name in {"Build_CreepTumor_Queen_Screen", TUMOR_CONTROLLER_ACTION}
         else _builder_reachable_cells(
             pathable,
+            player_relative,
             feature_units,
             unit_names,
             screen_size,
@@ -2457,6 +2665,7 @@ def _build_screen_position_is_legal(
         if spec.target_structure == "CreepTumorQueen"
         else _builder_reachable_cells(
             pathable,
+            player_relative,
             _value(observation, "feature_units", ()),
             unit_names,
             screen_size,
@@ -2587,6 +2796,7 @@ def _valid_build_positions(
 
 def _builder_reachable_cells(
     pathable: Any,
+    player_relative: Any,
     feature_units: Sequence[Any],
     unit_names: Mapping[int, str],
     screen_size: int,
@@ -2596,8 +2806,8 @@ def _builder_reachable_cells(
     """Return screen cells reachable from visible worker builders."""
 
     allowed_tags = None if builder_tags is None else {int(tag) for tag in builder_tags}
-    starts = {
-        (int(_value(unit, "x", 0)), int(_value(unit, "y", 0)))
+    builders = [
+        unit
         for unit in feature_units
         if int(_value(unit, "alliance", 0)) == 1
         and bool(_value(unit, "is_on_screen", True))
@@ -2606,8 +2816,8 @@ def _builder_reachable_cells(
             if allowed_tags is not None
             else _unit_name(unit, unit_names) in {"Probe", "SCV", "Drone"}
         )
-    }
-    if allowed_tags is not None and not starts:
+    ]
+    if allowed_tags is not None and not builders:
         selected_workers = [
             unit
             for unit in feature_units
@@ -2617,22 +2827,33 @@ def _builder_reachable_cells(
             and _unit_name(unit, unit_names) in {"Probe", "SCV", "Drone"}
         ]
         if len(selected_workers) == 1:
-            starts = {
-                (
-                    int(_value(selected_workers[0], "x", 0)),
-                    int(_value(selected_workers[0], "y", 0)),
-                )
-            }
+            builders = selected_workers
+    starts = {(int(_value(unit, "x", 0)), int(_value(unit, "y", 0))) for unit in builders}
     if not starts:
         return frozenset() if builder_tags is not None else None
 
     ratio = max(1, int(screen_size / SCREEN_WORLD_GRID))
+    builder_footprints: set[tuple[int, int]] = set()
+    for builder in builders:
+        center_x = int(_value(builder, "x", 0))
+        center_y = int(_value(builder, "y", 0))
+        radius = max(1, math.ceil(float(_value(builder, "radius", 0.375)) * ratio))
+        builder_footprints.update(
+            (center_x + dx, center_y + dy)
+            for dx in range(-radius, radius + 1)
+            for dy in range(-radius, radius + 1)
+            if dx * dx + dy * dy <= radius * radius
+        )
+
+    def traversable(x: int, y: int) -> bool:
+        return pathable[y][x] == 1 and (player_relative[y][x] == 0 or (x, y) in builder_footprints)
+
     frontier: list[tuple[int, int]] = []
     for start_x, start_y in sorted(starts):
         if (
             0 <= start_x < screen_size
             and 0 <= start_y < screen_size
-            and pathable[start_y][start_x] == 1
+            and traversable(start_x, start_y)
         ):
             frontier.append((start_x, start_y))
             continue
@@ -2644,7 +2865,7 @@ def _builder_reachable_cells(
                 if max(abs(dx), abs(dy)) == radius
                 and 0 <= start_x + dx < screen_size
                 and 0 <= start_y + dy < screen_size
-                and pathable[start_y + dy][start_x + dx] == 1
+                and traversable(start_x + dx, start_y + dy)
             )
             if nearby:
                 frontier.extend(nearby)
@@ -2670,7 +2891,7 @@ def _builder_reachable_cells(
                 neighbor in reachable
                 or not 0 <= neighbor[0] < screen_size
                 or not 0 <= neighbor[1] < screen_size
-                or pathable[neighbor[1]][neighbor[0]] != 1
+                or not traversable(neighbor[0], neighbor[1])
             ):
                 continue
             reachable.add(neighbor)

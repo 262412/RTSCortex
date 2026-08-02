@@ -34,6 +34,26 @@ def _unit(
     )
 
 
+def _gas_observation(
+    *,
+    game_loop: int,
+    extra_units: tuple[SimpleNamespace, ...] = (),
+    include_geyser: bool = True,
+) -> SimpleNamespace:
+    units = [
+        _unit(0xC1, 59, alliance=1, x=20, y=20),
+        *([_unit(0xA1, 342, alliance=3, x=24, y=20)] if include_geyser else []),
+        *extra_units,
+    ]
+    return SimpleNamespace(
+        raw_units=units,
+        feature_units=[],
+        feature_screen=None,
+        player_common=SimpleNamespace(minerals=500, vespene=500),
+        game_loop=[game_loop],
+    )
+
+
 def test_raw_placement_service_persists_and_quarantines_expansion_identity() -> None:
     service = RawPlacementService(unit_names={59: "Nexus", 341: "MineralField"})
     resources = [
@@ -112,6 +132,278 @@ def test_tag_targeted_build_records_requested_and_validated_world_positions() ->
     assert placement.requested_world_target == (60.25, 65.75)
     assert placement.final_validated_world_target == (60.25, 65.75)
     assert placement.world_target == (60.25, 65.75)
+
+
+def test_geyser_candidates_exclude_any_current_structure_occupancy() -> None:
+    service = RawPlacementService(unit_names={59: "Nexus", 88: "Extractor", 342: "VespeneGeyser"})
+    observation = _gas_observation(
+        game_loop=100,
+        extra_units=(_unit(0xE1, 88, alliance=4, x=24, y=20),),
+    )
+    service.observe(observation, require_feature_visibility=False)
+
+    candidates = service.candidates(observation, "Build_Assimilator_Near")
+
+    assert candidates.argument_candidates == []
+    assert candidates.unavailable_reason == "no_unoccupied_geyser"
+
+
+def test_geyser_no_start_requires_state_change_before_one_bounded_retry() -> None:
+    service = RawPlacementService(unit_names={2: "Probe", 59: "Nexus", 342: "VespeneGeyser"})
+    observation = _gas_observation(
+        game_loop=100,
+        extra_units=(_unit(0xB1, 2, alliance=1, x=21, y=20),),
+    )
+    service.observe(observation, require_feature_visibility=False)
+    assert service.candidates(observation, "Build_Assimilator_Near").argument_candidates == [[0xA1]]
+    service.resolve(
+        command_id="gas-rebuild-one",
+        action_name="Build_Assimilator_Near",
+        requested_arguments=(0xA1,),
+        observation=observation,
+        world_target=None,
+        builder_tag=0xB1,
+    )
+    service.quarantine_command(
+        command_id="gas-rebuild-one",
+        action_name="Build_Assimilator_Near",
+        requested_arguments=(0xA1,),
+        world_target=None,
+        failure_code="no_build_start_evidence",
+        game_loop=212,
+    )
+
+    unchanged = _gas_observation(
+        game_loop=400,
+        extra_units=(_unit(0xB1, 2, alliance=1, x=21, y=20),),
+    )
+    service.observe(unchanged, require_feature_visibility=False)
+    assert service.candidates(unchanged, "Build_Assimilator_Near").argument_candidates == []
+
+    hidden = _gas_observation(
+        game_loop=401,
+        extra_units=(_unit(0xB1, 2, alliance=1, x=21, y=20),),
+        include_geyser=False,
+    )
+    service.observe(hidden, require_feature_visibility=False)
+    revalidated = _gas_observation(
+        game_loop=402,
+        extra_units=(_unit(0xB1, 2, alliance=1, x=21, y=20),),
+    )
+    service.observe(revalidated, require_feature_visibility=False)
+    assert service.candidates(revalidated, "Build_Assimilator_Near").argument_candidates == [[0xA1]]
+
+    service.resolve(
+        command_id="gas-rebuild-two",
+        action_name="Build_Assimilator_Near",
+        requested_arguments=(0xA1,),
+        observation=revalidated,
+        world_target=None,
+        builder_tag=0xB1,
+    )
+    service.quarantine_command(
+        command_id="gas-rebuild-two",
+        action_name="Build_Assimilator_Near",
+        requested_arguments=(0xA1,),
+        world_target=None,
+        failure_code="no_build_start_evidence",
+        game_loop=514,
+    )
+    assert service.candidates(revalidated, "Build_Assimilator_Near").argument_candidates == []
+
+
+def test_same_pylon_failure_does_not_expire_without_target_state_change() -> None:
+    service = RawPlacementService(unit_names={2: "Probe"})
+    observation = SimpleNamespace(
+        raw_units=[_unit(0xB1, 2, alliance=1, x=20, y=20)],
+        feature_units=[],
+        feature_screen=None,
+        player_common=SimpleNamespace(minerals=500, vespene=500),
+        game_loop=[100],
+    )
+    service.resolve(
+        command_id="pylon-one",
+        action_name="Build_Pylon_Screen",
+        requested_arguments=([64, 64],),
+        observation=observation,
+        world_target=(22.0, 24.0),
+        builder_tag=0xB1,
+    )
+    service.quarantine_command(
+        command_id="pylon-one",
+        action_name="Build_Pylon_Screen",
+        requested_arguments=([64, 64],),
+        world_target=(22.0, 24.0),
+        failure_code="build_started_effect_missing",
+        game_loop=212,
+    )
+    later_same_state = SimpleNamespace(**{**vars(observation), "game_loop": [500]})
+
+    assert service.is_quarantined(
+        "Build_Pylon_Screen",
+        (22.0, 24.0),
+        game_loop=500,
+        observation=later_same_state,
+    )
+    assert not service.is_quarantined(
+        "Build_Pylon_Screen",
+        (30.0, 30.0),
+        game_loop=500,
+        observation=later_same_state,
+    )
+
+
+def test_expansion_rejects_illegal_exact_world_footprint_before_reservation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = RawPlacementService(unit_names={2: "Probe", 59: "Nexus", 341: "MineralField"})
+    resources = [
+        _unit(0x201 + index, 341, alliance=3, x=x, y=y)
+        for index, (x, y) in enumerate(((87, 80), (85, 85), (80, 87), (75, 85), (73, 80), (75, 75)))
+    ]
+    observation = SimpleNamespace(
+        raw_units=[
+            _unit(0xB1, 2, alliance=1, x=20, y=20),
+            _unit(0xC1, 59, alliance=1, x=20, y=20),
+            *resources,
+        ],
+        feature_units=[],
+        feature_screen=object(),
+        player_common=SimpleNamespace(minerals=500, vespene=500),
+        game_loop=[100],
+    )
+    service.observe(observation, require_feature_visibility=False)
+    monkeypatch.setattr(
+        extractor_module,
+        "world_build_target_is_legal",
+        lambda *args, **kwargs: False,
+        raising=False,
+    )
+
+    with pytest.raises(RawPlacementFailure) as failure:
+        service.resolve(
+            command_id="illegal-expansion",
+            action_name="Build_Nexus_Near",
+            requested_arguments=(0x201,),
+            observation=observation,
+            world_target=None,
+            builder_tag=0xB1,
+        )
+
+    assert failure.value.code == "no_legal_placement"
+    assert service.active_reservation_count == 0
+
+
+def test_expansion_rejects_unpathable_full_map_footprint() -> None:
+    class Grid:
+        def __init__(self, value: int) -> None:
+            self.shape = (128, 128)
+            self.rows = [[value] * 128 for _ in range(128)]
+
+        def __getitem__(self, index: int) -> list[int]:
+            return self.rows[index]
+
+    service = RawPlacementService(unit_names={2: "Probe", 59: "Nexus", 341: "MineralField"})
+    service.set_world_to_minimap_transform((1.0, 0.0, 0.0, 128.0, 127.0))
+    resources = [
+        _unit(0x301 + index, 341, alliance=3, x=x, y=y)
+        for index, (x, y) in enumerate(((87, 80), (85, 85), (80, 87), (75, 85), (73, 80), (75, 75)))
+    ]
+    buildable = Grid(1)
+    pathable = Grid(1)
+    pathable[48][80] = 0
+    observation = SimpleNamespace(
+        raw_units=[
+            _unit(0xB1, 2, alliance=1, x=20, y=20),
+            _unit(0xC1, 59, alliance=1, x=20, y=20),
+            *resources,
+        ],
+        feature_units=[],
+        feature_screen=None,
+        feature_minimap=SimpleNamespace(
+            buildable=buildable,
+            pathable=pathable,
+            visibility_map=Grid(2),
+            player_relative=Grid(0),
+        ),
+        player_common=SimpleNamespace(minerals=500, vespene=500),
+        game_loop=[100],
+    )
+
+    with pytest.raises(RawPlacementFailure) as failure:
+        service.resolve(
+            command_id="unpathable-expansion",
+            action_name="Build_Nexus_Near",
+            requested_arguments=(0x301,),
+            observation=observation,
+            world_target=None,
+            builder_tag=0xB1,
+        )
+
+    assert failure.value.code == "no_legal_placement"
+    assert service.active_reservation_count == 0
+
+
+def test_target_state_revision_normalizes_foreign_boolean_scalars(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    foreign_bool = type("bool", (), {"__bool__": lambda self: True})
+    service = RawPlacementService(unit_names={})
+    observation = SimpleNamespace(
+        raw_units=[],
+        feature_units=[],
+        feature_screen=object(),
+    )
+    monkeypatch.setattr(
+        extractor_module,
+        "world_build_target_is_legal",
+        lambda *args, **kwargs: foreign_bool(),
+    )
+
+    revision = service._target_state_revision(
+        observation,
+        "Build_Pylon_Screen",
+        (30.0, 25.0),
+        anchor_tag=None,
+    )
+
+    assert len(revision) == 64
+
+
+def test_builder_approach_does_not_route_through_dynamic_structure_occupancy() -> None:
+    class Grid:
+        def __init__(self, value: int, size: int = 16) -> None:
+            self.shape = (size, size)
+            self.rows = [[value] * size for _ in range(size)]
+
+        def __getitem__(self, index: int) -> list[int]:
+            return self.rows[index]
+
+    pathable = Grid(1)
+    player_relative = Grid(0)
+    for y in range(16):
+        player_relative[y][7] = 1
+    builder = SimpleNamespace(
+        tag=0xB1,
+        unit_type=2,
+        alliance=1,
+        is_on_screen=True,
+        x=3,
+        y=8,
+        radius=0.375,
+    )
+
+    reachable = extractor_module._builder_reachable_cells(
+        pathable,
+        player_relative,
+        [builder],
+        {2: "Probe"},
+        16,
+        builder_tags=(0xB1,),
+    )
+
+    assert (6, 8) in reachable
+    assert (8, 8) not in reachable
 
 
 def test_raw_placement_service_quarantines_pre_dispatch_world_target() -> None:
@@ -288,6 +580,7 @@ def test_placement_transition_is_durable_before_command_terminal() -> None:
         "actor_failure": False,
         "game_loop": 100,
         "release_reason": None,
+        "target_state_revision": reservation.target_state_revision,
     }
     assert service.drain_transition_history("build-durable") == []
 

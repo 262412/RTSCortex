@@ -31,6 +31,7 @@ class RawPlacementReservation:
     world_target: tuple[float, float]
     anchor_tag: int | None
     placement_revision: str
+    target_state_revision: str
     baseline_builder_orders: tuple[int, ...]
     structure_type: str
     footprint_width: int
@@ -72,6 +73,8 @@ class _TemporarySuppression:
     occupied_grid_cells: frozenset[tuple[int, int]]
     expires_game_loop: int
     reason: str
+    target_state_revision: str | None = None
+    anchor_tag: int | None = None
 
 
 @dataclass(frozen=True)
@@ -160,6 +163,12 @@ class RawPlacementService:
         self.unit_names = {int(key): str(value) for key, value in unit_names.items()}
         self.effect_timeout_game_loops = int(effect_timeout_game_loops)
         self._known_resources: dict[int, dict[str, Any]] = {}
+        self._visible_resource_tags: set[int] = set()
+        self._resource_presence_generation: dict[int, int] = {}
+        self._target_state_memory: dict[
+            tuple[str, tuple[float, float]],
+            tuple[str, int],
+        ] = {}
         self._suppressed_clusters: set[int] = set()
         self._suppressed_resource_tags: set[int] = set()
         self._permanent_exclusions: list[_SpatialExclusion] = []
@@ -176,6 +185,13 @@ class RawPlacementService:
         self._runtime_step_id = 0
         self._runtime_game_loop = 0
         self._last_transition_loop: dict[str, int] = {}
+        self._world_to_minimap_transform: tuple[float, float, float, float, float] | None = None
+
+    def set_world_to_minimap_transform(
+        self,
+        transform: tuple[float, float, float, float, float] | None,
+    ) -> None:
+        self._world_to_minimap_transform = transform
 
     @property
     def transitions_are_durable(self) -> bool:
@@ -240,6 +256,15 @@ class RawPlacementService:
             _value(observation, "feature_units", ()),
             require_feature_visibility=require_feature_visibility,
         )
+        for action_name, suppressions in self._temporary_suppressions.items():
+            for suppression in suppressions:
+                if suppression.target_state_revision is not None:
+                    self._target_state_revision(
+                        observation,
+                        action_name,
+                        suppression.world_target,
+                        anchor_tag=suppression.anchor_tag,
+                    )
 
     def observe_units(
         self,
@@ -252,6 +277,8 @@ class RawPlacementService:
 
         spec_by_structure = {spec.target_structure: spec for spec in BUILD_SPECS.values()}
         observed_occupancy: dict[int, _SpatialExclusion] = {}
+        previously_visible_resources = self._visible_resource_tags
+        currently_visible_resources: set[int] = set()
         visible_feature_tags = {
             int(_value(unit, "tag", 0))
             for unit in feature_units
@@ -264,7 +291,7 @@ class RawPlacementService:
             name = _unit_name(unit, self.unit_names)
             if (
                 tag > 0
-                and int(_value(unit, "alliance", 0)) == 1
+                and int(_value(unit, "alliance", 0)) in {1, 2, 4}
                 and _build_progress(unit) > 0.0
                 and name in spec_by_structure
             ):
@@ -287,6 +314,7 @@ class RawPlacementService:
                 and tag not in visible_feature_tags
             ):
                 continue
+            currently_visible_resources.add(tag)
             self._known_resources[tag] = {
                 "tag": tag,
                 "unit_type": name,
@@ -295,6 +323,11 @@ class RawPlacementService:
                 "y": float(_value(unit, "y", 0.0)),
                 "display_type": 1,
             }
+        for tag in previously_visible_resources.symmetric_difference(currently_visible_resources):
+            self._resource_presence_generation[tag] = (
+                self._resource_presence_generation.get(tag, 0) + 1
+            )
+        self._visible_resource_tags = currently_visible_resources
         self._observed_occupancy = observed_occupancy
         observed_cells = {
             cell
@@ -330,6 +363,7 @@ class RawPlacementService:
         )
 
         spec = BUILD_SPECS[action_name]
+        self.observe(observation, require_feature_visibility=False)
         eligibility = raw_build_eligibility(observation, spec, self.unit_names)
         if not eligibility.eligible:
             assert eligibility.failure_code is not None
@@ -372,6 +406,8 @@ class RawPlacementService:
                     action_name,
                     item.world_target,
                     game_loop=game_loop,
+                    observation=observation,
+                    anchor_tag=item.anchor_tag,
                 )
             ]
             reason = None if kept else self._screen_unavailable_reason(observation, spec)
@@ -387,6 +423,21 @@ class RawPlacementService:
                 self.unit_names,
                 target_structure=spec.target_structure,
             )
+            candidates = [
+                tag
+                for tag in candidates
+                if (target := _unit_by_tag(observation, tag)) is not None
+                and not self.is_quarantined(
+                    action_name,
+                    (
+                        float(_value(target, "x", 0.0)),
+                        float(_value(target, "y", 0.0)),
+                    ),
+                    game_loop=game_loop,
+                    observation=observation,
+                    anchor_tag=tag,
+                )
+            ]
             reason = None if candidates else "no_unoccupied_geyser"
             self._remember_diagnostic(action_name, reason)
             return RawPlacementCandidates(
@@ -394,7 +445,7 @@ class RawPlacementService:
                 screen_provenance=[],
                 unavailable_reason=reason,
             )
-        candidates = self._expansion_candidates(observation)
+        candidates = self._expansion_candidates(observation, action_name)
         reason = None if candidates else "no_unoccupied_resource_cluster"
         self._remember_diagnostic(action_name, reason)
         return RawPlacementCandidates(
@@ -426,9 +477,11 @@ class RawPlacementService:
             raw_build_eligibility,
             resolve_screen_build_world_target,
             screen_to_world_target,
+            world_build_target_is_legal,
         )
 
         spec = BUILD_SPECS[action_name]
+        self.observe(observation, require_feature_visibility=False)
         eligibility = raw_build_eligibility(observation, spec, self.unit_names)
         if not eligibility.eligible:
             assert eligibility.failure_code is not None
@@ -454,7 +507,17 @@ class RawPlacementService:
                     "builder_unavailable",
                     f"builder {hex(normalized_builder)} is not observable as an own unit",
                 )
+            if builder_tags and normalized_builder not in {int(tag) for tag in builder_tags}:
+                raise RawPlacementFailure(
+                    "builder_unavailable",
+                    f"builder {hex(normalized_builder)} is not bound to the final target",
+                )
             baseline_builder_orders = _orders(builder)
+        final_builder_tags = (
+            tuple(int(tag) for tag in builder_tags)
+            if builder_tags
+            else (() if normalized_builder is None else (normalized_builder,))
+        )
         if spec.placement_kind == "screen":
             if (placement_candidate_id is None) != (candidate_placement_revision is None):
                 raise RawPlacementFailure(
@@ -488,6 +551,8 @@ class RawPlacementService:
                 action_name,
                 emitted_target,
                 game_loop=game_loop,
+                observation=observation,
+                anchor_tag=preferred_anchor_tag,
             ):
                 raise RawPlacementFailure(
                     "no_legal_placement",
@@ -500,7 +565,7 @@ class RawPlacementService:
                     emitted_target,
                     preferred_anchor_tag=preferred_anchor_tag,
                     unit_names=self.unit_names,
-                    builder_tags=builder_tags,
+                    builder_tags=final_builder_tags,
                 )
                 resolved = (
                     None
@@ -512,6 +577,19 @@ class RawPlacementService:
                     )
                 )
                 if resolved is None or math.dist(emitted_target, resolved.world_target) > 0.75:
+                    self.suppress_world_target_temporarily(
+                        action_name,
+                        emitted_target,
+                        expires_game_loop=game_loop + self.effect_timeout_game_loops,
+                        reason="no_legal_placement",
+                        target_state_revision=self._target_state_revision(
+                            observation,
+                            action_name,
+                            emitted_target,
+                            anchor_tag=preferred_anchor_tag,
+                        ),
+                        anchor_tag=preferred_anchor_tag,
+                    )
                     raise RawPlacementFailure(
                         "no_legal_placement",
                         f"{action_name} world target {target} is no longer legal",
@@ -525,6 +603,7 @@ class RawPlacementService:
             if (
                 target_unit is None
                 or int(_value(target_unit, "alliance", 0)) != 3
+                or int(_value(target_unit, "display_type", 1)) != 1
                 or not _is_gas(_unit_name(target_unit, self.unit_names))
             ):
                 raise RawPlacementFailure(
@@ -537,11 +616,24 @@ class RawPlacementService:
             )
             requested_target = emitted
             anchor_tag = anchor
+            if self.is_quarantined(
+                action_name,
+                emitted,
+                game_loop=game_loop,
+                observation=observation,
+                anchor_tag=anchor_tag,
+            ):
+                raise RawPlacementFailure(
+                    "no_legal_placement",
+                    f"{action_name} geyser {hex(anchor)} has unchanged failed or occupied state",
+                )
         else:
             anchor = _tag_argument(requested_arguments, action_name=action_name)
             cluster_id = self._cluster_id(anchor)
-            if cluster_id is None or self._cluster_is_suppressed(
-                self._resource_cluster(cluster_id)
+            if (
+                cluster_id is None
+                or self._cluster_is_suppressed(self._resource_cluster(cluster_id))
+                or not self._cluster_is_current(cluster_id, observation)
             ):
                 raise RawPlacementFailure(
                     "invalid_expansion_anchor",
@@ -559,6 +651,47 @@ class RawPlacementService:
             )
             emitted = (float(round(expansion_target[0])), float(round(expansion_target[1])))
             anchor_tag = cluster_id
+            quarantined = self.is_quarantined(
+                action_name,
+                emitted,
+                game_loop=game_loop,
+                observation=observation,
+                anchor_tag=anchor_tag,
+            )
+            exact_target_legal = world_build_target_is_legal(
+                observation,
+                action_name,
+                emitted,
+                preferred_anchor_tag=anchor_tag,
+                unit_names=self.unit_names,
+                builder_tags=final_builder_tags,
+                world_to_minimap_transform=self._world_to_minimap_transform,
+            )
+            if quarantined or not exact_target_legal:
+                if not quarantined:
+                    self.suppress_world_target_temporarily(
+                        action_name,
+                        emitted,
+                        expires_game_loop=game_loop + self.effect_timeout_game_loops,
+                        reason="no_legal_placement",
+                        target_state_revision=self._target_state_revision(
+                            observation,
+                            action_name,
+                            emitted,
+                            anchor_tag=anchor_tag,
+                        ),
+                        anchor_tag=anchor_tag,
+                    )
+                raise RawPlacementFailure(
+                    "no_legal_placement",
+                    f"{action_name} anchor {hex(anchor)} has no current legal exact footprint",
+                )
+        target_state_revision = self._target_state_revision(
+            observation,
+            action_name,
+            emitted,
+            anchor_tag=anchor_tag,
+        )
         reservation = RawPlacementReservation(
             command_id=command_id,
             operation_id=operation_id,
@@ -570,6 +703,7 @@ class RawPlacementService:
             world_target=emitted,
             anchor_tag=anchor_tag,
             placement_revision=current_revision,
+            target_state_revision=target_state_revision,
             baseline_builder_orders=baseline_builder_orders,
             structure_type=spec.target_structure,
             footprint_width=(
@@ -652,8 +786,12 @@ class RawPlacementService:
             self.suppress_world_target_temporarily(
                 action_name,
                 target,
-                expires_game_loop=current_loop + 112,
+                expires_game_loop=current_loop + self.effect_timeout_game_loops,
                 reason=failure_code,
+                target_state_revision=(
+                    None if placement is None else placement.target_state_revision
+                ),
+                anchor_tag=anchor,
             )
             transition_state = "temporary_suppressed"
             failure_class = "spatial_retryable"
@@ -800,13 +938,24 @@ class RawPlacementService:
         *,
         expires_game_loop: int,
         reason: str,
+        target_state_revision: str | None = None,
+        anchor_tag: int | None = None,
     ) -> None:
         if len(target) != 2:
             return
         point = (float(target[0]), float(target[1]))
         cells = self._cells_for_action(action_name, point)
         stored = self._temporary_suppressions.setdefault(action_name, [])
-        stored.append(_TemporarySuppression(point, cells, int(expires_game_loop), reason))
+        stored.append(
+            _TemporarySuppression(
+                point,
+                cells,
+                int(expires_game_loop),
+                reason,
+                target_state_revision,
+                anchor_tag,
+            )
+        )
 
     def is_quarantined(
         self,
@@ -815,6 +964,8 @@ class RawPlacementService:
         *,
         radius: float | None = None,
         game_loop: int | None = None,
+        observation: Any | None = None,
+        anchor_tag: int | None = None,
     ) -> bool:
         if game_loop is not None:
             self._expire_temporary_suppressions(game_loop)
@@ -825,10 +976,26 @@ class RawPlacementService:
         )
         if any(cells & exclusion.occupied_grid_cells for exclusion in self._permanent_exclusions):
             return True
-        if any(
-            cells & suppression.occupied_grid_cells
-            for suppression in self._temporary_suppressions.get(action_name, ())
-        ):
+        suppressions = self._temporary_suppressions.get(action_name, [])
+        if observation is not None and suppressions:
+            current_state_revision = self._target_state_revision(
+                observation,
+                action_name,
+                target,
+                anchor_tag=anchor_tag,
+            )
+            suppressions = [
+                suppression
+                for suppression in suppressions
+                if not cells & suppression.occupied_grid_cells
+                or suppression.target_state_revision is None
+                or suppression.target_state_revision == current_state_revision
+            ]
+            if suppressions:
+                self._temporary_suppressions[action_name] = suppressions
+            else:
+                self._temporary_suppressions.pop(action_name, None)
+        if any(cells & suppression.occupied_grid_cells for suppression in suppressions):
             return True
         if any(
             cells & exclusion.occupied_grid_cells for exclusion in self._observed_occupancy.values()
@@ -868,7 +1035,8 @@ class RawPlacementService:
             kept = [
                 suppression
                 for suppression in suppressions
-                if suppression.expires_game_loop > int(game_loop)
+                if suppression.target_state_revision is not None
+                or suppression.expires_game_loop > int(game_loop)
             ]
             if kept:
                 self._temporary_suppressions[action_name] = kept
@@ -933,6 +1101,8 @@ class RawPlacementService:
             "game_loop": resolved_loop,
             "release_reason": release_reason,
         }
+        if reservation is not None:
+            transition["target_state_revision"] = reservation.target_state_revision
         self._transition_sequence += 1
         transition_id = (
             "placement-transition:"
@@ -1056,6 +1226,123 @@ class RawPlacementService:
         _, _, x, y = min(candidates)
         return float(x), float(y)
 
+    def _target_state_revision(
+        self,
+        observation: Any,
+        action_name: str,
+        target: tuple[float, float],
+        *,
+        anchor_tag: int | None,
+    ) -> str:
+        cells = self._cells_for_action(action_name, target)
+        occupants = sorted(
+            (
+                int(tag),
+                exclusion.world_target,
+                exclusion.reason,
+            )
+            for tag, exclusion in self._observed_occupancy.items()
+            if cells & exclusion.occupied_grid_cells
+        )
+        resource_tags: set[int] = set()
+        if anchor_tag is not None:
+            resource_tags = {
+                int(unit["tag"]) for unit in self._resource_cluster(int(anchor_tag))
+            } or {int(anchor_tag)}
+        exact_world_legal: bool | None = None
+        if (
+            _value(observation, "feature_screen", None) is not None
+            or self._world_to_minimap_transform is not None
+        ):
+            from rtscortex_llm_pysc2.extractor import world_build_target_is_legal
+
+            exact_world_legal = bool(
+                world_build_target_is_legal(
+                    observation,
+                    action_name,
+                    target,
+                    preferred_anchor_tag=anchor_tag,
+                    unit_names=self.unit_names,
+                    world_to_minimap_transform=self._world_to_minimap_transform,
+                )
+            )
+        payload = {
+            "action_name": action_name,
+            "world_target": [float(target[0]), float(target[1])],
+            "occupants": occupants,
+            "exact_world_legal": exact_world_legal,
+            "resource_presence": [
+                [
+                    tag,
+                    tag in self._visible_resource_tags,
+                    self._resource_presence_generation.get(tag, 0),
+                ]
+                for tag in sorted(resource_tags)
+            ],
+        }
+        signature = hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        key = (
+            action_name,
+            (round(float(target[0]), 3), round(float(target[1]), 3)),
+        )
+        previous_signature, generation = self._target_state_memory.get(
+            key,
+            ("", 0),
+        )
+        if signature != previous_signature:
+            generation += 1
+            self._target_state_memory[key] = (signature, generation)
+        return hashlib.sha256(f"{signature}:{generation}".encode()).hexdigest()
+
+    def _cluster_is_current(self, anchor_tag: int, observation: Any) -> bool:
+        current_resources = {
+            int(_value(unit, "tag", 0)): unit
+            for unit in _value(observation, "raw_units", ())
+            if int(_value(unit, "alliance", 0)) == 3
+            and int(_value(unit, "display_type", 1)) == 1
+            and _is_resource(_unit_name(unit, self.unit_names))
+        }
+        cluster = self._resource_cluster(anchor_tag)
+        current_cluster = [unit for unit in cluster if int(unit["tag"]) in current_resources]
+        if not current_cluster:
+            return (
+                _value(observation, "player_common", _value(observation, "player", None)) is None
+                and sum(_is_mineral(str(unit["unit_type"])) for unit in cluster) >= 5
+            )
+        center = (
+            sum(float(unit["x"]) for unit in current_cluster) / len(current_cluster),
+            sum(float(unit["y"]) for unit in current_cluster) / len(current_cluster),
+        )
+        occupied_cluster = any(
+            int(_value(unit, "alliance", 0)) in {1, 2, 4}
+            and _unit_name(unit, self.unit_names).casefold()
+            in {
+                "commandcenter",
+                "hatchery",
+                "hive",
+                "lair",
+                "nexus",
+                "orbitalcommand",
+                "planetaryfortress",
+            }
+            and math.dist(
+                center,
+                (
+                    float(_value(unit, "x", 0.0)),
+                    float(_value(unit, "y", 0.0)),
+                ),
+            )
+            < 12.0
+            for unit in _value(observation, "raw_units", ())
+        )
+        return (
+            int(anchor_tag) in current_resources
+            and sum(_is_mineral(str(unit["unit_type"])) for unit in current_cluster) >= 5
+            and not occupied_cluster
+        )
+
     def _resource_cluster(self, anchor_tag: int) -> list[dict[str, Any]]:
         anchor = self._known_resources.get(anchor_tag)
         if anchor is None:
@@ -1098,7 +1385,9 @@ class RawPlacementService:
             clusters.append((cluster_id, cluster))
         return sorted(clusters, key=lambda item: item[0])
 
-    def _expansion_candidates(self, observation: Any) -> list[int]:
+    def _expansion_candidates(self, observation: Any, action_name: str) -> list[int]:
+        from rtscortex_llm_pysc2.extractor import world_build_target_is_legal
+
         own_townhalls = [
             unit
             for unit in _value(observation, "raw_units", ())
@@ -1120,6 +1409,8 @@ class RawPlacementService:
                 continue
             if sum(_is_mineral(str(unit["unit_type"])) for unit in cluster) < 5:
                 continue
+            if not self._cluster_is_current(cluster_id, observation):
+                continue
             center = (
                 sum(float(unit["x"]) for unit in cluster) / len(cluster),
                 sum(float(unit["y"]) for unit in cluster) / len(cluster),
@@ -1136,7 +1427,25 @@ class RawPlacementService:
                 for townhall in own_townhalls
             ):
                 continue
-            if self._expansion_target(cluster_id, observation) is None:
+            expansion_target = self._expansion_target(cluster_id, observation)
+            if (
+                expansion_target is None
+                or self.is_quarantined(
+                    action_name,
+                    expansion_target,
+                    game_loop=_game_loop(observation),
+                    observation=observation,
+                    anchor_tag=cluster_id,
+                )
+                or not world_build_target_is_legal(
+                    observation,
+                    action_name,
+                    expansion_target,
+                    preferred_anchor_tag=cluster_id,
+                    unit_names=self.unit_names,
+                    world_to_minimap_transform=self._world_to_minimap_transform,
+                )
+            ):
                 continue
             base_distance = min(
                 (

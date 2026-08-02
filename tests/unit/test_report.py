@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import asdict
 from pathlib import Path
@@ -56,6 +57,185 @@ def _write_journal(run_dir: Path, events: list[StoredEvent]) -> None:
         "".join(json.dumps(asdict(event), sort_keys=True) + "\n" for event in events),
         encoding="utf-8",
     )
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _qualification_evidence(
+    tmp_path: Path,
+    *,
+    expected_git_sha: str,
+    diagnostic_only: bool = False,
+) -> Path:
+    recovery = tmp_path / "recovery-canary.json"
+    recovery.write_text(
+        json.dumps(
+            {
+                "format_version": "1.1",
+                "git_sha": expected_git_sha,
+                "expected_git_sha": expected_git_sha,
+                "passed": True,
+                "recovery_evidence_present": True,
+                "checkpoint_tail_recovery_bounded": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    baseline = tmp_path / "engineering-baseline.json"
+    baseline.write_text(
+        json.dumps(
+            {
+                "format_version": "1.0",
+                "source_issue": "SCX-PT-034",
+                "natural_run_bytes_per_game_loop": 10_000.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    manifest = tmp_path / "qualification-evidence.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "format_version": "1.0",
+                "evidence_kind": "three-seed-qualification",
+                "diagnostic_only": diagnostic_only,
+                "expected_git_sha": expected_git_sha,
+                "recovery_evidence": {
+                    "path": str(recovery),
+                    "sha256": _sha256(recovery),
+                },
+                "natural_run_baseline": {
+                    "path": str(baseline),
+                    "sha256": _sha256(baseline),
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    return manifest
+
+
+def test_qualification_evidence_reaches_engineering_report_call_path(
+    tmp_path: Path,
+) -> None:
+    expected_git_sha = "a" * 40
+    run_dir = tmp_path / "qualified"
+    _write_journal(
+        run_dir,
+        [
+            _event(
+                1,
+                "observation",
+                make_observation(
+                    run_id="live-run",
+                    episode_id="episode-0",
+                    game_loop=100,
+                ).model_dump(mode="json"),
+            ),
+            _event(
+                2,
+                "postgame_review_completed",
+                {"strategic_consequence_count": 0},
+            ),
+        ],
+    )
+    manifest = _qualification_evidence(
+        tmp_path,
+        expected_git_sha=expected_git_sha,
+    )
+
+    artifacts = write_run_reports(
+        run_dir,
+        qualification_evidence_path=manifest,
+    )
+    report = json.loads(artifacts.engineering_gates_path.read_text(encoding="utf-8"))
+
+    assert report["metrics"]["recovery_evidence_present"] is True
+    assert report["metrics"]["checkpoint_tail_recovery_bounded"] is True
+    assert report["metrics"]["postgame_semantic_event_coverage"] == 1.0
+    assert report["metrics"]["natural_run_disk_reduction_ratio"] is not None
+    assert report["evidence"]["expected_git_sha"] == expected_git_sha
+    assert report["evidence"]["recovery_evidence"]["sha256"] == _sha256(
+        tmp_path / "recovery-canary.json"
+    )
+    assert report["evidence"]["natural_run_baseline"] == {
+        "path": str((tmp_path / "engineering-baseline.json").resolve()),
+        "sha256": _sha256(tmp_path / "engineering-baseline.json"),
+        "source_issue": "SCX-PT-034",
+        "bytes_per_game_loop": 10_000.0,
+    }
+
+
+def test_diagnostic_manifest_cannot_populate_formal_engineering_evidence(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "diagnostic"
+    _write_journal(
+        run_dir,
+        [
+            _event(
+                1,
+                "observation",
+                make_observation(
+                    run_id="live-run",
+                    episode_id="episode-0",
+                    game_loop=100,
+                ).model_dump(mode="json"),
+            )
+        ],
+    )
+    manifest = _qualification_evidence(
+        tmp_path,
+        expected_git_sha="b" * 40,
+        diagnostic_only=True,
+    )
+
+    artifacts = write_run_reports(run_dir, qualification_evidence_path=manifest)
+    report = json.loads(artifacts.engineering_gates_path.read_text(encoding="utf-8"))
+
+    assert report["metrics"]["recovery_evidence_present"] is False
+    assert report["metrics"]["checkpoint_tail_recovery_bounded"] is None
+    assert report["metrics"]["natural_run_disk_reduction_ratio"] is None
+    assert report["accepted"] is False
+
+
+def test_missing_recovery_claims_remain_fail_closed(tmp_path: Path) -> None:
+    run_dir = tmp_path / "missing-recovery-claims"
+    _write_journal(
+        run_dir,
+        [
+            _event(
+                1,
+                "observation",
+                make_observation(
+                    run_id="live-run",
+                    episode_id="episode-0",
+                    game_loop=100,
+                ).model_dump(mode="json"),
+            )
+        ],
+    )
+    manifest_path = _qualification_evidence(tmp_path, expected_git_sha="c" * 40)
+    recovery_path = tmp_path / "recovery-canary.json"
+    recovery = json.loads(recovery_path.read_text(encoding="utf-8"))
+    del recovery["recovery_evidence_present"]
+    del recovery["checkpoint_tail_recovery_bounded"]
+    recovery_path.write_text(json.dumps(recovery), encoding="utf-8")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["recovery_evidence"]["sha256"] = _sha256(recovery_path)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    artifacts = write_run_reports(
+        run_dir,
+        qualification_evidence_path=manifest_path,
+    )
+    report = json.loads(artifacts.engineering_gates_path.read_text(encoding="utf-8"))
+
+    assert report["metrics"]["recovery_evidence_present"] is False
+    assert report["metrics"]["checkpoint_tail_recovery_bounded"] is None
+    assert report["accepted"] is False
 
 
 def test_hard_acceptance_allows_not_applicable_gates() -> None:

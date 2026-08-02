@@ -5249,6 +5249,102 @@ def test_train_stalker_requires_completed_cybernetics_core() -> None:
     ]
 
 
+def test_train_adept_does_not_treat_one_percent_core_as_complete() -> None:
+    timestep = _fake_timestep()
+    timestep.observation.player.minerals = 500
+    timestep.observation.player.vespene = 500
+    gateway = _unit(0xADE, 62, 1, 35, 35, 500, 255)
+    gateway.build_progress = 100
+    gateway.active = 0
+    core = _unit(0xC0E, 72, 1, 37, 35, 500, 255)
+    core.build_progress = 1
+    timestep.observation.raw_units.extend([gateway, core])
+    action = {"name": "Train_Adept", "arg": [], "func": [(457, None, ())]}
+    agent = _developer_agent(timestep, [action])
+    extractor = TimeStepExtractor(
+        "run-worker",
+        "episode-worker",
+        unit_names={62: "Gateway", 72: "CyberneticsCore"},
+        action_source_types={457: 62},
+    )
+
+    assert (
+        production_source_tag(
+            timestep.observation,
+            action,
+            unit_names={62: "Gateway", 72: "CyberneticsCore"},
+            action_source_types={457: 62},
+        )
+        is None
+    )
+    incomplete = extractor.extract(
+        timestep,
+        {"Developer": agent},
+        {"Developer": "production overview"},
+        step_id=1,
+    )
+    assert [item["name"] for item in incomplete["teams"][0]["available_actions"]] == [
+        "No_Operation"
+    ]
+
+    core.build_progress = 100
+    assert (
+        production_source_tag(
+            timestep.observation,
+            action,
+            unit_names={62: "Gateway", 72: "CyberneticsCore"},
+            action_source_types={457: 62},
+        )
+        == 0xADE
+    )
+    complete = extractor.extract(
+        timestep,
+        {"Developer": agent},
+        {"Developer": "production overview"},
+        step_id=2,
+    )
+    assert [item["name"] for item in complete["teams"][0]["available_actions"]] == [
+        "No_Operation",
+        "Train_Adept",
+    ]
+
+
+def test_train_adept_final_dispatch_revalidates_completed_core_and_capability() -> None:
+    timestep = _fake_timestep()
+    timestep.observation.player.minerals = 500
+    timestep.observation.player.vespene = 500
+    gateway = _unit(0xADE, 62, 1, 35, 35, 500, 255)
+    gateway.build_progress = 100
+    gateway.active = 0
+    core = _unit(0xC0E, 72, 1, 37, 35, 500, 255)
+    core.build_progress = 1
+    timestep.observation.raw_units.extend([gateway, core])
+    timestep.observation.available_actions = [457]
+
+    reason = _production_source_invalid_reason(
+        timestep.observation,
+        0xADE,
+        PRODUCTION_SPECS["Train_Adept"],
+        {62: "Gateway", 72: "CyberneticsCore"},
+        required_function_id=457,
+    )
+
+    assert reason is not None
+    assert "completed CyberneticsCore" in reason
+
+    core.build_progress = 100
+    timestep.observation.available_actions = []
+    reason = _production_source_invalid_reason(
+        timestep.observation,
+        0xADE,
+        PRODUCTION_SPECS["Train_Adept"],
+        {62: "Gateway", 72: "CyberneticsCore"},
+        required_function_id=457,
+    )
+    assert reason is not None
+    assert "not currently available" in reason
+
+
 def test_research_warpgate_requires_its_full_resource_cost() -> None:
     timestep = _fake_timestep()
     timestep.observation.upgrades = []

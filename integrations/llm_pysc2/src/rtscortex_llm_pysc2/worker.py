@@ -34,6 +34,7 @@ from rtscortex_llm_pysc2.extractor import (
     is_source_bound_action,
     minimap_scout_candidates,
     nexus_placement_footprint_is_visible,
+    production_dispatch_failure,
     production_source_tag,
     resolve_screen_build_world_target,
     resolve_screen_point_world_target,
@@ -947,6 +948,7 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
                 producer_tag,
                 source_spec,
                 self.unit_names,
+                required_function_id=requested_id,
             )
             if invalid_reason is not None:
                 self._settle_production_command_failure(
@@ -4223,6 +4225,8 @@ def _production_source_invalid_reason(
     source_tag: Optional[int],
     spec: _SourceActionSpec,
     unit_names: Mapping[int, str],
+    *,
+    required_function_id: int | None = None,
 ) -> Optional[str]:
     if source_tag is None:
         return f"{spec.action_name} producer provenance is unavailable at final dispatch"
@@ -4266,7 +4270,10 @@ def _production_source_invalid_reason(
             f"{source_name!r} alliance {int(value('alliance', 0))}"
         )
     progress = float(value("build_progress", 0.0))
-    normalized_progress = progress / 100.0 if progress > 1.0 else progress
+    percent_scale = any(
+        float(_observation_value(unit, "build_progress", 0.0)) > 1.0 for unit in raw_units
+    )
+    normalized_progress = progress / 100.0 if percent_scale else progress
     if normalized_progress < 1.0:
         return f"{spec.action_name} producer {hex(source_tag)} is no longer complete"
     minimum_energy = float(getattr(spec, "minimum_energy", 0.0))
@@ -4297,6 +4304,14 @@ def _production_source_invalid_reason(
         return f"{spec.action_name} producer {hex(source_tag)} became busy before final dispatch"
     if addon_spec(spec.action_name) is not None and int(value("add_on_tag", 0)) != 0:
         return f"{spec.action_name} producer {hex(source_tag)} already has an add-on"
+    contract_failure = production_dispatch_failure(
+        observation,
+        spec.action_name,
+        unit_names=unit_names,
+        required_function_id=required_function_id,
+    )
+    if contract_failure is not None:
+        return contract_failure
     return None
 
 
