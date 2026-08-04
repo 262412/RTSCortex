@@ -6,7 +6,8 @@ import hashlib
 import json
 import math
 from collections.abc import Callable, Collection, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
+from enum import Enum
 from typing import Any, Optional
 
 from rtscortex_llm_pysc2.effect_lifecycle import build_reservation_expiry
@@ -41,6 +42,7 @@ class RawPlacementReservation:
     placement_state: str
     episode_id: str
     expires_game_loop: int
+    attempt_ordinal: int | None = None
 
     @property
     def reservation_id(self) -> str:
@@ -88,6 +90,113 @@ class RawPlacementFailure(RuntimeError):
     def __init__(self, code: str, reason: str) -> None:
         super().__init__(reason)
         self.code = code
+
+
+class RawPlacementNoStartStatus(str, Enum):  # noqa: UP042 - PySC2 bridge supports Python 3.9
+    """Typed disposition for an operation whose accepted build never started."""
+
+    RETRY = "retry"
+    DEFER_REPLAN = "defer_replan"
+    DUPLICATE = "duplicate"
+    RESET = "reset"
+
+
+@dataclass(frozen=True)
+class RawPlacementNoStartState:
+    """Auditable operation-level no-start streak snapshot."""
+
+    operation_id: str
+    streak: int
+    threshold: int
+    circuit_open: bool
+    last_status: str
+    last_command_id: str | None = None
+    last_attempt_ordinal: int | None = None
+    last_builder_tag: int | None = None
+    last_world_target: tuple[float, float] | None = None
+    last_placement_revision: str | None = None
+    last_target_state_revision: str | None = None
+    last_observation_revision: str | None = None
+    blocked_target_state_revision: str | None = None
+    blocked_builder_tag: int | None = None
+    blocked_placement_revision: str | None = None
+    blocked_observation_revision: str | None = None
+    blocked_failure_classification: str | None = None
+    blocked_target_side_evidence: bool = False
+    seen_attempt_ordinals: tuple[int, ...] = ()
+    seen_command_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class RawPlacementNoStartDecision:
+    """One operation-level no-start update returned by ``quarantine_command``."""
+
+    operation_id: str | None
+    command_id: str
+    failure_code: str
+    status: str
+    streak: int
+    threshold: int
+    circuit_open: bool
+    duplicate_attempt: bool
+    suppressed_target: bool
+    target_side_evidence: bool
+    next_action: str
+    attempt_ordinal: int | None = None
+    failure_classification: str | None = None
+    classification_basis: tuple[str, ...] = ()
+    evidence: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def deferred(self) -> bool:
+        return self.status == RawPlacementNoStartStatus.DEFER_REPLAN.value
+
+    @property
+    def replan_required(self) -> bool:
+        return self.deferred
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "operation_id": self.operation_id,
+            "command_id": self.command_id,
+            "failure_code": self.failure_code,
+            "status": self.status,
+            "streak": self.streak,
+            "threshold": self.threshold,
+            "circuit_open": self.circuit_open,
+            "duplicate_attempt": self.duplicate_attempt,
+            "suppressed_target": self.suppressed_target,
+            "target_side_evidence": self.target_side_evidence,
+            "next_action": self.next_action,
+            "attempt_ordinal": self.attempt_ordinal,
+            "failure_classification": self.failure_classification,
+            "classification_basis": list(self.classification_basis),
+            "evidence": dict(self.evidence),
+        }
+
+
+@dataclass
+class _OperationNoStartLedger:
+    operation_id: str
+    threshold: int
+    streak: int = 0
+    circuit_open: bool = False
+    last_status: str = RawPlacementNoStartStatus.RESET.value
+    last_command_id: str | None = None
+    last_attempt_ordinal: int | None = None
+    last_builder_tag: int | None = None
+    last_world_target: tuple[float, float] | None = None
+    last_placement_revision: str | None = None
+    last_target_state_revision: str | None = None
+    last_observation_revision: str | None = None
+    blocked_target_state_revision: str | None = None
+    blocked_builder_tag: int | None = None
+    blocked_placement_revision: str | None = None
+    blocked_observation_revision: str | None = None
+    blocked_failure_classification: str | None = None
+    blocked_target_side_evidence: bool = False
+    seen_attempt_ordinals: set[int] = field(default_factory=set)
+    seen_command_ids: set[str] = field(default_factory=set)
 
 
 def _footprint_cells(
@@ -157,11 +266,15 @@ class RawPlacementService:
         unit_names: Mapping[int, str],
         transition_sink: Callable[[dict[str, Any]], None] | None = None,
         effect_timeout_game_loops: int = 112,
+        no_start_streak_threshold: int = 3,
     ) -> None:
         if effect_timeout_game_loops < 1:
             raise ValueError("effect_timeout_game_loops must be positive")
+        if no_start_streak_threshold < 1:
+            raise ValueError("no_start_streak_threshold must be positive")
         self.unit_names = {int(key): str(value) for key, value in unit_names.items()}
         self.effect_timeout_game_loops = int(effect_timeout_game_loops)
+        self.no_start_streak_threshold = int(no_start_streak_threshold)
         self._known_resources: dict[int, dict[str, Any]] = {}
         self._visible_resource_tags: set[int] = set()
         self._resource_presence_generation: dict[int, int] = {}
@@ -173,6 +286,7 @@ class RawPlacementService:
         self._suppressed_resource_tags: set[int] = set()
         self._permanent_exclusions: list[_SpatialExclusion] = []
         self._temporary_suppressions: dict[str, list[_TemporarySuppression]] = {}
+        self._operation_no_start: dict[str, _OperationNoStartLedger] = {}
         self._command_targets: dict[str, RawPlacementReservation] = {}
         self._observed_occupancy: dict[int, _SpatialExclusion] = {}
         self._builder_leases: dict[int, str] = {}
@@ -249,6 +363,296 @@ class RawPlacementService:
     def reset_diagnostics(self) -> None:
         self._placement_diagnostics.clear()
 
+    def operation_no_start_state(
+        self,
+        operation_id: str,
+    ) -> RawPlacementNoStartState | None:
+        """Return the current auditable no-start state for one operation."""
+
+        ledger = self._operation_no_start.get(str(operation_id))
+        if ledger is None:
+            return None
+        return RawPlacementNoStartState(
+            operation_id=ledger.operation_id,
+            streak=ledger.streak,
+            threshold=ledger.threshold,
+            circuit_open=ledger.circuit_open,
+            last_status=ledger.last_status,
+            last_command_id=ledger.last_command_id,
+            last_attempt_ordinal=ledger.last_attempt_ordinal,
+            last_builder_tag=ledger.last_builder_tag,
+            last_world_target=ledger.last_world_target,
+            last_placement_revision=ledger.last_placement_revision,
+            last_target_state_revision=ledger.last_target_state_revision,
+            last_observation_revision=ledger.last_observation_revision,
+            blocked_target_state_revision=ledger.blocked_target_state_revision,
+            blocked_builder_tag=ledger.blocked_builder_tag,
+            blocked_placement_revision=ledger.blocked_placement_revision,
+            blocked_observation_revision=ledger.blocked_observation_revision,
+            blocked_failure_classification=ledger.blocked_failure_classification,
+            blocked_target_side_evidence=ledger.blocked_target_side_evidence,
+            seen_attempt_ordinals=tuple(sorted(ledger.seen_attempt_ordinals)),
+            seen_command_ids=tuple(sorted(ledger.seen_command_ids)),
+        )
+
+    def no_start_streak(self, operation_id: str) -> int:
+        state = self.operation_no_start_state(operation_id)
+        return 0 if state is None else state.streak
+
+    def operation_retry_allowed(
+        self,
+        operation_id: str,
+        *,
+        world_target: tuple[float, float] | None = None,
+        target_state_revision: str | None = None,
+        failure_classification: str | None = None,
+        target_side_evidence: bool = False,
+        builder_tag: int | None = None,
+        builder_ready: bool = False,
+        observation_revision: str | None = None,
+    ) -> bool:
+        """Whether a circuit-open operation has acquired a genuinely new target state."""
+
+        ledger = self._operation_no_start.get(str(operation_id))
+        if ledger is None or not ledger.circuit_open:
+            return True
+        effective_classification = (
+            failure_classification
+            if failure_classification is not None
+            else ledger.blocked_failure_classification
+        )
+        effective_target_evidence = target_side_evidence or ledger.blocked_target_side_evidence
+        same_target = (
+            world_target is not None
+            and ledger.last_world_target is not None
+            and math.dist(world_target, ledger.last_world_target) <= 0.25
+        )
+        target_changed = (
+            same_target
+            and target_state_revision is not None
+            and ledger.blocked_target_state_revision is not None
+            and target_state_revision != ledger.blocked_target_state_revision
+        )
+        builder_changed = (
+            builder_ready
+            and builder_tag is not None
+            and (
+                ledger.blocked_builder_tag is None or int(builder_tag) != ledger.blocked_builder_tag
+            )
+            and observation_revision is not None
+            and ledger.blocked_observation_revision is not None
+            and observation_revision != ledger.blocked_observation_revision
+        )
+        if not self._allows_target_state_reopen(
+            effective_classification,
+            target_side_evidence=effective_target_evidence,
+            target_changed=target_changed,
+            builder_changed=builder_changed,
+        ):
+            return False
+        ledger.circuit_open = False
+        ledger.blocked_target_state_revision = None
+        ledger.blocked_builder_tag = None
+        ledger.blocked_placement_revision = None
+        ledger.blocked_observation_revision = None
+        ledger.blocked_failure_classification = None
+        ledger.blocked_target_side_evidence = False
+        ledger.last_status = RawPlacementNoStartStatus.RETRY.value
+        return True
+
+    def reset_operation_no_start(
+        self,
+        operation_id: str,
+        *,
+        reason: str = "build_started",
+    ) -> RawPlacementNoStartState | None:
+        """Clear an operation's consecutive no-start counter after success."""
+
+        ledger = self._operation_no_start.get(str(operation_id))
+        if ledger is None:
+            return None
+        ledger.streak = 0
+        ledger.circuit_open = False
+        ledger.blocked_target_state_revision = None
+        ledger.blocked_builder_tag = None
+        ledger.blocked_placement_revision = None
+        ledger.blocked_observation_revision = None
+        ledger.blocked_failure_classification = None
+        ledger.blocked_target_side_evidence = False
+        ledger.last_status = RawPlacementNoStartStatus.RESET.value
+        return self.operation_no_start_state(operation_id)
+
+    def record_no_start_failure(
+        self,
+        *,
+        operation_id: str | None,
+        command_id: str,
+        failure_code: str = "no_build_start_evidence",
+        attempt_ordinal: int | None = None,
+        builder_tag: int | None = None,
+        world_target: tuple[float, float] | None = None,
+        placement_revision: str | None = None,
+        target_state_revision: str | None = None,
+        failure_classification: str | None = None,
+        classification_basis: Sequence[str] = (),
+        target_side_evidence: bool = False,
+        suppressed_target: bool = False,
+        builder_ready: bool = False,
+        observation_revision: str | None = None,
+    ) -> RawPlacementNoStartDecision:
+        """Record one accepted gameplay no-start attempt by operation identity.
+
+        Coordinates, placement revisions, command IDs and builder tags are retained
+        as audit fields only; they never partition the streak.  Attempt ordinals
+        and command IDs de-duplicate replayed historical reports.
+        """
+
+        normalized_operation = None if operation_id is None else str(operation_id)
+        basis = tuple(str(item) for item in classification_basis)
+        if normalized_operation is None:
+            return RawPlacementNoStartDecision(
+                operation_id=None,
+                command_id=str(command_id),
+                failure_code=str(failure_code),
+                status=RawPlacementNoStartStatus.RETRY.value,
+                streak=0,
+                threshold=self.no_start_streak_threshold,
+                circuit_open=False,
+                duplicate_attempt=False,
+                suppressed_target=suppressed_target,
+                target_side_evidence=target_side_evidence,
+                next_action="retry",
+                attempt_ordinal=attempt_ordinal,
+                failure_classification=failure_classification,
+                classification_basis=basis,
+                evidence={
+                    "operation_id": None,
+                    "command_id": str(command_id),
+                    "failure_code": str(failure_code),
+                    "streak": 0,
+                    "threshold": self.no_start_streak_threshold,
+                    "circuit_open": False,
+                    "duplicate_attempt": False,
+                    "suppressed_target": suppressed_target,
+                    "target_side_evidence": target_side_evidence,
+                    "next_action": "retry",
+                    "attempt_ordinal": attempt_ordinal,
+                    "builder_tag": None if builder_tag is None else hex(int(builder_tag)),
+                    "builder_ready": builder_ready,
+                    "observation_revision": observation_revision,
+                    "world_target": world_target,
+                    "placement_revision": placement_revision,
+                    "target_state_revision": target_state_revision,
+                    "failure_classification": failure_classification,
+                    "classification_basis": list(basis),
+                },
+            )
+
+        ledger = self._operation_no_start.setdefault(
+            normalized_operation,
+            _OperationNoStartLedger(
+                operation_id=normalized_operation,
+                threshold=self.no_start_streak_threshold,
+            ),
+        )
+        duplicate = (
+            str(command_id) in ledger.seen_command_ids
+            or attempt_ordinal is not None
+            and (
+                int(attempt_ordinal) in ledger.seen_attempt_ordinals
+                or (
+                    bool(ledger.seen_attempt_ordinals)
+                    and int(attempt_ordinal) < max(ledger.seen_attempt_ordinals)
+                )
+            )
+        )
+        if duplicate:
+            status = RawPlacementNoStartStatus.DUPLICATE.value
+            next_action = "defer_replan" if ledger.circuit_open else "retry"
+        else:
+            if ledger.circuit_open and not self.operation_retry_allowed(
+                normalized_operation,
+                world_target=world_target,
+                target_state_revision=target_state_revision,
+                failure_classification=failure_classification,
+                target_side_evidence=target_side_evidence,
+                builder_tag=builder_tag,
+                builder_ready=builder_ready,
+                observation_revision=observation_revision,
+            ):
+                if attempt_ordinal is not None:
+                    ledger.seen_attempt_ordinals.add(int(attempt_ordinal))
+                ledger.seen_command_ids.add(str(command_id))
+                status = RawPlacementNoStartStatus.DEFER_REPLAN.value
+                next_action = "replan"
+            else:
+                if attempt_ordinal is not None:
+                    ledger.seen_attempt_ordinals.add(int(attempt_ordinal))
+                ledger.seen_command_ids.add(str(command_id))
+                ledger.streak += 1
+                ledger.last_command_id = str(command_id)
+                ledger.last_attempt_ordinal = (
+                    None if attempt_ordinal is None else int(attempt_ordinal)
+                )
+                ledger.last_builder_tag = None if builder_tag is None else int(builder_tag)
+                ledger.last_world_target = world_target
+                ledger.last_placement_revision = placement_revision
+                ledger.last_target_state_revision = target_state_revision
+                ledger.last_observation_revision = observation_revision
+                if ledger.streak >= ledger.threshold:
+                    ledger.circuit_open = True
+                    ledger.blocked_target_state_revision = target_state_revision
+                    ledger.blocked_builder_tag = None if builder_tag is None else int(builder_tag)
+                    ledger.blocked_placement_revision = placement_revision
+                    ledger.blocked_observation_revision = observation_revision
+                    ledger.blocked_failure_classification = failure_classification
+                    ledger.blocked_target_side_evidence = target_side_evidence
+                    status = RawPlacementNoStartStatus.DEFER_REPLAN.value
+                    next_action = "replan"
+                else:
+                    status = RawPlacementNoStartStatus.RETRY.value
+                    next_action = "retry"
+                ledger.last_status = status
+
+        evidence = {
+            "operation_id": normalized_operation,
+            "command_id": str(command_id),
+            "failure_code": str(failure_code),
+            "streak": ledger.streak,
+            "threshold": ledger.threshold,
+            "circuit_open": ledger.circuit_open,
+            "duplicate_attempt": duplicate,
+            "suppressed_target": suppressed_target,
+            "target_side_evidence": target_side_evidence,
+            "next_action": next_action,
+            "attempt_ordinal": None if attempt_ordinal is None else int(attempt_ordinal),
+            "builder_tag": None if builder_tag is None else hex(int(builder_tag)),
+            "builder_ready": builder_ready,
+            "observation_revision": observation_revision,
+            "world_target": world_target,
+            "placement_revision": placement_revision,
+            "target_state_revision": target_state_revision,
+            "failure_classification": failure_classification,
+            "classification_basis": list(basis),
+        }
+        return RawPlacementNoStartDecision(
+            operation_id=normalized_operation,
+            command_id=str(command_id),
+            failure_code=str(failure_code),
+            status=status,
+            streak=ledger.streak,
+            threshold=ledger.threshold,
+            circuit_open=ledger.circuit_open,
+            duplicate_attempt=duplicate,
+            suppressed_target=suppressed_target,
+            target_side_evidence=target_side_evidence,
+            next_action=next_action,
+            attempt_ordinal=None if attempt_ordinal is None else int(attempt_ordinal),
+            failure_classification=failure_classification,
+            classification_basis=basis,
+            evidence=evidence,
+        )
+
     def observe(self, observation: Any, *, require_feature_visibility: bool) -> None:
         self._runtime_game_loop = max(self._runtime_game_loop, _game_loop(observation))
         self.observe_units(
@@ -292,6 +696,7 @@ class RawPlacementService:
             if (
                 tag > 0
                 and int(_value(unit, "alliance", 0)) in {1, 2, 4}
+                and int(_value(unit, "display_type", 1)) == 1
                 and _build_progress(unit) > 0.0
                 and name in spec_by_structure
             ):
@@ -466,6 +871,7 @@ class RawPlacementService:
         builder_tags: Collection[int] = (),
         builder_tag: int | None = None,
         operation_id: str | None = None,
+        attempt_ordinal: int | None = None,
         ability_name: str | None = None,
         episode_id: str = "unknown",
         expires_game_loop: int | None = None,
@@ -532,6 +938,11 @@ class RawPlacementService:
             target = (float(world_target[0]), float(world_target[1]))
             if placement_candidate_id is not None:
                 assert candidate_placement_revision is not None
+                if candidate_placement_revision != current_revision:
+                    raise RawPlacementFailure(
+                        "placement_candidate_stale",
+                        f"{action_name} candidate belongs to an older observation revision",
+                    )
                 expected_candidate_id = _placement_candidate_id(
                     action_name,
                     target,
@@ -723,6 +1134,7 @@ class RawPlacementService:
                     base_timeout_game_loops=self.effect_timeout_game_loops,
                 )
             ),
+            attempt_ordinal=(None if attempt_ordinal is None else int(attempt_ordinal)),
         )
         self._command_targets[command_id] = reservation
         self._record_transition(
@@ -751,8 +1163,36 @@ class RawPlacementService:
         world_target: tuple[float, float] | None,
         failure_code: str = "invalid_terrain",
         game_loop: int | None = None,
-    ) -> None:
+        operation_id: str | None = None,
+        attempt_ordinal: int | None = None,
+        builder_tag: int | None = None,
+        placement_revision: str | None = None,
+        target_state_revision: str | None = None,
+        failure_classification: str | None = None,
+        classification_basis: Sequence[str] = (),
+        target_side_evidence: bool = False,
+        builder_ready: bool = False,
+        observation_revision: str | None = None,
+        observation: Any | None = None,
+    ) -> RawPlacementNoStartDecision | None:
         placement = self._command_targets.get(command_id)
+        operation_id = operation_id or (None if placement is None else placement.operation_id)
+        attempt_ordinal = (
+            attempt_ordinal
+            if attempt_ordinal is not None
+            else (None if placement is None else placement.attempt_ordinal)
+        )
+        builder_tag = (
+            builder_tag
+            if builder_tag is not None
+            else (None if placement is None else placement.builder_tag)
+        )
+        placement_revision = placement_revision or (
+            None if placement is None else placement.placement_revision
+        )
+        target_state_revision = target_state_revision or (
+            None if placement is None else placement.target_state_revision
+        )
         target = None if placement is None else placement.world_target
         anchor = None if placement is None else placement.anchor_tag
         if target is None and world_target is not None:
@@ -762,6 +1202,15 @@ class RawPlacementService:
                 anchor = _tag_argument(requested_arguments, action_name=action_name)
             except RawPlacementFailure:
                 anchor = None
+        if observation is not None and target is not None:
+            self.observe(observation, require_feature_visibility=False)
+            target_state_revision = self._target_state_revision(
+                observation,
+                action_name,
+                target,
+                anchor_tag=anchor,
+            )
+            observation_revision = _placement_revision(observation)
         permanent_spatial_codes = {
             "blocked",
             "invalid_terrain",
@@ -769,28 +1218,63 @@ class RawPlacementService:
             "not_pathable",
             "placement_occupied",
         }
-        retryable_spatial_codes = {
-            "build_started_effect_missing",
-            "no_build_start_evidence",
-            "no_legal_placement",
-            "pysc2_rejected",
-        }
+        retryable_spatial_codes = {"no_legal_placement"}
+        classification = None if failure_classification is None else str(failure_classification)
+        basis = tuple(str(item) for item in classification_basis)
+        target_side_evidence = target_side_evidence or self._target_side_evidence(
+            failure_code=failure_code,
+            failure_classification=classification,
+            classification_basis=basis,
+        )
+        temporary_suppression = target is not None and (
+            failure_code in retryable_spatial_codes
+            and classification
+            not in {
+                "builder_not_ready",
+                "gameplay_no_start_unknown",
+                "gameplay_effect_missing_after_start",
+            }
+            or target_side_evidence
+            and classification in {"dynamic_target_obstruction", "placement_invalid"}
+        )
+        no_start_decision: RawPlacementNoStartDecision | None = None
+        if failure_code == "no_build_start_evidence":
+            no_start_decision = self.record_no_start_failure(
+                operation_id=operation_id,
+                command_id=command_id,
+                failure_code=failure_code,
+                attempt_ordinal=attempt_ordinal,
+                builder_tag=builder_tag,
+                world_target=target,
+                placement_revision=placement_revision,
+                target_state_revision=target_state_revision,
+                failure_classification=classification,
+                classification_basis=basis,
+                target_side_evidence=target_side_evidence,
+                suppressed_target=temporary_suppression,
+                builder_ready=builder_ready,
+                observation_revision=observation_revision,
+            )
         transition_state = "released"
         failure_class = "nonspatial"
-        if target is not None and failure_code in permanent_spatial_codes:
+        if (
+            target is not None
+            and failure_code in permanent_spatial_codes
+            and classification != "dynamic_target_obstruction"
+            and (classification is None or target_side_evidence)
+        ):
             self.suppress_world_target(action_name, target, reason=failure_code)
             transition_state = "permanent_invalid"
             failure_class = "spatial_permanent"
-        elif target is not None and failure_code in retryable_spatial_codes:
+        elif temporary_suppression:
+            assert target is not None
             current_loop = 0 if game_loop is None else int(game_loop)
             self.suppress_world_target_temporarily(
                 action_name,
                 target,
                 expires_game_loop=current_loop + self.effect_timeout_game_loops,
                 reason=failure_code,
-                target_state_revision=(
-                    None if placement is None else placement.target_state_revision
-                ),
+                target_state_revision=target_state_revision,
                 anchor_tag=anchor,
             )
             transition_state = "temporary_suppressed"
@@ -809,11 +1293,68 @@ class RawPlacementService:
             previous_state=("unreserved" if placement is None else placement.placement_state),
             next_state=transition_state,
             failure_class=failure_class,
-            actor_failure=failure_code in {"builder_unavailable", "actor_not_available"},
+            actor_failure=failure_code in {"builder_unavailable", "actor_not_available"}
+            or classification == "builder_not_ready",
             game_loop=0 if game_loop is None else int(game_loop),
             release_reason=failure_code,
+            no_start_decision=no_start_decision,
         )
         self.release_command(command_id, record_transition=False)
+        return no_start_decision
+
+    @staticmethod
+    def _target_side_evidence(
+        *,
+        failure_code: str,
+        failure_classification: str | None,
+        classification_basis: Sequence[str],
+    ) -> bool:
+        if failure_classification in {
+            "builder_not_ready",
+            "gameplay_no_start_unknown",
+            "gameplay_effect_missing_after_start",
+        }:
+            return False
+        if failure_classification == "placement_invalid":
+            return True
+        if failure_classification == "dynamic_target_obstruction":
+            return any(
+                basis
+                in {
+                    "dynamic_unit_inside_footprint",
+                    "target_occupancy",
+                    "target_obstruction",
+                    "placement_occupied",
+                }
+                for basis in classification_basis
+            )
+        return failure_code in {
+            "blocked",
+            "invalid_terrain",
+            "invalid_expansion_anchor",
+            "not_pathable",
+            "placement_occupied",
+            "no_legal_placement",
+        }
+
+    @staticmethod
+    def _allows_target_state_reopen(
+        failure_classification: str | None,
+        *,
+        target_side_evidence: bool,
+        target_changed: bool,
+        builder_changed: bool,
+    ) -> bool:
+        if failure_classification in {"builder_not_ready", "gameplay_no_start_unknown"}:
+            return builder_changed or target_changed and target_side_evidence
+        if failure_classification in {
+            "dynamic_target_obstruction",
+            "placement_invalid",
+        }:
+            return target_changed and target_side_evidence
+        # Legacy callers have no classification.  Their target-state revision is
+        # the only available proof that retrying is meaningful.
+        return failure_classification is None and (target_changed or builder_changed)
 
     def suppress_anchor(self, tag: int) -> None:
         cluster = self._resource_cluster(int(tag))
@@ -825,6 +1366,8 @@ class RawPlacementService:
         placement = self._command_targets.get(command_id)
         if placement is None:
             return
+        if placement.operation_id is not None:
+            self.reset_operation_no_start(placement.operation_id, reason="effect_confirmed")
         if placement.anchor_tag is not None and any(
             townhall in placement.action_name for townhall in ("Nexus", "CommandCenter", "Hatchery")
         ):
@@ -870,6 +1413,8 @@ class RawPlacementService:
             expires_game_loop=max(placement.expires_game_loop, int(expires_game_loop)),
         )
         self._command_targets[command_id] = renewed
+        if placement.operation_id is not None:
+            self.reset_operation_no_start(placement.operation_id, reason="build_started")
         if placement.placement_state == "reserved":
             self._record_transition(
                 command_id,
@@ -1056,6 +1601,7 @@ class RawPlacementService:
         failure_class: str | None = None,
         actor_failure: bool = False,
         release_reason: str | None = None,
+        no_start_decision: RawPlacementNoStartDecision | None = None,
     ) -> None:
         from rtscortex_llm_pysc2.extractor import BUILD_SPECS
 
@@ -1090,7 +1636,7 @@ class RawPlacementService:
             ).hexdigest()
         )
         resolved_loop = self._resolved_transition_loop(reservation_id, game_loop)
-        transition = {
+        transition: dict[str, Any] = {
             "reservation_id": reservation_id,
             "structure_type": spec.target_structure,
             "footprint_cells": sorted(cells),
@@ -1103,6 +1649,8 @@ class RawPlacementService:
         }
         if reservation is not None:
             transition["target_state_revision"] = reservation.target_state_revision
+        if no_start_decision is not None:
+            transition["placement_no_start"] = no_start_decision.to_dict()
         self._transition_sequence += 1
         transition_id = (
             "placement-transition:"
@@ -1184,7 +1732,9 @@ class RawPlacementService:
         occupied = [
             unit
             for unit in _value(observation, "raw_units", ())
-            if int(_value(unit, "alliance", 0)) in {1, 2, 4} and _build_progress(unit) > 0.0
+            if int(_value(unit, "alliance", 0)) in {1, 2, 4}
+            and int(_value(unit, "display_type", 1)) == 1
+            and _build_progress(unit) > 0.0
         ]
         candidates: list[tuple[float, float, int, int]] = []
         for y in range(math.floor(center[1] - 12), math.ceil(center[1] + 12) + 1):
@@ -1270,6 +1820,13 @@ class RawPlacementService:
             "action_name": action_name,
             "world_target": [float(target[0]), float(target[1])],
             "occupants": occupants,
+            "dynamic_target_state": _dynamic_target_state(
+                observation,
+                cells,
+                target,
+                anchor_tag=anchor_tag,
+                unit_names=self.unit_names,
+            ),
             "exact_world_legal": exact_world_legal,
             "resource_presence": [
                 [
@@ -1317,6 +1874,7 @@ class RawPlacementService:
         )
         occupied_cluster = any(
             int(_value(unit, "alliance", 0)) in {1, 2, 4}
+            and int(_value(unit, "display_type", 1)) == 1
             and _unit_name(unit, self.unit_names).casefold()
             in {
                 "commandcenter",
@@ -1392,6 +1950,7 @@ class RawPlacementService:
             unit
             for unit in _value(observation, "raw_units", ())
             if int(_value(unit, "alliance", 0)) == 1
+            and int(_value(unit, "display_type", 1)) == 1
             and _unit_name(unit, self.unit_names).casefold()
             in {
                 "commandcenter",
@@ -1566,6 +2125,71 @@ def _game_loop(observation: Any) -> int:
     if isinstance(value, (list, tuple)):
         value = value[0] if value else 0
     return int(value)
+
+
+def _dynamic_target_state(
+    observation: Any,
+    footprint_cells: Collection[tuple[int, int]],
+    target: tuple[float, float],
+    *,
+    anchor_tag: int | None,
+    unit_names: Mapping[int, str],
+) -> list[list[Any]]:
+    """Return stable ground-blocker and nearby-enemy evidence for one target."""
+
+    footprint = set(footprint_cells)
+    state: list[list[Any]] = []
+    for unit in _value(observation, "raw_units", ()):
+        tag = int(_value(unit, "tag", 0))
+        alliance = int(_value(unit, "alliance", 0))
+        if (
+            tag <= 0
+            or tag == anchor_tag
+            or alliance not in {1, 2, 3, 4}
+            or int(_value(unit, "display_type", 1)) != 1
+        ):
+            continue
+        name = _unit_name(unit, unit_names)
+        if (
+            _is_resource(name)
+            or bool(_value(unit, "is_structure", False))
+            or bool(_value(unit, "is_flying", False))
+        ):
+            continue
+        position = (
+            float(_value(unit, "x", 0.0)),
+            float(_value(unit, "y", 0.0)),
+        )
+        radius = max(0.0, float(_value(unit, "radius", 0.5)))
+        footprint_blocker = _circle_intersects_cells(position, radius, footprint)
+        nearby_enemy = alliance == 4 and math.dist(position, target) <= 8.0 + radius
+        if not footprint_blocker and not nearby_enemy:
+            continue
+        state.append(
+            [
+                tag,
+                alliance,
+                name,
+                round(position[0] * 2.0) / 2.0,
+                round(position[1] * 2.0) / 2.0,
+                round(radius, 2),
+                "footprint" if footprint_blocker else "threat",
+            ]
+        )
+    return sorted(state, key=lambda item: (item[0], item[6]))
+
+
+def _circle_intersects_cells(
+    position: tuple[float, float],
+    radius: float,
+    cells: Collection[tuple[int, int]],
+) -> bool:
+    for cell_x, cell_y in cells:
+        nearest_x = min(max(position[0], cell_x - 0.5), cell_x + 0.5)
+        nearest_y = min(max(position[1], cell_y - 0.5), cell_y + 0.5)
+        if math.dist(position, (nearest_x, nearest_y)) <= radius:
+            return True
+    return False
 
 
 def _placement_revision(observation: Any) -> str:

@@ -71,6 +71,7 @@ from rtscortex_llm_pysc2.worker import (
     _semantic_target_failure,
     _should_block_gas_rebalance,
     _suppress_pending_build_control_action,
+    _sync_raw_team_membership,
     _translate_persistent_expansion_camera_primitive,
     _translate_worker_owned_zero_argument_primitive,
     _translated_build_position,
@@ -1652,6 +1653,55 @@ def test_builder_never_rebinds_to_selected_gas_worker() -> None:
     assert _rebind_builder_to_selected_worker(main_agent, observation) is False
     assert builder.team_unit_tag_curr == 10
     assert team["unit_tags"] == [10]
+
+
+def test_raw_builder_rebind_prefers_a_live_probe_when_route_tag_is_stale() -> None:
+    team = {"name": "Builder-Probe-1", "unit_type": [84], "unit_tags": [10]}
+    builder = SimpleNamespace(
+        teams=[team],
+        team_unit_tag_curr=10,
+        team_unit_team_curr="Builder-Probe-1",
+        team_unit_tag_list=[10],
+        team_unit_team_list=["Builder-Probe-1"],
+    )
+    main_agent = SimpleNamespace(agents={"Builder": builder})
+    fresh_probe = SimpleNamespace(
+        tag=30,
+        unit_type=84,
+        alliance=1,
+        build_progress=100,
+        order_length=0,
+        display_type=1,
+    )
+    snapshot_probe = SimpleNamespace(
+        tag=20,
+        unit_type=84,
+        alliance=1,
+        build_progress=100,
+        order_length=0,
+        display_type=2,
+    )
+    busy_probe = SimpleNamespace(
+        tag=10,
+        unit_type=84,
+        alliance=1,
+        build_progress=100,
+        order_length=1,
+        order_id_0=35,
+        active=1,
+    )
+
+    _sync_raw_team_membership(
+        main_agent,
+        SimpleNamespace(
+            raw_units=[busy_probe, snapshot_probe, fresh_probe],
+            feature_units=[],
+        ),
+    )
+
+    assert team["unit_tags"] == [30]
+    assert builder.team_unit_tag_curr == 30
+    assert builder.team_unit_tag_list == [30]
 
 
 def test_zerg_builder_refreshes_a_consumed_drone_from_mineral_workers() -> None:

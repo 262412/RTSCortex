@@ -210,6 +210,7 @@ class ExecutionTracker:
             "command_id": tracked.command.command_id,
             "operation_id": tracked.command.operation_id,
             "attempt_id": tracked.command.attempt_id,
+            "attempt_ordinal": tracked.command.attempt_ordinal,
             "action_name": tracked.command.name,
             "actor": tracked.command.actor,
             "source": tracked.command.source,

@@ -877,6 +877,155 @@ def test_build_effect_times_out_with_diagnostic_evidence() -> None:
     assert "primitive did not establish construction" in reason
 
 
+def test_no_start_timeout_classifies_stale_builder_order() -> None:
+    verifier = ActionEffectVerifier(timeout_game_loops=10)
+    command = RoutedCommand(
+        command_id="command-gateway-after-pylon",
+        actor="Builder/Builder-Probe-1",
+        team_name="Builder-Probe-1",
+        name="Build_Gateway_Screen",
+        source="planner",
+        requested_arguments=([65, 65],),
+        resolved_arguments=([65, 65],),
+        rendered_action="<Build_Gateway_Screen([65,65])>",
+    )
+    verifier.track(command)
+    verifier.prepare(
+        command.command_id,
+        _observation(game_loop=100, minerals=250, builder_orders=[35]),
+        0xABC,
+    )
+    verifier.accept_primitive(command.command_id, game_loop=101)
+
+    verdict = verifier.observe(_observation(game_loop=111, minerals=250, builder_orders=[35]))[0]
+
+    assert verdict.failure_code == "no_build_start_evidence"
+    assert verdict.evidence is not None
+    assert verdict.evidence["failure_classification"] == "builder_not_ready"
+    assert verdict.evidence["baseline_builder_orders"] == [35]
+    assert verdict.evidence["classification_basis"] == ["builder_had_prior_build_order"]
+
+
+def test_no_start_timeout_classifies_dynamic_target_obstruction() -> None:
+    verifier = ActionEffectVerifier(timeout_game_loops=10)
+    command = _build_command()
+    baseline = _observation(game_loop=100, minerals=250, builder_orders=[])
+    verifier.track(command)
+    verifier.prepare(command.command_id, baseline, 0xABC)
+    verifier.accept_primitive(command.command_id, game_loop=101)
+
+    obstructed = _observation(game_loop=111, minerals=250, builder_orders=[])
+    obstructed["raw_units"].append(
+        {
+            "tag": 0xBAD,
+            "unit_type": "Zergling",
+            "alliance": 4,
+            "x": 31.875,
+            "y": 30.0,
+            "radius": 0.375,
+            "health": 35,
+            "health_max": 35,
+            "display_type": 1,
+        }
+    )
+
+    verdict = verifier.observe(obstructed)[0]
+
+    assert verdict.failure_code == "no_build_start_evidence"
+    assert verdict.evidence is not None
+    assert verdict.evidence["failure_classification"] == "dynamic_target_obstruction"
+    assert verdict.evidence["classification_basis"] == ["dynamic_unit_inside_footprint"]
+    assert verdict.evidence["nearby_enemy_units"] == ["0xbad"]
+
+
+def test_no_start_timeout_does_not_call_nearby_corner_unit_a_footprint_blocker() -> None:
+    verifier = ActionEffectVerifier(timeout_game_loops=10)
+    command = _build_command()
+    verifier.track(command)
+    verifier.prepare(
+        command.command_id,
+        _observation(game_loop=100, minerals=250, builder_orders=[]),
+        0xABC,
+    )
+    verifier.accept_primitive(command.command_id, game_loop=101)
+
+    obstructed = _observation(game_loop=111, minerals=250, builder_orders=[])
+    obstructed["raw_units"].append(
+        {
+            "tag": 0xBAD,
+            "unit_type": "Zergling",
+            "alliance": 4,
+            "x": 32.65,
+            "y": 30.77,
+            "radius": 0.1,
+            "health": 35,
+            "health_max": 35,
+            "display_type": 1,
+        }
+    )
+
+    verdict = verifier.observe(obstructed)[0]
+
+    assert verdict.failure_code == "no_build_start_evidence"
+    assert verdict.evidence is not None
+    assert verdict.evidence["failure_classification"] == "gameplay_no_start_unknown"
+    assert verdict.evidence["nearby_dynamic_occupants"] == []
+    assert verdict.evidence["nearby_enemy_units"] == ["0xbad"]
+
+
+def test_no_start_timeout_ignores_snapshot_enemy_as_dynamic_evidence() -> None:
+    verifier = ActionEffectVerifier(timeout_game_loops=10)
+    command = _build_command()
+    verifier.track(command)
+    verifier.prepare(
+        command.command_id,
+        _observation(game_loop=100, minerals=250, builder_orders=[]),
+        0xABC,
+    )
+    verifier.accept_primitive(command.command_id, game_loop=101)
+
+    snapshot = _observation(game_loop=111, minerals=250, builder_orders=[])
+    snapshot["raw_units"].append(
+        {
+            "tag": 0xBAD,
+            "unit_type": "Zergling",
+            "alliance": 4,
+            "display_type": 2,
+            "x": 31.875,
+            "y": 30.0,
+            "radius": 0.375,
+            "health": 35,
+            "health_max": 35,
+        }
+    )
+
+    verdict = verifier.observe(snapshot)[0]
+
+    assert verdict.evidence is not None
+    assert verdict.evidence["failure_classification"] == "gameplay_no_start_unknown"
+    assert verdict.evidence["nearby_dynamic_occupants"] == []
+    assert verdict.evidence["nearby_enemy_units"] == []
+
+
+def test_no_start_timeout_without_specific_evidence_stays_unknown() -> None:
+    verifier = ActionEffectVerifier(timeout_game_loops=10)
+    command = _build_command()
+    verifier.track(command)
+    verifier.prepare(
+        command.command_id,
+        _observation(game_loop=100, minerals=250, builder_orders=[]),
+        0xABC,
+    )
+    verifier.accept_primitive(command.command_id, game_loop=101)
+
+    verdict = verifier.observe(_observation(game_loop=111, minerals=250, builder_orders=[]))[0]
+
+    assert verdict.failure_code == "no_build_start_evidence"
+    assert verdict.evidence is not None
+    assert verdict.evidence["failure_classification"] == "gameplay_no_start_unknown"
+    assert verdict.evidence["classification_basis"] == ["no_authoritative_rejection_evidence"]
+
+
 def test_build_effect_diagnostic_identifies_replaced_worker_order() -> None:
     verifier = ActionEffectVerifier(timeout_game_loops=10)
     command = _build_command()

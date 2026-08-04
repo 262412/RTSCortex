@@ -205,6 +205,7 @@ class ActionCommand(ContractModel):
     command_id: str
     operation_id: str | None = Field(default=None, pattern=r"^operation:[0-9a-f]{64}$")
     attempt_id: str | None = Field(default=None, pattern=r"^attempt:[0-9a-f]{64}$")
+    attempt_ordinal: int | None = Field(default=None, ge=0)
     actor: str
     name: str
     arguments: list[Any] = Field(default_factory=list)
@@ -257,6 +258,26 @@ class PrimitiveTraceEntry(ContractModel):
     )
 
 
+class PlacementNoStartEvidence(ContractModel):
+    """Auditable operation-level disposition for an accepted build that never started."""
+
+    operation_id: str | None = None
+    command_id: str = Field(min_length=1)
+    failure_code: str = Field(min_length=1)
+    status: Literal["retry", "defer_replan", "duplicate", "reset"]
+    streak: int = Field(ge=0)
+    threshold: int = Field(ge=1)
+    circuit_open: bool
+    duplicate_attempt: bool
+    suppressed_target: bool
+    target_side_evidence: bool
+    next_action: str = Field(min_length=1)
+    attempt_ordinal: int | None = Field(default=None, ge=0)
+    failure_classification: str | None = None
+    classification_basis: list[str] = Field(default_factory=list)
+    evidence: dict[str, Any] = Field(default_factory=dict)
+
+
 class PlacementLedgerTransition(ContractModel):
     reservation_id: str = Field(min_length=1)
     structure_type: str = Field(min_length=1)
@@ -268,6 +289,7 @@ class PlacementLedgerTransition(ContractModel):
     game_loop: int = Field(ge=0)
     release_reason: str | None = None
     target_state_revision: str | None = None
+    placement_no_start: PlacementNoStartEvidence | None = None
 
 
 class PlacementLedgerEvent(ContractModel):
@@ -326,6 +348,27 @@ class EffectEvidence(ContractModel):
     occupied_grid_cells: list[tuple[int, int]] = Field(default_factory=list)
     placement_ledger_transitions: list[PlacementLedgerTransition] = Field(default_factory=list)
     baseline_builder_orders: list[int] = Field(default_factory=list)
+    failure_classification: (
+        Literal[
+            "builder_not_ready",
+            "dynamic_target_obstruction",
+            "placement_invalid",
+            "gameplay_no_start_unknown",
+            "gameplay_effect_missing_after_start",
+        ]
+        | None
+    ) = None
+    classification_basis: list[str] = Field(default_factory=list)
+    nearby_enemy_units: list[str] = Field(default_factory=list)
+    nearby_dynamic_occupants: list[str] = Field(default_factory=list)
+    builder_status: str | None = None
+    baseline_builder_status: str | None = None
+    builder_alliance: int | None = None
+    builder_health: float | None = Field(default=None, ge=0)
+    builder_health_max: float | None = Field(default=None, ge=0)
+    observation_revision: str | None = None
+    failure_observation_revision: str | None = None
+    placement_query_result: str | None = None
     requested_producer_tag: str | None = None
     producer_tag: str | None = None
     producer_type: str | None = None
@@ -425,6 +468,7 @@ class ExecutionReport(ContractModel):
     command_id: str
     operation_id: str | None = Field(default=None, pattern=r"^operation:[0-9a-f]{64}$")
     attempt_id: str | None = Field(default=None, pattern=r"^attempt:[0-9a-f]{64}$")
+    attempt_ordinal: int | None = Field(default=None, ge=0)
     success: bool
     action_name: str | None = None
     actor: str | None = None

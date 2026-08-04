@@ -25,6 +25,7 @@ class RoutedCommand:
     episode_id: str = ""
     operation_id: str | None = None
     attempt_id: str | None = None
+    attempt_ordinal: int | None = None
     source: str = "planner"
     requested_arguments: tuple[Any, ...] = ()
     resolved_arguments: tuple[Any, ...] = ()
@@ -48,6 +49,8 @@ class RoutedCommand:
             payload["operation_id"] = self.operation_id
         if self.attempt_id is not None:
             payload["attempt_id"] = self.attempt_id
+        if self.attempt_ordinal is not None:
+            payload["attempt_ordinal"] = self.attempt_ordinal
         if self.screen_world_target is not None:
             payload["screen_world_target"] = list(self.screen_world_target)
         if self.screen_anchor_tag is not None:
@@ -138,6 +141,11 @@ class ActionRouter:
                     ),
                     attempt_id=(
                         None if command.get("attempt_id") is None else str(command["attempt_id"])
+                    ),
+                    attempt_ordinal=(
+                        None
+                        if command.get("attempt_ordinal") is None
+                        else int(command["attempt_ordinal"])
                     ),
                     actor=actor,
                     team_name=team_name,

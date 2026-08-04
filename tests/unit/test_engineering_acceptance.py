@@ -161,6 +161,207 @@ def test_zero_build_exposure_is_not_reported_as_full_coverage(tmp_path: Path) ->
     assert report["metrics"]["build_failure_rate"] is None
 
 
+def test_semantic_build_diagnostics_join_command_lifecycle_and_raw_placement_payloads(
+    tmp_path: Path,
+) -> None:
+    events = [
+        _semantic_build_dispatch(
+            1,
+            command_id="build-a1",
+            operation_id="operation:a",
+            attempt_id="attempt:a1",
+            status="dispatched",
+        ),
+        _semantic_build_transition(
+            2,
+            command_id="build-a1",
+            operation_id="operation:a",
+            target_state_revision="revision:a",
+            next_state="temporary_suppressed",
+            failure_class="spatial_retryable",
+            operation_circuit_open=True,
+        ),
+        _semantic_build_execution(
+            3,
+            command_id="build-a1",
+            operation_id="operation:a",
+            attempt_id="attempt:a1",
+            status="failed",
+            failure_code="no_build_start_evidence",
+            failure_classification="dynamic_target_obstruction",
+        ),
+        _semantic_build_dispatch(
+            4,
+            command_id="build-a2",
+            operation_id="operation:a",
+            attempt_id="attempt:a2",
+            status="dispatched",
+        ),
+        _semantic_build_transition(
+            5,
+            command_id="build-a2",
+            operation_id="operation:a",
+            target_state_revision="revision:b",
+            next_state="occupied",
+        ),
+        _semantic_build_execution(
+            6,
+            command_id="build-a2",
+            operation_id="operation:a",
+            attempt_id="attempt:a2",
+            status="succeeded",
+        ),
+        _semantic_build_dispatch(
+            7,
+            command_id="build-b1",
+            operation_id="operation:b",
+            attempt_id="attempt:b1",
+            status="dispatched",
+        ),
+        _semantic_build_transition(
+            8,
+            command_id="build-b1",
+            operation_id="operation:b",
+            target_state_revision="revision:c",
+            next_state="released",
+            failure_class="nonspatial",
+        ),
+        _semantic_build_execution(
+            9,
+            command_id="build-b1",
+            operation_id="operation:b",
+            attempt_id="attempt:b1",
+            status="failed",
+            failure_code="builder_unavailable",
+            failure_classification="builder_not_ready",
+        ),
+    ]
+
+    report = build_engineering_gate_report(
+        events,
+        run_dir=tmp_path,
+        natural_run_baseline_bytes_per_loop=100.0,
+    )
+
+    diagnostics = report["diagnostics"]
+    assert diagnostics["semantic_build_operation_max_failure_streak"] == 1
+    assert diagnostics["semantic_build_circuit_breaker_count"] == 1
+    assert diagnostics["semantic_build_cross_revision_retry_count"] == 1
+    assert diagnostics["semantic_build_failure_classification"] == {
+        "builder_not_ready": 1,
+        "dynamic_target_obstruction": 1,
+    }
+    assert diagnostics["semantic_build_operations"]["operation:a"] == {
+        "accepted_attempt_count": 2,
+        "no_start_failure_count": 1,
+        "max_no_start_failure_streak": 1,
+        "circuit_breaker_count": 1,
+        "cross_revision_retry_count": 1,
+        "failure_classification": {"dynamic_target_obstruction": 1},
+    }
+    assert diagnostics["semantic_build_operations"]["operation:b"] == {
+        "accepted_attempt_count": 1,
+        "no_start_failure_count": 0,
+        "max_no_start_failure_streak": 0,
+        "circuit_breaker_count": 0,
+        "cross_revision_retry_count": 0,
+        "failure_classification": {"builder_not_ready": 1},
+    }
+    assert report["gates"]["semantic_build_failure_streak_bounded"]["passed"] is True
+
+
+def test_semantic_build_failure_streak_gate_fails_closed_above_bound(tmp_path: Path) -> None:
+    events = []
+    for event_id in range(1, 5):
+        command_id = f"build-{event_id}"
+        events.extend(
+            [
+                _semantic_build_dispatch(
+                    event_id * 3 - 2,
+                    command_id=command_id,
+                    operation_id="operation:streak",
+                    attempt_id=f"attempt:s{event_id}",
+                    status="dispatched",
+                ),
+                _semantic_build_execution(
+                    event_id * 3 - 1,
+                    command_id=command_id,
+                    operation_id="operation:streak",
+                    attempt_id=f"attempt:s{event_id}",
+                    status="failed",
+                    failure_code="no_build_start_evidence",
+                ),
+            ]
+        )
+
+    report = build_engineering_gate_report(
+        events,
+        run_dir=tmp_path,
+        natural_run_baseline_bytes_per_loop=100.0,
+    )
+
+    assert report["diagnostics"]["semantic_build_operation_max_failure_streak"] == 4
+    assert report["gates"]["semantic_build_failure_streak_bounded"]["passed"] is False
+
+
+def test_semantic_build_streak_ignores_pre_dispatch_rejections(tmp_path: Path) -> None:
+    events = [
+        _semantic_build_execution(
+            event_id,
+            command_id=f"pre-dispatch-{event_id}",
+            operation_id="operation:pre-dispatch",
+            attempt_id=f"attempt:pre-{event_id}",
+            status="failed",
+            failure_code="builder_not_ready",
+            execution_stage="pre_dispatch",
+        )
+        for event_id in range(1, 5)
+    ]
+    events.append(
+        _semantic_build_execution(
+            5,
+            command_id="accepted-build",
+            operation_id="operation:pre-dispatch",
+            attempt_id="attempt:accepted",
+            status="succeeded",
+        )
+    )
+
+    report = build_engineering_gate_report(
+        events,
+        run_dir=tmp_path,
+        natural_run_baseline_bytes_per_loop=100.0,
+    )
+
+    assert report["diagnostics"]["semantic_build_operation_max_failure_streak"] == 0
+    assert report["gates"]["semantic_build_failure_streak_bounded"]["passed"] is True
+
+
+def test_build_started_effect_missing_is_not_a_no_start_streak(tmp_path: Path) -> None:
+    events = [
+        _semantic_build_execution(
+            1,
+            command_id="started-but-missing",
+            operation_id="operation:started",
+            attempt_id="attempt:started",
+            status="failed",
+            failure_code="build_started_effect_missing",
+            failure_classification="gameplay_effect_missing_after_start",
+        )
+    ]
+
+    report = build_engineering_gate_report(
+        events,
+        run_dir=tmp_path,
+        natural_run_baseline_bytes_per_loop=100.0,
+    )
+
+    assert report["diagnostics"]["semantic_build_operation_max_failure_streak"] == 0
+    assert report["diagnostics"]["semantic_build_failure_classification"] == {
+        "gameplay_effect_missing_after_start": 1
+    }
+
+
 def test_missing_recovery_evidence_does_not_pass_recovery_gate(tmp_path: Path) -> None:
     report = build_engineering_gate_report(
         [],
@@ -488,6 +689,97 @@ def _attack_dispatch(
                 "name": "Attack_Unit",
                 "actor": actor,
                 "arguments": ["0xdead"],
+            },
+        },
+    )
+
+
+def _semantic_build_dispatch(
+    event_id: int,
+    *,
+    command_id: str,
+    operation_id: str,
+    attempt_id: str,
+    status: str,
+) -> StoredEvent:
+    return _event(
+        event_id,
+        "command_lifecycle",
+        {
+            "status": status,
+            "command": {
+                "command_id": command_id,
+                "operation_id": operation_id,
+                "attempt_id": attempt_id,
+                "name": "Build_Pylon_Screen",
+                "actor": "Builder/Builder-Probe-1",
+                "arguments": [[20, 20]],
+            },
+        },
+    )
+
+
+def _semantic_build_transition(
+    event_id: int,
+    *,
+    command_id: str,
+    operation_id: str,
+    target_state_revision: str,
+    next_state: str,
+    failure_class: str | None = None,
+    operation_circuit_open: bool = False,
+) -> StoredEvent:
+    return _event(
+        event_id,
+        "placement_ledger_transition",
+        {
+            "command_id": command_id,
+            "action_name": "Build_Pylon_Screen",
+            "transition_id": f"placement-transition:{event_id:064x}",
+            "transition": {
+                "reservation_id": f"placement:{command_id}",
+                "structure_type": "Pylon",
+                "footprint_cells": [[19, 19], [19, 20], [20, 19], [20, 20]],
+                "previous_state": "reserved",
+                "next_state": next_state,
+                "failure_class": failure_class,
+                "game_loop": event_id,
+                "target_state_revision": target_state_revision,
+                "operation_circuit_open": operation_circuit_open,
+            },
+            "operation_id": operation_id,
+            "operation_circuit_open": operation_circuit_open,
+        },
+    )
+
+
+def _semantic_build_execution(
+    event_id: int,
+    *,
+    command_id: str,
+    operation_id: str,
+    attempt_id: str,
+    status: str,
+    failure_code: str | None = None,
+    failure_classification: str | None = None,
+    execution_stage: str = "effect_verification",
+) -> StoredEvent:
+    return _event(
+        event_id,
+        "execution",
+        {
+            "command_id": command_id,
+            "operation_id": operation_id,
+            "attempt_id": attempt_id,
+            "action_name": "Build_Pylon_Screen",
+            "status": status,
+            "failure_code": failure_code,
+            "execution_stage": execution_stage,
+            "effect_evidence": {
+                "effect_kind": "build",
+                "reservation_id": f"placement:{command_id}",
+                "failure_class": None,
+                "failure_classification": failure_classification,
             },
         },
     )

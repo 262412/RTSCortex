@@ -23,6 +23,7 @@ from rtscortex_llm_pysc2.effect_verifier import (
     ActionEffectVerifier,
 )
 from rtscortex_llm_pysc2.extractor import (
+    BUILD_RAW_FUNCTION_IDS,
     BUILD_SPECS,
     MINIMAP_POINT_ACTIONS,
     SCREEN_POINT_ACTIONS,
@@ -1674,6 +1675,7 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
             unit_names=unit_names,
             placement_service=placement_service,
         )
+        self._rtscortex_raw_dispatch_diagnostic_snapshot: dict[str, Any] = {}
         self.raw_decision_scheduler = RawDecisionScheduler()
         self._rtscortex_accept_visible_team_unit = True
         self._rtscortex_exact_single_unit_selection = True
@@ -1904,6 +1906,9 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
 
         with self.runtime_client.profiler.measure("raw_translate_dispatch"):
             dispatch = self.raw_executor.next_dispatch(obs.observation, self.agents)
+        self._rtscortex_raw_dispatch_diagnostic_snapshot = dict(
+            self.raw_executor.diagnostic_snapshot
+        )
         if dispatch is not None:
             resolved = list(dispatch.resolved_arguments)
             if resolved:
@@ -2865,6 +2870,40 @@ def _raw_mineral_assignment_choice(
 def _normalized_worker_build_progress(unit: Any) -> float:
     value = float(_observation_value(unit, "build_progress", 0.0))
     return value / 100.0 if value > 1.0 else value
+
+
+def _raw_builder_ready(unit: Any) -> bool:
+    """Return whether one observed worker can receive a raw build now."""
+
+    if (
+        int(_observation_value(unit, "alliance", 0)) != 1
+        or float(_observation_value(unit, "health", 1.0)) <= 0
+        or _normalized_worker_build_progress(unit) < 1.0
+        or int(_observation_value(unit, "display_type", 1)) != 1
+    ):
+        return False
+    order_ids: set[int] = set()
+    order_length = max(4, int(_observation_value(unit, "order_length", 0)))
+    for index in range(order_length):
+        order_id = int(_observation_value(unit, f"order_id_{index}", 0))
+        if order_id > 0:
+            order_ids.add(order_id)
+    orders = _observation_value(unit, "orders", ())
+    if isinstance(orders, Mapping):
+        orders = (orders,)
+    for order in orders or ():
+        order_id = int(
+            order.get("ability_id", order.get("abilityId", order.get("order_id", 0)))
+            if isinstance(order, Mapping)
+            else getattr(
+                order,
+                "ability_id",
+                getattr(order, "abilityId", getattr(order, "order_id", 0)),
+            )
+        )
+        if order_id > 0:
+            order_ids.add(order_id)
+    return not order_ids.intersection(BUILD_RAW_FUNCTION_IDS.values())
 
 
 def _worker_camera_position(main_agent: Any, unit: Any) -> tuple[int, int]:
@@ -5191,6 +5230,7 @@ def _sync_raw_team_membership(main_agent: Any, observation: Any) -> None:
         and int(_observation_value(unit, "tag", 0)) > 0
         and _normalized_worker_build_progress(unit) >= 1.0
     ]
+    raw_by_tag = {int(_observation_value(unit, "tag", 0)): unit for unit in raw_units}
     by_type: dict[int, list[int]] = {}
     for unit in raw_units:
         by_type.setdefault(int(_observation_value(unit, "unit_type", 0)), []).append(
@@ -5223,9 +5263,16 @@ def _sync_raw_team_membership(main_agent: Any, observation: Any) -> None:
             existing = [int(tag) for tag in (team.get("unit_tags") or ()) if int(tag) in candidates]
             if agent_name == "Builder":
                 eligible = [tag for tag in candidates if tag not in gas_worker_tags]
-                visible = [tag for tag in eligible if tag in on_screen_tags]
-                retained = [tag for tag in existing if tag in visible]
-                candidates = retained[:1] or visible[:1] or eligible[:1]
+                ready = [tag for tag in eligible if _raw_builder_ready(raw_by_tag[tag])]
+                visible_ready = [tag for tag in ready if tag in on_screen_tags]
+                if visible_ready:
+                    candidates = visible_ready[:1]
+                elif ready:
+                    candidates = ready[:1]
+                else:
+                    visible = [tag for tag in eligible if tag in on_screen_tags]
+                    retained = [tag for tag in existing if tag in visible]
+                    candidates = retained[:1] or visible[:1] or eligible[:1]
             team["unit_tags"] = candidates
             team["unit_tags_selected"] = list(candidates)
             if candidates:
@@ -5239,8 +5286,12 @@ def _sync_raw_team_membership(main_agent: Any, observation: Any) -> None:
         agent.team_unit_tag_list = observed_tags
         agent.team_unit_team_list = observed_teams
         agent.team_unit_obs_list = []
-        agent.team_unit_tag_curr = None
-        agent.team_unit_team_curr = None
+        if agent_name == "Builder" and observed_tags:
+            agent.team_unit_tag_curr = observed_tags[0]
+            agent.team_unit_team_curr = observed_teams[0]
+        else:
+            agent.team_unit_tag_curr = None
+            agent.team_unit_team_curr = None
         agent.enable = has_actor
 
 

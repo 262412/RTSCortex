@@ -168,6 +168,78 @@ def test_qualification_evidence_reaches_engineering_report_call_path(
     }
 
 
+def test_semantic_build_gate_is_serialized_by_run_report_writer(tmp_path: Path) -> None:
+    expected_git_sha = "d" * 40
+    run_dir = tmp_path / "semantic-build"
+    operation_id = "operation:" + "a" * 64
+    attempt_id = "attempt:" + "b" * 64
+    _write_journal(
+        run_dir,
+        [
+            _event(
+                1,
+                "command_lifecycle",
+                {
+                    "status": "dispatched",
+                    "command": {
+                        "command_id": "build-1",
+                        "operation_id": operation_id,
+                        "attempt_id": attempt_id,
+                        "actor": "Builder/Builder-Probe-1",
+                        "name": "Build_Pylon_Screen",
+                        "arguments": [[20, 20]],
+                        "created_game_loop": 0,
+                        "source": "planner",
+                    },
+                },
+            ),
+            _event(
+                2,
+                "execution",
+                {
+                    "protocol_version": "1.1",
+                    "run_id": "live-run",
+                    "episode_id": "episode-0",
+                    "step_id": 0,
+                    "command_id": "build-1",
+                    "operation_id": operation_id,
+                    "attempt_id": attempt_id,
+                    "action_name": "Build_Pylon_Screen",
+                    "actor": "Builder/Builder-Probe-1",
+                    "source": "planner",
+                    "requested_arguments": [[20, 20]],
+                    "resolved_arguments": [[20, 20]],
+                    "success": False,
+                    "status": "failed",
+                    "execution_stage": "effect_verification",
+                    "failure_code": "no_build_start_evidence",
+                    "effect_evidence": {
+                        "effect_kind": "build",
+                        "failure_classification": "gameplay_no_start_unknown",
+                        "classification_basis": ["no_authoritative_rejection_evidence"],
+                    },
+                },
+            ),
+        ],
+    )
+    manifest = _qualification_evidence(
+        tmp_path,
+        expected_git_sha=expected_git_sha,
+    )
+
+    artifacts = write_run_reports(
+        run_dir,
+        qualification_evidence_path=manifest,
+    )
+    report = json.loads(artifacts.engineering_gates_path.read_text(encoding="utf-8"))
+
+    assert report["diagnostics"]["semantic_build_operation_max_failure_streak"] == 1
+    assert report["diagnostics"]["semantic_build_failure_classification"] == {
+        "gameplay_no_start_unknown": 1
+    }
+    assert report["gates"]["semantic_build_failure_streak_bounded"]["passed"] is True
+
+
 def test_diagnostic_manifest_cannot_populate_formal_engineering_evidence(
     tmp_path: Path,
 ) -> None:

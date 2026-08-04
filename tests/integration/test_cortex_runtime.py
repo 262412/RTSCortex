@@ -849,6 +849,7 @@ def test_rejected_materialization_does_not_consume_dispatch_attempt_ordinal(
     dispatched = runtime._bind_dispatch_attempt(accepted)
 
     assert dispatched.lineage.attempt_ordinal == 0
+    assert dispatched.command.attempt_ordinal == 0
     assert dispatched.command.attempt_id == dispatched.lineage.attempt_id
     assert runtime._attempt_ordinals[operation_id] == 1
     asyncio.run(runtime.close())

@@ -1312,7 +1312,13 @@ class RuntimeEngine:
             and status is CommandStatus.DISPATCHED
             and current.command.attempt_id is None
             and command.attempt_id is not None
-            and current.command.model_copy(update={"attempt_id": command.attempt_id}) == command
+            and current.command.model_copy(
+                update={
+                    "attempt_id": command.attempt_id,
+                    "attempt_ordinal": command.attempt_ordinal,
+                }
+            )
+            == command
         )
         if current is not None and current.command != command and not dispatch_attempt_binding:
             raise RuntimeError(

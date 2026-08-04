@@ -12,6 +12,8 @@ from rtscortex_llm_pysc2.effect_lifecycle import (
 from rtscortex_llm_pysc2.raw_placement import (
     RawPlacementFailure,
     RawPlacementService,
+    _placement_candidate_id,
+    _placement_revision,
 )
 
 
@@ -171,6 +173,8 @@ def test_geyser_no_start_requires_state_change_before_one_bounded_retry() -> Non
         world_target=None,
         failure_code="no_build_start_evidence",
         game_loop=212,
+        failure_classification="dynamic_target_obstruction",
+        classification_basis=("dynamic_unit_inside_footprint",),
     )
 
     unchanged = _gas_observation(
@@ -208,8 +212,419 @@ def test_geyser_no_start_requires_state_change_before_one_bounded_retry() -> Non
         world_target=None,
         failure_code="no_build_start_evidence",
         game_loop=514,
+        failure_classification="dynamic_target_obstruction",
+        classification_basis=("dynamic_unit_inside_footprint",),
     )
     assert service.candidates(revalidated, "Build_Assimilator_Near").argument_candidates == []
+
+
+def test_operation_no_start_streak_spans_target_revision_command_and_builder() -> None:
+    service = RawPlacementService(unit_names={}, no_start_streak_threshold=3)
+    operation_id = "operation:placement-streak"
+    decisions = []
+    for ordinal in range(3):
+        decision = service.quarantine_command(
+            command_id=f"no-start-{ordinal}",
+            action_name="Build_Pylon_Screen",
+            requested_arguments=([64 + ordinal, 64 + ordinal],),
+            world_target=(22.0 + ordinal, 24.0 + ordinal),
+            failure_code="no_build_start_evidence",
+            game_loop=100 + ordinal,
+            operation_id=operation_id,
+            attempt_ordinal=ordinal,
+            builder_tag=0xB1 + ordinal,
+            placement_revision=f"placement-{ordinal}",
+            target_state_revision=f"target-{ordinal}",
+        )
+        assert decision is not None
+        decisions.append(decision)
+
+    assert [decision.status for decision in decisions] == ["retry", "retry", "defer_replan"]
+    assert decisions[-1].circuit_open is True
+    assert decisions[-1].streak == 3
+    assert all(decision.suppressed_target is False for decision in decisions)
+    state = service.operation_no_start_state(operation_id)
+    assert state is not None and state.streak == 3
+    assert service.is_quarantined("Build_Pylon_Screen", (22.0, 24.0)) is False
+
+
+def test_successful_build_start_resets_operation_no_start_streak() -> None:
+    service = RawPlacementService(unit_names={})
+    operation_id = "operation:placement-reset"
+    service.quarantine_command(
+        command_id="no-start-before-reset",
+        action_name="Build_Pylon_Screen",
+        requested_arguments=([64, 64],),
+        world_target=(22.0, 24.0),
+        failure_code="no_build_start_evidence",
+        game_loop=100,
+        operation_id=operation_id,
+        attempt_ordinal=0,
+        target_state_revision="target-0",
+    )
+
+    service.resolve(
+        command_id="start-after-reset",
+        action_name="Build_Pylon_Screen",
+        requested_arguments=([64, 64],),
+        observation=SimpleNamespace(
+            raw_units=[],
+            feature_units=[],
+            feature_screen=None,
+            game_loop=[200],
+        ),
+        world_target=(22.0, 24.0),
+        operation_id=operation_id,
+        attempt_ordinal=1,
+    )
+    service.mark_build_started("start-after-reset", game_loop=210, expires_game_loop=500)
+
+    state = service.operation_no_start_state(operation_id)
+    assert state is not None
+    assert state.streak == 0
+    assert state.circuit_open is False
+    assert state.last_status == "reset"
+
+
+def test_historical_attempt_ordinal_does_not_increment_no_start_streak() -> None:
+    service = RawPlacementService(unit_names={}, no_start_streak_threshold=2)
+    operation_id = "operation:placement-history"
+    first = service.quarantine_command(
+        command_id="attempt-four",
+        action_name="Build_Pylon_Screen",
+        requested_arguments=([64, 64],),
+        world_target=(22.0, 24.0),
+        failure_code="no_build_start_evidence",
+        game_loop=100,
+        operation_id=operation_id,
+        attempt_ordinal=4,
+    )
+    replay = service.quarantine_command(
+        command_id="replayed-attempt-four",
+        action_name="Build_Pylon_Screen",
+        requested_arguments=([70, 70],),
+        world_target=(30.0, 30.0),
+        failure_code="no_build_start_evidence",
+        game_loop=200,
+        operation_id=operation_id,
+        attempt_ordinal=4,
+    )
+    historical = service.quarantine_command(
+        command_id="historical-attempt-three",
+        action_name="Build_Pylon_Screen",
+        requested_arguments=([72, 72],),
+        world_target=(32.0, 32.0),
+        failure_code="no_build_start_evidence",
+        game_loop=300,
+        operation_id=operation_id,
+        attempt_ordinal=3,
+    )
+
+    assert first is not None
+    assert replay is not None
+    assert historical is not None
+    assert first.streak == 1
+    assert replay.duplicate_attempt is True
+    assert historical.duplicate_attempt is True
+    assert replay.streak == historical.streak == 1
+    assert replay.circuit_open is historical.circuit_open is False
+
+
+def test_no_start_circuit_reopens_only_after_real_target_state_change() -> None:
+    service = RawPlacementService(unit_names={}, no_start_streak_threshold=2)
+    operation_id = "operation:placement-retry"
+    for ordinal in range(2):
+        service.quarantine_command(
+            command_id=f"blocked-{ordinal}",
+            action_name="Build_Pylon_Screen",
+            requested_arguments=([64, 64],),
+            world_target=(22.0 + ordinal, 24.0),
+            failure_code="no_build_start_evidence",
+            game_loop=100 + ordinal,
+            operation_id=operation_id,
+            attempt_ordinal=ordinal,
+            target_state_revision="unchanged",
+            failure_classification="dynamic_target_obstruction",
+            classification_basis=("dynamic_unit_inside_footprint",),
+        )
+
+    assert (
+        service.operation_retry_allowed(
+            operation_id,
+            world_target=(23.0, 24.0),
+            target_state_revision="unchanged",
+        )
+        is False
+    )
+    assert (
+        service.operation_retry_allowed(
+            operation_id,
+            world_target=(40.0, 40.0),
+            target_state_revision="changed",
+            failure_classification="dynamic_target_obstruction",
+            target_side_evidence=True,
+        )
+        is False
+    )
+    assert (
+        service.operation_retry_allowed(
+            operation_id,
+            world_target=(23.0, 24.0),
+            target_state_revision="changed",
+            failure_classification="dynamic_target_obstruction",
+            target_side_evidence=True,
+        )
+        is True
+    )
+    state = service.operation_no_start_state(operation_id)
+    assert state is not None and state.circuit_open is False
+
+    retried = service.quarantine_command(
+        command_id="after-change",
+        action_name="Build_Pylon_Screen",
+        requested_arguments=([80, 80],),
+        world_target=(40.0, 40.0),
+        failure_code="no_build_start_evidence",
+        game_loop=300,
+        operation_id=operation_id,
+        attempt_ordinal=2,
+        target_state_revision="changed",
+        failure_classification="dynamic_target_obstruction",
+        classification_basis=("dynamic_unit_inside_footprint",),
+    )
+    assert retried is not None
+    assert retried.status == "defer_replan"
+    assert retried.circuit_open is True
+    assert retried.evidence["operation_id"] == operation_id
+    assert retried.evidence["streak"] == 3
+
+
+def test_no_start_circuit_reopens_for_fresh_ready_builder() -> None:
+    service = RawPlacementService(unit_names={}, no_start_streak_threshold=3)
+    operation_id = "operation:builder-refresh"
+    for ordinal in range(3):
+        service.quarantine_command(
+            command_id=f"builder-attempt-{ordinal}",
+            action_name="Build_Pylon_Screen",
+            requested_arguments=([64, 64],),
+            world_target=(22.0, 24.0),
+            failure_code="no_build_start_evidence",
+            game_loop=100 + ordinal,
+            operation_id=operation_id,
+            attempt_ordinal=ordinal,
+            builder_tag=0xB1,
+            placement_revision="dispatch-observation",
+            target_state_revision="target-0",
+            failure_classification="builder_not_ready",
+            classification_basis=("builder_unavailable_after_dispatch",),
+            observation_revision="failure-observation",
+        )
+
+    assert (
+        service.operation_retry_allowed(
+            operation_id,
+            builder_tag=0xB2,
+            builder_ready=True,
+            observation_revision="failure-observation",
+        )
+        is False
+    )
+    assert (
+        service.operation_retry_allowed(
+            operation_id,
+            builder_tag=0xB2,
+            builder_ready=True,
+            observation_revision="newer-observation",
+        )
+        is True
+    )
+    state = service.operation_no_start_state(operation_id)
+    assert state is not None
+    assert state.circuit_open is False
+
+
+def test_dynamic_circuit_reopens_when_same_target_obstruction_state_changes() -> None:
+    service = RawPlacementService(
+        unit_names={9: "Zergling"},
+        no_start_streak_threshold=1,
+    )
+    operation_id = "operation:dynamic-refresh"
+    target = (22.0, 24.0)
+    blocked = SimpleNamespace(
+        raw_units=[_unit(0xE1, 9, alliance=4, x=22.0, y=24.0)],
+        feature_units=[],
+        game_loop=[100],
+    )
+    service.observe(blocked, require_feature_visibility=False)
+    blocked_revision = service._target_state_revision(  # noqa: SLF001
+        blocked,
+        "Build_Pylon_Screen",
+        target,
+        anchor_tag=None,
+    )
+    decision = service.record_no_start_failure(
+        operation_id=operation_id,
+        command_id="dynamic-blocked",
+        attempt_ordinal=0,
+        builder_tag=0xB1,
+        world_target=target,
+        placement_revision="observation-100",
+        target_state_revision=blocked_revision,
+        failure_classification="dynamic_target_obstruction",
+        classification_basis=("dynamic_unit_inside_footprint",),
+        target_side_evidence=True,
+    )
+    assert decision.circuit_open is True
+
+    cleared = SimpleNamespace(raw_units=[], feature_units=[], game_loop=[101])
+    service.observe(cleared, require_feature_visibility=False)
+    cleared_revision = service._target_state_revision(  # noqa: SLF001
+        cleared,
+        "Build_Pylon_Screen",
+        target,
+        anchor_tag=None,
+    )
+    assert cleared_revision != blocked_revision
+    assert (
+        service.operation_retry_allowed(
+            operation_id,
+            world_target=target,
+            target_state_revision=cleared_revision,
+        )
+        is True
+    )
+
+
+def test_dynamic_suppression_binds_failure_observation_not_dispatch_snapshot() -> None:
+    service = RawPlacementService(unit_names={9: "Zergling"})
+    target = (22.0, 24.0)
+    blocked = SimpleNamespace(
+        raw_units=[_unit(0xE1, 9, alliance=4, x=22.0, y=24.0)],
+        feature_units=[],
+        game_loop=[212],
+    )
+    service.observe(blocked, require_feature_visibility=False)
+    service.quarantine_command(
+        command_id="dynamic-failure-observation",
+        action_name="Build_Pylon_Screen",
+        requested_arguments=([64, 64],),
+        world_target=target,
+        failure_code="no_build_start_evidence",
+        game_loop=212,
+        operation_id="operation:dynamic-observation",
+        attempt_ordinal=0,
+        failure_classification="dynamic_target_obstruction",
+        classification_basis=("dynamic_unit_inside_footprint",),
+        observation=blocked,
+    )
+
+    unchanged = SimpleNamespace(
+        raw_units=[_unit(0xE1, 9, alliance=4, x=22.0, y=24.0)],
+        feature_units=[],
+        game_loop=[213],
+    )
+    assert (
+        service.is_quarantined(
+            "Build_Pylon_Screen",
+            target,
+            game_loop=213,
+            observation=unchanged,
+        )
+        is True
+    )
+
+    cleared = SimpleNamespace(raw_units=[], feature_units=[], game_loop=[214])
+    assert (
+        service.is_quarantined(
+            "Build_Pylon_Screen",
+            target,
+            game_loop=214,
+            observation=cleared,
+        )
+        is False
+    )
+
+
+def test_classification_controls_target_suppression() -> None:
+    service = RawPlacementService(unit_names={})
+    target = (22.0, 24.0)
+    unknown = service.quarantine_command(
+        command_id="unknown-no-start",
+        action_name="Build_Pylon_Screen",
+        requested_arguments=([64, 64],),
+        world_target=target,
+        failure_code="no_build_start_evidence",
+        operation_id="operation:unknown",
+        attempt_ordinal=0,
+        failure_classification="gameplay_no_start_unknown",
+        classification_basis=("no_authoritative_rejection_evidence",),
+    )
+    assert unknown is not None and unknown.suppressed_target is False
+    assert not service.is_quarantined("Build_Pylon_Screen", target)
+
+    dynamic = service.quarantine_command(
+        command_id="dynamic-no-start",
+        action_name="Build_Pylon_Screen",
+        requested_arguments=([64, 64],),
+        world_target=(30.0, 30.0),
+        failure_code="no_build_start_evidence",
+        operation_id="operation:dynamic",
+        attempt_ordinal=0,
+        target_state_revision="target-0",
+        failure_classification="dynamic_target_obstruction",
+        classification_basis=("dynamic_unit_inside_footprint",),
+    )
+    assert dynamic is not None and dynamic.suppressed_target is True
+    assert service.is_quarantined("Build_Pylon_Screen", (30.0, 30.0))
+
+
+def test_builder_and_freshness_failures_do_not_quarantine_target() -> None:
+    service = RawPlacementService(unit_names={})
+    target = (22.0, 24.0)
+    for code in ("builder_unavailable", "stale_observation"):
+        service.quarantine_command(
+            command_id=code,
+            action_name="Build_Pylon_Screen",
+            requested_arguments=([64, 64],),
+            world_target=target,
+            failure_code=code,
+            game_loop=100,
+            operation_id="operation:attribution",
+            attempt_ordinal=0 if code == "builder_unavailable" else 1,
+        )
+
+    assert service.is_quarantined("Build_Pylon_Screen", target) is False
+
+
+def test_snapshot_structure_does_not_count_as_current_footprint_occupancy() -> None:
+    service = RawPlacementService(unit_names={60: "Pylon"})
+    target = (22.0, 24.0)
+    observation = SimpleNamespace(
+        raw_units=[
+            SimpleNamespace(
+                tag=0xC1,
+                unit_type=60,
+                alliance=4,
+                display_type=2,
+                build_progress=100,
+                x=22.0,
+                y=24.0,
+            )
+        ],
+        feature_units=[],
+        game_loop=[100],
+    )
+
+    service.observe(observation, require_feature_visibility=False)
+
+    assert (
+        service.is_quarantined(
+            "Build_Pylon_Screen",
+            target,
+            observation=observation,
+        )
+        is False
+    )
 
 
 def test_same_pylon_failure_does_not_expire_without_target_state_change() -> None:
@@ -239,7 +654,7 @@ def test_same_pylon_failure_does_not_expire_without_target_state_change() -> Non
     )
     later_same_state = SimpleNamespace(**{**vars(observation), "game_loop": [500]})
 
-    assert service.is_quarantined(
+    assert not service.is_quarantined(
         "Build_Pylon_Screen",
         (22.0, 24.0),
         game_loop=500,
@@ -402,6 +817,7 @@ def test_builder_approach_does_not_route_through_dynamic_structure_occupancy() -
         builder_tags=(0xB1,),
     )
 
+    assert reachable is not None
     assert (6, 8) in reachable
     assert (8, 8) not in reachable
 
@@ -501,6 +917,48 @@ def test_raw_placement_service_rejects_dispatch_time_relocation(
             preferred_anchor_tag=0xB1,
             builder_tags=(0xB1,),
         )
+
+
+def test_raw_placement_rejects_candidate_from_older_observation_revision() -> None:
+    service = RawPlacementService(unit_names={2: "Probe"})
+    target = (22.25, 24.5)
+    first = SimpleNamespace(
+        raw_units=[_unit(0xB1, 2, alliance=1, x=20, y=20)],
+        feature_units=[],
+        feature_screen=None,
+        game_loop=[100],
+    )
+    candidate_revision = _placement_revision(first)
+    candidate_id = _placement_candidate_id(
+        "Build_Pylon_Screen",
+        target,
+        0xB1,
+        candidate_revision,
+        2,
+        False,
+    )
+    newer = SimpleNamespace(
+        raw_units=first.raw_units,
+        feature_units=[],
+        feature_screen=None,
+        game_loop=[101],
+    )
+
+    with pytest.raises(RawPlacementFailure) as stale:
+        service.resolve(
+            command_id="older-placement-candidate",
+            action_name="Build_Pylon_Screen",
+            requested_arguments=([64, 64],),
+            observation=newer,
+            world_target=target,
+            preferred_anchor_tag=0xB1,
+            builder_tags=(0xB1,),
+            builder_tag=0xB1,
+            placement_candidate_id=candidate_id,
+            candidate_placement_revision=candidate_revision,
+        )
+
+    assert stale.value.code == "placement_candidate_stale"
 
 
 def test_builder_lease_is_exact_and_released_at_terminal() -> None:

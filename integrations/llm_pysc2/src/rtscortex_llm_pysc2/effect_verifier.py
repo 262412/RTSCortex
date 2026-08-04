@@ -22,7 +22,13 @@ from rtscortex_llm_pysc2.inject_effect_verifier import InjectEffectVerifier
 from rtscortex_llm_pysc2.morph_effect_verifier import MorphEffectVerifier
 from rtscortex_llm_pysc2.mule_effect_verifier import MuleEffectVerifier
 from rtscortex_llm_pysc2.production_effect_verifier import ProductionEffectVerifier
-from rtscortex_llm_pysc2.raw_placement import RawPlacementReservation, RawPlacementService
+from rtscortex_llm_pysc2.raw_placement import (
+    RawPlacementReservation,
+    RawPlacementService,
+    _circle_intersects_cells,
+    _occupied_cells_for_spec,
+    _placement_revision,
+)
 from rtscortex_llm_pysc2.research_effect_verifier import ResearchEffectVerifier
 from rtscortex_llm_pysc2.routing import RoutedCommand
 
@@ -40,19 +46,32 @@ MOVE_ORDER_ACQUISITION_TIMEOUT_GAME_LOOPS = 16
 @dataclass(frozen=True)
 class _BuilderEvidence:
     tag: int
+    alliance: int
     status: str
     orders: tuple[int, ...]
     selected: bool
     position: tuple[float, float]
+    health: float
+    health_max: float
+
+
+@dataclass(frozen=True)
+class _DynamicUnitEvidence:
+    tag: int
+    alliance: int
+    position: tuple[float, float]
+    radius: float
 
 
 @dataclass(frozen=True)
 class _Evidence:
     game_loop: int
+    observation_revision: str
     structures: tuple[_StructureEvidence, ...]
     occupants: tuple[tuple[int, tuple[float, float]], ...]
     minerals: int
     builder: Optional[_BuilderEvidence]
+    dynamic_units: tuple[_DynamicUnitEvidence, ...]
 
 
 @dataclass(frozen=True)
@@ -442,13 +461,28 @@ class ActionEffectVerifier:
                 failure_code = self._timeout_code(pending, current)
                 evidence = self._effect_evidence(pending, current, None)
                 if self.placement_service is not None:
+                    reservation = pending.reservation_snapshot
                     self.placement_service.quarantine_command(
                         command_id=command_id,
                         action_name=pending.command.name,
                         requested_arguments=pending.command.requested_arguments,
-                        world_target=pending.command.screen_world_target,
+                        world_target=pending.target_position,
                         failure_code=failure_code,
                         game_loop=current.game_loop,
+                        operation_id=pending.command.operation_id,
+                        attempt_ordinal=(
+                            None if reservation is None else reservation.attempt_ordinal
+                        ),
+                        builder_tag=pending.builder_tag,
+                        placement_revision=(
+                            None if reservation is None else reservation.placement_revision
+                        ),
+                        target_state_revision=(
+                            None if reservation is None else reservation.target_state_revision
+                        ),
+                        failure_classification=evidence.get("failure_classification"),
+                        classification_basis=evidence.get("classification_basis", ()),
+                        observation=observation,
                     )
                 verdicts.append(
                     EffectVerdict(
@@ -695,6 +729,7 @@ class ActionEffectVerifier:
             raise ValueError("raw SC2 observation has no player data")
         return _Evidence(
             game_loop=_game_loop(observation),
+            observation_revision=_placement_revision(observation),
             structures=tuple(
                 _StructureEvidence(
                     tag=int(_value(unit, "tag", 0)),
@@ -720,6 +755,25 @@ class ActionEffectVerifier:
             ),
             minerals=int(_value(player, "minerals", 0)),
             builder=None if builder is None else _builder_evidence(builder),
+            dynamic_units=tuple(
+                _DynamicUnitEvidence(
+                    tag=int(_value(unit, "tag", 0)),
+                    alliance=int(_value(unit, "alliance", 0)),
+                    position=(
+                        float(_value(unit, "x", 0.0)),
+                        float(_value(unit, "y", 0.0)),
+                    ),
+                    radius=max(0.0, float(_value(unit, "radius", 0.5))),
+                )
+                for unit in raw_units
+                if int(_value(unit, "tag", 0)) > 0
+                and int(_value(unit, "tag", 0)) != pending.builder_tag
+                and int(_value(unit, "tag", 0)) != pending.target_tag
+                and int(_value(unit, "display_type", 1)) == 1
+                and not bool(_value(unit, "is_structure", False))
+                and not bool(_value(unit, "is_flying", False))
+                and not _is_resource_name(self._unit_name(unit))
+            ),
         )
 
     def _unit_name(self, unit: Any) -> str:
@@ -907,6 +961,13 @@ class ActionEffectVerifier:
     ) -> dict[str, Any]:
         baseline = pending.baseline
         reservation = pending.reservation_snapshot
+        failure_classification, classification_basis = self._failure_classification(
+            pending,
+            current,
+            structure,
+        )
+        nearby_units = self._nearby_dynamic_units(pending, current)
+        nearby_enemies = self._nearby_enemy_units(pending, current)
         return {
             "effect_kind": "build",
             "target_type": pending.target_structure,
@@ -934,8 +995,24 @@ class ActionEffectVerifier:
                 [] if reservation is None else sorted(reservation.occupied_grid_cells)
             ),
             "baseline_builder_orders": (
-                [] if reservation is None else list(reservation.baseline_builder_orders)
+                list(baseline.builder.orders)
+                if baseline is not None and baseline.builder is not None
+                else []
             ),
+            "failure_classification": failure_classification,
+            "classification_basis": classification_basis,
+            "nearby_enemy_units": [hex(unit.tag) for unit in nearby_enemies],
+            "nearby_dynamic_occupants": [hex(unit.tag) for unit in nearby_units],
+            "builder_status": (None if current.builder is None else current.builder.status),
+            "baseline_builder_status": (
+                None if baseline is None or baseline.builder is None else baseline.builder.status
+            ),
+            "builder_alliance": (None if current.builder is None else current.builder.alliance),
+            "builder_health": (None if current.builder is None else current.builder.health),
+            "builder_health_max": (None if current.builder is None else current.builder.health_max),
+            "observation_revision": (None if baseline is None else baseline.observation_revision),
+            "failure_observation_revision": current.observation_revision,
+            "placement_query_result": "unavailable_no_controller_access",
             "baseline_structure_tags": (
                 [] if baseline is None else [hex(item.tag) for item in baseline.structures]
             ),
@@ -989,6 +1066,90 @@ class ActionEffectVerifier:
                 "new_structure" if structure is not None else pending.build_start_confirmation_kind
             ),
         }
+
+    def _failure_classification(
+        self,
+        pending: _PendingBuild,
+        current: _Evidence,
+        structure: Optional[_StructureEvidence],
+    ) -> tuple[str | None, list[str]]:
+        if structure is not None:
+            return None, []
+        if pending.build_started:
+            return "gameplay_effect_missing_after_start", ["build_start_evidence_without_structure"]
+        baseline_builder = None if pending.baseline is None else pending.baseline.builder
+        if baseline_builder is None:
+            return "builder_not_ready", ["builder_missing_at_dispatch"]
+        if baseline_builder.alliance != 1:
+            return "builder_not_ready", ["builder_not_owned_at_dispatch"]
+        if baseline_builder.health <= 0 or current.builder is None:
+            return "builder_not_ready", ["builder_unavailable_after_dispatch"]
+        build_order_ids = frozenset(BUILD_RAW_FUNCTION_IDS.values())
+        if build_order_ids.intersection(baseline_builder.orders):
+            return "builder_not_ready", ["builder_had_prior_build_order"]
+        if self._nearby_dynamic_units(pending, current):
+            return "dynamic_target_obstruction", ["dynamic_unit_inside_footprint"]
+        if self._nearby_enemy_units(pending, current):
+            return "gameplay_no_start_unknown", [
+                "nearby_enemy_threat_without_target_obstruction",
+                "no_authoritative_rejection_evidence",
+            ]
+        return "gameplay_no_start_unknown", ["no_authoritative_rejection_evidence"]
+
+    @staticmethod
+    def _nearby_dynamic_units(
+        pending: _PendingBuild,
+        current: _Evidence,
+    ) -> tuple[_DynamicUnitEvidence, ...]:
+        target = pending.target_position
+        if target is None:
+            return ()
+        spec = BUILD_SPECS.get(pending.command.name)
+        if pending.reservation_snapshot is not None:
+            footprint_cells = pending.reservation_snapshot.occupied_grid_cells
+        elif spec is not None:
+            footprint_cells = _occupied_cells_for_spec(target, spec)
+        else:
+            return ()
+        candidates = (
+            (*pending.baseline.dynamic_units, *current.dynamic_units)
+            if pending.baseline is not None
+            else current.dynamic_units
+        )
+        by_tag: dict[int, _DynamicUnitEvidence] = {}
+        for unit in candidates:
+            if _circle_intersects_cells(unit.position, unit.radius, footprint_cells):
+                by_tag[unit.tag] = unit
+        return tuple(by_tag[tag] for tag in sorted(by_tag))
+
+    @staticmethod
+    def _nearby_enemy_units(
+        pending: _PendingBuild,
+        current: _Evidence,
+    ) -> tuple[_DynamicUnitEvidence, ...]:
+        anchors = [pending.target_position]
+        if pending.baseline is not None and pending.baseline.builder is not None:
+            anchors.append(pending.baseline.builder.position)
+        if current.builder is not None:
+            anchors.append(current.builder.position)
+        positions = [anchor for anchor in anchors if anchor is not None]
+        if not positions:
+            return ()
+        candidates = (
+            (*pending.baseline.dynamic_units, *current.dynamic_units)
+            if pending.baseline is not None
+            else current.dynamic_units
+        )
+        by_tag = {
+            unit.tag: unit
+            for unit in candidates
+            if unit.alliance == 4
+            and any(
+                _position_distance(unit.position, anchor) <= 8.0 + unit.radius
+                for anchor in positions
+            )
+        }
+        return tuple(by_tag[tag] for tag in sorted(by_tag))
 
     def _confirm_build_started(
         self,
@@ -1186,6 +1347,7 @@ def _builder_evidence(unit: Any) -> _BuilderEvidence:
     orders = _unit_orders(unit)
     return _BuilderEvidence(
         tag=int(_value(unit, "tag", 0)),
+        alliance=int(_value(unit, "alliance", 0)),
         status="active" if int(_value(unit, "order_length", len(orders))) > 0 else "idle",
         orders=orders,
         selected=bool(_value(unit, "is_selected", False)),
@@ -1193,6 +1355,8 @@ def _builder_evidence(unit: Any) -> _BuilderEvidence:
             float(_value(unit, "x", 0.0)),
             float(_value(unit, "y", 0.0)),
         ),
+        health=float(_value(unit, "health", 1.0)),
+        health_max=float(_value(unit, "health_max", 1.0)),
     )
 
 

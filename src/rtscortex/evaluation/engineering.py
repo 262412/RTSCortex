@@ -16,6 +16,7 @@ from rtscortex.placement import (
 )
 
 ENGINEERING_GATES_FILENAME = "engineering-gates.json"
+SEMANTIC_BUILD_FAILURE_STREAK_LIMIT = 3
 REQUIRED_ENGINEERING_GATES = (
     "runtime_crash_zero",
     "friendly_target_zero",
@@ -26,6 +27,7 @@ REQUIRED_ENGINEERING_GATES = (
     "build_start_coverage",
     "build_confirmation_rate",
     "build_failure_rate",
+    "semantic_build_failure_streak_bounded",
     "placement_identity_complete",
     "builder_provenance_complete",
     "builder_lease_complete",
@@ -201,6 +203,7 @@ def build_engineering_gate_report(
         event.payload for event in retained if event.event_type == "defense_inventory_evaluated"
     ]
     defense_audit = _defense_inventory_audit(defense_evaluations)
+    semantic_build_audit = _semantic_build_operation_audit(retained)
     performance = _last_payload(retained, "event_store_performance")
     recovery_events = [
         event.payload for event in retained if event.event_type == "runtime_recovery_completed"
@@ -271,6 +274,11 @@ def build_engineering_gate_report(
         "build_start_coverage": _ratio_or_none(build_started, build_count),
         "build_confirmation_rate": _ratio_or_none(build_confirmed, build_count),
         "build_failure_rate": _ratio_or_none(build_failures, build_count),
+        "semantic_build_failure_streak_bounded": (
+            None
+            if semantic_build_audit["operation_count"] == 0
+            else semantic_build_audit["max_failure_streak"] <= SEMANTIC_BUILD_FAILURE_STREAK_LIMIT
+        ),
         "placement_identity_complete": (
             None if build_count == 0 else placement_complete == build_count
         ),
@@ -353,6 +361,17 @@ def build_engineering_gate_report(
             "build_start_count": build_started,
             "build_confirmed_count": build_confirmed,
             "build_failure_count": build_failures,
+            "semantic_build_operation_count": semantic_build_audit["operation_count"],
+            "semantic_build_failure_count": semantic_build_audit["failure_count"],
+            "semantic_build_operation_max_failure_streak": semantic_build_audit[
+                "max_failure_streak"
+            ],
+            "semantic_build_circuit_breaker_count": semantic_build_audit["circuit_breaker_count"],
+            "semantic_build_cross_revision_retry_count": semantic_build_audit[
+                "cross_revision_retry_count"
+            ],
+            "semantic_build_failure_classification": semantic_build_audit["failure_classification"],
+            "semantic_build_operations": semantic_build_audit["operations"],
             **ledger,
             "repeated_retreat_arrival_count": retreat_repeats,
             "unchanged_attack_redispatch_count": unchanged_attacks,
@@ -403,6 +422,377 @@ def _thresholds() -> dict[str, tuple[str, bool | int | float]]:
         }
     )
     return thresholds
+
+
+_SEMANTIC_BUILD_FAILURE_STATUSES = frozenset({"failed", "unconfirmed", "cancelled"})
+_SEMANTIC_BUILD_CLASSIFICATION_KEYS = (
+    "failure_classification",
+    "semantic_failure_classification",
+    "classification",
+)
+_SEMANTIC_BUILD_OPERATION_KEYS = (
+    "operation_id",
+    "semantic_operation_id",
+    "operation_key",
+    "operation",
+)
+_SEMANTIC_BUILD_REVISION_KEYS = (
+    "target_state_revision",
+    "placement_revision",
+    "observation_revision",
+    "revision",
+)
+
+
+def _semantic_build_operation_audit(events: Sequence[StoredEvent]) -> dict[str, Any]:
+    """Audit terminal semantic Build attempts across Runtime/Raw event shapes.
+
+    Runtime command lifecycle events carry the operation and attempt identity in a
+    nested command, while placement transitions may carry the revision and circuit
+    state in a nested ``transition`` object.  Execution reports are authoritative
+    when present; terminal lifecycle rows are used only for legacy journals that do
+    not contain an execution report.
+    """
+
+    ordered = sorted(events, key=lambda event: event.event_id)
+    transitions_by_command: defaultdict[str, list[dict[str, Any]]] = defaultdict(list)
+    command_metadata: dict[str, dict[str, Any]] = {}
+    terminal_execution_ids: set[str] = set()
+    terminal_attempts: dict[str, dict[str, Any]] = {}
+
+    for event in ordered:
+        payload = event.payload
+        if event.event_type == "placement_ledger_transition":
+            transition = _normalized_placement_transition(payload)
+            command_id = _string_value(payload.get("command_id")) or _string_value(
+                transition.get("command_id")
+            )
+            if (
+                command_id is not None
+                and _semantic_build_action_name(payload, transition) is not None
+            ):
+                transitions_by_command[command_id].append(transition)
+            continue
+
+        action_name = _semantic_build_action_name(payload)
+        command = payload.get("command")
+        command_payload = command if isinstance(command, dict) else {}
+        command_id = _string_value(payload.get("command_id")) or _string_value(
+            command_payload.get("command_id")
+        )
+        if action_name is None or command_id is None:
+            continue
+        metadata = dict(command_payload)
+        metadata.update(
+            {
+                key: value
+                for key, value in payload.items()
+                if key not in {"command", "effect_evidence"}
+            }
+        )
+        command_metadata[command_id] = metadata
+        if event.event_type != "execution":
+            continue
+        status = _semantic_build_terminal_status(payload)
+        if status is None:
+            continue
+        terminal_execution_ids.add(command_id)
+        terminal_attempts[command_id] = {
+            "event_id": event.event_id,
+            "command_id": command_id,
+            "payload": payload,
+            "metadata": metadata,
+            "status": status,
+            "gameplay_attempt": _pysc2_accepted(payload),
+        }
+
+    for event in ordered:
+        if event.event_type != "command_lifecycle":
+            continue
+        payload = event.payload
+        action_name = _semantic_build_action_name(payload)
+        command = payload.get("command")
+        command_payload = command if isinstance(command, dict) else {}
+        command_id = _string_value(payload.get("command_id")) or _string_value(
+            command_payload.get("command_id")
+        )
+        if action_name is None or command_id is None or command_id in terminal_execution_ids:
+            continue
+        status = _semantic_build_terminal_status(payload)
+        if status is None:
+            continue
+        metadata = command_metadata.get(command_id, dict(command_payload))
+        terminal_attempts[command_id] = {
+            "event_id": event.event_id,
+            "command_id": command_id,
+            "payload": payload,
+            "metadata": metadata,
+            "status": status,
+            "gameplay_attempt": False,
+        }
+
+    attempts_by_operation: defaultdict[str, list[dict[str, Any]]] = defaultdict(list)
+    circuit_command_ids: set[str] = set()
+    for attempt in sorted(terminal_attempts.values(), key=lambda item: item["event_id"]):
+        if not attempt["gameplay_attempt"]:
+            continue
+        command_id = attempt["command_id"]
+        payload = attempt["payload"]
+        metadata = attempt["metadata"]
+        transitions = transitions_by_command.get(command_id, [])
+        operation_id = _semantic_build_operation_id(payload, metadata, transitions, command_id)
+        revision = _semantic_build_revision(payload, metadata, transitions)
+        failure = attempt["status"] in _SEMANTIC_BUILD_FAILURE_STATUSES
+        failure_code = _string_value(payload.get("failure_code"))
+        no_start_failure = failure and failure_code == "no_build_start_evidence"
+        failure_classification = (
+            _semantic_build_failure_classification(payload, metadata, transitions)
+            if failure
+            else None
+        )
+        circuit_open = _semantic_build_circuit_open(payload, metadata, transitions)
+        if circuit_open:
+            circuit_command_ids.add(command_id)
+        attempts_by_operation[operation_id].append(
+            {
+                "event_id": attempt["event_id"],
+                "command_id": command_id,
+                "status": attempt["status"],
+                "failed": failure,
+                "no_start_failed": no_start_failure,
+                "failure_code": failure_code,
+                "revision": revision,
+                "failure_classification": failure_classification,
+                "circuit_open": circuit_open,
+            }
+        )
+
+    typed_circuit_command_ids: set[str] = set()
+    typed_circuit_event_count = 0
+    for event in ordered:
+        if event.event_type not in {
+            "operation_circuit_open",
+            "semantic_build_circuit_open",
+            "circuit_breaker_open",
+        }:
+            continue
+        payload = event.payload
+        command_id = _string_value(payload.get("command_id"))
+        if command_id is None:
+            typed_circuit_event_count += 1
+        else:
+            typed_circuit_command_ids.add(command_id)
+
+    max_failure_streak = 0
+    failure_count = 0
+    cross_revision_retry_count = 0
+    classification_counts: Counter[str] = Counter()
+    operation_diagnostics: dict[str, dict[str, Any]] = {}
+    for operation_id, attempts in sorted(attempts_by_operation.items()):
+        streak = 0
+        operation_max_streak = 0
+        operation_no_start_failures = 0
+        operation_classifications: Counter[str] = Counter()
+        for attempt in attempts:
+            if attempt["no_start_failed"]:
+                streak += 1
+                operation_no_start_failures += 1
+            else:
+                streak = 0
+            if attempt["failed"]:
+                failure_count += 1
+                classification = attempt["failure_classification"] or "unclassified"
+                classification_counts[classification] += 1
+                operation_classifications[classification] += 1
+            max_failure_streak = max(max_failure_streak, streak)
+            operation_max_streak = max(operation_max_streak, streak)
+        operation_cross_revision_retries = 0
+        for previous, current in zip(attempts, attempts[1:], strict=False):
+            if (
+                previous["failed"]
+                and previous["revision"] is not None
+                and current["revision"] is not None
+                and previous["revision"] != current["revision"]
+            ):
+                cross_revision_retry_count += 1
+                operation_cross_revision_retries += 1
+        operation_diagnostics[operation_id] = {
+            "accepted_attempt_count": len(attempts),
+            "no_start_failure_count": operation_no_start_failures,
+            "max_no_start_failure_streak": operation_max_streak,
+            "circuit_breaker_count": sum(attempt["circuit_open"] for attempt in attempts),
+            "cross_revision_retry_count": operation_cross_revision_retries,
+            "failure_classification": dict(sorted(operation_classifications.items())),
+        }
+
+    return {
+        "operation_count": len(attempts_by_operation),
+        "failure_count": failure_count,
+        "max_failure_streak": max_failure_streak,
+        "circuit_breaker_count": (
+            len(circuit_command_ids | typed_circuit_command_ids) + typed_circuit_event_count
+        ),
+        "cross_revision_retry_count": cross_revision_retry_count,
+        "failure_classification": dict(sorted(classification_counts.items())),
+        "operations": operation_diagnostics,
+    }
+
+
+def _semantic_build_action_name(
+    payload: dict[str, Any],
+    transition: dict[str, Any] | None = None,
+) -> str | None:
+    candidates: list[Any] = [
+        payload.get("action_name"),
+        payload.get("semantic_action"),
+        payload.get("action"),
+    ]
+    command = payload.get("command")
+    if isinstance(command, dict):
+        candidates.extend((command.get("name"), command.get("action_name")))
+    if transition is not None:
+        candidates.extend((transition.get("action_name"), transition.get("semantic_action")))
+    for value in candidates:
+        if not isinstance(value, str):
+            continue
+        normalized = value.replace("_", " ").replace("-", " ").strip().upper()
+        if value.startswith("Build_") or normalized.startswith("BUILD "):
+            return value
+    return None
+
+
+def _semantic_build_terminal_status(payload: dict[str, Any]) -> str | None:
+    status = payload.get("status")
+    if isinstance(status, str):
+        normalized = status.casefold()
+        if normalized == "succeeded" or normalized in _SEMANTIC_BUILD_FAILURE_STATUSES:
+            return normalized
+    if payload.get("success") is False or payload.get("failure_code") is not None:
+        return "failed"
+    return None
+
+
+def _semantic_build_operation_id(
+    payload: dict[str, Any],
+    metadata: dict[str, Any],
+    transitions: Sequence[dict[str, Any]],
+    command_id: str,
+) -> str:
+    for source in (payload, metadata, *_effect_evidence_sources(payload), *transitions):
+        for key in _SEMANTIC_BUILD_OPERATION_KEYS:
+            value = source.get(key)
+            if isinstance(value, str) and value:
+                return value
+    return f"command:{command_id}"
+
+
+def _semantic_build_revision(
+    payload: dict[str, Any],
+    metadata: dict[str, Any],
+    transitions: Sequence[dict[str, Any]],
+) -> str | None:
+    for source in (payload, metadata, *_effect_evidence_sources(payload), *transitions):
+        for key in _SEMANTIC_BUILD_REVISION_KEYS:
+            value = source.get(key)
+            if isinstance(value, str) and value:
+                return value
+    return None
+
+
+def _semantic_build_failure_classification(
+    payload: dict[str, Any],
+    metadata: dict[str, Any],
+    transitions: Sequence[dict[str, Any]],
+) -> str | None:
+    sources = (*_effect_evidence_sources(payload), payload, metadata, *transitions)
+    for source in sources:
+        for key in _SEMANTIC_BUILD_CLASSIFICATION_KEYS:
+            value = source.get(key)
+            if isinstance(value, str) and value:
+                return value
+    for source in sources:
+        legacy = source.get("failure_class")
+        if isinstance(legacy, str) and legacy:
+            return legacy
+    code = payload.get("failure_code")
+    if isinstance(code, str):
+        if code in {"builder_unavailable", "actor_not_available", "builder_not_observable"}:
+            return "builder_not_ready"
+        if code in _NEGATIVE_BUILD_EFFECT_CODES:
+            return "gameplay_no_start_unknown"
+    return None
+
+
+def _semantic_build_circuit_open(
+    payload: dict[str, Any],
+    metadata: dict[str, Any],
+    transitions: Sequence[dict[str, Any]],
+) -> bool:
+    for source in (payload, metadata, *transitions):
+        if source.get("operation_circuit_open") is True:
+            return True
+        placement_no_start = source.get("placement_no_start")
+        if isinstance(placement_no_start, dict) and placement_no_start.get("circuit_open") is True:
+            return True
+    return False
+
+
+def _effect_evidence_sources(payload: dict[str, Any]) -> tuple[dict[str, Any], ...]:
+    evidence = payload.get("effect_evidence")
+    return (evidence,) if isinstance(evidence, dict) else ()
+
+
+def _normalized_placement_transition(payload: dict[str, Any]) -> dict[str, Any]:
+    transition = payload.get("transition")
+    normalized = dict(transition) if isinstance(transition, dict) else {}
+    no_start = payload.get("placement_no_start")
+    if not isinstance(no_start, dict) and isinstance(transition, dict):
+        no_start = transition.get("placement_no_start")
+    if isinstance(no_start, dict):
+        normalized["placement_no_start"] = no_start
+        for key in (
+            "operation_id",
+            "failure_classification",
+            "classification_basis",
+            "target_state_revision",
+            "placement_revision",
+            "operation_circuit_open",
+            "circuit_breaker_open",
+            "circuit_open",
+            "breaker_open",
+            "circuit_breaker_triggered",
+            "breaker_tripped",
+        ):
+            if key in no_start:
+                normalized[key] = no_start[key]
+    for key in (
+        "command_id",
+        "operation_id",
+        "action_name",
+        "semantic_action",
+        "target_state_revision",
+        "placement_revision",
+        "failure_class",
+        "failure_classification",
+        "classification",
+        "operation_circuit_open",
+        "circuit_breaker_open",
+        "circuit_open",
+        "breaker_open",
+        "circuit_breaker_triggered",
+        "breaker_tripped",
+        "next_state",
+        "previous_state",
+        "release_reason",
+        "actor_failure",
+    ):
+        if key in payload:
+            normalized[key] = payload[key]
+    return normalized
+
+
+def _string_value(value: Any) -> str | None:
+    return value if isinstance(value, str) and value else None
 
 
 def _last_payload(events: Sequence[StoredEvent], event_type: str) -> dict[str, Any] | None:

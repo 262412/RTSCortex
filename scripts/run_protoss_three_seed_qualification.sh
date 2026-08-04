@@ -192,6 +192,7 @@ required = {
     "build_start_coverage": lambda value: value == 1.0,
     "build_confirmation_rate": lambda value: value is not None and value >= 0.9,
     "build_failure_rate": lambda value: value is not None and value <= 0.1,
+    "semantic_build_failure_streak_bounded": lambda value: value is True,
     "production_confirmation_complete": lambda value: value == 1.0,
     "recovery_evidence_present": lambda value: value is True,
     "checkpoint_tail_recovery_bounded": lambda value: value is True,

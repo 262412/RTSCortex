@@ -2653,6 +2653,7 @@ class CortexRuntimeEngine(RuntimeEngine):
                 update={
                     "operation_id": operation_id,
                     "attempt_id": attempt_id,
+                    "attempt_ordinal": attempt_ordinal,
                 }
             ),
             lineage=prepared.lineage.model_copy(
