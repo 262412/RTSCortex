@@ -64,6 +64,7 @@ from rtscortex_llm_pysc2.worker import (
     _release_runtime_observation_barrier,
     _replace_screen_action_position,
     _requires_explicit_production_chain,
+    _reserved_builder_worker_tags,
     _resolve_build_action_position,
     _run_with_auto_worker_management_guard,
     _runtime_observation_is_due,
@@ -1559,6 +1560,230 @@ def test_raw_worker_controller_assigns_idle_probe_to_nearby_mineral(
 
     assert action is not None
     assert action.arguments == ["now", [20], 500]
+
+
+def _patch_raw_gather_action(monkeypatch: pytest.MonkeyPatch) -> None:
+    raw_functions = SimpleNamespace(
+        Harvest_Gather_Probe_unit=lambda mode, tags, target: SimpleNamespace(
+            function=264,
+            arguments=[mode, tags, target],
+        )
+    )
+    real_import = importlib.import_module
+    monkeypatch.setattr(
+        "rtscortex_llm_pysc2.worker.importlib.import_module",
+        lambda name: (
+            SimpleNamespace(RAW_FUNCTIONS=raw_functions)
+            if name == "pysc2.lib.actions"
+            else real_import(name)
+        ),
+    )
+
+
+def _raw_gas_main_agent(
+    *,
+    builder: Any,
+    leased_tags: tuple[int, ...] = (),
+) -> Any:
+    return SimpleNamespace(
+        agents={"Builder": builder},
+        decision_broker=SimpleNamespace(
+            extractor=SimpleNamespace(
+                unit_names={
+                    59: "Nexus",
+                    61: "Assimilator",
+                    84: "Probe",
+                    341: "MineralField",
+                }
+            )
+        ),
+        raw_executor=SimpleNamespace(
+            placement_service=SimpleNamespace(leased_builder_tags=frozenset(leased_tags))
+        ),
+        nexus_info_dict={},
+    )
+
+
+def _raw_gas_observation(*workers: Any, gas_x: float = 24.0) -> Any:
+    return SimpleNamespace(
+        raw_units=[
+            SimpleNamespace(
+                tag=100,
+                unit_type=59,
+                alliance=1,
+                x=20.0,
+                y=20.0,
+                build_progress=100,
+                order_length=0,
+                buff_id_0=0,
+            ),
+            *workers,
+            SimpleNamespace(
+                tag=500,
+                unit_type=61,
+                alliance=1,
+                x=gas_x,
+                y=20.0,
+                build_progress=100,
+                assigned_harvesters=0,
+            ),
+        ]
+    )
+
+
+def _raw_probe(tag: int, x: float) -> Any:
+    return SimpleNamespace(
+        tag=tag,
+        unit_type=84,
+        alliance=1,
+        x=x,
+        y=20.0,
+        build_progress=100,
+        order_length=0,
+        buff_id_0=0,
+        is_selected=False,
+    )
+
+
+def test_raw_worker_controller_preserves_active_placement_lease_after_builder_rebind(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_raw_gather_action(monkeypatch)
+    team = {
+        "name": "Builder-Probe-1",
+        "unit_type": [84],
+        "unit_tags": [10],
+    }
+    builder = SimpleNamespace(
+        team_unit_tag_curr=10,
+        team_unit_team_curr="Builder-Probe-1",
+        teams=[team],
+    )
+    main_agent = _raw_gas_main_agent(builder=builder, leased_tags=(10,))
+    original = _raw_probe(10, 21.0)
+    original.order_length = 1
+    original.order_id_0 = 35
+    rebound = _raw_probe(20, 22.0)
+    spare = _raw_probe(30, 50.0)
+    observation = _raw_gas_observation(original, rebound, spare)
+    observation.feature_units = []
+
+    _sync_raw_team_membership(main_agent, observation)
+
+    assert builder.team_unit_tag_curr == 20
+    assert team["unit_tags"] == [20]
+    assert main_agent.raw_executor.placement_service.leased_builder_tags == frozenset({10})
+    action = GasWorkerController().next_raw_action(main_agent, observation, game_loop=100)
+
+    assert action is not None
+    assert action.arguments == ["now", [30], 500]
+
+
+def test_raw_worker_controller_clears_assignment_when_worker_gains_placement_lease(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_raw_gather_action(monkeypatch)
+    builder = SimpleNamespace(teams=[], team_unit_tag_curr=None)
+    main_agent = _raw_gas_main_agent(builder=builder)
+    worker = _raw_probe(10, 23.0)
+    spare = _raw_probe(20, 40.0)
+    observation = _raw_gas_observation(worker, spare)
+    controller = GasWorkerController()
+
+    first = controller.next_raw_action(main_agent, observation, game_loop=100)
+    assert first is not None
+    assert first.arguments == ["now", [10], 500]
+    assert controller.assignment is not None
+
+    main_agent.raw_executor.placement_service.leased_builder_tags = frozenset({10})
+    second = controller.next_raw_action(main_agent, observation, game_loop=108)
+
+    assert second is None
+    assert controller.assignment is None
+
+
+def test_raw_worker_controller_protects_all_active_placement_leases(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_raw_gather_action(monkeypatch)
+    main_agent = _raw_gas_main_agent(
+        builder=SimpleNamespace(teams=[], team_unit_tag_curr=None),
+        leased_tags=(10, 20),
+    )
+    first = _raw_probe(10, 23.0)
+    second = _raw_probe(20, 24.0)
+    spare = _raw_probe(30, 40.0)
+    observation = _raw_gas_observation(first, second, spare)
+
+    assert _reserved_builder_worker_tags(main_agent) == {10, 20}
+    action = GasWorkerController().next_raw_action(main_agent, observation, game_loop=100)
+
+    assert action is not None
+    assert action.arguments == ["now", [30], 500]
+
+
+def test_raw_worker_controller_rechecks_lease_after_action_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_raw_gather_action(monkeypatch)
+
+    class _LeaseView:
+        def __init__(self) -> None:
+            self.reads = 0
+
+        @property
+        def leased_builder_tags(self) -> frozenset[int]:
+            self.reads += 1
+            return frozenset() if self.reads == 1 else frozenset({10})
+
+    main_agent = _raw_gas_main_agent(builder=SimpleNamespace(teams=[], team_unit_tag_curr=None))
+    lease_view = _LeaseView()
+    main_agent.raw_executor.placement_service = lease_view
+    observation = _raw_gas_observation(_raw_probe(10, 23.0), _raw_probe(20, 40.0))
+    controller = GasWorkerController()
+
+    action = controller.next_raw_action(main_agent, observation, game_loop=100)
+
+    assert action is None
+    assert controller.assignment is None
+    assert lease_view.reads >= 2
+
+
+def test_raw_worker_controller_restores_original_worker_after_placement_lease_release(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_raw_gather_action(monkeypatch)
+    builder = SimpleNamespace(
+        teams=[{"name": "Builder-Probe-1", "unit_tags": [20]}],
+        team_unit_tag_curr=20,
+    )
+    main_agent = _raw_gas_main_agent(builder=builder, leased_tags=(10,))
+    leased = _raw_probe(10, 23.0)
+    builder_worker = _raw_probe(20, 24.0)
+    spare = _raw_probe(30, 40.0)
+    observation = _raw_gas_observation(leased, builder_worker, spare)
+
+    while_leased = GasWorkerController().next_raw_action(main_agent, observation, game_loop=100)
+    assert while_leased is not None
+    assert while_leased.arguments == ["now", [30], 500]
+
+    main_agent.raw_executor.placement_service.leased_builder_tags = frozenset()
+    after_release = GasWorkerController().next_raw_action(main_agent, observation, game_loop=108)
+
+    assert after_release is not None
+    assert after_release.arguments == ["now", [10], 500]
+
+
+def test_feature_worker_controller_keeps_original_blocking_with_active_placement_lease() -> None:
+    main_agent = _raw_gas_main_agent(
+        builder=SimpleNamespace(teams=[], team_unit_tag_curr=None),
+        leased_tags=(10,),
+    )
+    observation = _raw_gas_observation(_raw_probe(10, 23.0), _raw_probe(20, 40.0))
+
+    controller = GasWorkerController()
+    assert controller.next_action(main_agent, observation, game_loop=100, blocked=True) is None
+    assert controller.assignment is None
 
 
 def test_deterministic_gas_rebalance_evicts_builder_already_on_gas() -> None:

@@ -515,6 +515,7 @@ class GasWorkerController:
 
         assignment = self.assignment
         if assignment is not None:
+            reserved_builder_tags = _reserved_builder_worker_tags(main_agent)
             raw_by_tag = {
                 int(_observation_value(unit, "tag", 0)): unit
                 for unit in _observation_value(observation, "raw_units", ())
@@ -524,6 +525,7 @@ class GasWorkerController:
             if (
                 worker is None
                 or gas is None
+                or assignment.worker_tag in reserved_builder_tags
                 or _raw_gas_assignment_is_confirmed(worker, gas)
                 or game_loop - assignment.started_game_loop > self.timeout_game_loops
             ):
@@ -537,11 +539,12 @@ class GasWorkerController:
             if mineral_choice is None:
                 return None
             worker_tag, mineral_tag = mineral_choice
-            return actions.RAW_FUNCTIONS.Harvest_Gather_Probe_unit(
+            action = actions.RAW_FUNCTIONS.Harvest_Gather_Probe_unit(
                 "now",
                 [worker_tag],
                 mineral_tag,
             )
+            return self._lease_safe_raw_action(main_agent, action)
         worker_tag, gas_tag = choice
         self.assignment = _GasAssignment(
             worker_tag=worker_tag,
@@ -550,11 +553,20 @@ class GasWorkerController:
             phase="confirm",
             primitive_count=1,
         )
-        return actions.RAW_FUNCTIONS.Harvest_Gather_Probe_unit(
+        action = actions.RAW_FUNCTIONS.Harvest_Gather_Probe_unit(
             "now",
             [worker_tag],
             gas_tag,
         )
+        return self._lease_safe_raw_action(main_agent, action)
+
+    def _lease_safe_raw_action(self, main_agent: Any, action: Any) -> Optional[Any]:
+        """Return a worker primitive only while all actor tags remain unleased."""
+
+        if _raw_worker_action_has_builder_lease_conflict(main_agent, action):
+            self.assignment = None
+            return None
+        return action
 
 
 class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
@@ -1934,6 +1946,12 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
                 obs.observation,
                 game_loop=game_loop,
             )
+            if gas_action is not None and _raw_worker_action_has_builder_lease_conflict(
+                self,
+                gas_action,
+            ):
+                self.gas_worker_controller.assignment = None
+                gas_action = None
             if gas_action is None:
                 action = _raw_no_op()
                 self.transport_noop_primitives += 1
@@ -3044,15 +3062,42 @@ def _prime_deterministic_gas_rebalance(
     return True
 
 
+def _active_placement_builder_lease_tags(main_agent: Any) -> set[int]:
+    raw_executor = getattr(main_agent, "raw_executor", None)
+    placement_service = getattr(raw_executor, "placement_service", None)
+    return {
+        int(tag) for tag in getattr(placement_service, "leased_builder_tags", ()) if int(tag) > 0
+    }
+
+
+def _raw_worker_action_actor_tags(action: Any) -> tuple[int, ...]:
+    arguments = getattr(action, "arguments", ())
+    if not isinstance(arguments, Sequence) or len(arguments) < 2:
+        return ()
+    raw_tags = arguments[1]
+    if isinstance(raw_tags, Integral):
+        return (int(raw_tags),) if int(raw_tags) > 0 else ()
+    if not isinstance(raw_tags, Sequence) or isinstance(raw_tags, (str, bytes)):
+        return ()
+    return tuple(int(tag) for tag in raw_tags if isinstance(tag, Integral) and int(tag) > 0)
+
+
+def _raw_worker_action_has_builder_lease_conflict(main_agent: Any, action: Any) -> bool:
+    return bool(
+        set(_raw_worker_action_actor_tags(action))
+        & _active_placement_builder_lease_tags(main_agent)
+    )
+
+
 def _reserved_builder_worker_tags(main_agent: Any) -> set[int]:
+    tags = _active_placement_builder_lease_tags(main_agent)
     agents = getattr(main_agent, "agents", {})
     if not isinstance(agents, Mapping):
-        return set()
+        return tags
     builder = agents.get("Builder")
     if builder is None:
-        return set()
+        return tags
 
-    tags: set[int] = set()
     current = getattr(builder, "team_unit_tag_curr", None)
     if current is not None and int(current) > 0:
         tags.add(int(current))

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
 from rtscortex_llm_pysc2.addon import ADDON_SPECS, AddonSpec
 from rtscortex_llm_pysc2.effect_verifier import ActionEffectVerifier
 from rtscortex_llm_pysc2.inject_effect_verifier import (
@@ -499,6 +500,57 @@ def test_tracked_build_blocks_auto_worker_management_until_terminal() -> None:
     )
 
     assert verifier.blocks_auto_worker_management is False
+
+
+@pytest.mark.parametrize(
+    "terminal",
+    ["success", "failure", "cancel", "episode_terminal"],
+)
+def test_build_effect_terminal_releases_exact_builder_lease(terminal: str) -> None:
+    placement_service = RawPlacementService(unit_names={})
+    verifier = ActionEffectVerifier(
+        timeout_game_loops=112,
+        placement_service=placement_service,
+    )
+    command = _build_command(command_id=f"leased-builder-{terminal}")
+    baseline = _observation(game_loop=100, minerals=250)
+    placement_service.resolve(
+        command_id=command.command_id,
+        action_name=command.name,
+        requested_arguments=command.requested_arguments,
+        observation=baseline,
+        world_target=(31.875, 30.0),
+        builder_tag=0xABC,
+    )
+    verifier.track(command)
+    verifier.prepare(command.command_id, baseline, 0xABC)
+    verifier.accept_primitive(command.command_id, game_loop=101)
+
+    assert placement_service.leased_builder_tags == frozenset({0xABC})
+
+    if terminal == "success":
+        verdicts = verifier.observe(
+            _observation(
+                game_loop=112,
+                minerals=150,
+                structures=["Nexus", "Pylon"],
+                builder_orders=[35],
+            )
+        )
+        assert [verdict.status for verdict in verdicts] == ["succeeded"]
+    elif terminal == "failure":
+        assert (
+            verifier.observe(_observation(game_loop=102, minerals=150, builder_orders=[35])) == []
+        )
+        verdicts = verifier.observe(_observation(game_loop=550, minerals=250, builder_orders=[154]))
+        assert [verdict.failure_code for verdict in verdicts] == ["build_started_effect_missing"]
+    elif terminal == "cancel":
+        verifier.cancel(command.command_id)
+    else:
+        verdicts = verifier.fail_pending("episode ended before gameplay effect was confirmed")
+        assert [verdict.failure_code for verdict in verdicts] == ["episode_ended_unconfirmed"]
+
+    assert placement_service.leased_builder_tags == frozenset()
 
 
 def test_build_effect_uses_raw_placement_service_target_as_single_authority() -> None:
