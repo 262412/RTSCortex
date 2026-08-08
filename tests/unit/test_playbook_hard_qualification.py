@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -8,6 +10,7 @@ from rtscortex.memory import StoredEvent
 from rtscortex.playbook import (
     PlaybookCondition,
     PlaybookHardQualificationRunEvidence,
+    PlaybookRetryGuardBinding,
     PlaybookRule,
     PlaybookRuleCategory,
     PlaybookRuleEffect,
@@ -15,7 +18,11 @@ from rtscortex.playbook import (
     PlaybookRuleStrength,
     analyze_hard_qualification_evaluations,
     build_hard_qualification_manifest,
+    playbook_predicate_fingerprint,
+    playbook_rule_fingerprint,
 )
+from scripts.analyze_playbook_hard_qualification import write_hard_qualification_result
+from scripts.prepare_playbook_hard_qualification import _eligible_parent
 
 GIT_SHA = "a" * 40
 BASELINE_SHA = "b" * 64
@@ -43,6 +50,18 @@ def _parent() -> PlaybookRule:
         shadow_state_count=96,
         code_revision=GIT_SHA,
         sc2_patch="4.10",
+        retry_guard=PlaybookRetryGuardBinding(
+            failure_code="attack_target_lost",
+            max_age_game_loops=224,
+        ),
+        evidence={
+            "rule_fingerprint": "d" * 64,
+            "predicate_fingerprint": "e" * 64,
+            "typed_retry_binding": {
+                "schema_version": "1.0",
+                "kind": "execution_guard_retry",
+            },
+        },
     )
 
 
@@ -78,6 +97,8 @@ def _evaluation_event(
             "counterfactual_signature": f"{seed + 2:064x}",
             "behavior_before_hash": f"{seed + 3:064x}",
             "decision_epoch": 100,
+            "rule_fingerprint": "d" * 64,
+            "predicate_fingerprint": "e" * 64,
             "counterfactual_observable": observable,
             "strength_at_evaluation": "hard",
             "status_at_evaluation": "active",
@@ -106,6 +127,9 @@ def _application_event(*, event_id: int, seed: int) -> StoredEvent:
             "game_loop": 100,
             "target_kind": "candidate",
             "target_id": f"candidate-{seed}",
+            "rule_kind": "execution_guard",
+            "rule_fingerprint": "d" * 64,
+            "predicate_fingerprint": "e" * 64,
             "matched": True,
             "blocked": False,
             "score_delta": 0.0,
@@ -121,6 +145,12 @@ def _run_evidence(
     unresolved: int = 0,
     false_blocks: int = 0,
 ) -> PlaybookHardQualificationRunEvidence:
+    probe = _parent().model_copy(
+        update={
+            "effect": PlaybookRuleEffect.FORBID,
+            "strength": PlaybookRuleStrength.HARD,
+        }
+    )
     return PlaybookHardQualificationRunEvidence(
         seed_id=seed,
         run_id=f"qualification-{seed}",
@@ -142,6 +172,12 @@ def _run_evidence(
         resolved_counterfactual_count=resolved,
         unresolved_counterfactual_count=unresolved,
         execution_false_block_count=false_blocks,
+        structurally_unobservable_counterfactual_count=0,
+        invalid_application_count=0,
+        application_without_evaluation_count=0,
+        evaluation_without_application_count=0,
+        rule_fingerprint=playbook_rule_fingerprint(probe),
+        predicate_fingerprint=playbook_predicate_fingerprint(probe),
     )
 
 
@@ -170,6 +206,8 @@ def test_hard_qualification_uses_latest_terminal_evaluation() -> None:
     assert metrics.unresolved_counterfactual_count == 0
     assert metrics.execution_false_block_count == 0
     assert metrics.invalid_counterfactual_evidence_count == 0
+    assert metrics.invalid_application_count == 0
+    assert metrics.application_conservation_valid is True
 
 
 def test_successful_shadow_action_is_a_strict_false_block() -> None:
@@ -189,6 +227,162 @@ def test_successful_shadow_action_is_a_strict_false_block() -> None:
     assert metrics.resolved_counterfactual_count == 1
     assert metrics.execution_false_block_count == 1
     assert metrics.execution_false_block_rate == 1.0
+
+
+def test_not_selected_is_structurally_unobservable_not_unresolved() -> None:
+    metrics = analyze_hard_qualification_evaluations(
+        (
+            _application_event(event_id=1, seed=0),
+            _evaluation_event(
+                event_id=2,
+                seed=0,
+                outcome="not_selected",
+                false_block=None,
+                observable=False,
+            ),
+        ),
+        rule_id="playbook-rule:parent",
+    )
+
+    assert metrics.structurally_unobservable_counterfactual_count == 1
+    assert metrics.resolved_counterfactual_count == 0
+    assert metrics.unresolved_counterfactual_count == 0
+    assert metrics.execution_false_block_count == 0
+
+
+def test_observable_terminal_without_boolean_is_unresolved() -> None:
+    metrics = analyze_hard_qualification_evaluations(
+        (
+            _application_event(event_id=1, seed=0),
+            _evaluation_event(
+                event_id=2,
+                seed=0,
+                outcome="failed",
+                false_block=None,
+                observable=True,
+            ),
+        ),
+        rule_id="playbook-rule:parent",
+    )
+
+    assert metrics.structurally_unobservable_counterfactual_count == 0
+    assert metrics.resolved_counterfactual_count == 0
+    assert metrics.unresolved_counterfactual_count == 1
+
+
+def test_application_without_evaluation_and_schema_mismatch_are_invalid() -> None:
+    missing = analyze_hard_qualification_evaluations(
+        (_application_event(event_id=1, seed=0),),
+        rule_id="playbook-rule:parent",
+    )
+    mismatched = analyze_hard_qualification_evaluations(
+        (
+            _application_event(event_id=1, seed=0),
+            _evaluation_event(event_id=2, seed=0, outcome="failed", false_block=False),
+        ),
+        rule_id="playbook-rule:parent",
+    )
+    mismatched_source = _evaluation_event(
+        event_id=2,
+        seed=0,
+        outcome="failed",
+        false_block=False,
+    )
+    mismatched_event = replace(
+        mismatched_source,
+        payload={**mismatched_source.payload, "predicate_fingerprint": "f" * 64},
+    )
+    mismatched_fingerprint = analyze_hard_qualification_evaluations(
+        (_application_event(event_id=1, seed=0), mismatched_event),
+        rule_id="playbook-rule:parent",
+    )
+    malformed_application = replace(
+        _application_event(event_id=1, seed=0),
+        payload={
+            key: value
+            for key, value in _application_event(event_id=1, seed=0).payload.items()
+            if key != "application_id"
+        },
+    )
+    malformed = analyze_hard_qualification_evaluations(
+        (malformed_application,),
+        rule_id="playbook-rule:parent",
+    )
+
+    assert missing.invalid_counterfactual_evidence_count == 1
+    assert missing.invalid_application_count == 1
+    assert missing.application_without_evaluation_count == 1
+    assert missing.application_conservation_count == 1
+    assert mismatched.invalid_counterfactual_evidence_count == 0
+    assert mismatched_fingerprint.invalid_counterfactual_evidence_count == 1
+    assert mismatched_fingerprint.invalid_application_count == 1
+    assert malformed.invalid_counterfactual_evidence_count == 1
+    assert malformed.shadow_would_block_application_count == 1
+    assert malformed.invalid_application_count == 1
+    assert malformed.application_conservation_count == 1
+
+
+def test_multiple_evaluations_for_one_application_fail_closed_and_conserve() -> None:
+    first = _evaluation_event(
+        event_id=2,
+        seed=0,
+        outcome="failed",
+        false_block=False,
+    )
+    second = replace(
+        _evaluation_event(
+            event_id=3,
+            seed=0,
+            outcome="failed",
+            false_block=False,
+        ),
+        payload={
+            **_evaluation_event(
+                event_id=3,
+                seed=0,
+                outcome="failed",
+                false_block=False,
+            ).payload,
+            "evaluation_id": f"rule-evaluation:{99:064x}",
+        },
+    )
+
+    metrics = analyze_hard_qualification_evaluations(
+        (_application_event(event_id=1, seed=0), first, second),
+        rule_id="playbook-rule:parent",
+    )
+
+    assert metrics.invalid_application_count == 1
+    assert metrics.evaluation_without_application_count == 1
+    assert metrics.application_conservation_count == 1
+    assert metrics.shadow_would_block_application_count == 1
+    assert metrics.application_conservation_valid is True
+
+
+def test_manifest_schema_is_bumped_and_legacy_manifest_is_rejected() -> None:
+    manifest = build_hard_qualification_manifest(
+        parent=_parent(),
+        baseline_sha256=BASELINE_SHA,
+        probe_baseline_sha256=PROBE_SHA,
+        git_sha=GIT_SHA,
+        sc2_patch="4.10",
+        runs=(_run_evidence(0), _run_evidence(1), _run_evidence(2)),
+    )
+
+    assert manifest.schema_version == "1.2"
+
+
+def test_prepare_excludes_legacy_execution_parent_without_retry_binding() -> None:
+    legacy = _parent().model_copy(update={"retry_guard": None})
+
+    assert (
+        _eligible_parent(
+            legacy,
+            source_run_ids=set(legacy.source_run_ids),
+            source_seeds=set(legacy.source_seeds),
+        )
+        is False
+    )
 
 
 def test_manifest_requires_resolved_evidence_from_every_parent_seed() -> None:
@@ -257,7 +451,7 @@ def test_manifest_binds_real_run_evidence_and_parent_statistics() -> None:
         runs=(_run_evidence(0), _run_evidence(1), _run_evidence(2)),
     )
 
-    assert manifest.schema_version == "1.1"
+    assert manifest.schema_version == "1.2"
     assert manifest.counterfactual_evidence_accepted is True
     assert manifest.probe_baseline_sha256 == PROBE_SHA
     assert manifest.qualification_seed_ids == (0, 1, 2)
@@ -270,6 +464,7 @@ def test_manifest_binds_real_run_evidence_and_parent_statistics() -> None:
     assert manifest.counterfactual_resolved_count == 3
     assert manifest.counterfactual_unresolved_count == 0
     assert manifest.counterfactual_false_block_count == 0
+    assert manifest.counterfactual_invalid_application_count == 0
     assert manifest.shadow_state_count == 96
     assert manifest.execution_false_block_count == 0
 
@@ -297,6 +492,12 @@ def test_run_evidence_hashes_and_source_fingerprint_are_required() -> None:
             resolved_counterfactual_count=1,
             unresolved_counterfactual_count=0,
             execution_false_block_count=0,
+            structurally_unobservable_counterfactual_count=0,
+            invalid_application_count=0,
+            application_without_evaluation_count=0,
+            evaluation_without_application_count=0,
+            rule_fingerprint="d" * 64,
+            predicate_fingerprint="e" * 64,
         )
 
 
@@ -317,6 +518,8 @@ def test_hard_qualification_runner_keeps_probes_shadow_only_and_fail_closed() ->
     assert "--evaluation-seed 5" in runner
     assert "playbook hard-readiness" in runner
     assert "--allow-canary-fixture" not in runner
+    assert "run_protoss_playbook_counterfactual_canary.sh" not in runner
+    assert "run_protoss_playbook_formal_24.sh" not in runner
 
     config = (
         Path(__file__).parents[2]
@@ -328,3 +531,26 @@ def test_hard_qualification_runner_keeps_probes_shadow_only_and_fail_closed() ->
     assert "rule_mode: shadow" in config
     assert "hard_readiness_required: false" in config
     assert "allow_canary_fixture: false" in config
+
+
+def test_hard_rejection_records_nonzero_exit_and_report_without_manifest(
+    tmp_path: Path,
+) -> None:
+    report_path = tmp_path / "hard-qualification-report.json"
+    manifest_path = tmp_path / "hard-qualification-manifest.json"
+
+    exit_code, message = write_hard_qualification_result(
+        {"accepted": False, "parents": []},
+        None,
+        report_output=report_path,
+        manifest_output=manifest_path,
+    )
+
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    assert exit_code == 1
+    assert message == (f"hard_qualification rejected exit_code=1 report={report_path.resolve()}")
+    assert payload["accepted"] is False
+    assert payload["status"] == "rejected"
+    assert payload["exit_code"] == 1
+    assert payload["report_path"] == str(report_path.resolve())
+    assert manifest_path.exists() is False

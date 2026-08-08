@@ -21,6 +21,8 @@ from rtscortex.playbook.models import (
     PlaybookRuleKind,
     PlaybookRuleStatus,
     PlaybookRuleStrength,
+    playbook_predicate_fingerprint,
+    playbook_rule_fingerprint,
 )
 from rtscortex.playbook.selection import (
     hard_rule_set_sha256,
@@ -52,6 +54,10 @@ _VALID_ROLES = frozenset(
         "retreat",
     }
 )
+
+_HARD_QUALIFICATION_MANIFEST_SCHEMA = "1.2"
+_FINGERPRINT_PATTERN = r"^[0-9a-f]{64}$"
+_EXECUTION_BINDING_EFFECTS = frozenset({PlaybookRuleEffect.AVOID, PlaybookRuleEffect.FORBID})
 
 
 class PlaybookRuleReadiness(ContractModel):
@@ -87,6 +93,8 @@ class PlaybookRuleReadiness(ContractModel):
     qualification_seed_ids: tuple[int, ...]
     evaluation_seed_ids: tuple[int, ...]
     evidence_hashes: tuple[str, ...]
+    rule_fingerprint: str | None = None
+    predicate_fingerprint: str | None = None
     qualification_manifest_sha256: str | None = None
     strategic_ab_evidence_sha256: str | None = None
     strategic_ab_seed_ids: tuple[int, ...] = ()
@@ -118,12 +126,31 @@ class PlaybookHardQualificationRunEvidence(ContractModel):
     resolved_counterfactual_count: int = Field(ge=0)
     unresolved_counterfactual_count: int = Field(ge=0)
     execution_false_block_count: int = Field(ge=0)
+    structurally_unobservable_counterfactual_count: int = Field(ge=0)
+    invalid_application_count: int = Field(ge=0)
+    application_without_evaluation_count: int = Field(ge=0)
+    evaluation_without_application_count: int = Field(ge=0)
+    rule_fingerprint: str = Field(pattern=_FINGERPRINT_PATTERN)
+    predicate_fingerprint: str = Field(pattern=_FINGERPRINT_PATTERN)
+
+    @property
+    def not_selected_counterfactual_count(self) -> int:
+        return self.structurally_unobservable_counterfactual_count
+
+    @property
+    def application_conservation_valid(self) -> bool:
+        return self.shadow_would_block_application_count == (
+            self.resolved_counterfactual_count
+            + self.unresolved_counterfactual_count
+            + self.structurally_unobservable_counterfactual_count
+            + self.invalid_application_count
+        )
 
 
 class PlaybookHardQualificationManifest(ContractModel):
     """Typed, artifact-bound evidence produced by qualification-only runs."""
 
-    schema_version: Literal["1.1"]
+    schema_version: Literal["1.2"]
     artifact_kind: Literal["playbook-hard-qualification"]
     parent_rule_id: str = Field(min_length=1)
     parent_canonical_key: str = Field(min_length=1)
@@ -141,9 +168,28 @@ class PlaybookHardQualificationManifest(ContractModel):
     counterfactual_unresolved_count: int = Field(ge=0)
     counterfactual_false_block_count: int = Field(ge=0)
     counterfactual_false_block_rate: float = Field(ge=0.0, le=1.0)
+    counterfactual_structurally_unobservable_count: int = Field(ge=0)
+    counterfactual_invalid_application_count: int = Field(ge=0)
+    application_without_evaluation_count: int = Field(ge=0)
+    evaluation_without_application_count: int = Field(ge=0)
+    rule_fingerprint: str = Field(pattern=_FINGERPRINT_PATTERN)
+    predicate_fingerprint: str = Field(pattern=_FINGERPRINT_PATTERN)
     shadow_state_count: int = Field(ge=0)
     execution_false_block_count: int = Field(ge=0)
     execution_false_block_rate: float = Field(ge=0.0, le=1.0)
+
+    @property
+    def counterfactual_not_selected_count(self) -> int:
+        return self.counterfactual_structurally_unobservable_count
+
+    @property
+    def application_conservation_valid(self) -> bool:
+        return sum(run.shadow_would_block_application_count for run in self.qualification_runs) == (
+            self.counterfactual_resolved_count
+            + self.counterfactual_unresolved_count
+            + self.counterfactual_structurally_unobservable_count
+            + self.counterfactual_invalid_application_count
+        )
 
 
 class PlaybookStrategicABQualificationArtifact(ContractModel):
@@ -313,6 +359,8 @@ def analyze_hard_readiness(
                 qualification_seed_ids=rule.qualification_seed_ids,
                 evaluation_seed_ids=rule.evaluation_seed_ids,
                 evidence_hashes=rule.evidence_hashes,
+                rule_fingerprint=playbook_rule_fingerprint(rule),
+                predicate_fingerprint=playbook_predicate_fingerprint(rule),
                 qualification_manifest_sha256=_optional_string(
                     rule.evidence.get("qualification_manifest_sha256")
                 ),
@@ -504,6 +552,8 @@ def qualify_hard_rule(
         raise ValueError("hard qualification requires an active parent rule")
     if parent.strength is not PlaybookRuleStrength.SOFT:
         raise ValueError("hard qualification requires a soft parent rule")
+    if _requires_retry_guard(parent) and not _has_typed_retry_guard(parent):
+        raise ValueError("hard qualification requires a typed retry binding")
     if parent.code_revision != expected_git_sha or parent.sc2_patch != sc2_patch:
         raise ValueError(
             "soft parent must already be bound to the qualification git revision and SC2 patch"
@@ -734,6 +784,8 @@ def _hard_rejection_reasons(
         for condition in invalid_static_operators
     )
     if not (fixture and allow_canary_fixture):
+        if _requires_retry_guard(rule) and not _has_typed_retry_guard(rule):
+            reasons.append("missing_typed_retry_binding")
         if rule.code_revision is None:
             reasons.append("missing_code_revision")
         elif rule.code_revision != expected_git_sha:
@@ -761,6 +813,8 @@ def _hard_rejection_reasons(
             and parent.effect is PlaybookRuleEffect.AVOID
         ):
             reasons.append("parent_is_not_active_soft_avoid")
+        elif _requires_retry_guard(parent) and not _has_typed_retry_guard(parent):
+            reasons.append("parent_missing_typed_retry_binding")
         qualification_seeds = set(rule.qualification_seed_ids or rule.source_seeds)
         uncensored_seeds = qualification_seeds - set(rule.censored_source_seeds)
         uncensored_runs = set(rule.source_run_ids) - set(rule.censored_source_run_ids)
@@ -832,6 +886,41 @@ def _qualified_effect(effect: PlaybookRuleEffect) -> PlaybookRuleEffect:
     )
 
 
+def _retry_guard_payload(rule: PlaybookRule) -> dict[str, object] | None:
+    """Serialize the typed retry guard without inventing a legacy fallback."""
+
+    guard = rule.retry_guard
+    if guard is None:
+        return None
+    return guard.model_dump(mode="json")
+
+
+def _has_typed_retry_guard(rule: PlaybookRule) -> bool:
+    """Return whether the model carries the typed retry binding contract."""
+
+    payload = _retry_guard_payload(rule)
+    return isinstance(payload, dict) and payload.get("schema_version") == "1.0"
+
+
+def _requires_retry_guard(rule: PlaybookRule) -> bool:
+    return (
+        rule.category is PlaybookRuleCategory.EXECUTION_GUARD
+        and rule.effect in _EXECUTION_BINDING_EFFECTS
+    )
+
+
+def _probe_fingerprints(parent: PlaybookRule) -> tuple[str, str]:
+    """Return fingerprints for the hard probe derived from one soft parent."""
+
+    probe = parent.model_copy(
+        update={
+            "effect": PlaybookRuleEffect.FORBID,
+            "strength": PlaybookRuleStrength.HARD,
+        }
+    )
+    return playbook_rule_fingerprint(probe), playbook_predicate_fingerprint(probe)
+
+
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as source:
@@ -842,9 +931,18 @@ def _sha256_file(path: Path) -> str:
 
 def _load_qualification_manifest(path: Path) -> PlaybookHardQualificationManifest:
     try:
-        return PlaybookHardQualificationManifest.model_validate_json(
-            path.read_text(encoding="utf-8")
-        )
+        raw = path.read_text(encoding="utf-8")
+        payload = json.loads(raw)
+        if (
+            not isinstance(payload, dict)
+            or payload.get("schema_version") != _HARD_QUALIFICATION_MANIFEST_SCHEMA
+        ):
+            observed = payload.get("schema_version") if isinstance(payload, dict) else None
+            raise ValueError(
+                "unsupported hard qualification manifest schema "
+                f"{observed!r}; regenerate with schema {_HARD_QUALIFICATION_MANIFEST_SCHEMA}"
+            )
+        return PlaybookHardQualificationManifest.model_validate(payload)
     except (OSError, ValueError) as error:
         raise ValueError(f"invalid hard qualification manifest {path}: {error}") from error
 
@@ -871,7 +969,9 @@ def _validate_qualification_manifest(
 ) -> None:
     expected_runs = tuple(sorted(set(parent.source_run_ids) - set(parent.censored_source_run_ids)))
     manifest_integrity_reasons = _qualification_manifest_integrity_reasons(manifest)
+    expected_fingerprints = _probe_fingerprints(parent)
     checks = {
+        "schema_version": manifest.schema_version == _HARD_QUALIFICATION_MANIFEST_SCHEMA,
         "parent_rule_id": manifest.parent_rule_id == parent.rule_id,
         "parent_canonical_key": manifest.parent_canonical_key == parent.canonical_key,
         "baseline_sha256": manifest.baseline_sha256 == baseline_sha256,
@@ -890,6 +990,8 @@ def _validate_qualification_manifest(
             abs(manifest.execution_false_block_rate - parent.false_block_rate) < 1e-12
         ),
         "qualification_run_evidence": not manifest_integrity_reasons,
+        "rule_fingerprint": manifest.rule_fingerprint == expected_fingerprints[0],
+        "predicate_fingerprint": manifest.predicate_fingerprint == expected_fingerprints[1],
     }
     failures = [name for name, accepted in checks.items() if not accepted]
     if failures:
@@ -956,6 +1058,15 @@ def _qualification_evidence_reasons(
         reasons.append("qualification_manifest_git_mismatch")
     if manifest.sc2_patch != sc2_patch or manifest.sc2_patch != rule.qualified_at_sc2_patch:
         reasons.append("qualification_manifest_sc2_patch_mismatch")
+    if _requires_retry_guard(rule) and not _has_typed_retry_guard(rule):
+        reasons.append("missing_typed_retry_binding")
+    expected_fingerprints = _probe_fingerprints(parent)
+    if manifest.rule_fingerprint != expected_fingerprints[0]:
+        reasons.append("qualification_manifest_rule_fingerprint_mismatch")
+    if manifest.predicate_fingerprint != expected_fingerprints[1]:
+        reasons.append("qualification_manifest_predicate_fingerprint_mismatch")
+    if manifest.predicate_fingerprint != playbook_predicate_fingerprint(rule):
+        reasons.append("qualification_manifest_qualified_predicate_fingerprint_mismatch")
     if set(manifest.qualification_seed_ids) != set(rule.qualification_seed_ids):
         reasons.append("qualification_manifest_seed_mismatch")
     if set(manifest.source_run_ids) != (
@@ -1002,8 +1113,16 @@ def _qualification_manifest_integrity_reasons(
     runs = manifest.qualification_runs
     resolved = sum(item.resolved_counterfactual_count for item in runs)
     unresolved = sum(item.unresolved_counterfactual_count for item in runs)
+    structurally_unobservable = sum(
+        item.structurally_unobservable_counterfactual_count for item in runs
+    )
+    invalid_applications = sum(item.invalid_application_count for item in runs)
     false_blocks = sum(item.execution_false_block_count for item in runs)
+    missing_evaluations = sum(item.application_without_evaluation_count for item in runs)
+    extra_evaluations = sum(item.evaluation_without_application_count for item in runs)
     reasons: list[str] = []
+    if manifest.schema_version != _HARD_QUALIFICATION_MANIFEST_SCHEMA:
+        reasons.append("qualification_manifest_schema_unsupported")
     if len(runs) < 3 or len({item.run_id for item in runs}) != len(runs):
         reasons.append("qualification_manifest_run_evidence_incomplete")
     if {item.run_id for item in runs} & set(manifest.source_run_ids):
@@ -1012,6 +1131,10 @@ def _qualification_manifest_integrity_reasons(
         reasons.append("qualification_manifest_run_seed_mismatch")
     if len({item.source_attestation_fingerprint for item in runs}) != 1:
         reasons.append("qualification_manifest_source_attestation_mismatch")
+    if len({item.rule_fingerprint for item in runs}) != 1:
+        reasons.append("qualification_manifest_rule_fingerprint_mismatch")
+    if len({item.predicate_fingerprint for item in runs}) != 1:
+        reasons.append("qualification_manifest_predicate_fingerprint_mismatch")
     if any(
         item.git_sha != manifest.git_sha
         or item.sc2_patch != manifest.sc2_patch
@@ -1025,8 +1148,12 @@ def _qualification_manifest_integrity_reasons(
         or not item.engineering_accepted
         or item.analysis_evidence_overflow_count
         or item.invalid_counterfactual_evidence_count
+        or item.invalid_application_count
+        or not item.application_conservation_valid
         or item.shadow_would_block_application_count == 0
         or item.resolved_counterfactual_count == 0
+        or item.application_without_evaluation_count
+        or item.evaluation_without_application_count
         for item in runs
     ):
         reasons.append("qualification_manifest_run_not_accepted")
@@ -1034,10 +1161,16 @@ def _qualification_manifest_integrity_reasons(
         resolved != manifest.counterfactual_resolved_count
         or unresolved != manifest.counterfactual_unresolved_count
         or false_blocks != manifest.counterfactual_false_block_count
+        or structurally_unobservable != manifest.counterfactual_structurally_unobservable_count
+        or invalid_applications != manifest.counterfactual_invalid_application_count
+        or missing_evaluations != manifest.application_without_evaluation_count
+        or extra_evaluations != manifest.evaluation_without_application_count
         or manifest.analysis_evidence_overflow_count
         != sum(item.analysis_evidence_overflow_count for item in runs)
     ):
         reasons.append("qualification_manifest_counterfactual_aggregate_mismatch")
+    if not manifest.application_conservation_valid:
+        reasons.append("qualification_manifest_application_conservation_failed")
     observed_rate = false_blocks / resolved if resolved else 0.0
     if (
         resolved == 0

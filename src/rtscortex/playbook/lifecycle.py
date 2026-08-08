@@ -84,6 +84,12 @@ class PlaybookRuleLifecycle:
             raise ValueError("hard promotion revision gate failed")
         if rule.shadow_state_count < 48 or rule.false_block_rate > 0.01:
             raise ValueError("hard promotion shadow coverage gate failed")
+        if (
+            rule.category is PlaybookRuleCategory.EXECUTION_GUARD
+            and rule.effect in {PlaybookRuleEffect.AVOID, PlaybookRuleEffect.FORBID}
+            and rule.retry_guard is None
+        ):
+            raise ValueError("hard promotion requires a typed retry binding")
         uncensored_runs = set(rule.source_run_ids) - set(rule.censored_source_run_ids)
         uncensored_seeds = set(rule.source_seeds) - set(rule.censored_source_seeds)
         if len(uncensored_runs) < 3 or len(uncensored_seeds) < 3:

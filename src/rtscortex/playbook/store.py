@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sqlite3
 import threading
 from datetime import UTC, datetime
@@ -17,6 +18,7 @@ from rtscortex.playbook.models import (
     PlaybookHit,
     PlaybookLesson,
     PlaybookQuery,
+    PlaybookRetryGuardBinding,
     PlaybookRule,
     PlaybookRuleApplication,
     PlaybookRuleCategory,
@@ -472,6 +474,16 @@ def _candidate_rule(lesson: PlaybookLesson, source_case: DecisionCase) -> Playbo
         for action in (lesson.recommended_action, lesson.avoid_action)
         if action is not None and action.strip().casefold() not in {"", "unknown"}
     )
+    retry_guard = (
+        None
+        if source_case.retry_feedback is None
+        else PlaybookRetryGuardBinding(
+            failure_code=source_case.retry_feedback.failure_code,
+            max_age_game_loops=source_case.retry_feedback.max_age_game_loops,
+        )
+    )
+    if source_case.retry_feedback is not None:
+        actions = (source_case.retry_feedback.action_name,)
     roles = tuple(role for role in (lesson.recommended_role, lesson.avoid_role) if role is not None)
     canonical_payload = "|".join(
         (
@@ -485,7 +497,20 @@ def _candidate_rule(lesson: PlaybookLesson, source_case: DecisionCase) -> Playbo
             *roles,
         )
     )
-    canonical = hashlib.sha256(canonical_payload.encode()).hexdigest()
+    canonical = hashlib.sha256(
+        (
+            canonical_payload
+            if retry_guard is None
+            else json.dumps(
+                {
+                    "predicate": canonical_payload,
+                    "retry_guard": retry_guard.model_dump(mode="json"),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        ).encode()
+    ).hexdigest()
     seed = source_case.evidence.get("seed")
     return PlaybookRule(
         rule_id=f"playbook-rule:{canonical}",
@@ -497,6 +522,7 @@ def _candidate_rule(lesson: PlaybookLesson, source_case: DecisionCase) -> Playbo
         status=PlaybookRuleStatus.CANDIDATE,
         action_names=actions,
         role_ids=roles,
+        retry_guard=retry_guard,
         confidence=lesson.confidence,
         support_count=1,
         source_case_ids=(source_case.case_id,),
@@ -515,6 +541,11 @@ def _candidate_rule(lesson: PlaybookLesson, source_case: DecisionCase) -> Playbo
             "statement": lesson.statement,
             "consequence_type": (
                 None if lesson.consequence_type is None else lesson.consequence_type.value
+            ),
+            "retry_feedback_sources": (
+                {}
+                if source_case.retry_feedback is None
+                else {source_case.case_id: source_case.retry_feedback.model_dump(mode="json")}
             ),
         },
     )
@@ -550,6 +581,12 @@ def _merge_rule_evidence(existing: PlaybookRule, incoming: PlaybookRule) -> Play
         incoming.status is PlaybookRuleStatus.CANDIDATE
         and existing.status is PlaybookRuleStatus.ACTIVE
     )
+    existing_retry_sources = existing.evidence.get("retry_feedback_sources")
+    incoming_retry_sources = incoming.evidence.get("retry_feedback_sources")
+    retry_sources = {
+        **(existing_retry_sources if isinstance(existing_retry_sources, dict) else {}),
+        **(incoming_retry_sources if isinstance(incoming_retry_sources, dict) else {}),
+    }
     return incoming.model_copy(
         update={
             "status": existing.status if preserve_active else incoming.status,
@@ -589,6 +626,10 @@ def _merge_rule_evidence(existing: PlaybookRule, incoming: PlaybookRule) -> Play
             "contradiction_seeds": contradiction_seeds,
             "shadow_state_count": max(existing.shadow_state_count, incoming.shadow_state_count),
             "false_block_count": max(existing.false_block_count, incoming.false_block_count),
-            "evidence": {**existing.evidence, **incoming.evidence},
+            "evidence": {
+                **existing.evidence,
+                **incoming.evidence,
+                "retry_feedback_sources": retry_sources,
+            },
         }
     )

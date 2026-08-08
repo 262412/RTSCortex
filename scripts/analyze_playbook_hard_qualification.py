@@ -7,6 +7,7 @@ import csv
 import hashlib
 import json
 import re
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,8 @@ from rtscortex.playbook import (
     PlaybookStore,
     analyze_hard_qualification_evaluations,
     build_hard_qualification_manifest,
+    playbook_predicate_fingerprint,
+    playbook_rule_fingerprint,
 )
 from scripts.analyze_playbook_experiment import _run_metrics
 
@@ -36,7 +39,8 @@ def _sc2_version(worker_stderr: Path) -> tuple[str, str]:
     matches = set(_SC2_VERSION_PATTERN.findall(worker_stderr.read_text(encoding="utf-8")))
     if len(matches) != 1:
         return "unknown", "unknown"
-    return next(iter(matches))
+    build, patch = next(iter(matches))
+    return str(build), str(patch)
 
 
 def _shadow_config_is_valid(config_path: Path, *, expected_database: Path) -> bool:
@@ -180,6 +184,11 @@ def analyze_hard_qualification(
         rules_by_id = {rule.rule_id: rule for rule in store.rules()}
     finally:
         store.close()
+    probe_store = PlaybookStore(probe_path, read_only=True)
+    try:
+        probe_rules_by_id = {rule.rule_id: rule for rule in probe_store.rules()}
+    finally:
+        probe_store.close()
     accepted_manifests: list[Any] = []
     parent_reports: list[dict[str, Any]] = []
     for parent_rule_id in plan["parent_rule_ids"]:
@@ -189,12 +198,26 @@ def analyze_hard_qualification(
                 {"parent_rule_id": parent_rule_id, "accepted": False, "reason": "missing_parent"}
             )
             continue
+        probe_rule = probe_rules_by_id.get(parent_rule_id)
+        if probe_rule is None:
+            parent_reports.append(
+                {
+                    "parent_rule_id": parent_rule_id,
+                    "accepted": False,
+                    "reason": "missing_probe_rule",
+                }
+            )
+            continue
+        expected_rule_fingerprint = playbook_rule_fingerprint(probe_rule)
+        expected_predicate_fingerprint = playbook_predicate_fingerprint(probe_rule)
         run_evidence: list[PlaybookHardQualificationRunEvidence] = []
         counterfactual_by_seed: dict[str, dict[str, Any]] = {}
         for seed in sorted(events_by_seed):
             observed = analyze_hard_qualification_evaluations(
                 events_by_seed[seed],
                 rule_id=parent_rule_id,
+                expected_rule_fingerprint=expected_rule_fingerprint,
+                expected_predicate_fingerprint=expected_predicate_fingerprint,
             )
             counterfactual_by_seed[str(seed)] = {
                 "shadow_would_block_application_count": (
@@ -202,7 +225,17 @@ def analyze_hard_qualification(
                 ),
                 "resolved_counterfactual_count": observed.resolved_counterfactual_count,
                 "unresolved_counterfactual_count": observed.unresolved_counterfactual_count,
+                "structurally_unobservable_counterfactual_count": (
+                    observed.structurally_unobservable_counterfactual_count
+                ),
                 "execution_false_block_count": observed.execution_false_block_count,
+                "invalid_application_count": observed.invalid_application_count,
+                "application_without_evaluation_count": (
+                    observed.application_without_evaluation_count
+                ),
+                "evaluation_without_application_count": (
+                    observed.evaluation_without_application_count
+                ),
                 "execution_false_block_rate": observed.execution_false_block_rate,
                 "invalid_counterfactual_evidence_count": (
                     observed.invalid_counterfactual_evidence_count
@@ -220,6 +253,18 @@ def analyze_hard_qualification(
                     resolved_counterfactual_count=observed.resolved_counterfactual_count,
                     unresolved_counterfactual_count=observed.unresolved_counterfactual_count,
                     execution_false_block_count=observed.execution_false_block_count,
+                    structurally_unobservable_counterfactual_count=(
+                        observed.structurally_unobservable_counterfactual_count
+                    ),
+                    invalid_application_count=observed.invalid_application_count,
+                    application_without_evaluation_count=(
+                        observed.application_without_evaluation_count
+                    ),
+                    evaluation_without_application_count=(
+                        observed.evaluation_without_application_count
+                    ),
+                    rule_fingerprint=expected_rule_fingerprint,
+                    predicate_fingerprint=expected_predicate_fingerprint,
                 )
             )
         try:
@@ -247,6 +292,14 @@ def analyze_hard_qualification(
                 "parent_rule_id": parent_rule_id,
                 "accepted": True,
                 "counterfactual_resolved_count": manifest.counterfactual_resolved_count,
+                "counterfactual_unresolved_count": manifest.counterfactual_unresolved_count,
+                "counterfactual_structurally_unobservable_count": (
+                    manifest.counterfactual_structurally_unobservable_count
+                ),
+                "invalid_counterfactual_evidence_count": sum(
+                    item.invalid_counterfactual_evidence_count
+                    for item in manifest.qualification_runs
+                ),
                 "counterfactual_false_block_rate": manifest.counterfactual_false_block_rate,
                 "counterfactual_by_seed": counterfactual_by_seed,
             }
@@ -261,7 +314,7 @@ def analyze_hard_qualification(
     )
     selected = accepted_manifests[0] if accepted_manifests else None
     report = {
-        "schema_version": "1.0",
+        "schema_version": "1.1",
         "artifact_kind": "playbook-hard-qualification-report",
         "expected_git_sha": expected_git_sha,
         "sc2_patch": sc2_patch,
@@ -274,6 +327,50 @@ def analyze_hard_qualification(
         "accepted": selected is not None,
     }
     return report, None if selected is None else selected.model_dump(mode="json")
+
+
+def write_hard_qualification_result(
+    report: dict[str, Any],
+    manifest: dict[str, Any] | None,
+    *,
+    report_output: Path,
+    manifest_output: Path,
+) -> tuple[int, str]:
+    """Write one terminal result without allowing a rejected manifest downstream."""
+
+    resolved_report = report_output.expanduser().resolve()
+    resolved_manifest = manifest_output.expanduser().resolve()
+    exit_code = 0 if manifest is not None and report.get("accepted") is True else 1
+    status = "accepted" if exit_code == 0 else "rejected"
+    terminal_report = {
+        **report,
+        "status": status,
+        "exit_code": exit_code,
+        "report_path": str(resolved_report),
+    }
+    resolved_report.write_text(
+        json.dumps(terminal_report, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    if exit_code:
+        if resolved_manifest.exists():
+            raise ValueError(
+                f"hard qualification rejected but a manifest already exists: {resolved_manifest}"
+            )
+        return (
+            exit_code,
+            f"hard_qualification rejected exit_code=1 report={resolved_report}",
+        )
+    assert manifest is not None
+    resolved_manifest.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return (
+        exit_code,
+        "hard_qualification accepted exit_code=0 "
+        f"report={resolved_report} manifest={resolved_manifest}",
+    )
 
 
 def main() -> None:
@@ -301,16 +398,15 @@ def main() -> None:
         sc2_patch=arguments.sc2_patch,
         working_database=arguments.working_database.resolve(),
     )
-    arguments.report_output.write_text(
-        json.dumps(report, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
+    exit_code, message = write_hard_qualification_result(
+        report,
+        manifest,
+        report_output=arguments.report_output,
+        manifest_output=arguments.manifest_output,
     )
-    if manifest is None:
-        raise SystemExit(1)
-    arguments.manifest_output.write_text(
-        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    print(message, file=sys.stderr if exit_code else sys.stdout)
+    if exit_code:
+        raise SystemExit(exit_code)
 
 
 if __name__ == "__main__":

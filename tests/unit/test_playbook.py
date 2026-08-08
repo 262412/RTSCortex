@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -39,11 +40,13 @@ from rtscortex.playbook import (
     PlaybookIntentGuard,
     PlaybookPromotionSweep,
     PlaybookQuery,
+    PlaybookRetryGuardBinding,
     PlaybookRule,
     PlaybookRuleApplication,
     PlaybookRuleCategory,
     PlaybookRuleEffect,
     PlaybookRuleKind,
+    PlaybookRuleLifecycle,
     PlaybookRuleStatus,
     PlaybookRuleStrength,
     PlaybookRunLearner,
@@ -145,6 +148,9 @@ def test_recent_terminal_feedback_blocks_exact_candidate_during_cooldown() -> No
         actor=candidate.actor,
         failure_code="translator_rejected",
         command_id="command:failed-gateway",
+        operation_id=f"operation:{'c' * 64}",
+        attempt_ordinal=0,
+        terminal_game_loop=112,
         expires_game_loop=224,
         hard_suppression=False,
     )
@@ -164,6 +170,8 @@ def test_recent_terminal_feedback_blocks_exact_candidate_during_cooldown() -> No
         episode_id="episode",
         step_id=2,
         game_loop=128,
+        operation_id=f"operation:{'c' * 64}",
+        attempt_ordinal=1,
         mode="active",
         recent_feedback=(feedback,),
     )
@@ -171,6 +179,327 @@ def test_recent_terminal_feedback_blocks_exact_candidate_during_cooldown() -> No
     assert result.blocked is True
     assert result.score_delta == -2.0
     assert result.applications[0].reason == "recent_terminal_failure_cooldown"
+
+
+def _typed_retry_guard_fixture() -> tuple[
+    ExecutableCandidate,
+    SituationAssessment,
+    PlaybookRule,
+    RecentTerminalFeedback,
+]:
+    candidate = ExecutableCandidate(
+        candidate_id=f"candidate:{'d' * 64}",
+        observation_fingerprint="e" * 64,
+        intent_id="intent:attack-retry",
+        action_name="Attack_Unit",
+        actor="CombatGroup1/Stalker-1",
+        arguments=["0x100000001"],
+        features=CandidateFeatures(
+            action_rank=0,
+            actor_rank=0,
+            argument_rank=0,
+            compile_ordinal=0,
+        ),
+    )
+    situation = SituationAssessment(
+        assessment_id="assessment:retry-guard",
+        run_id="run",
+        episode_id="episode",
+        step_id=2,
+        game_loop=160,
+        valid_until_game_loop=176,
+        phase=GamePhase.COMBAT,
+        threat_level=ThreatLevel.LOW,
+        economy_status=EconomyStatus.FLOATING,
+        army_readiness=ArmyReadiness.READY,
+        source_kind="deterministic",
+        source_id="test",
+        source_version="1",
+    )
+    rule = PlaybookRule(
+        rule_id=f"playbook-rule:{'f' * 64}",
+        canonical_key="f" * 64,
+        category=PlaybookRuleCategory.EXECUTION_GUARD,
+        conditions=(
+            PlaybookCondition(field="agent_race", value="protoss"),
+            PlaybookCondition(field="opponent_race", value="zerg"),
+            PlaybookCondition(field="phase", value="combat"),
+            PlaybookCondition(field="map_name", value="Simple64"),
+            PlaybookCondition(field="threat_level", value="low"),
+            PlaybookCondition(field="economy_status", value="floating"),
+            PlaybookCondition(field="army_readiness", value="ready"),
+        ),
+        effect=PlaybookRuleEffect.FORBID,
+        strength=PlaybookRuleStrength.HARD,
+        status=PlaybookRuleStatus.ACTIVE,
+        action_names=("Attack_Unit",),
+        confidence=0.95,
+        retry_guard=PlaybookRetryGuardBinding(
+            failure_code="combat_actor_order_unbound",
+            max_age_game_loops=112,
+        ),
+    )
+    feedback = RecentTerminalFeedback(
+        signature=candidate_signature(
+            candidate.action_name,
+            candidate.actor,
+            candidate.arguments,
+        ),
+        action_name=candidate.action_name,
+        actor=candidate.actor,
+        failure_code="combat_actor_order_unbound",
+        command_id="command:failed-attack",
+        operation_id=f"operation:{'1' * 64}",
+        attempt_ordinal=2,
+        terminal_game_loop=112,
+        expires_game_loop=224,
+        hard_suppression=False,
+    )
+    return candidate, situation, rule, feedback
+
+
+def test_retry_guard_requires_exact_fresh_feedback_and_never_blocks_intent() -> None:
+    candidate, situation, rule, feedback = _typed_retry_guard_fixture()
+    context = PlaybookContext(
+        agent_race="protoss",
+        opponent_race="zerg",
+        phase=GamePhase.COMBAT,
+        map_name="Simple64",
+    )
+    no_feedback = PlaybookCandidateGuard().evaluate(
+        candidate,
+        role="focus_fire",
+        context=context,
+        situation=situation,
+        rules=(rule,),
+        run_id="run",
+        episode_id="episode",
+        step_id=2,
+        game_loop=160,
+        operation_id=feedback.operation_id,
+        attempt_ordinal=3,
+        mode="active",
+    )
+    assert no_feedback.blocked is False
+    assert rule.rule_id not in no_feedback.rule_ids
+
+    exact = PlaybookCandidateGuard().evaluate(
+        candidate,
+        role="focus_fire",
+        context=context,
+        situation=situation,
+        rules=(rule,),
+        run_id="run",
+        episode_id="episode",
+        step_id=2,
+        game_loop=160,
+        operation_id=feedback.operation_id,
+        attempt_ordinal=3,
+        mode="active",
+        recent_feedback=(feedback,),
+    )
+    assert exact.blocked is True
+    assert rule.rule_id in exact.rule_ids
+
+    intent = StrategicIntent(
+        intent_id="intent:attack-retry",
+        operation_id=feedback.operation_id,
+        continuity_key="attack-retry",
+        run_id="run",
+        episode_id="episode",
+        step_id=2,
+        created_game_loop=160,
+        role=RoleId.FOCUS_FIRE,
+        objective="attack the target",
+        desired_effect="damage target",
+        action_names=("Attack_Unit",),
+        semantic_target_key="enemy:0x100000001",
+        source_id="test",
+        source_version="1",
+    )
+    intent_result = PlaybookIntentGuard().evaluate(
+        intent,
+        context=context,
+        situation=situation,
+        rules=(rule,),
+        game_loop=160,
+        mode="active",
+    )
+    assert intent_result.blocked is False
+    assert rule.rule_id not in intent_result.rule_ids
+
+
+@pytest.mark.parametrize(
+    (
+        "feedback_signature",
+        "feedback_failure_code",
+        "operation_id",
+        "attempt_ordinal",
+        "game_loop",
+    ),
+    [
+        ("0" * 64, None, f"operation:{'1' * 64}", 3, 160),
+        (None, "effect_timeout", f"operation:{'1' * 64}", 3, 160),
+        (None, None, f"operation:{'2' * 64}", 3, 160),
+        (None, None, f"operation:{'1' * 64}", 4, 160),
+        (None, None, f"operation:{'1' * 64}", 3, 225),
+    ],
+)
+def test_retry_guard_rejects_mismatched_binding(
+    feedback_signature: str | None,
+    feedback_failure_code: str | None,
+    operation_id: str,
+    attempt_ordinal: int,
+    game_loop: int,
+) -> None:
+    candidate, situation, rule, feedback = _typed_retry_guard_fixture()
+    observed = PlaybookCandidateGuard().evaluate(
+        candidate,
+        role="focus_fire",
+        context=PlaybookContext(
+            agent_race="protoss",
+            opponent_race="zerg",
+            phase=GamePhase.COMBAT,
+            map_name="Simple64",
+        ),
+        situation=situation,
+        rules=(rule,),
+        run_id="run",
+        episode_id="episode",
+        step_id=2,
+        game_loop=game_loop,
+        operation_id=operation_id,
+        attempt_ordinal=attempt_ordinal,
+        mode="active",
+        recent_feedback=(
+            replace(
+                feedback,
+                signature=feedback.signature if feedback_signature is None else feedback_signature,
+                failure_code=(
+                    feedback.failure_code
+                    if feedback_failure_code is None
+                    else feedback_failure_code
+                ),
+            ),
+        ),
+    )
+
+    assert rule.rule_id not in observed.rule_ids
+
+
+def test_legacy_unbound_execution_retry_rule_cannot_promote_to_hard() -> None:
+    rule = PlaybookRule(
+        rule_id="rule:legacy-unbound-retry",
+        canonical_key="legacy-unbound-retry",
+        category=PlaybookRuleCategory.EXECUTION_GUARD,
+        conditions=(
+            PlaybookCondition(field="agent_race", value="protoss"),
+            PlaybookCondition(field="threat_level", value="low"),
+        ),
+        effect=PlaybookRuleEffect.AVOID,
+        strength=PlaybookRuleStrength.SOFT,
+        status=PlaybookRuleStatus.ACTIVE,
+        action_names=("Move_Minimap",),
+        confidence=0.95,
+        source_run_ids=("run-0", "run-1", "run-2"),
+        source_seeds=(0, 1, 2),
+        shadow_state_count=100,
+        code_revision="a" * 40,
+        sc2_patch="4.10",
+    )
+
+    with pytest.raises(ValueError, match="typed retry binding"):
+        PlaybookRuleLifecycle().promote_to_hard(
+            rule,
+            current_code_revision="a" * 40,
+            current_sc2_patch="4.10",
+        )
+
+
+def test_reviewer_persists_typed_retry_feedback_and_rule_binding(tmp_path: Path) -> None:
+    playbook = PlaybookStore(tmp_path / "playbook.sqlite3")
+    reviewer = CortexPlaybookReviewer(playbook, promotion_support=1)
+    store = EventStore(tmp_path / "events.sqlite3", tmp_path / "events.jsonl")
+    operation_id = f"operation:{'a' * 64}"
+    store.append_event(
+        run_id="run",
+        episode_id="episode",
+        step_id=1,
+        event_type="situation_assessed",
+        payload={
+            "phase": "combat",
+            "threat_level": "low",
+            "economy_status": "stable",
+            "army_readiness": "ready",
+        },
+    )
+    store.append_event(
+        run_id="run",
+        episode_id="episode",
+        step_id=2,
+        event_type="command_lineage",
+        payload={
+            "command_id": "command:failed-attack",
+            "semantic_action": "ATTACK UNIT",
+            "lineage": {"source_role": "tactical"},
+        },
+    )
+    store.append_event(
+        run_id="run",
+        episode_id="episode",
+        step_id=3,
+        event_type="execution",
+        payload=ExecutionReport(
+            run_id="run",
+            episode_id="episode",
+            step_id=3,
+            command_id="command:failed-attack",
+            operation_id=operation_id,
+            attempt_id=f"attempt:{'b' * 64}",
+            attempt_ordinal=2,
+            success=False,
+            action_name="Attack_Unit",
+            actor="CombatGroup1/Stalker-1",
+            requested_arguments=["0x100000001"],
+            source=ActionSource.REFLEX,
+            status=ExecutionStatus.FAILED,
+            execution_stage=ExecutionStage.EFFECT_VERIFICATION,
+            failure_code="combat_actor_order_unbound",
+        ),
+    )
+
+    cases, _ = reviewer.review_episode(
+        store.events_after("run", 0, 100, episode_id="episode"),
+        EpisodeResult(
+            run_id="run",
+            episode_id="episode",
+            scenario="Simple64",
+            seed=0,
+            outcome=EpisodeOutcome.DEFEAT,
+            steps=3,
+        ),
+        agent_race="protoss",
+        opponent_race="zerg",
+    )
+
+    case = next(item for item in cases if item.command_id == "command:failed-attack")
+    assert case.retry_feedback is not None
+    assert case.retry_feedback.operation_id == operation_id
+    assert case.retry_feedback.attempt_ordinal == 2
+    assert case.retry_feedback.candidate_signature == candidate_signature(
+        "Attack_Unit",
+        "CombatGroup1/Stalker-1",
+        ["0x100000001"],
+    )
+    rule = next(item for item in playbook.rules() if item.retry_guard is not None)
+    assert rule.action_names == ("Attack_Unit",)
+    assert rule.retry_guard is not None
+    assert rule.retry_guard.failure_code == "combat_actor_order_unbound"
+    assert rule.evidence["retry_feedback_sources"] == {
+        case.case_id: case.retry_feedback.model_dump(mode="json")
+    }
+    store.close()
+    playbook.close()
 
 
 def _episode_events(
@@ -1052,7 +1381,7 @@ def test_error_episode_cases_remain_diagnostic_but_do_not_update_rules(
     playbook.close()
 
 
-def test_shadow_validated_execution_rule_becomes_soft_and_changes_score(
+def test_shadow_validated_retry_rule_becomes_soft_but_requires_exact_feedback(
     tmp_path: Path,
 ) -> None:
     playbook = PlaybookStore(tmp_path / "playbook.sqlite3")
@@ -1093,6 +1422,9 @@ def test_shadow_validated_execution_rule_becomes_soft_and_changes_score(
                 episode_id="episode",
                 step_id=2,
                 command_id=f"{run_id}:command",
+                operation_id=f"operation:{run_index:064x}",
+                attempt_id=f"attempt:{run_index:064x}",
+                attempt_ordinal=0,
                 success=False,
                 action_name="Train_Adept",
                 actor="Developer/Empty",
@@ -1117,9 +1449,7 @@ def test_shadow_validated_execution_rule_becomes_soft_and_changes_score(
         )
         store.close()
         if run_index == 1:
-            candidate = next(
-                rule for rule in playbook.rules() if rule.action_names == ("TRAIN ADEPT",)
-            )
+            candidate = next(rule for rule in playbook.rules() if rule.retry_guard is not None)
             for state_index in range(48):
                 playbook.record_rule_application(
                     PlaybookRuleApplication(
@@ -1136,7 +1466,7 @@ def test_shadow_validated_execution_rule_becomes_soft_and_changes_score(
                     )
                 )
 
-    rule = next(rule for rule in playbook.rules() if rule.action_names == ("TRAIN ADEPT",))
+    rule = next(rule for rule in playbook.rules() if rule.retry_guard is not None)
     assert rule.status is PlaybookRuleStatus.ACTIVE
     assert rule.strength is PlaybookRuleStrength.SOFT
     assert set(rule.source_seeds) == {0, 1}
@@ -1146,9 +1476,7 @@ def test_shadow_validated_execution_rule_becomes_soft_and_changes_score(
         ("army_readiness", "forming"),
     }
     CortexPlaybookReviewer(playbook)
-    rule = next(
-        candidate for candidate in playbook.rules() if candidate.action_names == ("TRAIN ADEPT",)
-    )
+    rule = next(candidate for candidate in playbook.rules() if candidate.retry_guard is not None)
     assert rule.status is PlaybookRuleStatus.ACTIVE
     assert rule.strength is PlaybookRuleStrength.SOFT
     situation = SituationAssessment(
@@ -1196,8 +1524,61 @@ def test_shadow_validated_execution_rule_becomes_soft_and_changes_score(
         mode="active",
     )
 
-    assert result.score_delta == -0.5
-    assert result.rule_ids == (rule.rule_id,)
+    assert result.score_delta == 0.0
+    assert result.rule_ids == ()
+
+    executable = ExecutableCandidate(
+        candidate_id=f"candidate:{'c' * 64}",
+        observation_fingerprint="d" * 64,
+        intent_id=intent.intent_id,
+        action_name="Train_Adept",
+        actor="Developer/Empty",
+        arguments=[],
+        features=CandidateFeatures(
+            action_rank=0,
+            actor_rank=0,
+            argument_rank=0,
+            compile_ordinal=0,
+        ),
+    )
+    operation_id = f"operation:{'e' * 64}"
+    feedback = RecentTerminalFeedback(
+        signature=candidate_signature(
+            executable.action_name,
+            executable.actor,
+            executable.arguments,
+        ),
+        action_name=executable.action_name,
+        actor=executable.actor,
+        failure_code="producer_not_observable",
+        command_id="command:failed-adept",
+        operation_id=operation_id,
+        attempt_ordinal=2,
+        terminal_game_loop=80,
+        expires_game_loop=192,
+        hard_suppression=False,
+    )
+    retry_result = PlaybookCandidateGuard().evaluate(
+        executable,
+        role="production",
+        context=PlaybookContext(
+            agent_race="protoss",
+            opponent_race="zerg",
+            phase=GamePhase.PRODUCTION,
+            map_name="Simple64",
+        ),
+        situation=situation,
+        rules=playbook.rules_for_guard(),
+        run_id="next-run",
+        episode_id="episode",
+        step_id=1,
+        game_loop=100,
+        operation_id=operation_id,
+        attempt_ordinal=3,
+        mode="active",
+        recent_feedback=(feedback,),
+    )
+    assert rule.rule_id in retry_result.rule_ids
     playbook.close()
 
 
@@ -1482,7 +1863,7 @@ def test_playbook_quarantines_legacy_soft_execution_penalty(tmp_path: Path) -> N
     )
     assert rule.status is PlaybookRuleStatus.SUSPENDED
     assert rule.strength is PlaybookRuleStrength.ADVISORY
-    assert rule.evidence["suspension_reason"] == "missing_typed_failure_precondition"
+    assert rule.evidence["suspension_reason"] == "missing_typed_retry_binding"
     playbook.close()
 
 

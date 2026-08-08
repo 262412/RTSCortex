@@ -30,6 +30,8 @@ from rtscortex.playbook.models import (
     PlaybookHit,
     PlaybookLesson,
     PlaybookQuery,
+    PlaybookRetryFeedbackEvidence,
+    PlaybookRetryGuardBinding,
     PlaybookRule,
     PlaybookRuleApplication,
     PlaybookRuleCategory,
@@ -42,6 +44,8 @@ from rtscortex.playbook.models import (
     StrategicConditionSnapshot,
     StrategicConsequence,
     StrategicConsequenceType,
+    playbook_predicate_fingerprint,
+    playbook_rule_fingerprint,
 )
 from rtscortex.playbook.promotion import PlaybookPromotionSweep, PromotionSweepResult
 from rtscortex.playbook.readiness import (
@@ -86,6 +90,8 @@ __all__ = [
     "PlaybookLesson",
     "PlaybookQuery",
     "PlaybookRuleKind",
+    "PlaybookRetryFeedbackEvidence",
+    "PlaybookRetryGuardBinding",
     "PlaybookRuleReadiness",
     "PlaybookRule",
     "PlaybookRuleApplication",
@@ -113,6 +119,8 @@ __all__ = [
     "contains_canary_fixture",
     "create_canary_fixture",
     "evaluation_kind",
+    "playbook_predicate_fingerprint",
+    "playbook_rule_fingerprint",
     "load_hard_readiness_report",
     "qualify_hard_rule",
     "validate_runtime_hard_rule_approval",

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -58,6 +59,8 @@ from rtscortex.playbook import (
     PlaybookRuleStatus,
     PlaybookRuleStrength,
     PlaybookStore,
+    playbook_predicate_fingerprint,
+    playbook_rule_fingerprint,
 )
 from rtscortex.policy.hima import (
     HIMA_ADAPTER_VERSION,
@@ -75,7 +78,7 @@ from rtscortex.policy.models import (
     PolicyActionClassification,
 )
 from rtscortex.providers import FakeProvider
-from rtscortex.runtime import CortexRuntimeEngine
+from rtscortex.runtime import CortexRuntimeEngine, factory
 from rtscortex.runtime.engine import CommandStatus
 
 
@@ -565,6 +568,8 @@ def test_tactical_response_terminal_resolution_uses_execution_evidence(
                 counterfactual_signature="d" * 64,
                 behavior_before_hash="e" * 64,
                 decision_epoch=observation.game_loop,
+                rule_fingerprint=playbook_rule_fingerprint(rule),
+                predicate_fingerprint=playbook_predicate_fingerprint(rule),
                 matched=True,
                 blocked=False,
                 reason="shadow_would_block",
@@ -573,6 +578,8 @@ def test_tactical_response_terminal_resolution_uses_execution_evidence(
     )
     evaluation_id, evaluation = next(iter(runtime._pending_playbook_rule_evaluations.items()))
     assert evaluation.rule_kind is PlaybookRuleKind.EXECUTION_GUARD
+    assert evaluation.rule_fingerprint == playbook_rule_fingerprint(rule)
+    assert evaluation.predicate_fingerprint == playbook_predicate_fingerprint(rule)
     assert evaluation.strategic_outcome_window_end_game_loop is None
     runtime._pending_playbook_rule_evaluations[evaluation_id] = evaluation.model_copy(
         update={"counterfactual_observable": True}
@@ -613,6 +620,8 @@ def test_tactical_response_terminal_resolution_uses_execution_evidence(
     )[-1]
     assert resolved.payload["rule_kind"] == "execution_guard"
     assert resolved.payload["execution_false_block"] is True
+    assert resolved.payload["rule_fingerprint"] == playbook_rule_fingerprint(rule)
+    assert resolved.payload["predicate_fingerprint"] == playbook_predicate_fingerprint(rule)
     assert resolved.payload["strategic_regret"] is None
     assert runtime._terminal_strategy_rule_evaluations == {}
     asyncio.run(runtime.close())
@@ -2504,6 +2513,103 @@ def test_completed_episode_emits_strategic_consequence_and_review_summary(
         natural_run_baseline_bytes_per_loop=None,
     )
     assert engineering["metrics"]["postgame_semantic_event_coverage"] == 1.0
+    asyncio.run(runtime.close())
+
+
+def test_frozen_episode_reviews_semantics_once_without_mutating_playbook(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "playbook.sqlite3"
+    writable = PlaybookStore(database)
+    writable.upsert_rule(
+        PlaybookRule(
+            rule_id="rule:unsafe-frozen",
+            canonical_key="unsafe-frozen",
+            category=PlaybookRuleCategory.EXECUTION_GUARD,
+            conditions=(),
+            effect=PlaybookRuleEffect.AVOID,
+            strength=PlaybookRuleStrength.SOFT,
+            status=PlaybookRuleStatus.ACTIVE,
+            action_names=("Attack_Unit",),
+            confidence=0.95,
+        )
+    )
+    writable.close()
+    before = hashlib.sha256(database.read_bytes()).hexdigest()
+    base = _config(tmp_path, macro=False)
+    config = base.model_copy(
+        update={
+            "cortex": base.cortex.model_copy(
+                update={
+                    "playbook": CortexPlaybookSettings(
+                        enabled=True,
+                        database_path=database,
+                        learning_mode="frozen",
+                    )
+                }
+            )
+        }
+    )
+
+    runtime = factory.build_runtime(config, tmp_path / "run")
+    assert isinstance(runtime, CortexRuntimeEngine)
+    assert runtime._playbook_reviewer is not None
+    for step_id, game_loop in ((10, 1_000), (20, 1_224)):
+        runtime.store.append_event(
+            run_id="cortex-run",
+            episode_id="episode-1",
+            step_id=step_id,
+            event_type="situation_assessed",
+            payload={
+                "game_loop": game_loop,
+                "phase": "combat",
+                "threat_level": "high",
+                "economy_status": "stable",
+                "army_readiness": "ready",
+                "own_force": {"estimated_resource_value": 800, "total_units": 8},
+                "visible_enemy_force": {
+                    "estimated_resource_value": 700,
+                    "total_units": 7,
+                },
+                "bases": {"own_base_count": 2, "own_production_capacity": 4},
+                "scouting": {"enemy_visible": True},
+            },
+        )
+
+    result = EpisodeResult(
+        run_id="cortex-run",
+        episode_id="episode-1",
+        scenario="Simple64",
+        seed=0,
+        outcome=EpisodeOutcome.DEFEAT,
+        steps=20,
+    )
+    runtime.end_episode(result)
+    runtime.end_episode(result)
+
+    consequences = runtime.store.events_of_type(
+        "cortex-run",
+        "episode-1",
+        "strategic_consequence_attributed",
+    )
+    reviews = runtime.store.events_of_type(
+        "cortex-run",
+        "episode-1",
+        "postgame_review_completed",
+    )
+    assert len(consequences) == 1
+    assert consequences[0].payload["consequence_type"] == "threat_unanswered"
+    assert len(reviews) == 1
+    assert reviews[0].payload["strategic_consequence_count"] == 1
+    assert (
+        runtime.store.events_of_type(
+            "cortex-run",
+            "episode-1",
+            "playbook_rule_updated",
+        )
+        == []
+    )
+    assert hashlib.sha256(database.read_bytes()).hexdigest() == before
     asyncio.run(runtime.close())
 
 

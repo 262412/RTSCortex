@@ -145,8 +145,9 @@ def _build_cortex_runtime(
         CortexPlaybookReviewer(
             playbook_store,
             promotion_support=config.cortex.playbook.promotion_support,
+            read_only=config.cortex.playbook.learning_mode == "frozen",
         )
-        if (playbook_store is not None and config.cortex.playbook.learning_mode == "evolving")
+        if playbook_store is not None
         else None
     )
     return CortexRuntimeEngine(

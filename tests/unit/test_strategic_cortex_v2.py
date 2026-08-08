@@ -901,7 +901,7 @@ def test_equivalent_intent_matches_across_run_local_operation_ids() -> None:
     rule = PlaybookRule(
         rule_id="rule:avoid-adept",
         canonical_key="avoid-adept",
-        category=PlaybookRuleCategory.EXECUTION_GUARD,
+        category=PlaybookRuleCategory.TACTICAL_RESPONSE,
         conditions=(PlaybookCondition(field="agent_race", value="protoss"),),
         effect=PlaybookRuleEffect.FORBID,
         strength=PlaybookRuleStrength.HARD,
@@ -1002,7 +1002,7 @@ def _intent_counterfactual_key(intent: StrategicIntent) -> str | None:
     rule = PlaybookRule(
         rule_id="rule:no-operation",
         canonical_key="no-operation",
-        category=PlaybookRuleCategory.EXECUTION_GUARD,
+        category=PlaybookRuleCategory.TACTICAL_RESPONSE,
         conditions=(PlaybookCondition(field="agent_race", value="protoss"),),
         effect=PlaybookRuleEffect.FORBID,
         strength=PlaybookRuleStrength.HARD,
@@ -1038,7 +1038,7 @@ def _candidate_counterfactual_keys(
     rule = PlaybookRule(
         rule_id="rule:no-attack",
         canonical_key="no-attack",
-        category=PlaybookRuleCategory.EXECUTION_GUARD,
+        category=PlaybookRuleCategory.TACTICAL_RESPONSE,
         conditions=(PlaybookCondition(field="agent_race", value="protoss"),),
         effect=PlaybookRuleEffect.FORBID,
         strength=PlaybookRuleStrength.HARD,
@@ -1136,7 +1136,7 @@ def test_playbook_matches_hima_semantic_build_action_to_runtime_candidate() -> N
     rule = PlaybookRule(
         rule_id="rule:placement",
         canonical_key="placement",
-        category=PlaybookRuleCategory.EXECUTION_GUARD,
+        category=PlaybookRuleCategory.ENGINE_INVARIANT,
         conditions=(PlaybookCondition(field="agent_race", value="protoss"),),
         effect=PlaybookRuleEffect.AVOID,
         strength=PlaybookRuleStrength.SOFT,

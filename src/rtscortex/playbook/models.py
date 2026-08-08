@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import datetime
 from enum import StrEnum
 from typing import Literal, TypeAlias
@@ -120,6 +122,30 @@ class PlaybookCondition(ContractModel):
     value: PlaybookConditionValue
 
 
+class PlaybookRetryGuardBinding(ContractModel):
+    """Executable preconditions for one bounded retry after terminal failure."""
+
+    schema_version: Literal["1.0"] = "1.0"
+    failure_code: str = Field(min_length=1)
+    require_exact_candidate_signature: Literal[True] = True
+    require_same_operation: Literal[True] = True
+    require_next_attempt: Literal[True] = True
+    max_age_game_loops: int = Field(gt=0, le=10_000)
+
+
+class PlaybookRetryFeedbackEvidence(ContractModel):
+    """Auditable source identity from which a retry guard was derived."""
+
+    schema_version: Literal["1.0"] = "1.0"
+    action_name: str = Field(min_length=1)
+    failure_code: str = Field(min_length=1)
+    candidate_signature: str = Field(pattern=r"^[0-9a-f]{64}$")
+    operation_id: str = Field(pattern=r"^operation:[0-9a-f]{64}$")
+    attempt_ordinal: int = Field(ge=0)
+    terminal_game_loop: int = Field(ge=0)
+    max_age_game_loops: int = Field(gt=0, le=10_000)
+
+
 class PlaybookRule(ContractModel):
     schema_version: str = "2.1"
     rule_id: str = Field(min_length=1)
@@ -131,6 +157,7 @@ class PlaybookRule(ContractModel):
     status: PlaybookRuleStatus
     action_names: tuple[str, ...] = ()
     role_ids: tuple[str, ...] = ()
+    retry_guard: PlaybookRetryGuardBinding | None = None
     confidence: float = Field(ge=0.0, le=1.0)
     support_count: int = Field(default=0, ge=0)
     contradiction_count: int = Field(default=0, ge=0)
@@ -157,11 +184,56 @@ class PlaybookRule(ContractModel):
     qualification_kind: Literal["execution", "strategic"] | None = None
     evidence: dict[str, object] = Field(default_factory=dict)
 
+    @model_validator(mode="after")
+    def validate_retry_guard_scope(self) -> PlaybookRule:
+        if self.retry_guard is None:
+            return self
+        if self.category is not PlaybookRuleCategory.EXECUTION_GUARD:
+            raise ValueError("retry guards require an execution-guard rule")
+        if self.effect not in {PlaybookRuleEffect.AVOID, PlaybookRuleEffect.FORBID}:
+            raise ValueError("retry guards require an avoid or forbid effect")
+        if len(self.action_names) != 1:
+            raise ValueError("retry guards require exactly one bound action")
+        return self
+
     @property
     def false_block_rate(self) -> float:
         if self.shadow_state_count == 0:
             return 0.0
         return self.false_block_count / self.shadow_state_count
+
+
+def playbook_predicate_fingerprint(rule: PlaybookRule) -> str:
+    """Return the stable identity of the exact executable rule predicate."""
+
+    payload = {
+        "category": rule.category.value,
+        "conditions": [condition.model_dump(mode="json") for condition in rule.conditions],
+        "effect": rule.effect.value,
+        "action_names": list(rule.action_names),
+        "role_ids": list(rule.role_ids),
+        "retry_guard": (
+            None if rule.retry_guard is None else rule.retry_guard.model_dump(mode="json")
+        ),
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def playbook_rule_fingerprint(rule: PlaybookRule) -> str:
+    """Return the stable identity of a rule plus its executable predicate."""
+
+    payload = {
+        "predicate_fingerprint": playbook_predicate_fingerprint(rule),
+        "rule_id": rule.rule_id,
+        "canonical_key": rule.canonical_key,
+        "status": rule.status.value,
+        "strength": rule.strength.value,
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
 
 
 class PlaybookRuleApplication(ContractModel):
@@ -189,6 +261,8 @@ class PlaybookRuleApplication(ContractModel):
         pattern=r"^[0-9a-f]{64}$",
     )
     decision_epoch: int | None = Field(default=None, ge=0)
+    rule_fingerprint: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    predicate_fingerprint: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     matched: bool
     blocked: bool = False
     score_delta: float = 0.0
@@ -220,6 +294,8 @@ class PlaybookRuleEvaluation(ContractModel):
         pattern=r"^[0-9a-f]{64}$",
     )
     decision_epoch: int | None = Field(default=None, ge=0)
+    rule_fingerprint: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    predicate_fingerprint: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     counterfactual_observable: bool = False
     strategic_outcome_window_end_game_loop: int | None = Field(default=None, ge=0)
     strength_at_evaluation: PlaybookRuleStrength
@@ -308,6 +384,7 @@ class DecisionCase(ContractModel):
     quality: DecisionQuality
     failure_owner: FailureOwner
     consequence: str = Field(min_length=1)
+    retry_feedback: PlaybookRetryFeedbackEvidence | None = None
     evidence: dict[str, object] = Field(default_factory=dict)
     episode_outcome: str = Field(min_length=1)
     confidence: float = Field(ge=0.0, le=1.0)

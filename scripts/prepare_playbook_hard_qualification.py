@@ -13,6 +13,7 @@ from typing import Any
 
 from rtscortex.playbook import (
     PlaybookRule,
+    PlaybookRuleCategory,
     PlaybookRuleEffect,
     PlaybookRuleKind,
     PlaybookRuleStatus,
@@ -37,7 +38,8 @@ def _sc2_version(worker_stderr: Path) -> tuple[str, str]:
     matches = set(_SC2_VERSION_PATTERN.findall(worker_stderr.read_text(encoding="utf-8")))
     if len(matches) != 1:
         raise ValueError(f"run must attest exactly one SC2 build and patch: {worker_stderr}")
-    return next(iter(matches))
+    build, patch = next(iter(matches))
+    return str(build), str(patch)
 
 
 def _load_source_rows(
@@ -148,6 +150,10 @@ def _eligible_parent(
         and rule.strength is PlaybookRuleStrength.SOFT
         and rule.effect is PlaybookRuleEffect.AVOID
         and evaluation_kind(rule.category) is PlaybookRuleKind.EXECUTION_GUARD
+        and (
+            rule.category is not PlaybookRuleCategory.EXECUTION_GUARD
+            or rule.retry_guard is not None
+        )
         and uncensored_runs == source_run_ids
         and uncensored_seeds == source_seeds
         and len(uncensored_runs) >= 3

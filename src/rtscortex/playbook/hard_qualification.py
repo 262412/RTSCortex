@@ -2,20 +2,25 @@
 
 from __future__ import annotations
 
+import string
+from collections import Counter, defaultdict
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 
 from rtscortex.memory import StoredEvent
 from rtscortex.playbook.models import (
     PlaybookRule,
+    PlaybookRuleApplication,
     PlaybookRuleCategory,
     PlaybookRuleEffect,
+    PlaybookRuleEvaluation,
     PlaybookRuleStatus,
     PlaybookRuleStrength,
 )
 from rtscortex.playbook.readiness import (
     PlaybookHardQualificationManifest,
     PlaybookHardQualificationRunEvidence,
+    _probe_fingerprints,
 )
 from rtscortex.playbook.semantics import evaluation_kind
 
@@ -29,6 +34,43 @@ class HardQualificationEvaluationMetrics:
     unresolved_counterfactual_count: int
     execution_false_block_count: int
     invalid_counterfactual_evidence_count: int
+    structurally_unobservable_counterfactual_count: int = 0
+    invalid_application_count: int = 0
+    application_without_evaluation_count: int = 0
+    evaluation_without_application_count: int = 0
+
+    @property
+    def not_selected_counterfactual_count(self) -> int:
+        """Compatibility alias for the structural ``not_selected`` bucket."""
+
+        return self.structurally_unobservable_counterfactual_count
+
+    @property
+    def counterfactual_not_selected_count(self) -> int:
+        return self.structurally_unobservable_counterfactual_count
+
+    @property
+    def counterfactual_structurally_unobservable_count(self) -> int:
+        return self.structurally_unobservable_counterfactual_count
+
+    @property
+    def classified_application_count(self) -> int:
+        return (
+            self.resolved_counterfactual_count
+            + self.unresolved_counterfactual_count
+            + self.structurally_unobservable_counterfactual_count
+            + self.invalid_application_count
+        )
+
+    @property
+    def application_conservation_count(self) -> int:
+        return self.classified_application_count
+
+    @property
+    def application_conservation_valid(self) -> bool:
+        """Whether every probe application belongs to one classification bucket."""
+
+        return self.application_conservation_count == self.shadow_would_block_application_count
 
     @property
     def execution_false_block_rate(self) -> float:
@@ -41,26 +83,24 @@ def analyze_hard_qualification_evaluations(
     events: Iterable[StoredEvent],
     *,
     rule_id: str,
+    expected_rule_fingerprint: str | None = None,
+    expected_predicate_fingerprint: str | None = None,
 ) -> HardQualificationEvaluationMetrics:
     """Reduce journal events to the latest terminal state of each probe evaluation."""
 
-    applications: set[str] = set()
+    application_events: list[dict[str, object]] = []
     evaluations: dict[str, tuple[int, dict[str, object]]] = {}
+    malformed_evaluation_count = 0
     for event in events:
         payload = event.payload
         if payload.get("rule_id") != rule_id:
             continue
         if event.event_type == "playbook_rule_applied":
-            application_id = payload.get("application_id")
-            if (
-                isinstance(application_id, str)
-                and payload.get("reason") == "shadow_would_block"
-                and payload.get("blocked") is False
-            ):
-                applications.add(application_id)
+            application_events.append(dict(payload))
         elif event.event_type == "playbook_rule_evaluated":
             evaluation_id = payload.get("evaluation_id")
             if not isinstance(evaluation_id, str):
+                malformed_evaluation_count += 1
                 continue
             previous = evaluations.get(evaluation_id)
             if previous is None or event.event_id > previous[0]:
@@ -69,14 +109,67 @@ def analyze_hard_qualification_evaluations(
     resolved = 0
     unresolved = 0
     false_blocks = 0
-    invalid = 0
-    evaluated_application_ids: set[str] = set()
+    structurally_unobservable = 0
+    application_without_evaluation = 0
+    evaluation_without_application = malformed_evaluation_count
+    application_id_counts = Counter(
+        application_id
+        for application in application_events
+        if isinstance((application_id := application.get("application_id")), str)
+    )
+    known_application_ids = set(application_id_counts)
+    valid_applications: dict[str, dict[str, object]] = {}
+    invalid_application_count = 0
+    for application in application_events:
+        application_id = application.get("application_id")
+        if (
+            not isinstance(application_id, str)
+            or application_id_counts[application_id] != 1
+            or not _is_complete_hard_probe_application(
+                application,
+                expected_rule_fingerprint=expected_rule_fingerprint,
+                expected_predicate_fingerprint=expected_predicate_fingerprint,
+            )
+        ):
+            invalid_application_count += 1
+            continue
+        valid_applications[application_id] = application
+
+    evaluations_by_application: defaultdict[str, list[dict[str, object]]] = defaultdict(list)
     for _, evaluation in evaluations.values():
         application_id = evaluation.get("application_id")
-        if isinstance(application_id, str):
-            evaluated_application_ids.add(application_id)
-        if not _is_complete_hard_probe_evaluation(evaluation):
-            invalid += 1
+        if not isinstance(application_id, str) or application_id not in known_application_ids:
+            evaluation_without_application += 1
+            continue
+        evaluations_by_application[application_id].append(evaluation)
+
+    for application_id, application in valid_applications.items():
+        matching_evaluations = evaluations_by_application[application_id]
+        if not matching_evaluations:
+            application_without_evaluation += 1
+            invalid_application_count += 1
+            continue
+        if len(matching_evaluations) != 1:
+            invalid_application_count += 1
+            evaluation_without_application += len(matching_evaluations) - 1
+            continue
+        evaluation = matching_evaluations[0]
+        if not _is_complete_hard_probe_evaluation(
+            evaluation,
+            expected_rule_fingerprint=expected_rule_fingerprint,
+            expected_predicate_fingerprint=expected_predicate_fingerprint,
+        ) or _application_evaluation_schema_mismatch(application, evaluation):
+            invalid_application_count += 1
+            continue
+        if evaluation.get("actual_outcome") == "not_selected":
+            if (
+                evaluation.get("counterfactual_observable") is not False
+                or evaluation.get("execution_false_block", evaluation.get("false_block"))
+                is not None
+            ):
+                invalid_application_count += 1
+                continue
+            structurally_unobservable += 1
             continue
         if evaluation.get("counterfactual_observable") is not True:
             unresolved += 1
@@ -88,13 +181,17 @@ def analyze_hard_qualification_evaluations(
         resolved += 1
         false_blocks += false_block
 
-    unresolved += len(applications - evaluated_application_ids)
+    invalid = invalid_application_count + evaluation_without_application
     return HardQualificationEvaluationMetrics(
-        shadow_would_block_application_count=len(applications),
+        shadow_would_block_application_count=len(application_events),
         resolved_counterfactual_count=resolved,
         unresolved_counterfactual_count=unresolved,
         execution_false_block_count=false_blocks,
         invalid_counterfactual_evidence_count=invalid,
+        structurally_unobservable_counterfactual_count=structurally_unobservable,
+        invalid_application_count=invalid_application_count,
+        application_without_evaluation_count=application_without_evaluation,
+        evaluation_without_application_count=evaluation_without_application,
     )
 
 
@@ -124,8 +221,22 @@ def build_hard_qualification_manifest(
     unresolved = sum(item.unresolved_counterfactual_count for item in ordered_runs)
     false_blocks = sum(item.execution_false_block_count for item in ordered_runs)
     overflow = sum(item.analysis_evidence_overflow_count for item in ordered_runs)
+    structurally_unobservable = sum(
+        item.structurally_unobservable_counterfactual_count for item in ordered_runs
+    )
+    invalid_applications = sum(item.invalid_application_count for item in ordered_runs)
+    application_without_evaluation = sum(
+        item.application_without_evaluation_count for item in ordered_runs
+    )
+    evaluation_without_application = sum(
+        item.evaluation_without_application_count for item in ordered_runs
+    )
+    fingerprints = {(item.rule_fingerprint, item.predicate_fingerprint) for item in ordered_runs}
+    if len(fingerprints) != 1:
+        raise ValueError("hard qualification rejected: fingerprint_identity")
+    rule_fingerprint, predicate_fingerprint = next(iter(fingerprints))
     return PlaybookHardQualificationManifest(
-        schema_version="1.1",
+        schema_version="1.2",
         artifact_kind="playbook-hard-qualification",
         parent_rule_id=parent.rule_id,
         parent_canonical_key=parent.canonical_key,
@@ -147,6 +258,12 @@ def build_hard_qualification_manifest(
         counterfactual_unresolved_count=unresolved,
         counterfactual_false_block_count=false_blocks,
         counterfactual_false_block_rate=false_blocks / resolved,
+        counterfactual_structurally_unobservable_count=structurally_unobservable,
+        counterfactual_invalid_application_count=invalid_applications,
+        application_without_evaluation_count=application_without_evaluation,
+        evaluation_without_application_count=evaluation_without_application,
+        rule_fingerprint=rule_fingerprint,
+        predicate_fingerprint=predicate_fingerprint,
         shadow_state_count=parent.shadow_state_count,
         execution_false_block_count=parent.false_block_count,
         execution_false_block_rate=parent.false_block_rate,
@@ -172,6 +289,8 @@ def _qualification_rejection_reasons(
         reasons.append("parent_not_soft")
     if parent.effect is not PlaybookRuleEffect.AVOID:
         reasons.append("parent_effect_not_avoid")
+    if parent.category is PlaybookRuleCategory.EXECUTION_GUARD and parent.retry_guard is None:
+        reasons.append("parent_missing_typed_retry_binding")
     if evaluation_kind(parent.category).value != "execution_guard":
         reasons.append("strategic_parent_requires_paired_ab")
     if parent.category not in {
@@ -213,6 +332,23 @@ def _qualification_rejection_reasons(
         reasons.append("analysis_evidence_overflow")
     if any(item.invalid_counterfactual_evidence_count for item in runs):
         reasons.append("invalid_counterfactual_evidence")
+    if any(
+        not item.application_conservation_valid
+        or item.invalid_application_count
+        or item.application_without_evaluation_count
+        or item.evaluation_without_application_count
+        for item in runs
+    ):
+        reasons.append("application_conservation")
+    if len({(item.rule_fingerprint, item.predicate_fingerprint) for item in runs}) != 1:
+        reasons.append("fingerprint_identity")
+    expected_fingerprints = _probe_fingerprints(parent)
+    if any(
+        item.rule_fingerprint != expected_fingerprints[0]
+        or item.predicate_fingerprint != expected_fingerprints[1]
+        for item in runs
+    ):
+        reasons.append("fingerprint_mismatch")
     if any(item.shadow_would_block_application_count == 0 for item in runs):
         reasons.append("shadow_would_block_coverage")
     if any(item.resolved_counterfactual_count == 0 for item in runs):
@@ -227,16 +363,99 @@ def _qualification_rejection_reasons(
     return tuple(dict.fromkeys(reasons))
 
 
-def _is_complete_hard_probe_evaluation(evaluation: dict[str, object]) -> bool:
+def _is_complete_hard_probe_application(
+    application: dict[str, object],
+    *,
+    expected_rule_fingerprint: str | None,
+    expected_predicate_fingerprint: str | None,
+) -> bool:
+    try:
+        observed = PlaybookRuleApplication.model_validate(application)
+    except ValueError:
+        return False
+    if (
+        observed.reason != "shadow_would_block"
+        or observed.blocked is not False
+        or observed.rule_kind is None
+        or observed.rule_kind.value != "execution_guard"
+        or not _is_fingerprint(observed.rule_fingerprint)
+        or not _is_fingerprint(observed.predicate_fingerprint)
+    ):
+        return False
+    if (
+        expected_rule_fingerprint is not None
+        and observed.rule_fingerprint != expected_rule_fingerprint
+    ):
+        return False
+    if (
+        expected_predicate_fingerprint is not None
+        and observed.predicate_fingerprint != expected_predicate_fingerprint
+    ):
+        return False
+    return True
+
+
+def _is_complete_hard_probe_evaluation(
+    evaluation: dict[str, object],
+    *,
+    expected_rule_fingerprint: str | None,
+    expected_predicate_fingerprint: str | None,
+) -> bool:
+    try:
+        observed = PlaybookRuleEvaluation.model_validate(evaluation)
+    except ValueError:
+        return False
+    if (
+        observed.strength_at_evaluation is not PlaybookRuleStrength.HARD
+        or observed.status_at_evaluation is not PlaybookRuleStatus.ACTIVE
+        or observed.shadow_decision != "would_block"
+        or observed.rule_kind.value != "execution_guard"
+        or observed.counterfactual_signature is None
+        or observed.behavior_before_hash is None
+        or observed.decision_epoch is None
+        or not _is_fingerprint(observed.rule_fingerprint)
+        or not _is_fingerprint(observed.predicate_fingerprint)
+    ):
+        return False
+    if (
+        expected_rule_fingerprint is not None
+        and observed.rule_fingerprint != expected_rule_fingerprint
+    ):
+        return False
+    if (
+        expected_predicate_fingerprint is not None
+        and observed.predicate_fingerprint != expected_predicate_fingerprint
+    ):
+        return False
+    return True
+
+
+def _application_evaluation_schema_mismatch(
+    application: dict[str, object],
+    evaluation: dict[str, object],
+) -> bool:
+    """Ensure the evaluation is evidence for the exact emitted application."""
+
+    for field in (
+        "application_id",
+        "rule_id",
+        "run_id",
+        "episode_id",
+        "target_kind",
+        "target_id",
+        "rule_kind",
+        "rule_fingerprint",
+        "predicate_fingerprint",
+    ):
+        if application.get(field) != evaluation.get(field):
+            return True
+    return False
+
+
+def _is_fingerprint(value: object) -> bool:
     return (
-        evaluation.get("strength_at_evaluation") == "hard"
-        and evaluation.get("status_at_evaluation") == "active"
-        and evaluation.get("shadow_decision") == "would_block"
-        and evaluation.get("rule_kind") == "execution_guard"
-        and isinstance(evaluation.get("application_id"), str)
-        and isinstance(evaluation.get("counterfactual_key"), str)
-        and isinstance(evaluation.get("counterfactual_signature"), str)
-        and isinstance(evaluation.get("behavior_before_hash"), str)
-        and isinstance(evaluation.get("decision_epoch"), int)
-        and isinstance(evaluation.get("counterfactual_observable"), bool)
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in string.hexdigits for character in value)
+        and value == value.lower()
     )

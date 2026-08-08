@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
@@ -1150,21 +1151,69 @@ def _health_delta_engagement_collisions(
     reports: Sequence[tuple[int, dict[str, Any]]],
 ) -> int:
     engagements: defaultdict[tuple[Any, ...], set[str]] = defaultdict(set)
+    invalid_confirmations = 0
     for _, payload in reports:
         evidence = _evidence(payload)
-        if evidence.get("effect_kind") != "combat" or not evidence.get("target_health_delta"):
+        if evidence.get("effect_kind") != "combat":
             continue
+        confirmation_kind = evidence.get("confirmation_kind")
+        if payload.get("status") != "succeeded" or confirmation_kind not in {
+            "target_damaged",
+            "target_removed",
+        }:
+            continue
+
+        confirmed_game_loop = evidence.get("confirmed_game_loop")
+        if confirmed_game_loop is None:
+            confirmed_game_loop = evidence.get("confirmed_loop")
         engagement = evidence.get("engagement_id")
-        if not isinstance(engagement, str):
+        target_tag = evidence.get("target_tag")
+        baseline = _finite_number(evidence.get("baseline_target_health"))
+        observed = _finite_number(evidence.get("observed_target_health"))
+        delta = _finite_number(evidence.get("target_health_delta"))
+        if (
+            not isinstance(confirmed_game_loop, int)
+            or isinstance(confirmed_game_loop, bool)
+            or confirmed_game_loop < 0
+            or not isinstance(engagement, str)
+            or not engagement
+            or not isinstance(target_tag, str)
+            or not target_tag
+            or baseline is None
+            or observed is None
+            or delta is None
+        ):
+            # A claimed confirmation without a complete, internally consistent
+            # health transition is itself an attribution failure.  Failed and
+            # unconfirmed reports were filtered above and remain diagnostics.
+            invalid_confirmations += 1
+            continue
+        if (
+            baseline < 0
+            or observed < 0
+            or delta < 0
+            or observed > baseline
+            or not math.isclose(delta, baseline - observed, rel_tol=0.0, abs_tol=1e-6)
+            or confirmation_kind == "target_damaged"
+            and delta <= 0
+        ):
+            invalid_confirmations += 1
             continue
         key = (
-            evidence.get("target_tag"),
-            evidence.get("confirmed_game_loop"),
-            evidence.get("baseline_target_health"),
-            evidence.get("observed_target_health"),
+            target_tag,
+            confirmed_game_loop,
+            baseline,
+            observed,
         )
         engagements[key].add(engagement)
-    return sum(max(0, len(values) - 1) for values in engagements.values())
+    return invalid_confirmations + sum(max(0, len(values) - 1) for values in engagements.values())
+
+
+def _finite_number(value: Any) -> float | None:
+    if not isinstance(value, int | float) or isinstance(value, bool):
+        return None
+    numeric = float(value)
+    return numeric if math.isfinite(numeric) else None
 
 
 def _expansion_immediate_rearms(events: Sequence[StoredEvent]) -> int:

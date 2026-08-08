@@ -445,6 +445,101 @@ def test_same_actor_retry_after_terminal_is_new_attack_attempt(tmp_path: Path) -
     assert report["diagnostics"]["unchanged_attack_redispatch_count"] == 0
 
 
+def test_health_delta_collision_ignores_failed_or_unconfirmed_evidence(tmp_path: Path) -> None:
+    events = [
+        _combat_execution(
+            1,
+            status="failed",
+            confirmation_kind="target_damaged",
+            engagement_id="engagement:failed",
+        ),
+        _combat_execution(
+            2,
+            status="unconfirmed",
+            confirmation_kind="target_damaged",
+            engagement_id="engagement:unconfirmed",
+        ),
+    ]
+
+    report = build_engineering_gate_report(
+        events,
+        run_dir=tmp_path,
+        natural_run_baseline_bytes_per_loop=100.0,
+    )
+
+    assert report["diagnostics"]["health_delta_engagement_collision_count"] == 0
+    assert report["gates"]["health_delta_engagement_attribution_valid"]["passed"] is True
+
+
+def test_confirmed_health_evidence_requires_complete_attribution(tmp_path: Path) -> None:
+    for field, value in (
+        ("confirmed_game_loop", None),
+        ("engagement_id", None),
+        ("target_tag", None),
+        ("observed_target_health", 100.0),
+        ("target_health_delta", None),
+    ):
+        evidence = _combat_execution(1, confirmation_kind="target_damaged").payload[
+            "effect_evidence"
+        ]
+        evidence[field] = value
+
+        report = build_engineering_gate_report(
+            [_event(1, "execution", {**_combat_execution(1).payload, "effect_evidence": evidence})],
+            run_dir=tmp_path,
+            natural_run_baseline_bytes_per_loop=100.0,
+        )
+
+        assert report["diagnostics"]["health_delta_engagement_collision_count"] == 1
+        assert report["gates"]["health_delta_engagement_attribution_valid"]["passed"] is False
+
+
+def test_same_confirmed_health_transition_in_distinct_engagements_collides(
+    tmp_path: Path,
+) -> None:
+    events = [
+        _combat_execution(1, engagement_id="engagement:first"),
+        _combat_execution(2, engagement_id="engagement:second"),
+    ]
+
+    report = build_engineering_gate_report(
+        events,
+        run_dir=tmp_path,
+        natural_run_baseline_bytes_per_loop=100.0,
+    )
+
+    assert report["diagnostics"]["health_delta_engagement_collision_count"] == 1
+    assert report["gates"]["health_delta_engagement_attribution_valid"]["passed"] is False
+
+
+def test_target_removed_confirmation_is_grouped_even_without_health_delta(tmp_path: Path) -> None:
+    events = [
+        _combat_execution(
+            1,
+            confirmation_kind="target_removed",
+            observed_target_health=100.0,
+            target_health_delta=0.0,
+            engagement_id="engagement:first",
+        ),
+        _combat_execution(
+            2,
+            confirmation_kind="target_removed",
+            observed_target_health=100.0,
+            target_health_delta=0.0,
+            engagement_id="engagement:second",
+        ),
+    ]
+
+    report = build_engineering_gate_report(
+        events,
+        run_dir=tmp_path,
+        natural_run_baseline_bytes_per_loop=100.0,
+    )
+
+    assert report["diagnostics"]["health_delta_engagement_collision_count"] == 1
+    assert report["gates"]["health_delta_engagement_attribution_valid"]["passed"] is False
+
+
 def test_cross_type_overlapping_footprint_fails_gate(tmp_path: Path) -> None:
     events = [
         _ledger_transition(
@@ -689,6 +784,40 @@ def _attack_dispatch(
                 "name": "Attack_Unit",
                 "actor": actor,
                 "arguments": ["0xdead"],
+            },
+        },
+    )
+
+
+def _combat_execution(
+    event_id: int,
+    *,
+    status: str = "succeeded",
+    confirmation_kind: str | None = "target_damaged",
+    target_tag: str | None = "0xdead",
+    confirmed_game_loop: int | None = 108,
+    engagement_id: str | None = "engagement:shared",
+    baseline_target_health: float | None = 100.0,
+    observed_target_health: float | None = 90.0,
+    target_health_delta: float | None = 10.0,
+) -> StoredEvent:
+    return _event(
+        event_id,
+        "execution",
+        {
+            "command_id": f"attack-{event_id}",
+            "action_name": "Attack_Unit",
+            "status": status,
+            "execution_stage": "effect_verification",
+            "effect_evidence": {
+                "effect_kind": "combat",
+                "confirmation_kind": confirmation_kind,
+                "target_tag": target_tag,
+                "confirmed_game_loop": confirmed_game_loop,
+                "engagement_id": engagement_id,
+                "baseline_target_health": baseline_target_health,
+                "observed_target_health": observed_target_health,
+                "target_health_delta": target_health_delta,
             },
         },
     )

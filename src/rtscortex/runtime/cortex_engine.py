@@ -2879,6 +2879,12 @@ class CortexRuntimeEngine(RuntimeEngine):
                 behavior_before_hash=counterfactual_observation_fingerprint(observation),
                 mode=mode,
                 recent_feedback=recent_feedback,
+                operation_id=intent.operation_id,
+                attempt_ordinal=(
+                    None
+                    if intent.operation_id is None
+                    else self._attempt_ordinals.get(intent.operation_id, 0)
+                ),
             )
             self._record_playbook_applications(observation, result.applications)
             if result.blocked:
@@ -2950,6 +2956,8 @@ class CortexRuntimeEngine(RuntimeEngine):
                 counterfactual_signature=application.counterfactual_signature,
                 behavior_before_hash=application.behavior_before_hash,
                 decision_epoch=application.decision_epoch,
+                rule_fingerprint=application.rule_fingerprint,
+                predicate_fingerprint=application.predicate_fingerprint,
                 counterfactual_observable=False,
                 strategic_outcome_window_end_game_loop=(
                     application.game_loop + 448
@@ -3269,7 +3277,12 @@ class CortexRuntimeEngine(RuntimeEngine):
                 self._urgent_replan_requested = True
 
     def _remember_terminal_feedback(self, report: ExecutionReport) -> None:
-        if report.action_name is None or report.actor is None:
+        if (
+            report.action_name is None
+            or report.actor is None
+            or report.operation_id is None
+            or report.attempt_ordinal is None
+        ):
             return
         arguments = report.requested_arguments or report.resolved_arguments
         signature = candidate_signature(
@@ -3277,8 +3290,9 @@ class CortexRuntimeEngine(RuntimeEngine):
             report.actor,
             arguments,
         )
+        feedback_key = f"{report.operation_id}|{signature}"
         if report.status is ExecutionStatus.SUCCEEDED:
-            self._recent_terminal_feedback.pop(signature, None)
+            self._recent_terminal_feedback.pop(feedback_key, None)
             return
         if report.status is not ExecutionStatus.FAILED:
             return
@@ -3291,13 +3305,17 @@ class CortexRuntimeEngine(RuntimeEngine):
         }
         hard_suppression = (report.failure_code or "") in hard_failure_codes
         cooldown = 336 if hard_suppression else 112
-        self._recent_terminal_feedback[signature] = RecentTerminalFeedback(
+        terminal_game_loop = self._execution_game_loop(report)
+        self._recent_terminal_feedback[feedback_key] = RecentTerminalFeedback(
             signature=signature,
             action_name=report.action_name,
             actor=report.actor,
             failure_code=report.failure_code or "unknown_failure",
             command_id=report.command_id,
-            expires_game_loop=self._execution_game_loop(report) + cooldown,
+            operation_id=report.operation_id,
+            attempt_ordinal=report.attempt_ordinal,
+            terminal_game_loop=terminal_game_loop,
+            expires_game_loop=terminal_game_loop + cooldown,
             hard_suppression=hard_suppression,
         )
 

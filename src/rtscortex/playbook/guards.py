@@ -17,9 +17,12 @@ from rtscortex.playbook.models import (
     PlaybookRoleId,
     PlaybookRule,
     PlaybookRuleApplication,
+    PlaybookRuleCategory,
     PlaybookRuleEffect,
     PlaybookRuleStatus,
     PlaybookRuleStrength,
+    playbook_predicate_fingerprint,
+    playbook_rule_fingerprint,
 )
 from rtscortex.playbook.semantics import evaluation_kind
 
@@ -39,6 +42,9 @@ class RecentTerminalFeedback:
     actor: str
     failure_code: str
     command_id: str
+    operation_id: str
+    attempt_ordinal: int
+    terminal_game_loop: int
     expires_game_loop: int
     hard_suppression: bool
 
@@ -99,6 +105,8 @@ class PlaybookCandidateGuard:
         behavior_before_hash: str | None = None,
         mode: Literal["shadow", "active"] = "shadow",
         recent_feedback: Sequence[RecentTerminalFeedback] = (),
+        operation_id: str | None = None,
+        attempt_ordinal: int | None = None,
     ) -> GuardResult:
         values = _values(
             context,
@@ -125,6 +133,9 @@ class PlaybookCandidateGuard:
             behavior_before_hash=behavior_before_hash,
             decision_epoch=game_loop,
             mode=mode,
+            recent_feedback=recent_feedback,
+            operation_id=operation_id,
+            attempt_ordinal=attempt_ordinal,
         )
         signature = candidate_signature(
             candidate.action_name,
@@ -135,7 +146,13 @@ class PlaybookCandidateGuard:
             (
                 item
                 for item in recent_feedback
-                if item.signature == signature and item.expires_game_loop >= game_loop
+                if _terminal_feedback_matches(
+                    item,
+                    signature=signature,
+                    operation_id=operation_id,
+                    attempt_ordinal=attempt_ordinal,
+                    game_loop=game_loop,
+                )
             ),
             None,
         )
@@ -248,6 +265,9 @@ def _evaluate(
     behavior_before_hash: str | None,
     decision_epoch: int,
     mode: Literal["shadow", "active"],
+    recent_feedback: Sequence[RecentTerminalFeedback] = (),
+    operation_id: str | None = None,
+    attempt_ordinal: int | None = None,
 ) -> GuardResult:
     applicable = [
         rule
@@ -257,6 +277,15 @@ def _evaluate(
             or rule.status is PlaybookRuleStatus.CANDIDATE
         )
         and all(condition_matches(condition, values) for condition in rule.conditions)
+        and _rule_retry_binding_matches(
+            rule,
+            target_kind=target_kind,
+            counterfactual_signature=counterfactual_signature,
+            recent_feedback=recent_feedback,
+            operation_id=operation_id,
+            attempt_ordinal=attempt_ordinal,
+            game_loop=game_loop,
+        )
     ]
     required = {
         _action_key(action)
@@ -327,6 +356,8 @@ def _evaluate(
                     counterfactual_signature=counterfactual_signature,
                     behavior_before_hash=behavior_before_hash,
                     decision_epoch=decision_epoch,
+                    rule_fingerprint=playbook_rule_fingerprint(rule),
+                    predicate_fingerprint=playbook_predicate_fingerprint(rule),
                     matched=matched,
                     blocked=effective_block,
                     score_delta=rule_delta,
@@ -348,6 +379,61 @@ def _evaluate(
         score_delta=delta if mode == "active" else 0.0,
         rule_ids=tuple(dict.fromkeys(applied_ids)),
         applications=tuple(applications),
+    )
+
+
+def _rule_retry_binding_matches(
+    rule: PlaybookRule,
+    *,
+    target_kind: Literal["intent", "candidate"],
+    counterfactual_signature: str,
+    recent_feedback: Sequence[RecentTerminalFeedback],
+    operation_id: str | None,
+    attempt_ordinal: int | None,
+    game_loop: int,
+) -> bool:
+    binding = rule.retry_guard
+    if binding is None:
+        return not (
+            rule.category is PlaybookRuleCategory.EXECUTION_GUARD
+            and rule.effect in {PlaybookRuleEffect.AVOID, PlaybookRuleEffect.FORBID}
+            and rule.evidence.get("canary_fixture") is not True
+        )
+    if target_kind != "candidate":
+        return False
+    return any(
+        feedback.failure_code == binding.failure_code
+        and _terminal_feedback_matches(
+            feedback,
+            signature=counterfactual_signature,
+            operation_id=operation_id,
+            attempt_ordinal=attempt_ordinal,
+            game_loop=game_loop,
+            max_age_game_loops=binding.max_age_game_loops,
+        )
+        for feedback in recent_feedback
+    )
+
+
+def _terminal_feedback_matches(
+    feedback: RecentTerminalFeedback,
+    *,
+    signature: str,
+    operation_id: str | None,
+    attempt_ordinal: int | None,
+    game_loop: int,
+    max_age_game_loops: int | None = None,
+) -> bool:
+    if operation_id is None or attempt_ordinal is None:
+        return False
+    age = game_loop - feedback.terminal_game_loop
+    return (
+        feedback.signature == signature
+        and feedback.operation_id == operation_id
+        and attempt_ordinal == feedback.attempt_ordinal + 1
+        and age >= 0
+        and feedback.expires_game_loop >= game_loop
+        and (max_age_game_loops is None or age <= max_age_game_loops)
     )
 
 

@@ -11,6 +11,7 @@ from rtscortex.playbook import (
     PlaybookCondition,
     PlaybookConditionOperator,
     PlaybookHardReadinessReport,
+    PlaybookRetryGuardBinding,
     PlaybookRule,
     PlaybookRuleCategory,
     PlaybookRuleEffect,
@@ -21,6 +22,8 @@ from rtscortex.playbook import (
     analyze_hard_readiness_database,
     create_canary_fixture,
     evaluation_kind,
+    playbook_predicate_fingerprint,
+    playbook_rule_fingerprint,
     qualify_hard_rule,
 )
 
@@ -49,6 +52,18 @@ def _soft_rule() -> PlaybookRule:
         shadow_state_count=48,
         code_revision=GIT_SHA,
         sc2_patch="4.10",
+        retry_guard=PlaybookRetryGuardBinding(
+            failure_code="build_target_lost",
+            max_age_game_loops=224,
+        ),
+        evidence={
+            "rule_fingerprint": "d" * 64,
+            "predicate_fingerprint": "e" * 64,
+            "typed_retry_binding": {
+                "schema_version": "1.0",
+                "kind": "execution_guard_retry",
+            },
+        },
     )
 
 
@@ -71,6 +86,14 @@ def _qualification_manifest(
     **updates: object,
 ) -> None:
     probe_sha256 = "c" * 64
+    probe = parent.model_copy(
+        update={
+            "effect": PlaybookRuleEffect.FORBID,
+            "strength": PlaybookRuleStrength.HARD,
+        }
+    )
+    probe_rule_fingerprint = playbook_rule_fingerprint(probe)
+    probe_predicate_fingerprint = playbook_predicate_fingerprint(probe)
     qualification_runs = [
         {
             "seed_id": seed,
@@ -93,11 +116,17 @@ def _qualification_manifest(
             "resolved_counterfactual_count": 1,
             "unresolved_counterfactual_count": 0,
             "execution_false_block_count": 0,
+            "structurally_unobservable_counterfactual_count": 0,
+            "invalid_application_count": 0,
+            "application_without_evaluation_count": 0,
+            "evaluation_without_application_count": 0,
+            "rule_fingerprint": probe_rule_fingerprint,
+            "predicate_fingerprint": probe_predicate_fingerprint,
         }
         for seed in (0, 1, 2)
     ]
     payload: dict[str, object] = {
-        "schema_version": "1.1",
+        "schema_version": "1.2",
         "artifact_kind": "playbook-hard-qualification",
         "parent_rule_id": parent.rule_id,
         "parent_canonical_key": parent.canonical_key,
@@ -118,6 +147,12 @@ def _qualification_manifest(
         "shadow_state_count": 48,
         "execution_false_block_count": 0,
         "execution_false_block_rate": 0.0,
+        "counterfactual_structurally_unobservable_count": 0,
+        "counterfactual_invalid_application_count": 0,
+        "application_without_evaluation_count": 0,
+        "evaluation_without_application_count": 0,
+        "rule_fingerprint": probe_rule_fingerprint,
+        "predicate_fingerprint": probe_predicate_fingerprint,
     }
     payload.update(updates)
     path.write_text(json.dumps(payload), encoding="utf-8")
@@ -199,6 +234,8 @@ def test_soft_rule_readiness_fails_with_audit_reasons(tmp_path: Path) -> None:
     assert audit.source_seed_ids == (0, 1, 2)
     assert audit.execution_false_block_rate == 0.0
     assert audit.code_revision == GIT_SHA
+    assert audit.rule_fingerprint == playbook_rule_fingerprint(_soft_rule())
+    assert audit.predicate_fingerprint == playbook_predicate_fingerprint(_soft_rule())
 
 
 def test_qualification_creates_disjoint_hard_child_without_mutating_parent(
@@ -256,6 +293,7 @@ def test_tactical_response_qualification_kind_matches_shared_evaluation_kind(
             "rule_id": "tactical-soft-rule",
             "canonical_key": "tactical-soft-rule",
             "category": PlaybookRuleCategory.TACTICAL_RESPONSE,
+            "retry_guard": None,
         }
     )
     _write_store(database, parent)
@@ -307,7 +345,9 @@ def test_strategic_hard_qualification_requires_paired_outcome_evidence(
 ) -> None:
     database = tmp_path / "playbook.sqlite3"
     manifest = tmp_path / "qualification.json"
-    strategic = _soft_rule().model_copy(update={"category": PlaybookRuleCategory.MATCHUP_STRATEGY})
+    strategic = _soft_rule().model_copy(
+        update={"category": PlaybookRuleCategory.MATCHUP_STRATEGY, "retry_guard": None}
+    )
     _write_store(database, strategic)
     _qualification_manifest(manifest, database, strategic)
     store = PlaybookStore(database)
@@ -469,13 +509,87 @@ def test_parent_without_revision_bound_evidence_cannot_be_restamped(
         store.close()
 
 
+def test_legacy_execution_guard_without_typed_retry_binding_is_ineligible(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "playbook.sqlite3"
+    manifest = tmp_path / "qualification.json"
+    parent = _soft_rule().model_copy(update={"retry_guard": None})
+    _write_store(database, parent)
+    _qualification_manifest(manifest, database, parent)
+    store = PlaybookStore(database)
+    try:
+        with pytest.raises(ValueError, match="typed retry binding"):
+            qualify_hard_rule(
+                store,
+                parent_rule_id=parent.rule_id,
+                expected_git_sha=GIT_SHA,
+                sc2_patch="4.10",
+                qualification_manifest_path=manifest,
+                evaluation_seed_ids=(3, 4, 5),
+            )
+    finally:
+        store.close()
+
+
+def test_legacy_qualification_manifest_schema_is_rejected_fail_closed(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "playbook.sqlite3"
+    manifest = tmp_path / "qualification.json"
+    parent = _soft_rule()
+    _write_store(database, parent)
+    _qualification_manifest(manifest, database, parent, schema_version="1.1")
+    store = PlaybookStore(database)
+    try:
+        with pytest.raises(ValueError, match="invalid hard qualification manifest"):
+            qualify_hard_rule(
+                store,
+                parent_rule_id=parent.rule_id,
+                expected_git_sha=GIT_SHA,
+                sc2_patch="4.10",
+                qualification_manifest_path=manifest,
+                evaluation_seed_ids=(3, 4, 5),
+            )
+    finally:
+        store.close()
+
+
+def test_current_manifest_missing_conservation_field_is_rejected_fail_closed(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "playbook.sqlite3"
+    manifest = tmp_path / "qualification.json"
+    parent = _soft_rule()
+    _write_store(database, parent)
+    _qualification_manifest(manifest, database, parent)
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    del payload["counterfactual_invalid_application_count"]
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+    store = PlaybookStore(database)
+    try:
+        with pytest.raises(ValueError, match="invalid hard qualification manifest"):
+            qualify_hard_rule(
+                store,
+                parent_rule_id=parent.rule_id,
+                expected_git_sha=GIT_SHA,
+                sc2_patch="4.10",
+                qualification_manifest_path=manifest,
+                evaluation_seed_ids=(3, 4, 5),
+            )
+    finally:
+        store.close()
+
+
 def test_strategic_ab_artifact_is_hashed_and_identity_bound(tmp_path: Path) -> None:
     children: list[PlaybookRule] = []
     for index, improvement in enumerate((0.1, 0.2)):
         database = tmp_path / f"playbook-{index}.sqlite3"
         manifest = tmp_path / f"qualification-{index}.json"
         strategic_path = tmp_path / f"strategic-{index}.json"
-        parent = _soft_rule().model_copy(update={"category": PlaybookRuleCategory.MATCHUP_STRATEGY})
+        parent = _soft_rule().model_copy(
+            update={"category": PlaybookRuleCategory.MATCHUP_STRATEGY, "retry_guard": None}
+        )
         _write_store(database, parent)
         _qualification_manifest(manifest, database, parent)
         _strategic_ab_manifest(
@@ -528,6 +642,7 @@ def test_one_valid_rule_does_not_hide_stale_active_hard_rule(tmp_path: Path) -> 
                 "canonical_key": "stale-hard",
                 "code_revision": "b" * 40,
                 "effect": PlaybookRuleEffect.REQUIRE,
+                "retry_guard": None,
             }
         )
         store.upsert_rule(stale)
