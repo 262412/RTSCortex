@@ -1779,6 +1779,50 @@ Two limitations are deliberately still visible:
   - a canary with a permuted held-out seed tuple is rejected;
   - direct analyzer invocation with noncanonical seed order fails closed.
 
+#### 2026-08-08 production hard-qualification evidence closure
+
+- **Status:** implemented in code and deterministic tests. A formal run remains
+  blocked until the natural-terminal shadow qualification and production
+  Active/Shadow canary both pass at the exact new revision.
+- **Evidence and root cause:** the accepted seed 0/1/2 engineering runs were
+  executed with Playbook rules disabled. They can reconstruct multi-seed soft
+  parents and historical situation coverage, but they contain no
+  `playbook_rule_applied` or `playbook_rule_evaluated` counterfactual outcome.
+  The former schema allowed a boolean `counterfactual_evidence_accepted`
+  without binding the natural-terminal runs that justified it.
+- **Implemented correction:**
+  - source runs are aggregated into a separate soft baseline; their original
+    Git SHA, engineering reports, reviewed source identity, event journals and
+    actual `SC2.<patch>` startup line are hashed without changing the runs;
+  - eligible soft parents are copied to a separate, frozen qualification DB as
+    `HARD + FORBID` probes. The qualification config is shadow-only, so probes
+    never change the gameplay action stream and cannot enter production;
+  - every parent must resolve at least one terminally observable execution
+    counterfactual in each of the three qualification seeds. Missing,
+    unselected, malformed or unresolved evidence fails closed. A succeeded
+    action remains a real false block, and the aggregate false-block rate must
+    remain at or below one percent;
+  - manifest schema 1.1 binds each run ID/path, seed, event/gate/Worker hashes,
+    immutable probe hash, current Git SHA, source fingerprint, SC2 build/patch,
+    engineering acceptance, overflow and per-run counterfactual counts;
+  - only the best actually accepted parent is promoted in the clean soft
+    baseline. Hard readiness then revalidates the derived production baseline
+    for held-out seeds 3/4/5 before the production canary can start.
+- **Acceptance criteria:**
+  - ordinary three-seed engineering acceptance cannot satisfy hard
+    qualification without real shadow rule evaluations;
+  - the historical source SHA and current qualification SHA remain distinct
+    and auditable;
+  - qualification probes are frozen, shadow-only and identical before/after
+    every run;
+  - every qualification seed is natural-terminal, engineering-accepted and
+    source/SC2-attested, with zero analysis overflow and zero unresolved
+    counterfactuals;
+  - no manifest is emitted when every prospective parent is unobserved or has
+    a false-block rate above the hard gate;
+  - fixture evidence and qualification probes remain ineligible for formal
+    production use.
+
 ## Repair order
 
 1. Freeze characterization tests and add the cross-layer `OperationKey`,

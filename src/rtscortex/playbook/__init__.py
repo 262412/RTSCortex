@@ -8,6 +8,11 @@ from rtscortex.playbook.guards import (
     RecentTerminalFeedback,
     candidate_signature,
 )
+from rtscortex.playbook.hard_qualification import (
+    HardQualificationEvaluationMetrics,
+    analyze_hard_qualification_evaluations,
+    build_hard_qualification_manifest,
+)
 from rtscortex.playbook.learning import (
     LearnedEpisode,
     PlaybookLearningResult,
@@ -41,6 +46,7 @@ from rtscortex.playbook.models import (
 from rtscortex.playbook.promotion import PlaybookPromotionSweep, PromotionSweepResult
 from rtscortex.playbook.readiness import (
     PlaybookHardQualificationManifest,
+    PlaybookHardQualificationRunEvidence,
     PlaybookHardReadinessReport,
     PlaybookRuleReadiness,
     PlaybookStrategicABQualificationArtifact,
@@ -72,8 +78,10 @@ __all__ = [
     "PlaybookRunLearner",
     "RecentTerminalFeedback",
     "GuardResult",
+    "HardQualificationEvaluationMetrics",
     "PlaybookHit",
     "PlaybookHardQualificationManifest",
+    "PlaybookHardQualificationRunEvidence",
     "PlaybookHardReadinessReport",
     "PlaybookLesson",
     "PlaybookQuery",
@@ -99,6 +107,8 @@ __all__ = [
     "PlaybookStrategicABQualificationArtifact",
     "analyze_hard_readiness",
     "analyze_hard_readiness_database",
+    "analyze_hard_qualification_evaluations",
+    "build_hard_qualification_manifest",
     "candidate_signature",
     "contains_canary_fixture",
     "create_canary_fixture",

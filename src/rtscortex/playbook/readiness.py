@@ -95,21 +95,52 @@ class PlaybookRuleReadiness(ContractModel):
     rejection_reasons: tuple[str, ...]
 
 
-class PlaybookHardQualificationManifest(ContractModel):
-    """Typed evidence produced by qualification-only runs."""
+class PlaybookHardQualificationRunEvidence(ContractModel):
+    """Immutable evidence from one natural-terminal shadow qualification run."""
 
-    schema_version: Literal["1.0"]
+    seed_id: int = Field(ge=0)
+    run_id: str = Field(min_length=1)
+    run_directory: str = Field(min_length=1)
+    events_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    engineering_gates_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    worker_stderr_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    playbook_before_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    playbook_after_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    git_sha: str = Field(pattern=r"^[0-9a-f]{40}$")
+    source_attestation_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    sc2_build: str = Field(min_length=1)
+    sc2_patch: str = Field(min_length=1)
+    natural_terminal: bool
+    engineering_accepted: bool
+    analysis_evidence_overflow_count: int = Field(ge=0)
+    invalid_counterfactual_evidence_count: int = Field(ge=0)
+    shadow_would_block_application_count: int = Field(ge=0)
+    resolved_counterfactual_count: int = Field(ge=0)
+    unresolved_counterfactual_count: int = Field(ge=0)
+    execution_false_block_count: int = Field(ge=0)
+
+
+class PlaybookHardQualificationManifest(ContractModel):
+    """Typed, artifact-bound evidence produced by qualification-only runs."""
+
+    schema_version: Literal["1.1"]
     artifact_kind: Literal["playbook-hard-qualification"]
     parent_rule_id: str = Field(min_length=1)
     parent_canonical_key: str = Field(min_length=1)
     baseline_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    probe_baseline_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     git_sha: str = Field(pattern=r"^[0-9a-f]{40}$")
     sc2_patch: str = Field(min_length=1)
     qualification_seed_ids: tuple[int, ...]
     source_run_ids: tuple[str, ...]
+    qualification_runs: tuple[PlaybookHardQualificationRunEvidence, ...]
     engineering_accepted: bool
     counterfactual_evidence_accepted: bool
     analysis_evidence_overflow_count: int = Field(ge=0)
+    counterfactual_resolved_count: int = Field(ge=0)
+    counterfactual_unresolved_count: int = Field(ge=0)
+    counterfactual_false_block_count: int = Field(ge=0)
+    counterfactual_false_block_rate: float = Field(ge=0.0, le=1.0)
     shadow_state_count: int = Field(ge=0)
     execution_false_block_count: int = Field(ge=0)
     execution_false_block_rate: float = Field(ge=0.0, le=1.0)
@@ -839,6 +870,7 @@ def _validate_qualification_manifest(
     qualification_seeds: tuple[int, ...],
 ) -> None:
     expected_runs = tuple(sorted(set(parent.source_run_ids) - set(parent.censored_source_run_ids)))
+    manifest_integrity_reasons = _qualification_manifest_integrity_reasons(manifest)
     checks = {
         "parent_rule_id": manifest.parent_rule_id == parent.rule_id,
         "parent_canonical_key": manifest.parent_canonical_key == parent.canonical_key,
@@ -857,11 +889,14 @@ def _validate_qualification_manifest(
         "execution_false_block_rate": (
             abs(manifest.execution_false_block_rate - parent.false_block_rate) < 1e-12
         ),
+        "qualification_run_evidence": not manifest_integrity_reasons,
     }
     failures = [name for name, accepted in checks.items() if not accepted]
     if failures:
+        failures.extend(manifest_integrity_reasons)
         raise ValueError(
-            "qualification manifest does not match the parent evidence: " + ", ".join(failures)
+            "qualification manifest does not match the parent evidence: "
+            + ", ".join(dict.fromkeys(failures))
         )
 
 
@@ -933,6 +968,7 @@ def _qualification_evidence_reasons(
         or manifest.analysis_evidence_overflow_count
     ):
         reasons.append("qualification_manifest_not_accepted")
+    reasons.extend(_qualification_manifest_integrity_reasons(manifest))
     if not isinstance(manifest_sha256, str) or manifest_sha256 not in rule.evidence_hashes:
         reasons.append("qualification_manifest_hash_unbound")
     strategic_payload = rule.evidence.get("strategic_ab_manifest")
@@ -957,6 +993,59 @@ def _qualification_evidence_reasons(
                     or strategic_sha256 not in rule.evidence_hashes
                 ):
                     reasons.append("strategic_ab_hash_unbound")
+    return tuple(reasons)
+
+
+def _qualification_manifest_integrity_reasons(
+    manifest: PlaybookHardQualificationManifest,
+) -> tuple[str, ...]:
+    runs = manifest.qualification_runs
+    resolved = sum(item.resolved_counterfactual_count for item in runs)
+    unresolved = sum(item.unresolved_counterfactual_count for item in runs)
+    false_blocks = sum(item.execution_false_block_count for item in runs)
+    reasons: list[str] = []
+    if len(runs) < 3 or len({item.run_id for item in runs}) != len(runs):
+        reasons.append("qualification_manifest_run_evidence_incomplete")
+    if {item.run_id for item in runs} & set(manifest.source_run_ids):
+        reasons.append("qualification_manifest_source_run_reused")
+    if {item.seed_id for item in runs} != set(manifest.qualification_seed_ids):
+        reasons.append("qualification_manifest_run_seed_mismatch")
+    if len({item.source_attestation_fingerprint for item in runs}) != 1:
+        reasons.append("qualification_manifest_source_attestation_mismatch")
+    if any(
+        item.git_sha != manifest.git_sha
+        or item.sc2_patch != manifest.sc2_patch
+        or item.playbook_before_sha256 != manifest.probe_baseline_sha256
+        or item.playbook_after_sha256 != manifest.probe_baseline_sha256
+        for item in runs
+    ):
+        reasons.append("qualification_manifest_probe_identity_mismatch")
+    if any(
+        not item.natural_terminal
+        or not item.engineering_accepted
+        or item.analysis_evidence_overflow_count
+        or item.invalid_counterfactual_evidence_count
+        or item.shadow_would_block_application_count == 0
+        or item.resolved_counterfactual_count == 0
+        for item in runs
+    ):
+        reasons.append("qualification_manifest_run_not_accepted")
+    if (
+        resolved != manifest.counterfactual_resolved_count
+        or unresolved != manifest.counterfactual_unresolved_count
+        or false_blocks != manifest.counterfactual_false_block_count
+        or manifest.analysis_evidence_overflow_count
+        != sum(item.analysis_evidence_overflow_count for item in runs)
+    ):
+        reasons.append("qualification_manifest_counterfactual_aggregate_mismatch")
+    observed_rate = false_blocks / resolved if resolved else 0.0
+    if (
+        resolved == 0
+        or unresolved
+        or abs(observed_rate - manifest.counterfactual_false_block_rate) >= 1e-12
+        or observed_rate > 0.01
+    ):
+        reasons.append("qualification_manifest_counterfactual_gate_failed")
     return tuple(reasons)
 
 
