@@ -1129,6 +1129,116 @@ def test_builder_lease_is_exact_and_released_at_terminal() -> None:
     assert service.leased_builder_tags == frozenset()
 
 
+def test_new_observation_revision_replaces_reservation_with_closed_ledger_chain() -> None:
+    service = RawPlacementService(unit_names={2: "Probe"})
+    first_observation = SimpleNamespace(
+        raw_units=[_unit(0xB1, 2, alliance=1, x=20, y=20)],
+        feature_units=[],
+        feature_screen=None,
+        game_loop=[100],
+    )
+    newer_observation = SimpleNamespace(
+        raw_units=[_unit(0xB1, 2, alliance=1, x=21, y=20)],
+        feature_units=[],
+        feature_screen=None,
+        game_loop=[116],
+    )
+
+    first = service.resolve(
+        command_id="build-across-observations",
+        action_name="Build_Pylon_Screen",
+        requested_arguments=([64, 64],),
+        observation=first_observation,
+        world_target=(30.0, 25.0),
+        builder_tag=0xB1,
+        ability_name="Build_Pylon_pt",
+    )
+    same_revision = service.resolve(
+        command_id="build-across-observations",
+        action_name="Build_Pylon_Screen",
+        requested_arguments=([64, 64],),
+        observation=first_observation,
+        world_target=(30.0, 25.0),
+        builder_tag=0xB1,
+        ability_name="Build_Pylon_pt",
+    )
+    refreshed = service.resolve(
+        command_id="build-across-observations",
+        action_name="Build_Pylon_Screen",
+        requested_arguments=([64, 64],),
+        observation=newer_observation,
+        world_target=(30.0, 25.0),
+        builder_tag=0xB1,
+        ability_name="Build_Pylon_pt",
+    )
+
+    assert same_revision.reservation_id == first.reservation_id
+    assert refreshed.reservation_id != first.reservation_id
+    transitions = service.drain_transition_history("build-across-observations")
+    assert [
+        (transition["reservation_id"], transition["previous_state"], transition["next_state"])
+        for transition in transitions
+    ] == [
+        (first.reservation_id, "unreserved", "reserved"),
+        (first.reservation_id, "reserved", "released"),
+        (refreshed.reservation_id, "unreserved", "reserved"),
+    ]
+    assert transitions[1]["release_reason"] == "reservation_replaced"
+    assert service.leased_builder_tags == frozenset({0xB1})
+
+
+def test_builder_rebind_closes_old_reservation_before_acquiring_new_lease() -> None:
+    service = RawPlacementService(unit_names={2: "Probe"})
+    observation = SimpleNamespace(
+        raw_units=[
+            _unit(0xB1, 2, alliance=1, x=20, y=20),
+            _unit(0xB2, 2, alliance=1, x=21, y=20),
+        ],
+        feature_units=[],
+        feature_screen=None,
+        game_loop=[100],
+    )
+
+    first = service.resolve(
+        command_id="build-rebound",
+        action_name="Build_Pylon_Screen",
+        requested_arguments=([64, 64],),
+        observation=observation,
+        world_target=(30.0, 25.0),
+        builder_tags=(0xB1, 0xB2),
+        builder_tag=0xB1,
+        ability_name="Build_Pylon_pt",
+    )
+    rebound = service.resolve(
+        command_id="build-rebound",
+        action_name="Build_Pylon_Screen",
+        requested_arguments=([64, 64],),
+        observation=observation,
+        world_target=(30.0, 25.0),
+        builder_tags=(0xB1, 0xB2),
+        builder_tag=0xB2,
+        ability_name="Build_Pylon_pt",
+    )
+
+    assert rebound.reservation_id != first.reservation_id
+    assert service.leased_builder_tags == frozenset({0xB2})
+    assert service.builder_lease_owner(0xB1) is None
+    assert service.builder_lease_owner(0xB2) == "build-rebound"
+    transitions = service.drain_transition_history("build-rebound")
+    assert [
+        (transition["reservation_id"], transition["previous_state"], transition["next_state"])
+        for transition in transitions
+    ] == [
+        (first.reservation_id, "unreserved", "reserved"),
+        (first.reservation_id, "reserved", "released"),
+        (rebound.reservation_id, "unreserved", "reserved"),
+    ]
+    assert transitions[1]["release_reason"] == "reservation_replaced"
+
+    service.release_command("build-rebound", game_loop=101)
+    assert service.leased_builder_tags == frozenset()
+
+
 def test_placement_transition_is_durable_before_command_terminal() -> None:
     durable_events: list[dict[str, object]] = []
     service = RawPlacementService(

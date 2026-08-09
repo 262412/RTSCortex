@@ -638,6 +638,20 @@ def test_seed2_far_staged_builder_is_authorized_by_exact_tag_and_target() -> Non
 
     assert dispatch is not None
     assert dispatch.approach_only is False
+    assert dispatch.reservation_id != approach_dispatch.reservation_id
+    placement_transitions = executor.placement_service.drain_transition_history("seed2-far-pylon")
+    assert [
+        (
+            transition["reservation_id"],
+            transition["previous_state"],
+            transition["next_state"],
+        )
+        for transition in placement_transitions
+    ] == [
+        (approach_dispatch.reservation_id, "unreserved", "reserved"),
+        (approach_dispatch.reservation_id, "reserved", "released"),
+        (dispatch.reservation_id, "unreserved", "reserved"),
+    ]
     assert query.calls == [{"builder_tag": 0xB2, "ability_id": 881, "world_target": target}]
     assert executor.diagnostic_snapshot["builder_tag"] == "0xb2"
     assert executor.diagnostic_snapshot["target_legality_fingerprint"] == "legal:test"

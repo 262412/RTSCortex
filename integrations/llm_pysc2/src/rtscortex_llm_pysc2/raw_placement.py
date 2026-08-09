@@ -1470,25 +1470,6 @@ class RawPlacementService:
             emitted,
             anchor_tag=anchor_tag,
         )
-        existing = self._command_targets.get(command_id)
-        if (
-            existing is not None
-            and existing.action_name == action_name
-            and existing.builder_tag == normalized_builder
-            and existing.world_target == emitted
-        ):
-            refreshed = replace(
-                existing,
-                requested_world_target=requested_target,
-                final_validated_world_target=emitted,
-                placement_revision=current_revision,
-                target_state_revision=target_state_revision,
-                baseline_builder_orders=baseline_builder_orders,
-                expires_game_loop=max(existing.expires_game_loop, int(expires_game_loop or 0)),
-                placement_state="reserved",
-            )
-            self._command_targets[command_id] = refreshed
-            return refreshed
         reservation = RawPlacementReservation(
             command_id=command_id,
             operation_id=operation_id,
@@ -1522,6 +1503,29 @@ class RawPlacementService:
             ),
             attempt_ordinal=(None if attempt_ordinal is None else int(attempt_ordinal)),
         )
+        existing = self._command_targets.get(command_id)
+        if existing is not None and existing.reservation_id == reservation.reservation_id:
+            refreshed = replace(
+                existing,
+                requested_world_target=requested_target,
+                final_validated_world_target=emitted,
+                placement_revision=current_revision,
+                target_state_revision=target_state_revision,
+                baseline_builder_orders=baseline_builder_orders,
+                expires_game_loop=max(existing.expires_game_loop, int(expires_game_loop or 0)),
+            )
+            self._command_targets[command_id] = refreshed
+            return refreshed
+        if existing is not None:
+            self._record_transition(
+                command_id,
+                reservation=existing,
+                previous_state=existing.placement_state,
+                next_state="released",
+                game_loop=game_loop,
+                release_reason="reservation_replaced",
+            )
+            self._release_builder_lease(existing)
         self._command_targets[command_id] = reservation
         self._record_transition(
             command_id,
