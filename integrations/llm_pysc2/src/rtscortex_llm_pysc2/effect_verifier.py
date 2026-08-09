@@ -257,6 +257,14 @@ class ActionEffectVerifier:
             return
         self._get(command_id).resolved_arguments = tuple(arguments)
 
+    def record_action_result(self, command_id: str, results: Sequence[Any]) -> None:
+        """Refresh the pending reservation snapshot with SC2 acceptance evidence."""
+
+        del results
+        pending = self._pending.get(command_id)
+        if pending is not None and self.placement_service is not None:
+            pending.reservation_snapshot = self.placement_service.command_target(command_id)
+
     def prepare(
         self,
         command_id: str,
@@ -479,6 +487,9 @@ class ActionEffectVerifier:
                         ),
                         target_state_revision=(
                             None if reservation is None else reservation.target_state_revision
+                        ),
+                        material_legality_identity=(
+                            None if reservation is None else reservation.material_legality_identity
                         ),
                         failure_classification=evidence.get("failure_classification"),
                         classification_basis=evidence.get("classification_basis", ()),
@@ -1012,7 +1023,40 @@ class ActionEffectVerifier:
             "builder_health_max": (None if current.builder is None else current.builder.health_max),
             "observation_revision": (None if baseline is None else baseline.observation_revision),
             "failure_observation_revision": current.observation_revision,
-            "placement_query_result": "unavailable_no_controller_access",
+            "available_ability_query": (
+                "unavailable_no_controller_access"
+                if reservation is None or reservation.available_ability_query is None
+                else reservation.available_ability_query
+            ),
+            "placement_query_result": (
+                "unavailable_no_controller_access"
+                if reservation is None or reservation.placement_query_result is None
+                else reservation.placement_query_result
+            ),
+            "ability_id": None if reservation is None else reservation.ability_id,
+            "target_legality_fingerprint": (
+                None if reservation is None else reservation.target_legality_fingerprint
+            ),
+            "material_legality_identity": (
+                None if reservation is None else reservation.material_legality_identity
+            ),
+            "build_authorization_details": (
+                {} if reservation is None else dict(reservation.build_authorization_details)
+            ),
+            "primitive_constructed_game_loop": (
+                None if reservation is None else reservation.primitive_constructed_game_loop
+            ),
+            "primitive_submitted_game_loop": (
+                None if reservation is None else reservation.primitive_submitted_game_loop
+            ),
+            "action_result": (
+                []
+                if reservation is None or reservation.action_result is None
+                else list(reservation.action_result)
+            ),
+            "action_result_seen": (
+                reservation is not None and reservation.action_result is not None
+            ),
             "baseline_structure_tags": (
                 [] if baseline is None else [hex(item.tag) for item in baseline.structures]
             ),

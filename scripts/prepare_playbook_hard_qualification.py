@@ -11,6 +11,9 @@ import shutil
 from pathlib import Path
 from typing import Any
 
+import yaml
+
+from rtscortex.memory import read_event_log
 from rtscortex.playbook import (
     PlaybookRule,
     PlaybookRuleCategory,
@@ -20,6 +23,8 @@ from rtscortex.playbook import (
     PlaybookRuleStrength,
     PlaybookRunLearner,
     PlaybookStore,
+    TypedRetryCoverageBySeed,
+    analyze_typed_retry_coverage_by_seed,
     evaluation_kind,
 )
 
@@ -42,6 +47,22 @@ def _sc2_version(worker_stderr: Path) -> tuple[str, str]:
     return str(build), str(patch)
 
 
+def _runtime_context_from_config(config_path: Path) -> dict[str, object]:
+    try:
+        payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        environment = payload["environment"]
+        if not isinstance(environment, dict):
+            return {}
+    except (OSError, KeyError, TypeError, ValueError, yaml.YAMLError):
+        return {}
+    context: dict[str, object] = {}
+    for field in ("agent_race", "opponent_race", "scenario"):
+        value = environment.get(field)
+        if isinstance(value, str) and value:
+            context["map_name" if field == "scenario" else field] = value
+    return context
+
+
 def _load_source_rows(
     status_path: Path,
     run_directories: tuple[Path, ...],
@@ -60,12 +81,16 @@ def _load_source_rows(
     builds: set[str] = set()
     source_git_shas: set[str] = set()
     attestation_payloads: set[str] = set()
+    config_hashes_by_seed: dict[int, str] = {}
     for row in rows:
         run_directory = Path(row["run_dir"]).expanduser().resolve()
         gates_path = run_directory / "engineering-gates.json"
         events_path = run_directory / "events.jsonl"
         worker_stderr = run_directory / "worker.stderr.log"
-        if not all(path.is_file() for path in (gates_path, events_path, worker_stderr)):
+        config_path = run_directory / "config.yaml"
+        if not all(
+            path.is_file() for path in (gates_path, events_path, worker_stderr, config_path)
+        ):
             raise ValueError(f"source run is missing required artifacts: {run_directory}")
         gates = json.loads(gates_path.read_text(encoding="utf-8"))
         evidence = gates.get("evidence", {})
@@ -108,6 +133,10 @@ def _load_source_rows(
             )
         builds.add(sc2_build)
         source_git_shas.add(source_git_sha)
+        config_sha256 = _sha256_file(config_path)
+        if seed in config_hashes_by_seed:
+            raise ValueError(f"source status contains duplicate seed {seed}")
+        config_hashes_by_seed[seed] = config_sha256
         attestation = json.dumps(
             {
                 "git_sha": source_git_sha,
@@ -129,11 +158,26 @@ def _load_source_rows(
                 "events_sha256": _sha256_file(events_path),
                 "engineering_gates_sha256": _sha256_file(gates_path),
                 "worker_stderr_sha256": _sha256_file(worker_stderr),
+                "config_path": str(config_path),
+                "config_sha256": config_sha256,
             }
         )
-    if len(builds) != 1 or len(source_git_shas) != 1 or len(attestation_payloads) != 1:
+    if (
+        len(builds) != 1
+        or len(source_git_shas) != 1
+        or len(attestation_payloads) != 1
+        or set(config_hashes_by_seed) != {int(entry["seed_id"]) for entry in source_entries}
+    ):
         raise ValueError("source runs do not share one source and SC2 attestation")
-    fingerprint = hashlib.sha256(next(iter(attestation_payloads)).encode()).hexdigest()
+    fingerprint_payload = {
+        "common_attestation": next(iter(attestation_payloads)),
+        "config_sha256_by_seed": {
+            str(seed): config_hashes_by_seed[seed] for seed in sorted(config_hashes_by_seed)
+        },
+    }
+    fingerprint = hashlib.sha256(
+        json.dumps(fingerprint_payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
     return source_entries, next(iter(builds)), fingerprint, next(iter(source_git_shas))
 
 
@@ -142,6 +186,7 @@ def _eligible_parent(
     *,
     source_run_ids: set[str],
     source_seeds: set[int],
+    typed_retry_coverage: TypedRetryCoverageBySeed,
 ) -> bool:
     uncensored_runs = set(rule.source_run_ids) - set(rule.censored_source_run_ids)
     uncensored_seeds = set(rule.source_seeds) - set(rule.censored_source_seeds)
@@ -163,6 +208,7 @@ def _eligible_parent(
         and rule.shadow_state_count >= 48
         and rule.false_block_rate <= 0.01
         and bool(rule.action_names or rule.role_ids)
+        and typed_retry_coverage.has_real_opportunity_every_seed
     )
 
 
@@ -188,6 +234,18 @@ def prepare_hard_qualification(
         run_directories,
         sc2_patch=sc2_patch,
     )
+    events_by_seed = {
+        int(entry["seed_id"]): tuple(
+            read_event_log(Path(str(entry["run_directory"])) / "events.jsonl")
+        )
+        for entry in source_entries
+    }
+    context_values_by_seed = {
+        int(entry["seed_id"]): _runtime_context_from_config(
+            Path(str(entry["run_directory"])) / "config.yaml"
+        )
+        for entry in source_entries
+    }
     baseline_output.parent.mkdir(parents=True, exist_ok=True)
     store = PlaybookStore(baseline_output)
     try:
@@ -198,19 +256,41 @@ def prepare_hard_qualification(
         )
         learned_run_ids = {episode.run_id for episode in learning.learned_episodes}
         learned_seeds = {episode.seed for episode in learning.learned_episodes}
-        parent_candidates = [
+        typed_coverage_by_rule: dict[str, TypedRetryCoverageBySeed] = {}
+        typed_diagnostics: dict[str, dict[str, object]] = {}
+        candidate_pool = [
             rule
             for rule in store.rules()
+            if (
+                rule.status is PlaybookRuleStatus.ACTIVE
+                and rule.strength is PlaybookRuleStrength.SOFT
+                and evaluation_kind(rule.category) is PlaybookRuleKind.EXECUTION_GUARD
+            )
+        ]
+        for rule in candidate_pool:
+            coverage = analyze_typed_retry_coverage_by_seed(
+                events_by_seed,
+                rule=rule,
+                context_values_by_seed=context_values_by_seed,
+            )
+            typed_coverage_by_rule[rule.rule_id] = coverage
+            typed_diagnostics[rule.rule_id] = coverage.as_dict()
+        parent_candidates = [
+            rule
+            for rule in candidate_pool
             if _eligible_parent(
                 rule,
                 source_run_ids=learned_run_ids,
                 source_seeds=learned_seeds,
+                typed_retry_coverage=typed_coverage_by_rule[rule.rule_id],
             )
         ]
         parent_candidates.sort(key=lambda rule: (-rule.shadow_state_count, rule.rule_id))
         if not parent_candidates:
             raise ValueError(
-                "no three-seed active soft execution rule is eligible for qualification"
+                "no three-seed active soft execution rule is eligible for qualification; "
+                "typed_retry_coverage_unavailable diagnostics per rule/seed: "
+                + json.dumps(typed_diagnostics, sort_keys=True)
             )
         if len(parent_candidates) > max_probes:
             raise ValueError(
@@ -235,6 +315,9 @@ def prepare_hard_qualification(
                         "sc2_patch": sc2_patch,
                         "evidence": {
                             **parent.evidence,
+                            "typed_retry_coverage": typed_coverage_by_rule[
+                                parent.rule_id
+                            ].as_dict(),
                             "hard_qualification_source_binding": source_binding,
                         },
                     }
@@ -288,6 +371,33 @@ def prepare_hard_qualification(
         "source_status_path": str(source_status.resolve()),
         "source_status_sha256": _sha256_file(source_status),
         "source_runs": source_entries,
+        "typed_retry_opportunity_count_by_parent_seed": {
+            rule.rule_id: {
+                str(seed): count
+                for seed, count in typed_coverage_by_rule[
+                    rule.rule_id
+                ].typed_retry_opportunity_count_by_seed.items()
+            }
+            for rule in bound_parents
+        },
+        "typed_retry_application_count_by_parent_seed": {
+            rule.rule_id: {
+                str(seed): count
+                for seed, count in typed_coverage_by_rule[
+                    rule.rule_id
+                ].typed_retry_application_count_by_seed.items()
+            }
+            for rule in bound_parents
+        },
+        "typed_retry_coverage_unavailable_by_parent_seed": {
+            rule_id: {
+                str(seed): list(reasons)
+                for seed, reasons in coverage.unavailable_reasons_by_seed.items()
+            }
+            for rule_id, coverage in typed_coverage_by_rule.items()
+            if coverage.typed_retry_coverage_unavailable
+        },
+        "typed_retry_coverage_diagnostics": typed_diagnostics,
     }
     plan_output.write_text(json.dumps(plan, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return plan

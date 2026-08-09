@@ -763,6 +763,11 @@ def _normalized_placement_transition(payload: dict[str, Any]) -> dict[str, Any]:
             "breaker_open",
             "circuit_breaker_triggered",
             "breaker_tripped",
+            "material_legality_identity",
+            "target_legality_fingerprint",
+            "available_ability_query",
+            "placement_query_result",
+            "ability_id",
         ):
             if key in no_start:
                 normalized[key] = no_start[key]
@@ -786,6 +791,14 @@ def _normalized_placement_transition(payload: dict[str, Any]) -> dict[str, Any]:
         "previous_state",
         "release_reason",
         "actor_failure",
+        "material_legality_identity",
+        "target_legality_fingerprint",
+        "available_ability_query",
+        "placement_query_result",
+        "ability_id",
+        "primitive_constructed_game_loop",
+        "primitive_submitted_game_loop",
+        "action_result",
     ):
         if key in payload:
             normalized[key] = payload[key]

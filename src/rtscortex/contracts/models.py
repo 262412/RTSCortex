@@ -271,6 +271,7 @@ class PlacementNoStartEvidence(ContractModel):
     duplicate_attempt: bool
     suppressed_target: bool
     target_side_evidence: bool
+    material_duplicate: bool = False
     next_action: str = Field(min_length=1)
     attempt_ordinal: int | None = Field(default=None, ge=0)
     failure_classification: str | None = None
@@ -289,6 +290,14 @@ class PlacementLedgerTransition(ContractModel):
     game_loop: int = Field(ge=0)
     release_reason: str | None = None
     target_state_revision: str | None = None
+    ability_id: int | None = Field(default=None, ge=0)
+    available_ability_query: str | None = None
+    placement_query_result: str | None = None
+    target_legality_fingerprint: str | None = None
+    material_legality_identity: str | None = None
+    primitive_constructed_game_loop: int | None = Field(default=None, ge=0)
+    primitive_submitted_game_loop: int | None = Field(default=None, ge=0)
+    action_result: list[int] | None = None
     placement_no_start: PlacementNoStartEvidence | None = None
 
 
@@ -368,7 +377,16 @@ class EffectEvidence(ContractModel):
     builder_health_max: float | None = Field(default=None, ge=0)
     observation_revision: str | None = None
     failure_observation_revision: str | None = None
+    available_ability_query: str | None = None
     placement_query_result: str | None = None
+    ability_id: int | None = Field(default=None, ge=0)
+    target_legality_fingerprint: str | None = None
+    material_legality_identity: str | None = None
+    build_authorization_details: dict[str, Any] = Field(default_factory=dict)
+    primitive_constructed_game_loop: int | None = Field(default=None, ge=0)
+    primitive_submitted_game_loop: int | None = Field(default=None, ge=0)
+    action_result: list[int] = Field(default_factory=list)
+    action_result_seen: bool = False
     requested_producer_tag: str | None = None
     producer_tag: str | None = None
     producer_type: str | None = None

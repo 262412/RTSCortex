@@ -7,6 +7,8 @@ from rtscortex.playbook.guards import (
     PlaybookIntentGuard,
     RecentTerminalFeedback,
     candidate_signature,
+    typed_candidate_predicate_matches,
+    typed_retry_binding_matches,
 )
 from rtscortex.playbook.hard_qualification import (
     HardQualificationEvaluationMetrics,
@@ -62,6 +64,13 @@ from rtscortex.playbook.readiness import (
     qualify_hard_rule,
     validate_runtime_hard_rule_approval,
 )
+from rtscortex.playbook.retry_coverage import (
+    TypedRetryCoverage,
+    TypedRetryCoverageBySeed,
+    TypedRetryOpportunityBinding,
+    analyze_typed_retry_coverage,
+    analyze_typed_retry_coverage_by_seed,
+)
 from rtscortex.playbook.reviewer import CortexPlaybookReviewer
 from rtscortex.playbook.semantics import evaluation_kind
 from rtscortex.playbook.store import PlaybookStore
@@ -103,6 +112,9 @@ __all__ = [
     "PlaybookRuleLifecycle",
     "PlaybookPromotionSweep",
     "PromotionSweepResult",
+    "TypedRetryCoverage",
+    "TypedRetryCoverageBySeed",
+    "TypedRetryOpportunityBinding",
     "StrategicABEvidence",
     "StrategicConditionSnapshot",
     "StrategicConsequence",
@@ -114,8 +126,12 @@ __all__ = [
     "analyze_hard_readiness",
     "analyze_hard_readiness_database",
     "analyze_hard_qualification_evaluations",
+    "analyze_typed_retry_coverage",
+    "analyze_typed_retry_coverage_by_seed",
     "build_hard_qualification_manifest",
     "candidate_signature",
+    "typed_candidate_predicate_matches",
+    "typed_retry_binding_matches",
     "contains_canary_fixture",
     "create_canary_fixture",
     "evaluation_kind",

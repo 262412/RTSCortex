@@ -6814,6 +6814,57 @@ def test_broker_attributes_builder_failure_and_combat_success_in_same_step() -> 
     assert reports["command-combat"]["primitive_trace"][0]["failure_code"] is None
 
 
+@pytest.mark.parametrize(
+    "failure_code",
+    ["placement_query_rejected_cached", "operation_no_start_circuit_open"],
+)
+def test_raw_build_authorization_tombstones_remain_pre_dispatch(
+    failure_code: str,
+) -> None:
+    runtime = FakeRuntime()
+    coordinator = BridgeCoordinator(runtime)
+    broker = SharedDecisionBroker(
+        coordinator,
+        TimeStepExtractor("run-worker", "episode-worker"),
+    )
+    _register_bridge_route(
+        broker,
+        coordinator,
+        _bridge_route(
+            "Builder",
+            ("Builder-Probe-1",),
+            RoutedCommand(
+                command_id="command-builder-authorization",
+                actor="Builder/Builder-Probe-1",
+                team_name="Builder-Probe-1",
+                name="Build_Pylon_Screen",
+                rendered_action="<Build_Pylon_Screen([30,25])>",
+                requested_arguments=([30, 25],),
+                resolved_arguments=([30, 25],),
+            ),
+            step_id=903,
+        ),
+    )
+
+    rejected = broker.reject_command(
+        "Builder",
+        "Builder-Probe-1",
+        "Build_Pylon_Screen",
+        failure_code=failure_code,
+    )
+    assert rejected is not None
+    broker.settle_primitive(
+        rejected,
+        success=False,
+        failure_reason=failure_code,
+        game_loop=20812,
+    )
+
+    report = runtime.execution_reports[0]
+    assert report["execution_stage"] == "pre_dispatch"
+    assert report["primitive_trace"][0]["accepted"] is False
+
+
 def test_broker_keeps_same_attack_action_isolated_by_explicit_team() -> None:
     runtime = FakeRuntime()
     coordinator = BridgeCoordinator(runtime)
@@ -7042,6 +7093,78 @@ def test_worker_maps_next_action_result_to_pysc2_rejection_and_clears_chain() ->
             "detail": "PySC2 action result 1",
         }
     ]
+
+
+def test_worker_keeps_approach_move_pending_without_build_quarantine() -> None:
+    settled: list[tuple[PrimitiveDispatch, bool, str | None, int]] = []
+    action_results: list[tuple[str, list[int]]] = []
+    rejected: list[str] = []
+
+    class Broker:
+        def settle_primitive(
+            self,
+            dispatch: PrimitiveDispatch,
+            *,
+            success: bool,
+            failure_reason: str | None,
+            game_loop: int,
+        ) -> None:
+            settled.append((dispatch, success, failure_reason, game_loop))
+
+    approach = PrimitiveDispatch(
+        command_id="approach-command",
+        function_name="Move_Move_pt",
+        final_primitive=False,
+        origin="translator",
+        ordinal=0,
+        total=1,
+        requested_function_id=547,
+        emitted_function_id=547,
+    )
+    pending_raw = SimpleNamespace(
+        command=SimpleNamespace(command_id="approach-command"),
+        primitive=approach,
+        approach_only=True,
+    )
+    raw_executor = SimpleNamespace(
+        diagnostic_snapshot={},
+        mark_primitive_submitted=lambda command_id, *, game_loop: None,
+        record_action_result=lambda command_id, values: action_results.append(
+            (command_id, list(values))
+        ),
+        record_rejection=lambda *args, **kwargs: rejected.append("rejected"),
+    )
+    main_agent = cast(Any, object.__new__(RTSCortexMainAgent))
+    main_agent._pending_raw_dispatch = pending_raw
+    main_agent._pending_raw_observation = SimpleNamespace()
+    main_agent._pending_raw_game_loop = 100
+    main_agent._pending_primitive = None
+    main_agent._pending_primitive_agent = None
+    main_agent.raw_executor = raw_executor
+    main_agent.decision_broker = Broker()
+    main_agent.runtime_client = SimpleNamespace(
+        profiler=SimpleNamespace(observe_milliseconds=lambda *args: None)
+    )
+
+    main_agent.record_environment_step(0.1)
+
+    assert main_agent._pending_primitive is approach
+    assert main_agent._pending_raw_dispatch is pending_raw
+
+    main_agent._settle_previous_primitive(
+        SimpleNamespace(observation=SimpleNamespace(game_loop=[116], action_result=[1]))
+    )
+
+    assert action_results == [("approach-command", [1])]
+    assert rejected == []
+    assert len(settled) == 1
+    settled_dispatch, success, failure_reason, game_loop = settled[0]
+    assert settled_dispatch.final_primitive is False
+    assert success is False
+    assert failure_reason == "PySC2 action result 1"
+    assert game_loop == 116
+    assert main_agent._pending_primitive is None
+    assert main_agent._pending_raw_dispatch is None
 
 
 def test_worker_anchors_production_selection_barrier_to_acceptance_observation() -> None:

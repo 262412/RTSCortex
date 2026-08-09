@@ -864,6 +864,124 @@ def test_rejected_materialization_does_not_consume_dispatch_attempt_ordinal(
     asyncio.run(runtime.close())
 
 
+def test_raw_build_tombstone_defers_before_candidate_preparation(tmp_path: Path) -> None:
+    runtime = CortexRuntimeEngine(
+        config=_config(tmp_path, macro=False),
+        store=_store(tmp_path),
+        provider=FakeProvider(),
+    )
+    observation = _macro_observation(step_id=1, game_loop=32)
+    runtime._current_situation = DeterministicSituationAnalyzer().assess(observation)
+    intent = TacticalIntent(
+        intent_id="raw-build-tombstone-intent",
+        run_id=observation.run_id,
+        episode_id=observation.episode_id,
+        step_id=observation.step_id,
+        created_game_loop=observation.game_loop,
+        objective="Construct a Pylon",
+        action_names=["Build_Pylon_Screen"],
+        actor_scopes=["Builder/Probe-1"],
+        source_id="test",
+        source_version="1",
+        ttl_game_loops=16,
+    )
+    strategic = runtime._strategic_adapter.adapt(intent)
+    assert strategic.operation_id is not None
+    runtime._raw_build_material_tombstones = {strategic.operation_id: {"build-legality:old"}}
+
+    # One no-start identity is retained for duplicate-attempt accounting, but
+    # the upper Cortex tombstone only engages after the bridge circuit opens.
+    assert runtime._compile_intent(observation, intent) is not None
+    next_observation = observation.model_copy(update={"step_id": 2, "game_loop": 33})
+    runtime._current_situation = DeterministicSituationAnalyzer().assess(next_observation)
+    runtime._raw_build_material_tombstone_circuits.add(strategic.operation_id)
+    assert (
+        runtime._compile_intent(
+            next_observation,
+            intent.model_copy(update={"step_id": 2, "created_game_loop": 33}),
+        )
+        is None
+    )
+    churned_intent = intent.model_copy(
+        update={
+            "intent_id": "raw-build-tombstone-intent-recreated",
+            "step_id": 3,
+            "created_game_loop": 34,
+        }
+    )
+    churned_observation = observation.model_copy(update={"step_id": 3, "game_loop": 34})
+    runtime._current_situation = DeterministicSituationAnalyzer().assess(churned_observation)
+    assert runtime._strategic_adapter.adapt(churned_intent).operation_id == strategic.operation_id
+    assert runtime._compile_intent(churned_observation, churned_intent) is None
+    assert runtime._candidate_compiler is not None
+    assert runtime._strategic_by_legacy_intent[intent.intent_id].hard_blockers == (
+        "raw_build_material_tombstone",
+    )
+    deferred = runtime.store.events_of_type(
+        observation.run_id,
+        observation.episode_id,
+        "raw_build_tombstone_defer",
+    )
+    assert len(deferred) == 2
+    assert deferred[0].payload["operation_id"] == strategic.operation_id
+    asyncio.run(runtime.close())
+
+
+def test_raw_build_tombstones_checkpoint_and_recovery_tail(tmp_path: Path) -> None:
+    observation = _macro_observation(step_id=2, game_loop=64)
+    operation_id = f"operation:{'a' * 64}"
+    first = CortexRuntimeEngine(
+        config=_config(tmp_path, macro=False),
+        store=_store(tmp_path),
+        provider=FakeProvider(),
+    )
+
+    async def checkpoint_and_append() -> None:
+        await first._activate_episode(observation)
+        first._raw_build_material_tombstones = {operation_id: {"build-legality:checkpoint"}}
+        first._raw_build_material_tombstone_circuits = {operation_id}
+        first._record_cortex_checkpoint(observation)
+        first.store.append_event(
+            run_id=observation.run_id,
+            episode_id=observation.episode_id,
+            step_id=observation.step_id + 1,
+            event_type="placement_ledger_transition",
+            payload={
+                "command_id": "raw-build-command",
+                "action_name": "Build_Pylon_Screen",
+                "transition": {
+                    "next_state": "released",
+                    "placement_no_start": {
+                        "operation_id": operation_id,
+                        "status": "defer_replan",
+                        "circuit_open": True,
+                        "evidence": {"material_legality_identity": "build-legality:tail"},
+                    },
+                },
+            },
+        )
+        await first.close()
+
+    asyncio.run(checkpoint_and_append())
+    recovered = CortexRuntimeEngine(
+        config=_config(tmp_path, macro=False),
+        store=_store(tmp_path),
+        provider=FakeProvider(),
+    )
+
+    async def recover() -> None:
+        await recovered._activate_episode(
+            observation.model_copy(update={"step_id": 3, "game_loop": 65})
+        )
+        assert recovered._raw_build_material_tombstones == {
+            operation_id: {"build-legality:checkpoint", "build-legality:tail"}
+        }
+        assert recovered._raw_build_material_tombstone_circuits == {operation_id}
+        await recovered.close()
+
+    asyncio.run(recover())
+
+
 def test_opaque_future_step_cannot_dispatch_before_replan(tmp_path: Path) -> None:
     client = _FakeMacroClient(
         "Actions: ['Pylon', 'Gateway', 'Assimilator', 'CyberneticsCore', 'Stargate', 'Zealot']"

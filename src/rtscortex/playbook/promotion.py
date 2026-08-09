@@ -11,6 +11,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, cast
 
+import yaml
+
+from rtscortex.memory import StoredEvent, read_event_log
 from rtscortex.playbook.conditions import condition_matches
 from rtscortex.playbook.lifecycle import PlaybookRuleLifecycle
 from rtscortex.playbook.models import (
@@ -19,9 +22,16 @@ from rtscortex.playbook.models import (
     PlaybookRule,
     PlaybookRuleCategory,
     PlaybookRuleEffect,
+    PlaybookRuleKind,
     PlaybookRuleStatus,
     PlaybookRuleStrength,
 )
+from rtscortex.playbook.retry_coverage import (
+    TypedRetryCoverage,
+    TypedRetryCoverageBySeed,
+    analyze_typed_retry_coverage,
+)
+from rtscortex.playbook.semantics import evaluation_kind
 from rtscortex.playbook.store import PlaybookStore
 
 _SITUATION_FIELDS = {
@@ -91,12 +101,78 @@ class PlaybookPromotionSweep:
         matched_counts: dict[str, int] = {}
         rejected: dict[str, str] = {}
         situation_cache: dict[str, tuple[tuple[dict[str, object], int], ...] | None] = {}
+        event_cache: dict[str, tuple[StoredEvent, ...] | None] = {}
 
         for rule in candidates:
             preliminary_error = _preliminary_rejection(rule)
             if preliminary_error is not None:
                 rejected[rule.rule_id] = preliminary_error
                 continue
+            typed_coverage: dict[str, object] | None = None
+            typed_opportunity_count: int | None = None
+            if (
+                evaluation_kind(rule.category) is PlaybookRuleKind.EXECUTION_GUARD
+                and rule.retry_guard is not None
+            ):
+                typed_by_seed: dict[int, TypedRetryCoverage] = {}
+                typed_reasons: dict[str, tuple[str, ...]] = {}
+                missing_typed_run: str | None = None
+                source_run_ids = tuple(dict.fromkeys(rule.source_run_ids))
+                for run_id in source_run_ids:
+                    if run_id not in event_cache:
+                        event_cache[run_id] = self._load_events(run_id)
+                    events = event_cache[run_id]
+                    if events is None:
+                        missing_typed_run = run_id
+                        unavailable_runs.add(run_id)
+                        break
+                    seed = self._run_seed(run_id, events)
+                    if seed is None or seed in typed_by_seed:
+                        missing_typed_run = run_id
+                        unavailable_runs.add(run_id)
+                        break
+                    coverage = analyze_typed_retry_coverage(
+                        events,
+                        rule=rule,
+                        context_values=self._load_runtime_context(run_id),
+                    )
+                    typed_by_seed[seed] = coverage
+                    if coverage.unavailable_reasons:
+                        typed_reasons[str(seed)] = coverage.unavailable_reasons
+                if missing_typed_run is not None:
+                    rejected[rule.rule_id] = "typed_retry_coverage_unavailable:" + missing_typed_run
+                    continue
+                typed_coverage_by_seed = TypedRetryCoverageBySeed(by_seed=typed_by_seed)
+                if (
+                    typed_reasons
+                    or set(typed_by_seed)
+                    != set(rule.source_seeds) - set(rule.censored_source_seeds)
+                    or any(
+                        coverage.typed_retry_opportunity_count <= 0
+                        for coverage in typed_by_seed.values()
+                    )
+                ):
+                    rejected[rule.rule_id] = (
+                        "typed_retry_coverage_unavailable:"
+                        if typed_reasons
+                        else "typed_retry_opportunity_coverage:"
+                    ) + json.dumps(
+                        {
+                            "reasons_by_seed": {
+                                seed: list(reasons) for seed, reasons in typed_reasons.items()
+                            },
+                            "opportunity_count_by_seed": {
+                                str(seed): coverage.typed_retry_opportunity_count
+                                for seed, coverage in sorted(typed_by_seed.items())
+                            },
+                        },
+                        sort_keys=True,
+                    )
+                    continue
+                typed_opportunity_count = sum(
+                    coverage.typed_retry_opportunity_count for coverage in typed_by_seed.values()
+                )
+                typed_coverage = typed_coverage_by_seed.as_dict()
             states: list[tuple[dict[str, object], int]] = []
             for run_id in dict.fromkeys(rule.source_run_ids):
                 if run_id not in situation_cache:
@@ -106,24 +182,35 @@ class PlaybookPromotionSweep:
                     unavailable_runs.add(run_id)
                     continue
                 states.extend(run_states)
-            matched_count = sum(
+            broad_matched_count = sum(
                 count for state, count in states if _matches_rule_situation(rule, state)
             )
-            matched_counts[rule.rule_id] = matched_count
+            matched_counts[rule.rule_id] = broad_matched_count
             updated = rule
-            if matched_count > rule.shadow_state_count:
+            if typed_opportunity_count is not None or broad_matched_count > rule.shadow_state_count:
+                promotion_sweep_evidence: dict[str, object] = {
+                    "source": "historical_situation_shadow_replay",
+                    "matched_state_count": broad_matched_count,
+                    "source_run_count": len(set(rule.source_run_ids)),
+                }
+                if typed_opportunity_count is not None:
+                    promotion_sweep_evidence["typed_retry_opportunity_count"] = (
+                        typed_opportunity_count
+                    )
+                    if typed_coverage is not None:
+                        promotion_sweep_evidence["typed_retry_opportunity_count_by_seed"] = (
+                            typed_coverage.get("typed_retry_opportunity_count_by_seed", {})
+                        )
                 evidence = {
                     **rule.evidence,
-                    "promotion_sweep": {
-                        "source": "historical_situation_shadow_replay",
-                        "matched_state_count": matched_count,
-                        "source_run_count": len(set(rule.source_run_ids)),
-                    },
+                    "promotion_sweep": promotion_sweep_evidence,
                 }
+                if typed_coverage is not None:
+                    evidence["typed_retry_coverage"] = typed_coverage
                 updated = self.store.upsert_rule(
                     rule.model_copy(
                         update={
-                            "shadow_state_count": matched_count,
+                            "shadow_state_count": max(rule.shadow_state_count, broad_matched_count),
                             "evidence": evidence,
                         }
                     )
@@ -146,6 +233,52 @@ class PlaybookPromotionSweep:
             rejected_reason_by_rule=rejected,
             consolidated_rule_ids=consolidated,
         )
+
+    def _load_events(self, run_id: str) -> tuple[StoredEvent, ...] | None:
+        run_directory = self.run_directories.get(run_id, self.run_root / run_id)
+        events_path = run_directory / "events.jsonl"
+        if not events_path.is_file():
+            return None
+        try:
+            return tuple(read_event_log(events_path))
+        except (OSError, ValueError):
+            return None
+
+    def _load_runtime_context(self, run_id: str) -> dict[str, object]:
+        run_directory = self.run_directories.get(run_id, self.run_root / run_id)
+        config_path = run_directory / "config.yaml"
+        try:
+            payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+            environment = payload["environment"]
+            if not isinstance(environment, dict):
+                return {}
+        except (OSError, KeyError, TypeError, ValueError, yaml.YAMLError):
+            return {}
+        context: dict[str, object] = {}
+        for field in ("agent_race", "opponent_race", "scenario"):
+            value = environment.get(field)
+            if isinstance(value, str) and value:
+                context["map_name" if field == "scenario" else field] = value
+        return context
+
+    def _run_seed(self, run_id: str, events: tuple[StoredEvent, ...]) -> int | None:
+        run_directory = self.run_directories.get(run_id, self.run_root / run_id)
+        config_path = run_directory / "config.yaml"
+        try:
+            payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+            run_config = payload.get("run") if isinstance(payload, dict) else None
+            seed = run_config.get("seed") if isinstance(run_config, dict) else None
+            if isinstance(seed, int) and not isinstance(seed, bool):
+                return seed
+        except (OSError, TypeError, ValueError, yaml.YAMLError):
+            pass
+        for event in events:
+            if event.event_type != "episode_result":
+                continue
+            seed = event.payload.get("seed")
+            if isinstance(seed, int) and not isinstance(seed, bool):
+                return seed
+        return None
 
     def _consolidate_compatible_candidates(self) -> tuple[str, ...]:
         """Merge fragmented strategic evidence without broadening execution guards."""
@@ -259,7 +392,7 @@ class PlaybookPromotionSweep:
             if not sibling_path.is_file():
                 return None
             database_path = sibling_path
-        connection = sqlite3.connect(f"file:{database_path}?mode=ro", uri=True)
+        connection = sqlite3.connect(f"file:{database_path}?mode=ro&immutable=1", uri=True)
         try:
             rows = connection.execute(
                 """

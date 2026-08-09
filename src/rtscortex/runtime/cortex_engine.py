@@ -22,6 +22,7 @@ from rtscortex.contracts import (
     ExecutionStatus,
     IdleReason,
     ObservationEnvelope,
+    PlacementLedgerEvent,
 )
 from rtscortex.contracts.interfaces import LLMProvider
 from rtscortex.cortex import (
@@ -305,6 +306,11 @@ class CortexRuntimeEngine(RuntimeEngine):
         self._strategic_agenda: StrategicAgenda | None = None
         self._pending_strategic_arbitration: StrategicArbitration | None = None
         self._strategic_by_legacy_intent: dict[str, StrategicIntent] = {}
+        # Raw bridge no-start identities are durable semantic tombstones. They
+        # prevent Cortex from preparing the same operation/material again after
+        # a placement was accepted but never started.
+        self._raw_build_material_tombstones: dict[str, set[str]] = {}
+        self._raw_build_material_tombstone_circuits: set[str] = set()
 
     async def start(self) -> None:
         """Load and validate the configured specialist before SC2 starts."""
@@ -940,6 +946,8 @@ class CortexRuntimeEngine(RuntimeEngine):
         self._macro_task_outcome_revision = None
         self._macro_outcome_revision = 0
         self._next_macro_retry_game_loop = None
+        self._raw_build_material_tombstones = {}
+        self._raw_build_material_tombstone_circuits = set()
         self._restore_consumed_canary_fixture_rules(observation)
         self._recover_cortex_episode(observation)
         if (
@@ -966,6 +974,14 @@ class CortexRuntimeEngine(RuntimeEngine):
         if checkpoint is not None:
             self._restore_cortex_checkpoint(checkpoint.payload)
             checkpoint_event_id = checkpoint.through_event_id
+
+        for event in self.store.events_of_type(
+            observation.run_id,
+            observation.episode_id,
+            "placement_ledger_transition",
+            after_event_id=checkpoint_event_id,
+        ):
+            self._remember_raw_build_placement_transition(event.payload)
 
         plan_event = self.store.last_event(
             observation.run_id,
@@ -1267,6 +1283,14 @@ class CortexRuntimeEngine(RuntimeEngine):
             "last_plan_accepted_game_loop": self._last_plan_accepted_game_loop,
             "macro_outcome_revision": self._macro_outcome_revision,
             "next_macro_retry_game_loop": self._next_macro_retry_game_loop,
+            "raw_build_material_tombstones": {
+                operation_id: sorted(materials)
+                for operation_id, materials in self._raw_build_material_tombstones.items()
+                if materials
+            },
+            "raw_build_material_tombstone_circuits": sorted(
+                self._raw_build_material_tombstone_circuits
+            ),
         }
 
     def _restore_cortex_checkpoint(self, payload: dict[str, Any]) -> None:
@@ -1337,6 +1361,20 @@ class CortexRuntimeEngine(RuntimeEngine):
         self._macro_outcome_revision = int(payload.get("macro_outcome_revision", 0))
         retry_loop = payload.get("next_macro_retry_game_loop")
         self._next_macro_retry_game_loop = None if retry_loop is None else int(retry_loop)
+        raw_tombstones = payload.get("raw_build_material_tombstones", {})
+        self._raw_build_material_tombstones = {
+            str(operation_id): {str(identity) for identity in identities}
+            for operation_id, identities in (
+                raw_tombstones.items() if isinstance(raw_tombstones, dict) else ()
+            )
+            if isinstance(identities, (list, tuple, set, frozenset)) and identities
+        }
+        circuits = payload.get("raw_build_material_tombstone_circuits", ())
+        self._raw_build_material_tombstone_circuits = (
+            {str(operation_id) for operation_id in circuits}
+            if isinstance(circuits, (list, tuple, set, frozenset))
+            else set()
+        )
 
     def _announce_specialist_health(self, observation: ObservationEnvelope) -> None:
         episode_key = (observation.run_id, observation.episode_id)
@@ -2527,6 +2565,33 @@ class CortexRuntimeEngine(RuntimeEngine):
             )
         )[intent.intent_id]
         self._strategic_by_legacy_intent[intent.intent_id] = strategic_intent
+        if self._raw_build_tombstone_blocks(strategic_intent):
+            operation_id = strategic_intent.operation_id
+            assert operation_id is not None
+            self._strategic_by_legacy_intent[intent.intent_id] = strategic_intent.model_copy(
+                update={
+                    "hard_blockers": tuple(
+                        dict.fromkeys(
+                            (*strategic_intent.hard_blockers, "raw_build_material_tombstone")
+                        )
+                    )
+                }
+            )
+            self._record_cortex_event(
+                observation,
+                "raw_build_tombstone_defer",
+                {
+                    "intent_id": intent.intent_id,
+                    "operation_id": operation_id,
+                    "action_names": list(strategic_intent.action_names),
+                    "material_legality_identities": sorted(
+                        self._raw_build_material_tombstones[operation_id]
+                    ),
+                    "circuit_open": operation_id in self._raw_build_material_tombstone_circuits,
+                    "next_action": "replan_with_new_builder_target_or_ability",
+                },
+            )
+            return None
         self._record_cortex_event(
             observation,
             "role_intent_emitted",
@@ -3188,12 +3253,75 @@ class CortexRuntimeEngine(RuntimeEngine):
             },
         )
 
+    def _remember_raw_build_placement_transition(self, payload: Any) -> None:
+        """Replay raw no-start material identities into the Cortex tombstone."""
+
+        if not isinstance(payload, dict):
+            return
+        transition = payload.get("transition", payload)
+        if not isinstance(transition, dict):
+            return
+        no_start = transition.get("placement_no_start")
+        if not isinstance(no_start, dict):
+            no_start = payload.get("placement_no_start")
+        if not isinstance(no_start, dict):
+            return
+        operation_id = no_start.get("operation_id") or payload.get("operation_id")
+        if not isinstance(operation_id, str) or not operation_id:
+            return
+        evidence = no_start.get("evidence")
+        if not isinstance(evidence, dict):
+            evidence = {}
+        material_identity = (
+            transition.get("material_legality_identity")
+            or no_start.get("material_legality_identity")
+            or evidence.get("material_legality_identity")
+        )
+        status = str(no_start.get("status") or "")
+        if status == "reset" or transition.get("next_state") == "occupied":
+            self._raw_build_material_tombstones.pop(operation_id, None)
+            self._raw_build_material_tombstone_circuits.discard(operation_id)
+            return
+        if isinstance(material_identity, str) and material_identity:
+            self._raw_build_material_tombstones.setdefault(operation_id, set()).add(
+                material_identity
+            )
+        if no_start.get("circuit_open") is True:
+            self._raw_build_material_tombstone_circuits.add(operation_id)
+
+    def record_placement_transition(
+        self,
+        event: PlacementLedgerEvent,
+    ) -> Literal["recorded", "already_recorded"]:
+        result = super().record_placement_transition(event)
+        self._remember_raw_build_placement_transition(event.model_dump(mode="json"))
+        return result
+
+    def _raw_build_tombstone_blocks(self, intent: StrategicIntent) -> bool:
+        return bool(
+            intent.operation_id
+            and intent.operation_id in self._raw_build_material_tombstone_circuits
+            and self._raw_build_material_tombstones.get(intent.operation_id)
+            and any(action_name.startswith("Build_") for action_name in intent.action_names)
+        )
+
     def record_execution(self, report: ExecutionReport) -> None:
         metadata = self._macro_command_steps.get(report.command_id)
         existing = self._terminal_execution_fingerprints.get(report.command_id)
         super().record_execution(report)
         if existing is not None:
             return
+        if report.effect_evidence is not None:
+            for placement_transition in report.effect_evidence.placement_ledger_transitions:
+                self._remember_raw_build_placement_transition(
+                    {
+                        "operation_id": report.operation_id,
+                        "transition": placement_transition.model_dump(mode="json"),
+                    }
+                )
+        if report.status is ExecutionStatus.SUCCEEDED and report.operation_id is not None:
+            self._raw_build_material_tombstones.pop(report.operation_id, None)
+            self._raw_build_material_tombstone_circuits.discard(report.operation_id)
         self._remember_terminal_feedback(report)
         lineage = self._command_lineages.get(report.command_id)
         self._resolve_playbook_rule_evaluations(report, lineage)
@@ -3206,21 +3334,21 @@ class CortexRuntimeEngine(RuntimeEngine):
         if responsibility in tactical_responsibilities and isinstance(
             self._tactical, ExecutionAwareTacticalPolicyProvider
         ):
-            transition = self._tactical.record_execution(
+            tactical_transition = self._tactical.record_execution(
                 report,
                 game_loop=self._execution_game_loop(report),
             )
-            if transition is not None:
+            if tactical_transition is not None:
                 self.store.append_event(
                     run_id=report.run_id,
                     episode_id=report.episode_id,
                     step_id=report.step_id,
                     event_type=(
                         "tactical_actor_state"
-                        if "target_tag" not in transition
+                        if "target_tag" not in tactical_transition
                         else "tactical_target_state"
                     ),
-                    payload=transition,
+                    payload=tactical_transition,
                 )
         defense_transition = self._role_agents.record_execution(
             report,

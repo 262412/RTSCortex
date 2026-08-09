@@ -267,6 +267,21 @@ def build_hard_qualification_manifest(
         shadow_state_count=parent.shadow_state_count,
         execution_false_block_count=parent.false_block_count,
         execution_false_block_rate=parent.false_block_rate,
+        typed_retry_opportunity_count_by_seed={
+            str(item.seed_id): item.typed_retry_opportunity_count
+            for item in ordered_runs
+            if item.typed_retry_opportunity_count is not None
+        },
+        typed_retry_application_count_by_seed={
+            str(item.seed_id): item.typed_retry_application_count
+            for item in ordered_runs
+            if item.typed_retry_application_count is not None
+        },
+        typed_retry_coverage_unavailable_by_seed={
+            str(item.seed_id): tuple(item.typed_retry_coverage_reasons or ())
+            for item in ordered_runs
+            if item.typed_retry_coverage_unavailable or item.typed_retry_coverage_reasons
+        },
     )
 
 
@@ -351,6 +366,39 @@ def _qualification_rejection_reasons(
         reasons.append("fingerprint_mismatch")
     if any(item.shadow_would_block_application_count == 0 for item in runs):
         reasons.append("shadow_would_block_coverage")
+    typed_retry_required = (
+        parent.retry_guard is not None
+        and evaluation_kind(parent.category).value == "execution_guard"
+    )
+    typed_retry_present = typed_retry_required or any(
+        item.typed_retry_opportunity_count is not None
+        or item.typed_retry_application_count is not None
+        or item.typed_retry_coverage_unavailable is not None
+        or item.typed_retry_coverage_reasons is not None
+        for item in runs
+    )
+    if typed_retry_present:
+        if any(
+            item.typed_retry_coverage_unavailable is not False
+            or item.typed_retry_opportunity_count is None
+            or item.typed_retry_application_count is None
+            or item.typed_retry_coverage_reasons is None
+            or (typed_retry_required and item.config_sha256 is None)
+            for item in runs
+        ):
+            reasons.append("typed_retry_coverage_unavailable")
+        if any(
+            item.typed_retry_opportunity_count is not None
+            and item.typed_retry_opportunity_count <= 0
+            for item in runs
+        ):
+            reasons.append("typed_retry_opportunity_coverage")
+        if any(
+            item.typed_retry_application_count is not None
+            and item.typed_retry_application_count <= 0
+            for item in runs
+        ):
+            reasons.append("typed_retry_application_coverage")
     if any(item.resolved_counterfactual_count == 0 for item in runs):
         reasons.append("resolved_counterfactual_coverage")
     unresolved = sum(item.unresolved_counterfactual_count for item in runs)

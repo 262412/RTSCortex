@@ -101,6 +101,9 @@ class PlaybookRuleReadiness(ContractModel):
     strategic_ab_metrics: dict[str, float | int] = Field(default_factory=dict)
     canary_fixture: bool
     rejection_reasons: tuple[str, ...]
+    typed_retry_opportunity_count: int | None = Field(default=None, ge=0)
+    typed_retry_application_count: int | None = Field(default=None, ge=0)
+    typed_retry_coverage_unavailable: bool | None = None
 
 
 class PlaybookHardQualificationRunEvidence(ContractModel):
@@ -132,6 +135,11 @@ class PlaybookHardQualificationRunEvidence(ContractModel):
     evaluation_without_application_count: int = Field(ge=0)
     rule_fingerprint: str = Field(pattern=_FINGERPRINT_PATTERN)
     predicate_fingerprint: str = Field(pattern=_FINGERPRINT_PATTERN)
+    typed_retry_opportunity_count: int | None = Field(default=None, ge=0)
+    typed_retry_application_count: int | None = Field(default=None, ge=0)
+    typed_retry_coverage_unavailable: bool | None = None
+    typed_retry_coverage_reasons: tuple[str, ...] | None = None
+    config_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
     @property
     def not_selected_counterfactual_count(self) -> int:
@@ -177,6 +185,11 @@ class PlaybookHardQualificationManifest(ContractModel):
     shadow_state_count: int = Field(ge=0)
     execution_false_block_count: int = Field(ge=0)
     execution_false_block_rate: float = Field(ge=0.0, le=1.0)
+    typed_retry_opportunity_count_by_seed: dict[str, int] = Field(default_factory=dict)
+    typed_retry_application_count_by_seed: dict[str, int] = Field(default_factory=dict)
+    typed_retry_coverage_unavailable_by_seed: dict[str, tuple[str, ...]] = Field(
+        default_factory=dict
+    )
 
     @property
     def counterfactual_not_selected_count(self) -> int:
@@ -325,6 +338,7 @@ def analyze_hard_readiness(
             rejected_runtime_hard_rules.append(rule.rule_id)
         strategic_regret = rule.evidence.get("strategic_regret_count")
         strategic_ab_manifest = rule.evidence.get("strategic_ab_manifest")
+        typed_retry_coverage = _typed_retry_coverage_summary(rule)
         rule_audits.append(
             PlaybookRuleReadiness(
                 rule_id=rule.rule_id,
@@ -374,6 +388,9 @@ def analyze_hard_readiness(
                 strategic_ab_metrics=_strategic_metrics(strategic_ab_manifest),
                 canary_fixture=fixture,
                 rejection_reasons=reasons,
+                typed_retry_opportunity_count=typed_retry_coverage[0],
+                typed_retry_application_count=typed_retry_coverage[1],
+                typed_retry_coverage_unavailable=typed_retry_coverage[2],
             )
         )
     exact_selection_approved = (
@@ -968,7 +985,13 @@ def _validate_qualification_manifest(
     qualification_seeds: tuple[int, ...],
 ) -> None:
     expected_runs = tuple(sorted(set(parent.source_run_ids) - set(parent.censored_source_run_ids)))
-    manifest_integrity_reasons = _qualification_manifest_integrity_reasons(manifest)
+    manifest_integrity_reasons = _qualification_manifest_integrity_reasons(
+        manifest,
+        typed_retry_required=(
+            parent.retry_guard is not None
+            and evaluation_kind(parent.category) is PlaybookRuleKind.EXECUTION_GUARD
+        ),
+    )
     expected_fingerprints = _probe_fingerprints(parent)
     checks = {
         "schema_version": manifest.schema_version == _HARD_QUALIFICATION_MANIFEST_SCHEMA,
@@ -1079,7 +1102,15 @@ def _qualification_evidence_reasons(
         or manifest.analysis_evidence_overflow_count
     ):
         reasons.append("qualification_manifest_not_accepted")
-    reasons.extend(_qualification_manifest_integrity_reasons(manifest))
+    reasons.extend(
+        _qualification_manifest_integrity_reasons(
+            manifest,
+            typed_retry_required=(
+                rule.retry_guard is not None
+                and evaluation_kind(rule.category) is PlaybookRuleKind.EXECUTION_GUARD
+            ),
+        )
+    )
     if not isinstance(manifest_sha256, str) or manifest_sha256 not in rule.evidence_hashes:
         reasons.append("qualification_manifest_hash_unbound")
     strategic_payload = rule.evidence.get("strategic_ab_manifest")
@@ -1109,6 +1140,8 @@ def _qualification_evidence_reasons(
 
 def _qualification_manifest_integrity_reasons(
     manifest: PlaybookHardQualificationManifest,
+    *,
+    typed_retry_required: bool = False,
 ) -> tuple[str, ...]:
     runs = manifest.qualification_runs
     resolved = sum(item.resolved_counterfactual_count for item in runs)
@@ -1157,6 +1190,54 @@ def _qualification_manifest_integrity_reasons(
         for item in runs
     ):
         reasons.append("qualification_manifest_run_not_accepted")
+    typed_retry_present = typed_retry_required or any(
+        item.typed_retry_opportunity_count is not None
+        or item.typed_retry_application_count is not None
+        or item.typed_retry_coverage_unavailable is not None
+        or item.typed_retry_coverage_reasons is not None
+        for item in runs
+    )
+    if typed_retry_present:
+        typed_opportunities = {
+            str(item.seed_id): item.typed_retry_opportunity_count
+            for item in runs
+            if item.typed_retry_opportunity_count is not None
+        }
+        typed_applications = {
+            str(item.seed_id): item.typed_retry_application_count
+            for item in runs
+            if item.typed_retry_application_count is not None
+        }
+        if any(
+            item.typed_retry_coverage_unavailable is not False
+            or item.typed_retry_opportunity_count is None
+            or item.typed_retry_application_count is None
+            or item.typed_retry_coverage_reasons is None
+            or item.config_sha256 is None
+            for item in runs
+        ):
+            reasons.append("qualification_manifest_typed_retry_coverage_unavailable")
+        if any(
+            item.typed_retry_opportunity_count is None or item.typed_retry_opportunity_count <= 0
+            for item in runs
+        ):
+            reasons.append("qualification_manifest_typed_retry_opportunity_coverage")
+        if any(
+            item.typed_retry_application_count is None or item.typed_retry_application_count <= 0
+            for item in runs
+        ):
+            reasons.append("qualification_manifest_typed_retry_application_coverage")
+        if manifest.typed_retry_opportunity_count_by_seed != typed_opportunities:
+            reasons.append("qualification_manifest_typed_retry_opportunity_aggregate_mismatch")
+        if manifest.typed_retry_application_count_by_seed != typed_applications:
+            reasons.append("qualification_manifest_typed_retry_application_aggregate_mismatch")
+        expected_unavailable = {
+            str(item.seed_id): tuple(item.typed_retry_coverage_reasons or ())
+            for item in runs
+            if item.typed_retry_coverage_unavailable or item.typed_retry_coverage_reasons
+        }
+        if manifest.typed_retry_coverage_unavailable_by_seed != expected_unavailable:
+            reasons.append("qualification_manifest_typed_retry_reason_aggregate_mismatch")
     if (
         resolved != manifest.counterfactual_resolved_count
         or unresolved != manifest.counterfactual_unresolved_count
@@ -1208,3 +1289,40 @@ def _strategic_metrics(payload: object) -> dict[str, float | int]:
         if isinstance(value, int | float):
             result[field] = value
     return result
+
+
+def _typed_retry_coverage_summary(
+    rule: PlaybookRule,
+) -> tuple[int | None, int | None, bool | None]:
+    payload = rule.evidence.get("typed_retry_coverage")
+    if not isinstance(payload, dict):
+        return None, None, None
+    opportunity = payload.get("typed_retry_opportunity_count")
+    application = payload.get("typed_retry_application_count")
+    unavailable = payload.get("typed_retry_coverage_unavailable")
+    if not isinstance(opportunity, int):
+        opportunity_counts = [
+            item
+            for values in (payload.get("typed_retry_opportunity_count_by_seed"),)
+            if isinstance(values, dict)
+            for item in values.values()
+            if isinstance(item, int) and item >= 0
+        ]
+        opportunity = sum(opportunity_counts) if opportunity_counts else None
+    if not isinstance(application, int):
+        application_counts = [
+            item
+            for values in (payload.get("typed_retry_application_count_by_seed"),)
+            if isinstance(values, dict)
+            for item in values.values()
+            if isinstance(item, int) and item >= 0
+        ]
+        application = sum(application_counts) if application_counts else None
+    coverage_unavailable = (
+        unavailable if isinstance(unavailable, bool) else opportunity is None or application is None
+    )
+    return (
+        int(opportunity) if isinstance(opportunity, int) and opportunity >= 0 else None,
+        int(application) if isinstance(application, int) and application >= 0 else None,
+        coverage_unavailable,
+    )

@@ -1,0 +1,25 @@
+--- a/pysc2/env/run_loop.py
++++ b/pysc2/env/run_loop.py
+@@ -31,7 +31,22 @@
+       total_episodes += 1
+       timesteps = env.reset()
+       for a in agents:
+         a.reset()
++      controllers = getattr(env, "_controllers", ()) or ()
++      for index, agent in enumerate(agents):
++        controller = controllers[index] if index < len(controllers) else None
++        raw_build_query_capability = None
++        if controller is not None:
++          try:
++            from rtscortex_llm_pysc2.worker import SC2RawBuildQueryCapability
++          except ImportError:
++            raw_build_query_capability = None
++          else:
++            raw_build_query_capability = SC2RawBuildQueryCapability(controller)
++        set_raw_build_query_capability = getattr(
++            agent, "set_raw_build_query_capability", None)
++        if set_raw_build_query_capability is not None:
++          set_raw_build_query_capability(raw_build_query_capability)
+       while True:
+         total_frames += 1
+         actions = [agent.step(timestep)

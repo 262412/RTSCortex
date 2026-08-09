@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import importlib
+import json
 import math
 import os
 import time
@@ -50,7 +52,11 @@ from rtscortex_llm_pysc2.production import (
     production_spec,
 )
 from rtscortex_llm_pysc2.protocol import RuntimeClient
-from rtscortex_llm_pysc2.raw_executor import RawActionExecutor, RawDispatch
+from rtscortex_llm_pysc2.raw_executor import (
+    RawActionExecutor,
+    RawBuildAuthorization,
+    RawDispatch,
+)
 from rtscortex_llm_pysc2.raw_placement import RawPlacementService
 from rtscortex_llm_pysc2.research import RESEARCH_SPECS, research_spec
 
@@ -79,6 +85,101 @@ class _SourceActionSpec(Protocol):
 
     @property
     def race(self) -> str: ...
+
+
+class SC2RawBuildQueryCapability:
+    """Narrow read-only bridge to SC2's exact builder/placement queries."""
+
+    def __init__(self, controller: Any) -> None:
+        self._controller = controller
+        self._legality_states: dict[
+            tuple[int, int, tuple[float, float]],
+            tuple[tuple[bool | None, str | int | None], int],
+        ] = {}
+
+    def authorize_build(
+        self,
+        *,
+        builder_tag: int,
+        ability_id: int,
+        world_target: tuple[float, float],
+    ) -> RawBuildAuthorization:
+        try:
+            from s2clientprotocol import error_pb2, query_pb2  # type: ignore[import-untyped]
+
+            request = query_pb2.RequestQuery()
+            request.abilities.add(unit_tag=int(builder_tag))
+            placement = request.placements.add(
+                ability_id=int(ability_id),
+                placing_unit_tag=int(builder_tag),
+            )
+            placement.target_pos.x = float(world_target[0])
+            placement.target_pos.y = float(world_target[1])
+            response = self._controller.query(request)
+            ability_ids: tuple[int, ...] = ()
+            if response.abilities:
+                ability_ids = tuple(
+                    sorted(int(item.ability_id) for item in response.abilities[0].abilities)
+                )
+            ability_available = int(ability_id) in ability_ids
+            placement_result: str | int | None = None
+            if response.placements:
+                raw_result = int(response.placements[0].result)
+                try:
+                    placement_result = error_pb2.ActionResult.Name(raw_result)
+                except ValueError:
+                    placement_result = raw_result
+            state_key = (
+                int(builder_tag),
+                int(ability_id),
+                (round(float(world_target[0]), 3), round(float(world_target[1]), 3)),
+            )
+            legality_state = (ability_available, placement_result)
+            previous_state = self._legality_states.get(state_key)
+            generation = (
+                0
+                if previous_state is None
+                else previous_state[1] + (previous_state[0] != legality_state)
+            )
+            self._legality_states[state_key] = (legality_state, generation)
+            fingerprint_payload = {
+                "builder_tag": int(builder_tag),
+                "ability_id": int(ability_id),
+                "world_target": [float(world_target[0]), float(world_target[1])],
+                "ability_available": ability_available,
+                "placement_result": placement_result,
+                "legality_generation": generation,
+            }
+            fingerprint = hashlib.sha256(
+                json.dumps(
+                    fingerprint_payload,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+            ).hexdigest()
+            return RawBuildAuthorization(
+                ability_available=ability_available,
+                placement_result=placement_result,
+                target_legality_fingerprint=f"sc2:{fingerprint}",
+                available_ability_ids=ability_ids,
+                details={
+                    "builder_tag": hex(int(builder_tag)),
+                    "ability_id": int(ability_id),
+                    "world_target": [float(world_target[0]), float(world_target[1])],
+                    "available_ability_ids": list(ability_ids),
+                },
+                ability_id=int(ability_id),
+            )
+        except Exception as error:
+            return RawBuildAuthorization(
+                ability_available=None,
+                placement_result=None,
+                details={
+                    "reason": "query_exception",
+                    "error_type": type(error).__name__,
+                },
+                ability_id=int(ability_id),
+            )
 
 
 try:
@@ -1646,6 +1747,8 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
         self._pending_primitive: Optional[PrimitiveDispatch] = None
         self._pending_primitive_agent: Optional[Any] = None
         self._pending_raw_dispatch: Optional[RawDispatch] = None
+        self._pending_raw_observation: Any | None = None
+        self._pending_raw_game_loop: Optional[int] = None
         self._actor_selection_retry_key: Optional[tuple[str, str]] = None
         self._actor_selection_attempts = 0
         self._orchestration_budget_key: Optional[tuple[str, str]] = None
@@ -1928,17 +2031,13 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
                     dispatch.command.command_id,
                     resolved,
                 )
-            self.decision_broker.prepare_effect(
-                dispatch.primitive,
-                obs.observation,
-                builder_tag=dispatch.builder_tag,
-                producer_tag=dispatch.producer_tag,
-                actor_tags=dispatch.actor_tags,
-                minimap_transform=None,
-            )
-            self._pending_primitive = dispatch.primitive
-            self._pending_primitive_agent = None
             self._pending_raw_dispatch = dispatch
+            self._pending_raw_observation = obs.observation
+            self._pending_raw_game_loop = game_loop
+            self.raw_executor.mark_primitive_constructed(
+                dispatch.command.command_id,
+                game_loop=game_loop,
+            )
             action = dispatch.action
         else:
             gas_action = self.gas_worker_controller.next_raw_action(
@@ -1969,6 +2068,39 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
     def record_environment_step(self, elapsed_seconds: float) -> None:
         """Receive the patched PySC2 run-loop environment-step duration."""
 
+        pending_raw = self._pending_raw_dispatch
+        if pending_raw is not None and self._pending_primitive is None:
+            submitted_loop = self._pending_raw_game_loop or 0
+            self.raw_executor.mark_primitive_submitted(
+                pending_raw.command.command_id,
+                game_loop=submitted_loop,
+            )
+            if pending_raw.approach_only:
+                self._pending_primitive = pending_raw.primitive
+                self._pending_primitive_agent = None
+                self._rtscortex_raw_dispatch_diagnostic_snapshot = dict(
+                    self.raw_executor.diagnostic_snapshot
+                )
+                self.runtime_client.profiler.observe_milliseconds(
+                    "pysc2_environment_step",
+                    float(elapsed_seconds) * 1_000,
+                )
+                return
+            if self._pending_raw_observation is None:
+                raise RuntimeError("raw dispatch submission has no pre-step observation")
+            self.decision_broker.prepare_effect(
+                pending_raw.primitive,
+                self._pending_raw_observation,
+                builder_tag=pending_raw.builder_tag,
+                producer_tag=pending_raw.producer_tag,
+                actor_tags=pending_raw.actor_tags,
+                minimap_transform=None,
+            )
+            self._pending_primitive = pending_raw.primitive
+            self._pending_primitive_agent = None
+            self._rtscortex_raw_dispatch_diagnostic_snapshot = dict(
+                self.raw_executor.diagnostic_snapshot
+            )
         self.runtime_client.profiler.observe_milliseconds(
             "pysc2_environment_step",
             float(elapsed_seconds) * 1_000,
@@ -2111,18 +2243,32 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
             return
         settlement_loop = _observation_game_loop(obs.observation)
         action_results = list(getattr(obs.observation, "action_result", ()))
+        pending_raw_dispatch = getattr(self, "_pending_raw_dispatch", None)
+        if pending_raw_dispatch is not None:
+            self.raw_executor.record_action_result(
+                pending_raw_dispatch.command.command_id,
+                action_results,
+            )
         failure_reason = None
         if action_results:
             failure_reason = ", ".join(
                 f"PySC2 action result {int(value)}" for value in action_results
             )
             if dispatch.origin == "translator":
-                dispatch = replace(
-                    dispatch,
-                    final_primitive=True,
-                    failure_code="pysc2_rejected",
+                approach_rejected = (
+                    pending_raw_dispatch is not None and pending_raw_dispatch.approach_only
                 )
-                if self._pending_primitive_agent is not None:
+                if approach_rejected:
+                    # Keep the approach move non-final: its rejection is a
+                    # primitive trace fact, not a failed build/effect report.
+                    dispatch = replace(dispatch, failure_code="pysc2_rejected")
+                else:
+                    dispatch = replace(
+                        dispatch,
+                        final_primitive=True,
+                        failure_code="pysc2_rejected",
+                    )
+                if self._pending_primitive_agent is not None and not approach_rejected:
                     self._pending_primitive_agent.func_list.clear()
                     route = getattr(
                         self._pending_primitive_agent,
@@ -2138,8 +2284,7 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
                             self._pending_primitive_agent._rtscortex_rejected_build_targets.setdefault(
                                 action_name, set()
                             ).add(world_target)
-                pending_raw_dispatch = getattr(self, "_pending_raw_dispatch", None)
-                if pending_raw_dispatch is not None:
+                if pending_raw_dispatch is not None and not pending_raw_dispatch.approach_only:
                     self.raw_executor.record_rejection(
                         pending_raw_dispatch,
                         self.agents,
@@ -2171,9 +2316,16 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
         )
         self._pending_primitive = None
         self._pending_raw_dispatch = None
+        self._pending_raw_observation = None
+        self._pending_raw_game_loop = None
         if self._pending_primitive_agent is not None:
             self._pending_primitive_agent._rtscortex_active_build_route = None
         self._pending_primitive_agent = None
+
+    def set_raw_build_query_capability(self, capability: Any | None) -> None:
+        """Install the reviewed runner's read-only SC2 build query capability."""
+
+        self.raw_executor.set_build_query_capability(capability)
 
     def _capture_primitive(self, action: Any, obs: Any) -> None:
         if self._pending_primitive is not None or not self.AGENT_NAMES:

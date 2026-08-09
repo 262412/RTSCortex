@@ -18,6 +18,7 @@ from rtscortex.playbook import (
     PlaybookHardQualificationRunEvidence,
     PlaybookStore,
     analyze_hard_qualification_evaluations,
+    analyze_typed_retry_coverage,
     build_hard_qualification_manifest,
     playbook_predicate_fingerprint,
     playbook_rule_fingerprint,
@@ -48,7 +49,7 @@ def _shadow_config_is_valid(config_path: Path, *, expected_database: Path) -> bo
         payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
         playbook = payload["cortex"]["playbook"]
         observed_database = Path(playbook["database_path"]).expanduser().resolve()
-    except (OSError, KeyError, TypeError, ValueError):
+    except (OSError, KeyError, TypeError, ValueError, yaml.YAMLError):
         return False
     return (
         playbook.get("enabled") is True
@@ -57,6 +58,47 @@ def _shadow_config_is_valid(config_path: Path, *, expected_database: Path) -> bo
         and playbook.get("hard_readiness_required") is False
         and observed_database == expected_database.resolve()
     )
+
+
+def _runtime_context_from_config(config_path: Path) -> dict[str, object]:
+    """Return only immutable runtime context values needed by guard replay."""
+
+    try:
+        payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        environment = payload["environment"]
+        if not isinstance(environment, dict):
+            return {}
+    except (OSError, KeyError, TypeError, ValueError, yaml.YAMLError):
+        return {}
+    context: dict[str, object] = {}
+    for field in ("agent_race", "opponent_race", "scenario"):
+        value = environment.get(field)
+        if isinstance(value, str) and value:
+            context["map_name" if field == "scenario" else field] = value
+    return context
+
+
+def _qualification_config_fingerprint(config_path: Path) -> str | None:
+    """Hash the generated qualification config independent of its seed."""
+
+    try:
+        payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError, yaml.YAMLError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    run = payload.get("run")
+    if not isinstance(run, dict) or not isinstance(run.get("seed"), int):
+        return None
+    normalized = dict(payload)
+    normalized_run = dict(run)
+    normalized_run.pop("seed", None)
+    normalized["run"] = normalized_run
+    try:
+        serialized = json.dumps(normalized, sort_keys=True, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return None
+    return hashlib.sha256(serialized.encode()).hexdigest()
 
 
 def analyze_hard_qualification(
@@ -92,13 +134,16 @@ def analyze_hard_qualification(
     recovery_evidence = json.loads(recovery_evidence_path.read_text(encoding="utf-8"))
     rows = list(csv.DictReader(status_path.open(encoding="utf-8"), delimiter="\t"))
     expected_seeds = {int(entry["seed_id"]) for entry in plan["source_runs"]}
+    planned_source_by_seed = {int(entry["seed_id"]): entry for entry in plan["source_runs"]}
     observed_seeds = {int(row["seed"]) for row in rows}
     if len(rows) != 3 or observed_seeds != expected_seeds:
         raise ValueError("qualification status must contain one row for every source seed")
 
     common_run_evidence: dict[int, dict[str, Any]] = {}
     events_by_seed: dict[int, tuple[Any, ...]] = {}
+    context_values_by_seed: dict[int, dict[str, object]] = {}
     run_reports: list[dict[str, Any]] = []
+    qualification_config_fingerprint: str | None = None
     for row in rows:
         seed = int(row["seed"])
         run_directory = Path(row["run_dir"]).expanduser().resolve()
@@ -121,6 +166,28 @@ def analyze_hard_qualification(
             run_directory / "config.yaml",
             expected_database=working_database,
         )
+        config_sha256 = _sha256_file(run_directory / "config.yaml")
+        generated_config_fingerprint = _qualification_config_fingerprint(
+            run_directory / "config.yaml"
+        )
+        if qualification_config_fingerprint is None:
+            qualification_config_fingerprint = generated_config_fingerprint
+        try:
+            run_config = yaml.safe_load((run_directory / "config.yaml").read_text(encoding="utf-8"))
+        except (OSError, TypeError, ValueError, yaml.YAMLError):
+            run_config = {}
+        run_seed = (
+            run_config.get("run", {}).get("seed")
+            if isinstance(run_config, dict) and isinstance(run_config.get("run"), dict)
+            else None
+        )
+        planned_source = planned_source_by_seed.get(seed, {})
+        config_bound = (
+            config_valid
+            and generated_config_fingerprint is not None
+            and generated_config_fingerprint == qualification_config_fingerprint
+            and run_seed == seed
+        )
         source_valid = (
             run_metrics.source_tree_clean
             and run_metrics.source_commit_matches_expected_sha
@@ -137,12 +204,14 @@ def analyze_hard_qualification(
             and run_metrics.engineering_accepted
             and source_valid
             and config_valid
+            and config_bound
             and immutable_probe
             and sc2_build == plan["sc2_build"]
             and observed_patch == sc2_patch
         )
         events = tuple(read_event_log(events_path))
         events_by_seed[seed] = events
+        context_values_by_seed[seed] = _runtime_context_from_config(run_directory / "config.yaml")
         common_run_evidence[seed] = {
             "seed_id": seed,
             "run_id": run_directory.name,
@@ -161,6 +230,7 @@ def analyze_hard_qualification(
             "natural_terminal": run_metrics.natural_terminal,
             "engineering_accepted": run_accepted,
             "analysis_evidence_overflow_count": run_metrics.analysis_evidence_overflow_count,
+            "config_sha256": config_sha256,
         }
         run_reports.append(
             {
@@ -172,6 +242,9 @@ def analyze_hard_qualification(
                 "engineering_accepted": run_metrics.engineering_accepted,
                 "source_attestation_consistent": source_valid,
                 "shadow_config_valid": config_valid,
+                "qualification_config_bound": config_bound,
+                "source_config_sha256": planned_source.get("config_sha256"),
+                "qualification_config_fingerprint": generated_config_fingerprint,
                 "probe_baseline_immutable": immutable_probe,
                 "sc2_build": sc2_build,
                 "sc2_patch": observed_patch,
@@ -219,6 +292,13 @@ def analyze_hard_qualification(
                 expected_rule_fingerprint=expected_rule_fingerprint,
                 expected_predicate_fingerprint=expected_predicate_fingerprint,
             )
+            typed_retry = analyze_typed_retry_coverage(
+                events_by_seed[seed],
+                rule=probe_rule,
+                expected_rule_fingerprint=expected_rule_fingerprint,
+                expected_predicate_fingerprint=expected_predicate_fingerprint,
+                context_values=context_values_by_seed.get(seed),
+            )
             counterfactual_by_seed[str(seed)] = {
                 "shadow_would_block_application_count": (
                     observed.shadow_would_block_application_count
@@ -240,6 +320,15 @@ def analyze_hard_qualification(
                 "invalid_counterfactual_evidence_count": (
                     observed.invalid_counterfactual_evidence_count
                 ),
+                "typed_retry_opportunity_count": typed_retry.typed_retry_opportunity_count,
+                "typed_retry_application_count": typed_retry.typed_retry_application_count,
+                "typed_retry_coverage_unavailable": (typed_retry.typed_retry_coverage_unavailable),
+                "typed_retry_coverage_reasons": list(typed_retry.unavailable_reasons),
+                "typed_retry_opportunity_ids": list(typed_retry.opportunity_ids),
+                "typed_retry_application_ids": list(typed_retry.application_ids),
+                "typed_retry_opportunity_bindings": [
+                    binding.as_dict() for binding in typed_retry.opportunity_bindings
+                ],
             }
             run_evidence.append(
                 PlaybookHardQualificationRunEvidence(
@@ -265,6 +354,10 @@ def analyze_hard_qualification(
                     ),
                     rule_fingerprint=expected_rule_fingerprint,
                     predicate_fingerprint=expected_predicate_fingerprint,
+                    typed_retry_opportunity_count=typed_retry.typed_retry_opportunity_count,
+                    typed_retry_application_count=typed_retry.typed_retry_application_count,
+                    typed_retry_coverage_unavailable=(typed_retry.typed_retry_coverage_unavailable),
+                    typed_retry_coverage_reasons=typed_retry.unavailable_reasons,
                 )
             )
         try:
@@ -302,6 +395,15 @@ def analyze_hard_qualification(
                 ),
                 "counterfactual_false_block_rate": manifest.counterfactual_false_block_rate,
                 "counterfactual_by_seed": counterfactual_by_seed,
+                "typed_retry_opportunity_count_by_seed": (
+                    manifest.typed_retry_opportunity_count_by_seed
+                ),
+                "typed_retry_application_count_by_seed": (
+                    manifest.typed_retry_application_count_by_seed
+                ),
+                "typed_retry_coverage_unavailable_by_seed": (
+                    manifest.typed_retry_coverage_unavailable_by_seed
+                ),
             }
         )
 

@@ -170,6 +170,10 @@ class BridgeCoordinator:
         if self.effect_verifier.is_tracked(command_id):
             self.effect_verifier.resolve_arguments(command_id, arguments)
 
+    def record_action_result(self, command_id: str, results: Sequence[Any]) -> None:
+        if self.effect_verifier.is_tracked(command_id):
+            self.effect_verifier.record_action_result(command_id, results)
+
     def complete_command(
         self,
         command_id: str,

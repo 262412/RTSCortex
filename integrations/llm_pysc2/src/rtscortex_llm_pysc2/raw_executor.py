@@ -8,8 +8,8 @@ import math
 from collections import deque
 from collections.abc import Collection, Mapping, Sequence
 from copy import deepcopy
-from dataclasses import dataclass
-from typing import Any, Optional
+from dataclasses import dataclass, field, replace
+from typing import Any, Optional, Protocol
 
 from rtscortex_llm_pysc2.broker import PrimitiveDispatch, SharedDecisionBroker
 from rtscortex_llm_pysc2.coordinator import BridgeDecision
@@ -24,6 +24,7 @@ from rtscortex_llm_pysc2.production import production_spec
 from rtscortex_llm_pysc2.raw_placement import (
     RawPlacementFailure,
     RawPlacementService,
+    _placement_candidate_id,
     _placement_revision,
 )
 from rtscortex_llm_pysc2.research import research_spec
@@ -48,12 +49,17 @@ _WARP_RAW_FUNCTIONS = {
     "Warp_Stalker_Near": "TrainWarp_Stalker_pt",
 }
 _BUILDER_THREAT_CLEARANCE = 3.0
+_BUILDER_APPROACH_MAX_DISTANCE = 12.0
 _NONSPATIAL_BUILD_FAILURE_CODES = frozenset(
     {
         "build_insufficient_minerals",
         "build_insufficient_vespene",
         "build_missing_prerequisite",
         "operation_no_start_circuit_open",
+        "builder_ability_unavailable",
+        "placement_query_rejected",
+        "placement_query_unavailable",
+        "placement_query_rejected_cached",
     }
 )
 _BUILDER_DEFERRAL_CODES = frozenset(
@@ -65,6 +71,65 @@ _BUILDER_DEFERRAL_CODES = frozenset(
         "stale_observation",
     }
 )
+
+
+@dataclass(frozen=True)
+class RawBuildAuthorization:
+    """Read-only SC2 authority result for one exact final build target."""
+
+    ability_available: bool | None
+    placement_result: str | int | None
+    target_legality_fingerprint: str | None = None
+    available_ability_ids: tuple[int, ...] = ()
+    details: Mapping[str, Any] = field(default_factory=dict)
+    ability_id: int | None = None
+
+    @property
+    def available_ability_query(self) -> str:
+        if self.ability_available is True:
+            return "available"
+        if self.ability_available is False:
+            return "unavailable"
+        return "unavailable_no_controller_access"
+
+    @property
+    def placement_query_status(self) -> str:
+        value = self.placement_result
+        if value is None:
+            return "unavailable"
+        if isinstance(value, str):
+            normalized = value.casefold()
+            if normalized in {"success", "ok", "1"}:
+                return "Success"
+            return value
+        return str(value)
+
+    @property
+    def authorized(self) -> bool:
+        return self.ability_available is True and self.placement_query_status == "Success"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "ability_available": self.ability_available,
+            "available_ability_query": self.available_ability_query,
+            "available_ability_ids": list(self.available_ability_ids),
+            "ability_id": self.ability_id,
+            "placement_query_result": self.placement_query_status,
+            "target_legality_fingerprint": self.target_legality_fingerprint,
+            "details": deepcopy(dict(self.details)),
+        }
+
+
+class RawBuildQueryCapability(Protocol):
+    """The only SC2 authority surface the raw policy executor may call."""
+
+    def authorize_build(
+        self,
+        *,
+        builder_tag: int,
+        ability_id: int,
+        world_target: tuple[float, float],
+    ) -> RawBuildAuthorization: ...
 
 
 @dataclass(frozen=True)
@@ -80,6 +145,9 @@ class RawDispatch:
     resolved_arguments: tuple[Any, ...] = ()
     reservation_id: Optional[str] = None
     placement_revision: Optional[str] = None
+    build_authorization: RawBuildAuthorization | None = None
+    approach_only: bool = False
+    approach_target: tuple[float, float] | None = None
 
 
 class RawActionExecutor:
@@ -91,16 +159,23 @@ class RawActionExecutor:
         *,
         unit_names: Mapping[int, str],
         placement_service: Optional[RawPlacementService] = None,
+        build_query_capability: RawBuildQueryCapability | None = None,
     ) -> None:
         self.broker = broker
         self.unit_names = {int(key): str(value) for key, value in unit_names.items()}
         self.placement_service = placement_service or RawPlacementService(
             unit_names=self.unit_names
         )
+        self.build_query_capability = build_query_capability or getattr(
+            broker,
+            "raw_build_query_capability",
+            None,
+        )
         self._commands: deque[RoutedCommand] = deque()
         self._inflight: dict[str, RawDispatch] = {}
         self._builder_freshness_barrier: dict[int, int] = {}
         self._deferred_counts: dict[str, int] = {}
+        self._approach_rebases: set[str] = set()
         self._diagnostic_snapshot: dict[str, Any] = {}
 
     @property
@@ -138,6 +213,58 @@ class RawActionExecutor:
         """Whether queueing or effect verification still owns command work."""
 
         return bool(self._commands or self._inflight)
+
+    def set_build_query_capability(
+        self,
+        capability: RawBuildQueryCapability | None,
+    ) -> None:
+        """Install the current-step read-only SC2 build query surface."""
+
+        self.build_query_capability = capability
+
+    def mark_primitive_submitted(self, command_id: str, *, game_loop: int) -> None:
+        """Record env.step submission after the environment accepts the action call."""
+
+        self.placement_service.mark_primitive_submitted(
+            command_id,
+            game_loop=int(game_loop),
+        )
+        self._diagnostic_snapshot = {
+            **self._diagnostic_snapshot,
+            "primitive_submitted": True,
+            "primitive_submitted_game_loop": int(game_loop),
+        }
+
+    def mark_primitive_constructed(self, command_id: str, *, game_loop: int) -> None:
+        """Record a translated primitive before the environment step boundary."""
+
+        self.placement_service.mark_primitive_constructed(
+            command_id,
+            game_loop=int(game_loop),
+        )
+        pending = self._inflight.get(command_id)
+        if pending is not None:
+            self._diagnostic_snapshot = {
+                **self._diagnostic_snapshot,
+                "primitive_constructed": True,
+                "primitive_constructed_game_loop": int(game_loop),
+                "primitive_submitted": False,
+            }
+
+    def record_action_result(self, command_id: str, results: Sequence[Any]) -> None:
+        """Attach SC2 action-result rejection evidence to the lifecycle snapshot."""
+
+        normalized_results = [int(value) for value in results]
+        self.placement_service.record_action_result(command_id, normalized_results)
+        record_action_result = getattr(self.broker, "record_action_result", None)
+        if callable(record_action_result):
+            record_action_result(command_id, normalized_results)
+        self._diagnostic_snapshot = {
+            **self._diagnostic_snapshot,
+            "command_id": command_id,
+            "action_result": normalized_results,
+            "action_result_seen": bool(normalized_results),
+        }
 
     def enqueue(self, decision: BridgeDecision) -> None:
         """Preserve Runtime ActionBatch order across per-agent routes."""
@@ -256,6 +383,7 @@ class RawActionExecutor:
             "builder_tag": None if dispatch is None else dispatch.builder_tag,
             "placement_revision": command.placement_revision,
             "target_state_revision": None,
+            "material_legality_identity": None,
             "failure_classification": None,
             "classification_basis": (),
             "target_side_evidence": False,
@@ -271,6 +399,7 @@ class RawActionExecutor:
             values["world_target"] = reservation.world_target
             values["placement_revision"] = reservation.placement_revision
             values["target_state_revision"] = reservation.target_state_revision
+            values["material_legality_identity"] = reservation.material_legality_identity
         if evidence is not None:
             values["failure_classification"] = evidence.get("failure_classification")
             values["classification_basis"] = tuple(
@@ -295,9 +424,16 @@ class RawActionExecutor:
         )
         while self._commands:
             command = self._commands.popleft()
+            if command.command_id in self._approach_rebases:
+                self._approach_rebases.remove(command.command_id)
+                command = _rebase_approach_command(command, observation)
             try:
                 dispatch = self._translate(command, observation, agents)
-                self._inflight[command.command_id] = dispatch
+                if dispatch.approach_only:
+                    self._commands.appendleft(command)
+                    self._approach_rebases.add(command.command_id)
+                else:
+                    self._inflight[command.command_id] = dispatch
                 self._deferred_counts.pop(command.command_id, None)
                 self._diagnostic_snapshot = _dispatch_snapshot(dispatch, observation)
                 return dispatch
@@ -414,6 +550,11 @@ class RawActionExecutor:
                 agents,
                 unit_names=self.unit_names,
                 leased_builder_tags=self.placement_service.leased_builder_tags,
+                owned_lease_builder_tags=tuple(
+                    tag
+                    for tag in self.placement_service.leased_builder_tags
+                    if self.placement_service.builder_lease_owner(tag) == command.command_id
+                ),
                 freshness_blocked_builder_tags=self._freshness_blocked_builders(
                     _game_loop(observation)
                 ),
@@ -426,7 +567,12 @@ class RawActionExecutor:
                     f"{name} has no candidate-stage placement identity",
                 )
             available_builders = tuple(
-                tag for tag in actor_tags if tag not in self.placement_service.leased_builder_tags
+                tag
+                for tag in actor_tags
+                if (
+                    tag not in self.placement_service.leased_builder_tags
+                    or self.placement_service.builder_lease_owner(tag) == command.command_id
+                )
             )
             if not available_builders:
                 raise _RawDispatchDeferral(
@@ -461,6 +607,8 @@ class RawActionExecutor:
                     target_state_revision=None,
                     builder_tag=builder_tag,
                     observation_revision=_placement_revision(observation),
+                    material_legality_identity=None,
+                    target_side_evidence=False,
                 ):
                     raise _RawDispatchFailure(
                         "operation_no_start_circuit_open",
@@ -473,23 +621,6 @@ class RawActionExecutor:
                         details={"builder_state": builder_state},
                     ) from error
                 raise _RawDispatchFailure(error.code, str(error)) from error
-            if command.operation_id is not None and not _operation_retry_allowed(
-                self.placement_service,
-                operation_id=command.operation_id,
-                world_target=placement.world_target,
-                target_state_revision=placement.target_state_revision,
-                builder_tag=builder_tag,
-                observation_revision=placement.placement_revision,
-            ):
-                self.placement_service.release_command(
-                    command.command_id,
-                    game_loop=_game_loop(observation),
-                    reason="operation_no_start_circuit_open",
-                )
-                raise _RawDispatchFailure(
-                    "operation_no_start_circuit_open",
-                    f"{name} operation {command.operation_id} remains circuit-open",
-                )
             blockers = _dynamic_target_obstructions(
                 observation,
                 placement,
@@ -514,6 +645,99 @@ class RawActionExecutor:
                         ],
                         "placement_revision": placement.placement_revision,
                     },
+                )
+            builder_unit = _unit_by_tag(observation, builder_tag)
+            builder_position = (
+                None
+                if builder_unit is None
+                else (
+                    float(_value(builder_unit, "x", 0.0)),
+                    float(_value(builder_unit, "y", 0.0)),
+                )
+            )
+            if (
+                builder_position is not None
+                and math.dist(builder_position, placement.world_target)
+                > _BUILDER_APPROACH_MAX_DISTANCE
+            ):
+                approach_target = _raw_point(placement.world_target)
+                function = actions.RAW_FUNCTIONS.Move_Move_pt
+                action = function("now", [builder_tag], approach_target)
+                return RawDispatch(
+                    command=command,
+                    primitive=PrimitiveDispatch(
+                        command.command_id,
+                        str(function.name),
+                        False,
+                        origin="translator",
+                        ordinal=0,
+                        total=1,
+                        requested_function_id=int(function.id),
+                        emitted_function_id=int(function.id),
+                    ),
+                    action=action,
+                    actor_tags=(builder_tag,),
+                    builder_tag=builder_tag,
+                    resolved_arguments=(approach_target,),
+                    reservation_id=placement.reservation_id,
+                    placement_revision=placement.placement_revision,
+                    approach_only=True,
+                    approach_target=placement.world_target,
+                )
+            ability_id = int(getattr(function, "ability_id", 0))
+            if self.placement_service.build_authorization_was_rejected(
+                operation_id=command.operation_id,
+                builder_tag=builder_tag,
+                ability_id=ability_id,
+                world_target=placement.world_target,
+                target_state_revision=placement.target_state_revision,
+            ):
+                self.placement_service.release_command(
+                    command.command_id,
+                    game_loop=_game_loop(observation),
+                    reason="build_authorization_rejected_cached",
+                )
+                raise _RawDispatchFailure(
+                    "placement_query_rejected_cached",
+                    "exact builder/ability/target legality identity was already rejected",
+                    details={
+                        "builder_tag": hex(int(builder_tag)),
+                        "ability_id": ability_id,
+                        "world_target": tuple(float(value) for value in placement.world_target),
+                        "target_state_revision": placement.target_state_revision,
+                    },
+                )
+            authorization = self._authorize_build(
+                command,
+                placement=placement,
+                builder_tag=builder_tag,
+                ability_id=ability_id,
+                observation=observation,
+                builder_state=builder_state,
+            )
+            authorized_placement = self.placement_service.command_target(command.command_id)
+            if command.operation_id is not None and not _operation_retry_allowed(
+                self.placement_service,
+                operation_id=command.operation_id,
+                world_target=placement.world_target,
+                target_state_revision=placement.target_state_revision,
+                builder_tag=builder_tag,
+                observation_revision=placement.placement_revision,
+                material_legality_identity=(
+                    None
+                    if authorized_placement is None
+                    else authorized_placement.material_legality_identity
+                ),
+                target_side_evidence=authorization.authorized,
+            ):
+                self.placement_service.release_command(
+                    command.command_id,
+                    game_loop=_game_loop(observation),
+                    reason="operation_no_start_circuit_open",
+                )
+                raise _RawDispatchFailure(
+                    "operation_no_start_circuit_open",
+                    f"{name} operation {command.operation_id} remains circuit-open",
                 )
             if name == "Build_Assimilator_Near":
                 assert placement.anchor_tag is not None
@@ -630,6 +854,102 @@ class RawActionExecutor:
             resolved_arguments=resolved_arguments,
             reservation_id=(None if placement is None else placement.reservation_id),
             placement_revision=(None if placement is None else placement.placement_revision),
+            build_authorization=(authorization if name in _BUILD_RAW_FUNCTIONS else None),
+        )
+
+    def _authorize_build(
+        self,
+        command: RoutedCommand,
+        *,
+        placement: Any,
+        builder_tag: int,
+        ability_id: int,
+        observation: Any,
+        builder_state: Sequence[Mapping[str, Any]] = (),
+    ) -> RawBuildAuthorization:
+        capability = self.build_query_capability
+        if capability is None:
+            authorization = RawBuildAuthorization(
+                ability_available=None,
+                placement_result=None,
+                details={"reason": "no_read_only_query_capability"},
+            )
+        else:
+            try:
+                authorization = capability.authorize_build(
+                    builder_tag=int(builder_tag),
+                    ability_id=int(ability_id),
+                    world_target=(
+                        float(placement.world_target[0]),
+                        float(placement.world_target[1]),
+                    ),
+                )
+            except Exception as error:  # query failure is fail-closed, never a build
+                authorization = RawBuildAuthorization(
+                    ability_available=None,
+                    placement_result=None,
+                    details={
+                        "reason": "query_exception",
+                        "error_type": type(error).__name__,
+                    },
+                )
+        if authorization.ability_id is None:
+            authorization = replace(authorization, ability_id=int(ability_id))
+        self.placement_service.record_build_authorization(
+            command.command_id,
+            ability_id=int(ability_id),
+            authorization=authorization,
+            game_loop=_game_loop(observation),
+        )
+        if authorization.authorized:
+            return authorization
+        if authorization.ability_available is False:
+            code = "builder_ability_unavailable"
+            reason = f"builder {hex(builder_tag)} lacks ability {ability_id}"
+        elif authorization.placement_result is None:
+            code = "placement_query_unavailable"
+            reason = "authoritative SC2 placement query unavailable"
+        else:
+            code = "placement_query_rejected"
+            reason = (
+                "authoritative SC2 placement query rejected exact target with result "
+                f"{authorization.placement_query_status}"
+            )
+            if (
+                authorization.ability_available is True
+                and authorization.placement_result is not None
+            ):
+                self.placement_service.record_failed_build_authorization(
+                    operation_id=command.operation_id,
+                    builder_tag=builder_tag,
+                    ability_id=ability_id,
+                    world_target=placement.world_target,
+                    target_state_revision=placement.target_state_revision,
+                )
+        self.placement_service.release_command(
+            command.command_id,
+            game_loop=_game_loop(observation),
+            reason="build_authorization_failed",
+        )
+        raise _RawDispatchFailure(
+            code,
+            reason,
+            details={
+                "builder_tag": hex(int(builder_tag)),
+                "ability_id": int(ability_id),
+                "world_target": tuple(float(value) for value in placement.world_target),
+                "builder_state": deepcopy(
+                    next(
+                        (
+                            state
+                            for state in builder_state
+                            if state.get("tag") == hex(int(builder_tag))
+                        ),
+                        {},
+                    )
+                ),
+                **authorization.to_dict(),
+            },
         )
 
     def _freshness_blocked_builders(self, game_loop: int) -> frozenset[int]:
@@ -644,9 +964,16 @@ class RawActionExecutor:
 
 
 class _RawDispatchFailure(RuntimeError):
-    def __init__(self, code: str, reason: str) -> None:
+    def __init__(
+        self,
+        code: str,
+        reason: str,
+        *,
+        details: Mapping[str, Any] | None = None,
+    ) -> None:
         super().__init__(reason)
         self.code = code
+        self.details = dict(details or {})
 
 
 class _RawDispatchDeferral(_RawDispatchFailure):
@@ -655,6 +982,34 @@ class _RawDispatchDeferral(_RawDispatchFailure):
     def __init__(self, code: str, reason: str, *, details: Mapping[str, Any] | None = None) -> None:
         super().__init__(code, reason)
         self.details = dict(details or {})
+
+
+def _rebase_approach_command(command: RoutedCommand, observation: Any) -> RoutedCommand:
+    """Refresh candidate provenance after a staged builder movement."""
+
+    if (
+        not command.name.endswith("_Screen")
+        or command.screen_world_target is None
+        or command.screen_anchor_tag is None
+    ):
+        return command
+    spec = BUILD_SPECS.get(command.name)
+    if spec is None:
+        return command
+    revision = _placement_revision(observation)
+    candidate_id = _placement_candidate_id(
+        command.name,
+        command.screen_world_target,
+        command.screen_anchor_tag,
+        revision,
+        int(spec.footprint),
+        bool(spec.reserves_addon_space),
+    )
+    return replace(
+        command,
+        placement_candidate_id=candidate_id,
+        placement_revision=revision,
+    )
 
 
 def _call_optional_service_method(method: Any, values: Mapping[str, Any]) -> Any:
@@ -681,6 +1036,8 @@ def _operation_retry_allowed(
     target_state_revision: str | None,
     builder_tag: int | None,
     observation_revision: str | None,
+    material_legality_identity: str | None,
+    target_side_evidence: bool,
 ) -> bool:
     """Honor operation-level no-start circuit state when the hook is available."""
 
@@ -696,6 +1053,8 @@ def _operation_retry_allowed(
             "builder_tag": builder_tag,
             "builder_ready": builder_tag is not None,
             "observation_revision": observation_revision,
+            "material_legality_identity": material_legality_identity,
+            "target_side_evidence": target_side_evidence,
         },
     )
     return True if result is None else bool(result)
@@ -708,12 +1067,14 @@ def _resolve_builder_tags(
     *,
     unit_names: Mapping[int, str],
     leased_builder_tags: Collection[int],
+    owned_lease_builder_tags: Collection[int],
     freshness_blocked_builder_tags: Collection[int],
 ) -> tuple[tuple[int, ...], list[dict[str, Any]]]:
     """Bind a build command to fresh, complete, idle workers in this snapshot."""
 
     configured = set(_actor_tags(command.actor, observation, agents))
     leases = {int(tag) for tag in leased_builder_tags}
+    owned_leases = {int(tag) for tag in owned_lease_builder_tags}
     freshness_blocked = {int(tag) for tag in freshness_blocked_builder_tags}
     feature_visible = {
         int(_value(unit, "tag", 0))
@@ -756,7 +1117,7 @@ def _resolve_builder_tags(
             reason = "dead"
         elif int(_value(unit, "display_type", 1)) != 1:
             reason = "not_visible"
-        elif tag in leases:
+        elif tag in leases and tag not in owned_leases:
             reason = "leased"
         elif tag in freshness_blocked:
             reason = "awaiting_fresh_observation"
@@ -770,6 +1131,7 @@ def _resolve_builder_tags(
             {
                 "tag": hex(tag),
                 "unit_type": name,
+                "alliance": int(_value(unit, "alliance", 0)),
                 "configured": tag in configured,
                 "ready": reason is None,
                 "reason": reason,
@@ -783,6 +1145,23 @@ def _resolve_builder_tags(
                     float(_value(unit, "x", 0.0)),
                     float(_value(unit, "y", 0.0)),
                 ],
+                "approach_distance": (
+                    None
+                    if command.screen_world_target is None
+                    else round(
+                        math.dist(
+                            (
+                                float(_value(unit, "x", 0.0)),
+                                float(_value(unit, "y", 0.0)),
+                            ),
+                            (
+                                float(command.screen_world_target[0]),
+                                float(command.screen_world_target[1]),
+                            ),
+                        ),
+                        3,
+                    )
+                ),
                 "health": float(_value(unit, "health", 1.0)),
                 "nearby_enemy_units": nearby_enemies,
             }
@@ -951,8 +1330,13 @@ def _circle_intersects_cells(
 
 def _dispatch_snapshot(dispatch: RawDispatch, observation: Any) -> dict[str, Any]:
     reservation_id = dispatch.reservation_id
-    return {
-        "status": "dispatched",
+    authorization = dispatch.build_authorization
+    snapshot: dict[str, Any] = {
+        "status": "approach_staged" if dispatch.approach_only else "dispatched",
+        "primitive_constructed": True,
+        "primitive_submitted": False,
+        "approach_only": dispatch.approach_only,
+        "approach_target": dispatch.approach_target,
         "command_id": dispatch.command.command_id,
         "operation_id": dispatch.command.operation_id,
         "action_name": dispatch.command.name,
@@ -962,7 +1346,16 @@ def _dispatch_snapshot(dispatch: RawDispatch, observation: Any) -> dict[str, Any
         "observation_revision": _placement_revision(observation),
         "reservation_id": reservation_id,
         "game_loop": _game_loop(observation),
-        "placement_query_result": "unavailable_no_controller_access",
+        "available_ability_query": (
+            "not_applicable" if authorization is None else authorization.available_ability_query
+        ),
+        "placement_query_result": (
+            "not_applicable" if authorization is None else authorization.placement_query_status
+        ),
+        "target_legality_fingerprint": (
+            None if authorization is None else authorization.target_legality_fingerprint
+        ),
+        "ability_id": None if authorization is None else authorization.ability_id,
         "conservative_final_checks": [
             "builder_readiness",
             "canonical_footprint",
@@ -972,6 +1365,9 @@ def _dispatch_snapshot(dispatch: RawDispatch, observation: Any) -> dict[str, Any
         ],
         "emitted_arguments": deepcopy(dispatch.resolved_arguments),
     }
+    if authorization is not None:
+        snapshot["authorization_details"] = deepcopy(dict(authorization.details))
+    return snapshot
 
 
 def _deferral_snapshot(
@@ -995,6 +1391,8 @@ def _deferral_snapshot(
         "observation_revision": _placement_revision(observation),
         "game_loop": _game_loop(observation),
         "deferral_count": int(count),
+        "primitive_constructed": False,
+        "primitive_submitted": False,
     }
     snapshot.update(deepcopy(error.details))
     return snapshot
@@ -1005,7 +1403,7 @@ def _failure_snapshot(
     observation: Any,
     error: _RawDispatchFailure,
 ) -> dict[str, Any]:
-    return {
+    snapshot = {
         "status": "failed",
         "deferred": False,
         "failure_code": error.code,
@@ -1018,7 +1416,11 @@ def _failure_snapshot(
         "placement_revision": command.placement_revision,
         "observation_revision": _placement_revision(observation),
         "game_loop": _game_loop(observation),
+        "primitive_constructed": False,
+        "primitive_submitted": False,
     }
+    snapshot.update(deepcopy(error.details))
+    return snapshot
 
 
 def _actor_tags(
@@ -1163,4 +1565,9 @@ def _value(value: Any, name: str, default: Any) -> Any:
     return getattr(value, name, default)
 
 
-__all__ = ["RawActionExecutor", "RawDispatch"]
+__all__ = [
+    "RawActionExecutor",
+    "RawBuildAuthorization",
+    "RawBuildQueryCapability",
+    "RawDispatch",
+]

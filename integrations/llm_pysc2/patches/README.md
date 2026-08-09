@@ -100,12 +100,20 @@ git -C third_party/LLM-PySC2 apply --check \
   ../../integrations/llm_pysc2/patches/0024-route-managed-logs-and-profile-env-step.patch
 git -C third_party/LLM-PySC2 apply \
   ../../integrations/llm_pysc2/patches/0024-route-managed-logs-and-profile-env-step.patch
+git -C third_party/LLM-PySC2 apply --check \
+  ../../integrations/llm_pysc2/patches/0025-install-read-only-build-query-capability.patch
+git -C third_party/LLM-PySC2 apply \
+  ../../integrations/llm_pysc2/patches/0025-install-read-only-build-query-capability.patch
 ```
 
 After the live run, restore the clean pinned checkout by reversing exactly these reviewed
 patches in reverse order:
 
 ```bash
+git -C third_party/LLM-PySC2 apply --reverse --check \
+  ../../integrations/llm_pysc2/patches/0025-install-read-only-build-query-capability.patch
+git -C third_party/LLM-PySC2 apply --reverse \
+  ../../integrations/llm_pysc2/patches/0025-install-read-only-build-query-capability.patch
 git -C third_party/LLM-PySC2 apply --reverse --check \
   ../../integrations/llm_pysc2/patches/0024-route-managed-logs-and-profile-env-step.patch
 git -C third_party/LLM-PySC2 apply --reverse \
@@ -211,6 +219,10 @@ edits or gitlink drift.
 absolute `RTSCORTEX_LLM_LOG_DIR`, routes all logger outputs and copied templates beneath that
 run-owned root, and reports the PySC2 environment-step duration to the Bridge profiler. It
 prevents runtime writes from changing the attested reviewed source tree.
+
+`0025-install-read-only-build-query-capability.patch` gives RTSCortex agents a narrow
+per-episode wrapper around the SC2 controller's read-only ability and exact placement query.
+The wrapper is installed by the reviewed run loop and never exposes the controller itself.
 
 `0001-return-noop-while-awaiting-runtime.patch` changes one branch in `MainAgent.step`.
 The upstream implementation currently spins inside its bounded `while` loop while an

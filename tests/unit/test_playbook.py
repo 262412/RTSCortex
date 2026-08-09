@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import sqlite3
 import subprocess
 import sys
 from dataclasses import replace
@@ -1689,6 +1691,36 @@ def test_promotion_sweep_replays_multi_seed_states_and_activates_soft_rule(
 
     assert guard_result.score_delta == 0.5
     assert guard_result.rule_ids == (rule.rule_id,)
+    playbook.close()
+
+
+def test_promotion_situation_replay_uses_immutable_sqlite_read(tmp_path: Path) -> None:
+    run_dir = tmp_path / "historical-run"
+    run_dir.mkdir()
+    database = run_dir / "events.sqlite3"
+    connection = sqlite3.connect(database)
+    connection.execute("CREATE TABLE events (event_id INTEGER, event_type TEXT, payload_json TEXT)")
+    connection.execute(
+        "INSERT INTO events VALUES (?, ?, ?)",
+        (
+            1,
+            "situation_assessed",
+            json.dumps({"phase": "combat", "threat_level": "low"}),
+        ),
+    )
+    connection.commit()
+    connection.close()
+
+    playbook = PlaybookStore(tmp_path / "playbook.sqlite3")
+    sweep = PlaybookPromotionSweep(
+        playbook,
+        run_directories={"historical-run": run_dir},
+    )
+
+    assert sweep._load_situations("historical-run") == (
+        ({"phase": "combat", "threat_level": "low"}, 1),
+    )
+    assert list(run_dir.glob("events.sqlite3-*")) == []
     playbook.close()
 
 

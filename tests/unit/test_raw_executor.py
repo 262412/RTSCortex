@@ -6,13 +6,14 @@ from typing import Any, cast
 
 import pytest
 from rtscortex_llm_pysc2.coordinator import BridgeDecision
-from rtscortex_llm_pysc2.raw_executor import RawActionExecutor
+from rtscortex_llm_pysc2.raw_executor import RawActionExecutor, RawBuildAuthorization
 from rtscortex_llm_pysc2.raw_placement import (
     RawPlacementService,
     _placement_candidate_id,
     _placement_revision,
 )
 from rtscortex_llm_pysc2.routing import RoutedActionBatch, RoutedCommand
+from rtscortex_llm_pysc2.worker import SC2RawBuildQueryCapability
 
 pytest.importorskip("pysc2.lib.actions")
 
@@ -27,9 +28,42 @@ class _Broker:
                 (action, tuple(target))
             ),
         )
+        self.raw_build_query_capability = _AllowRawBuildQuery()
 
     def settle_primitive(self, dispatch: Any, *, success: bool, **_: Any) -> None:
         self.settled.append((dispatch.command_id, success))
+
+
+class _AllowRawBuildQuery:
+    def __init__(
+        self,
+        *,
+        ability_available: bool | None = True,
+        placement_result: str | None = "Success",
+    ) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self.ability_available = ability_available
+        self.placement_result = placement_result
+
+    def authorize_build(
+        self,
+        *,
+        builder_tag: int,
+        ability_id: int,
+        world_target: tuple[float, float],
+    ) -> RawBuildAuthorization:
+        self.calls.append(
+            {
+                "builder_tag": builder_tag,
+                "ability_id": ability_id,
+                "world_target": world_target,
+            }
+        )
+        return RawBuildAuthorization(
+            ability_available=self.ability_available,
+            placement_result=self.placement_result,
+            target_legality_fingerprint="legal:test",
+        )
 
 
 def _decision(command: RoutedCommand) -> BridgeDecision:
@@ -213,6 +247,450 @@ def test_raw_executor_binds_exact_tags_and_one_final_primitive(
     else:
         assert dispatch.producer_tag == expected_tags[0]
     assert broker.settled == []
+
+
+def _authorized_pylon_command(
+    observation: Any,
+    *,
+    command_id: str = "authorized-pylon",
+    operation_id: str | None = None,
+    target: tuple[float, float] = (22.0, 24.0),
+) -> RoutedCommand:
+    placement_revision = _placement_revision(observation)
+    return RoutedCommand(
+        command_id=command_id,
+        actor="Builder/Builder-Probe-1",
+        team_name="Builder-Probe-1",
+        name="Build_Pylon_Screen",
+        rendered_action="",
+        requested_arguments=([65, 65],),
+        operation_id=operation_id,
+        screen_world_target=target,
+        screen_anchor_tag=0xB1,
+        placement_candidate_id=_placement_candidate_id(
+            "Build_Pylon_Screen",
+            target,
+            0xB1,
+            placement_revision,
+            2,
+            False,
+        ),
+        placement_revision=placement_revision,
+    )
+
+
+def test_raw_executor_authorizes_exact_builder_ability_and_world_target_before_dispatch() -> None:
+    broker = _Broker()
+    query = _AllowRawBuildQuery()
+    executor = RawActionExecutor(
+        cast(Any, broker),
+        unit_names={2: "Probe"},
+        build_query_capability=query,
+    )
+    observation = SimpleNamespace(
+        raw_units=[_unit(0xB1, 2)],
+        game_loop=[100],
+        player_common=SimpleNamespace(minerals=500, vespene=0, food_used=0, food_cap=20),
+    )
+    command = _authorized_pylon_command(observation, target=(30.0, 25.0))
+    executor.enqueue(_decision(command))
+
+    dispatch = executor.next_dispatch(observation, {"Builder": _agent("Builder-Probe-1", [0xB1])})
+
+    assert dispatch is not None
+    assert query.calls == [{"builder_tag": 0xB1, "ability_id": 881, "world_target": (30.0, 25.0)}]
+    assert executor.diagnostic_snapshot["placement_query_result"] == "Success"
+    assert executor.diagnostic_snapshot["available_ability_query"] == "available"
+
+
+def test_sc2_query_fingerprint_tracks_requested_legality_state_generation() -> None:
+    from s2clientprotocol import error_pb2, query_pb2  # type: ignore[import-untyped]
+
+    class Controller:
+        def __init__(self) -> None:
+            self.responses = [
+                ([881], "Success"),
+                ([881, 999], "Success"),
+                ([], "CantBuildLocationInvalid"),
+                ([881], "Success"),
+            ]
+
+        def query(self, request: Any) -> Any:
+            del request
+            ability_ids, result_name = self.responses.pop(0)
+            response = query_pb2.ResponseQuery()
+            ability_response = response.abilities.add()
+            for ability_id in ability_ids:
+                ability_response.abilities.add(ability_id=ability_id)
+            response.placements.add(result=error_pb2.ActionResult.Value(result_name))
+            return response
+
+    capability = SC2RawBuildQueryCapability(Controller())
+    first = capability.authorize_build(
+        builder_tag=0xB1,
+        ability_id=881,
+        world_target=(30.0, 25.0),
+    )
+    unrelated_ability_churn = capability.authorize_build(
+        builder_tag=0xB1,
+        ability_id=881,
+        world_target=(30.0, 25.0),
+    )
+    rejected = capability.authorize_build(
+        builder_tag=0xB1,
+        ability_id=881,
+        world_target=(30.0, 25.0),
+    )
+    recovered = capability.authorize_build(
+        builder_tag=0xB1,
+        ability_id=881,
+        world_target=(30.0, 25.0),
+    )
+
+    assert first.target_legality_fingerprint == unrelated_ability_churn.target_legality_fingerprint
+    assert first.target_legality_fingerprint != rejected.target_legality_fingerprint
+    assert rejected.target_legality_fingerprint != recovered.target_legality_fingerprint
+    assert first.authorized is True
+    assert rejected.authorized is False
+    assert recovered.authorized is True
+
+
+def test_raw_executor_fails_closed_without_controller_query_capability() -> None:
+    broker = _Broker()
+    del broker.raw_build_query_capability
+    executor = RawActionExecutor(cast(Any, broker), unit_names={2: "Probe"})
+    observation = SimpleNamespace(
+        raw_units=[_unit(0xB1, 2)],
+        game_loop=[100],
+        player_common=SimpleNamespace(minerals=500, vespene=0, food_used=0, food_cap=20),
+    )
+    executor.enqueue(_decision(_authorized_pylon_command(observation, target=(30.0, 25.0))))
+
+    assert (
+        executor.next_dispatch(observation, {"Builder": _agent("Builder-Probe-1", [0xB1])}) is None
+    )
+    assert broker.settled == [("authorized-pylon", False)]
+    assert executor.diagnostic_snapshot["failure_code"] == "placement_query_unavailable"
+    assert executor.diagnostic_snapshot["available_ability_query"] == (
+        "unavailable_no_controller_access"
+    )
+    assert executor.placement_service.active_reservation_count == 0
+
+
+@pytest.mark.parametrize(
+    ("ability_available", "placement_result", "failure_code"),
+    [
+        (False, "Success", "builder_ability_unavailable"),
+        (True, "CantBuildLocationInvalid", "placement_query_rejected"),
+        (None, None, "placement_query_unavailable"),
+    ],
+)
+def test_raw_executor_fails_closed_when_final_build_query_does_not_authorize(
+    ability_available: bool | None,
+    placement_result: str | None,
+    failure_code: str,
+) -> None:
+    broker = _Broker()
+    query = _AllowRawBuildQuery(
+        ability_available=ability_available,
+        placement_result=placement_result,
+    )
+    executor = RawActionExecutor(
+        cast(Any, broker),
+        unit_names={2: "Probe"},
+        build_query_capability=query,
+    )
+    observation = SimpleNamespace(
+        raw_units=[_unit(0xB1, 2)],
+        game_loop=[100],
+        player_common=SimpleNamespace(minerals=500, vespene=0, food_used=0, food_cap=20),
+    )
+    executor.enqueue(_decision(_authorized_pylon_command(observation, target=(30.0, 25.0))))
+
+    assert (
+        executor.next_dispatch(observation, {"Builder": _agent("Builder-Probe-1", [0xB1])}) is None
+    )
+    assert broker.settled == [("authorized-pylon", False)]
+    assert executor.effect_inflight_count == 0
+    assert executor.diagnostic_snapshot["failure_code"] == failure_code
+    assert executor.diagnostic_snapshot["primitive_submitted"] is False
+
+
+def test_placement_query_rejection_suppresses_same_target_until_state_changes() -> None:
+    broker = _Broker()
+    query = _AllowRawBuildQuery(placement_result="CantBuildLocationInvalid")
+    executor = RawActionExecutor(
+        cast(Any, broker),
+        unit_names={2: "Probe"},
+        build_query_capability=query,
+    )
+    observation = SimpleNamespace(
+        raw_units=[_unit(0xB1, 2)],
+        game_loop=[100],
+        player_common=SimpleNamespace(minerals=500, vespene=0, food_used=0, food_cap=20),
+    )
+    command = _authorized_pylon_command(observation, target=(30.0, 25.0))
+    executor.enqueue(_decision(command))
+    assert (
+        executor.next_dispatch(observation, {"Builder": _agent("Builder-Probe-1", [0xB1])}) is None
+    )
+    assert len(query.calls) == 1
+
+    executor.enqueue(_decision(command))
+    assert (
+        executor.next_dispatch(observation, {"Builder": _agent("Builder-Probe-1", [0xB1])}) is None
+    )
+    assert len(query.calls) == 1
+    assert executor.diagnostic_snapshot["failure_code"] == "placement_query_rejected_cached"
+
+
+def test_rejected_authorization_allows_same_target_with_different_builder() -> None:
+    broker = _Broker()
+    query = _AllowRawBuildQuery(placement_result="CantBuildLocationInvalid")
+    executor = RawActionExecutor(
+        cast(Any, broker),
+        unit_names={2: "Probe", 9: "Zergling"},
+        build_query_capability=query,
+    )
+    first_observation = SimpleNamespace(
+        raw_units=[_unit(0xB1, 2, x=20, y=20), _unit(0xB2, 2, x=20, y=25)],
+        game_loop=[100],
+        player_common=SimpleNamespace(minerals=500, vespene=0, food_used=0, food_cap=20),
+    )
+    command = _authorized_pylon_command(first_observation, target=(30.0, 25.0))
+    command = replace(command, actor="Builder/Builder-Probe-1")
+    executor.enqueue(_decision(command))
+    assert (
+        executor.next_dispatch(
+            first_observation,
+            {"Builder": _agent("Builder-Probe-1", [0xB1, 0xB2])},
+        )
+        is None
+    )
+    assert query.calls[0]["builder_tag"] == 0xB1
+
+    second_observation = SimpleNamespace(
+        raw_units=[
+            _unit(0xB1, 2, x=20, y=20),
+            _unit(0xB2, 2, x=20, y=25),
+            _unit(0xE1, 9, alliance=4, x=22, y=20),
+        ],
+        game_loop=[116],
+        player_common=first_observation.player_common,
+    )
+    second_command = replace(
+        _authorized_pylon_command(second_observation, target=(30.0, 25.0)),
+        actor="Builder/Builder-Probe-1",
+    )
+    executor.enqueue(_decision(second_command))
+    assert (
+        executor.next_dispatch(
+            second_observation,
+            {"Builder": _agent("Builder-Probe-1", [0xB1, 0xB2])},
+        )
+        is None
+    )
+    assert query.calls[-1]["builder_tag"] == 0xB2
+    assert len(query.calls) == 2
+
+
+def test_seed0_gateway_dynamic_obstruction_is_staged_before_authority_query() -> None:
+    broker = _Broker()
+    query = _AllowRawBuildQuery()
+    executor = RawActionExecutor(
+        cast(Any, broker),
+        unit_names={2: "Probe"},
+        build_query_capability=query,
+    )
+    target = (60.0, 71.0)
+    observation = SimpleNamespace(
+        raw_units=[
+            _unit(0xB1, 2, x=20, y=20),
+            _unit(0xE1, 9, alliance=4, x=59, y=72),
+        ],
+        game_loop=[100],
+        player_common=SimpleNamespace(minerals=500, vespene=0, food_used=0, food_cap=20),
+    )
+    revision = _placement_revision(observation)
+    command = RoutedCommand(
+        command_id="seed0-gateway-obstruction",
+        actor="Builder/Builder-Probe-1",
+        team_name="Builder-Probe-1",
+        name="Build_Gateway_Screen",
+        rendered_action="",
+        requested_arguments=([65, 65],),
+        screen_world_target=target,
+        screen_anchor_tag=0xB1,
+        placement_candidate_id=_placement_candidate_id(
+            "Build_Gateway_Screen", target, 0xB1, revision, 3, False
+        ),
+        placement_revision=revision,
+    )
+    executor.enqueue(_decision(command))
+
+    assert (
+        executor.next_dispatch(observation, {"Builder": _agent("Builder-Probe-1", [0xB1])}) is None
+    )
+    assert executor.queued_count == 1
+    assert executor.diagnostic_snapshot["failure_code"] == "dynamic_target_obstruction"
+    assert executor.diagnostic_snapshot["dynamic_blockers"] == [
+        {
+            "tag": "0xe1",
+            "unit_type": "unit:9",
+            "alliance": 4,
+            "position": [59.0, 72.0],
+            "radius": 0.5,
+        }
+    ]
+    assert query.calls == []
+
+
+def test_seed2_far_staged_builder_is_authorized_by_exact_tag_and_target() -> None:
+    broker = _Broker()
+    query = _AllowRawBuildQuery()
+    executor = RawActionExecutor(
+        cast(Any, broker),
+        unit_names={2: "Probe"},
+        build_query_capability=query,
+    )
+    target = (65.0, 65.0)
+    observation = SimpleNamespace(
+        raw_units=[_unit(0xB2, 2, x=2, y=2)],
+        game_loop=[100],
+        player_common=SimpleNamespace(minerals=500, vespene=0, food_used=0, food_cap=20),
+    )
+    revision = _placement_revision(observation)
+    command = RoutedCommand(
+        command_id="seed2-far-pylon",
+        actor="Builder/Builder-Probe-1",
+        team_name="Builder-Probe-1",
+        name="Build_Pylon_Screen",
+        rendered_action="",
+        requested_arguments=([65, 65],),
+        screen_world_target=target,
+        screen_anchor_tag=0xB2,
+        placement_candidate_id=_placement_candidate_id(
+            "Build_Pylon_Screen", target, 0xB2, revision, 2, False
+        ),
+        placement_revision=revision,
+    )
+    executor.enqueue(_decision(command))
+
+    approach_dispatch = executor.next_dispatch(
+        observation,
+        {"Builder": _agent("Builder-Probe-1", [0xB2])},
+    )
+
+    assert approach_dispatch is not None
+    assert approach_dispatch.approach_only is True
+    assert query.calls == []
+    assert executor.diagnostic_snapshot["status"] == "approach_staged"
+    assert executor.diagnostic_snapshot["primitive_constructed"] is True
+
+    approach_observation = SimpleNamespace(
+        raw_units=[_unit(0xB2, 2, x=60, y=61)],
+        game_loop=[116],
+        player_common=SimpleNamespace(minerals=500, vespene=0, food_used=0, food_cap=20),
+    )
+    dispatch = executor.next_dispatch(
+        approach_observation,
+        {"Builder": _agent("Builder-Probe-1", [0xB2])},
+    )
+
+    assert dispatch is not None
+    assert dispatch.approach_only is False
+    assert query.calls == [{"builder_tag": 0xB2, "ability_id": 881, "world_target": target}]
+    assert executor.diagnostic_snapshot["builder_tag"] == "0xb2"
+    assert executor.diagnostic_snapshot["target_legality_fingerprint"] == "legal:test"
+
+
+def test_raw_dispatch_lifecycle_separates_constructed_from_env_step_submission() -> None:
+    broker = _Broker()
+    query = _AllowRawBuildQuery()
+    executor = RawActionExecutor(
+        cast(Any, broker),
+        unit_names={2: "Probe"},
+        build_query_capability=query,
+    )
+    observation = SimpleNamespace(
+        raw_units=[_unit(0xB1, 2)],
+        game_loop=[100],
+        player_common=SimpleNamespace(minerals=500, vespene=0, food_used=0, food_cap=20),
+    )
+    executor.enqueue(_decision(_authorized_pylon_command(observation, target=(30.0, 25.0))))
+
+    dispatch = executor.next_dispatch(
+        observation,
+        {"Builder": _agent("Builder-Probe-1", [0xB1])},
+    )
+
+    assert dispatch is not None
+    assert executor.diagnostic_snapshot["primitive_constructed"] is True
+    assert executor.diagnostic_snapshot["primitive_submitted"] is False
+    executor.mark_primitive_constructed(dispatch.command.command_id, game_loop=100)
+    assert executor.diagnostic_snapshot["primitive_submitted"] is False
+    executor.mark_primitive_submitted(dispatch.command.command_id, game_loop=116)
+    assert executor.diagnostic_snapshot["primitive_submitted"] is True
+    assert executor.diagnostic_snapshot["primitive_submitted_game_loop"] == 116
+
+
+def test_approaching_builder_is_staged_but_authority_rejects_exact_placement() -> None:
+    broker = _Broker()
+    query = _AllowRawBuildQuery(placement_result="CantBuildLocationInvalid")
+    executor = RawActionExecutor(
+        cast(Any, broker),
+        unit_names={2: "Probe"},
+        build_query_capability=query,
+    )
+    target = (65.0, 65.0)
+    observation = SimpleNamespace(
+        raw_units=[_unit(0xB2, 2, x=20, y=20)],
+        game_loop=[100],
+        player_common=SimpleNamespace(minerals=500, vespene=0, food_used=0, food_cap=20),
+    )
+    revision = _placement_revision(observation)
+    command = RoutedCommand(
+        command_id="approach-placement-reject",
+        actor="Builder/Builder-Probe-1",
+        team_name="Builder-Probe-1",
+        name="Build_Pylon_Screen",
+        rendered_action="",
+        requested_arguments=([65, 65],),
+        screen_world_target=target,
+        screen_anchor_tag=0xB2,
+        placement_candidate_id=_placement_candidate_id(
+            "Build_Pylon_Screen", target, 0xB2, revision, 2, False
+        ),
+        placement_revision=revision,
+    )
+    executor.enqueue(_decision(command))
+
+    approach_dispatch = executor.next_dispatch(
+        observation,
+        {"Builder": _agent("Builder-Probe-1", [0xB2])},
+    )
+    assert approach_dispatch is not None
+    assert approach_dispatch.approach_only is True
+    assert query.calls == []
+    assert executor.effect_inflight_count == 0
+
+    near_observation = SimpleNamespace(
+        raw_units=[_unit(0xB2, 2, x=60, y=61)],
+        game_loop=[116],
+        player_common=SimpleNamespace(minerals=500, vespene=0, food_used=0, food_cap=20),
+    )
+    assert (
+        executor.next_dispatch(
+            near_observation,
+            {"Builder": _agent("Builder-Probe-1", [0xB2])},
+        )
+        is None
+    )
+    assert query.calls == [{"builder_tag": 0xB2, "ability_id": 881, "world_target": target}]
+    assert executor.diagnostic_snapshot["failure_code"] == "placement_query_rejected"
+    assert executor.diagnostic_snapshot["builder_state"]["position"] == [60.0, 61.0]
+    assert executor.diagnostic_snapshot["builder_state"]["approach_distance"] == 6.403
+    assert executor.effect_inflight_count == 0
 
 
 def test_raw_executor_rejects_missing_actor_without_emitting_action() -> None:
@@ -946,6 +1424,10 @@ def test_raw_executor_keeps_operation_circuit_open_without_new_target_state() ->
                 "command_id": first.command_id,
                 "status": "failed",
                 "failure_code": "no_build_start_evidence",
+                "effect_evidence": {
+                    "failure_classification": "gameplay_no_start_unknown",
+                    "target_side_evidence": False,
+                },
             }
         ],
         agents,
@@ -958,10 +1440,10 @@ def test_raw_executor_keeps_operation_circuit_open_without_new_target_state() ->
     retry_revision = _placement_revision(retry_observation)
     retry_kwargs: dict[str, Any] = {
         **command_kwargs,
-        "screen_world_target": (30.0, 30.0),
+        "screen_world_target": (22.25, 24.5),
         "placement_candidate_id": _placement_candidate_id(
             "Build_Pylon_Screen",
-            (30.0, 30.0),
+            (22.25, 24.5),
             0xB1,
             retry_revision,
             2,
@@ -978,6 +1460,32 @@ def test_raw_executor_keeps_operation_circuit_open_without_new_target_state() ->
     assert placement_service.active_reservation_count == 0
     assert executor.diagnostic_snapshot["failure_code"] == "operation_no_start_circuit_open"
     assert placement_service.quarantined_targets == {}
+
+    changed_observation = SimpleNamespace(raw_units=[_unit(0xB2, 2)], game_loop=[103])
+    changed_revision = _placement_revision(changed_observation)
+    changed = RoutedCommand(
+        command_id="circuit-material-change",
+        **{
+            **command_kwargs,
+            "attempt_ordinal": 8,
+            "screen_anchor_tag": 0xB2,
+            "placement_candidate_id": _placement_candidate_id(
+                "Build_Pylon_Screen",
+                (22.25, 24.5),
+                0xB2,
+                changed_revision,
+                2,
+                False,
+            ),
+            "placement_revision": changed_revision,
+        },
+    )
+    changed_agents = {"Builder": _agent("Builder-Probe-1", [0xB2])}
+    executor.enqueue(_decision(changed))
+    changed_dispatch = executor.next_dispatch(changed_observation, changed_agents)
+
+    assert changed_dispatch is not None
+    assert changed_dispatch.builder_tag == 0xB2
 
 
 def test_failed_build_effect_temporarily_suppresses_emitted_world_target() -> None:
@@ -1085,7 +1593,7 @@ def test_raw_nexus_uses_resource_clearance_position_not_resource_centroid() -> N
     dispatch = executor.next_dispatch(
         SimpleNamespace(
             raw_units=[
-                _unit(0xB1, 2),
+                _unit(0xB1, 2, x=75, y=75),
                 _unit(0xC1, 59, x=20, y=20),
                 *resources,
             ],

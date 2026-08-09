@@ -122,6 +122,11 @@ def _qualification_manifest(
             "evaluation_without_application_count": 0,
             "rule_fingerprint": probe_rule_fingerprint,
             "predicate_fingerprint": probe_predicate_fingerprint,
+            "typed_retry_opportunity_count": 1,
+            "typed_retry_application_count": 1,
+            "typed_retry_coverage_unavailable": False,
+            "typed_retry_coverage_reasons": [],
+            "config_sha256": f"{seed + 10:064x}",
         }
         for seed in (0, 1, 2)
     ]
@@ -153,6 +158,9 @@ def _qualification_manifest(
         "evaluation_without_application_count": 0,
         "rule_fingerprint": probe_rule_fingerprint,
         "predicate_fingerprint": probe_predicate_fingerprint,
+        "typed_retry_opportunity_count_by_seed": {"0": 1, "1": 1, "2": 1},
+        "typed_retry_application_count_by_seed": {"0": 1, "1": 1, "2": 1},
+        "typed_retry_coverage_unavailable_by_seed": {},
     }
     payload.update(updates)
     path.write_text(json.dumps(payload), encoding="utf-8")
@@ -281,6 +289,42 @@ def test_qualification_creates_disjoint_hard_child_without_mutating_parent(
     assert report.approved_hard_rule_ids == (child.rule_id,)
     assert report.runtime_selected_hard_rule_ids == (child.rule_id,)
     assert report.canary_runnable is True
+
+
+def test_readiness_rejects_qualification_manifest_without_typed_retry_coverage(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "playbook.sqlite3"
+    manifest = tmp_path / "qualification.json"
+    parent = _soft_rule()
+    _write_store(database, parent)
+    _qualification_manifest(manifest, database, parent)
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    for run in payload["qualification_runs"]:
+        run["typed_retry_opportunity_count"] = None
+        run["typed_retry_application_count"] = None
+        run["typed_retry_coverage_unavailable"] = None
+        run["typed_retry_coverage_reasons"] = None
+        run["config_sha256"] = None
+    payload["typed_retry_opportunity_count_by_seed"] = {}
+    payload["typed_retry_application_count_by_seed"] = {}
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+    store = PlaybookStore(database)
+    try:
+        with pytest.raises(
+            ValueError,
+            match="qualification_manifest_typed_retry_coverage_unavailable",
+        ):
+            qualify_hard_rule(
+                store,
+                parent_rule_id=parent.rule_id,
+                expected_git_sha=GIT_SHA,
+                sc2_patch="4.10",
+                qualification_manifest_path=manifest,
+                evaluation_seed_ids=(3, 4, 5),
+            )
+    finally:
+        store.close()
 
 
 def test_tactical_response_qualification_kind_matches_shared_evaluation_kind(

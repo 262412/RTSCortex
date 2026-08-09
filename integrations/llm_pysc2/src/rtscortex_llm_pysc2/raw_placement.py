@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 from collections.abc import Callable, Collection, Mapping, Sequence
+from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, Optional
@@ -43,6 +44,15 @@ class RawPlacementReservation:
     episode_id: str
     expires_game_loop: int
     attempt_ordinal: int | None = None
+    ability_id: int | None = None
+    target_legality_fingerprint: str | None = None
+    material_legality_identity: str | None = None
+    available_ability_query: str | None = None
+    placement_query_result: str | None = None
+    build_authorization_details: Mapping[str, Any] = field(default_factory=dict)
+    primitive_constructed_game_loop: int | None = None
+    primitive_submitted_game_loop: int | None = None
+    action_result: tuple[int, ...] | None = None
 
     @property
     def reservation_id(self) -> str:
@@ -123,6 +133,9 @@ class RawPlacementNoStartState:
     blocked_observation_revision: str | None = None
     blocked_failure_classification: str | None = None
     blocked_target_side_evidence: bool = False
+    last_material_legality_identity: str | None = None
+    blocked_material_legality_identity: str | None = None
+    failed_material_legality_identities: tuple[str, ...] = ()
     seen_attempt_ordinals: tuple[int, ...] = ()
     seen_command_ids: tuple[str, ...] = ()
 
@@ -146,6 +159,7 @@ class RawPlacementNoStartDecision:
     failure_classification: str | None = None
     classification_basis: tuple[str, ...] = ()
     evidence: dict[str, Any] = field(default_factory=dict)
+    material_duplicate: bool = False
 
     @property
     def deferred(self) -> bool:
@@ -172,6 +186,7 @@ class RawPlacementNoStartDecision:
             "failure_classification": self.failure_classification,
             "classification_basis": list(self.classification_basis),
             "evidence": dict(self.evidence),
+            "material_duplicate": self.material_duplicate,
         }
 
 
@@ -195,6 +210,9 @@ class _OperationNoStartLedger:
     blocked_observation_revision: str | None = None
     blocked_failure_classification: str | None = None
     blocked_target_side_evidence: bool = False
+    last_material_legality_identity: str | None = None
+    blocked_material_legality_identity: str | None = None
+    failed_material_legality_identities: set[str] = field(default_factory=set)
     seen_attempt_ordinals: set[int] = field(default_factory=set)
     seen_command_ids: set[str] = field(default_factory=set)
 
@@ -213,6 +231,33 @@ def _footprint_cells(
     return frozenset(
         (x, y) for y in range(start_y, start_y + height) for x in range(start_x, start_x + width)
     )
+
+
+def _optional_str(value: Any) -> str | None:
+    return None if value is None else str(value)
+
+
+def _optional_int(value: Any) -> int | None:
+    return None if value is None else int(value)
+
+
+def _optional_point(value: Any) -> tuple[float, float] | None:
+    if value is None or not isinstance(value, Sequence) or len(value) != 2:
+        return None
+    return float(value[0]), float(value[1])
+
+
+def _required_point(value: Any) -> tuple[float, float]:
+    point = _optional_point(value)
+    if point is None:
+        raise ValueError("checkpoint placement target must be a two-coordinate point")
+    return point
+
+
+def _required_grid_cell(value: Any) -> tuple[int, int]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)) or len(value) != 2:
+        raise ValueError("checkpoint placement cell must contain two coordinates")
+    return int(value[0]), int(value[1])
 
 
 def _occupied_cells_for_spec(
@@ -250,6 +295,33 @@ def _placement_candidate_id(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
     return f"placement-candidate:{digest}"
+
+
+def build_material_legality_identity(
+    *,
+    operation_id: str | None,
+    builder_tag: int | None,
+    ability_id: int | None,
+    world_target: tuple[float, float] | None,
+    target_legality_fingerprint: str | None,
+    target_state_revision: str | None = None,
+) -> str:
+    """Build the stable identity used by operation-level no-start tombstones."""
+
+    payload = {
+        "operation_id": None if operation_id is None else str(operation_id),
+        "builder_tag": None if builder_tag is None else int(builder_tag),
+        "ability_id": None if ability_id is None else int(ability_id),
+        "world_target": (
+            None if world_target is None else [float(world_target[0]), float(world_target[1])]
+        ),
+        "target_legality_fingerprint": target_legality_fingerprint,
+        "target_state_revision": target_state_revision,
+    }
+    digest = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    return f"build-legality:{digest}"
 
 
 class RawPlacementService:
@@ -300,6 +372,7 @@ class RawPlacementService:
         self._runtime_game_loop = 0
         self._last_transition_loop: dict[str, int] = {}
         self._world_to_minimap_transform: tuple[float, float, float, float, float] | None = None
+        self._failed_build_authorizations: set[str] = set()
 
     def set_world_to_minimap_transform(
         self,
@@ -349,6 +422,71 @@ class RawPlacementService:
     def leased_builder_tags(self) -> frozenset[int]:
         return frozenset(self._builder_leases)
 
+    def builder_lease_owner(self, builder_tag: int) -> str | None:
+        """Return the command that owns a builder lease, if any."""
+
+        return self._builder_leases.get(int(builder_tag))
+
+    @staticmethod
+    def build_authorization_identity(
+        *,
+        operation_id: str | None,
+        builder_tag: int,
+        ability_id: int,
+        world_target: tuple[float, float],
+        target_state_revision: str | None,
+    ) -> str:
+        payload = {
+            "operation_id": operation_id,
+            "builder_tag": int(builder_tag),
+            "ability_id": int(ability_id),
+            "world_target": [float(world_target[0]), float(world_target[1])],
+            "target_state_revision": target_state_revision,
+        }
+        digest = hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        return f"build-authorization:{digest}"
+
+    def record_failed_build_authorization(
+        self,
+        *,
+        operation_id: str | None,
+        builder_tag: int,
+        ability_id: int,
+        world_target: tuple[float, float],
+        target_state_revision: str | None,
+    ) -> str:
+        identity = self.build_authorization_identity(
+            operation_id=operation_id,
+            builder_tag=builder_tag,
+            ability_id=ability_id,
+            world_target=world_target,
+            target_state_revision=target_state_revision,
+        )
+        self._failed_build_authorizations.add(identity)
+        return identity
+
+    def build_authorization_was_rejected(
+        self,
+        *,
+        operation_id: str | None,
+        builder_tag: int,
+        ability_id: int,
+        world_target: tuple[float, float],
+        target_state_revision: str | None,
+    ) -> bool:
+        return (
+            self.build_authorization_identity(
+                operation_id=operation_id,
+                builder_tag=builder_tag,
+                ability_id=ability_id,
+                world_target=world_target,
+                target_state_revision=target_state_revision,
+            )
+            in self._failed_build_authorizations
+        )
+
     @property
     def active_reservation_count(self) -> int:
         return len(self._command_targets)
@@ -362,6 +500,189 @@ class RawPlacementService:
 
     def reset_diagnostics(self) -> None:
         self._placement_diagnostics.clear()
+
+    def checkpoint_state(self) -> dict[str, Any]:
+        """Return JSON-safe placement/tombstone state for episode checkpoints."""
+
+        return {
+            "version": 1,
+            "no_start_operations": {
+                operation_id: {
+                    "operation_id": ledger.operation_id,
+                    "threshold": ledger.threshold,
+                    "streak": ledger.streak,
+                    "circuit_open": ledger.circuit_open,
+                    "last_status": ledger.last_status,
+                    "last_command_id": ledger.last_command_id,
+                    "last_attempt_ordinal": ledger.last_attempt_ordinal,
+                    "last_builder_tag": ledger.last_builder_tag,
+                    "last_world_target": ledger.last_world_target,
+                    "last_placement_revision": ledger.last_placement_revision,
+                    "last_target_state_revision": ledger.last_target_state_revision,
+                    "last_observation_revision": ledger.last_observation_revision,
+                    "last_material_legality_identity": ledger.last_material_legality_identity,
+                    "failed_material_legality_identities": sorted(
+                        ledger.failed_material_legality_identities
+                    ),
+                    "blocked_target_state_revision": ledger.blocked_target_state_revision,
+                    "blocked_builder_tag": ledger.blocked_builder_tag,
+                    "blocked_placement_revision": ledger.blocked_placement_revision,
+                    "blocked_observation_revision": ledger.blocked_observation_revision,
+                    "blocked_material_legality_identity": ledger.blocked_material_legality_identity,
+                    "blocked_failure_classification": ledger.blocked_failure_classification,
+                    "blocked_target_side_evidence": ledger.blocked_target_side_evidence,
+                    "seen_attempt_ordinals": sorted(ledger.seen_attempt_ordinals),
+                    "seen_command_ids": sorted(ledger.seen_command_ids),
+                }
+                for operation_id, ledger in self._operation_no_start.items()
+            },
+            "permanent_exclusions": [
+                {
+                    "world_target": exclusion.world_target,
+                    "occupied_grid_cells": sorted(exclusion.occupied_grid_cells),
+                    "reason": exclusion.reason,
+                }
+                for exclusion in self._permanent_exclusions
+            ],
+            "temporary_suppressions": {
+                action_name: [
+                    {
+                        "world_target": suppression.world_target,
+                        "occupied_grid_cells": sorted(suppression.occupied_grid_cells),
+                        "expires_game_loop": suppression.expires_game_loop,
+                        "reason": suppression.reason,
+                        "target_state_revision": suppression.target_state_revision,
+                        "anchor_tag": suppression.anchor_tag,
+                    }
+                    for suppression in suppressions
+                ]
+                for action_name, suppressions in self._temporary_suppressions.items()
+            },
+            "failed_build_authorizations": sorted(self._failed_build_authorizations),
+            "target_state_memory": [
+                {
+                    "action_name": action_name,
+                    "world_target": list(world_target),
+                    "signature": signature,
+                    "generation": generation,
+                }
+                for (action_name, world_target), (
+                    signature,
+                    generation,
+                ) in self._target_state_memory.items()
+            ],
+        }
+
+    export_state = checkpoint_state
+
+    def restore_checkpoint_state(self, state: Mapping[str, Any]) -> None:
+        """Restore durable operation tombstones and target suppressions."""
+
+        operations = state.get("no_start_operations", {})
+        if isinstance(operations, Mapping):
+            for operation_id, raw in operations.items():
+                if not isinstance(raw, Mapping):
+                    continue
+                ledger = _OperationNoStartLedger(
+                    operation_id=str(raw.get("operation_id", operation_id)),
+                    threshold=int(raw.get("threshold", self.no_start_streak_threshold)),
+                    streak=int(raw.get("streak", 0)),
+                    circuit_open=bool(raw.get("circuit_open", False)),
+                    last_status=str(raw.get("last_status", RawPlacementNoStartStatus.RESET.value)),
+                    last_command_id=_optional_str(raw.get("last_command_id")),
+                    last_attempt_ordinal=_optional_int(raw.get("last_attempt_ordinal")),
+                    last_builder_tag=_optional_int(raw.get("last_builder_tag")),
+                    last_world_target=_optional_point(raw.get("last_world_target")),
+                    last_placement_revision=_optional_str(raw.get("last_placement_revision")),
+                    last_target_state_revision=_optional_str(raw.get("last_target_state_revision")),
+                    last_observation_revision=_optional_str(raw.get("last_observation_revision")),
+                    last_material_legality_identity=_optional_str(
+                        raw.get("last_material_legality_identity")
+                    ),
+                    blocked_target_state_revision=_optional_str(
+                        raw.get("blocked_target_state_revision")
+                    ),
+                    blocked_builder_tag=_optional_int(raw.get("blocked_builder_tag")),
+                    blocked_placement_revision=_optional_str(raw.get("blocked_placement_revision")),
+                    blocked_observation_revision=_optional_str(
+                        raw.get("blocked_observation_revision")
+                    ),
+                    blocked_material_legality_identity=_optional_str(
+                        raw.get("blocked_material_legality_identity")
+                    ),
+                    blocked_failure_classification=_optional_str(
+                        raw.get("blocked_failure_classification")
+                    ),
+                    blocked_target_side_evidence=bool(
+                        raw.get("blocked_target_side_evidence", False)
+                    ),
+                    failed_material_legality_identities={
+                        str(value) for value in raw.get("failed_material_legality_identities", ())
+                    },
+                    seen_attempt_ordinals={
+                        int(value) for value in raw.get("seen_attempt_ordinals", ())
+                    },
+                    seen_command_ids={str(value) for value in raw.get("seen_command_ids", ())},
+                )
+                self._operation_no_start[str(operation_id)] = ledger
+        permanent = state.get("permanent_exclusions", ())
+        if isinstance(permanent, Sequence) and not isinstance(permanent, (str, bytes)):
+            self._permanent_exclusions = [
+                _SpatialExclusion(
+                    _required_point(item.get("world_target")),
+                    frozenset(
+                        _required_grid_cell(value) for value in item.get("occupied_grid_cells", ())
+                    ),
+                    str(item.get("reason", "invalid_terrain")),
+                )
+                for item in permanent
+                if isinstance(item, Mapping)
+            ]
+        temporary = state.get("temporary_suppressions", {})
+        if isinstance(temporary, Mapping):
+            self._temporary_suppressions = {
+                str(action_name): [
+                    _TemporarySuppression(
+                        _required_point(item.get("world_target")),
+                        frozenset(
+                            _required_grid_cell(value)
+                            for value in item.get("occupied_grid_cells", ())
+                        ),
+                        int(item.get("expires_game_loop", 0)),
+                        str(item.get("reason", "no_legal_placement")),
+                        _optional_str(item.get("target_state_revision")),
+                        _optional_int(item.get("anchor_tag")),
+                    )
+                    for item in values
+                    if isinstance(item, Mapping)
+                ]
+                for action_name, values in temporary.items()
+                if isinstance(values, Sequence) and not isinstance(values, (str, bytes))
+            }
+        failed_authorizations = state.get("failed_build_authorizations", ())
+        self._failed_build_authorizations = (
+            {str(value) for value in failed_authorizations}
+            if isinstance(failed_authorizations, (list, tuple, set, frozenset))
+            else set()
+        )
+        target_state_memory = state.get("target_state_memory", ())
+        if isinstance(target_state_memory, Sequence) and not isinstance(
+            target_state_memory,
+            (str, bytes),
+        ):
+            self._target_state_memory = {
+                (
+                    str(item.get("action_name")),
+                    _required_point(item.get("world_target")),
+                ): (
+                    str(item.get("signature", "")),
+                    int(item.get("generation", 0)),
+                )
+                for item in target_state_memory
+                if isinstance(item, Mapping)
+            }
+
+    restore_state = restore_checkpoint_state
 
     def operation_no_start_state(
         self,
@@ -391,6 +712,11 @@ class RawPlacementService:
             blocked_observation_revision=ledger.blocked_observation_revision,
             blocked_failure_classification=ledger.blocked_failure_classification,
             blocked_target_side_evidence=ledger.blocked_target_side_evidence,
+            last_material_legality_identity=ledger.last_material_legality_identity,
+            blocked_material_legality_identity=ledger.blocked_material_legality_identity,
+            failed_material_legality_identities=tuple(
+                sorted(ledger.failed_material_legality_identities)
+            ),
             seen_attempt_ordinals=tuple(sorted(ledger.seen_attempt_ordinals)),
             seen_command_ids=tuple(sorted(ledger.seen_command_ids)),
         )
@@ -410,12 +736,20 @@ class RawPlacementService:
         builder_tag: int | None = None,
         builder_ready: bool = False,
         observation_revision: str | None = None,
+        material_legality_identity: str | None = None,
     ) -> bool:
         """Whether a circuit-open operation has acquired a genuinely new target state."""
 
         ledger = self._operation_no_start.get(str(operation_id))
         if ledger is None or not ledger.circuit_open:
-            return True
+            return material_legality_identity not in (
+                set() if ledger is None else ledger.failed_material_legality_identities
+            )
+        if (
+            material_legality_identity is not None
+            and material_legality_identity in ledger.failed_material_legality_identities
+        ):
+            return False
         effective_classification = (
             failure_classification
             if failure_classification is not None
@@ -426,6 +760,11 @@ class RawPlacementService:
             world_target is not None
             and ledger.last_world_target is not None
             and math.dist(world_target, ledger.last_world_target) <= 0.25
+        )
+        material_changed = (
+            material_legality_identity is not None
+            and ledger.blocked_material_legality_identity is not None
+            and material_legality_identity != ledger.blocked_material_legality_identity
         )
         target_changed = (
             same_target
@@ -443,6 +782,12 @@ class RawPlacementService:
             and ledger.blocked_observation_revision is not None
             and observation_revision != ledger.blocked_observation_revision
         )
+        # Once a durable material identity is available, observation churn alone
+        # cannot reopen the circuit.  Only a changed exact builder/ability/target
+        # legality identity is a valid new attempt.
+        if ledger.blocked_material_legality_identity is not None:
+            target_changed = material_changed
+            builder_changed = False
         if not self._allows_target_state_reopen(
             effective_classification,
             target_side_evidence=effective_target_evidence,
@@ -457,6 +802,7 @@ class RawPlacementService:
         ledger.blocked_observation_revision = None
         ledger.blocked_failure_classification = None
         ledger.blocked_target_side_evidence = False
+        ledger.blocked_material_legality_identity = None
         ledger.last_status = RawPlacementNoStartStatus.RETRY.value
         return True
 
@@ -479,6 +825,8 @@ class RawPlacementService:
         ledger.blocked_observation_revision = None
         ledger.blocked_failure_classification = None
         ledger.blocked_target_side_evidence = False
+        ledger.blocked_material_legality_identity = None
+        ledger.failed_material_legality_identities.clear()
         ledger.last_status = RawPlacementNoStartStatus.RESET.value
         return self.operation_no_start_state(operation_id)
 
@@ -499,6 +847,7 @@ class RawPlacementService:
         suppressed_target: bool = False,
         builder_ready: bool = False,
         observation_revision: str | None = None,
+        material_legality_identity: str | None = None,
     ) -> RawPlacementNoStartDecision:
         """Record one accepted gameplay no-start attempt by operation identity.
 
@@ -545,6 +894,7 @@ class RawPlacementService:
                     "target_state_revision": target_state_revision,
                     "failure_classification": failure_classification,
                     "classification_basis": list(basis),
+                    "material_legality_identity": material_legality_identity,
                 },
             )
 
@@ -566,9 +916,15 @@ class RawPlacementService:
                 )
             )
         )
-        if duplicate:
+        material_duplicate = (
+            material_legality_identity is not None
+            and material_legality_identity in ledger.failed_material_legality_identities
+        )
+        if duplicate or material_duplicate:
             status = RawPlacementNoStartStatus.DUPLICATE.value
-            next_action = "defer_replan" if ledger.circuit_open else "retry"
+            next_action = "defer_replan" if ledger.circuit_open or material_duplicate else "retry"
+            if material_duplicate and not duplicate:
+                ledger.seen_command_ids.add(str(command_id))
         else:
             if ledger.circuit_open and not self.operation_retry_allowed(
                 normalized_operation,
@@ -579,6 +935,7 @@ class RawPlacementService:
                 builder_tag=builder_tag,
                 builder_ready=builder_ready,
                 observation_revision=observation_revision,
+                material_legality_identity=material_legality_identity,
             ):
                 if attempt_ordinal is not None:
                     ledger.seen_attempt_ordinals.add(int(attempt_ordinal))
@@ -599,6 +956,9 @@ class RawPlacementService:
                 ledger.last_placement_revision = placement_revision
                 ledger.last_target_state_revision = target_state_revision
                 ledger.last_observation_revision = observation_revision
+                ledger.last_material_legality_identity = material_legality_identity
+                if material_legality_identity is not None:
+                    ledger.failed_material_legality_identities.add(material_legality_identity)
                 if ledger.streak >= ledger.threshold:
                     ledger.circuit_open = True
                     ledger.blocked_target_state_revision = target_state_revision
@@ -607,6 +967,7 @@ class RawPlacementService:
                     ledger.blocked_observation_revision = observation_revision
                     ledger.blocked_failure_classification = failure_classification
                     ledger.blocked_target_side_evidence = target_side_evidence
+                    ledger.blocked_material_legality_identity = material_legality_identity
                     status = RawPlacementNoStartStatus.DEFER_REPLAN.value
                     next_action = "replan"
                 else:
@@ -622,6 +983,7 @@ class RawPlacementService:
             "threshold": ledger.threshold,
             "circuit_open": ledger.circuit_open,
             "duplicate_attempt": duplicate,
+            "material_duplicate": material_duplicate,
             "suppressed_target": suppressed_target,
             "target_side_evidence": target_side_evidence,
             "next_action": next_action,
@@ -634,6 +996,7 @@ class RawPlacementService:
             "target_state_revision": target_state_revision,
             "failure_classification": failure_classification,
             "classification_basis": list(basis),
+            "material_legality_identity": material_legality_identity,
         }
         return RawPlacementNoStartDecision(
             operation_id=normalized_operation,
@@ -651,6 +1014,7 @@ class RawPlacementService:
             failure_classification=failure_classification,
             classification_basis=basis,
             evidence=evidence,
+            material_duplicate=material_duplicate,
         )
 
     def observe(self, observation: Any, *, require_feature_visibility: bool) -> None:
@@ -963,7 +1327,8 @@ class RawPlacementService:
                 emitted_target,
                 game_loop=game_loop,
                 observation=observation,
-                anchor_tag=preferred_anchor_tag,
+                anchor_tag=None,
+                exclude_command_id=command_id,
             ):
                 raise RawPlacementFailure(
                     "no_legal_placement",
@@ -1033,6 +1398,7 @@ class RawPlacementService:
                 game_loop=game_loop,
                 observation=observation,
                 anchor_tag=anchor_tag,
+                exclude_command_id=command_id,
             ):
                 raise RawPlacementFailure(
                     "no_legal_placement",
@@ -1068,6 +1434,7 @@ class RawPlacementService:
                 game_loop=game_loop,
                 observation=observation,
                 anchor_tag=anchor_tag,
+                exclude_command_id=command_id,
             )
             exact_target_legal = world_build_target_is_legal(
                 observation,
@@ -1103,6 +1470,25 @@ class RawPlacementService:
             emitted,
             anchor_tag=anchor_tag,
         )
+        existing = self._command_targets.get(command_id)
+        if (
+            existing is not None
+            and existing.action_name == action_name
+            and existing.builder_tag == normalized_builder
+            and existing.world_target == emitted
+        ):
+            refreshed = replace(
+                existing,
+                requested_world_target=requested_target,
+                final_validated_world_target=emitted,
+                placement_revision=current_revision,
+                target_state_revision=target_state_revision,
+                baseline_builder_orders=baseline_builder_orders,
+                expires_game_loop=max(existing.expires_game_loop, int(expires_game_loop or 0)),
+                placement_state="reserved",
+            )
+            self._command_targets[command_id] = refreshed
+            return refreshed
         reservation = RawPlacementReservation(
             command_id=command_id,
             operation_id=operation_id,
@@ -1148,6 +1534,72 @@ class RawPlacementService:
             self._builder_leases[normalized_builder] = command_id
         return reservation
 
+    def record_build_authorization(
+        self,
+        command_id: str,
+        *,
+        ability_id: int,
+        authorization: Any,
+        game_loop: int,
+    ) -> None:
+        """Attach the exact read-only SC2 authority result to a reservation."""
+
+        placement = self._command_targets.get(command_id)
+        if placement is None:
+            return
+        placement_result = getattr(authorization, "placement_query_status", None)
+        if placement_result is None:
+            placement_result = getattr(authorization, "placement_result", None)
+        available_query = getattr(authorization, "available_ability_query", None)
+        fingerprint = getattr(authorization, "target_legality_fingerprint", None)
+        details = getattr(authorization, "details", {})
+        if not isinstance(details, Mapping):
+            details = {}
+        material_identity = build_material_legality_identity(
+            operation_id=placement.operation_id,
+            builder_tag=placement.builder_tag,
+            ability_id=int(ability_id),
+            world_target=placement.world_target,
+            target_legality_fingerprint=(None if fingerprint is None else str(fingerprint)),
+            target_state_revision=placement.target_state_revision,
+        )
+        self._command_targets[command_id] = replace(
+            placement,
+            ability_id=int(ability_id),
+            target_legality_fingerprint=(None if fingerprint is None else str(fingerprint)),
+            material_legality_identity=material_identity,
+            available_ability_query=(None if available_query is None else str(available_query)),
+            placement_query_result=(None if placement_result is None else str(placement_result)),
+            build_authorization_details=deepcopy(dict(details)),
+        )
+
+    def mark_primitive_constructed(self, command_id: str, *, game_loop: int) -> None:
+        placement = self._command_targets.get(command_id)
+        if placement is None:
+            return
+        self._command_targets[command_id] = replace(
+            placement,
+            primitive_constructed_game_loop=int(game_loop),
+        )
+
+    def mark_primitive_submitted(self, command_id: str, *, game_loop: int) -> None:
+        placement = self._command_targets.get(command_id)
+        if placement is None:
+            return
+        self._command_targets[command_id] = replace(
+            placement,
+            primitive_submitted_game_loop=int(game_loop),
+        )
+
+    def record_action_result(self, command_id: str, results: Sequence[Any]) -> None:
+        placement = self._command_targets.get(command_id)
+        if placement is None:
+            return
+        self._command_targets[command_id] = replace(
+            placement,
+            action_result=tuple(int(value) for value in results),
+        )
+
     def command_target(self, command_id: str) -> RawPlacementReservation | None:
         return self._command_targets.get(command_id)
 
@@ -1174,6 +1626,7 @@ class RawPlacementService:
         builder_ready: bool = False,
         observation_revision: str | None = None,
         observation: Any | None = None,
+        material_legality_identity: str | None = None,
     ) -> RawPlacementNoStartDecision | None:
         placement = self._command_targets.get(command_id)
         operation_id = operation_id or (None if placement is None else placement.operation_id)
@@ -1192,6 +1645,9 @@ class RawPlacementService:
         )
         target_state_revision = target_state_revision or (
             None if placement is None else placement.target_state_revision
+        )
+        material_legality_identity = material_legality_identity or (
+            None if placement is None else placement.material_legality_identity
         )
         target = None if placement is None else placement.world_target
         anchor = None if placement is None else placement.anchor_tag
@@ -1254,6 +1710,7 @@ class RawPlacementService:
                 suppressed_target=temporary_suppression,
                 builder_ready=builder_ready,
                 observation_revision=observation_revision,
+                material_legality_identity=material_legality_identity,
             )
         transition_state = "released"
         failure_class = "nonspatial"
@@ -1511,6 +1968,7 @@ class RawPlacementService:
         game_loop: int | None = None,
         observation: Any | None = None,
         anchor_tag: int | None = None,
+        exclude_command_id: str | None = None,
     ) -> bool:
         if game_loop is not None:
             self._expire_temporary_suppressions(game_loop)
@@ -1548,7 +2006,8 @@ class RawPlacementService:
             return True
         return any(
             cells & reservation.occupied_grid_cells
-            for reservation in self._command_targets.values()
+            for command_id, reservation in self._command_targets.items()
+            if command_id != exclude_command_id
         )
 
     @staticmethod
@@ -1649,6 +2108,26 @@ class RawPlacementService:
         }
         if reservation is not None:
             transition["target_state_revision"] = reservation.target_state_revision
+            if reservation.ability_id is not None:
+                transition["ability_id"] = reservation.ability_id
+            if reservation.available_ability_query is not None:
+                transition["available_ability_query"] = reservation.available_ability_query
+            if reservation.placement_query_result is not None:
+                transition["placement_query_result"] = reservation.placement_query_result
+            if reservation.target_legality_fingerprint is not None:
+                transition["target_legality_fingerprint"] = reservation.target_legality_fingerprint
+            if reservation.material_legality_identity is not None:
+                transition["material_legality_identity"] = reservation.material_legality_identity
+            if reservation.primitive_constructed_game_loop is not None:
+                transition["primitive_constructed_game_loop"] = (
+                    reservation.primitive_constructed_game_loop
+                )
+            if reservation.primitive_submitted_game_loop is not None:
+                transition["primitive_submitted_game_loop"] = (
+                    reservation.primitive_submitted_game_loop
+                )
+            if reservation.action_result is not None:
+                transition["action_result"] = list(reservation.action_result)
         if no_start_decision is not None:
             transition["placement_no_start"] = no_start_decision.to_dict()
         self._transition_sequence += 1
@@ -2228,6 +2707,9 @@ __all__ = [
     "RawPlacement",
     "RawPlacementCandidates",
     "RawPlacementFailure",
+    "RawPlacementNoStartDecision",
+    "RawPlacementNoStartState",
     "RawPlacementReservation",
     "RawPlacementService",
+    "build_material_legality_identity",
 ]

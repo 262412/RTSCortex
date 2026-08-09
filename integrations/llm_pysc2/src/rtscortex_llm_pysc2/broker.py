@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from collections import defaultdict, deque
+from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from threading import Condition
@@ -608,6 +609,9 @@ class SharedDecisionBroker:
 
     def resolve_arguments(self, command_id: str, arguments: list[Any]) -> None:
         self.coordinator.resolve_arguments(command_id, arguments)
+
+    def record_action_result(self, command_id: str, results: Sequence[Any]) -> None:
+        self.coordinator.record_action_result(command_id, results)
 
     def screen_route_provenance(
         self,

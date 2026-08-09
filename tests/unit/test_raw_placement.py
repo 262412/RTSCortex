@@ -14,6 +14,7 @@ from rtscortex_llm_pysc2.raw_placement import (
     RawPlacementService,
     _placement_candidate_id,
     _placement_revision,
+    build_material_legality_identity,
 )
 
 
@@ -441,6 +442,136 @@ def test_no_start_circuit_reopens_for_fresh_ready_builder() -> None:
     state = service.operation_no_start_state(operation_id)
     assert state is not None
     assert state.circuit_open is False
+
+
+def test_material_legality_identity_blocks_observation_only_retry_and_checkpoint_restores() -> None:
+    service = RawPlacementService(unit_names={}, no_start_streak_threshold=2)
+    operation_id = "operation:material-tombstone"
+    for ordinal in range(2):
+        service.record_no_start_failure(
+            operation_id=operation_id,
+            command_id=f"material-attempt-{ordinal}",
+            attempt_ordinal=ordinal,
+            builder_tag=0xB1,
+            world_target=(65.0, 65.0),
+            placement_revision=f"obs-{ordinal}",
+            target_state_revision=f"state-{ordinal}",
+            failure_classification="dynamic_target_obstruction",
+            target_side_evidence=True,
+            material_legality_identity=(
+                "build-legality:blocked-material"
+                if ordinal == 0
+                else "build-legality:second-material"
+            ),
+        )
+
+    state = service.operation_no_start_state(operation_id)
+    assert state is not None and state.circuit_open is True
+    assert state.blocked_material_legality_identity == "build-legality:second-material"
+    assert (
+        service.operation_retry_allowed(
+            operation_id,
+            world_target=(65.0, 65.0),
+            target_state_revision="state-new",
+            builder_tag=0xB1,
+            builder_ready=True,
+            observation_revision="obs-new",
+            material_legality_identity="build-legality:second-material",
+        )
+        is False
+    )
+
+    checkpoint = service.checkpoint_state()
+    restored = RawPlacementService(unit_names={}, no_start_streak_threshold=2)
+    restored.restore_checkpoint_state(checkpoint)
+    restored_state = restored.operation_no_start_state(operation_id)
+    assert restored_state == state
+    assert (
+        restored.operation_retry_allowed(
+            operation_id,
+            world_target=(65.0, 65.0),
+            target_state_revision="state-new",
+            builder_tag=0xB2,
+            builder_ready=True,
+            observation_revision="obs-new",
+            material_legality_identity="build-legality:changed-material",
+        )
+        is True
+    )
+
+
+def test_material_identity_includes_target_legality_state_revision() -> None:
+    common: dict[str, Any] = {
+        "operation_id": "operation:material-state",
+        "builder_tag": 0xB1,
+        "ability_id": 881,
+        "world_target": (30.0, 25.0),
+        "target_legality_fingerprint": "sc2:stable",
+    }
+    state_a = build_material_legality_identity(
+        **common,
+        target_state_revision="state-a",
+    )
+    state_b = build_material_legality_identity(
+        **common,
+        target_state_revision="state-b",
+    )
+    assert state_a != state_b
+    assert state_a == build_material_legality_identity(
+        **common,
+        target_state_revision="state-a",
+    )
+
+
+def test_target_state_revision_checkpoint_preserves_a_b_a_generation() -> None:
+    service = RawPlacementService(unit_names={9: "Zergling"})
+    target = (22.0, 24.0)
+    action_name = "Build_Pylon_Screen"
+    observation_a = SimpleNamespace(raw_units=[], feature_units=[], game_loop=[100])
+    observation_b = SimpleNamespace(
+        raw_units=[_unit(0xE1, 9, alliance=4, x=22.0, y=24.0)],
+        feature_units=[],
+        game_loop=[101],
+    )
+
+    service.observe(observation_a, require_feature_visibility=False)
+    revision_a = service._target_state_revision(  # noqa: SLF001
+        observation_a,
+        action_name,
+        target,
+        anchor_tag=None,
+    )
+    service.observe(observation_b, require_feature_visibility=False)
+    revision_b = service._target_state_revision(  # noqa: SLF001
+        observation_b,
+        action_name,
+        target,
+        anchor_tag=None,
+    )
+    service.observe(observation_a, require_feature_visibility=False)
+    revision_a_again = service._target_state_revision(  # noqa: SLF001
+        observation_a,
+        action_name,
+        target,
+        anchor_tag=None,
+    )
+
+    assert revision_a != revision_b
+    assert revision_a_again != revision_a
+
+    checkpoint = service.checkpoint_state()
+    restored = RawPlacementService(unit_names={9: "Zergling"})
+    restored.restore_checkpoint_state(checkpoint)
+    restored.observe(observation_a, require_feature_visibility=False)
+    assert (
+        restored._target_state_revision(  # noqa: SLF001
+            observation_a,
+            action_name,
+            target,
+            anchor_tag=None,
+        )
+        == revision_a_again
+    )
 
 
 def test_dynamic_circuit_reopens_when_same_target_obstruction_state_changes() -> None:

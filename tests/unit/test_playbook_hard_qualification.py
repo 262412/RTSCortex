@@ -16,12 +16,17 @@ from rtscortex.playbook import (
     PlaybookRuleEffect,
     PlaybookRuleStatus,
     PlaybookRuleStrength,
+    TypedRetryCoverage,
+    TypedRetryCoverageBySeed,
     analyze_hard_qualification_evaluations,
     build_hard_qualification_manifest,
     playbook_predicate_fingerprint,
     playbook_rule_fingerprint,
 )
-from scripts.analyze_playbook_hard_qualification import write_hard_qualification_result
+from scripts.analyze_playbook_hard_qualification import (
+    _qualification_config_fingerprint,
+    write_hard_qualification_result,
+)
 from scripts.prepare_playbook_hard_qualification import _eligible_parent
 
 GIT_SHA = "a" * 40
@@ -178,6 +183,11 @@ def _run_evidence(
         evaluation_without_application_count=0,
         rule_fingerprint=playbook_rule_fingerprint(probe),
         predicate_fingerprint=playbook_predicate_fingerprint(probe),
+        typed_retry_opportunity_count=1,
+        typed_retry_application_count=1,
+        typed_retry_coverage_unavailable=False,
+        typed_retry_coverage_reasons=(),
+        config_sha256=f"{seed + 10:064x}",
     )
 
 
@@ -380,9 +390,66 @@ def test_prepare_excludes_legacy_execution_parent_without_retry_binding() -> Non
             legacy,
             source_run_ids=set(legacy.source_run_ids),
             source_seeds=set(legacy.source_seeds),
+            typed_retry_coverage=TypedRetryCoverageBySeed(),
         )
         is False
     )
+
+
+def test_prepare_requires_typed_retry_opportunity_in_every_source_seed() -> None:
+    parent = _parent()
+    sparse = TypedRetryCoverageBySeed(
+        by_seed={
+            0: TypedRetryCoverage(typed_retry_opportunity_count=1),
+            1: TypedRetryCoverage(typed_retry_opportunity_count=0),
+            2: TypedRetryCoverage(typed_retry_opportunity_count=1),
+        }
+    )
+    assert (
+        _eligible_parent(
+            parent,
+            source_run_ids=set(parent.source_run_ids),
+            source_seeds=set(parent.source_seeds),
+            typed_retry_coverage=sparse,
+        )
+        is False
+    )
+    complete = TypedRetryCoverageBySeed(
+        by_seed={
+            seed: TypedRetryCoverage(typed_retry_opportunity_count=1)
+            for seed in parent.source_seeds
+        }
+    )
+    assert _eligible_parent(
+        parent,
+        source_run_ids=set(parent.source_run_ids),
+        source_seeds=set(parent.source_seeds),
+        typed_retry_coverage=complete,
+    )
+
+
+def test_manifest_rejects_missing_typed_retry_coverage() -> None:
+    runs = tuple(
+        _run_evidence(seed).model_copy(
+            update={
+                "typed_retry_opportunity_count": None,
+                "typed_retry_application_count": None,
+                "typed_retry_coverage_unavailable": None,
+                "typed_retry_coverage_reasons": None,
+                "config_sha256": None,
+            }
+        )
+        for seed in (0, 1, 2)
+    )
+    with pytest.raises(ValueError, match="typed_retry_coverage_unavailable"):
+        build_hard_qualification_manifest(
+            parent=_parent(),
+            baseline_sha256=BASELINE_SHA,
+            probe_baseline_sha256=PROBE_SHA,
+            git_sha=GIT_SHA,
+            sc2_patch="4.10",
+            runs=runs,
+        )
 
 
 def test_manifest_requires_resolved_evidence_from_every_parent_seed() -> None:
@@ -531,6 +598,40 @@ def test_hard_qualification_runner_keeps_probes_shadow_only_and_fail_closed() ->
     assert "rule_mode: shadow" in config
     assert "hard_readiness_required: false" in config
     assert "allow_canary_fixture: false" in config
+
+
+def test_qualification_config_binding_ignores_seed_but_detects_probe_drift(
+    tmp_path: Path,
+) -> None:
+    seed_zero = tmp_path / "seed-0.yaml"
+    seed_one = tmp_path / "seed-1.yaml"
+    drifted = tmp_path / "drifted.yaml"
+    seed_zero.write_text(
+        "run:\n"
+        "  output_root: /outputs\n"
+        "  seed: 0\n"
+        "cortex:\n"
+        "  playbook:\n"
+        "    enabled: true\n"
+        "    learning_mode: frozen\n"
+        "    rule_mode: shadow\n",
+        encoding="utf-8",
+    )
+    seed_one.write_text(
+        seed_zero.read_text(encoding="utf-8").replace("seed: 0", "seed: 1"),
+        encoding="utf-8",
+    )
+    drifted.write_text(
+        seed_zero.read_text(encoding="utf-8").replace("rule_mode: shadow", "rule_mode: active"),
+        encoding="utf-8",
+    )
+
+    assert _qualification_config_fingerprint(seed_zero) == _qualification_config_fingerprint(
+        seed_one
+    )
+    assert _qualification_config_fingerprint(seed_zero) != _qualification_config_fingerprint(
+        drifted
+    )
 
 
 def test_hard_rejection_records_nonzero_exit_and_report_without_manifest(

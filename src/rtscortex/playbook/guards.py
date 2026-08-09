@@ -14,6 +14,7 @@ from rtscortex.cortex.strategic import StrategicIntent
 from rtscortex.playbook.conditions import condition_matches
 from rtscortex.playbook.models import (
     PlaybookContext,
+    PlaybookRetryGuardBinding,
     PlaybookRoleId,
     PlaybookRule,
     PlaybookRuleApplication,
@@ -47,6 +48,65 @@ class RecentTerminalFeedback:
     terminal_game_loop: int
     expires_game_loop: int
     hard_suppression: bool
+
+
+def typed_retry_binding_matches(
+    binding: PlaybookRetryGuardBinding,
+    *,
+    target_kind: Literal["intent", "candidate"],
+    counterfactual_signature: str,
+    recent_feedback: Sequence[RecentTerminalFeedback],
+    operation_id: str | None,
+    attempt_ordinal: int | None,
+    game_loop: int,
+) -> bool:
+    """Apply the exact runtime retry predicate to one candidate.
+
+    Historical replay and the live candidate guard both call this helper.  It
+    deliberately keeps the runtime's five identity checks together: failure
+    code, candidate signature, operation lineage, next attempt ordinal, and
+    bounded freshness.
+    """
+
+    if target_kind != "candidate":
+        return False
+    return any(
+        feedback.failure_code == binding.failure_code
+        and _terminal_feedback_matches(
+            feedback,
+            signature=counterfactual_signature,
+            operation_id=operation_id,
+            attempt_ordinal=attempt_ordinal,
+            game_loop=game_loop,
+            max_age_game_loops=binding.max_age_game_loops,
+        )
+        for feedback in recent_feedback
+    )
+
+
+def typed_candidate_predicate_matches(
+    rule: PlaybookRule,
+    *,
+    action_name: str,
+    role: str | None,
+    values: Mapping[str, object],
+) -> bool:
+    """Evaluate the candidate rule predicate shared by live and replay paths.
+
+    ``values`` must contain the same context, situation, action, and role
+    fields that :class:`PlaybookCandidateGuard` passes to ``_evaluate``.
+    Keeping condition and target matching here prevents historical replay from
+    drifting from the runtime's action/role semantics.
+    """
+
+    if not all(condition_matches(condition, values) for condition in rule.conditions):
+        return False
+    action_key = _action_key(action_name)
+    targets_action = not rule.action_names or action_key in {
+        _action_key(action) for action in rule.action_names
+    }
+    targets_role = not rule.role_ids or (role is not None and role in rule.role_ids)
+    return targets_action and targets_role
 
 
 class PlaybookIntentGuard:
@@ -299,12 +359,13 @@ def _evaluate(
     applied_ids: list[str] = []
     for rule in applicable:
         shadow_candidate = rule.status is PlaybookRuleStatus.CANDIDATE
+        matched = typed_candidate_predicate_matches(
+            rule,
+            action_name=action_name,
+            role=role,
+            values=values,
+        )
         action_key = _action_key(action_name)
-        targets_action = not rule.action_names or action_key in {
-            _action_key(action) for action in rule.action_names
-        }
-        targets_role = not rule.role_ids or role in rule.role_ids
-        matched = targets_action and targets_role
         rule_blocked = False
         rule_delta = 0.0
         if rule.strength is not PlaybookRuleStrength.ADVISORY:
@@ -399,19 +460,14 @@ def _rule_retry_binding_matches(
             and rule.effect in {PlaybookRuleEffect.AVOID, PlaybookRuleEffect.FORBID}
             and rule.evidence.get("canary_fixture") is not True
         )
-    if target_kind != "candidate":
-        return False
-    return any(
-        feedback.failure_code == binding.failure_code
-        and _terminal_feedback_matches(
-            feedback,
-            signature=counterfactual_signature,
-            operation_id=operation_id,
-            attempt_ordinal=attempt_ordinal,
-            game_loop=game_loop,
-            max_age_game_loops=binding.max_age_game_loops,
-        )
-        for feedback in recent_feedback
+    return typed_retry_binding_matches(
+        binding,
+        target_kind=target_kind,
+        counterfactual_signature=counterfactual_signature,
+        recent_feedback=recent_feedback,
+        operation_id=operation_id,
+        attempt_ordinal=attempt_ordinal,
+        game_loop=game_loop,
     )
 
 
