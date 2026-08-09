@@ -355,10 +355,49 @@ def test_sc2_query_fingerprint_tracks_requested_legality_state_generation() -> N
     assert recovered.authorized is True
 
 
+def test_sc2_query_requests_exact_builder_ability_and_placement_target() -> None:
+    from s2clientprotocol import error_pb2, query_pb2
+
+    class Controller:
+        def __init__(self) -> None:
+            self.requests: list[Any] = []
+
+        def query(self, request: Any) -> Any:
+            self.requests.append(request)
+            response = query_pb2.ResponseQuery()
+            response.abilities.add().abilities.add(ability_id=881)
+            response.placements.add(result=error_pb2.ActionResult.Success)
+            return response
+
+    controller = Controller()
+    capability = SC2RawBuildQueryCapability(controller)
+
+    authorization = capability.authorize_build(
+        builder_tag=0xB1,
+        ability_id=881,
+        world_target=(30.25, 25.75),
+    )
+
+    assert authorization.authorized is True
+    assert len(controller.requests) == 1
+    request = controller.requests[0]
+    assert len(request.abilities) == 1
+    assert request.abilities[0].unit_tag == 0xB1
+    assert len(request.placements) == 1
+    assert request.placements[0].placing_unit_tag == 0xB1
+    assert request.placements[0].ability_id == 881
+    assert request.placements[0].target_pos.x == pytest.approx(30.25)
+    assert request.placements[0].target_pos.y == pytest.approx(25.75)
+
+
 def test_raw_executor_fails_closed_without_controller_query_capability() -> None:
     broker = _Broker()
     del broker.raw_build_query_capability
-    executor = RawActionExecutor(cast(Any, broker), unit_names={2: "Probe"})
+    executor = RawActionExecutor(
+        cast(Any, broker),
+        unit_names={2: "Probe"},
+        build_query_capability=None,
+    )
     observation = SimpleNamespace(
         raw_units=[_unit(0xB1, 2)],
         game_loop=[100],
