@@ -13,6 +13,7 @@ from rtscortex.contracts import (
     ObservationEnvelope,
 )
 from rtscortex.cortex.models import (
+    ArmyReadiness,
     CortexIntent,
     IntentTarget,
     IntentTargetKind,
@@ -141,12 +142,16 @@ class ProductionAgent(_RoutingRoleAgent):
 
 class DefenseAgent(_RoutingRoleAgent):
     agent_id = _DEFENSE_AGENT_ID
-    agent_version = "2.0.0"
+    agent_version = "2.1.0"
 
     def __init__(self, profile: RaceProfile, adapter: StrategicIntentAdapter) -> None:
         super().__init__(RoleId.DEFENSE, profile, adapter)
         self._episode_key: tuple[str, str] | None = None
         self._actor_states: dict[str, _DefenseActorState] = {}
+        self._active_prerequisite_suppression: tuple[str, int, int, str, str, str, str] | None = (
+            None
+        )
+        self._pending_diagnostics: list[dict[str, object]] = []
 
     def evaluate(self, context: RoleAgentContext) -> list[StrategicIntent]:
         return [
@@ -180,12 +185,15 @@ class DefenseAgent(_RoutingRoleAgent):
         if episode_key != self._episode_key:
             self._episode_key = episode_key
             self._actor_states.clear()
+            self._active_prerequisite_suppression = None
+            self._pending_diagnostics.clear()
         threatened = context.situation.threat_level in {
             ThreatLevel.HIGH,
             ThreatLevel.CRITICAL,
         }
         if not threatened:
             self._actor_states.clear()
+            self._active_prerequisite_suppression = None
             return ()
 
         proposals: list[TacticalIntent] = []
@@ -371,6 +379,7 @@ class DefenseAgent(_RoutingRoleAgent):
                     )
                 )
 
+        prerequisite_suppressed = False
         if not immediate_action_available:
             for action_name in doctrine.prerequisite_actions:
                 action = available.get(action_name)
@@ -384,6 +393,10 @@ class DefenseAgent(_RoutingRoleAgent):
                     game_loop=observation.game_loop,
                 ):
                     continue
+                if self._terminal_collapse(context.situation):
+                    self._record_terminal_collapse_suppression(context)
+                    prerequisite_suppressed = True
+                    break
                 proposals.append(
                     self._source_intent(
                         context,
@@ -401,6 +414,8 @@ class DefenseAgent(_RoutingRoleAgent):
                     )
                 )
                 break
+        if not prerequisite_suppressed:
+            self._active_prerequisite_suppression = None
 
         if context.situation.threat_level is ThreatLevel.CRITICAL and not combat_response_exists:
             for action_name in doctrine.worker_defense_actions:
@@ -460,6 +475,55 @@ class DefenseAgent(_RoutingRoleAgent):
                     )
                     return proposals
         return proposals
+
+    @staticmethod
+    def _terminal_collapse(situation: SituationAssessment) -> bool:
+        return (
+            situation.army_readiness is ArmyReadiness.EMPTY
+            and situation.bases.own_base_count == 0
+            and situation.bases.own_production_capacity == 0
+        )
+
+    def _record_terminal_collapse_suppression(
+        self,
+        context: RoleAgentContext,
+    ) -> None:
+        situation = context.situation
+        signature = (
+            situation.army_readiness.value,
+            situation.bases.own_base_count,
+            situation.bases.own_production_capacity,
+            situation.threat_level.value,
+            situation.source_kind,
+            situation.source_id,
+            situation.source_version,
+        )
+        if signature == self._active_prerequisite_suppression:
+            return
+        self._active_prerequisite_suppression = signature
+        self._pending_diagnostics.append(
+            {
+                "state": "defense_prerequisite_suppressed_terminal_collapse",
+                "reason": "defense_prerequisite_suppressed_terminal_collapse",
+                "army_readiness": situation.army_readiness.value,
+                "own_base_count": situation.bases.own_base_count,
+                "own_production_capacity": situation.bases.own_production_capacity,
+                "threat_level": situation.threat_level.value,
+                "source_lineage": {
+                    "source_id": self.agent_id,
+                    "source_version": self.agent_version,
+                    "situation_assessment_id": situation.assessment_id,
+                    "situation_source_kind": situation.source_kind,
+                    "situation_source_id": situation.source_id,
+                    "situation_source_version": situation.source_version,
+                },
+            }
+        )
+
+    def drain_diagnostics(self) -> tuple[dict[str, object], ...]:
+        diagnostics = tuple(self._pending_diagnostics)
+        self._pending_diagnostics.clear()
+        return diagnostics
 
     def _defense_unit_saturated(
         self,
@@ -785,6 +849,9 @@ class RoleAgentCoordinator:
             context,
             claimed_actor_scopes=claimed_actor_scopes,
         )
+
+    def drain_defense_diagnostics(self) -> tuple[dict[str, object], ...]:
+        return self.defense_agent.drain_diagnostics()
 
     def own_tactical_intents(
         self,

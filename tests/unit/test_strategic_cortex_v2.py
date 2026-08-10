@@ -90,6 +90,71 @@ def _observation(*, minerals: int = 200, vespene: int = 0) -> ObservationEnvelop
     )
 
 
+def _terminal_collapse_defense_observation(
+    *,
+    own_structures: list[UnitState] | None = None,
+    immediate_action: str | None = None,
+) -> ObservationEnvelope:
+    actions = [
+        AvailableAction(
+            name="Build_Pylon_Screen",
+            argument_names=["screen"],
+            argument_types=[ActionArgumentType.POSITION],
+            actor_scopes=["Builder/Builder-Probe-1"],
+            argument_candidates=[[[64, 64]]],
+        ),
+        AvailableAction(
+            name="Attack_Unit",
+            argument_names=["tag"],
+            argument_types=[ActionArgumentType.TAG],
+            actor_scopes=["Builder/Builder-Probe-1"],
+            argument_candidates=[["0xe1"]],
+        ),
+    ]
+    if immediate_action is not None:
+        actions.insert(
+            0,
+            AvailableAction(
+                name=immediate_action,
+                actor_scopes=["Developer/Empty"],
+            ),
+        )
+    return ObservationEnvelope(
+        run_id="run",
+        episode_id="terminal-collapse",
+        step_id=1,
+        game_loop=32,
+        state=SC2State(
+            economy=EconomyState(
+                minerals=500,
+                vespene=300,
+                supply_used=1,
+                supply_cap=15,
+                workers=1,
+                army_supply=0,
+            ),
+            own_units=[
+                UnitState(
+                    unit_id="0xprobe",
+                    unit_type="Probe",
+                    alliance="self",
+                    position=(10, 10),
+                )
+            ],
+            own_structures=[] if own_structures is None else own_structures,
+            visible_enemies=[
+                UnitState(
+                    unit_id="0xe1",
+                    unit_type="Zergling",
+                    alliance="enemy",
+                    position=(12, 10),
+                )
+            ],
+        ),
+        available_actions=actions,
+    )
+
+
 def _intent(
     identity: str,
     role: RoleId,
@@ -418,6 +483,109 @@ def test_defense_agent_compiles_race_profile_emergency_options_and_resource_clai
     assert phoenix.resource_claim.minerals == 150
     assert phoenix.resource_claim.vespene == 100
     assert phoenix.mutually_exclusive_groups == ("defense-emergency-response",)
+
+
+def test_terminal_collapse_suppresses_prerequisite_but_keeps_worker_defense() -> None:
+    observation = _terminal_collapse_defense_observation()
+    assessment = (
+        DeterministicSituationAnalyzer().assess(observation).model_copy(update={"facts": []})
+    )
+    profile = race_profile("protoss")
+    coordinator = RoleAgentCoordinator(profile, StrategicIntentAdapter(profile))
+
+    source_intents = coordinator.propose_defense_intents(
+        RoleAgentContext(observation, assessment, ())
+    )
+
+    assert assessment.army_readiness.value == "empty"
+    assert assessment.bases.own_base_count == 0
+    assert assessment.bases.own_production_capacity == 0
+    assert [intent.action_names[0] for intent in source_intents] == ["Attack_Unit"]
+    diagnostics = coordinator.drain_defense_diagnostics()
+    assert len(diagnostics) == 1
+    assert diagnostics[0] == {
+        "state": "defense_prerequisite_suppressed_terminal_collapse",
+        "reason": "defense_prerequisite_suppressed_terminal_collapse",
+        "army_readiness": "empty",
+        "own_base_count": 0,
+        "own_production_capacity": 0,
+        "threat_level": "critical",
+        "source_lineage": {
+            "source_id": "deterministic-defense-agent",
+            "source_version": "2.1.0",
+            "situation_assessment_id": assessment.assessment_id,
+            "situation_source_kind": "deterministic",
+            "situation_source_id": assessment.source_id,
+            "situation_source_version": assessment.source_version,
+        },
+    }
+
+    coordinator.propose_defense_intents(
+        RoleAgentContext(
+            observation.model_copy(update={"step_id": 2, "game_loop": 33}),
+            assessment,
+            (),
+        )
+    )
+    assert coordinator.drain_defense_diagnostics() == ()
+
+
+@pytest.mark.parametrize(
+    ("structure_type", "expected_base_count", "expected_production_capacity"),
+    [
+        ("Nexus", 1, 0),
+        ("Gateway", 0, 1),
+    ],
+)
+def test_empty_army_with_surviving_base_or_production_keeps_emergency_prerequisite(
+    structure_type: str,
+    expected_base_count: int,
+    expected_production_capacity: int,
+) -> None:
+    observation = _terminal_collapse_defense_observation(
+        own_structures=[
+            UnitState(
+                unit_id="0xstructure",
+                unit_type=structure_type,
+                alliance="self",
+                position=(10, 10),
+            )
+        ]
+    )
+    assessment = (
+        DeterministicSituationAnalyzer()
+        .assess(observation)
+        .model_copy(update={"threat_level": ThreatLevel.CRITICAL, "facts": []})
+    )
+    profile = race_profile("protoss")
+    coordinator = RoleAgentCoordinator(profile, StrategicIntentAdapter(profile))
+
+    source_intents = coordinator.propose_defense_intents(
+        RoleAgentContext(observation, assessment, ())
+    )
+
+    assert assessment.army_readiness.value == "empty"
+    assert assessment.bases.own_base_count == expected_base_count
+    assert assessment.bases.own_production_capacity == expected_production_capacity
+    assert "Build_Pylon_Screen" in {intent.action_names[0] for intent in source_intents}
+    assert coordinator.drain_defense_diagnostics() == ()
+
+
+def test_terminal_collapse_keeps_immediate_defense_priority_without_suppression() -> None:
+    observation = _terminal_collapse_defense_observation(immediate_action="Train_Stalker")
+    assessment = DeterministicSituationAnalyzer().assess(observation)
+    profile = race_profile("protoss")
+    coordinator = RoleAgentCoordinator(profile, StrategicIntentAdapter(profile))
+
+    source_intents = coordinator.propose_defense_intents(
+        RoleAgentContext(observation, assessment, ())
+    )
+    actions = [intent.action_names[0] for intent in source_intents]
+
+    assert "Train_Stalker" in actions
+    assert "Build_Pylon_Screen" not in actions
+    assert "Attack_Unit" in actions
+    assert coordinator.drain_defense_diagnostics() == ()
 
 
 def test_defense_unit_production_stops_at_race_saturation_target() -> None:

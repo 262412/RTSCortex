@@ -406,6 +406,12 @@ class CortexRuntimeEngine(RuntimeEngine):
             ),
             claimed_actor_scopes=claimed_reflex_actors,
         )
+        for diagnostic in self._role_agents.drain_defense_diagnostics():
+            self._record_cortex_event(
+                observation,
+                "defense_actor_state",
+                diagnostic,
+            )
         if self._shadow_tactical is not None:
             shadow_started = time.perf_counter()
             shadow_intents = self._shadow_tactical.evaluate(observation, assessment)

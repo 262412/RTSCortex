@@ -519,6 +519,113 @@ def test_cortex_runtime_dispatches_proactive_tactical_focus_fire(tmp_path: Path)
     asyncio.run(runtime.close())
 
 
+def test_terminal_collapse_prerequisite_never_reaches_dispatch_boundary(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    runtime = CortexRuntimeEngine(
+        config=_config(tmp_path, macro=False),
+        store=store,
+        provider=FakeProvider(),
+    )
+    observation = ObservationEnvelope(
+        run_id="cortex-run",
+        episode_id="episode-1",
+        step_id=0,
+        game_loop=0,
+        state=SC2State(
+            economy=EconomyState(
+                minerals=500,
+                vespene=300,
+                supply_used=1,
+                supply_cap=15,
+                workers=1,
+                army_supply=0,
+            ),
+            own_units=[
+                UnitState(
+                    unit_id="0xprobe",
+                    unit_type="Probe",
+                    alliance="self",
+                    position=(10, 10),
+                )
+            ],
+            visible_enemies=[
+                UnitState(
+                    unit_id="0xe1",
+                    unit_type="Zergling",
+                    alliance="enemy",
+                    position=(12, 10),
+                )
+            ],
+        ),
+        available_actions=[
+            AvailableAction(
+                name="Build_Pylon_Screen",
+                argument_names=["screen"],
+                argument_types=[ActionArgumentType.POSITION],
+                actor_scopes=["Builder/Builder-Probe-1"],
+                argument_candidates=[[[64, 64]]],
+            ),
+            AvailableAction(
+                name="Attack_Unit",
+                argument_names=["tag"],
+                argument_types=[ActionArgumentType.TAG],
+                actor_scopes=["Builder/Builder-Probe-1"],
+                argument_candidates=[["0xe1"]],
+            ),
+        ],
+    )
+
+    batch = asyncio.run(runtime.tick(observation))
+    store.flush()
+
+    assert all(command.name != "Build_Pylon_Screen" for command in batch.commands)
+    role_intents = store.events_of_type(
+        observation.run_id,
+        observation.episode_id,
+        "role_intent_emitted",
+    )
+    assert [event.payload["intent"]["action_names"][0] for event in role_intents] == ["Attack_Unit"]
+    for event_type in ("role_intent_emitted", "candidate_set_built", "command_lineage"):
+        assert all(
+            "Build_Pylon_Screen" not in str(event.payload)
+            for event in store.events_of_type(
+                observation.run_id,
+                observation.episode_id,
+                event_type,
+            )
+        )
+    assert not store.events_of_type(
+        observation.run_id,
+        observation.episode_id,
+        "placement_ledger_transition",
+    )
+    assert not store.events_of_type(
+        observation.run_id,
+        observation.episode_id,
+        "execution",
+    )
+    diagnostics = store.events_of_type(
+        observation.run_id,
+        observation.episode_id,
+        "defense_actor_state",
+    )
+    assert len(diagnostics) == 1
+    assert diagnostics[0].payload["state"] == ("defense_prerequisite_suppressed_terminal_collapse")
+    assessment = runtime._current_situation
+    assert assessment is not None
+    assert diagnostics[0].payload["source_lineage"] == {
+        "source_id": "deterministic-defense-agent",
+        "source_version": "2.1.0",
+        "situation_assessment_id": assessment.assessment_id,
+        "situation_source_kind": "deterministic",
+        "situation_source_id": assessment.source_id,
+        "situation_source_version": assessment.source_version,
+    }
+    asyncio.run(runtime.close())
+
+
 def test_tactical_response_terminal_resolution_uses_execution_evidence(
     tmp_path: Path,
 ) -> None:
