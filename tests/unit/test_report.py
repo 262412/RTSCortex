@@ -240,6 +240,53 @@ def test_semantic_build_gate_is_serialized_by_run_report_writer(tmp_path: Path) 
     assert report["gates"]["semantic_build_failure_streak_bounded"]["passed"] is True
 
 
+def test_terminal_collapse_macro_dispatch_gate_is_serialized_by_run_report_writer(
+    tmp_path: Path,
+) -> None:
+    expected_git_sha = "e" * 40
+    run_dir = tmp_path / "terminal-collapse-macro"
+    _write_journal(
+        run_dir,
+        [
+            _event(
+                1,
+                "command_lifecycle",
+                {
+                    "command": {"command_id": "unsafe-macro-build"},
+                    "status": "dispatched",
+                },
+            ),
+            _event(
+                2,
+                "command_lineage",
+                {
+                    "command_id": "unsafe-macro-build",
+                    "lineage": {
+                        "command_id": "unsafe-macro-build",
+                        "source_role": "macro",
+                    },
+                    "semantic_action": "BUILD PYLON",
+                    "terminal_collapse": True,
+                    "townhall_recovery": False,
+                },
+            ),
+        ],
+    )
+    manifest = _qualification_evidence(
+        tmp_path,
+        expected_git_sha=expected_git_sha,
+    )
+
+    artifacts = write_run_reports(
+        run_dir,
+        qualification_evidence_path=manifest,
+    )
+    report = json.loads(artifacts.engineering_gates_path.read_text(encoding="utf-8"))
+
+    assert report["metrics"]["terminal_collapse_non_recovery_macro_dispatch_count"] == 1
+    assert report["gates"]["terminal_collapse_non_recovery_macro_dispatch_count"]["passed"] is False
+
+
 def test_diagnostic_manifest_cannot_populate_formal_engineering_evidence(
     tmp_path: Path,
 ) -> None:

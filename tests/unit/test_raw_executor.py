@@ -12,7 +12,7 @@ from rtscortex_llm_pysc2.raw_placement import (
     _placement_candidate_id,
     _placement_revision,
 )
-from rtscortex_llm_pysc2.routing import RoutedActionBatch, RoutedCommand
+from rtscortex_llm_pysc2.routing import ActionRouter, RoutedActionBatch, RoutedCommand
 from rtscortex_llm_pysc2.worker import SC2RawBuildQueryCapability
 
 pytest.importorskip("pysc2.lib.actions")
@@ -301,6 +301,118 @@ def test_raw_executor_authorizes_exact_builder_ability_and_world_target_before_d
     assert query.calls == [{"builder_tag": 0xB1, "ability_id": 881, "world_target": (30.0, 25.0)}]
     assert executor.diagnostic_snapshot["placement_query_result"] == "Success"
     assert executor.diagnostic_snapshot["available_ability_query"] == "available"
+
+
+def test_queued_macro_build_is_terminalized_before_raw_dispatch_after_terminal_collapse() -> None:
+    broker = _Broker()
+    query = _AllowRawBuildQuery()
+    executor = RawActionExecutor(
+        cast(Any, broker),
+        unit_names={2: "Probe"},
+        build_query_capability=query,
+    )
+    observation = SimpleNamespace(
+        raw_units=[_unit(0xB1, 2)],
+        game_loop=[100],
+        player_common=SimpleNamespace(minerals=500, vespene=0, food_used=0, food_cap=20),
+    )
+    command = replace(
+        _authorized_pylon_command(observation),
+        semantic_source_role="macro",
+        semantic_action="BUILD PYLON",
+        townhall_recovery=False,
+    )
+    executor.enqueue(_decision(command))
+
+    dispatch = executor.next_dispatch(
+        observation,
+        {"Builder": _agent("Builder-Probe-1", [0xB1])},
+        terminal_collapse=True,
+    )
+
+    assert dispatch is None
+    assert executor.queued_count == 0
+    assert executor.effect_inflight_count == 0
+    assert executor.diagnostic_snapshot["failure_code"] == (
+        "terminal_collapse_non_recovery_macro_dispatch"
+    )
+    assert executor.placement_service.leased_builder_tags == frozenset()
+    assert query.calls == []
+
+
+def test_router_carries_macro_terminal_semantics_to_raw_queue() -> None:
+    route = ActionRouter().route(
+        {
+            "protocol_version": "1.1",
+            "run_id": "run-raw",
+            "episode_id": "episode-raw",
+            "step_id": 1,
+            "decision_id": "decision-raw",
+            "commands": [
+                {
+                    "command_id": "macro-pylon",
+                    "actor": "Builder/Builder-Probe-1",
+                    "name": "Build_Pylon_Screen",
+                    "arguments": [[65, 65]],
+                    "source": "planner",
+                    "semantic_source_role": "macro",
+                    "semantic_action": "BUILD PYLON",
+                    "townhall_recovery": False,
+                }
+            ],
+        },
+        agent_name="Builder",
+        team_order=["Builder-Probe-1"],
+        available_actions=[
+            {
+                "name": "Build_Pylon_Screen",
+                "argument_names": ["screen"],
+                "argument_types": ["position"],
+                "actor_scopes": ["Builder/Builder-Probe-1"],
+                "argument_candidates": [[[65, 65]]],
+            }
+        ],
+    )
+
+    assert route.commands[0].semantic_source_role == "macro"
+    assert route.commands[0].semantic_action == "BUILD PYLON"
+    assert route.commands[0].townhall_recovery is False
+
+
+@pytest.mark.parametrize(
+    ("semantic_source_role", "townhall_recovery"),
+    [("macro", True), ("tactical", False)],
+)
+def test_terminal_collapse_raw_boundary_preserves_recovery_and_non_macro_paths(
+    semantic_source_role: str,
+    townhall_recovery: bool,
+) -> None:
+    broker = _Broker()
+    executor = RawActionExecutor(
+        cast(Any, broker),
+        unit_names={2: "Probe"},
+        build_query_capability=_AllowRawBuildQuery(),
+    )
+    observation = SimpleNamespace(
+        raw_units=[_unit(0xB1, 2)],
+        game_loop=[100],
+        player_common=SimpleNamespace(minerals=500, vespene=0, food_used=0, food_cap=20),
+    )
+    command = replace(
+        _authorized_pylon_command(observation),
+        semantic_source_role=semantic_source_role,
+        semantic_action="BUILD TOWNHALL" if townhall_recovery else "BUILD PYLON",
+        townhall_recovery=townhall_recovery,
+    )
+    executor.enqueue(_decision(command))
+
+    dispatch = executor.next_dispatch(
+        observation,
+        {"Builder": _agent("Builder-Probe-1", [0xB1])},
+        terminal_collapse=True,
+    )
+
+    assert dispatch is not None
 
 
 def test_sc2_query_fingerprint_tracks_requested_legality_state_generation() -> None:

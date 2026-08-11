@@ -56,11 +56,14 @@ from rtscortex.cortex import (
     StrategicIntentAdapter,
     TacticalIntent,
     TacticalPolicyProvider,
+    TerminalCollapseReason,
     counterfactual_observation_fingerprint,
     hima_previous_action_for_runtime_action,
+    is_terminal_collapse,
     macro_goal_spec,
     macro_plan_from_hima,
     runtime_frontier,
+    townhall_recovery_runtime_actions,
 )
 from rtscortex.cortex.race_brain import (
     HIMAEnsemblePolicyClient,
@@ -173,6 +176,12 @@ class _PreparedCommand:
     macro_step_ordinal: int | None = None
 
 
+@dataclass(frozen=True)
+class _TerminalCollapseMacroHold:
+    plan_id: str
+    townhall_recovery_availability_signature: tuple[str, ...]
+
+
 class CortexRuntimeEngine(RuntimeEngine):
     """Run specialist SC2 cognition while keeping execution deterministic and safe.
 
@@ -255,6 +264,7 @@ class CortexRuntimeEngine(RuntimeEngine):
         self._current_situation: SituationAssessment | None = None
         self._macro_goal: GoalSpec | None = None
         self._macro_plan_frozen = False
+        self._terminal_collapse_macro_hold: _TerminalCollapseMacroHold | None = None
         self._macro_inflight_command_id: str | None = None
         self._macro_command_steps: dict[str, tuple[str, str, int | None]] = {}
         self._command_lineages: dict[str, CommandLineage] = {}
@@ -353,6 +363,7 @@ class CortexRuntimeEngine(RuntimeEngine):
         assessment = self._situation.assess(observation)
         self._current_situation = assessment
         self._record_cortex_event(observation, "situation_assessed", assessment)
+        self._update_terminal_collapse_macro_hold(observation, assessment)
         if self._shadow_situation is not None:
             shadow_assessment = self._shadow_situation.assess(observation)
             self._record_cortex_event(
@@ -526,7 +537,17 @@ class CortexRuntimeEngine(RuntimeEngine):
         )
         accepted_commands: list[ActionCommand] = []
         for command in defense_outcome.accepted:
-            prepared_command = self._bind_dispatch_attempt(prepared_by_id[command.command_id])
+            prepared_command = prepared_by_id[command.command_id]
+            terminal_failure = self._guard_terminal_collapse_macro_dispatch(
+                observation,
+                prepared_command,
+            )
+            if terminal_failure is not None:
+                rejected_commands.extend(
+                    self._apply_validation_failures([terminal_failure], observation)
+                )
+                continue
+            prepared_command = self._bind_dispatch_attempt(prepared_command)
             prepared_by_id[command.command_id] = prepared_command
             accepted_commands.append(prepared_command.command)
         accepted_ids = {command.command_id for command in accepted_commands}
@@ -584,8 +605,7 @@ class CortexRuntimeEngine(RuntimeEngine):
                 )
                 if (
                     self._expansion_commitment_id is not None
-                    and prepared_command.semantic_action
-                    == self._semantic_action_for_target(self._race_profile.data.townhall_types[0])
+                    and prepared_command.semantic_action == self._townhall_semantic_action()
                     and not self._expansion_commitment_dispatched
                 ):
                     self._expansion_commitment_dispatched = True
@@ -928,6 +948,7 @@ class CortexRuntimeEngine(RuntimeEngine):
         self._current_situation = None
         self._macro_goal = None
         self._macro_plan_frozen = False
+        self._terminal_collapse_macro_hold = None
         self._macro_inflight_command_id = None
         self._macro_command_steps = {}
         self._command_lineages = {}
@@ -995,7 +1016,9 @@ class CortexRuntimeEngine(RuntimeEngine):
             "macro_plan_accepted",
             after_event_id=checkpoint_event_id,
         )
+        active_plan_accept_event_id = checkpoint_event_id
         if plan_event is not None:
+            active_plan_accept_event_id = plan_event.event_id
             plan_payload = plan_event.payload.get("plan", plan_event.payload)
             self._macro_plan = MacroPlan.model_validate(plan_payload)
             raw_response = self._macro_plan.raw_proposal
@@ -1019,6 +1042,41 @@ class CortexRuntimeEngine(RuntimeEngine):
                     self._macro_plan.created_game_loop,
                 )
             )
+
+        obsolete_event = self.store.last_event(
+            observation.run_id,
+            observation.episode_id,
+            "macro_frontier_obsolete",
+            after_event_id=checkpoint_event_id,
+        )
+        if (
+            obsolete_event is not None
+            and obsolete_event.event_id > active_plan_accept_event_id
+            and self._macro_plan is not None
+            and obsolete_event.payload.get("plan_id") == self._macro_plan.plan_id
+            and obsolete_event.payload.get("reason")
+            == TerminalCollapseReason.MACRO_FRONTIER_OBSOLETE.value
+        ):
+            for ordinal in obsolete_event.payload.get("obsolete_ordinals", ()):
+                if isinstance(ordinal, int):
+                    self._set_macro_step_status(
+                        ordinal,
+                        MacroStepStatus.OBSOLETE,
+                        TerminalCollapseReason.MACRO_FRONTIER_OBSOLETE.value,
+                    )
+            if obsolete_event.payload.get("plan_frozen") is True:
+                self._macro_plan_frozen = True
+                self._urgent_replan_requested = False
+                self._terminal_collapse_macro_hold = _TerminalCollapseMacroHold(
+                    plan_id=self._macro_plan.plan_id,
+                    townhall_recovery_availability_signature=tuple(
+                        str(item)
+                        for item in obsolete_event.payload.get(
+                            "townhall_recovery_availability_signature",
+                            (),
+                        )
+                    ),
+                )
 
         agenda_event = self.store.last_event(
             observation.run_id,
@@ -1246,6 +1304,16 @@ class CortexRuntimeEngine(RuntimeEngine):
                 None if self._macro_goal is None else self._macro_goal.model_dump(mode="json")
             ),
             "macro_plan_frozen": self._macro_plan_frozen,
+            "terminal_collapse_macro_hold": (
+                None
+                if self._terminal_collapse_macro_hold is None
+                else {
+                    "plan_id": self._terminal_collapse_macro_hold.plan_id,
+                    "townhall_recovery_availability_signature": list(
+                        self._terminal_collapse_macro_hold.townhall_recovery_availability_signature
+                    ),
+                }
+            ),
             "macro_inflight_command_id": self._macro_inflight_command_id,
             "macro_command_steps": {
                 command_id: [plan_id, semantic_action, ordinal]
@@ -1311,6 +1379,21 @@ class CortexRuntimeEngine(RuntimeEngine):
         macro_goal = payload.get("macro_goal")
         self._macro_goal = None if macro_goal is None else GoalSpec.model_validate(macro_goal)
         self._macro_plan_frozen = bool(payload.get("macro_plan_frozen"))
+        terminal_hold = payload.get("terminal_collapse_macro_hold")
+        self._terminal_collapse_macro_hold = (
+            None
+            if not isinstance(terminal_hold, dict)
+            else _TerminalCollapseMacroHold(
+                plan_id=str(terminal_hold["plan_id"]),
+                townhall_recovery_availability_signature=tuple(
+                    str(item)
+                    for item in terminal_hold.get(
+                        "townhall_recovery_availability_signature",
+                        (),
+                    )
+                ),
+            )
+        )
         inflight = payload.get("macro_inflight_command_id")
         self._macro_inflight_command_id = None if inflight is None else str(inflight)
         self._macro_command_steps = {
@@ -1420,11 +1503,117 @@ class CortexRuntimeEngine(RuntimeEngine):
             },
         )
 
+    def _update_terminal_collapse_macro_hold(
+        self,
+        observation: ObservationEnvelope,
+        assessment: SituationAssessment,
+    ) -> None:
+        hold = self._terminal_collapse_macro_hold
+        if hold is None:
+            return
+        recovery_signature = self._townhall_recovery_availability_signature(observation)
+        if (
+            is_terminal_collapse(assessment)
+            and recovery_signature == hold.townhall_recovery_availability_signature
+        ):
+            return
+        reason = (
+            "terminal_collapse_townhall_recovery_availability_changed"
+            if is_terminal_collapse(assessment)
+            else "terminal_collapse_material_state_changed"
+        )
+        replacement_plan_present = (
+            self._macro_plan is not None and self._macro_plan.plan_id != hold.plan_id
+        )
+        self._terminal_collapse_macro_hold = None
+        if not replacement_plan_present:
+            self._macro_plan = None
+            self._macro_proposal = None
+            self._macro_goal = None
+            self._macro_plan_frozen = False
+            self._next_macro_retry_game_loop = None
+            self._urgent_replan_requested = True
+        self._record_cortex_event(
+            observation,
+            "terminal_collapse_macro_hold_released",
+            {
+                "plan_id": hold.plan_id,
+                "current_game_loop": observation.game_loop,
+                "current_situation_assessment_id": assessment.assessment_id,
+                "army_readiness": assessment.army_readiness.value,
+                "own_base_count": assessment.bases.own_base_count,
+                "own_production_capacity": assessment.bases.own_production_capacity,
+                "threat_level": assessment.threat_level.value,
+                "replacement_plan_present": replacement_plan_present,
+                "reason": reason,
+            },
+        )
+
+    def _townhall_recovery_availability_signature(
+        self,
+        observation: ObservationEnvelope,
+    ) -> tuple[str, ...]:
+        recovery_actions = townhall_recovery_runtime_actions(self._race_profile.data)
+        signatures = [
+            json.dumps(
+                action.model_dump(mode="json"),
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            for action in observation.available_actions
+            if action.name in recovery_actions
+        ]
+        recovery_semantics = {
+            self._semantic_action_for_runtime(runtime_action) for runtime_action in recovery_actions
+        }
+        if self._macro_proposal is not None and any(
+            step.canonical_action in recovery_semantics for step in self._macro_proposal.steps
+        ):
+            signatures.extend(
+                "resource-readiness:"
+                + json.dumps(
+                    {
+                        "action": action_name,
+                        "ready": self._runtime_action_resources_ready(
+                            action_name,
+                            observation,
+                        ),
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                for action_name in sorted(recovery_actions)
+            )
+        return tuple(sorted(signatures))
+
+    def _runtime_action_resources_ready(
+        self,
+        action_name: str,
+        observation: ObservationEnvelope,
+    ) -> bool:
+        spec = next(
+            (
+                candidate
+                for candidate in self._race_profile.data.progress_action_specs
+                if candidate.name == action_name
+            ),
+            None,
+        )
+        if spec is None:
+            return False
+        economy = observation.state.economy
+        return (
+            economy.minerals >= spec.minerals
+            and economy.vespene >= spec.vespene
+            and economy.supply_cap - economy.supply_used >= spec.supply
+        )
+
     def _should_start_macro(self, observation: ObservationEnvelope) -> bool:
         if (
             self._macro_client is None
             or self._macro_task is not None
             or self._macro_requests_suspended
+            or self._terminal_collapse_macro_hold is not None
         ):
             return False
         if (
@@ -1546,6 +1735,9 @@ class CortexRuntimeEngine(RuntimeEngine):
                 self.config.cortex.macro.plan_ttl_game_loops,
                 current_observation=(observation if revalidate_after_outcome else None),
                 profile=self._race_profile.data,
+            )
+            plan = plan.model_copy(
+                update={"proposal_source_game_loop": source_observation.game_loop}
             )
             if isinstance(policy_response, RaceBrainProposalResponse):
                 raw = policy_response.model_dump(mode="json")
@@ -1718,10 +1910,15 @@ class CortexRuntimeEngine(RuntimeEngine):
         *,
         latency_ms: float,
     ) -> None:
-        proposal_source_game_loop = plan.created_game_loop
+        proposal_source_game_loop = (
+            plan.proposal_source_game_loop
+            if plan.proposal_source_game_loop is not None
+            else plan.created_game_loop
+        )
         plan = plan.model_copy(
             update={
                 "created_game_loop": observation.game_loop,
+                "proposal_source_game_loop": proposal_source_game_loop,
                 "expires_game_loop": (
                     observation.game_loop + self.config.cortex.macro.plan_ttl_game_loops
                 ),
@@ -1879,6 +2076,14 @@ class CortexRuntimeEngine(RuntimeEngine):
                 },
             )
             frontier = fallback
+        frontier = self._apply_terminal_collapse_macro_boundary(
+            observation,
+            assessment,
+            remaining_proposal,
+            frontier,
+        )
+        if frontier is None:
+            return None
         if frontier.classification is PolicyActionClassification.MAPPED_DEFERRED:
             step = self._macro_step(frontier.ordinal)
             status_changed = (
@@ -2038,6 +2243,163 @@ class CortexRuntimeEngine(RuntimeEngine):
             macro_step_ordinal=(frontier.ordinal if advances_plan_step else None),
         )
 
+    def _apply_terminal_collapse_macro_boundary(
+        self,
+        observation: ObservationEnvelope,
+        assessment: SituationAssessment,
+        proposal: MacroPolicyProposal,
+        frontier: PolicyActionAssessment,
+    ) -> PolicyActionAssessment | None:
+        if not is_terminal_collapse(assessment):
+            return frontier
+        recovery = (
+            frontier
+            if self._frontier_is_townhall_recovery(frontier)
+            else self._terminal_collapse_recovery_frontier(proposal, observation)
+        )
+        recovery_is_legal = (
+            recovery is not None
+            and recovery.classification is PolicyActionClassification.MAPPED_LEGAL_NOW
+            and self._frontier_is_townhall_recovery(recovery)
+            and recovery.runtime_action is not None
+            and self._runtime_action_resources_ready(
+                recovery.runtime_action,
+                observation,
+            )
+        )
+        recovery_ordinal = recovery.ordinal if recovery is not None and recovery_is_legal else None
+        obsolete = self._obsolete_terminal_collapse_steps(
+            recovery_ordinal=recovery_ordinal,
+        )
+        if obsolete:
+            self._record_terminal_collapse_macro_obsolete(
+                observation,
+                assessment,
+                obsolete,
+                plan_frozen=not recovery_is_legal,
+            )
+        if recovery_is_legal:
+            self._terminal_collapse_macro_hold = None
+            return recovery
+        assert self._macro_plan is not None
+        self._macro_plan_frozen = True
+        self._urgent_replan_requested = False
+        self._next_macro_retry_game_loop = None
+        self._terminal_collapse_macro_hold = _TerminalCollapseMacroHold(
+            plan_id=self._macro_plan.plan_id,
+            townhall_recovery_availability_signature=(
+                self._townhall_recovery_availability_signature(observation)
+            ),
+        )
+        return None
+
+    def _terminal_collapse_recovery_frontier(
+        self,
+        proposal: MacroPolicyProposal,
+        observation: ObservationEnvelope,
+    ) -> PolicyActionAssessment | None:
+        recovery_semantics = {
+            self._semantic_action_for_runtime(runtime_action)
+            for runtime_action in townhall_recovery_runtime_actions(self._race_profile.data)
+        }
+        recovery_steps = [
+            step for step in proposal.steps if step.canonical_action in recovery_semantics
+        ]
+        if not recovery_steps:
+            return None
+        return runtime_frontier(
+            proposal.model_copy(update={"steps": recovery_steps}),
+            observation,
+            self._recent_hima_actions(observation.game_loop),
+            self._race_profile.data,
+        )
+
+    def _obsolete_terminal_collapse_steps(
+        self,
+        *,
+        recovery_ordinal: int | None,
+    ) -> list[MacroStep]:
+        assert self._macro_plan is not None
+        obsolete: list[MacroStep] = []
+        for step in self._macro_plan.steps:
+            if self._macro_step_is_complete(step.ordinal) or step.ordinal == recovery_ordinal:
+                continue
+            obsolete.append(step)
+            self._set_macro_step_status(
+                step.ordinal,
+                MacroStepStatus.OBSOLETE,
+                TerminalCollapseReason.MACRO_FRONTIER_OBSOLETE.value,
+            )
+        return obsolete
+
+    def _record_terminal_collapse_macro_obsolete(
+        self,
+        observation: ObservationEnvelope,
+        assessment: SituationAssessment,
+        obsolete: list[MacroStep],
+        *,
+        plan_frozen: bool,
+    ) -> None:
+        assert self._macro_plan is not None
+        first = min(obsolete, key=lambda step: step.ordinal)
+        available_recovery = townhall_recovery_runtime_actions(self._race_profile.data)
+        self._record_cortex_event(
+            observation,
+            "macro_frontier_obsolete",
+            {
+                "plan_id": self._macro_plan.plan_id,
+                "semantic_action": first.semantic_action,
+                "runtime_action": first.runtime_actions[0] if first.runtime_actions else None,
+                "ordinal": first.ordinal,
+                "obsolete_ordinals": sorted(step.ordinal for step in obsolete),
+                "proposal_source_game_loop": (
+                    self._macro_plan.proposal_source_game_loop
+                    if self._macro_plan.proposal_source_game_loop is not None
+                    else self._macro_plan.created_game_loop
+                ),
+                "current_game_loop": observation.game_loop,
+                "current_situation_assessment_id": assessment.assessment_id,
+                "army_readiness": assessment.army_readiness.value,
+                "own_base_count": assessment.bases.own_base_count,
+                "own_production_capacity": assessment.bases.own_production_capacity,
+                "threat_level": assessment.threat_level.value,
+                "source_model_id": self._macro_plan.source_model_id,
+                "source_model_version": self._macro_plan.source_model_revision,
+                "townhall_recovery_actions_available": sorted(
+                    action.name
+                    for action in observation.available_actions
+                    if action.name in available_recovery
+                ),
+                "townhall_recovery_availability_signature": list(
+                    self._townhall_recovery_availability_signature(observation)
+                ),
+                "plan_frozen": plan_frozen,
+                "reason": TerminalCollapseReason.MACRO_FRONTIER_OBSOLETE.value,
+            },
+        )
+
+    def _frontier_is_townhall_recovery(
+        self,
+        frontier: PolicyActionAssessment,
+    ) -> bool:
+        return self._macro_action_is_townhall_recovery(
+            frontier.source_action,
+            frontier.runtime_action,
+        )
+
+    def _macro_action_is_townhall_recovery(
+        self,
+        semantic_action: str | None,
+        runtime_action: str | None,
+    ) -> bool:
+        if (
+            semantic_action is None
+            or runtime_action is None
+            or runtime_action not in townhall_recovery_runtime_actions(self._race_profile.data)
+        ):
+            return False
+        return semantic_action == self._semantic_action_for_runtime(runtime_action)
+
     def _proposal_with_expansion_commitment(
         self,
         proposal: MacroPolicyProposal,
@@ -2051,9 +2413,7 @@ class CortexRuntimeEngine(RuntimeEngine):
             or self._expansion_goal.terminal_state is not None
         ):
             return proposal
-        townhall_action = self._semantic_action_for_target(
-            self._race_profile.data.townhall_types[0]
-        )
+        townhall_action = self._townhall_semantic_action()
         if any(step.canonical_action == townhall_action for step in proposal.steps):
             return proposal
         ordinals = [step.ordinal for step in proposal.steps]
@@ -2084,9 +2444,7 @@ class CortexRuntimeEngine(RuntimeEngine):
         supply_action = self._supply_macro_action()
         gas_runtime_action = self._runtime_action_for_target(self._race_profile.data.gas_structure)
         gas_action = self._semantic_action_for_runtime(gas_runtime_action)
-        townhall_action = self._semantic_action_for_target(
-            self._race_profile.data.townhall_types[0]
-        )
+        townhall_action = self._townhall_semantic_action()
         fallback_unit_action = self._fallback_unit_macro_action()
         if (
             blocked_frontier.source_action != supply_action
@@ -2672,6 +3030,20 @@ class CortexRuntimeEngine(RuntimeEngine):
             selection,
             command_id=resolved_command_id,
         )
+        command = command.model_copy(
+            update={
+                "semantic_source_role": intent.source_role.value,
+                "semantic_action": semantic_action,
+                "townhall_recovery": (
+                    self._macro_action_is_townhall_recovery(
+                        semantic_action,
+                        command.name,
+                    )
+                    if intent.source_role is CortexRole.MACRO
+                    else None
+                ),
+            }
+        )
         if strategic_intent.operation_id is not None:
             command = command.model_copy(
                 update={
@@ -3238,6 +3610,45 @@ class CortexRuntimeEngine(RuntimeEngine):
             )
         self._terminal_strategy_rule_evaluations.clear()
 
+    def _guard_terminal_collapse_macro_dispatch(
+        self,
+        observation: ObservationEnvelope,
+        prepared: _PreparedCommand,
+    ) -> ValidationFailure | None:
+        assessment = self._current_situation
+        if (
+            prepared.lineage.source_role is not CortexRole.MACRO
+            or assessment is None
+            or not is_terminal_collapse(assessment)
+            or self._macro_action_is_townhall_recovery(
+                prepared.semantic_action,
+                prepared.command.name,
+            )
+        ):
+            return None
+        self._record_cortex_event(
+            observation,
+            "terminal_collapse_non_recovery_macro_dispatch",
+            {
+                "command_id": prepared.command.command_id,
+                "plan_id": prepared.lineage.macro_plan_id,
+                "semantic_action": prepared.semantic_action,
+                "runtime_action": prepared.command.name,
+                "current_game_loop": observation.game_loop,
+                "current_situation_assessment_id": assessment.assessment_id,
+                "army_readiness": assessment.army_readiness.value,
+                "own_base_count": assessment.bases.own_base_count,
+                "own_production_capacity": assessment.bases.own_production_capacity,
+                "threat_level": assessment.threat_level.value,
+                "reason": TerminalCollapseReason.NON_RECOVERY_MACRO_DISPATCH.value,
+            },
+        )
+        return ValidationFailure(
+            command=prepared.command,
+            reason=TerminalCollapseReason.NON_RECOVERY_MACRO_DISPATCH.value,
+            disposition=ValidationDisposition.OBSOLETE,
+        )
+
     def _record_command_lineage(
         self,
         observation: ObservationEnvelope,
@@ -3247,6 +3658,16 @@ class CortexRuntimeEngine(RuntimeEngine):
         if existing is not None and existing != prepared.lineage:
             raise RuntimeError("command ID was reused with conflicting Cortex lineage")
         self._command_lineages[prepared.command.command_id] = prepared.lineage
+        assessment = self._current_situation
+        terminal_collapse = assessment is not None and is_terminal_collapse(assessment)
+        townhall_recovery = (
+            self._macro_action_is_townhall_recovery(
+                prepared.semantic_action,
+                prepared.command.name,
+            )
+            if prepared.lineage.source_role is CortexRole.MACRO
+            else None
+        )
         self._record_cortex_event(
             observation,
             "command_lineage",
@@ -3256,6 +3677,8 @@ class CortexRuntimeEngine(RuntimeEngine):
                 "macro_plan_id": prepared.lineage.macro_plan_id,
                 "semantic_action": prepared.semantic_action,
                 "macro_step_ordinal": prepared.macro_step_ordinal,
+                "terminal_collapse": terminal_collapse,
+                "townhall_recovery": townhall_recovery,
             },
         )
 
@@ -3408,7 +3831,41 @@ class CortexRuntimeEngine(RuntimeEngine):
                 self._urgent_replan_requested = False
             else:
                 self._macro_plan_frozen = True
-                self._urgent_replan_requested = True
+                plan = self._macro_plan
+                terminal_townhall_failure = (
+                    plan is not None
+                    and self._current_situation is not None
+                    and is_terminal_collapse(self._current_situation)
+                    and report.action_name == self._townhall_runtime_action()
+                )
+                if terminal_townhall_failure:
+                    assert plan is not None
+                    latest_observation = self._latest_observation(
+                        report.run_id,
+                        report.episode_id,
+                    )
+                    self._terminal_collapse_macro_hold = _TerminalCollapseMacroHold(
+                        plan_id=plan.plan_id,
+                        townhall_recovery_availability_signature=(
+                            ("observation-unavailable",)
+                            if latest_observation is None
+                            else self._townhall_recovery_availability_signature(latest_observation)
+                        ),
+                    )
+                    self._urgent_replan_requested = False
+                    self._next_macro_retry_game_loop = None
+                else:
+                    self._urgent_replan_requested = True
+
+    def _latest_observation(
+        self,
+        run_id: str,
+        episode_id: str,
+    ) -> ObservationEnvelope | None:
+        event = self.store.last_event(run_id, episode_id, "observation")
+        if event is None:
+            return None
+        return ObservationEnvelope.model_validate(event.payload)
 
     def _remember_terminal_feedback(self, report: ExecutionReport) -> None:
         if (
@@ -3513,9 +3970,7 @@ class CortexRuntimeEngine(RuntimeEngine):
         proposal = self._macro_proposal
         if plan is None or proposal is None:
             return
-        townhall_action = self._semantic_action_for_target(
-            self._race_profile.data.townhall_types[0]
-        )
+        townhall_action = self._townhall_semantic_action()
         executable_ordinals = {step.ordinal for step in plan.steps}
         expansion_steps = [
             step
@@ -3922,7 +4377,16 @@ class CortexRuntimeEngine(RuntimeEngine):
         )
 
     def _townhall_runtime_action(self) -> str:
-        return self._runtime_action_for_target(self._race_profile.data.townhall_types[0])
+        actions = townhall_recovery_runtime_actions(self._race_profile.data)
+        if len(actions) != 1:
+            raise RuntimeError(
+                f"{self._race_profile.race.value} profile must define exactly one "
+                "direct townhall recovery action"
+            )
+        return next(iter(actions))
+
+    def _townhall_semantic_action(self) -> str:
+        return self._semantic_action_for_runtime(self._townhall_runtime_action())
 
     def _set_macro_step_status(
         self,
@@ -3961,7 +4425,7 @@ class CortexRuntimeEngine(RuntimeEngine):
         return step.status in {MacroStepStatus.CONFIRMED, MacroStepStatus.OBSOLETE}
 
     def _request_macro_if_exhausted(self) -> None:
-        if self._macro_plan is None:
+        if self._macro_plan is None or self._terminal_collapse_macro_hold is not None:
             return
         if all(
             step.status in {MacroStepStatus.CONFIRMED, MacroStepStatus.OBSOLETE}

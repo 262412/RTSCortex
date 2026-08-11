@@ -229,18 +229,38 @@ def _config(
     )
 
 
-def _macro_observation(*, step_id: int, game_loop: int, pylon: bool = False) -> ObservationEnvelope:
-    structures = (
-        [
-            UnitState(
-                unit_id="0xpylon",
-                unit_type="Pylon",
-                alliance="self",
-            )
-        ]
-        if pylon
-        else []
-    )
+def _macro_observation(
+    *,
+    step_id: int,
+    game_loop: int,
+    pylon: bool = False,
+    townhall: bool = True,
+    minerals: int = 200,
+) -> ObservationEnvelope:
+    structures = [
+        *(
+            [
+                UnitState(
+                    unit_id="0xnexus",
+                    unit_type="Nexus",
+                    alliance="self",
+                )
+            ]
+            if townhall
+            else []
+        ),
+        *(
+            [
+                UnitState(
+                    unit_id="0xpylon",
+                    unit_type="Pylon",
+                    alliance="self",
+                )
+            ]
+            if pylon
+            else []
+        ),
+    ]
     return ObservationEnvelope(
         run_id="cortex-run",
         episode_id="episode-1",
@@ -248,7 +268,7 @@ def _macro_observation(*, step_id: int, game_loop: int, pylon: bool = False) -> 
         game_loop=game_loop,
         state=SC2State(
             economy=EconomyState(
-                minerals=200,
+                minerals=minerals,
                 supply_used=12,
                 supply_cap=15,
                 workers=12,
@@ -264,6 +284,49 @@ def _macro_observation(*, step_id: int, game_loop: int, pylon: bool = False) -> 
                 argument_candidates=[[[65, 90]]],
             )
         ],
+    )
+
+
+def _terminal_macro_observation(
+    *,
+    step_id: int,
+    game_loop: int,
+    include_townhall_recovery: bool = False,
+    minerals: int = 500,
+) -> ObservationEnvelope:
+    observation = _macro_observation(
+        step_id=step_id,
+        game_loop=game_loop,
+        townhall=False,
+        minerals=minerals,
+    )
+    available_actions = list(observation.available_actions)
+    if include_townhall_recovery:
+        available_actions.append(
+            AvailableAction(
+                name="Build_Nexus_Near",
+                argument_names=["tag"],
+                argument_types=[ActionArgumentType.TAG],
+                actor_scopes=["Builder/Probe-1"],
+                argument_candidates=[["0x99"]],
+            )
+        )
+    return observation.model_copy(
+        update={
+            "state": observation.state.model_copy(
+                update={
+                    "visible_enemies": [
+                        UnitState(
+                            unit_id="0xzergling",
+                            unit_type="Zergling",
+                            alliance="enemy",
+                            position=(10, 10),
+                        )
+                    ]
+                }
+            ),
+            "available_actions": available_actions,
+        }
     )
 
 
@@ -1350,6 +1413,587 @@ def test_slow_hima_plan_ttl_starts_at_acceptance_game_loop(tmp_path: Path) -> No
     asyncio.run(exercise())
 
 
+def test_async_macro_frontier_becomes_obsolete_at_terminal_collapse_boundary(
+    tmp_path: Path,
+) -> None:
+    client = _BlockingFirstMacroClient()
+    client.outputs = ["Actions: ['Pylon', 'Gateway']", "Actions: ['Pylon']"]
+    store = _store(tmp_path)
+    runtime = CortexRuntimeEngine(
+        config=_config(tmp_path),
+        store=store,
+        provider=FakeProvider(),
+        macro_client=client,
+    )
+
+    async def exercise() -> None:
+        await runtime.start()
+        source = _macro_observation(step_id=0, game_loop=100)
+        first = await runtime.tick(source)
+        assert first.planner_pending is True
+        assert runtime._macro_task is not None
+
+        client.release_first.set()
+        runtime._macro_outcome_revision += 1
+        await runtime._macro_task
+        collapsed = _terminal_macro_observation(step_id=1, game_loop=164)
+        batch = await runtime.tick(collapsed)
+
+        assert batch.commands == []
+        assert runtime._macro_plan is not None
+        assert runtime._macro_plan_frozen is True
+        assert {step.status for step in runtime._macro_plan.steps} == {MacroStepStatus.OBSOLETE}
+        assert [
+            event.payload["reason"]
+            for event in store.events_of_type(
+                collapsed.run_id,
+                collapsed.episode_id,
+                "macro_frontier_obsolete",
+            )
+        ] == ["terminal_collapse_macro_frontier_obsolete"]
+        suppression = store.events_of_type(
+            collapsed.run_id,
+            collapsed.episode_id,
+            "macro_frontier_obsolete",
+        )[0].payload
+        assessment = runtime._current_situation
+        assert assessment is not None
+        assert suppression == {
+            "plan_id": runtime._macro_plan.plan_id,
+            "semantic_action": "BUILD PYLON",
+            "runtime_action": "Build_Pylon_Screen",
+            "ordinal": 0,
+            "obsolete_ordinals": [0, 1],
+            "proposal_source_game_loop": 100,
+            "current_game_loop": 164,
+            "current_situation_assessment_id": assessment.assessment_id,
+            "army_readiness": "empty",
+            "own_base_count": 0,
+            "own_production_capacity": 0,
+            "threat_level": "critical",
+            "source_model_id": runtime._macro_plan.source_model_id,
+            "source_model_version": runtime._macro_plan.source_model_revision,
+            "townhall_recovery_actions_available": [],
+            "townhall_recovery_availability_signature": [],
+            "plan_frozen": True,
+            "reason": "terminal_collapse_macro_frontier_obsolete",
+        }
+        assert (
+            len(
+                store.events_of_type(
+                    collapsed.run_id,
+                    collapsed.episode_id,
+                    "macro_proposal_revalidated",
+                )
+            )
+            == 1
+        )
+        for event_type in (
+            "role_intent_emitted",
+            "intent_emitted",
+            "candidate_set_built",
+            "command_lineage",
+            "placement_ledger_transition",
+            "execution",
+        ):
+            assert all(
+                "Build_Pylon_Screen" not in str(event.payload)
+                and "Build_Gateway_Screen" not in str(event.payload)
+                for event in store.events_of_type(
+                    collapsed.run_id,
+                    collapsed.episode_id,
+                    event_type,
+                )
+            )
+
+        unchanged = collapsed.model_copy(update={"step_id": 2, "game_loop": 165})
+        await runtime.tick(unchanged)
+        assert len(client.contexts) == 1
+        assert (
+            len(
+                store.events_of_type(
+                    collapsed.run_id,
+                    collapsed.episode_id,
+                    "macro_frontier_obsolete",
+                )
+            )
+            == 1
+        )
+        await runtime.close()
+
+    asyncio.run(exercise())
+
+
+def test_async_macro_pylon_is_unchanged_when_source_and_current_keep_townhall(
+    tmp_path: Path,
+) -> None:
+    client = _BlockingFirstMacroClient()
+    store = _store(tmp_path)
+    runtime = CortexRuntimeEngine(
+        config=_config(tmp_path),
+        store=store,
+        provider=FakeProvider(),
+        macro_client=client,
+    )
+
+    async def exercise() -> None:
+        await runtime.start()
+        await runtime.tick(_macro_observation(step_id=0, game_loop=100))
+        assert runtime._macro_task is not None
+        client.release_first.set()
+        runtime._macro_outcome_revision += 1
+        await runtime._macro_task
+
+        batch = await runtime.tick(_macro_observation(step_id=1, game_loop=164))
+
+        assert [command.name for command in batch.commands] == ["Build_Pylon_Screen"]
+        assert batch.commands[0].semantic_source_role == "macro"
+        assert batch.commands[0].semantic_action == "BUILD PYLON"
+        assert batch.commands[0].townhall_recovery is False
+        assert not store.events_of_type(
+            "cortex-run",
+            "episode-1",
+            "macro_frontier_obsolete",
+        )
+        lineage = store.events_of_type(
+            "cortex-run",
+            "episode-1",
+            "command_lineage",
+        )[0].payload
+        assert lineage["terminal_collapse"] is False
+        assert lineage["townhall_recovery"] is False
+        await runtime.close()
+
+    asyncio.run(exercise())
+
+
+def test_accepted_macro_plan_cannot_dispatch_after_next_tick_terminal_collapse(
+    tmp_path: Path,
+) -> None:
+    client = _FakeMacroClient()
+    store = _store(tmp_path)
+    runtime = CortexRuntimeEngine(
+        config=_config(tmp_path),
+        store=store,
+        provider=FakeProvider(),
+        macro_client=client,
+    )
+
+    async def exercise() -> None:
+        await runtime.start()
+        await runtime.tick(_macro_observation(step_id=0, game_loop=100, minerals=0))
+        assert runtime._macro_task is not None
+        await runtime._macro_task
+        current = _macro_observation(step_id=1, game_loop=101, minerals=0)
+        current.available_actions[0] = current.available_actions[0].model_copy(
+            update={"actor_scopes": []}
+        )
+        accepted = await runtime.tick(current)
+        assert accepted.commands == []
+        assert runtime._macro_plan is not None
+        assert runtime._macro_plan_frozen is False
+
+        collapsed = _terminal_macro_observation(step_id=2, game_loop=102)
+        blocked = await runtime.tick(collapsed)
+
+        assert blocked.commands == []
+        assert runtime._macro_plan_frozen is True
+        assert not store.events_of_type(
+            collapsed.run_id,
+            collapsed.episode_id,
+            "command_lineage",
+        )
+        assert (
+            len(
+                store.events_of_type(
+                    collapsed.run_id,
+                    collapsed.episode_id,
+                    "macro_frontier_obsolete",
+                )
+            )
+            == 1
+        )
+        await runtime.close()
+
+    asyncio.run(exercise())
+
+
+def test_terminal_collapse_allows_only_race_profile_townhall_recovery(
+    tmp_path: Path,
+) -> None:
+    client = _BlockingFirstMacroClient()
+    client.outputs = ["Actions: ['Pylon', 'Nexus', 'Gateway']"]
+    store = _store(tmp_path)
+    runtime = CortexRuntimeEngine(
+        config=_config(tmp_path),
+        store=store,
+        provider=FakeProvider(),
+        macro_client=client,
+    )
+
+    async def exercise() -> None:
+        await runtime.start()
+        await runtime.tick(_macro_observation(step_id=0, game_loop=100))
+        assert runtime._macro_task is not None
+        client.release_first.set()
+        runtime._macro_outcome_revision += 1
+        await runtime._macro_task
+
+        collapsed = _terminal_macro_observation(
+            step_id=1,
+            game_loop=164,
+            include_townhall_recovery=True,
+        )
+        batch = await runtime.tick(collapsed)
+
+        assert [command.name for command in batch.commands] == ["Build_Nexus_Near"]
+        assert batch.commands[0].semantic_source_role == "macro"
+        assert batch.commands[0].semantic_action == "BUILD NEXUS"
+        assert batch.commands[0].townhall_recovery is True
+        assert runtime._macro_plan is not None
+        status_by_action = {step.semantic_action: step.status for step in runtime._macro_plan.steps}
+        assert status_by_action == {
+            "BUILD PYLON": MacroStepStatus.OBSOLETE,
+            "BUILD NEXUS": MacroStepStatus.DISPATCHED,
+            "BUILD GATEWAY": MacroStepStatus.OBSOLETE,
+        }
+        emitted_actions = [
+            event.payload["intent"]["action_names"][0]
+            for event in store.events_of_type(
+                collapsed.run_id,
+                collapsed.episode_id,
+                "intent_emitted",
+            )
+            if event.payload["role"] == "macro"
+        ]
+        assert emitted_actions == ["Build_Nexus_Near"]
+        lineage = store.events_of_type(
+            collapsed.run_id,
+            collapsed.episode_id,
+            "command_lineage",
+        )[0].payload
+        assert lineage["terminal_collapse"] is True
+        assert lineage["townhall_recovery"] is True
+        await runtime.close()
+
+    asyncio.run(exercise())
+
+
+def test_terminal_collapse_hold_replans_once_after_material_state_recovers(
+    tmp_path: Path,
+) -> None:
+    client = _BlockingFirstMacroClient()
+    store = _store(tmp_path)
+    runtime = CortexRuntimeEngine(
+        config=_config(tmp_path),
+        store=store,
+        provider=FakeProvider(),
+        macro_client=client,
+    )
+
+    async def exercise() -> None:
+        await runtime.start()
+        await runtime.tick(_macro_observation(step_id=0, game_loop=100))
+        assert runtime._macro_task is not None
+        client.release_first.set()
+        runtime._macro_outcome_revision += 1
+        await runtime._macro_task
+        await runtime.tick(_terminal_macro_observation(step_id=1, game_loop=164))
+        await runtime.tick(_terminal_macro_observation(step_id=2, game_loop=165))
+
+        restored = _macro_observation(step_id=3, game_loop=200)
+        pending = await runtime.tick(restored)
+        assert pending.commands == []
+        assert pending.planner_pending is True
+        assert runtime._macro_task is not None
+        await runtime._macro_task
+
+        resumed = await runtime.tick(_macro_observation(step_id=4, game_loop=201))
+
+        assert [command.name for command in resumed.commands] == ["Build_Pylon_Screen"]
+        assert len(client.contexts) == 2
+        assert client.contexts[1].observation.step_id == 3
+        assert (
+            len(
+                store.events_of_type(
+                    restored.run_id,
+                    restored.episode_id,
+                    "macro_frontier_obsolete",
+                )
+            )
+            == 1
+        )
+        macro_intents = [
+            event.payload["intent"]
+            for event in store.events_of_type(
+                restored.run_id,
+                restored.episode_id,
+                "intent_emitted",
+            )
+            if event.payload["role"] == "macro"
+        ]
+        assert macro_intents[-1]["step_id"] == 4
+        assessment = runtime._current_situation
+        assert assessment is not None
+        assert macro_intents[-1]["situation_assessment_id"] == assessment.assessment_id
+        await runtime.close()
+
+    asyncio.run(exercise())
+
+
+def test_terminal_collapse_macro_hold_survives_checkpoint_without_duplicate_event(
+    tmp_path: Path,
+) -> None:
+    client = _BlockingFirstMacroClient()
+    first = CortexRuntimeEngine(
+        config=_config(tmp_path),
+        store=_store(tmp_path),
+        provider=FakeProvider(),
+        macro_client=client,
+    )
+
+    async def create_checkpoint() -> None:
+        await first.start()
+        await first.tick(_macro_observation(step_id=0, game_loop=100))
+        assert first._macro_task is not None
+        client.release_first.set()
+        first._macro_outcome_revision += 1
+        await first._macro_task
+        collapsed = _terminal_macro_observation(step_id=1, game_loop=164)
+        await first.tick(collapsed)
+        first._record_cortex_checkpoint(collapsed)
+        await first.close()
+
+    asyncio.run(create_checkpoint())
+
+    replacement_client = _FakeMacroClient()
+    recovered = CortexRuntimeEngine(
+        config=_config(tmp_path),
+        store=_store(tmp_path),
+        provider=FakeProvider(),
+        macro_client=replacement_client,
+    )
+
+    async def recover() -> None:
+        await recovered.start()
+        batch = await recovered.tick(_terminal_macro_observation(step_id=2, game_loop=165))
+
+        assert batch.commands == []
+        assert replacement_client.contexts == []
+        assert recovered._macro_plan_frozen is True
+        assert recovered._terminal_collapse_macro_hold is not None
+        events = recovered.store.events_of_type(
+            "cortex-run",
+            "episode-1",
+            "macro_frontier_obsolete",
+        )
+        assert len(events) == 1
+        await recovered.close()
+
+    asyncio.run(recover())
+
+
+def test_terminal_collapse_hold_releases_when_townhall_recovery_becomes_legal(
+    tmp_path: Path,
+) -> None:
+    client = _BlockingFirstMacroClient()
+    client.outputs = [
+        "Actions: ['Pylon', 'Nexus']",
+        "Actions: ['Pylon', 'Nexus']",
+    ]
+    runtime = CortexRuntimeEngine(
+        config=_config(tmp_path),
+        store=_store(tmp_path),
+        provider=FakeProvider(),
+        macro_client=client,
+    )
+
+    async def exercise() -> None:
+        await runtime.start()
+        await runtime.tick(_macro_observation(step_id=0, game_loop=100))
+        assert runtime._macro_task is not None
+        client.release_first.set()
+        runtime._macro_outcome_revision += 1
+        await runtime._macro_task
+
+        resource_blocked = _terminal_macro_observation(
+            step_id=1,
+            game_loop=164,
+            include_townhall_recovery=True,
+            minerals=300,
+        )
+        blocked = await runtime.tick(resource_blocked)
+        assert blocked.commands == []
+        assert runtime._terminal_collapse_macro_hold is not None
+
+        resource_ready = _terminal_macro_observation(
+            step_id=2,
+            game_loop=165,
+            include_townhall_recovery=True,
+            minerals=500,
+        )
+        pending = await runtime.tick(resource_ready)
+        assert pending.commands == []
+        assert pending.planner_pending is True
+        assert runtime._macro_task is not None
+        await runtime._macro_task
+
+        dispatched = await runtime.tick(
+            _terminal_macro_observation(
+                step_id=3,
+                game_loop=166,
+                include_townhall_recovery=True,
+                minerals=500,
+            )
+        )
+
+        assert [command.name for command in dispatched.commands] == ["Build_Nexus_Near"]
+        assert len(client.contexts) == 2
+        await runtime.close()
+
+    asyncio.run(exercise())
+
+
+def test_terminal_collapse_townhall_effect_failure_does_not_hot_replan(
+    tmp_path: Path,
+) -> None:
+    client = _BlockingFirstMacroClient()
+    client.outputs = ["Actions: ['Pylon', 'Nexus']"]
+    runtime = CortexRuntimeEngine(
+        config=_config(tmp_path),
+        store=_store(tmp_path),
+        provider=FakeProvider(),
+        macro_client=client,
+    )
+
+    async def exercise() -> None:
+        await runtime.start()
+        await runtime.tick(_macro_observation(step_id=0, game_loop=100))
+        assert runtime._macro_task is not None
+        client.release_first.set()
+        runtime._macro_outcome_revision += 1
+        await runtime._macro_task
+        collapsed = _terminal_macro_observation(
+            step_id=1,
+            game_loop=164,
+            include_townhall_recovery=True,
+        )
+        dispatched = await runtime.tick(collapsed)
+        command = dispatched.commands[0]
+        assert command.name == "Build_Nexus_Near"
+
+        runtime.record_execution(
+            ExecutionReport(
+                run_id=dispatched.run_id,
+                episode_id=dispatched.episode_id,
+                step_id=dispatched.step_id,
+                command_id=command.command_id,
+                operation_id=command.operation_id,
+                attempt_id=command.attempt_id,
+                attempt_ordinal=command.attempt_ordinal,
+                success=False,
+                action_name=command.name,
+                actor=command.actor,
+                source=command.source,
+                requested_arguments=command.arguments,
+                resolved_arguments=command.arguments,
+                status=ExecutionStatus.FAILED,
+                execution_stage=ExecutionStage.EFFECT_VERIFICATION,
+                failure_code="effect_timeout",
+                failure_reason="townhall effect was not observed",
+            )
+        )
+
+        waiting = await runtime.tick(
+            _terminal_macro_observation(
+                step_id=2,
+                game_loop=165,
+                include_townhall_recovery=True,
+            )
+        )
+
+        assert waiting.commands == []
+        assert waiting.planner_pending is False
+        assert runtime._terminal_collapse_macro_hold is not None
+        assert len(client.contexts) == 1
+        await runtime.close()
+
+    asyncio.run(exercise())
+
+
+def test_checkpoint_replay_does_not_apply_old_obsolete_event_to_reaccepted_plan(
+    tmp_path: Path,
+) -> None:
+    client = _BlockingFirstMacroClient()
+    store = _store(tmp_path)
+    first = CortexRuntimeEngine(
+        config=_config(tmp_path),
+        store=store,
+        provider=FakeProvider(),
+        macro_client=client,
+    )
+
+    async def write_reaccepted_plan() -> str:
+        await first.start()
+        await first.tick(_macro_observation(step_id=0, game_loop=100))
+        assert first._macro_task is not None
+        client.release_first.set()
+        first._macro_outcome_revision += 1
+        await first._macro_task
+        await first.tick(_terminal_macro_observation(step_id=1, game_loop=164))
+        assert first._macro_plan is not None
+        reaccepted = first._macro_plan.model_copy(
+            update={
+                "source_step_id": 2,
+                "created_game_loop": 200,
+                "expires_game_loop": 648,
+                "steps": [
+                    step.model_copy(
+                        update={
+                            "status": MacroStepStatus.PENDING,
+                            "reason": None,
+                        }
+                    )
+                    for step in first._macro_plan.steps
+                ],
+            }
+        )
+        store.append_event(
+            run_id="cortex-run",
+            episode_id="episode-1",
+            step_id=2,
+            event_type="macro_plan_accepted",
+            payload={
+                "plan": reaccepted.model_dump(mode="json"),
+                "accepted_game_loop": 200,
+            },
+        )
+        store.flush()
+        await first.close()
+        return reaccepted.plan_id
+
+    reaccepted_plan_id = asyncio.run(write_reaccepted_plan())
+    recovered = CortexRuntimeEngine(
+        config=_config(tmp_path),
+        store=_store(tmp_path),
+        provider=FakeProvider(),
+        macro_client=_FakeMacroClient(),
+    )
+
+    async def recover() -> None:
+        await recovered.start()
+        dispatched = await recovered.tick(_macro_observation(step_id=3, game_loop=201))
+
+        assert recovered._macro_plan is not None
+        assert recovered._macro_plan.plan_id == reaccepted_plan_id
+        assert recovered._terminal_collapse_macro_hold is None
+        assert recovered._macro_plan_frozen is False
+        assert [command.name for command in dispatched.commands] == ["Build_Pylon_Screen"]
+        await recovered.close()
+
+    asyncio.run(recover())
+
+
 def test_failed_macro_command_is_not_retried_while_replacement_plan_is_pending(
     tmp_path: Path,
 ) -> None:
@@ -1696,11 +2340,16 @@ def test_macro_defers_duplicate_supply_provider_while_one_is_constructing(
                     ),
                     "own_structures": [
                         UnitState(
+                            unit_id="0xnexus",
+                            unit_type="Nexus",
+                            alliance="self",
+                        ),
+                        UnitState(
                             unit_id="0x1",
                             unit_type="Pylon",
                             alliance="self",
                             status="constructing",
-                        )
+                        ),
                     ],
                 }
             )
@@ -1805,7 +2454,10 @@ def test_redundant_pylon_skip_advances_to_next_legal_step_in_same_tick(
                 supply_cap=31,
                 workers=12,
             ),
-            own_structures=[UnitState(unit_id="0x1", unit_type="Pylon", alliance="self")],
+            own_structures=[
+                UnitState(unit_id="0xnexus", unit_type="Nexus", alliance="self"),
+                UnitState(unit_id="0x1", unit_type="Pylon", alliance="self"),
+            ],
         ),
         available_actions=[
             AvailableAction(
@@ -2053,7 +2705,10 @@ def test_gas_blocked_stargate_uses_supply_or_expansion_fallback(
                 supply_cap=31,
                 workers=18,
             ),
-            own_structures=[UnitState(unit_id="0x2", unit_type="CyberneticsCore", alliance="self")],
+            own_structures=[
+                UnitState(unit_id="0xnexus", unit_type="Nexus", alliance="self"),
+                UnitState(unit_id="0x2", unit_type="CyberneticsCore", alliance="self"),
+            ],
         ),
         available_actions=[
             AvailableAction(

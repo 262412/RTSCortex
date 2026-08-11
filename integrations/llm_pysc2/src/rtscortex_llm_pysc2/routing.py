@@ -33,6 +33,9 @@ class RoutedCommand:
     screen_anchor_tag: int | None = None
     placement_candidate_id: str | None = None
     placement_revision: str | None = None
+    semantic_source_role: str | None = None
+    semantic_action: str | None = None
+    townhall_recovery: bool | None = None
 
     def to_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -59,6 +62,12 @@ class RoutedCommand:
             payload["placement_candidate_id"] = self.placement_candidate_id
         if self.placement_revision is not None:
             payload["placement_revision"] = self.placement_revision
+        if self.semantic_source_role is not None:
+            payload["semantic_source_role"] = self.semantic_source_role
+        if self.semantic_action is not None:
+            payload["semantic_action"] = self.semantic_action
+        if self.townhall_recovery is not None:
+            payload["townhall_recovery"] = self.townhall_recovery
         return payload
 
 
@@ -167,6 +176,21 @@ class ActionRouter:
                     ),
                     placement_revision=(
                         None if screen_metadata is None else screen_metadata.placement_revision
+                    ),
+                    semantic_source_role=(
+                        None
+                        if command.get("semantic_source_role") is None
+                        else str(command["semantic_source_role"])
+                    ),
+                    semantic_action=(
+                        None
+                        if command.get("semantic_action") is None
+                        else str(command["semantic_action"])
+                    ),
+                    townhall_recovery=(
+                        None
+                        if command.get("townhall_recovery") is None
+                        else bool(command["townhall_recovery"])
                     ),
                 )
             )

@@ -55,6 +55,172 @@ def test_engineering_accumulator_is_hard_bounded() -> None:
     assert accumulator.retention_overflow_count == 2
 
 
+def test_terminal_collapse_non_recovery_macro_dispatch_fails_closed(
+    tmp_path: Path,
+) -> None:
+    report = build_engineering_gate_report(
+        [
+            _event(
+                1,
+                "command_lifecycle",
+                {
+                    "command": {"command_id": "macro-build"},
+                    "status": "dispatched",
+                },
+            ),
+            _event(
+                2,
+                "command_lineage",
+                {
+                    "command_id": "macro-build",
+                    "lineage": {
+                        "command_id": "macro-build",
+                        "source_role": "macro",
+                    },
+                    "macro_plan_id": "macro-plan:unsafe",
+                    "semantic_action": "BUILD PYLON",
+                    "terminal_collapse": True,
+                    "townhall_recovery": False,
+                },
+            ),
+        ],
+        run_dir=tmp_path,
+        natural_run_baseline_bytes_per_loop=100.0,
+    )
+
+    assert report["metrics"]["terminal_collapse_non_recovery_macro_dispatch_count"] == 1
+    assert report["diagnostics"]["terminal_collapse_non_recovery_macro_dispatch_count"] == 1
+    assert report["gates"]["terminal_collapse_non_recovery_macro_dispatch_count"]["passed"] is False
+    assert report["accepted"] is False
+
+
+def test_terminal_collapse_lineage_without_dispatch_is_not_counted(
+    tmp_path: Path,
+) -> None:
+    report = build_engineering_gate_report(
+        [
+            _event(
+                1,
+                "command_lifecycle",
+                {
+                    "command": {"command_id": "macro-build"},
+                    "status": "superseded",
+                },
+            ),
+            _event(
+                2,
+                "command_lineage",
+                {
+                    "command_id": "macro-build",
+                    "lineage": {
+                        "command_id": "macro-build",
+                        "source_role": "macro",
+                    },
+                    "terminal_collapse": True,
+                    "townhall_recovery": False,
+                },
+            ),
+        ],
+        run_dir=tmp_path,
+        natural_run_baseline_bytes_per_loop=100.0,
+    )
+
+    assert report["metrics"]["terminal_collapse_non_recovery_macro_dispatch_count"] == 0
+    assert report["diagnostics"]["terminal_collapse_macro_lineage_unknown_count"] == 0
+    assert report["gates"]["terminal_collapse_non_recovery_macro_dispatch_count"]["passed"] is True
+
+
+def test_terminal_collapse_dispatch_guard_violation_fails_gate(tmp_path: Path) -> None:
+    report = build_engineering_gate_report(
+        [
+            _event(
+                1,
+                "terminal_collapse_non_recovery_macro_dispatch",
+                {
+                    "command_id": "guarded-macro-build",
+                    "reason": "terminal_collapse_non_recovery_macro_dispatch",
+                },
+            )
+        ],
+        run_dir=tmp_path,
+        natural_run_baseline_bytes_per_loop=100.0,
+    )
+
+    assert report["metrics"]["terminal_collapse_non_recovery_macro_dispatch_count"] == 1
+    assert report["diagnostics"]["terminal_collapse_macro_dispatch_guard_violation_count"] == 1
+    assert report["gates"]["terminal_collapse_non_recovery_macro_dispatch_count"]["passed"] is False
+
+
+def test_terminal_collapse_raw_boundary_violation_fails_gate(tmp_path: Path) -> None:
+    report = build_engineering_gate_report(
+        [
+            _event(
+                1,
+                "execution",
+                {
+                    "command_id": "queued-macro-build",
+                    "status": "failed",
+                    "execution_stage": "raw_pre_dispatch",
+                    "failure_code": "terminal_collapse_non_recovery_macro_dispatch",
+                },
+            )
+        ],
+        run_dir=tmp_path,
+        natural_run_baseline_bytes_per_loop=100.0,
+    )
+
+    assert report["metrics"]["terminal_collapse_non_recovery_macro_dispatch_count"] == 1
+    assert report["diagnostics"]["terminal_collapse_macro_raw_boundary_violation_count"] == 1
+    assert report["gates"]["terminal_collapse_non_recovery_macro_dispatch_count"]["passed"] is False
+
+
+def test_missing_terminal_collapse_lineage_classification_fails_closed(
+    tmp_path: Path,
+) -> None:
+    report = build_engineering_gate_report(
+        [
+            _event(
+                1,
+                "command_lifecycle",
+                {
+                    "command": {"command_id": "legacy-macro-build"},
+                    "status": "dispatched",
+                },
+            ),
+            _event(
+                2,
+                "command_lineage",
+                {
+                    "command_id": "legacy-macro-build",
+                    "lineage": {
+                        "command_id": "legacy-macro-build",
+                        "source_role": "macro",
+                    },
+                },
+            ),
+        ],
+        run_dir=tmp_path,
+        natural_run_baseline_bytes_per_loop=100.0,
+    )
+
+    assert report["metrics"]["terminal_collapse_non_recovery_macro_dispatch_count"] is None
+    assert report["diagnostics"]["terminal_collapse_macro_lineage_unknown_count"] == 1
+    assert report["gates"]["terminal_collapse_non_recovery_macro_dispatch_count"]["passed"] is False
+
+
+def test_no_terminal_collapse_non_recovery_macro_dispatch_passes_zero_gate(
+    tmp_path: Path,
+) -> None:
+    report = build_engineering_gate_report(
+        [],
+        run_dir=tmp_path,
+        natural_run_baseline_bytes_per_loop=100.0,
+    )
+
+    assert report["metrics"]["terminal_collapse_non_recovery_macro_dispatch_count"] == 0
+    assert report["gates"]["terminal_collapse_non_recovery_macro_dispatch_count"]["passed"] is True
+
+
 def test_build_gates_use_effect_evidence_not_api_acceptance(tmp_path: Path) -> None:
     events = [
         _event(

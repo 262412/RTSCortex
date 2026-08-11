@@ -133,6 +133,13 @@ from rtscortex.cortex.strategic import (
     StrategicIntentAdapter,
 )
 from rtscortex.cortex.tactical import DeterministicTacticalAgent
+from rtscortex.cortex.terminal import (
+    TerminalCollapseReason,
+    TerminalCollapseState,
+    is_terminal_collapse,
+    is_terminal_collapse_state,
+    townhall_recovery_runtime_actions,
+)
 
 __all__ = [
     "ArmyReadiness",
@@ -232,6 +239,8 @@ __all__ = [
     "StrategicIntentAdapter",
     "TacticalIntent",
     "TechnologyAgent",
+    "TerminalCollapseReason",
+    "TerminalCollapseState",
     "ThreatLevel",
     "DEFAULT_EXECUTOR_SPLIT_SEED",
     "EXECUTOR_CORPUS_BUILDER_VERSION",
@@ -241,11 +250,14 @@ __all__ = [
     "executor_episode_split",
     "hima_previous_action_for_runtime_action",
     "hima_previous_actions_for_runtime_actions",
+    "is_terminal_collapse",
+    "is_terminal_collapse_state",
     "macro_goal_spec",
     "macro_plan_from_hima",
     "load_executor_corpus",
     "observation_fingerprint",
     "runtime_frontier",
     "selected_hima_response",
+    "townhall_recovery_runtime_actions",
     "verify_executor_corpus",
 ]

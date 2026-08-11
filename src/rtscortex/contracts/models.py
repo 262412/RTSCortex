@@ -214,6 +214,18 @@ class ActionCommand(ContractModel):
     created_game_loop: int = Field(ge=0)
     source: ActionSource
     preconditions: dict[str, Any] = Field(default_factory=dict)
+    semantic_source_role: Literal["macro", "tactical", "reflex"] | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    semantic_action: str | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    townhall_recovery: bool | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
 
 
 class ActionBatch(ContractModel):

@@ -241,6 +241,23 @@ def test_legacy_journal_has_non_applicable_cortex_projection() -> None:
     assert "### Cortex observability" not in report
 
 
+@pytest.mark.parametrize(
+    "event_type",
+    [
+        "macro_frontier_obsolete",
+        "terminal_collapse_macro_hold_released",
+        "terminal_collapse_non_recovery_macro_dispatch",
+    ],
+)
+def test_terminal_collapse_events_are_retained_in_cortex_observability(
+    event_type: str,
+) -> None:
+    metrics = compute_cortex_observability([_event(1, event_type, {"reason": "typed"})])
+
+    assert metrics.observed is True
+    assert metrics.event_counts[event_type] == 1
+
+
 def test_cortex_invariants_are_scoped_to_the_intent_and_selection() -> None:
     events = [
         _event(

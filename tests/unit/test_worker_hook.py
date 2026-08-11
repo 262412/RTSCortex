@@ -55,6 +55,7 @@ from rtscortex_llm_pysc2.worker import (
     _producer_is_visible,
     _production_source_invalid_reason,
     _pysc2_action_argument_failure,
+    _raw_terminal_collapse,
     _rebind_builder_to_selected_worker,
     _recover_observation_gap,
     _refresh_build_action_position,
@@ -84,6 +85,35 @@ from rtscortex_llm_pysc2.worker import (
 )
 
 from rtscortex.contracts import ObservationEnvelope
+
+
+def test_raw_terminal_collapse_uses_exact_shared_structured_condition() -> None:
+    player = SimpleNamespace(food_army=0)
+    probe = SimpleNamespace(alliance=1, unit_type=1)
+    nexus = SimpleNamespace(alliance=1, unit_type=2)
+    gateway = SimpleNamespace(alliance=1, unit_type=3)
+    unit_names = {1: "Probe", 2: "Nexus", 3: "Gateway"}
+
+    assert _raw_terminal_collapse(
+        SimpleNamespace(player_common=player, raw_units=[probe]),
+        race="protoss",
+        unit_names=unit_names,
+    )
+    assert not _raw_terminal_collapse(
+        SimpleNamespace(player_common=player, raw_units=[probe, nexus]),
+        race="protoss",
+        unit_names=unit_names,
+    )
+    assert not _raw_terminal_collapse(
+        SimpleNamespace(player_common=player, raw_units=[probe, gateway]),
+        race="protoss",
+        unit_names=unit_names,
+    )
+    assert not _raw_terminal_collapse(
+        SimpleNamespace(player_common=SimpleNamespace(food_army=1), raw_units=[probe]),
+        race="protoss",
+        unit_names=unit_names,
+    )
 
 
 def test_raw_decision_scheduler_separates_effect_polling_from_runtime_ticks() -> None:

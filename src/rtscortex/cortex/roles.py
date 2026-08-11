@@ -13,7 +13,6 @@ from rtscortex.contracts import (
     ObservationEnvelope,
 )
 from rtscortex.cortex.models import (
-    ArmyReadiness,
     CortexIntent,
     IntentTarget,
     IntentTargetKind,
@@ -24,6 +23,7 @@ from rtscortex.cortex.models import (
     ThreatLevel,
 )
 from rtscortex.cortex.strategic import RoleId, StrategicIntent, StrategicIntentAdapter
+from rtscortex.cortex.terminal import TerminalCollapseReason, is_terminal_collapse
 from rtscortex.races import ActionDomain, RaceProfile
 from rtscortex.targeting import attackable_enemies_for_actor
 
@@ -393,7 +393,7 @@ class DefenseAgent(_RoutingRoleAgent):
                     game_loop=observation.game_loop,
                 ):
                     continue
-                if self._terminal_collapse(context.situation):
+                if is_terminal_collapse(context.situation):
                     self._record_terminal_collapse_suppression(context)
                     prerequisite_suppressed = True
                     break
@@ -476,14 +476,6 @@ class DefenseAgent(_RoutingRoleAgent):
                     return proposals
         return proposals
 
-    @staticmethod
-    def _terminal_collapse(situation: SituationAssessment) -> bool:
-        return (
-            situation.army_readiness is ArmyReadiness.EMPTY
-            and situation.bases.own_base_count == 0
-            and situation.bases.own_production_capacity == 0
-        )
-
     def _record_terminal_collapse_suppression(
         self,
         context: RoleAgentContext,
@@ -503,8 +495,8 @@ class DefenseAgent(_RoutingRoleAgent):
         self._active_prerequisite_suppression = signature
         self._pending_diagnostics.append(
             {
-                "state": "defense_prerequisite_suppressed_terminal_collapse",
-                "reason": "defense_prerequisite_suppressed_terminal_collapse",
+                "state": TerminalCollapseReason.DEFENSE_PREREQUISITE_SUPPRESSED.value,
+                "reason": TerminalCollapseReason.DEFENSE_PREREQUISITE_SUPPRESSED.value,
                 "army_readiness": situation.army_readiness.value,
                 "own_base_count": situation.bases.own_base_count,
                 "own_production_capacity": situation.bases.own_production_capacity,

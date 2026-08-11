@@ -10,6 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from rtscortex.cortex.terminal import TerminalCollapseReason
 from rtscortex.memory import StoredEvent
 from rtscortex.placement import (
     CANONICAL_PLACEMENT_SPECS,
@@ -28,6 +29,7 @@ REQUIRED_ENGINEERING_GATES = (
     "build_start_coverage",
     "build_confirmation_rate",
     "build_failure_rate",
+    "terminal_collapse_non_recovery_macro_dispatch_count",
     "semantic_build_failure_streak_bounded",
     "placement_identity_complete",
     "builder_provenance_complete",
@@ -73,6 +75,9 @@ _RETAINED_EVENT_TYPES = frozenset(
         "execution",
         "command_lifecycle",
         "command_lineage",
+        "macro_frontier_obsolete",
+        "terminal_collapse_macro_hold_released",
+        "terminal_collapse_non_recovery_macro_dispatch",
         "placement_ledger_transition",
         "tactical_actor_state",
         "expansion_commitment_started",
@@ -205,6 +210,7 @@ def build_engineering_gate_report(
     ]
     defense_audit = _defense_inventory_audit(defense_evaluations)
     semantic_build_audit = _semantic_build_operation_audit(retained)
+    terminal_collapse_macro_audit = _terminal_collapse_macro_dispatch_audit(retained)
     performance = _last_payload(retained, "event_store_performance")
     recovery_events = [
         event.payload for event in retained if event.event_type == "runtime_recovery_completed"
@@ -275,6 +281,11 @@ def build_engineering_gate_report(
         "build_start_coverage": _ratio_or_none(build_started, build_count),
         "build_confirmation_rate": _ratio_or_none(build_confirmed, build_count),
         "build_failure_rate": _ratio_or_none(build_failures, build_count),
+        "terminal_collapse_non_recovery_macro_dispatch_count": (
+            None
+            if terminal_collapse_macro_audit["unknown_count"] > 0
+            else terminal_collapse_macro_audit["violation_count"]
+        ),
         "semantic_build_failure_streak_bounded": (
             None
             if semantic_build_audit["operation_count"] == 0
@@ -352,7 +363,7 @@ def build_engineering_gate_report(
         name for name in REQUIRED_ENGINEERING_GATES if name not in metrics or metrics[name] is None
     ]
     return {
-        "format_version": "1.1",
+        "format_version": "1.2",
         "evidence": evidence,
         "metrics": metrics,
         "diagnostics": {
@@ -362,6 +373,21 @@ def build_engineering_gate_report(
             "build_start_count": build_started,
             "build_confirmed_count": build_confirmed,
             "build_failure_count": build_failures,
+            "terminal_collapse_non_recovery_macro_dispatch_count": (
+                terminal_collapse_macro_audit["violation_count"]
+            ),
+            "terminal_collapse_macro_lineage_unknown_count": (
+                terminal_collapse_macro_audit["unknown_count"]
+            ),
+            "terminal_collapse_macro_dispatched_violation_count": (
+                terminal_collapse_macro_audit["dispatched_violation_count"]
+            ),
+            "terminal_collapse_macro_dispatch_guard_violation_count": (
+                terminal_collapse_macro_audit["guard_violation_count"]
+            ),
+            "terminal_collapse_macro_raw_boundary_violation_count": (
+                terminal_collapse_macro_audit["raw_boundary_violation_count"]
+            ),
             "semantic_build_operation_count": semantic_build_audit["operation_count"],
             "semantic_build_failure_count": semantic_build_audit["failure_count"],
             "semantic_build_operation_max_failure_streak": semantic_build_audit[
@@ -412,6 +438,7 @@ def _thresholds() -> dict[str, tuple[str, bool | int | float]]:
     }
     thresholds.update(
         {
+            "terminal_collapse_non_recovery_macro_dispatch_count": ("==", 0),
             "production_confirmation_complete": (">=", 1.0),
             "build_start_coverage": (">=", 1.0),
             "build_confirmation_rate": (">=", 0.90),
@@ -423,6 +450,63 @@ def _thresholds() -> dict[str, tuple[str, bool | int | float]]:
         }
     )
     return thresholds
+
+
+def _terminal_collapse_macro_dispatch_audit(
+    events: Sequence[StoredEvent],
+) -> dict[str, int]:
+    dispatched_ids = {
+        str(command["command_id"])
+        for event in events
+        if event.event_type == "command_lifecycle"
+        and event.payload.get("status") == "dispatched"
+        and isinstance((command := event.payload.get("command")), dict)
+        and isinstance(command.get("command_id"), str)
+    }
+    dispatched_violation_ids: set[str] = set()
+    unknown_count = 0
+    for event in events:
+        if event.event_type != "command_lineage":
+            continue
+        payload = event.payload
+        lineage = payload.get("lineage", payload)
+        if not isinstance(lineage, dict) or lineage.get("source_role") != "macro":
+            continue
+        command_id = payload.get("command_id", lineage.get("command_id"))
+        if not isinstance(command_id, str) or command_id not in dispatched_ids:
+            continue
+        terminal_collapse = payload.get("terminal_collapse")
+        townhall_recovery = payload.get("townhall_recovery")
+        if not isinstance(terminal_collapse, bool) or not isinstance(
+            townhall_recovery,
+            bool,
+        ):
+            unknown_count += 1
+            continue
+        if terminal_collapse and not townhall_recovery:
+            dispatched_violation_ids.add(command_id)
+    guard_violation_ids = {
+        str(command_id)
+        for event in events
+        if event.event_type == "terminal_collapse_non_recovery_macro_dispatch"
+        and (command_id := event.payload.get("command_id")) is not None
+    }
+    raw_boundary_violation_ids = {
+        str(command_id)
+        for event in events
+        if event.event_type == "execution"
+        and event.payload.get("failure_code")
+        == TerminalCollapseReason.NON_RECOVERY_MACRO_DISPATCH.value
+        and (command_id := event.payload.get("command_id")) is not None
+    }
+    violation_ids = dispatched_violation_ids | guard_violation_ids | raw_boundary_violation_ids
+    return {
+        "violation_count": len(violation_ids),
+        "unknown_count": unknown_count,
+        "dispatched_violation_count": len(dispatched_violation_ids),
+        "guard_violation_count": len(guard_violation_ids),
+        "raw_boundary_violation_count": len(raw_boundary_violation_ids),
+    }
 
 
 _SEMANTIC_BUILD_FAILURE_STATUSES = frozenset({"failed", "unconfirmed", "cancelled"})

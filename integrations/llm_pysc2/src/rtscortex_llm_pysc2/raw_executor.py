@@ -11,6 +11,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from typing import Any, Optional, Protocol
 
+from rtscortex.cortex.terminal import TerminalCollapseReason
 from rtscortex_llm_pysc2.broker import PrimitiveDispatch, SharedDecisionBroker
 from rtscortex_llm_pysc2.coordinator import BridgeDecision
 from rtscortex_llm_pysc2.extractor import (
@@ -60,6 +61,7 @@ _NONSPATIAL_BUILD_FAILURE_CODES = frozenset(
         "placement_query_rejected",
         "placement_query_unavailable",
         "placement_query_rejected_cached",
+        TerminalCollapseReason.NON_RECOVERY_MACRO_DISPATCH.value,
     }
 )
 _BUILDER_DEFERRAL_CODES = frozenset(
@@ -415,6 +417,8 @@ class RawActionExecutor:
         self,
         observation: Any,
         agents: Mapping[str, Any],
+        *,
+        terminal_collapse: bool = False,
     ) -> Optional[RawDispatch]:
         """Return the next executable raw action, terminalizing invalid commands."""
 
@@ -428,6 +432,15 @@ class RawActionExecutor:
                 self._approach_rebases.remove(command.command_id)
                 command = _rebase_approach_command(command, observation)
             try:
+                if (
+                    terminal_collapse
+                    and command.semantic_source_role == "macro"
+                    and command.townhall_recovery is not True
+                ):
+                    raise _RawDispatchFailure(
+                        TerminalCollapseReason.NON_RECOVERY_MACRO_DISPATCH.value,
+                        "terminal collapse made the queued non-recovery macro obsolete",
+                    )
                 dispatch = self._translate(command, observation, agents)
                 if dispatch.approach_only:
                     self._commands.appendleft(command)

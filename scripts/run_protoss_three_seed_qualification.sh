@@ -188,10 +188,16 @@ gates = json.loads((run_dir / "engineering-gates.json").read_text(encoding="utf-
 metrics = gates.get("metrics", {})
 diagnostics = gates.get("diagnostics", {})
 evidence = gates.get("evidence", {})
+gate_results = gates.get("gates", {})
+
+def exact_zero_integer(value):
+    return isinstance(value, int) and not isinstance(value, bool) and value == 0
+
 required = {
     "build_start_coverage": lambda value: value == 1.0,
     "build_confirmation_rate": lambda value: value is not None and value >= 0.9,
     "build_failure_rate": lambda value: value is not None and value <= 0.1,
+    "terminal_collapse_non_recovery_macro_dispatch_count": exact_zero_integer,
     "semantic_build_failure_streak_bounded": lambda value: value is True,
     "production_confirmation_complete": lambda value: value == 1.0,
     "recovery_evidence_present": lambda value: value is True,
@@ -201,9 +207,19 @@ required = {
     "defense_inventory_within_cap": lambda value: value is True,
     "unchanged_failed_target_redispatch_zero": lambda value: value is True,
 }
-valid = gates.get("accepted") is True
+valid = gates.get("format_version") == "1.2"
+valid = valid and gates.get("accepted") is True
 valid = valid and all(check(metrics.get(name)) for name, check in required.items())
+valid = valid and gate_results.get(
+    "terminal_collapse_non_recovery_macro_dispatch_count", {}
+).get("passed") is True
 valid = valid and diagnostics.get("unchanged_failed_target_redispatch_count") == 0
+valid = valid and exact_zero_integer(
+    diagnostics.get("terminal_collapse_non_recovery_macro_dispatch_count")
+)
+valid = valid and exact_zero_integer(
+    diagnostics.get("terminal_collapse_macro_lineage_unknown_count")
+)
 valid = valid and evidence.get("expected_git_sha") == expected_git_sha
 valid = valid and evidence.get("diagnostic_only") is False
 raise SystemExit(0 if valid else 1)

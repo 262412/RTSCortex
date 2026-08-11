@@ -15,6 +15,9 @@ from functools import partial
 from numbers import Integral, Real
 from typing import Any, Optional, Protocol
 
+from rtscortex.cortex.models import ArmyReadiness
+from rtscortex.cortex.terminal import TerminalCollapseState, is_terminal_collapse_state
+from rtscortex.races import race_profile
 from rtscortex_llm_pysc2.ability import ABILITY_SPECS, ability_spec
 from rtscortex_llm_pysc2.addon import ADDON_SPECS, addon_spec
 from rtscortex_llm_pysc2.broker import PrimitiveDispatch, SharedDecisionBroker
@@ -2020,7 +2023,15 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
             )
 
         with self.runtime_client.profiler.measure("raw_translate_dispatch"):
-            dispatch = self.raw_executor.next_dispatch(obs.observation, self.agents)
+            dispatch = self.raw_executor.next_dispatch(
+                obs.observation,
+                self.agents,
+                terminal_collapse=_raw_terminal_collapse(
+                    obs.observation,
+                    race=self.worker_settings.agent_race,
+                    unit_names=self.decision_broker.extractor.unit_names,
+                ),
+            )
         self._rtscortex_raw_dispatch_diagnostic_snapshot = dict(
             self.raw_executor.diagnostic_snapshot
         )
@@ -4766,6 +4777,41 @@ def _raw_emergency_signature(observation: Any) -> tuple[str, ...]:
         <= 0.3
     )
     return (*alerts, *((f"critical_own_units:{critical_own_units}",) if critical_own_units else ()))
+
+
+def _raw_terminal_collapse(
+    observation: Any,
+    *,
+    race: str,
+    unit_names: Mapping[int, str],
+) -> bool:
+    """Re-evaluate the shared terminal state at the final raw queue boundary."""
+
+    player = _observation_value(observation, "player_common", None)
+    army_supply = _observation_value(player, "food_army", None)
+    if army_supply is None:
+        return False
+    profile = race_profile(race).data
+    own_structure_names = [
+        _worker_unit_name(unit, unit_names)
+        for unit in _observation_value(observation, "raw_units", ())
+        if int(_observation_value(unit, "alliance", 0)) == 1
+        and _worker_unit_name(unit, unit_names)
+        in {*profile.townhall_types, *profile.production_structures}
+    ]
+    return is_terminal_collapse_state(
+        TerminalCollapseState(
+            army_readiness=(
+                ArmyReadiness.EMPTY if int(army_supply) == 0 else ArmyReadiness.FORMING
+            ),
+            own_base_count=sum(
+                unit_name in profile.townhall_types for unit_name in own_structure_names
+            ),
+            own_production_capacity=sum(
+                unit_name in profile.production_structures for unit_name in own_structure_names
+            ),
+        )
+    )
 
 
 def _observation_game_loop(observation: Any) -> int:

@@ -173,6 +173,11 @@ class MacroPlan(ContractModel):
     episode_id: str
     source_step_id: int = Field(ge=0)
     created_game_loop: int = Field(ge=0)
+    proposal_source_game_loop: int | None = Field(
+        default=None,
+        ge=0,
+        exclude_if=lambda value: value is None,
+    )
     expires_game_loop: int = Field(ge=0)
     strategic_objective: str = Field(min_length=1)
     steps: list[MacroStep] = Field(default_factory=list)
@@ -191,6 +196,11 @@ class MacroPlan(ContractModel):
     def validate_plan(self) -> MacroPlan:
         if self.expires_game_loop <= self.created_game_loop:
             raise ValueError("macro plan must expire after it is created")
+        if (
+            self.proposal_source_game_loop is not None
+            and self.proposal_source_game_loop > self.created_game_loop
+        ):
+            raise ValueError("macro proposal source cannot follow plan acceptance")
         ordinals = [step.ordinal for step in self.steps]
         if len(ordinals) != len(set(ordinals)):
             raise ValueError("macro plan step ordinals must be unique")
