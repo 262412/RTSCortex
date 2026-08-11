@@ -40,7 +40,7 @@ export PYTHONPATH="${repo_dir}/src:${repo_dir}/integrations/llm_pysc2/src${PYTHO
 mkdir -p "${run_set_dir}"
 run_set_dir="$(readlink -f "${run_set_dir}")"
 baseline="${run_set_dir}/playbook.soft-baseline.sqlite3"
-probe="${run_set_dir}/playbook.hard-shadow-probe.sqlite3"
+probe_output="${run_set_dir}/playbook.hard-shadow-probe.sqlite3"
 plan="${run_set_dir}/hard-qualification-plan.json"
 report="${run_set_dir}/hard-qualification-report.json"
 manifest="${run_set_dir}/hard-qualification-manifest.json"
@@ -165,11 +165,15 @@ done
   "${source_run_args[@]}" \
   --source-status "${source_status}" \
   --baseline-output "${baseline}" \
-  --probe-output "${probe}" \
+  --probe-output "${probe_output}" \
   --plan-output "${plan}" \
   --expected-git-sha "${expected_git_sha}" \
-  --sc2-patch "${sc2_patch}"
-probe_sha256="$(sha256sum "${probe}" | awk '{print $1}')"
+  --sc2-patch "${sc2_patch}" \
+  --max-probes-per-batch 8 \
+  --max-probe-batches 2
+eligible_parent_count="$(jq -r '.eligible_parent_count' "${plan}")"
+batch_count="$(jq -r '.batches | length' "${plan}")"
+batch_sizes="$(jq -r '[.batches[].batch_size] | @json' "${plan}")"
 
 {
   echo "started_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -178,82 +182,144 @@ probe_sha256="$(sha256sum "${probe}" | awk '{print $1}')"
   echo "source_run_set=${source_run_set}"
   echo "source_status=${source_status}"
   echo "qualification_plan=${plan}"
-  echo "probe_sha256=${probe_sha256}"
+  echo "eligible_parent_count=${eligible_parent_count}"
+  echo "batch_count=${batch_count}"
+  echo "batch_sizes=${batch_sizes}"
   echo "reviewed_source_manifest=${reviewed_source_manifest}"
   echo "reviewed_source_manifest_sha256=${reviewed_source_manifest_sha256}"
   echo "reviewed_source_tree_sha256=${reviewed_source_tree_sha256}"
 } > "${run_set_dir}/hard-qualification-metadata.txt"
 
-printf "experiment_kind\tmode\tseed\tarm\tsubject_arm\tarm_order\texit_code\trun_dir\tplaybook_before_sha256\tplaybook_after_sha256\tplaybook_before_snapshot\tplaybook_after_snapshot\tgit_head_before\tgit_head_after\tsuperproject_dirty_before\tsuperproject_dirty_after\tsubmodule_commit_before\tsubmodule_commit_after\tsubmodule_dirty_before\tsubmodule_dirty_after\tsubmodule_gitlink_before\tsubmodule_gitlink_after\tsubmodule_diff_sha256_before\tsubmodule_diff_sha256_after\treviewed_source_commit_before\treviewed_source_commit_after\treviewed_source_diff_sha256_before\treviewed_source_diff_sha256_after\treviewed_source_tree_sha256_before\treviewed_source_tree_sha256_after\n" > "${status_file}"
+status_header=(
+  experiment_kind mode batch_id batch_index seed probe_path probe_sha256 arm subject_arm
+  arm_order exit_code run_dir playbook_before_sha256 playbook_after_sha256
+  playbook_before_snapshot playbook_after_snapshot git_head_before git_head_after
+  superproject_dirty_before superproject_dirty_after submodule_commit_before
+  submodule_commit_after submodule_dirty_before submodule_dirty_after
+  submodule_gitlink_before submodule_gitlink_after submodule_diff_sha256_before
+  submodule_diff_sha256_after reviewed_source_commit_before reviewed_source_commit_after
+  reviewed_source_diff_sha256_before reviewed_source_diff_sha256_after
+  reviewed_source_tree_sha256_before reviewed_source_tree_sha256_after
+)
+(
+  IFS=$'\t'
+  echo "${status_header[*]}"
+) > "${status_file}"
 
-for seed in "${seeds[@]}"; do
-  rm -f "${working_playbook}" "${working_playbook}-shm" "${working_playbook}-wal"
-  cp "${probe}" "${working_playbook}"
-  before_snapshot="${run_set_dir}/seed-${seed}.before.sqlite3"
-  after_snapshot="${run_set_dir}/seed-${seed}.after.sqlite3"
-  cp "${working_playbook}" "${before_snapshot}"
-  before_sha256="$(sha256sum "${working_playbook}" | awk '{print $1}')"
-  capture_attestation
-  if ! attestation_matches; then
-    echo "source attestation changed before hard qualification seed ${seed}" >&2
-    exit 2
-  fi
-  git_head_before="${source_git_head}"
-  dirty_before="${source_superproject_dirty}"
-  submodule_commit_before="${source_submodule_commit}"
-  submodule_dirty_before="${source_submodule_dirty}"
-  submodule_gitlink_before="${source_submodule_gitlink}"
-  submodule_diff_before="${source_submodule_diff_sha256}"
-  reviewed_commit_before="${source_reviewed_commit}"
-  reviewed_diff_before="${source_reviewed_diff_sha256}"
-  reviewed_tree_before="${source_reviewed_tree_sha256}"
-  log_path="${run_set_dir}/seed-${seed}.log"
+write_terminal_rejection() {
+  local reason="$1"
+  local runner_exit_code="$2"
   set +e
-  SC2PATH="/mnt/scratch/users/tbczhang/StarCraftII" \
-    HF_HUB_OFFLINE=1 \
-    TRANSFORMERS_OFFLINE=1 \
-    TOKENIZERS_PARALLELISM=false \
-    "${core_cli}" run \
-      --config "${config}" \
-      --seed "${seed}" \
-      --qualification-evidence "${qualification_evidence}" \
-    2>&1 | tee "${log_path}"
-  run_status=${PIPESTATUS[0]}
+  "${core_python}" -m scripts.analyze_playbook_hard_qualification \
+    --plan "${plan}" \
+    --baseline "${baseline}" \
+    --status "${status_file}" \
+    --engineering-baseline "${engineering_baseline}" \
+    --recovery-evidence "${recovery_evidence}" \
+    --expected-git-sha "${expected_git_sha}" \
+    --sc2-patch "${sc2_patch}" \
+    --working-database "${working_playbook}" \
+    --report-output "${report}" \
+    --manifest-output "${manifest}" \
+    --terminal-rejection-reason "${reason}" \
+    --runner-exit-code "${runner_exit_code}"
   set -e
-  run_dir="$(sed -n -e 's/^Run directory: //p' -e 's/^Artifacts: //p' "${log_path}" | tail -n 1)"
-  capture_attestation
-  if ! attestation_matches; then
-    echo "source attestation changed during hard qualification seed ${seed}" >&2
-    run_status=86
-  fi
-  after_sha256="$(sha256sum "${working_playbook}" | awk '{print $1}')"
-  cp "${working_playbook}" "${after_snapshot}"
-  fields=(
-    "qualification" "hard_shadow" "${seed}" "shadow_probe" "shadow_probe" "0,1,2"
-    "${run_status}" "${run_dir}" "${before_sha256}" "${after_sha256}"
-    "${before_snapshot}" "${after_snapshot}" "${git_head_before}" "${source_git_head}"
-    "${dirty_before}" "${source_superproject_dirty}" "${submodule_commit_before}"
-    "${source_submodule_commit}" "${submodule_dirty_before}" "${source_submodule_dirty}"
-    "${submodule_gitlink_before}" "${source_submodule_gitlink}"
-    "${submodule_diff_before}" "${source_submodule_diff_sha256}"
-    "${reviewed_commit_before}" "${source_reviewed_commit}"
-    "${reviewed_diff_before}" "${source_reviewed_diff_sha256}"
-    "${reviewed_tree_before}" "${source_reviewed_tree_sha256}"
-  )
-  (
-    IFS=$'\t'
-    echo "${fields[*]}"
-  ) >> "${status_file}"
-  if [[ ${run_status} -ne 0 ]]; then
-    echo "hard qualification seed ${seed} failed with ${run_status}" >&2
-    exit "${run_status}"
-  fi
-done
+}
 
+failure_stage="post_plan_initialization"
+terminal_rejection_on_exit() {
+  local runner_exit_code="$1"
+  trap - EXIT
+  if [[ ${runner_exit_code} -ne 0 && ! -f "${report}" ]]; then
+    write_terminal_rejection "runner_failed:${failure_stage}" "${runner_exit_code}"
+  fi
+  exit "${runner_exit_code}"
+}
+trap 'terminal_rejection_on_exit $?' EXIT
+
+while IFS=$'\t' read -r batch_id batch_index probe_path probe_sha256; do
+  failure_stage="${batch_id}:probe_validation"
+  if [[ ! -f "${probe_path}" \
+    || "$(sha256sum "${probe_path}" | awk '{print $1}')" != "${probe_sha256}" ]]; then
+    echo "hard qualification probe hash mismatch for ${batch_id}" >&2
+    exit 87
+  fi
+  for seed in "${seeds[@]}"; do
+    failure_stage="${batch_id}:seed-${seed}"
+    rm -f "${working_playbook}" "${working_playbook}-shm" "${working_playbook}-wal"
+    cp "${probe_path}" "${working_playbook}"
+    before_snapshot="${run_set_dir}/${batch_id}.seed-${seed}.before.sqlite3"
+    after_snapshot="${run_set_dir}/${batch_id}.seed-${seed}.after.sqlite3"
+    cp "${working_playbook}" "${before_snapshot}"
+    before_sha256="$(sha256sum "${working_playbook}" | awk '{print $1}')"
+    capture_attestation
+    git_head_before="${source_git_head}"
+    dirty_before="${source_superproject_dirty}"
+    submodule_commit_before="${source_submodule_commit}"
+    submodule_dirty_before="${source_submodule_dirty}"
+    submodule_gitlink_before="${source_submodule_gitlink}"
+    submodule_diff_before="${source_submodule_diff_sha256}"
+    reviewed_commit_before="${source_reviewed_commit}"
+    reviewed_diff_before="${source_reviewed_diff_sha256}"
+    reviewed_tree_before="${source_reviewed_tree_sha256}"
+    log_path="${run_set_dir}/${batch_id}.seed-${seed}.log"
+    run_dir=""
+    if ! attestation_matches; then
+      echo "source attestation changed before ${batch_id} seed ${seed}" >&2
+      run_status=86
+    else
+      set +e
+      SC2PATH="/mnt/scratch/users/tbczhang/StarCraftII" \
+        HF_HUB_OFFLINE=1 \
+        TRANSFORMERS_OFFLINE=1 \
+        TOKENIZERS_PARALLELISM=false \
+        "${core_cli}" run \
+          --config "${config}" \
+          --seed "${seed}" \
+          --qualification-evidence "${qualification_evidence}" \
+        2>&1 | tee "${log_path}"
+      run_status=${PIPESTATUS[0]}
+      set -e
+      run_dir="$(sed -n -e 's/^Run directory: //p' -e 's/^Artifacts: //p' "${log_path}" | tail -n 1)"
+    fi
+    capture_attestation
+    if ! attestation_matches; then
+      echo "source attestation changed during ${batch_id} seed ${seed}" >&2
+      run_status=86
+    fi
+    after_sha256="$(sha256sum "${working_playbook}" | awk '{print $1}')"
+    cp "${working_playbook}" "${after_snapshot}"
+    fields=(
+      "qualification" "hard_shadow" "${batch_id}" "${batch_index}" "${seed}"
+      "${probe_path}" "${probe_sha256}" "shadow_probe" "shadow_probe" "0,1,2"
+      "${run_status}" "${run_dir}" "${before_sha256}" "${after_sha256}"
+      "${before_snapshot}" "${after_snapshot}" "${git_head_before}" "${source_git_head}"
+      "${dirty_before}" "${source_superproject_dirty}" "${submodule_commit_before}"
+      "${source_submodule_commit}" "${submodule_dirty_before}" "${source_submodule_dirty}"
+      "${submodule_gitlink_before}" "${source_submodule_gitlink}"
+      "${submodule_diff_before}" "${source_submodule_diff_sha256}"
+      "${reviewed_commit_before}" "${source_reviewed_commit}"
+      "${reviewed_diff_before}" "${source_reviewed_diff_sha256}"
+      "${reviewed_tree_before}" "${source_reviewed_tree_sha256}"
+    )
+    (
+      IFS=$'\t'
+      echo "${fields[*]}"
+    ) >> "${status_file}"
+    if [[ ${run_status} -ne 0 ]]; then
+      echo "hard qualification ${batch_id} seed ${seed} failed with ${run_status}" >&2
+      write_terminal_rejection "runner_failed:${batch_id}:seed-${seed}" "${run_status}"
+      exit "${run_status}"
+    fi
+  done
+done < <(
+  jq -r '.batches[] | [.batch_id, .batch_index, .probe_baseline_path, .probe_baseline_sha256] | @tsv' "${plan}"
+)
+
+failure_stage="aggregate_analysis"
 "${core_python}" -m scripts.analyze_playbook_hard_qualification \
   --plan "${plan}" \
   --baseline "${baseline}" \
-  --probe "${probe}" \
   --status "${status_file}" \
   --engineering-baseline "${engineering_baseline}" \
   --recovery-evidence "${recovery_evidence}" \
@@ -263,6 +329,7 @@ done
   --report-output "${report}" \
   --manifest-output "${manifest}"
 
+failure_stage="selected_parent_promotion"
 selected_parent_rule_id="$(jq -r '.parent_rule_id' "${manifest}")"
 cp "${baseline}" "${production_baseline}"
 "${core_cli}" playbook qualify-hard \
@@ -276,6 +343,7 @@ cp "${baseline}" "${production_baseline}"
   --evaluation-seed 5 \
   > "${run_set_dir}/qualified-hard-rule.json"
 
+failure_stage="hard_readiness"
 "${core_cli}" playbook hard-readiness \
   --database "${production_baseline}" \
   --config "${readiness_config}" \
@@ -295,4 +363,5 @@ production_baseline_sha256="$(sha256sum "${production_baseline}" | awk '{print $
   echo "readiness_evidence=${readiness_evidence}"
   echo "exit_code=0"
 } >> "${run_set_dir}/hard-qualification-metadata.txt"
+trap - EXIT
 echo "hard_rule_qualification status=accepted run_set=${run_set_dir} baseline=${production_baseline}"

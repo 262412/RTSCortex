@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -16,6 +18,7 @@ from rtscortex.playbook import (
     PlaybookRuleEffect,
     PlaybookRuleStatus,
     PlaybookRuleStrength,
+    PlaybookStore,
     TypedRetryCoverage,
     TypedRetryCoverageBySeed,
     analyze_hard_qualification_evaluations,
@@ -24,10 +27,20 @@ from rtscortex.playbook import (
     playbook_rule_fingerprint,
 )
 from scripts.analyze_playbook_hard_qualification import (
+    _index_batch_status_rows,
     _qualification_config_fingerprint,
+    _require_complete_batch_run_audit,
+    _select_global_manifest,
+    _values_for_parent_batch,
+    build_incomplete_hard_qualification_report,
     write_hard_qualification_result,
 )
-from scripts.prepare_playbook_hard_qualification import _eligible_parent
+from scripts.prepare_playbook_hard_qualification import (
+    ProbeBatchCapacityError,
+    _create_probe_batch,
+    _eligible_parent,
+    _partition_probe_batches,
+)
 
 GIT_SHA = "a" * 40
 BASELINE_SHA = "b" * 64
@@ -68,6 +81,92 @@ def _parent() -> PlaybookRule:
             },
         },
     )
+
+
+def _parents(count: int, *, same_shadow_count: bool = False) -> tuple[PlaybookRule, ...]:
+    return tuple(
+        _parent().model_copy(
+            update={
+                "rule_id": f"playbook-rule:parent-{index:02d}",
+                "canonical_key": f"parent-{index:02d}",
+                "shadow_state_count": 96 if same_shadow_count else 200 - index,
+            }
+        )
+        for index in range(count)
+    )
+
+
+def _batch_plan(tmp_path: Path) -> dict[str, object]:
+    first_probe = tmp_path / "probe.batch-000.sqlite3"
+    second_probe = tmp_path / "probe.batch-001.sqlite3"
+    return {
+        "schema_version": "2.0",
+        "artifact_kind": "playbook-hard-qualification-plan",
+        "expected_git_sha": GIT_SHA,
+        "source_git_sha": "9" * 40,
+        "source_attestation": {
+            "submodule_commit": "8" * 40,
+            "submodule_gitlink": "8" * 40,
+            "submodule_diff_sha256": "7" * 64,
+            "reviewed_commit": "8" * 40,
+            "reviewed_diff_sha256": "6" * 64,
+            "reviewed_tree_sha256": "5" * 64,
+        },
+        "source_runs": [{"seed_id": seed} for seed in (0, 1, 2)],
+        "eligible_parent_ids": [
+            "playbook-rule:parent-00",
+            "playbook-rule:parent-01",
+        ],
+        "batches": [
+            {
+                "batch_id": "batch-000",
+                "batch_index": 0,
+                "parent_rule_ids": ["playbook-rule:parent-00"],
+                "probe_baseline_path": str(first_probe.resolve()),
+                "probe_baseline_sha256": "1" * 64,
+            },
+            {
+                "batch_id": "batch-001",
+                "batch_index": 1,
+                "parent_rule_ids": ["playbook-rule:parent-01"],
+                "probe_baseline_path": str(second_probe.resolve()),
+                "probe_baseline_sha256": "2" * 64,
+            },
+        ],
+    }
+
+
+def _status_row(plan: dict[str, object], batch_index: int, seed: int) -> dict[str, str]:
+    batch = plan["batches"][batch_index]  # type: ignore[index]
+    source = plan["source_attestation"]
+    assert isinstance(batch, dict)
+    assert isinstance(source, dict)
+    return {
+        "batch_id": str(batch["batch_id"]),
+        "batch_index": str(batch["batch_index"]),
+        "seed": str(seed),
+        "probe_path": str(batch["probe_baseline_path"]),
+        "probe_sha256": str(batch["probe_baseline_sha256"]),
+        "exit_code": "0",
+        "git_head_before": GIT_SHA,
+        "git_head_after": GIT_SHA,
+        "superproject_dirty_before": "false",
+        "superproject_dirty_after": "false",
+        "submodule_dirty_before": "false",
+        "submodule_dirty_after": "false",
+        "submodule_commit_before": str(source["submodule_commit"]),
+        "submodule_commit_after": str(source["submodule_commit"]),
+        "submodule_gitlink_before": str(source["submodule_gitlink"]),
+        "submodule_gitlink_after": str(source["submodule_gitlink"]),
+        "submodule_diff_sha256_before": str(source["submodule_diff_sha256"]),
+        "submodule_diff_sha256_after": str(source["submodule_diff_sha256"]),
+        "reviewed_source_commit_before": str(source["reviewed_commit"]),
+        "reviewed_source_commit_after": str(source["reviewed_commit"]),
+        "reviewed_source_diff_sha256_before": str(source["reviewed_diff_sha256"]),
+        "reviewed_source_diff_sha256_after": str(source["reviewed_diff_sha256"]),
+        "reviewed_source_tree_sha256_before": str(source["reviewed_tree_sha256"]),
+        "reviewed_source_tree_sha256_after": str(source["reviewed_tree_sha256"]),
+    }
 
 
 def _evaluation_event(
@@ -536,6 +635,283 @@ def test_manifest_binds_real_run_evidence_and_parent_statistics() -> None:
     assert manifest.execution_false_block_count == 0
 
 
+@pytest.mark.parametrize(
+    ("candidate_count", "expected_sizes"),
+    [(8, [8]), (9, [8, 1]), (10, [8, 2])],
+)
+def test_probe_candidates_are_partitioned_into_bounded_batches(
+    candidate_count: int,
+    expected_sizes: list[int],
+) -> None:
+    batches = _partition_probe_batches(
+        _parents(candidate_count),
+        max_probes_per_batch=8,
+        max_probe_batches=2,
+    )
+
+    assert [len(batch) for batch in batches] == expected_sizes
+    flattened = [rule.rule_id for batch in batches for rule in batch]
+    assert flattened == [rule.rule_id for rule in _parents(candidate_count)]
+    assert len(flattened) == len(set(flattened)) == candidate_count
+
+
+def test_probe_batch_sort_is_stable_for_equal_shadow_counts() -> None:
+    parents = tuple(reversed(_parents(10, same_shadow_count=True)))
+
+    batches = _partition_probe_batches(
+        parents,
+        max_probes_per_batch=8,
+        max_probe_batches=2,
+    )
+
+    assert [rule.rule_id for batch in batches for rule in batch] == sorted(
+        rule.rule_id for rule in parents
+    )
+
+
+def test_probe_capacity_failure_reports_every_candidate() -> None:
+    parents = _parents(17)
+
+    with pytest.raises(ProbeBatchCapacityError) as raised:
+        _partition_probe_batches(
+            parents,
+            max_probes_per_batch=8,
+            max_probe_batches=2,
+        )
+
+    payload = raised.value.payload
+    assert payload["eligible_parent_count"] == 17
+    assert payload["required_batch_count"] == 3
+    assert payload["max_probe_batches"] == 2
+    assert payload["eligible_parent_ids"] == [rule.rule_id for rule in parents]
+
+
+def test_probe_batch_activates_only_members_and_suspends_other_eligible_rules(
+    tmp_path: Path,
+) -> None:
+    parents = _parents(10)
+    baseline = tmp_path / "baseline.sqlite3"
+    probe = tmp_path / "probe.batch-001.sqlite3"
+    store = PlaybookStore(baseline)
+    try:
+        for parent in parents:
+            store.upsert_rule(parent)
+    finally:
+        store.close()
+    baseline_sha256 = hashlib.sha256(baseline.read_bytes()).hexdigest()
+
+    validation = _create_probe_batch(
+        baseline_path=baseline,
+        probe_path=probe,
+        eligible_parents=parents,
+        batch_members=parents[8:],
+        batch_id="batch-001",
+        batch_index=1,
+        baseline_sha256=baseline_sha256,
+        expected_git_sha=GIT_SHA,
+        sc2_build="B75689",
+        sc2_patch="4.10",
+        max_probes_per_batch=8,
+    )
+
+    assert validation["verified"] is True
+    assert validation["active_hard_parent_ids"] == [
+        "playbook-rule:parent-08",
+        "playbook-rule:parent-09",
+    ]
+    probe_store = PlaybookStore(probe, read_only=True)
+    try:
+        rules = {rule.rule_id: rule for rule in probe_store.rules()}
+        runtime_rules = probe_store.rules_for_guard(max_hard=8, max_soft=8)
+    finally:
+        probe_store.close()
+    for parent in parents[:8]:
+        isolated = rules[parent.rule_id]
+        assert isolated.status is PlaybookRuleStatus.SUSPENDED
+        assert isolated.strength is PlaybookRuleStrength.SOFT
+        assert isolated.effect is PlaybookRuleEffect.AVOID
+    for parent in parents[8:]:
+        active = rules[parent.rule_id]
+        assert active.status is PlaybookRuleStatus.ACTIVE
+        assert active.strength is PlaybookRuleStrength.HARD
+        assert active.effect is PlaybookRuleEffect.FORBID
+    assert {rule.rule_id for rule in runtime_rules} == {
+        "playbook-rule:parent-08",
+        "playbook-rule:parent-09",
+    }
+    assert hashlib.sha256(baseline.read_bytes()).hexdigest() == baseline_sha256
+
+
+def test_batch_status_requires_exact_batch_seed_cross_product(tmp_path: Path) -> None:
+    plan = _batch_plan(tmp_path)
+    rows = [_status_row(plan, batch, seed) for batch in (0, 1) for seed in (0, 1, 2)]
+
+    indexed = _index_batch_status_rows(plan, rows)
+
+    assert set(indexed) == {
+        ("batch-000", 0),
+        ("batch-000", 1),
+        ("batch-000", 2),
+        ("batch-001", 0),
+        ("batch-001", 1),
+        ("batch-001", 2),
+    }
+
+
+def test_batch_status_rejects_duplicate_source_seed(tmp_path: Path) -> None:
+    plan = _batch_plan(tmp_path)
+    plan["source_runs"] = [{"seed_id": seed} for seed in (0, 0, 2)]
+
+    with pytest.raises(ValueError, match="seeds 0/1/2 exactly once"):
+        _index_batch_status_rows(plan, [])
+
+
+@pytest.mark.parametrize(
+    ("mutation", "reason"),
+    [
+        ("missing", "missing batch-seed status"),
+        ("duplicate", "duplicate batch-seed status"),
+        ("extra", "unknown batch ID"),
+        ("probe_hash", "probe SHA"),
+        ("git", "Git attestation"),
+        ("submodule_dirty", "Git attestation"),
+    ],
+)
+def test_batch_status_fails_closed_on_partition_or_attestation_mismatch(
+    tmp_path: Path,
+    mutation: str,
+    reason: str,
+) -> None:
+    plan = _batch_plan(tmp_path)
+    rows = [_status_row(plan, batch, seed) for batch in (0, 1) for seed in (0, 1, 2)]
+    if mutation == "missing":
+        rows.pop()
+    elif mutation == "duplicate":
+        rows.append(dict(rows[0]))
+    elif mutation == "extra":
+        rows[-1]["batch_id"] = "batch-999"
+    elif mutation == "probe_hash":
+        rows[-1]["probe_sha256"] = "f" * 64
+    elif mutation == "git":
+        rows[-1]["git_head_after"] = "f" * 40
+    else:
+        rows[-1]["submodule_dirty_after"] = "true"
+
+    with pytest.raises(ValueError, match=reason):
+        _index_batch_status_rows(plan, rows)
+
+
+def test_parent_evidence_is_scoped_to_its_own_batch() -> None:
+    values = {
+        ("batch-000", 0): "first-0",
+        ("batch-000", 1): "first-1",
+        ("batch-000", 2): "first-2",
+        ("batch-001", 0): "second-0",
+        ("batch-001", 1): "second-1",
+        ("batch-001", 2): "second-2",
+    }
+
+    selected = _values_for_parent_batch(
+        "playbook-rule:parent-01",
+        batch_id_by_parent={
+            "playbook-rule:parent-00": "batch-000",
+            "playbook-rule:parent-01": "batch-001",
+        },
+        values_by_batch_seed=values,
+        expected_seeds=(0, 1, 2),
+    )
+
+    assert selected == {0: "second-0", 1: "second-1", 2: "second-2"}
+
+
+def test_common_batch_run_failure_rejects_the_global_audit() -> None:
+    reports = [
+        {"batch_id": "batch-000", "seed_id": 0, "accepted": True},
+        {"batch_id": "batch-000", "seed_id": 1, "accepted": True},
+        {"batch_id": "batch-001", "seed_id": 0, "accepted": False},
+    ]
+
+    with pytest.raises(ValueError, match="batch-001:0"):
+        _require_complete_batch_run_audit(reports)
+
+
+def test_complete_batch_run_audit_accepts_all_common_runs() -> None:
+    _require_complete_batch_run_audit(
+        [
+            {"batch_id": batch_id, "seed_id": seed, "accepted": True}
+            for batch_id in ("batch-000", "batch-001")
+            for seed in (0, 1, 2)
+        ]
+    )
+
+
+def test_global_manifest_selection_uses_frozen_order() -> None:
+    candidates = [
+        SimpleNamespace(
+            parent_rule_id="parent-c",
+            counterfactual_false_block_rate=0.1,
+            counterfactual_resolved_count=9,
+        ),
+        SimpleNamespace(
+            parent_rule_id="parent-b",
+            counterfactual_false_block_rate=0.0,
+            counterfactual_resolved_count=3,
+        ),
+        SimpleNamespace(
+            parent_rule_id="parent-a",
+            counterfactual_false_block_rate=0.0,
+            counterfactual_resolved_count=3,
+        ),
+        SimpleNamespace(
+            parent_rule_id="parent-z",
+            counterfactual_false_block_rate=0.0,
+            counterfactual_resolved_count=2,
+        ),
+    ]
+
+    selected, ordered = _select_global_manifest(candidates)
+
+    assert selected is not None
+    assert selected.parent_rule_id == "parent-a"
+    assert [item.parent_rule_id for item in ordered] == [
+        "parent-a",
+        "parent-b",
+        "parent-z",
+        "parent-c",
+    ]
+
+
+def test_incomplete_runner_report_lists_completed_failed_and_unrun(
+    tmp_path: Path,
+) -> None:
+    plan = _batch_plan(tmp_path)
+    completed = _status_row(plan, 0, 0)
+    failed = _status_row(plan, 0, 1)
+    failed["exit_code"] = "42"
+
+    report = build_incomplete_hard_qualification_report(
+        plan,
+        [completed, failed],
+        reason="runner_failed:batch-000:seed-1",
+        runner_exit_code=42,
+    )
+
+    assert report["accepted"] is False
+    assert report["batch_audit_complete"] is False
+    assert report["completed_batch_seed_runs"] == ["batch-000:0"]
+    assert report["failed_batch_seed_runs"] == ["batch-000:1"]
+    assert report["unrun_batch_seed_runs"] == [
+        "batch-000:2",
+        "batch-001:0",
+        "batch-001:1",
+        "batch-001:2",
+    ]
+    eligible_parent_ids = plan["eligible_parent_ids"]
+    assert isinstance(eligible_parent_ids, list)
+    assert {parent["parent_rule_id"] for parent in report["parents"]} == set(eligible_parent_ids)
+    assert all(parent["accepted"] is False for parent in report["parents"])
+
+
 def test_run_evidence_hashes_and_source_fingerprint_are_required() -> None:
     with pytest.raises(ValueError):
         PlaybookHardQualificationRunEvidence(
@@ -577,8 +953,14 @@ def test_hard_qualification_runner_keeps_probes_shadow_only_and_fail_closed() ->
 
     assert "seeds=(0 1 2)" in runner
     assert "prepare_playbook_hard_qualification" in runner
+    assert "--max-probes-per-batch 8" in runner
+    assert "--max-probe-batches 2" in runner
+    assert "read -r batch_id batch_index probe_path probe_sha256" in runner
+    assert "${batch_id}.seed-${seed}.log" in runner
+    assert "write_terminal_rejection" in runner
     assert analyzer_call in runner
     assert qualify_call in runner
+    assert runner.count(qualify_call) == 1
     assert runner.index(analyzer_call) < runner.index(qualify_call)
     assert "--evaluation-seed 3" in runner
     assert "--evaluation-seed 4" in runner
