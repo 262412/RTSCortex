@@ -15,9 +15,6 @@ from functools import partial
 from numbers import Integral, Real
 from typing import Any, Optional, Protocol
 
-from rtscortex.cortex.models import ArmyReadiness
-from rtscortex.cortex.terminal import TerminalCollapseState, is_terminal_collapse_state
-from rtscortex.races import race_profile
 from rtscortex_llm_pysc2.ability import ABILITY_SPECS, ability_spec
 from rtscortex_llm_pysc2.addon import ADDON_SPECS, addon_spec
 from rtscortex_llm_pysc2.broker import PrimitiveDispatch, SharedDecisionBroker
@@ -31,8 +28,10 @@ from rtscortex_llm_pysc2.extractor import (
     BUILD_RAW_FUNCTION_IDS,
     BUILD_SPECS,
     MINIMAP_POINT_ACTIONS,
+    PRODUCTION_STRUCTURE_NAMES,
     SCREEN_POINT_ACTIONS,
     SELECT_BLINK_ACTION,
+    TOWNHALL_NAMES,
     TimeStepExtractor,
     build_screen_candidates,
     builder_move_requires_power,
@@ -62,6 +61,11 @@ from rtscortex_llm_pysc2.raw_executor import (
 )
 from rtscortex_llm_pysc2.raw_placement import RawPlacementService
 from rtscortex_llm_pysc2.research import RESEARCH_SPECS, research_spec
+from rtscortex_llm_pysc2.terminal import (
+    TerminalArmyReadiness,
+    TerminalCollapseState,
+    is_terminal_collapse_state,
+)
 
 PRODUCTION_CAMERA_SETTLE_MAX_OBSERVATIONS = 4
 PRODUCTION_SELECTION_MAX_ATTEMPTS = 8
@@ -2028,7 +2032,6 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
                 self.agents,
                 terminal_collapse=_raw_terminal_collapse(
                     obs.observation,
-                    race=self.worker_settings.agent_race,
                     unit_names=self.decision_broker.extractor.unit_names,
                 ),
             )
@@ -4782,33 +4785,29 @@ def _raw_emergency_signature(observation: Any) -> tuple[str, ...]:
 def _raw_terminal_collapse(
     observation: Any,
     *,
-    race: str,
     unit_names: Mapping[int, str],
 ) -> bool:
-    """Re-evaluate the shared terminal state at the final raw queue boundary."""
+    """Re-evaluate the mirrored typed terminal state at the raw queue boundary."""
 
     player = _observation_value(observation, "player_common", None)
     army_supply = _observation_value(player, "food_army", None)
     if army_supply is None:
         return False
-    profile = race_profile(race).data
     own_structure_names = [
-        _worker_unit_name(unit, unit_names)
+        _worker_unit_name(unit, unit_names).casefold()
         for unit in _observation_value(observation, "raw_units", ())
         if int(_observation_value(unit, "alliance", 0)) == 1
-        and _worker_unit_name(unit, unit_names)
-        in {*profile.townhall_types, *profile.production_structures}
     ]
     return is_terminal_collapse_state(
         TerminalCollapseState(
             army_readiness=(
-                ArmyReadiness.EMPTY if int(army_supply) == 0 else ArmyReadiness.FORMING
+                TerminalArmyReadiness.EMPTY
+                if int(army_supply) == 0
+                else TerminalArmyReadiness.FORMING
             ),
-            own_base_count=sum(
-                unit_name in profile.townhall_types for unit_name in own_structure_names
-            ),
+            own_base_count=sum(unit_name in TOWNHALL_NAMES for unit_name in own_structure_names),
             own_production_capacity=sum(
-                unit_name in profile.production_structures for unit_name in own_structure_names
+                unit_name in PRODUCTION_STRUCTURE_NAMES for unit_name in own_structure_names
             ),
         )
     )

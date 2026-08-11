@@ -5,6 +5,7 @@ from __future__ import annotations
 import inspect
 import io
 import json
+import sys
 import tempfile
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -30,6 +31,7 @@ from rtscortex_llm_pysc2.terran_melee import RTSCortexTerranMeleeConfig
 from rtscortex_llm_pysc2.worker import (
     SC2RawBuildQueryCapability,
     _pysc2_action_argument_failure,
+    _raw_terminal_collapse,
 )
 from rtscortex_llm_pysc2.zerg_melee import (
     QUEEN_CONTROLLER_ACTIONS,
@@ -51,6 +53,58 @@ def _assert_candidate_mapping() -> None:
     main_step_source = inspect.getsource(MainAgent.step)
     assert "return translator settlement no_op" in main_step_source
     assert "_rtscortex_transport_noop_without_actor_selection" in main_step_source
+
+
+def _assert_terminal_collapse_boundary_is_worker_isolated() -> None:
+    assert not any(name == "rtscortex" or name.startswith("rtscortex.") for name in sys.modules)
+    empty_army = SimpleNamespace(food_army=0)
+    assert _raw_terminal_collapse(
+        SimpleNamespace(player_common=empty_army, raw_units=[]),
+        unit_names={},
+    )
+
+    for structure_name in (
+        "Nexus",
+        "Gateway",
+        "WarpGate",
+        "RoboticsFacility",
+        "Stargate",
+        "CommandCenter",
+        "OrbitalCommand",
+        "PlanetaryFortress",
+        "Barracks",
+        "Factory",
+        "Starport",
+        "Hatchery",
+        "Lair",
+        "Hive",
+    ):
+        assert not _raw_terminal_collapse(
+            SimpleNamespace(
+                player_common=empty_army,
+                raw_units=[SimpleNamespace(alliance=1, unit_type=1)],
+            ),
+            unit_names={1: structure_name},
+        )
+
+    assert _raw_terminal_collapse(
+        SimpleNamespace(
+            player_common=empty_army,
+            raw_units=[
+                SimpleNamespace(alliance=4, unit_type=1),
+                SimpleNamespace(alliance=1, unit_type=2),
+            ],
+        ),
+        unit_names={1: "Gateway", 2: "UnknownStructure"},
+    )
+    assert not _raw_terminal_collapse(
+        SimpleNamespace(player_common=SimpleNamespace(), raw_units=[]),
+        unit_names={},
+    )
+    assert not _raw_terminal_collapse(
+        SimpleNamespace(player_common=SimpleNamespace(food_army=1), raw_units=[]),
+        unit_names={},
+    )
 
 
 def _assert_reserved_builder_worker_guard() -> None:
@@ -1223,6 +1277,7 @@ def _assert_exact_anchor_and_footprint() -> None:
 
 def main() -> None:
     _assert_candidate_mapping()
+    _assert_terminal_collapse_boundary_is_worker_isolated()
     _assert_reserved_builder_worker_guard()
     _assert_worker_assignment_revalidates_workplaces()
     _assert_max_frame_hook()

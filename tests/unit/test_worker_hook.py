@@ -3,6 +3,8 @@ from __future__ import annotations
 import importlib
 import inspect
 import json
+import os
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -14,6 +16,8 @@ from rtscortex_llm_pysc2.addon import ADDON_SPECS
 from rtscortex_llm_pysc2.broker import PrimitiveDispatch, SharedDecisionBroker
 from rtscortex_llm_pysc2.coordinator import BridgeCoordinator
 from rtscortex_llm_pysc2.extractor import (
+    PRODUCTION_STRUCTURE_NAMES,
+    TOWNHALL_NAMES,
     TimeStepExtractor,
     _own_unit_has_energy,
     _prioritize_creep_tumor_source,
@@ -30,6 +34,18 @@ from rtscortex_llm_pysc2.morph import MORPH_SPECS
 from rtscortex_llm_pysc2.observation import ObservationMapper
 from rtscortex_llm_pysc2.production import PRODUCTION_SPECS
 from rtscortex_llm_pysc2.routing import RoutedActionBatch, RoutedCommand
+from rtscortex_llm_pysc2.terminal import (
+    TerminalArmyReadiness,
+)
+from rtscortex_llm_pysc2.terminal import (
+    TerminalCollapseReason as WorkerTerminalCollapseReason,
+)
+from rtscortex_llm_pysc2.terminal import (
+    TerminalCollapseState as WorkerTerminalCollapseState,
+)
+from rtscortex_llm_pysc2.terminal import (
+    is_terminal_collapse_state as worker_is_terminal_collapse_state,
+)
 from rtscortex_llm_pysc2.worker import (
     ExpansionScoutController,
     GasWorkerController,
@@ -84,7 +100,56 @@ from rtscortex_llm_pysc2.worker import (
     _zerg_larva_townhall_tag,
 )
 
+from rtscortex.config import load_config
 from rtscortex.contracts import ObservationEnvelope
+from rtscortex.cortex.models import ArmyReadiness
+from rtscortex.cortex.situation import _PRODUCTION_TYPES, _TOWNHALL_TYPES
+from rtscortex.cortex.terminal import (
+    TerminalCollapseReason as CoreTerminalCollapseReason,
+)
+from rtscortex.cortex.terminal import (
+    TerminalCollapseState as CoreTerminalCollapseState,
+)
+from rtscortex.cortex.terminal import (
+    is_terminal_collapse_state as core_is_terminal_collapse_state,
+)
+from rtscortex.runtime.live import _worker_python
+
+
+def test_configured_python39_worker_imports_terminal_boundary_without_core() -> None:
+    project_root = Path(__file__).resolve().parents[2]
+    config = load_config(
+        project_root
+        / "configs/experiments/live_simple64_hima_protoss_ensemble_cortex_v0_5_qualification.yaml"
+    )
+    worker_python = _worker_python(config, os.environ)
+    if not worker_python.is_file():
+        pytest.skip("configured live Worker Python is unavailable")
+    environment = dict(os.environ)
+    environment["PYTHONPATH"] = str(project_root / "integrations/llm_pysc2/src")
+
+    completed = subprocess.run(
+        [
+            str(worker_python),
+            "-c",
+            (
+                "import sys; "
+                "from rtscortex_llm_pysc2.terminal import TerminalArmyReadiness, "
+                "TerminalCollapseState, is_terminal_collapse_state; "
+                "import rtscortex_llm_pysc2.worker; "
+                "assert not any(name == 'rtscortex' or name.startswith('rtscortex.') "
+                "for name in sys.modules); "
+                "assert is_terminal_collapse_state("
+                "TerminalCollapseState(TerminalArmyReadiness.EMPTY, 0, 0))"
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert completed.returncode == 0, completed.stderr
 
 
 def test_raw_terminal_collapse_uses_exact_shared_structured_condition() -> None:
@@ -96,23 +161,107 @@ def test_raw_terminal_collapse_uses_exact_shared_structured_condition() -> None:
 
     assert _raw_terminal_collapse(
         SimpleNamespace(player_common=player, raw_units=[probe]),
-        race="protoss",
         unit_names=unit_names,
     )
     assert not _raw_terminal_collapse(
         SimpleNamespace(player_common=player, raw_units=[probe, nexus]),
-        race="protoss",
         unit_names=unit_names,
     )
     assert not _raw_terminal_collapse(
         SimpleNamespace(player_common=player, raw_units=[probe, gateway]),
-        race="protoss",
         unit_names=unit_names,
     )
     assert not _raw_terminal_collapse(
         SimpleNamespace(player_common=SimpleNamespace(food_army=1), raw_units=[probe]),
-        race="protoss",
         unit_names=unit_names,
+    )
+
+
+@pytest.mark.parametrize(
+    ("readiness", "base_count", "production_capacity"),
+    [
+        ("empty", 0, 0),
+        ("forming", 0, 0),
+        ("ready", 0, 0),
+        ("empty", 1, 0),
+        ("empty", 0, 1),
+    ],
+)
+def test_worker_terminal_contract_matches_core_shared_predicate(
+    readiness: str,
+    base_count: int,
+    production_capacity: int,
+) -> None:
+    core_result = core_is_terminal_collapse_state(
+        CoreTerminalCollapseState(
+            army_readiness=ArmyReadiness(readiness),
+            own_base_count=base_count,
+            own_production_capacity=production_capacity,
+        )
+    )
+    worker_result = worker_is_terminal_collapse_state(
+        WorkerTerminalCollapseState(
+            army_readiness=TerminalArmyReadiness(readiness),
+            own_base_count=base_count,
+            own_production_capacity=production_capacity,
+        )
+    )
+
+    assert worker_result is core_result
+    assert (
+        WorkerTerminalCollapseReason.NON_RECOVERY_MACRO_DISPATCH.value
+        == CoreTerminalCollapseReason.NON_RECOVERY_MACRO_DISPATCH.value
+    )
+
+
+def test_worker_terminal_structure_projection_matches_core_situation_contract() -> None:
+    assert TOWNHALL_NAMES == frozenset(name.casefold() for name in _TOWNHALL_TYPES)
+    assert PRODUCTION_STRUCTURE_NAMES == frozenset(name.casefold() for name in _PRODUCTION_TYPES)
+
+
+@pytest.mark.parametrize(
+    "structure_name",
+    [
+        "Nexus",
+        "Gateway",
+        "WarpGate",
+        "RoboticsFacility",
+        "Stargate",
+        "CommandCenter",
+        "Barracks",
+        "Factory",
+        "Starport",
+        "Hatchery",
+        "Lair",
+        "Hive",
+    ],
+)
+def test_raw_terminal_collapse_is_race_neutral(structure_name: str) -> None:
+    structure = SimpleNamespace(alliance=1, unit_type=1)
+
+    assert not _raw_terminal_collapse(
+        SimpleNamespace(
+            player_common=SimpleNamespace(food_army=0),
+            raw_units=[structure],
+        ),
+        unit_names={1: structure_name},
+    )
+
+
+def test_raw_terminal_collapse_ignores_enemy_and_unknown_units_but_requires_army_data() -> None:
+    enemy_gateway = SimpleNamespace(alliance=4, unit_type=1)
+    own_unknown = SimpleNamespace(alliance=1, unit_type=2)
+
+    assert _raw_terminal_collapse(
+        SimpleNamespace(
+            player_common=SimpleNamespace(food_army=0),
+            raw_units=[enemy_gateway, own_unknown],
+        ),
+        unit_names={1: "Gateway", 2: "UnknownStructure"},
+    )
+    assert not _raw_terminal_collapse(
+        SimpleNamespace(player_common=SimpleNamespace(), raw_units=[]),
+        unit_names={},
     )
 
 

@@ -43,6 +43,20 @@ TOWNHALL_NAMES = frozenset(
         "planetaryfortress",
     }
 )
+PRODUCTION_STRUCTURE_NAMES = frozenset(
+    {
+        "gateway",
+        "warpgate",
+        "roboticsfacility",
+        "stargate",
+        "barracks",
+        "factory",
+        "starport",
+        "hatchery",
+        "lair",
+        "hive",
+    }
+)
 
 
 @dataclass(frozen=True)

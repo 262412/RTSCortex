@@ -11,7 +11,6 @@ from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from typing import Any, Optional, Protocol
 
-from rtscortex.cortex.terminal import TerminalCollapseReason
 from rtscortex_llm_pysc2.broker import PrimitiveDispatch, SharedDecisionBroker
 from rtscortex_llm_pysc2.coordinator import BridgeDecision
 from rtscortex_llm_pysc2.extractor import (
@@ -30,6 +29,7 @@ from rtscortex_llm_pysc2.raw_placement import (
 )
 from rtscortex_llm_pysc2.research import research_spec
 from rtscortex_llm_pysc2.routing import RoutedCommand
+from rtscortex_llm_pysc2.terminal import TerminalCollapseReason
 
 _BUILD_RAW_FUNCTIONS = {
     "Build_Pylon_Screen": "Build_Pylon_pt",
