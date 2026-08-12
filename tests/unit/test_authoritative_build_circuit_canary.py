@@ -279,6 +279,9 @@ def _runtime_event(event_id: int, event_type: str, payload: dict[str, object]) -
 
 def _valid_runtime_events() -> list[StoredEvent]:
     operation_id = "operation:" + "a" * 64
+    reset_material_identity = "build-legality:" + "f" * 64
+    reset_world_target = [31.0, 30.0]
+    reset_reservation_id = "placement:command-reset"
     events: list[StoredEvent] = []
     for ordinal in range(3):
         command_id = f"command-{ordinal}"
@@ -338,6 +341,11 @@ def _valid_runtime_events() -> list[StoredEvent]:
                     "opened_command_id": "command-2",
                     "opened_attempt_id": third_attempt,
                     "opened_attempt_ordinal": 2,
+                    "material_legality_identity": "build-legality:" + "2" * 64,
+                    "blocked_semantic_material_identity": ("semantic-build-material:" + "1" * 64),
+                    "material_evidence_valid": True,
+                    "invalid_evidence_reasons": [],
+                    "next_action": "wait_for_material_legality_change_or_new_operation",
                 },
             ),
             _runtime_event(
@@ -349,9 +357,12 @@ def _valid_runtime_events() -> list[StoredEvent]:
                     "reason": "semantic_legality_material_change",
                     "previous_semantic_material_identity": "semantic-build-material:" + "1" * 64,
                     "current_semantic_material_identity": "semantic-build-material:" + "2" * 64,
-                    "raw_material_legality_identity": "build-legality:" + "3" * 64,
+                    "raw_material_legality_identity": "build-legality:" + "2" * 64,
                     "previous_builder_tag": 100,
                     "bound_builder_tag": 200,
+                    "ability_id": 881,
+                    "world_target": [32.0, 30.0],
+                    "game_loop": 80,
                     "reset_from_streak": 3,
                     "operation_epoch_changed": False,
                 },
@@ -365,7 +376,13 @@ def _valid_runtime_events() -> list[StoredEvent]:
                     "attempt_id": reset_attempt,
                     "attempt_ordinal": 3,
                     "action_name": "Build_Pylon_Screen",
+                    "builder_tag": "0xc8",
                     "builder_lease_state": None,
+                    "reservation_id": reset_reservation_id,
+                    "ability_id": 881,
+                    "world_target": reset_world_target,
+                    "target_state_revision": "target-revalidated",
+                    "material_legality_identity": reset_material_identity,
                     "next_state": "build_started",
                     "release_reason": "build_start_observed",
                     "authoritative_pre_dispatch": {
@@ -374,9 +391,22 @@ def _valid_runtime_events() -> list[StoredEvent]:
                         "attempt_id": reset_attempt,
                         "attempt_ordinal": 3,
                         "action_name": "Build_Pylon_Screen",
+                        "failure_code": "build_started",
                         "status": "reset",
-                        "state_transition": "open_to_reset",
+                        "streak": 0,
+                        "threshold": 3,
                         "circuit_open": False,
+                        "duplicate_attempt": False,
+                        "builder_tag": 200,
+                        "ability_id": 881,
+                        "world_target": reset_world_target,
+                        "target_state_revision": "target-revalidated",
+                        "material_legality_identity": reset_material_identity,
+                        "material_evidence_valid": True,
+                        "invalid_evidence_reasons": [],
+                        "state_transition": "open_to_reset",
+                        "reset_reason": "build_started",
+                        "next_action": "retry",
                     },
                 },
             ),
@@ -384,12 +414,17 @@ def _valid_runtime_events() -> list[StoredEvent]:
                 7,
                 "placement_ledger_transition",
                 {
-                    "operation_id": None,
+                    "operation_id": operation_id,
                     "command_id": "command-reset",
-                    "attempt_id": None,
-                    "attempt_ordinal": None,
+                    "attempt_id": reset_attempt,
+                    "attempt_ordinal": 3,
                     "action_name": "Build_Pylon_Screen",
+                    "builder_tag": "0xc8",
                     "builder_lease_state": "released",
+                    "reservation_id": reset_reservation_id,
+                    "ability_id": 881,
+                    "world_target": reset_world_target,
+                    "material_legality_identity": reset_material_identity,
                     "next_state": "occupied",
                     "release_reason": "effect_confirmed",
                 },
@@ -409,6 +444,13 @@ def _valid_runtime_events() -> list[StoredEvent]:
                     "success": True,
                     "effect_evidence": {
                         "effect_kind": "build",
+                        "reservation_id": reset_reservation_id,
+                        "builder_tag": "0xc8",
+                        "ability_id": 881,
+                        "target_position": reset_world_target,
+                        "emitted_target_position": reset_world_target,
+                        "verified_target_position": reset_world_target,
+                        "material_legality_identity": reset_material_identity,
                         "build_started": True,
                         "observed_structure_tag": "0xfeed",
                         "confirmation_kind": "new_structure",
@@ -500,6 +542,95 @@ def test_runtime_events_are_authoritative_for_the_canary_path() -> None:
     assert report["runtime_core_reset_count"] == 1
     assert report["runtime_raw_reset_count"] == 1
     assert report["runtime_success_count"] == 1
+    assert report["raw_success_reset_provenance_consistent"] is True
+    assert report["engineering_authoritative_circuit_consistent"] is True
+    assert report["engineering_authoritative_circuit"] == {
+        "failure_count": 3,
+        "open_count": 1,
+        "success_reset_count": 1,
+        "missing_identity_count": 0,
+        "identity_inconsistency_count": 0,
+        "invalid_transition_count": 0,
+        "post_open_command_count": 0,
+        "post_open_dispatch_count": 0,
+        "post_open_rejection_count": 0,
+        "consistent": True,
+    }
+
+
+def test_runtime_replay_exposes_general_engineering_circuit_disagreement() -> None:
+    phase_events = _valid_phases()
+    phase_replay = _replay_phases(phase_events, expected_seed=7)
+    runtime_events = _valid_runtime_events()
+    runtime_events[4].payload["raw_material_legality_identity"] = "build-legality:" + "e" * 64
+
+    report = _replay_runtime_events(
+        runtime_events,
+        phase_events=phase_events,
+        phase_replay=phase_replay,
+    )
+
+    assert report["raw_success_reset_provenance_consistent"] is True
+    assert report["engineering_authoritative_circuit_consistent"] is False
+    assert report["engineering_authoritative_circuit"]["invalid_transition_count"] == 1
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "nested_material_identity",
+        "parent_material_identity",
+        "material_valid",
+        "invalid_reasons",
+        "effect_material_identity",
+        "effect_builder",
+        "effect_ability",
+        "effect_target",
+        "parent_target",
+        "target_state_revision",
+        "reservation_id",
+    ),
+)
+def test_runtime_replay_rejects_forged_success_reset_material_provenance(
+    mutation: str,
+) -> None:
+    phase_events = _valid_phases()
+    phase_replay = _replay_phases(phase_events, expected_seed=7)
+    runtime_events = _valid_runtime_events()
+    reset_transition = next(event for event in runtime_events if event.event_id == 6).payload
+    reset_evidence = reset_transition["authoritative_pre_dispatch"]
+    assert isinstance(reset_evidence, dict)
+    success_effect = runtime_events[-1].payload["effect_evidence"]
+    assert isinstance(success_effect, dict)
+    if mutation == "nested_material_identity":
+        reset_evidence["material_legality_identity"] = "build-legality:" + "A" * 64
+    elif mutation == "parent_material_identity":
+        reset_transition["material_legality_identity"] = "build-legality:" + "e" * 64
+    elif mutation == "material_valid":
+        reset_evidence["material_evidence_valid"] = False
+    elif mutation == "invalid_reasons":
+        reset_evidence["invalid_evidence_reasons"] = ["forged"]
+    elif mutation == "effect_material_identity":
+        success_effect["material_legality_identity"] = "build-legality:" + "e" * 64
+    elif mutation == "effect_builder":
+        success_effect["builder_tag"] = "0xc9"
+    elif mutation == "effect_ability":
+        success_effect["ability_id"] = 882
+    elif mutation == "effect_target":
+        success_effect["target_position"] = [32.0, 30.0]
+    elif mutation == "parent_target":
+        reset_transition.pop("world_target")
+    elif mutation == "target_state_revision":
+        reset_evidence["target_state_revision"] = "forged-target-state"
+    else:
+        reset_transition["reservation_id"] = "placement:forged"
+
+    with pytest.raises(CanaryArtifactError, match="reset|reservation|material|effect"):
+        _replay_runtime_events(
+            runtime_events,
+            phase_events=phase_events,
+            phase_replay=phase_replay,
+        )
 
 
 def _runtime_events_with_opening_lifecycle(status: str) -> list[StoredEvent]:
@@ -568,6 +699,7 @@ def test_analyzer_rejects_tampered_hash_and_wrong_run_dir(
         "_replay_runtime_events",
         lambda *args, **kwargs: {
             "runtime_raw_reset_count": 1,
+            "engineering_authoritative_circuit_consistent": True,
         },
     )
     report = analyze_canary_run(run_set, expected_git_sha="a" * 40, seed=7)
@@ -589,6 +721,28 @@ def test_analyzer_rejects_tampered_hash_and_wrong_run_dir(
     )
     with pytest.raises(CanaryArtifactError, match="run_dir attestation"):
         analyze_canary_run(run_set, expected_git_sha="a" * 40, seed=7)
+
+
+def test_analyzer_fails_closed_when_general_engineering_circuit_disagrees(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_set, _run_dir, _attestation = _artifact_fixture(tmp_path)
+    monkeypatch.setattr(analyzer, "_summary_artifact_is_canonical", lambda *args, **kwargs: True)
+    monkeypatch.setattr(analyzer, "read_event_log", lambda _path: _valid_runtime_events())
+    monkeypatch.setattr(
+        analyzer,
+        "_replay_runtime_events",
+        lambda *args, **kwargs: {
+            "runtime_raw_reset_count": 1,
+            "engineering_authoritative_circuit_consistent": False,
+        },
+    )
+
+    report = analyze_canary_run(run_set, expected_git_sha="a" * 40, seed=7)
+
+    assert report["accepted"] is False
+    assert report["gates"]["engineering_authoritative_circuit_consistent"] is False
 
 
 def test_summary_canonical_check_compares_json_round_trip(

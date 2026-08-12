@@ -354,6 +354,14 @@ class AuthoritativePreDispatchEvidence(ContractModel):
             raise ValueError("open_to_reset cannot remain circuit-open")
         if self.circuit_open and self.streak < 3:
             raise ValueError("authoritative circuit cannot open before the third failure")
+        if self.status == "reset" and (
+            self.failure_code != "build_started"
+            or self.reset_reason not in {"build_started", "effect_confirmed"}
+            or not self.material_evidence_valid
+            or self.invalid_evidence_reasons
+            or not self.target_state_revision
+        ):
+            raise ValueError("authoritative success reset requires valid build material evidence")
         if self.operation_id is None:
             if self.attempt_id is not None:
                 raise ValueError("attempt identity cannot be bound without an operation identity")
@@ -404,11 +412,16 @@ class PlacementLedgerTransition(ContractModel):
     game_loop: int = Field(ge=0)
     release_reason: str | None = None
     target_state_revision: str | None = None
+    builder_tag: int | None = Field(default=None, gt=0)
     ability_id: int | None = Field(default=None, ge=0)
+    world_target: tuple[float, float] | None = None
     available_ability_query: str | None = None
     placement_query_result: str | None = None
     target_legality_fingerprint: str | None = None
-    material_legality_identity: str | None = None
+    material_legality_identity: str | None = Field(
+        default=None,
+        pattern=r"^build-legality:[0-9a-f]{64}$",
+    )
     primitive_constructed_game_loop: int | None = Field(default=None, ge=0)
     primitive_submitted_game_loop: int | None = Field(default=None, ge=0)
     action_result: list[int] | None = None
@@ -424,9 +437,14 @@ class PlacementLedgerTransition(ContractModel):
             or evidence.action_name != self.action_name
             or evidence.attempt_id != self.attempt_id
             or evidence.attempt_ordinal != self.attempt_ordinal
+            or evidence.builder_tag != self.builder_tag
+            or evidence.ability_id != self.ability_id
+            or evidence.world_target != self.world_target
+            or evidence.target_state_revision != self.target_state_revision
+            or evidence.material_legality_identity != self.material_legality_identity
         ):
             raise ValueError(
-                "nested authoritative evidence does not match its transition parent identity"
+                "nested authoritative evidence does not match its transition parent provenance"
             )
         return self
 
@@ -451,14 +469,21 @@ class PlacementLedgerEvent(ContractModel):
     @model_validator(mode="after")
     def validate_authoritative_parent_identity(self) -> PlacementLedgerEvent:
         evidence = self.transition.authoritative_pre_dispatch
+        try:
+            envelope_builder_tag = None if self.builder_tag is None else int(self.builder_tag, 0)
+        except ValueError:
+            envelope_builder_tag = None
         if evidence is not None and (
             evidence.operation_id != self.operation_id
             or evidence.command_id != self.command_id
             or evidence.action_name != self.action_name
             or evidence.attempt_id != self.attempt_id
             or evidence.attempt_ordinal != self.attempt_ordinal
+            or evidence.builder_tag != envelope_builder_tag
         ):
-            raise ValueError("placement authoritative evidence does not match its parent identity")
+            raise ValueError(
+                "placement authoritative evidence does not match its parent provenance"
+            )
         return self
 
 

@@ -18,6 +18,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+from rtscortex.evaluation.engineering import authoritative_build_pre_dispatch_audit
 from rtscortex.evaluation.report import _build_run_summary
 from rtscortex.memory import read_event_log
 
@@ -616,6 +617,245 @@ def _runtime_command_operation(command: Mapping[str, Any]) -> str | None:
     return operation_id if isinstance(operation_id, str) else None
 
 
+def _runtime_world_target(value: Any, *, phase: str) -> tuple[float, float]:
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        raise CanaryArtifactError(f"{phase}: world_target is missing or malformed")
+    if not all(
+        isinstance(item, (int, float)) and not isinstance(item, bool) and math.isfinite(float(item))
+        for item in value
+    ):
+        raise CanaryArtifactError(f"{phase}: world_target is missing or malformed")
+    return float(value[0]), float(value[1])
+
+
+def _runtime_builder_tag(value: Any, *, phase: str) -> int:
+    try:
+        return _positive_int(value, label=f"{phase}.builder_tag")
+    except CanaryArtifactError as error:
+        raise CanaryArtifactError(f"{phase}: builder_tag is missing or malformed") from error
+
+
+def _runtime_ability_id(value: Any, *, phase: str) -> int:
+    if type(value) is not int or value <= 0:
+        raise CanaryArtifactError(f"{phase}: ability_id is missing or malformed")
+    return value
+
+
+def _runtime_require_equal(
+    left: Any,
+    right: Any,
+    *,
+    field: str,
+    phase: str,
+) -> None:
+    if left != right:
+        raise CanaryArtifactError(f"{phase}: {field} does not match successful reservation/effect")
+
+
+def _runtime_validate_success_reset_contract(
+    reset_events: Sequence[Any],
+    *,
+    success_payload: Mapping[str, Any],
+    operation_id: str,
+) -> None:
+    """Validate the raw authoritative reset against the successful Build evidence.
+
+    The general engineering replay treats nested authoritative evidence as a
+    child contract of its durable placement transition.  The focused canary
+    must additionally prove that this child belongs to the reservation and the
+    successful effect which cleared the circuit; otherwise a synthetic reset
+    envelope can make the diagnostic canary appear green.
+    """
+
+    if len(reset_events) != 1:
+        raise CanaryArtifactError(
+            "runtime must contain exactly one raw authoritative success reset"
+        )
+    reset_event = reset_events[0]
+    reset_payload = _runtime_payload(reset_event)
+    transition = reset_payload.get("transition")
+    parent = dict(transition) if isinstance(transition, Mapping) else dict(reset_payload)
+    parent.update(
+        {
+            key: value
+            for key, value in reset_payload.items()
+            if key not in {"transition", "authoritative_pre_dispatch"}
+        }
+    )
+    nested = _runtime_authoritative(reset_payload)
+    if nested is None or nested.get("status") != "reset":
+        raise CanaryArtifactError("raw success reset lacks nested reset evidence")
+
+    expected_identity_fields = {
+        "operation_id": operation_id,
+        "command_id": success_payload.get("command_id"),
+        "action_name": _RUNTIME_ACTION,
+        "attempt_id": success_payload.get("attempt_id"),
+        "attempt_ordinal": 3,
+    }
+    for field, expected in expected_identity_fields.items():
+        if not isinstance(expected, str) and field not in {"attempt_ordinal"}:
+            raise CanaryArtifactError(f"raw success reset: successful {field} is missing")
+        if parent.get(field) != expected or nested.get(field) != expected:
+            raise CanaryArtifactError(
+                f"raw success reset: {field} does not match successful reservation/effect"
+            )
+
+    if nested.get("state_transition") != "open_to_reset":
+        raise CanaryArtifactError("raw success reset: nested state transition is not open_to_reset")
+    if nested.get("failure_code") != "build_started":
+        raise CanaryArtifactError(
+            "raw success reset: nested reset failure_code is not build_started"
+        )
+    if nested.get("reset_reason") not in {"build_started", "effect_confirmed"}:
+        raise CanaryArtifactError("raw success reset: nested reset reason is not typed")
+    expected_next_state = (
+        "build_started" if nested.get("reset_reason") == "build_started" else "occupied"
+    )
+    if parent.get("next_state") != expected_next_state:
+        raise CanaryArtifactError(
+            "raw success reset: parent next_state disagrees with reset reason"
+        )
+    if (
+        nested.get("streak") != 0
+        or nested.get("threshold") != 3
+        or nested.get("circuit_open") is not False
+        or nested.get("duplicate_attempt") is not False
+    ):
+        raise CanaryArtifactError("raw success reset: nested circuit state is not a cleared reset")
+
+    material_identity = nested.get("material_legality_identity")
+    if (
+        not isinstance(material_identity, str)
+        or _BUILD_LEGALITY_RE.fullmatch(material_identity) is None
+    ):
+        raise CanaryArtifactError(
+            "raw success reset: nested material_legality_identity is not strict build-legality"
+        )
+    if nested.get("material_evidence_valid") is not True:
+        raise CanaryArtifactError("raw success reset: material_evidence_valid is not true")
+    if nested.get("invalid_evidence_reasons") != []:
+        raise CanaryArtifactError("raw success reset: invalid_evidence_reasons is not empty")
+    target_state_revision = nested.get("target_state_revision")
+    if not isinstance(target_state_revision, str) or not target_state_revision:
+        raise CanaryArtifactError("raw success reset: target_state_revision is missing")
+    if parent.get("target_state_revision") != target_state_revision:
+        raise CanaryArtifactError(
+            "raw success reset: target_state_revision does not match parent transition"
+        )
+    parent_material = parent.get("material_legality_identity")
+    if (
+        parent_material != material_identity
+        or _BUILD_LEGALITY_RE.fullmatch(str(parent_material)) is None
+    ):
+        raise CanaryArtifactError(
+            "raw success reset: nested material identity does not match parent transition"
+        )
+
+    effect = success_payload.get("effect_evidence")
+    if not isinstance(effect, Mapping) or effect.get("effect_kind") != "build":
+        raise CanaryArtifactError("raw success reset: successful effect evidence is not a build")
+    reservation_id = parent.get("reservation_id")
+    effect_reservation_id = effect.get("reservation_id")
+    if (
+        not isinstance(reservation_id, str)
+        or not reservation_id
+        or effect_reservation_id != reservation_id
+    ):
+        raise CanaryArtifactError(
+            "raw success reset: reservation identity does not match successful effect"
+        )
+    if effect.get("material_legality_identity") != material_identity:
+        raise CanaryArtifactError(
+            "raw success reset: material identity does not match successful effect"
+        )
+
+    nested_builder = _runtime_builder_tag(nested.get("builder_tag"), phase="raw success reset")
+    parent_builder = _runtime_builder_tag(parent.get("builder_tag"), phase="raw success reset")
+    effect_builder = _runtime_builder_tag(effect.get("builder_tag"), phase="raw success reset")
+    if nested_builder != parent_builder or nested_builder != effect_builder:
+        raise CanaryArtifactError(
+            "raw success reset: builder identity does not match reservation/effect"
+        )
+    nested_ability = _runtime_ability_id(nested.get("ability_id"), phase="raw success reset")
+    parent_ability = _runtime_ability_id(parent.get("ability_id"), phase="raw success reset")
+    effect_ability = _runtime_ability_id(effect.get("ability_id"), phase="raw success reset")
+    if nested_ability != parent_ability or nested_ability != effect_ability:
+        raise CanaryArtifactError(
+            "raw success reset: ability identity does not match reservation/effect"
+        )
+
+    nested_target = _runtime_world_target(nested.get("world_target"), phase="raw success reset")
+    effect_target_value = effect.get("target_position")
+    effect_target = _runtime_world_target(effect_target_value, phase="raw success reset")
+    if nested_target != effect_target:
+        raise CanaryArtifactError(
+            "raw success reset: world target does not match successful effect"
+        )
+    parent_target = _runtime_world_target(parent.get("world_target"), phase="raw success reset")
+    if parent_target != nested_target:
+        raise CanaryArtifactError(
+            "raw success reset: world target does not match parent transition"
+        )
+    for field in (
+        "emitted_target_position",
+        "verified_target_position",
+        "final_validated_target_position",
+        "validated_target_position",
+    ):
+        value = effect.get(field)
+        if (
+            value is not None
+            and _runtime_world_target(value, phase="raw success reset") != nested_target
+        ):
+            raise CanaryArtifactError(
+                f"raw success reset: successful effect {field} disagrees with reset target"
+            )
+
+    for field in ("operation_id", "command_id", "action_name", "attempt_id", "attempt_ordinal"):
+        if field in effect and effect.get(field) is not None:
+            _runtime_require_equal(
+                effect.get(field),
+                expected_identity_fields[field],
+                field=field,
+                phase="raw success reset",
+            )
+
+
+def _runtime_engineering_circuit_contract(
+    runtime_events: Sequence[Any],
+    *,
+    operation_id: str,
+) -> dict[str, Any]:
+    audit = authoritative_build_pre_dispatch_audit(runtime_events)
+    operations = audit.get("operations")
+    operation = operations.get(operation_id) if isinstance(operations, Mapping) else None
+    operation_metrics = operation if isinstance(operation, Mapping) else {}
+    metrics = {
+        "failure_count": audit.get("failure_count"),
+        "open_count": audit.get("circuit_open_count"),
+        "success_reset_count": operation_metrics.get("success_reset_count"),
+        "missing_identity_count": audit.get("missing_identity_count"),
+        "identity_inconsistency_count": audit.get("identity_inconsistency_count"),
+        "invalid_transition_count": audit.get("invalid_transition_count"),
+        "post_open_command_count": audit.get("post_open_command_count"),
+        "post_open_dispatch_count": audit.get("post_open_dispatch_count"),
+        "post_open_rejection_count": audit.get("post_open_rejection_count"),
+    }
+    metrics["consistent"] = metrics == {
+        "failure_count": 3,
+        "open_count": 1,
+        "success_reset_count": 1,
+        "missing_identity_count": 0,
+        "identity_inconsistency_count": 0,
+        "invalid_transition_count": 0,
+        "post_open_command_count": 0,
+        "post_open_dispatch_count": 0,
+        "post_open_rejection_count": 0,
+    }
+    return metrics
+
+
 def _replay_runtime_events(
     runtime_events: Sequence[Any],
     *,
@@ -984,6 +1224,15 @@ def _replay_runtime_events(
         raise CanaryArtifactError("runtime lacks raw authoritative circuit reset evidence")
     if not released_transition_observed:
         raise CanaryArtifactError("runtime lacks final released ownership transition")
+    _runtime_validate_success_reset_contract(
+        raw_reset_events,
+        success_payload=success,
+        operation_id=operation_id,
+    )
+    engineering_circuit = _runtime_engineering_circuit_contract(
+        ordered,
+        operation_id=operation_id,
+    )
 
     phase_core = next(event for event in phase_events if event["phase"] == "core_defer_observed")
     phase_reset = next(
@@ -1004,6 +1253,9 @@ def _replay_runtime_events(
         "runtime_core_reset_count": len(reset_events),
         "runtime_raw_reset_count": len(raw_reset_events),
         "runtime_released_ownership": released_transition_observed,
+        "raw_success_reset_provenance_consistent": True,
+        "engineering_authoritative_circuit": engineering_circuit,
+        "engineering_authoritative_circuit_consistent": engineering_circuit["consistent"],
         "runtime_success_count": len(successes),
         "post_open_command_count": len(post_open_command_ids),
         "post_open_dispatch_count": len(post_open_dispatch_ids),
@@ -1255,6 +1507,13 @@ def analyze_canary_run(
             "primitive_submitted": True,
             "real_build_start_and_effect_confirmation": True,
             "runtime_raw_circuit_reset": runtime_replay["runtime_raw_reset_count"] > 0,
+            # This is the authoritative child contract from the general replay;
+            # the diagnostic engineering report as a whole is intentionally not
+            # a prerequisite for this focused canary.
+            "engineering_authoritative_circuit_consistent": runtime_replay.get(
+                "engineering_authoritative_circuit_consistent"
+            )
+            is True,
             "nonzero_failure_open_reset_counts": all(
                 replay[key] > 0 for key in ("failure_count", "open_count", "reset_count")
             ),

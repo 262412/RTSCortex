@@ -1287,6 +1287,103 @@ def test_authoritative_replay_requires_typed_reset_for_success(tmp_path: Path) -
     assert report["gates"]["authoritative_build_pre_dispatch_circuit_bounded"]["passed"] is False
 
 
+def test_authoritative_replay_accepts_complete_success_reset_provenance(tmp_path: Path) -> None:
+    operation_id = _strict_identity("operation", 190)
+    events = [
+        _authoritative_failure_event(
+            event_id,
+            operation_id=operation_id,
+            attempt_ordinal=event_id - 1,
+            attempt_index=event_id,
+            streak=event_id,
+            state_transition="closed_to_open" if event_id == 3 else None,
+            circuit_open=event_id == 3,
+        )
+        for event_id in range(1, 4)
+    ]
+    events.append(_authoritative_success_reset_event(4, operation_id=operation_id))
+
+    report = build_engineering_gate_report(
+        events,
+        run_dir=tmp_path,
+        natural_run_baseline_bytes_per_loop=100.0,
+    )
+
+    operation = report["diagnostics"]["authoritative_build_pre_dispatch_operations"][operation_id]
+    assert operation["success_reset_count"] == 1
+    assert report["diagnostics"]["authoritative_build_pre_dispatch_missing_identity_count"] == 0
+    assert (
+        report["diagnostics"]["authoritative_build_pre_dispatch_identity_inconsistency_count"] == 0
+    )
+    assert report["gates"]["authoritative_build_pre_dispatch_circuit_bounded"]["passed"] is True
+
+
+@pytest.mark.parametrize(
+    "defect",
+    (
+        "missing_material",
+        "short_material",
+        "mismatched_material",
+        "material_invalid",
+        "invalid_reasons",
+        "builder_mismatch",
+        "ability_mismatch",
+        "target_state_mismatch",
+        "target_mismatch",
+    ),
+)
+def test_authoritative_replay_rejects_invalid_success_reset_provenance(
+    defect: str,
+    tmp_path: Path,
+) -> None:
+    operation_id = _strict_identity("operation", 191)
+    events = [
+        _authoritative_failure_event(
+            event_id,
+            operation_id=operation_id,
+            attempt_ordinal=event_id - 1,
+            attempt_index=event_id,
+            streak=event_id,
+            state_transition="closed_to_open" if event_id == 3 else None,
+            circuit_open=event_id == 3,
+        )
+        for event_id in range(1, 4)
+    ]
+    reset = _authoritative_success_reset_event(4, operation_id=operation_id)
+    nested = reset.payload["authoritative_pre_dispatch"]
+    assert isinstance(nested, dict)
+    if defect == "missing_material":
+        nested.pop("material_legality_identity")
+    elif defect == "short_material":
+        nested["material_legality_identity"] = "build-legality:1"
+    elif defect == "mismatched_material":
+        nested["material_legality_identity"] = _strict_identity("build-legality", 999)
+    elif defect == "material_invalid":
+        nested["material_evidence_valid"] = False
+    elif defect == "invalid_reasons":
+        nested["invalid_evidence_reasons"] = ["material_legality_identity_invalid"]
+    elif defect == "builder_mismatch":
+        nested["builder_tag"] = 0xC
+    elif defect == "ability_mismatch":
+        nested["ability_id"] = 883
+    elif defect == "target_state_mismatch":
+        nested["target_state_revision"] = "different-target-state"
+    else:
+        nested["world_target"] = [65.0, 90.0]
+    events.append(reset)
+
+    report = build_engineering_gate_report(
+        events,
+        run_dir=tmp_path,
+        natural_run_baseline_bytes_per_loop=100.0,
+    )
+
+    operation = report["diagnostics"]["authoritative_build_pre_dispatch_operations"][operation_id]
+    assert operation["success_reset_count"] == 0
+    assert report["diagnostics"]["authoritative_build_pre_dispatch_missing_identity_count"] == 1
+    assert report["gates"]["authoritative_build_pre_dispatch_circuit_bounded"]["passed"] is False
+
+
 def test_build_started_effect_missing_is_not_a_no_start_streak(tmp_path: Path) -> None:
     events = [
         _semantic_build_execution(
@@ -1800,6 +1897,63 @@ def _authoritative_failure_event(
                 "invalid_evidence_reasons": [],
                 "state_transition": state_transition,
                 "reset_reason": None,
+            },
+        },
+    )
+
+
+def _authoritative_success_reset_event(
+    event_id: int,
+    *,
+    operation_id: str,
+    command_id: str = "authoritative-success",
+    attempt_ordinal: int = 3,
+    reset_reason: str = "build_started",
+) -> StoredEvent:
+    attempt_id = AttemptKey(
+        operation_id=operation_id,
+        command_id=command_id,
+        attempt_ordinal=attempt_ordinal,
+    ).attempt_id
+    material_identity = _strict_identity("build-legality", 500)
+    next_state = "build_started" if reset_reason == "build_started" else "occupied"
+    return _event(
+        event_id,
+        "placement_ledger_transition",
+        {
+            "command_id": command_id,
+            "operation_id": operation_id,
+            "attempt_id": attempt_id,
+            "attempt_ordinal": attempt_ordinal,
+            "action_name": "Build_Pylon_Screen",
+            "builder_tag": "0xb",
+            "ability_id": 881,
+            "world_target": [64.0, 90.0],
+            "target_state_revision": "revalidated-target",
+            "material_legality_identity": material_identity,
+            "previous_state": "reserved",
+            "next_state": next_state,
+            "authoritative_pre_dispatch": {
+                "operation_id": operation_id,
+                "action_name": "Build_Pylon_Screen",
+                "command_id": command_id,
+                "failure_code": "build_started",
+                "status": "reset",
+                "streak": 0,
+                "threshold": 3,
+                "circuit_open": False,
+                "duplicate_attempt": False,
+                "attempt_id": attempt_id,
+                "attempt_ordinal": attempt_ordinal,
+                "builder_tag": 0xB,
+                "ability_id": 881,
+                "world_target": [64.0, 90.0],
+                "target_state_revision": "revalidated-target",
+                "material_legality_identity": material_identity,
+                "material_evidence_valid": True,
+                "invalid_evidence_reasons": [],
+                "state_transition": "open_to_reset",
+                "reset_reason": reset_reason,
             },
         },
     )

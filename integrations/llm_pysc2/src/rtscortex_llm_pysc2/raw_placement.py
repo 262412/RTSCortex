@@ -501,6 +501,22 @@ def _placement_candidate_id(
     return f"placement-candidate:{digest}"
 
 
+def _authoritative_attempt_identity(
+    operation_id: str,
+    command_id: str,
+    attempt_ordinal: int,
+) -> str:
+    payload = {
+        "operation_id": operation_id,
+        "command_id": command_id,
+        "attempt_ordinal": attempt_ordinal,
+    }
+    digest = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    return f"attempt:{digest}"
+
+
 def build_material_legality_identity(
     *,
     operation_id: str | None,
@@ -1407,6 +1423,7 @@ class RawPlacementService:
         target_state_revision: str | None = None,
         observation_revision: str | None = None,
         observation_game_loop: int | None = None,
+        material_legality_identity: str | None = None,
     ) -> RawAuthoritativePreDispatchDecision | None:
         if reason not in {"build_started", "effect_confirmed"}:
             raise ValueError(
@@ -1415,6 +1432,93 @@ class RawPlacementService:
         ledger = self._operation_authoritative_pre_dispatch.get(str(operation_id))
         if ledger is None:
             return None
+        normalized_operation = str(operation_id)
+        normalized_attempt = None if attempt_id is None else str(attempt_id)
+        normalized_material = (
+            str(material_legality_identity)
+            if material_legality_identity is not None
+            and _BUILD_LEGALITY_IDENTITY.fullmatch(str(material_legality_identity)) is not None
+            else None
+        )
+        expected_attempt = (
+            _authoritative_attempt_identity(
+                normalized_operation,
+                str(command_id),
+                int(attempt_ordinal),
+            )
+            if _OPERATION_IDENTITY.fullmatch(normalized_operation) is not None
+            and command_id
+            and isinstance(attempt_ordinal, int)
+            and not isinstance(attempt_ordinal, bool)
+            and attempt_ordinal >= 0
+            else None
+        )
+        invalid_evidence_reasons = tuple(
+            reason
+            for reason, invalid in (
+                (
+                    "operation_id_invalid",
+                    _OPERATION_IDENTITY.fullmatch(normalized_operation) is None,
+                ),
+                ("command_id_missing", not command_id),
+                (
+                    "action_name_invalid",
+                    not action_name.startswith("Build_") or len(action_name) <= len("Build_"),
+                ),
+                ("attempt_id_missing", normalized_attempt is None),
+                (
+                    "attempt_id_invalid",
+                    normalized_attempt is not None
+                    and (
+                        _ATTEMPT_IDENTITY.fullmatch(normalized_attempt) is None
+                        or expected_attempt is None
+                        or normalized_attempt != expected_attempt
+                    ),
+                ),
+                ("builder_tag_missing", not _is_positive_int(builder_tag)),
+                ("ability_id_missing", not _is_positive_int(ability_id)),
+                ("world_target_missing", not _is_finite_point(world_target)),
+                (
+                    "target_state_revision_missing",
+                    target_state_revision is None or not str(target_state_revision),
+                ),
+                (
+                    "material_legality_identity_invalid",
+                    normalized_material is None,
+                ),
+            )
+            if invalid
+        )
+        material_evidence_valid = not invalid_evidence_reasons
+        if not material_evidence_valid:
+            return RawAuthoritativePreDispatchDecision(
+                operation_id=normalized_operation,
+                action_name=action_name or (ledger.action_name or ""),
+                command_id=command_id,
+                failure_code="build_started",
+                status=(
+                    RawAuthoritativePreDispatchStatus.DEFER_REPLAN.value
+                    if ledger.circuit_open
+                    else RawAuthoritativePreDispatchStatus.RETRY.value
+                ),
+                streak=ledger.streak,
+                threshold=ledger.threshold,
+                circuit_open=ledger.circuit_open,
+                duplicate_attempt=False,
+                attempt_id=normalized_attempt,
+                attempt_ordinal=attempt_ordinal,
+                builder_tag=builder_tag,
+                ability_id=ability_id,
+                world_target=world_target,
+                placement_revision=placement_revision,
+                target_state_revision=target_state_revision,
+                observation_revision=observation_revision,
+                observation_game_loop=observation_game_loop,
+                material_legality_identity=normalized_material,
+                material_evidence_valid=False,
+                invalid_evidence_reasons=invalid_evidence_reasons,
+                next_action="replan" if ledger.circuit_open else "retry",
+            )
         had_state = ledger.streak > 0 or ledger.circuit_open
         was_open = ledger.circuit_open
         ledger.streak = 0
@@ -1445,6 +1549,9 @@ class RawPlacementService:
             target_state_revision=target_state_revision,
             observation_revision=observation_revision,
             observation_game_loop=observation_game_loop,
+            material_legality_identity=normalized_material,
+            material_evidence_valid=True,
+            invalid_evidence_reasons=(),
             state_transition=("open_to_reset" if was_open else None),
             reset_reason=str(reason),
             next_action="retry",
@@ -2638,6 +2745,7 @@ class RawPlacementService:
                 placement_revision=placement.placement_revision,
                 target_state_revision=placement.target_state_revision,
                 observation_game_loop=game_loop,
+                material_legality_identity=placement.material_legality_identity,
             )
         )
         if placement.anchor_tag is not None and any(
@@ -2704,6 +2812,7 @@ class RawPlacementService:
                 placement_revision=placement.placement_revision,
                 target_state_revision=placement.target_state_revision,
                 observation_game_loop=game_loop,
+                material_legality_identity=placement.material_legality_identity,
             )
         )
         if placement.placement_state == "reserved":
@@ -2996,6 +3105,9 @@ class RawPlacementService:
         if no_start_decision is not None:
             transition["placement_no_start"] = no_start_decision.to_dict()
         if authoritative_pre_dispatch_decision is not None:
+            if reservation is not None:
+                transition["builder_tag"] = reservation.builder_tag
+                transition["world_target"] = reservation.world_target
             transition.update(
                 {
                     "operation_id": resolved_operation_id,

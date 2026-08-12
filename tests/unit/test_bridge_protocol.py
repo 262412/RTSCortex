@@ -12,7 +12,13 @@ from rtscortex_llm_pysc2.observation import ObservationMapper, canonical_actor, 
 from rtscortex_llm_pysc2.raw_placement import RawPlacementService
 from rtscortex_llm_pysc2.routing import ActionRouter, RoutedActionBatch
 
-from rtscortex.contracts import ActionBatch, ExecutionReport, ObservationEnvelope
+from rtscortex.contracts import (
+    ActionBatch,
+    ExecutionReport,
+    ObservationEnvelope,
+    PlacementLedgerEvent,
+)
+from rtscortex.cortex.operations import AttemptKey
 from rtscortex.runtime.validation import ActionValidator
 
 FIXTURES = Path(__file__).parents[1] / "fixtures" / "llm_pysc2"
@@ -153,6 +159,91 @@ def test_execution_tracker_rejects_authoritative_evidence_for_a_different_parent
 
     with pytest.raises(ValueError, match="execution parent identity"):
         ExecutionReport.model_validate(report)
+
+
+def test_authoritative_success_reset_round_trip_preserves_provenance() -> None:
+    operation_id = f"operation:{'a' * 64}"
+    command_id = "command-pylon-reset"
+    attempt_ordinal = 3
+    attempt_id = AttemptKey(
+        operation_id=operation_id,
+        command_id=command_id,
+        attempt_ordinal=attempt_ordinal,
+    ).attempt_id
+    material_identity = f"build-legality:{'b' * 64}"
+    payload = {
+        "protocol_version": "1.1",
+        "run_id": "run-fixture",
+        "episode_id": "episode-pvz-task1",
+        "step_id": 8,
+        "command_id": command_id,
+        "operation_id": operation_id,
+        "attempt_id": attempt_id,
+        "attempt_ordinal": attempt_ordinal,
+        "action_name": "Build_Pylon_Screen",
+        "transition_id": f"placement-transition:{'c' * 64}",
+        "builder_tag": "0xb1",
+        "builder_lease_state": None,
+        "transition": {
+            "operation_id": operation_id,
+            "command_id": command_id,
+            "action_name": "Build_Pylon_Screen",
+            "attempt_id": attempt_id,
+            "attempt_ordinal": attempt_ordinal,
+            "reservation_id": f"placement:{'d' * 64}",
+            "structure_type": "Pylon",
+            "footprint_cells": [[29, 24], [29, 25], [30, 24], [30, 25]],
+            "previous_state": "reserved",
+            "next_state": "build_started",
+            "failure_class": None,
+            "actor_failure": False,
+            "game_loop": 240,
+            "release_reason": "build_start_observed",
+            "target_state_revision": "target-revalidated",
+            "builder_tag": 0xB1,
+            "ability_id": 881,
+            "world_target": [30.0, 25.0],
+            "material_legality_identity": material_identity,
+            "authoritative_pre_dispatch": {
+                "operation_id": operation_id,
+                "action_name": "Build_Pylon_Screen",
+                "command_id": command_id,
+                "failure_code": "build_started",
+                "status": "reset",
+                "streak": 0,
+                "threshold": 3,
+                "circuit_open": False,
+                "duplicate_attempt": False,
+                "attempt_id": attempt_id,
+                "attempt_ordinal": attempt_ordinal,
+                "builder_tag": 0xB1,
+                "ability_id": 881,
+                "world_target": [30.0, 25.0],
+                "target_state_revision": "target-revalidated",
+                "material_legality_identity": material_identity,
+                "material_evidence_valid": True,
+                "invalid_evidence_reasons": [],
+                "state_transition": "open_to_reset",
+                "reset_reason": "build_started",
+                "next_action": "retry",
+            },
+        },
+    }
+
+    first = PlacementLedgerEvent.model_validate(payload)
+    second = PlacementLedgerEvent.model_validate(first.model_dump(mode="json"))
+
+    assert second == first
+    nested = second.transition.authoritative_pre_dispatch
+    assert nested is not None
+    assert nested.builder_tag == second.transition.builder_tag == 0xB1
+    assert nested.ability_id == second.transition.ability_id == 881
+    assert nested.world_target == second.transition.world_target == (30.0, 25.0)
+    assert (
+        nested.material_legality_identity
+        == second.transition.material_legality_identity
+        == material_identity
+    )
 
 
 def test_coordinator_calls_runtime_once_and_reports_execution() -> None:

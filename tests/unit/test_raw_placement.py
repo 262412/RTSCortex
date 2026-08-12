@@ -231,10 +231,18 @@ def test_authoritative_pre_dispatch_checkpoint_restore_and_success_reset() -> No
         action_name="Build_Pylon_Screen",
         attempt_id=_attempt_id(operation_id, "success", 3),
         attempt_ordinal=3,
+        builder_tag=0xB2,
+        ability_id=881,
+        world_target=(22.0, 24.0),
+        target_state_revision="target-revalidated",
+        material_legality_identity=_material_id("2"),
     )
     assert reset is not None
     assert reset.transition == "open_to_reset"
     assert reset.reset_reason == "build_started"
+    assert reset.material_legality_identity == _material_id("2")
+    assert reset.material_evidence_valid is True
+    assert reset.invalid_evidence_reasons == ()
     state = restored.authoritative_pre_dispatch_state(operation_id)
     assert state is not None
     assert state.circuit_open is False
@@ -265,6 +273,11 @@ def test_authoritative_pre_dispatch_success_clears_closed_streak_without_open_tr
         action_name="Build_Gateway_Screen",
         attempt_id=_attempt_id(operation_id, "gateway-success", 1),
         attempt_ordinal=1,
+        builder_tag=0xB1,
+        ability_id=883,
+        world_target=(24.0, 28.0),
+        target_state_revision="target-revalidated",
+        material_legality_identity=_material_id("4"),
     )
 
     assert reset is not None
@@ -274,6 +287,199 @@ def test_authoritative_pre_dispatch_success_clears_closed_streak_without_open_tr
     assert state is not None
     assert state.streak == 0
     assert state.circuit_open is False
+
+
+@pytest.mark.parametrize(
+    ("material_identity", "target_state_revision", "expected_reason"),
+    (
+        ("build-legality:1", "revalidated-target", "material_legality_identity_invalid"),
+        (_material_id("9"), None, "target_state_revision_missing"),
+    ),
+)
+def test_authoritative_success_reset_with_invalid_material_evidence_stays_open(
+    material_identity: str,
+    target_state_revision: str | None,
+    expected_reason: str,
+) -> None:
+    service = RawPlacementService(unit_names={})
+    operation_id = _operation_id("5")
+    for ordinal in range(3):
+        command_id = f"invalid-reset-{ordinal}"
+        service.record_authoritative_pre_dispatch_failure(
+            operation_id=operation_id,
+            action_name="Build_Pylon_Screen",
+            command_id=command_id,
+            failure_code="placement_candidate_stale",
+            attempt_id=_attempt_id(operation_id, command_id, ordinal),
+            attempt_ordinal=ordinal,
+            builder_tag=0xB1,
+            ability_id=881,
+            world_target=(22.0, 24.0),
+            target_state_revision="failed-target",
+            material_legality_identity=_material_id("5"),
+        )
+
+    reset = service.reset_authoritative_pre_dispatch(
+        operation_id,
+        reason="build_started",
+        command_id="invalid-reset-success",
+        action_name="Build_Pylon_Screen",
+        attempt_id=_attempt_id(operation_id, "invalid-reset-success", 3),
+        attempt_ordinal=3,
+        builder_tag=0xB2,
+        ability_id=881,
+        world_target=(22.0, 24.0),
+        target_state_revision=target_state_revision,
+        material_legality_identity=material_identity,
+    )
+
+    assert reset is not None
+    assert reset.status == "defer_replan"
+    assert reset.circuit_open is True
+    assert reset.state_transition is None
+    assert reset.material_evidence_valid is False
+    assert expected_reason in reset.invalid_evidence_reasons
+    state = service.authoritative_pre_dispatch_state(operation_id)
+    assert state is not None
+    assert state.circuit_open is True
+    assert state.streak == 3
+
+
+def test_mark_build_started_emits_complete_authoritative_success_reset_identity() -> None:
+    service = RawPlacementService(unit_names={2: "Probe"})
+    operation_id = _operation_id("6")
+    for ordinal in range(3):
+        command_id = f"start-failure-{ordinal}"
+        service.record_authoritative_pre_dispatch_failure(
+            operation_id=operation_id,
+            action_name="Build_Pylon_Screen",
+            command_id=command_id,
+            failure_code="placement_candidate_stale",
+            attempt_id=_attempt_id(operation_id, command_id, ordinal),
+            attempt_ordinal=ordinal,
+            builder_tag=0xB1,
+            ability_id=881,
+            world_target=(22.0, 24.0),
+            target_state_revision="failed-target",
+            material_legality_identity=_material_id("6"),
+        )
+    observation = SimpleNamespace(
+        raw_units=[_unit(0xB2, 2, alliance=1, x=20, y=20)],
+        feature_units=[],
+        feature_screen=None,
+        game_loop=[100],
+    )
+    command_id = "start-success"
+    attempt_id = _attempt_id(operation_id, command_id, 3)
+    service.resolve(
+        command_id=command_id,
+        operation_id=operation_id,
+        attempt_id=attempt_id,
+        attempt_ordinal=3,
+        action_name="Build_Pylon_Screen",
+        requested_arguments=([64, 64],),
+        observation=observation,
+        world_target=(22.0, 24.0),
+        builder_tag=0xB2,
+        ability_name="Build_Pylon_pt",
+    )
+    service.record_build_authorization(
+        command_id,
+        ability_id=881,
+        authorization=SimpleNamespace(
+            placement_query_status="Success",
+            available_ability_query="available",
+            target_legality_fingerprint=f"sc2:{'7' * 64}",
+            details={},
+        ),
+        game_loop=100,
+    )
+    reservation = service.command_target(command_id)
+    assert reservation is not None
+    assert reservation.material_legality_identity is not None
+
+    service.mark_build_started(command_id, game_loop=101, expires_game_loop=549)
+
+    transition = service.drain_transition_history(command_id)[-1]
+    nested = transition["authoritative_pre_dispatch"]
+    assert transition["builder_tag"] == reservation.builder_tag
+    assert transition["ability_id"] == reservation.ability_id
+    assert transition["world_target"] == reservation.world_target
+    assert transition["material_legality_identity"] == reservation.material_legality_identity
+    assert nested["operation_id"] == operation_id
+    assert nested["command_id"] == command_id
+    assert nested["attempt_id"] == attempt_id
+    assert nested["builder_tag"] == reservation.builder_tag
+    assert nested["ability_id"] == reservation.ability_id
+    assert nested["world_target"] == list(reservation.world_target)
+    assert nested["material_legality_identity"] == reservation.material_legality_identity
+    assert nested["material_evidence_valid"] is True
+    assert nested["invalid_evidence_reasons"] == []
+
+
+def test_confirm_command_emits_complete_authoritative_success_reset_identity() -> None:
+    service = RawPlacementService(unit_names={2: "Probe"})
+    operation_id = _operation_id("7")
+    failed_command = "confirm-failure"
+    service.record_authoritative_pre_dispatch_failure(
+        operation_id=operation_id,
+        action_name="Build_Pylon_Screen",
+        command_id=failed_command,
+        failure_code="placement_candidate_stale",
+        attempt_id=_attempt_id(operation_id, failed_command, 0),
+        attempt_ordinal=0,
+        builder_tag=0xB1,
+        ability_id=881,
+        world_target=(22.0, 24.0),
+        target_state_revision="failed-target",
+        material_legality_identity=_material_id("8"),
+    )
+    observation = SimpleNamespace(
+        raw_units=[_unit(0xB2, 2, alliance=1, x=20, y=20)],
+        feature_units=[],
+        feature_screen=None,
+        game_loop=[100],
+    )
+    command_id = "confirm-success"
+    attempt_id = _attempt_id(operation_id, command_id, 1)
+    service.resolve(
+        command_id=command_id,
+        operation_id=operation_id,
+        attempt_id=attempt_id,
+        attempt_ordinal=1,
+        action_name="Build_Pylon_Screen",
+        requested_arguments=([64, 64],),
+        observation=observation,
+        world_target=(22.0, 24.0),
+        builder_tag=0xB2,
+        ability_name="Build_Pylon_pt",
+    )
+    service.record_build_authorization(
+        command_id,
+        ability_id=881,
+        authorization=SimpleNamespace(
+            placement_query_status="Success",
+            available_ability_query="available",
+            target_legality_fingerprint=f"sc2:{'9' * 64}",
+            details={},
+        ),
+        game_loop=100,
+    )
+    reservation = service.command_target(command_id)
+    assert reservation is not None
+
+    service.confirm_command(command_id, game_loop=102)
+
+    transition = service.drain_transition_history(command_id)[-1]
+    nested = transition["authoritative_pre_dispatch"]
+    assert transition["next_state"] == "occupied"
+    assert nested["reset_reason"] == "effect_confirmed"
+    assert nested["builder_tag"] == reservation.builder_tag
+    assert nested["ability_id"] == reservation.ability_id
+    assert nested["world_target"] == list(reservation.world_target)
+    assert nested["material_legality_identity"] == reservation.material_legality_identity
+    assert nested["material_evidence_valid"] is True
+    assert nested["invalid_evidence_reasons"] == []
 
 
 def test_authoritative_pre_dispatch_operation_state_is_isolated() -> None:

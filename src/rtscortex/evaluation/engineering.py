@@ -215,7 +215,7 @@ def build_engineering_gate_report(
     ]
     defense_audit = _defense_inventory_audit(defense_evaluations)
     semantic_build_audit = _semantic_build_operation_audit(retained)
-    authoritative_pre_dispatch_audit = _authoritative_build_pre_dispatch_audit(retained)
+    authoritative_pre_dispatch_audit = authoritative_build_pre_dispatch_audit(retained)
     terminal_collapse_macro_audit = _terminal_collapse_macro_dispatch_audit(retained)
     performance = _last_payload(retained, "event_store_performance")
     recovery_events = [
@@ -624,6 +624,20 @@ def _finite_world_point(value: Any) -> tuple[float, float] | None:
     return float(value[0]), float(value[1])
 
 
+def _positive_unit_tag(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if isinstance(value, str):
+        try:
+            parsed = int(value, 0)
+        except ValueError:
+            return None
+        return parsed if parsed > 0 else None
+    return None
+
+
 def _authoritative_attempt_identity(
     operation_id: str,
     command_id: str,
@@ -653,7 +667,7 @@ def _authoritative_pre_dispatch_evidence(payload: dict[str, Any]) -> dict[str, A
     return None
 
 
-def _authoritative_build_pre_dispatch_audit(
+def authoritative_build_pre_dispatch_audit(
     events: Sequence[StoredEvent],
 ) -> dict[str, Any]:
     """Replay the raw Build boundary instead of trusting producer summaries.
@@ -787,7 +801,20 @@ def _authoritative_build_pre_dispatch_audit(
                 and next_state == "occupied"
             ):
                 parent_mismatch = True
+            if any(
+                (
+                    _positive_unit_tag(parent.get("builder_tag")) != builder_tag,
+                    parent.get("ability_id") != ability_id,
+                    _finite_world_point(parent.get("world_target")) != world_target,
+                    _string_value(parent.get("target_state_revision"))
+                    != _string_value(evidence.get("target_state_revision")),
+                    parent_material_identity != material_identity,
+                )
+            ):
+                parent_mismatch = True
         failure = failure_code in _AUTHORITATIVE_BUILD_PRE_DISPATCH_CODES and status != "reset"
+        success_reset = status == "reset"
+        material_identity_required = failure or success_reset
         attempt_ordinal_valid = isinstance(attempt_ordinal, int) and not isinstance(
             attempt_ordinal, bool
         )
@@ -814,9 +841,13 @@ def _authoritative_build_pre_dispatch_audit(
             and len(action_name) > len("Build_")
             and identity_attempt_valid
             and attempt_ordinal_valid
-            and (not failure or _typed_digest_identity(material_identity, "build-legality:"))
             and (
-                not failure
+                not material_identity_required
+                or _typed_digest_identity(material_identity, "build-legality:")
+            )
+            and (not success_reset or bool(_string_value(evidence.get("target_state_revision"))))
+            and (
+                not material_identity_required
                 or (
                     isinstance(builder_tag, int)
                     and not isinstance(builder_tag, bool)
