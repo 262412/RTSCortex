@@ -22,6 +22,7 @@ from rtscortex_llm_pysc2.extractor import (
 from rtscortex_llm_pysc2.observation import split_actor
 from rtscortex_llm_pysc2.production import production_spec
 from rtscortex_llm_pysc2.raw_placement import (
+    _AUTHORITATIVE_PRE_DISPATCH_FAILURE_CODES,
     RawPlacementFailure,
     RawPlacementService,
     _placement_candidate_id,
@@ -61,6 +62,9 @@ _NONSPATIAL_BUILD_FAILURE_CODES = frozenset(
         "placement_query_rejected",
         "placement_query_unavailable",
         "placement_query_rejected_cached",
+        "authoritative_pre_dispatch_circuit_open",
+        "placement_candidate_stale",
+        "no_legal_placement",
         TerminalCollapseReason.NON_RECOVERY_MACRO_DISPATCH.value,
     }
 )
@@ -381,8 +385,14 @@ class RawActionExecutor:
             "failure_code": failure_code,
             "game_loop": game_loop,
             "operation_id": command.operation_id,
+            "attempt_id": command.attempt_id,
             "attempt_ordinal": command.attempt_ordinal,
             "builder_tag": None if dispatch is None else dispatch.builder_tag,
+            "ability_id": (
+                None
+                if dispatch is None or dispatch.build_authorization is None
+                else dispatch.build_authorization.ability_id
+            ),
             "placement_revision": command.placement_revision,
             "target_state_revision": None,
             "material_legality_identity": None,
@@ -392,6 +402,7 @@ class RawActionExecutor:
         }
         if reservation is not None:
             values["operation_id"] = values["operation_id"] or reservation.operation_id
+            values["attempt_id"] = values["attempt_id"] or reservation.attempt_id
             values["attempt_ordinal"] = (
                 reservation.attempt_ordinal
                 if reservation.attempt_ordinal is not None
@@ -482,6 +493,14 @@ class RawActionExecutor:
                     ordinal=0,
                     total=1,
                     failure_code=error.code,
+                    authoritative_pre_dispatch=(
+                        error.details.get("authoritative_pre_dispatch")
+                        if isinstance(
+                            error.details.get("authoritative_pre_dispatch"),
+                            dict,
+                        )
+                        else None
+                    ),
                     requested_function_id=0,
                     emitted_function_id=0,
                 )
@@ -595,6 +614,65 @@ class RawActionExecutor:
                 )
             builder_tag = available_builders[0]
             function = getattr(actions.RAW_FUNCTIONS, _BUILD_RAW_FUNCTIONS[name])
+            ability_id = int(getattr(function, "ability_id", 0))
+            pre_dispatch_target = _pre_dispatch_world_target(command, observation, name)
+            pre_dispatch_target_state_revision = _pre_dispatch_target_state_revision(
+                self.placement_service,
+                observation=observation,
+                action_name=name,
+                world_target=pre_dispatch_target,
+                # Screen-placement provenance may carry the Builder tag as its
+                # anchor.  It is not a resource anchor and must not become part
+                # of the target-state identity; RawPlacementService.resolve()
+                # deliberately uses no anchor for screen builds.
+                anchor_tag=(None if name.endswith("_Screen") else command.screen_anchor_tag),
+            )
+            pre_dispatch_material_identity = _pre_dispatch_material_identity(
+                self.placement_service,
+                operation_id=command.operation_id,
+                builder_tag=builder_tag,
+                ability_id=ability_id,
+                world_target=pre_dispatch_target,
+                target_state_revision=pre_dispatch_target_state_revision,
+            )
+            if command.operation_id is not None and not _authoritative_pre_dispatch_retry_allowed(
+                self.placement_service,
+                operation_id=command.operation_id,
+                builder_tag=builder_tag,
+                ability_id=ability_id,
+                world_target=pre_dispatch_target,
+                target_state_revision=pre_dispatch_target_state_revision,
+                material_legality_identity=pre_dispatch_material_identity,
+            ):
+                decision = _record_authoritative_pre_dispatch_failure(
+                    self.placement_service,
+                    {
+                        "operation_id": command.operation_id,
+                        "action_name": name,
+                        "command_id": command.command_id,
+                        "failure_code": "authoritative_pre_dispatch_circuit_open",
+                        "attempt_id": command.attempt_id,
+                        "attempt_ordinal": command.attempt_ordinal,
+                        "builder_tag": builder_tag,
+                        "ability_id": ability_id,
+                        "world_target": pre_dispatch_target,
+                        "placement_revision": command.placement_revision,
+                        "target_state_revision": pre_dispatch_target_state_revision,
+                        "observation_revision": _placement_revision(observation),
+                        "observation_game_loop": _game_loop(observation),
+                        "material_legality_identity": pre_dispatch_material_identity,
+                    },
+                )
+                raise _RawDispatchFailure(
+                    "authoritative_pre_dispatch_circuit_open",
+                    f"{name} operation {command.operation_id} remains authoritative "
+                    "pre-dispatch circuit-open",
+                    details={
+                        "authoritative_pre_dispatch": (
+                            None if decision is None else decision.to_dict()
+                        )
+                    },
+                )
             try:
                 placement = self.placement_service.resolve(
                     command_id=command.command_id,
@@ -606,6 +684,7 @@ class RawActionExecutor:
                     builder_tags=available_builders,
                     builder_tag=builder_tag,
                     operation_id=command.operation_id,
+                    attempt_id=command.attempt_id,
                     attempt_ordinal=command.attempt_ordinal,
                     ability_name=_BUILD_RAW_FUNCTIONS[name],
                     episode_id=command.episode_id or "unknown",
@@ -613,6 +692,35 @@ class RawActionExecutor:
                     candidate_placement_revision=command.placement_revision,
                 )
             except RawPlacementFailure as error:
+                if error.code in _AUTHORITATIVE_PRE_DISPATCH_FAILURE_CODES:
+                    decision = _record_authoritative_pre_dispatch_failure(
+                        self.placement_service,
+                        {
+                            "operation_id": command.operation_id,
+                            "action_name": name,
+                            "command_id": command.command_id,
+                            "failure_code": error.code,
+                            "attempt_id": command.attempt_id,
+                            "attempt_ordinal": command.attempt_ordinal,
+                            "builder_tag": builder_tag,
+                            "ability_id": ability_id,
+                            "world_target": pre_dispatch_target,
+                            "placement_revision": command.placement_revision,
+                            "target_state_revision": pre_dispatch_target_state_revision,
+                            "observation_revision": _placement_revision(observation),
+                            "observation_game_loop": _game_loop(observation),
+                            "material_legality_identity": pre_dispatch_material_identity,
+                        },
+                    )
+                    raise _RawDispatchFailure(
+                        error.code,
+                        str(error),
+                        details={
+                            "authoritative_pre_dispatch": (
+                                None if decision is None else decision.to_dict()
+                            )
+                        },
+                    ) from error
                 if command.operation_id is not None and not _operation_retry_allowed(
                     self.placement_service,
                     operation_id=command.operation_id,
@@ -697,7 +805,6 @@ class RawActionExecutor:
                     approach_only=True,
                     approach_target=placement.world_target,
                 )
-            ability_id = int(getattr(function, "ability_id", 0))
             if self.placement_service.build_authorization_was_rejected(
                 operation_id=command.operation_id,
                 builder_tag=builder_tag,
@@ -705,6 +812,36 @@ class RawActionExecutor:
                 world_target=placement.world_target,
                 target_state_revision=placement.target_state_revision,
             ):
+                cached_material_identity = (
+                    _failed_authorization_material_identity(
+                        self.placement_service,
+                        operation_id=command.operation_id,
+                        builder_tag=builder_tag,
+                        ability_id=ability_id,
+                        world_target=placement.world_target,
+                        target_state_revision=placement.target_state_revision,
+                    )
+                    or placement.material_legality_identity
+                )
+                decision = _record_authoritative_pre_dispatch_failure(
+                    self.placement_service,
+                    {
+                        "operation_id": command.operation_id,
+                        "action_name": name,
+                        "command_id": command.command_id,
+                        "failure_code": "placement_query_rejected_cached",
+                        "attempt_id": command.attempt_id,
+                        "attempt_ordinal": command.attempt_ordinal,
+                        "builder_tag": builder_tag,
+                        "ability_id": ability_id,
+                        "world_target": placement.world_target,
+                        "placement_revision": placement.placement_revision,
+                        "target_state_revision": placement.target_state_revision,
+                        "observation_revision": _placement_revision(observation),
+                        "observation_game_loop": _game_loop(observation),
+                        "material_legality_identity": cached_material_identity,
+                    },
+                )
                 self.placement_service.release_command(
                     command.command_id,
                     game_loop=_game_loop(observation),
@@ -718,6 +855,9 @@ class RawActionExecutor:
                         "ability_id": ability_id,
                         "world_target": tuple(float(value) for value in placement.world_target),
                         "target_state_revision": placement.target_state_revision,
+                        "authoritative_pre_dispatch": (
+                            None if decision is None else decision.to_dict()
+                        ),
                     },
                 )
             authorization = self._authorize_build(
@@ -916,6 +1056,7 @@ class RawActionExecutor:
         )
         if authorization.authorized:
             return authorization
+        decision = None
         if authorization.ability_available is False:
             code = "builder_ability_unavailable"
             reason = f"builder {hex(builder_tag)} lacks ability {ability_id}"
@@ -932,12 +1073,41 @@ class RawActionExecutor:
                 authorization.ability_available is True
                 and authorization.placement_result is not None
             ):
+                authorized_placement = self.placement_service.command_target(command.command_id)
                 self.placement_service.record_failed_build_authorization(
                     operation_id=command.operation_id,
                     builder_tag=builder_tag,
                     ability_id=ability_id,
                     world_target=placement.world_target,
                     target_state_revision=placement.target_state_revision,
+                    material_legality_identity=(
+                        None
+                        if authorized_placement is None
+                        else authorized_placement.material_legality_identity
+                    ),
+                )
+                decision = _record_authoritative_pre_dispatch_failure(
+                    self.placement_service,
+                    {
+                        "operation_id": command.operation_id,
+                        "action_name": command.name,
+                        "command_id": command.command_id,
+                        "failure_code": code,
+                        "attempt_id": command.attempt_id,
+                        "attempt_ordinal": command.attempt_ordinal,
+                        "builder_tag": builder_tag,
+                        "ability_id": ability_id,
+                        "world_target": placement.world_target,
+                        "placement_revision": placement.placement_revision,
+                        "target_state_revision": placement.target_state_revision,
+                        "observation_revision": _placement_revision(observation),
+                        "observation_game_loop": _game_loop(observation),
+                        "material_legality_identity": (
+                            None
+                            if authorized_placement is None
+                            else authorized_placement.material_legality_identity
+                        ),
+                    },
                 )
         self.placement_service.release_command(
             command.command_id,
@@ -962,6 +1132,7 @@ class RawActionExecutor:
                     )
                 ),
                 **authorization.to_dict(),
+                "authoritative_pre_dispatch": (None if decision is None else decision.to_dict()),
             },
         )
 
@@ -1041,6 +1212,117 @@ def _call_optional_service_method(method: Any, values: Mapping[str, Any]) -> Any
     return method(**accepted)
 
 
+def _pre_dispatch_world_target(
+    command: RoutedCommand,
+    observation: Any,
+    action_name: str,
+) -> tuple[float, float] | None:
+    target = command.screen_world_target
+    if target is not None:
+        if action_name.endswith("_Screen"):
+            return float(round(target[0])), float(round(target[1]))
+        return float(target[0]), float(target[1])
+    if action_name == "Build_Assimilator_Near" and command.requested_arguments:
+        try:
+            anchor = _tag_argument(command.requested_arguments, action_name=action_name)
+        except RawPlacementFailure:
+            return None
+        unit = _unit_by_tag(observation, anchor)
+        if unit is None:
+            return None
+        return float(_value(unit, "x", 0.0)), float(_value(unit, "y", 0.0))
+    return None
+
+
+def _pre_dispatch_target_state_revision(
+    placement_service: Any,
+    *,
+    observation: Any,
+    action_name: str,
+    world_target: tuple[float, float] | None,
+    anchor_tag: int | None,
+) -> str | None:
+    method = getattr(placement_service, "target_state_revision_for", None)
+    if method is None or world_target is None:
+        return None
+    result = _call_optional_service_method(
+        method,
+        {
+            "observation": observation,
+            "action_name": action_name,
+            "world_target": world_target,
+            "anchor_tag": anchor_tag,
+        },
+    )
+    return None if result is None else str(result)
+
+
+def _failed_authorization_material_identity(
+    placement_service: Any,
+    *,
+    operation_id: str | None,
+    builder_tag: int,
+    ability_id: int,
+    world_target: tuple[float, float],
+    target_state_revision: str | None,
+) -> str | None:
+    method = getattr(placement_service, "failed_build_authorization_material_identity", None)
+    if method is None:
+        return None
+    result = _call_optional_service_method(
+        method,
+        {
+            "operation_id": operation_id,
+            "builder_tag": builder_tag,
+            "ability_id": ability_id,
+            "world_target": world_target,
+            "target_state_revision": target_state_revision,
+        },
+    )
+    return None if result is None else str(result)
+
+
+def _pre_dispatch_material_identity(
+    placement_service: Any,
+    *,
+    operation_id: str | None,
+    builder_tag: int | None,
+    ability_id: int | None,
+    world_target: tuple[float, float] | None,
+    target_state_revision: str | None,
+) -> str | None:
+    if (
+        operation_id is not None
+        and builder_tag is not None
+        and ability_id is not None
+        and world_target is not None
+    ):
+        cached = _failed_authorization_material_identity(
+            placement_service,
+            operation_id=operation_id,
+            builder_tag=builder_tag,
+            ability_id=ability_id,
+            world_target=world_target,
+            target_state_revision=target_state_revision,
+        )
+        if cached is not None:
+            return str(cached)
+    method = getattr(placement_service, "authoritative_pre_dispatch_material_identity", None)
+    if method is None:
+        return None
+    result = _call_optional_service_method(
+        method,
+        {
+            "operation_id": operation_id,
+            "builder_tag": builder_tag,
+            "ability_id": ability_id,
+            "world_target": world_target,
+            "target_state_revision": target_state_revision,
+        },
+    )
+    return None if result is None else str(result)
+
+
 def _operation_retry_allowed(
     placement_service: Any,
     *,
@@ -1071,6 +1353,47 @@ def _operation_retry_allowed(
         },
     )
     return True if result is None else bool(result)
+
+
+def _authoritative_pre_dispatch_retry_allowed(
+    placement_service: Any,
+    *,
+    operation_id: str,
+    builder_tag: int | None,
+    ability_id: int | None,
+    world_target: tuple[float, float] | None,
+    target_state_revision: str | None,
+    material_legality_identity: str | None,
+) -> bool:
+    """Honor the distinct authoritative pre-dispatch circuit when available."""
+
+    method = getattr(placement_service, "authoritative_pre_dispatch_retry_allowed", None)
+    if method is None:
+        return True
+    result = _call_optional_service_method(
+        method,
+        {
+            "operation_id": operation_id,
+            "builder_tag": builder_tag,
+            "ability_id": ability_id,
+            "world_target": world_target,
+            "target_state_revision": target_state_revision,
+            "material_legality_identity": material_legality_identity,
+        },
+    )
+    return True if result is None else bool(result)
+
+
+def _record_authoritative_pre_dispatch_failure(
+    placement_service: Any,
+    values: Mapping[str, Any],
+) -> Any:
+    """Record a typed authoritative failure without requiring a reservation."""
+
+    method = getattr(placement_service, "record_authoritative_pre_dispatch_failure", None)
+    if method is None:
+        return None
+    return _call_optional_service_method(method, values)
 
 
 def _resolve_builder_tags(

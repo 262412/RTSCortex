@@ -111,7 +111,7 @@ uv run python scripts/run_recovery_acceptance_canary.py \
   --expected-git-sha "${expected_git_sha}" \
   --output "${recovery_evidence}"
 
-printf "experiment_kind\tmode\tseed\tarm\tsubject_arm\tarm_order\texit_code\trun_dir\tplaybook_before_sha256\tplaybook_after_sha256\tplaybook_before_snapshot\tplaybook_after_snapshot\tgit_head_before\tgit_head_after\tsuperproject_dirty_before\tsuperproject_dirty_after\tsubmodule_commit_before\tsubmodule_commit_after\tsubmodule_dirty_before\tsubmodule_dirty_after\tsubmodule_gitlink_before\tsubmodule_gitlink_after\tsubmodule_diff_sha256_before\tsubmodule_diff_sha256_after\treviewed_source_commit_before\treviewed_source_commit_after\treviewed_source_diff_sha256_before\treviewed_source_diff_sha256_after\treviewed_source_tree_sha256_before\treviewed_source_tree_sha256_after\n" > "${status_file}"
+printf "experiment_kind\tmode\tseed\tarm\tsubject_arm\tarm_order\texit_code\trun_dir\tevents_sha256\tsummary_sha256\tplaybook_before_sha256\tplaybook_after_sha256\tplaybook_before_snapshot\tplaybook_after_snapshot\tgit_head_before\tgit_head_after\tsuperproject_dirty_before\tsuperproject_dirty_after\tsubmodule_commit_before\tsubmodule_commit_after\tsubmodule_dirty_before\tsubmodule_dirty_after\tsubmodule_gitlink_before\tsubmodule_gitlink_after\tsubmodule_diff_sha256_before\tsubmodule_diff_sha256_after\treviewed_source_commit_before\treviewed_source_commit_after\treviewed_source_diff_sha256_before\treviewed_source_diff_sha256_after\treviewed_source_tree_sha256_before\treviewed_source_tree_sha256_after\n" > "${status_file}"
 
 run_canary_arm() {
   local kind="$1"
@@ -151,6 +151,10 @@ run_canary_arm() {
     HF_HUB_OFFLINE=1 \
     TRANSFORMERS_OFFLINE=1 \
     TOKENIZERS_PARALLELISM=false \
+    RTSCORTEX_EXPERIMENT_MODE=causal_canary \
+    RTSCORTEX_EXPERIMENT_KIND="${kind}" \
+    RTSCORTEX_EXPERIMENT_ARM="${arm}" \
+    RTSCORTEX_EXPERIMENT_SUBJECT_ARM="${subject_arm}" \
     uv run rtscortex run \
       --config "${config}" \
       --seed "${seed}" \
@@ -167,6 +171,14 @@ run_canary_arm() {
       "${log_path}" \
       | tail -n 1
   )"
+  local events_sha256=""
+  local summary_sha256=""
+  if [[ -n "${run_dir}" && -f "${run_dir}/events.jsonl" ]]; then
+    events_sha256="$(sha256sum "${run_dir}/events.jsonl" | awk '{print $1}')"
+  fi
+  if [[ -n "${run_dir}" && -f "${run_dir}/summary.json" ]]; then
+    summary_sha256="$(sha256sum "${run_dir}/summary.json" | awk '{print $1}')"
+  fi
   local after_sha256
   after_sha256="$(sha256sum "${working_playbook}" | awk '{print $1}')"
   cp "${working_playbook}" "${after_snapshot}"
@@ -201,7 +213,8 @@ run_canary_arm() {
   fi
   local fields=(
     "${kind}" "causal_canary" "${seed}" "${arm}" "${subject_arm}" "active,shadow"
-    "${run_status}" "${run_dir}" "${before_sha256}" "${after_sha256}"
+    "${run_status}" "${run_dir}" "${events_sha256}" "${summary_sha256}"
+    "${before_sha256}" "${after_sha256}"
     "${before_snapshot}" "${after_snapshot}" "${git_head}" "${git_head_after}"
     "${superproject_dirty}" "${dirty_after}" "${submodule_commit}"
     "${submodule_commit_after}" "${submodule_dirty}" "${submodule_dirty_after}"

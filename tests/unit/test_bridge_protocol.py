@@ -118,6 +118,43 @@ def test_execution_tracker_aggregates_multiple_pysc2_primitives() -> None:
     assert validated.primitive_trace[1].emitted_function_id == 12
 
 
+def test_execution_tracker_rejects_authoritative_evidence_for_a_different_parent_action() -> None:
+    route = _fixture_route()
+    tracker = ExecutionTracker()
+    tracker.register(route)
+    evidence = {
+        "operation_id": None,
+        "action_name": "Build_Pylon_Screen",
+        "command_id": "command-adept-attack",
+        "failure_code": "placement_query_rejected",
+        "status": "retry",
+        "streak": 1,
+        "threshold": 3,
+        "circuit_open": False,
+        "duplicate_attempt": False,
+        "attempt_ordinal": None,
+        "builder_tag": 0xB1,
+        "ability_id": 881,
+        "world_target": [30.0, 25.0],
+        "material_legality_identity": f"build-legality:{'a' * 64}",
+        "material_evidence_valid": False,
+        "invalid_evidence_reasons": ["operation_id_missing"],
+        "next_action": "retry",
+    }
+    tracker.record_primitive(
+        "command-adept-attack",
+        "raw_pre_dispatch",
+        success=False,
+        failure_code="placement_query_rejected",
+        authoritative_pre_dispatch=evidence,
+    )
+
+    report = tracker.complete("command-adept-attack")
+
+    with pytest.raises(ValueError, match="execution parent identity"):
+        ExecutionReport.model_validate(report)
+
+
 def test_coordinator_calls_runtime_once_and_reports_execution() -> None:
     runtime = FakeRuntime(load_fixture("action_batch.json"))
     coordinator = BridgeCoordinator(runtime)

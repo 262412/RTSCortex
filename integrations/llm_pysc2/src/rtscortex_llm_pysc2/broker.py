@@ -48,6 +48,7 @@ class PrimitiveDispatch:
     failure_code: Optional[str] = None
     requested_function_id: Optional[int] = None
     emitted_function_id: Optional[int] = None
+    authoritative_pre_dispatch: Optional[dict[str, Any]] = None
 
 
 @dataclass
@@ -714,6 +715,7 @@ class SharedDecisionBroker:
             total=dispatch.total,
             game_loop=game_loop,
             failure_code=dispatch.failure_code,
+            authoritative_pre_dispatch=dispatch.authoritative_pre_dispatch,
             requested_function_id=dispatch.requested_function_id,
             emitted_function_id=dispatch.emitted_function_id,
         )

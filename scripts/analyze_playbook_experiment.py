@@ -6,6 +6,8 @@ import argparse
 import csv
 import hashlib
 import json
+import math
+import re
 import resource
 from collections import Counter
 from dataclasses import asdict, dataclass, field
@@ -19,6 +21,8 @@ from rtscortex.evaluation.engineering import (
     EngineeringAccumulator,
     build_engineering_gate_report,
 )
+from rtscortex.evaluation.metrics import compute_execution_metrics
+from rtscortex.evaluation.report import _build_run_summary
 from rtscortex.memory import read_event_log
 
 _ERROR_CONSEQUENCES = frozenset(
@@ -33,6 +37,34 @@ _ERROR_CONSEQUENCES = frozenset(
 )
 MAX_RULE_EVALUATIONS = 100_000
 MAX_METRIC_STATE_KEYS = 100_000
+GAMEPLAY_GATE_NAMES = (
+    "upstream_placement_rejections",
+    "meaningful_command_success_rate",
+    "completed_execution_success_rate",
+    "build_pre_dispatch_rejection_rate",
+)
+CANARY_GATE_KEYS_BASE = frozenset(
+    {
+        "hard_readiness_accepted",
+        "runs_exit_zero",
+        "execution_seed_contract",
+        "runs_complete_for_kind",
+        "source_attestation_matches",
+        "active_hard_block_observed",
+        "all_active_hard_blocks_matched",
+        "matched_prestate_identity",
+        "rule_evaluation_kind_consistent",
+        "analysis_memory_budget_respected",
+        "active_role_contract",
+        "shadow_role_contract",
+        "run_identity_contract",
+        "matching_provenance",
+        "active_block_prestate_identity",
+    }
+)
+CANARY_GATE_KEYS_PRODUCTION = CANARY_GATE_KEYS_BASE | {"terminal_counterfactual_resolved"}
+CANARY_GATE_KEYS_FIXTURE = CANARY_GATE_KEYS_BASE | {"matched_shadow_guard_allow_observed"}
+_SHA256_RE = re.compile(r"[0-9a-f]{64}")
 
 
 @dataclass
@@ -131,6 +163,19 @@ class RunMetrics:
     active_hard_block_records: tuple[tuple[str, int, str], ...] = ()
     counterfactual_state_records: tuple[tuple[int, str, str], ...] = ()
     hard_rule_kind_records: tuple[tuple[str, str], ...] = ()
+    gameplay_metrics: dict[str, int | float] = field(default_factory=dict)
+    gameplay_gate_results: dict[str, bool] = field(
+        default_factory=lambda: {name: False for name in GAMEPLAY_GATE_NAMES}
+    )
+    gameplay_acceptance_accepted: bool = False
+    events_sha256: str | None = None
+    summary_sha256: str | None = None
+    artifact_integrity_valid: bool = False
+    legacy_acceptance_valid: bool = False
+    event_identity_valid: bool = True
+    event_run_id: str | None = None
+    event_episode_ids: tuple[str, ...] = ()
+    source_attestation: dict[str, str] = field(default_factory=dict)
 
 
 def main() -> None:
@@ -169,6 +214,10 @@ def main() -> None:
         counterfactual_canary=counterfactual_canary,
         expected_git_sha=arguments.expected_git_sha,
         expected_seeds=tuple(arguments.expected_seeds or (0, 1, 2)),
+        run_set_dir=run_set,
+        counterfactual_canary_run_set_dir=(
+            arguments.counterfactual_canary.expanduser().resolve().parent
+        ),
     )
     (run_set / "comparison.json").write_text(
         json.dumps(report, indent=2, sort_keys=True) + "\n",
@@ -185,10 +234,11 @@ def _run_metrics(
     expected_git_sha: str | None = None,
     recovery_evidence: dict[str, Any] | None = None,
     metric_state_limit: int = MAX_METRIC_STATE_KEYS,
+    persist_engineering_report: bool = True,
 ) -> RunMetrics:
     run_dir_value = row.get("run_dir", "").strip()
     run_dir = (
-        Path(run_dir_value).expanduser()
+        Path(run_dir_value).expanduser().resolve()
         if run_dir_value
         else Path("/__rtscortex_missing_run_dir__")
     )
@@ -432,7 +482,7 @@ def _run_metrics(
         recovery_evidence=recovery_evidence,
         expected_git_sha=expected_git_sha,
     )
-    if run_dir.is_dir():
+    if persist_engineering_report and run_dir.is_dir():
         (run_dir / ENGINEERING_GATES_FILENAME).write_text(
             json.dumps(engineering, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
@@ -441,6 +491,20 @@ def _run_metrics(
         name: engineering.get("gates", {}).get(name, {}).get("passed") is True
         for name in REQUIRED_ENGINEERING_GATES
     }
+    gameplay_metrics, gameplay_gate_results = _recompute_gameplay_acceptance(journal)
+    (
+        events_sha256,
+        summary_sha256,
+        artifact_integrity_valid,
+        legacy_acceptance_valid,
+    ) = _validate_run_artifacts(
+        run_dir,
+        row,
+    )
+    event_identity_valid, event_run_id, event_episode_ids = _validate_event_identity(
+        run_dir,
+        row,
+    )
     git_head_before = row.get("git_head_before") or row.get("git_head", "")
     git_head_after = row.get("git_head_after") or row.get("git_head", "")
     dirty_before = row.get("superproject_dirty_before") or row.get("git_dirty", "")
@@ -606,7 +670,271 @@ def _run_metrics(
         active_hard_block_records=active_hard_block_records,
         counterfactual_state_records=counterfactual_state_records,
         hard_rule_kind_records=hard_rule_kind_records,
+        gameplay_metrics=gameplay_metrics,
+        gameplay_gate_results=gameplay_gate_results,
+        gameplay_acceptance_accepted=(
+            artifact_integrity_valid
+            and legacy_acceptance_valid
+            and all(gameplay_gate_results.values())
+        ),
+        events_sha256=events_sha256,
+        summary_sha256=summary_sha256,
+        artifact_integrity_valid=artifact_integrity_valid,
+        legacy_acceptance_valid=legacy_acceptance_valid,
+        event_identity_valid=event_identity_valid,
+        event_run_id=event_run_id,
+        event_episode_ids=event_episode_ids,
+        source_attestation={
+            "git_head_before": git_head_before,
+            "git_head_after": git_head_after,
+            "superproject_dirty_before": dirty_before,
+            "superproject_dirty_after": dirty_after,
+            "submodule_commit_before": submodule_commit_before,
+            "submodule_commit_after": submodule_commit_after,
+            "submodule_dirty_before": submodule_dirty_before,
+            "submodule_dirty_after": submodule_dirty_after,
+            "submodule_gitlink_before": submodule_gitlink_before,
+            "submodule_gitlink_after": submodule_gitlink_after,
+            "submodule_diff_sha256_before": submodule_diff_before,
+            "submodule_diff_sha256_after": submodule_diff_after,
+            "reviewed_source_commit_before": reviewed_source_commit_before,
+            "reviewed_source_commit_after": reviewed_source_commit_after,
+            "reviewed_source_diff_sha256_before": reviewed_source_diff_before,
+            "reviewed_source_diff_sha256_after": reviewed_source_diff_after,
+            "reviewed_source_tree_sha256_before": reviewed_source_tree_before,
+            "reviewed_source_tree_sha256_after": reviewed_source_tree_after,
+        },
     )
+
+
+def _recompute_gameplay_acceptance(
+    journal: Path,
+) -> tuple[dict[str, int | float], dict[str, bool]]:
+    """Recompute the gameplay contract directly from the immutable event journal."""
+
+    if not journal.is_file():
+        return {}, {name: False for name in GAMEPLAY_GATE_NAMES}
+    try:
+        execution = compute_execution_metrics(list(read_event_log(journal)))
+    except (OSError, TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        return {}, {name: False for name in GAMEPLAY_GATE_NAMES}
+    values: dict[str, int | float] = {
+        "upstream_placement_rejections": execution.upstream_placement_rejections,
+        "meaningful_command_success_rate": execution.meaningful_action_success_rate,
+        "completed_execution_success_rate": execution.completed_execution_success_rate,
+        "build_pre_dispatch_rejection_rate": execution.build_pre_dispatch_rejection_rate,
+    }
+    gates = {
+        "upstream_placement_rejections": (
+            type(values["upstream_placement_rejections"]) is int
+            and values["upstream_placement_rejections"] == 0
+        ),
+        "meaningful_command_success_rate": _finite_ratio_at_least(
+            values["meaningful_command_success_rate"], 0.70
+        ),
+        "completed_execution_success_rate": _finite_ratio_at_least(
+            values["completed_execution_success_rate"], 0.75
+        ),
+        "build_pre_dispatch_rejection_rate": _finite_ratio_at_most(
+            values["build_pre_dispatch_rejection_rate"], 0.05
+        ),
+    }
+    return values, gates
+
+
+def _finite_ratio_at_least(value: int | float, threshold: float) -> bool:
+    return (
+        isinstance(value, int | float)
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+        and value >= threshold
+    )
+
+
+def _finite_ratio_at_most(value: int | float, threshold: float) -> bool:
+    return (
+        isinstance(value, int | float)
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+        and value <= threshold
+    )
+
+
+def _validate_run_artifacts(
+    run_dir: Path,
+    row: dict[str, str],
+) -> tuple[str | None, str | None, bool, bool]:
+    """Validate status-file hashes and the summary schema before accepting a run."""
+
+    events_path = run_dir / "events.jsonl"
+    summary_path = run_dir / "summary.json"
+    events_sha256 = row.get("events_sha256")
+    summary_sha256 = row.get("summary_sha256")
+    if not (
+        isinstance(events_sha256, str)
+        and isinstance(summary_sha256, str)
+        and _SHA256_RE.fullmatch(events_sha256)
+        and _SHA256_RE.fullmatch(summary_sha256)
+        and events_path.is_file()
+        and summary_path.is_file()
+    ):
+        return events_sha256 or None, summary_sha256 or None, False, False
+    try:
+        actual_events_sha256 = _sha256_file(events_path)
+        actual_summary_sha256 = _sha256_file(summary_path)
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        events = list(read_event_log(events_path))
+        canonical_summary = _build_run_summary(events)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+        return events_sha256, summary_sha256, False, False
+    schema_valid = _summary_schema_is_valid(summary)
+    canonical_valid = summary == canonical_summary
+    return (
+        events_sha256,
+        summary_sha256,
+        actual_events_sha256 == events_sha256
+        and actual_summary_sha256 == summary_sha256
+        and schema_valid
+        and canonical_valid,
+        schema_valid and canonical_valid and _summary_legacy_acceptance_passed(summary),
+    )
+
+
+def _validate_event_identity(
+    run_dir: Path,
+    row: dict[str, str],
+) -> tuple[bool, str | None, tuple[str, ...]]:
+    """Bind one runtime-emitted experiment identity to one status row."""
+
+    required = bool(
+        row.get("experiment_kind") or row.get("run_id") or row.get("event_identity_required")
+    )
+    journal = run_dir / "events.jsonl"
+    if not journal.is_file():
+        return (not required), None, ()
+    try:
+        events = list(read_event_log(journal))
+    except (OSError, UnicodeDecodeError, TypeError, ValueError, json.JSONDecodeError):
+        return False, None, ()
+    if not events:
+        return (not required), None, ()
+
+    run_ids = {event.run_id for event in events if isinstance(event.run_id, str) and event.run_id}
+    episode_ids = tuple(
+        sorted(
+            {
+                event.episode_id
+                for event in events
+                if isinstance(event.episode_id, str) and event.episode_id
+            }
+        )
+    )
+    identity_events = [event for event in events if event.event_type == "experiment_run_identity"]
+    if not required and not identity_events:
+        return len(run_ids) == 1 and bool(episode_ids), next(iter(run_ids), None), episode_ids
+    if len(identity_events) != 1 or len(run_ids) != 1 or len(episode_ids) != 1:
+        return False, next(iter(run_ids), None), episode_ids
+    identity_event = identity_events[0]
+    identity = identity_event.payload if isinstance(identity_event.payload, dict) else {}
+    if set(identity) != {
+        "schema_version",
+        "source",
+        "run_id",
+        "episode_id",
+        "seed",
+        "mode",
+        "experiment_kind",
+        "arm",
+        "subject_arm",
+    }:
+        return False, next(iter(run_ids), None), episode_ids
+    expected_seed: int | None
+    try:
+        expected_seed = int(row["seed"])
+    except (KeyError, TypeError, ValueError):
+        expected_seed = None
+    expected_arm = row.get("arm") or None
+    expected_kind = row.get("experiment_kind") or None
+    expected_subject_arm = row.get("subject_arm") or None
+    expected_mode = row.get("mode") or None
+    event_run_id = next(iter(run_ids))
+    event_episode_id = episode_ids[0]
+    valid = (
+        identity.get("schema_version") == "1.0"
+        and identity.get("source") == "runner_environment"
+        and identity_event.run_id == event_run_id == identity.get("run_id")
+        and identity_event.episode_id == event_episode_id == identity.get("episode_id")
+        and (not row.get("run_id") or row.get("run_id") == event_run_id)
+        and (not row.get("episode_id") or row.get("episode_id") == event_episode_id)
+        and expected_seed is not None
+        and type(identity.get("seed")) is int
+        and identity.get("seed") == expected_seed
+        and expected_mode is not None
+        and identity.get("mode") == expected_mode
+        and expected_arm is not None
+        and identity.get("arm") == expected_arm
+        and expected_kind is not None
+        and identity.get("experiment_kind") == expected_kind
+        and identity.get("subject_arm") == expected_subject_arm
+    )
+    return valid, event_run_id, episode_ids
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _summary_schema_is_valid(summary: Any) -> bool:
+    if not isinstance(summary, dict):
+        return False
+    if set(summary) != {"format_version", "source_journal", "runs"}:
+        return False
+    if summary.get("format_version") != "1.0" or summary.get("source_journal") != "events.jsonl":
+        return False
+    runs = summary.get("runs")
+    if not isinstance(runs, dict) or not runs:
+        return False
+    for run in runs.values():
+        if (
+            not isinstance(run, dict)
+            or set(run) != {"episodes"}
+            or not isinstance(run.get("episodes"), dict)
+            or not run["episodes"]
+        ):
+            return False
+        for episode in run["episodes"].values():
+            if not isinstance(episode, dict):
+                return False
+            hard_acceptance = episode.get("hard_acceptance")
+            if (
+                not isinstance(hard_acceptance, dict)
+                or type(hard_acceptance.get("passed")) is not bool
+            ):
+                return False
+    return True
+
+
+def _summary_legacy_acceptance_passed(summary: dict[str, Any]) -> bool:
+    runs = summary.get("runs")
+    if not isinstance(runs, dict) or not runs:
+        return False
+    for run in runs.values():
+        if not isinstance(run, dict):
+            return False
+        episodes = run.get("episodes")
+        if not isinstance(episodes, dict) or not episodes:
+            return False
+        for episode in episodes.values():
+            if not isinstance(episode, dict):
+                return False
+            hard_acceptance = episode.get("hard_acceptance")
+            if not isinstance(hard_acceptance, dict) or hard_acceptance.get("passed") is not True:
+                return False
+    return True
 
 
 def _consequence_signature(payload: dict[str, Any]) -> str:
@@ -661,23 +989,100 @@ def counterfactual_canary_is_valid(
     expected_git_sha: str | None,
     expected_evaluation_seeds: tuple[int, ...],
     approved_rule_set_sha256: str | None = None,
+    run_set_dir: Path | None = None,
+    expected_run_set_dir: Path | None = None,
+    natural_run_baseline_bytes_per_loop: float | None = None,
+    recovery_evidence: dict[str, Any] | None = None,
 ) -> bool:
     gates = artifact.get("gates")
+    gameplay_gates = artifact.get("gameplay_gates")
     behavior = artifact.get("behavior")
     shadow = artifact.get("shadow")
     readiness = artifact.get("hard_readiness")
-    return (
+    context_blocking_count = (
+        readiness.get("context_applicable_blocking_hard_count")
+        if isinstance(readiness, dict)
+        else None
+    )
+    active_hard_block_count = artifact.get("active_hard_block_count")
+    terminal_resolved_count = artifact.get("terminal_counterfactual_resolved_count")
+    behavior_run_dir = (
+        _canonical_run_directory(str(behavior.get("run_dir", "")))
+        if isinstance(behavior, dict)
+        else Path("/__rtscortex_missing_run_dir__")
+    )
+    shadow_run_dir = (
+        _canonical_run_directory(str(shadow.get("run_dir", "")))
+        if isinstance(shadow, dict)
+        else Path("/__rtscortex_missing_run_dir__")
+    )
+    if not isinstance(gates, dict) or set(gates) != CANARY_GATE_KEYS_PRODUCTION:
+        return False
+    if not all(type(value) is bool for value in gates.values()) or not all(gates.values()):
+        return False
+    expected_gameplay_gate_keys = {
+        "runs_exit_zero",
+        "runs_complete_for_kind",
+        "behavior_artifact_integrity_valid",
+        "shadow_artifact_integrity_valid",
+        "behavior_legacy_acceptance_valid",
+        "shadow_legacy_acceptance_valid",
+        "behavior_per_run",
+        "shadow_per_run",
+    }
+    if not isinstance(gameplay_gates, dict) or set(gameplay_gates) != expected_gameplay_gate_keys:
+        return False
+    if not all(
+        type(gameplay_gates.get(name)) is bool
+        for name in (
+            "runs_exit_zero",
+            "runs_complete_for_kind",
+            "behavior_artifact_integrity_valid",
+            "shadow_artifact_integrity_valid",
+            "behavior_legacy_acceptance_valid",
+            "shadow_legacy_acceptance_valid",
+        )
+    ):
+        return False
+    for name in ("behavior_per_run", "shadow_per_run"):
+        per_run = gameplay_gates.get(name)
+        if not isinstance(per_run, dict) or set(per_run) != set(GAMEPLAY_GATE_NAMES):
+            return False
+        if not all(type(value) is bool for value in per_run.values()):
+            return False
+    for name in (
+        "counterfactual_qualification_accepted",
+        "gameplay_acceptance_accepted",
+        "production_authorizing_accepted",
+        "canonical_report_valid",
+    ):
+        if type(artifact.get(name)) is not bool:
+            return False
+    if not isinstance(artifact.get("canonical_report_sha256"), str) or not _SHA256_RE.fullmatch(
+        artifact["canonical_report_sha256"]
+    ):
+        return False
+    if artifact["canonical_report_sha256"] != _canonical_report_digest(artifact):
+        return False
+    try:
+        derived_fields_valid = _canary_derived_fields_are_consistent(artifact)
+    except (TypeError, ValueError, KeyError):
+        return False
+    if not derived_fields_valid:
+        return False
+    basic_valid = (
         artifact.get("schema_version") == "1.1"
         and artifact.get("canary_kind") == "production"
         and artifact.get("canary_fixture") is False
         and artifact.get("accepted") is True
+        and artifact.get("counterfactual_qualification_accepted") is True
+        and artifact.get("gameplay_acceptance_accepted") is True
+        and artifact.get("production_authorizing_accepted") is True
+        and artifact.get("canonical_report_valid") is True
         and artifact.get("baseline_sha256") == baseline_sha256
         and tuple(artifact.get("evaluation_seed_ids", ())) == expected_evaluation_seeds
         and artifact.get("execution_seed") in expected_evaluation_seeds
         and (expected_git_sha is None or artifact.get("expected_git_sha") == expected_git_sha)
-        and isinstance(gates, dict)
-        and bool(gates)
-        and all(value is True for value in gates.values())
         and isinstance(readiness, dict)
         and readiness.get("canary_runnable") is True
         and readiness.get("baseline_sha256") == baseline_sha256
@@ -694,19 +1099,313 @@ def counterfactual_canary_is_valid(
             approved_rule_set_sha256 is None
             or artifact.get("approved_rule_set_sha256") == approved_rule_set_sha256
         )
-        and int(readiness.get("context_applicable_blocking_hard_count", 0)) >= 1
+        and type(context_blocking_count) is int
+        and context_blocking_count >= 1
         and not bool(readiness.get("canary_fixture_rule_ids"))
-        and int(artifact.get("active_hard_block_count", 0)) > 0
+        and type(active_hard_block_count) is int
+        and active_hard_block_count > 0
         and artifact.get("terminal_counterfactual_required") is True
-        and int(artifact.get("terminal_counterfactual_resolved_count", 0)) > 0
-        and int(artifact.get("unmatched_active_hard_block_count", -1)) == 0
+        and type(terminal_resolved_count) is int
+        and terminal_resolved_count > 0
+        and type(artifact.get("unmatched_active_hard_block_count")) is int
+        and artifact.get("unmatched_active_hard_block_count") == 0
         and isinstance(behavior, dict)
         and isinstance(shadow, dict)
+        and behavior.get("artifact_integrity_valid") is True
+        and shadow.get("artifact_integrity_valid") is True
+        and behavior.get("legacy_acceptance_valid") is True
+        and shadow.get("legacy_acceptance_valid") is True
+        and behavior.get("gameplay_acceptance_accepted") is True
+        and shadow.get("gameplay_acceptance_accepted") is True
+        and isinstance(behavior.get("events_sha256"), str)
+        and isinstance(behavior.get("summary_sha256"), str)
+        and isinstance(shadow.get("events_sha256"), str)
+        and isinstance(shadow.get("summary_sha256"), str)
+        and _SHA256_RE.fullmatch(behavior["events_sha256"]) is not None
+        and _SHA256_RE.fullmatch(behavior["summary_sha256"]) is not None
+        and _SHA256_RE.fullmatch(shadow["events_sha256"]) is not None
+        and _SHA256_RE.fullmatch(shadow["summary_sha256"]) is not None
+        and isinstance(behavior.get("gameplay_gate_results"), dict)
+        and isinstance(shadow.get("gameplay_gate_results"), dict)
+        and set(behavior["gameplay_gate_results"]) == set(GAMEPLAY_GATE_NAMES)
+        and set(shadow["gameplay_gate_results"]) == set(GAMEPLAY_GATE_NAMES)
+        and all(type(value) is bool for value in behavior["gameplay_gate_results"].values())
+        and all(type(value) is bool for value in shadow["gameplay_gate_results"].values())
+        and all(behavior["gameplay_gate_results"].values())
+        and all(shadow["gameplay_gate_results"].values())
         and behavior.get("source_attestation_fingerprint")
         == shadow.get("source_attestation_fingerprint")
         and behavior.get("analysis_evidence_overflow_count") == 0
         and shadow.get("analysis_evidence_overflow_count") == 0
+        and behavior.get("event_identity_valid") is True
+        and shadow.get("event_identity_valid") is True
+        and behavior.get("mode") == "causal_canary"
+        and shadow.get("mode") == "causal_canary"
+        and behavior.get("arm") == "active"
+        and shadow.get("arm") == "shadow"
+        and behavior.get("experiment_kind") == "behavior"
+        and shadow.get("experiment_kind") == "calibration"
+        and behavior.get("seed") == shadow.get("seed") == artifact.get("execution_seed")
+        and behavior_run_dir != Path("/__rtscortex_missing_run_dir__")
+        and shadow_run_dir != Path("/__rtscortex_missing_run_dir__")
+        and behavior_run_dir != shadow_run_dir
+        and behavior.get("playbook_before_sha256") == shadow.get("playbook_before_sha256")
     )
+    if not basic_valid:
+        return False
+    return _strict_canary_report_is_canonical(
+        artifact,
+        baseline_sha256=baseline_sha256,
+        expected_git_sha=expected_git_sha,
+        expected_evaluation_seeds=expected_evaluation_seeds,
+        run_set_dir=(expected_run_set_dir or run_set_dir),
+        natural_run_baseline_bytes_per_loop=natural_run_baseline_bytes_per_loop,
+        recovery_evidence=recovery_evidence,
+    )
+
+
+def _canary_derived_fields_are_consistent(artifact: dict[str, Any]) -> bool:
+    behavior = artifact.get("behavior")
+    shadow = artifact.get("shadow")
+    gates = artifact.get("gates")
+    gameplay_gates = artifact.get("gameplay_gates")
+    if not isinstance(behavior, dict) or not isinstance(shadow, dict):
+        return False
+    if not isinstance(gates, dict) or not isinstance(gameplay_gates, dict):
+        return False
+
+    def records(value: Any, width: int) -> list[tuple[Any, ...]] | None:
+        if not isinstance(value, (list, tuple)):
+            return None
+        parsed: list[tuple[Any, ...]] = []
+        for item in value:
+            if not isinstance(item, (list, tuple)) or len(item) != width:
+                return None
+            parsed.append(tuple(item))
+        return parsed
+
+    active_records = records(behavior.get("active_hard_block_records"), 3)
+    if active_records is None:
+        return False
+    if len(active_records) != len(set(active_records)):
+        return False
+    active_keys = {str(item[0]) for item in active_records}
+    reported_active_keys = behavior.get("active_hard_block_keys")
+    if not isinstance(reported_active_keys, (list, tuple)) or list(reported_active_keys) != sorted(
+        active_keys
+    ):
+        return False
+    resolved = shadow.get("resolved_counterfactual_keys")
+    if not isinstance(resolved, (list, tuple)) or list(resolved) != sorted(
+        set(str(key) for key in resolved)
+    ):
+        return False
+    resolved_keys = set(str(key) for key in resolved)
+    unmatched = [item for item in active_records if str(item[0]) not in resolved_keys]
+    if artifact.get("active_hard_block_count") != len(active_keys):
+        return False
+    if artifact.get("terminal_counterfactual_resolved_count") != len(active_keys & resolved_keys):
+        return False
+    if artifact.get("unmatched_active_hard_block_count") != len(unmatched):
+        return False
+    reported_unmatched = artifact.get("unmatched_active_hard_blocks")
+    if not isinstance(reported_unmatched, (list, tuple)):
+        return False
+    expected_unmatched = [
+        {"counterfactual_key": str(key), "game_loop": loop, "state_hash": str(state_hash)}
+        for key, loop, state_hash in unmatched
+    ]
+    if reported_unmatched != expected_unmatched:
+        return False
+    first_unmatched = min((int(item[1]) for item in unmatched), default=None)
+    if artifact.get("first_unmatched_game_loop") != first_unmatched:
+        return False
+
+    behavior_states = records(behavior.get("counterfactual_state_records"), 3)
+    shadow_states = records(shadow.get("counterfactual_state_records"), 3)
+    if behavior_states is None or shadow_states is None:
+        return False
+    behavior_state_keys = [(int(item[0]), str(item[1])) for item in behavior_states]
+    shadow_state_keys = [(int(item[0]), str(item[1])) for item in shadow_states]
+    if len(behavior_state_keys) != len(set(behavior_state_keys)) or len(shadow_state_keys) != len(
+        set(shadow_state_keys)
+    ):
+        return False
+    behavior_state_map = {(int(item[0]), str(item[1])): str(item[2]) for item in behavior_states}
+    shadow_state_map = {(int(item[0]), str(item[1])): str(item[2]) for item in shadow_states}
+    divergent = [
+        key[0]
+        for key, state_hash in behavior_state_map.items()
+        if key in shadow_state_map and shadow_state_map[key] != state_hash
+    ]
+    first_divergence = min(divergent, default=first_unmatched)
+    return artifact.get("first_state_hash_divergence_game_loop") == first_divergence
+
+
+def _canonical_report_digest(report: dict[str, Any]) -> str:
+    payload = _report_canonical_projection(report)
+    payload.pop("canonical_report_sha256", None)
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=list,
+    )
+    return hashlib.sha256(encoded.encode()).hexdigest()
+
+
+_VOLATILE_CANARY_METRIC_FIELDS = frozenset(
+    {
+        "analysis_peak_rss_kib",
+        "analysis_rss_per_10k_game_loops",
+    }
+)
+
+
+def _metric_canonical_projection(metric: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: value for key, value in metric.items() if key not in _VOLATILE_CANARY_METRIC_FIELDS
+    }
+
+
+def _report_canonical_projection(report: dict[str, Any]) -> dict[str, Any]:
+    projected = dict(report)
+    projected.pop("canonical_report_sha256", None)
+    projected["behavior"] = _metric_canonical_projection(report["behavior"])
+    projected["shadow"] = _metric_canonical_projection(report["shadow"])
+    memory = report.get("analysis_memory")
+    if isinstance(memory, dict):
+        projected["analysis_memory"] = {
+            key: value
+            for key, value in memory.items()
+            if key
+            not in {
+                "behavior_peak_rss_kib",
+                "shadow_peak_rss_kib",
+                "behavior_rss_per_10k_game_loops",
+                "shadow_rss_per_10k_game_loops",
+            }
+        }
+    normalized = json.loads(json.dumps(projected, sort_keys=True, default=list))
+    if not isinstance(normalized, dict):
+        raise TypeError("canonical canary report projection must be an object")
+    return normalized
+
+
+def _strict_canary_report_is_canonical(
+    artifact: dict[str, Any],
+    *,
+    baseline_sha256: str,
+    expected_git_sha: str | None,
+    expected_evaluation_seeds: tuple[int, ...],
+    run_set_dir: Path | None,
+    natural_run_baseline_bytes_per_loop: float | None,
+    recovery_evidence: dict[str, Any] | None,
+) -> bool:
+    from scripts.analyze_playbook_counterfactual_canary import build_canary_report
+
+    behavior_data = artifact.get("behavior")
+    shadow_data = artifact.get("shadow")
+    if not isinstance(behavior_data, dict) or not isinstance(shadow_data, dict):
+        return False
+    expected_metric_keys = set(RunMetrics.__dataclass_fields__)
+    if set(behavior_data) != expected_metric_keys or set(shadow_data) != expected_metric_keys:
+        return False
+
+    if run_set_dir is None:
+        return False
+
+    expected_root = run_set_dir.expanduser().resolve()
+    status_path = expected_root / "experiment-status.tsv"
+    baseline_snapshot = expected_root / "playbook.baseline.sqlite3"
+    readiness_path = expected_root / "playbook-hard-readiness.json"
+    recovery_path = expected_root / "recovery-canary.json"
+    engineering_baseline_path = (
+        Path(__file__).resolve().parents[1]
+        / "configs"
+        / "acceptance"
+        / "protoss_natural_terminal_v1.json"
+    )
+    if not all(
+        path.is_file()
+        for path in (
+            status_path,
+            baseline_snapshot,
+            readiness_path,
+            recovery_path,
+            engineering_baseline_path,
+        )
+    ):
+        return False
+    try:
+        canonical_readiness = json.loads(readiness_path.read_text(encoding="utf-8"))
+        canonical_recovery = json.loads(recovery_path.read_text(encoding="utf-8"))
+        engineering_baseline = json.loads(engineering_baseline_path.read_text(encoding="utf-8"))
+        canonical_bytes_per_loop = float(engineering_baseline["natural_run_bytes_per_game_loop"])
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+        return False
+    if (
+        _sha256_file(baseline_snapshot) != baseline_sha256
+        or canonical_readiness != artifact.get("hard_readiness")
+        or recovery_evidence is not None
+        and recovery_evidence != canonical_recovery
+        or natural_run_baseline_bytes_per_loop is not None
+        and natural_run_baseline_bytes_per_loop != canonical_bytes_per_loop
+    ):
+        return False
+    behavior_dir = _canonical_run_directory(str(behavior_data.get("run_dir", "")))
+    shadow_dir = _canonical_run_directory(str(shadow_data.get("run_dir", "")))
+    if behavior_dir == shadow_dir or not behavior_dir.is_dir() or not shadow_dir.is_dir():
+        return False
+    try:
+        status_rows = list(csv.DictReader(status_path.open(), delimiter="\t"))
+    except (OSError, UnicodeDecodeError, csv.Error):
+        return False
+    if len(status_rows) != 2:
+        return False
+    rows_by_directory: dict[Path, dict[str, str]] = {}
+    for row in status_rows:
+        directory = _canonical_run_directory(row.get("run_dir", ""))
+        if directory in rows_by_directory:
+            return False
+        rows_by_directory[directory] = row
+    if set(rows_by_directory) != {behavior_dir, shadow_dir}:
+        return False
+    behavior_row = rows_by_directory[behavior_dir]
+    shadow_row = rows_by_directory[shadow_dir]
+    if not (
+        behavior_row.get("experiment_kind") == "behavior"
+        and behavior_row.get("mode") == "causal_canary"
+        and behavior_row.get("arm") == "active"
+        and not behavior_row.get("subject_arm")
+        and shadow_row.get("experiment_kind") == "calibration"
+        and shadow_row.get("mode") == "causal_canary"
+        and shadow_row.get("arm") == "shadow"
+        and shadow_row.get("subject_arm") == "active"
+        and behavior_row.get("seed") == shadow_row.get("seed")
+    ):
+        return False
+    kwargs = {
+        "natural_run_baseline_bytes_per_loop": canonical_bytes_per_loop,
+        "expected_git_sha": expected_git_sha,
+        "recovery_evidence": canonical_recovery,
+        "persist_engineering_report": False,
+    }
+    try:
+        behavior_metrics = _run_metrics(behavior_row, **kwargs)
+        shadow_metrics = _run_metrics(shadow_row, **kwargs)
+        expected = build_canary_report(
+            behavior_metrics,
+            shadow_metrics,
+            baseline_sha256=baseline_sha256,
+            expected_git_sha=str(artifact.get("expected_git_sha", expected_git_sha)),
+            readiness_evidence=canonical_readiness,
+            canary_kind="production",
+        )
+    except (OSError, KeyError, TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    return _report_canonical_projection(artifact) == _report_canonical_projection(expected)
 
 
 def _comparison(
@@ -716,10 +1415,14 @@ def _comparison(
     counterfactual_canary: dict[str, Any] | None = None,
     expected_git_sha: str | None = None,
     expected_seeds: tuple[int, ...] = (0, 1, 2),
+    run_set_dir: Path | None = None,
+    counterfactual_canary_run_set_dir: Path | None = None,
 ) -> dict[str, Any]:
     behavior = [metric for metric in metrics if metric.experiment_kind == "behavior"]
     calibration = [metric for metric in metrics if metric.experiment_kind == "calibration"]
-    split_matrix = any(metric.subject_arm is not None for metric in metrics)
+    split_matrix = run_set_dir is not None or any(
+        metric.subject_arm is not None or metric.experiment_kind != "behavior" for metric in metrics
+    )
     unique_expected_seeds = tuple(dict.fromkeys(expected_seeds))
     if len(unique_expected_seeds) != 3:
         raise ValueError("formal comparison requires exactly three distinct held-out seeds")
@@ -741,6 +1444,65 @@ def _comparison(
     observed_calibration_matrix = {
         (metric.mode, metric.seed, metric.subject_arm) for metric in calibration
     }
+    canonical_run_dirs = [_canonical_run_directory(metric.run_dir) for metric in metrics]
+    canonical_run_dirs_unique = len(canonical_run_dirs) == len(set(canonical_run_dirs)) and all(
+        path != Path("/__rtscortex_missing_run_dir__") for path in canonical_run_dirs
+    )
+    run_dirs_match_status = False
+    if run_set_dir is not None:
+        expected_root = run_set_dir.expanduser().resolve()
+        status_path = expected_root / "experiment-status.tsv"
+        try:
+            status_rows = list(csv.DictReader(status_path.open(), delimiter="\t"))
+        except (OSError, UnicodeDecodeError, csv.Error):
+            status_rows = []
+        status_run_dirs = [_canonical_run_directory(row.get("run_dir", "")) for row in status_rows]
+        rows_by_run_dir = {
+            directory: row for directory, row in zip(status_run_dirs, status_rows, strict=True)
+        }
+        metric_identity_matches_status = all(
+            (row := rows_by_run_dir.get(directory)) is not None
+            and row.get("experiment_kind") == metric.experiment_kind
+            and row.get("mode") == metric.mode
+            and row.get("seed") == str(metric.seed)
+            and row.get("arm") == metric.arm
+            and (row.get("subject_arm") or None) == metric.subject_arm
+            and row.get("exit_code") == str(metric.exit_code)
+            for directory, metric in zip(canonical_run_dirs, metrics, strict=True)
+        )
+        run_dirs_match_status = (
+            len(status_rows) == 24
+            and len(status_run_dirs) == len(set(status_run_dirs))
+            and set(status_run_dirs) == set(canonical_run_dirs)
+            and metric_identity_matches_status
+            and all(path.is_dir() for path in canonical_run_dirs)
+        )
+    event_run_ids = [metric.event_run_id for metric in metrics if metric.event_run_id is not None]
+    event_identity_unique = len(event_run_ids) == len(set(event_run_ids))
+    event_identity_contract = (
+        all(metric.event_identity_valid for metric in metrics)
+        and len(event_run_ids) == len(metrics)
+        and all(metric.event_episode_ids for metric in metrics)
+        and event_identity_unique
+    )
+    formal_split_contract = True
+    if split_matrix:
+        formal_split_contract = (
+            len(metrics) == 24
+            and len(behavior) == 12
+            and len(calibration) == 12
+            and all(metric.experiment_kind in {"behavior", "calibration"} for metric in metrics)
+            and all(
+                metric.arm in {"frozen", "evolving"} and metric.subject_arm == metric.arm
+                for metric in behavior
+            )
+            and all(
+                metric.arm == "shadow" and metric.subject_arm in {"frozen", "evolving"}
+                for metric in calibration
+            )
+            and run_set_dir is not None
+            and run_dirs_match_status
+        )
     paired: list[dict[str, Any]] = []
     for mode in ("independent_paired", "sequential_learning"):
         for seed in unique_expected_seeds:
@@ -864,7 +1626,41 @@ def _comparison(
         for metric in metrics
         if metric.source_attestation_fingerprint is not None
     }
+    gameplay_acceptance = bool(metrics) and all(
+        _gameplay_contract_is_valid(metric) for metric in metrics
+    )
+    run_artifact_integrity = bool(metrics) and all(
+        _artifact_attestation_is_valid(metric) for metric in metrics
+    )
+    canary_is_valid = counterfactual_canary is not None and counterfactual_canary_is_valid(
+        counterfactual_canary,
+        baseline_sha256=baseline_sha256,
+        expected_git_sha=expected_git_sha,
+        expected_evaluation_seeds=unique_expected_seeds,
+        run_set_dir=counterfactual_canary_run_set_dir,
+    )
+    canary_counterfactual_qualification = (
+        counterfactual_canary is not None
+        and counterfactual_canary.get("counterfactual_qualification_accepted") is True
+    )
+    canary_gameplay_acceptance = (
+        counterfactual_canary is not None
+        and counterfactual_canary.get("gameplay_acceptance_accepted") is True
+    )
+    production_authorizing_acceptance = (
+        canary_is_valid
+        and canary_counterfactual_qualification
+        and canary_gameplay_acceptance
+        and gameplay_acceptance
+    )
     gates = {
+        "formal_split_contract": formal_split_contract,
+        "canonical_run_directory_identity": (
+            canonical_run_dirs_unique and run_dirs_match_status
+            if split_matrix
+            else canonical_run_dirs_unique
+        ),
+        "event_identity_contract": event_identity_contract,
         "complete_unique_run_matrix": (
             len(behavior) == len(expected_behavior_matrix)
             and observed_behavior_matrix == expected_behavior_matrix
@@ -873,6 +1669,7 @@ def _comparison(
                 or (
                     len(calibration) == len(expected_calibration_matrix)
                     and observed_calibration_matrix == expected_calibration_matrix
+                    and formal_split_contract
                 )
             )
         ),
@@ -909,16 +1706,12 @@ def _comparison(
         ),
         "active_hard_blocks_have_matched_shadow_evidence": (not unmatched_active_hard_blocks),
         "counterfactual_schema_complete": invalid_counterfactual_evidence_count == 0,
-        "counterfactual_canary_accepted": (
-            True
-            if counterfactual_canary is None
-            else counterfactual_canary_is_valid(
-                counterfactual_canary,
-                baseline_sha256=baseline_sha256,
-                expected_git_sha=expected_git_sha,
-                expected_evaluation_seeds=unique_expected_seeds,
-            )
-        ),
+        "counterfactual_canary_accepted": (canary_is_valid),
+        "counterfactual_qualification_accepted": canary_counterfactual_qualification,
+        "all_runs_gameplay_acceptance_pass": gameplay_acceptance,
+        "gameplay_acceptance_accepted": canary_gameplay_acceptance and gameplay_acceptance,
+        "production_authorizing_acceptance": production_authorizing_acceptance,
+        "run_artifact_integrity_valid": run_artifact_integrity,
         "analysis_memory_budget_respected": all(
             metric.analysis_evidence_overflow_count == 0 for metric in metrics
         ),
@@ -968,8 +1761,43 @@ def _comparison(
             "missing_engineering_metrics": missing_engineering_metrics,
         },
         "gates": gates,
+        "counterfactual_qualification_accepted": canary_counterfactual_qualification,
+        "gameplay_acceptance_accepted": canary_gameplay_acceptance and gameplay_acceptance,
+        "production_authorizing_accepted": production_authorizing_acceptance,
         "accepted": all(gates.values()),
     }
+
+
+def _gameplay_contract_is_valid(metric: RunMetrics) -> bool:
+    results = metric.gameplay_gate_results
+    return (
+        isinstance(results, dict)
+        and set(results) == set(GAMEPLAY_GATE_NAMES)
+        and all(type(value) is bool for value in results.values())
+        and metric.gameplay_acceptance_accepted is True
+        and metric.artifact_integrity_valid is True
+        and metric.legacy_acceptance_valid is True
+        and all(results.values())
+    )
+
+
+def _artifact_attestation_is_valid(metric: RunMetrics) -> bool:
+    return (
+        metric.artifact_integrity_valid is True
+        and isinstance(metric.events_sha256, str)
+        and isinstance(metric.summary_sha256, str)
+        and _SHA256_RE.fullmatch(metric.events_sha256) is not None
+        and _SHA256_RE.fullmatch(metric.summary_sha256) is not None
+    )
+
+
+def _canonical_run_directory(value: str | Path) -> Path:
+    raw = (
+        Path(value).expanduser()
+        if value is not None and str(value).strip()
+        else Path("/__rtscortex_missing_run_dir__")
+    )
+    return raw.resolve()
 
 
 def _win(outcome: str | None) -> int:

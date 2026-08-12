@@ -10,7 +10,13 @@ from pathlib import Path
 from typing import Any, Literal
 
 from rtscortex.playbook import PlaybookRuleCategory, evaluation_kind
-from scripts.analyze_playbook_experiment import RunMetrics, _run_metrics
+from scripts.analyze_playbook_experiment import (
+    GAMEPLAY_GATE_NAMES,
+    RunMetrics,
+    _canonical_report_digest,
+    _run_metrics,
+    counterfactual_canary_is_valid,
+)
 
 
 def build_canary_report(
@@ -45,6 +51,25 @@ def build_canary_report(
         for (epoch, signature), state_hash in behavior_states.items()
         if (epoch, signature) in shadow_states and shadow_states[(epoch, signature)] != state_hash
     ]
+    unique_active_records = len(behavior.active_hard_block_records) == len(
+        set(behavior.active_hard_block_records)
+    )
+    unique_behavior_states = len(behavior_states) == len(behavior.counterfactual_state_records)
+    unique_shadow_states = len(shadow_states) == len(shadow.counterfactual_state_records)
+    prestate_identity_valid = (
+        unique_active_records
+        and unique_behavior_states
+        and unique_shadow_states
+        and set(behavior_states) == set(shadow_states)
+        and not divergent_epochs
+    )
+    active_block_prestate_identity = not behavior.counterfactual_state_records or all(
+        any(
+            epoch == loop and state_hash == prestate_hash
+            for epoch, _signature, prestate_hash in behavior.counterfactual_state_records
+        )
+        for _key, loop, state_hash in behavior.active_hard_block_records
+    )
     first_unmatched_loop = min((record[1] for record in unmatched), default=None)
     first_state_hash_divergence = min(divergent_epochs, default=first_unmatched_loop)
     approved_kinds, readiness_kind_contract_valid = _approved_evaluation_kinds(readiness_evidence)
@@ -63,8 +88,12 @@ def build_canary_report(
         for arm, rule_id, observed_kind in observed_kind_records
         if approved_kinds.get(rule_id) != observed_kind
     ]
+    observed_rule_ids = {rule_id for _, rule_id, _ in observed_kind_records}
     rule_kind_contract_valid = (
-        readiness_kind_contract_valid and bool(observed_kind_records) and not rule_kind_mismatches
+        readiness_kind_contract_valid
+        and observed_rule_ids == set(approved_kinds)
+        and bool(observed_kind_records)
+        and not rule_kind_mismatches
     )
     readiness_valid = (
         readiness_evidence.get("schema_version") == "1.1"
@@ -105,6 +134,32 @@ def build_canary_report(
             and shadow.source_commit_matches_expected_sha
             and behavior.source_attestation_fingerprint == shadow.source_attestation_fingerprint
         ),
+        "active_role_contract": (
+            behavior.mode == ("fixture" if canary_kind == "fixture" else "causal_canary")
+            and behavior.arm == "active"
+            and behavior.experiment_kind == "behavior"
+        ),
+        "shadow_role_contract": (
+            shadow.mode == ("fixture" if canary_kind == "fixture" else "causal_canary")
+            and shadow.arm == "shadow"
+            and shadow.experiment_kind == "calibration"
+        ),
+        "run_identity_contract": (
+            behavior.seed == shadow.seed
+            and behavior.run_dir != shadow.run_dir
+            and behavior.event_identity_valid
+            and shadow.event_identity_valid
+            and (
+                behavior.event_run_id is None
+                or shadow.event_run_id is None
+                or behavior.event_run_id != shadow.event_run_id
+            )
+        ),
+        "matching_provenance": (
+            behavior.playbook_before_sha256 == shadow.playbook_before_sha256
+            and behavior.source_attestation_fingerprint is not None
+            and behavior.source_attestation_fingerprint == shadow.source_attestation_fingerprint
+        ),
         "active_hard_block_observed": bool(active_keys),
         (
             "matched_shadow_guard_allow_observed"
@@ -112,14 +167,72 @@ def build_canary_report(
             else "terminal_counterfactual_resolved"
         ): matched_count > 0,
         "all_active_hard_blocks_matched": not unmatched,
-        "matched_prestate_identity": not divergent_epochs,
+        "matched_prestate_identity": prestate_identity_valid,
+        "active_block_prestate_identity": active_block_prestate_identity,
         "rule_evaluation_kind_consistent": rule_kind_contract_valid,
         "analysis_memory_budget_respected": (
             behavior.analysis_evidence_overflow_count == 0
             and shadow.analysis_evidence_overflow_count == 0
         ),
     }
-    return {
+    counterfactual_gate_names = {
+        "hard_readiness_accepted",
+        "runs_exit_zero",
+        "execution_seed_contract",
+        "runs_complete_for_kind",
+        "source_attestation_matches",
+        "active_role_contract",
+        "shadow_role_contract",
+        "run_identity_contract",
+        "matching_provenance",
+        "active_block_prestate_identity",
+        "active_hard_block_observed",
+        "terminal_counterfactual_resolved"
+        if canary_kind == "production"
+        else "matched_shadow_guard_allow_observed",
+        "all_active_hard_blocks_matched",
+        "matched_prestate_identity",
+        "rule_evaluation_kind_consistent",
+        "analysis_memory_budget_respected",
+    }
+    counterfactual_qualification_accepted = all(gates[name] for name in counterfactual_gate_names)
+    behavior_gameplay_gates = {
+        name: behavior.gameplay_gate_results.get(name) is True for name in GAMEPLAY_GATE_NAMES
+    }
+    shadow_gameplay_gates = {
+        name: shadow.gameplay_gate_results.get(name) is True for name in GAMEPLAY_GATE_NAMES
+    }
+    gameplay_gates: dict[str, Any] = {
+        "runs_exit_zero": gates["runs_exit_zero"],
+        "runs_complete_for_kind": gates["runs_complete_for_kind"],
+        "behavior_artifact_integrity_valid": behavior.artifact_integrity_valid,
+        "shadow_artifact_integrity_valid": shadow.artifact_integrity_valid,
+        "behavior_legacy_acceptance_valid": behavior.legacy_acceptance_valid,
+        "shadow_legacy_acceptance_valid": shadow.legacy_acceptance_valid,
+        "behavior_per_run": behavior_gameplay_gates,
+        "shadow_per_run": shadow_gameplay_gates,
+    }
+    gameplay_acceptance_accepted = (
+        all(
+            gameplay_gates[name] is True
+            for name in (
+                "runs_exit_zero",
+                "runs_complete_for_kind",
+                "behavior_artifact_integrity_valid",
+                "shadow_artifact_integrity_valid",
+                "behavior_legacy_acceptance_valid",
+                "shadow_legacy_acceptance_valid",
+            )
+        )
+        and all(behavior_gameplay_gates.values())
+        and all(shadow_gameplay_gates.values())
+    )
+    production_authorizing_accepted = (
+        canary_kind == "production"
+        and counterfactual_qualification_accepted
+        and gameplay_acceptance_accepted
+    )
+    report = {
         "schema_version": "1.1",
         "canary_kind": canary_kind,
         "canary_fixture": canary_kind == "fixture",
@@ -156,8 +269,17 @@ def build_canary_report(
             "shadow_rss_per_10k_game_loops": shadow.analysis_rss_per_10k_game_loops,
         },
         "gates": gates,
-        "accepted": all(gates.values()),
+        "gameplay_gates": gameplay_gates,
+        "counterfactual_qualification_accepted": counterfactual_qualification_accepted,
+        "gameplay_acceptance_accepted": gameplay_acceptance_accepted,
+        "production_authorizing_accepted": production_authorizing_accepted,
+        "canonical_report_valid": True,
+        "accepted": (
+            production_authorizing_accepted if canary_kind == "production" else all(gates.values())
+        ),
     }
+    report["canonical_report_sha256"] = _canonical_report_digest(report)
+    return report
 
 
 def _approved_evaluation_kinds(
@@ -175,6 +297,9 @@ def _approved_evaluation_kinds(
         if not isinstance(audit, dict) or str(audit.get("rule_id")) not in approved_ids:
             continue
         rule_id = str(audit["rule_id"])
+        if rule_id in approved_kinds:
+            valid = False
+            continue
         try:
             expected = evaluation_kind(PlaybookRuleCategory(str(audit.get("category"))))
         except ValueError:
@@ -216,7 +341,12 @@ def main() -> None:
     )
     behavior_rows = [row for row in rows if row.get("experiment_kind") == "behavior"]
     shadow_rows = [row for row in rows if row.get("experiment_kind") == "calibration"]
-    if len(behavior_rows) != 1 or len(shadow_rows) != 1:
+    if (
+        len(rows) != 2
+        or len(behavior_rows) != 1
+        or len(shadow_rows) != 1
+        or any(row.get("experiment_kind") not in {"behavior", "calibration"} for row in rows)
+    ):
         raise SystemExit("counterfactual canary requires exactly one behavior and one shadow run")
     kwargs = {
         "natural_run_baseline_bytes_per_loop": float(
@@ -225,19 +355,40 @@ def main() -> None:
         "expected_git_sha": arguments.expected_git_sha,
         "recovery_evidence": recovery_evidence,
     }
+    behavior_metrics = _run_metrics(behavior_rows[0], **kwargs)
+    shadow_metrics = _run_metrics(shadow_rows[0], **kwargs)
     report = build_canary_report(
-        _run_metrics(behavior_rows[0], **kwargs),
-        _run_metrics(shadow_rows[0], **kwargs),
+        behavior_metrics,
+        shadow_metrics,
         baseline_sha256=arguments.baseline_sha256,
         expected_git_sha=arguments.expected_git_sha,
         readiness_evidence=readiness_evidence,
         canary_kind=arguments.canary_kind,
     )
+    if arguments.canary_kind == "production":
+        canonical_valid = counterfactual_canary_is_valid(
+            report,
+            baseline_sha256=arguments.baseline_sha256,
+            expected_git_sha=arguments.expected_git_sha,
+            expected_evaluation_seeds=tuple(
+                int(seed) for seed in readiness_evidence.get("evaluation_seed_ids", ())
+            ),
+            run_set_dir=arguments.run_set_dir,
+            natural_run_baseline_bytes_per_loop=float(
+                engineering_baseline["natural_run_bytes_per_game_loop"]
+            ),
+            recovery_evidence=recovery_evidence,
+        )
+    else:
+        canonical_valid = report["canonical_report_sha256"] == _canonical_report_digest(report)
+    report["canonical_report_valid"] = canonical_valid
+    if not canonical_valid:
+        report["accepted"] = False
     arguments.output.write_text(
         json.dumps(report, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
-    raise SystemExit(0 if report["accepted"] else 1)
+    raise SystemExit(0 if report["accepted"] and canonical_valid else 1)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from types import SimpleNamespace
 from typing import Any
 
@@ -16,6 +18,425 @@ from rtscortex_llm_pysc2.raw_placement import (
     _placement_revision,
     build_material_legality_identity,
 )
+
+
+def _operation_id(marker: str) -> str:
+    return f"operation:{marker * 64}"
+
+
+def _material_id(marker: str) -> str:
+    return f"build-legality:{marker * 64}"
+
+
+def _attempt_id(operation_id: str, command_id: str, ordinal: int) -> str:
+    encoded = json.dumps(
+        {
+            "operation_id": operation_id,
+            "command_id": command_id,
+            "attempt_ordinal": ordinal,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    return f"attempt:{hashlib.sha256(encoded).hexdigest()}"
+
+
+def test_authoritative_pre_dispatch_circuit_counts_exact_failures_without_placement_state() -> None:
+    transitions: list[dict[str, Any]] = []
+    service = RawPlacementService(
+        unit_names={},
+        transition_sink=transitions.append,
+        no_start_streak_threshold=3,
+    )
+    service.set_runtime_context(run_id="run", episode_id="episode", step_id=4, game_loop=100)
+
+    operation_id = _operation_id("a")
+    material_identity = _material_id("b")
+    decisions = [
+        service.record_authoritative_pre_dispatch_failure(
+            operation_id=operation_id,
+            action_name="Build_Pylon_Screen",
+            command_id=f"command-{ordinal}",
+            failure_code=code,
+            attempt_id=_attempt_id(operation_id, f"command-{ordinal}", ordinal),
+            attempt_ordinal=ordinal,
+            builder_tag=0xB1,
+            ability_id=881,
+            world_target=(22.0, 24.0),
+            placement_revision=f"candidate-{ordinal}",
+            target_state_revision="target-stable",
+            observation_revision=f"observation-{ordinal}",
+            observation_game_loop=100 + ordinal,
+            material_legality_identity=material_identity,
+        )
+        for ordinal, code in enumerate(
+            (
+                "placement_query_rejected",
+                "placement_candidate_stale",
+                "no_legal_placement",
+            )
+        )
+    ]
+
+    assert [decision.streak for decision in decisions] == [1, 2, 3]
+    assert decisions[-1].circuit_open is True
+    assert decisions[-1].transition == "closed_to_open"
+    # A failure before reservation is execution evidence, not a fabricated
+    # placement-ledger transition.
+    assert transitions == []
+    payload = decisions[-1].to_dict()
+    assert payload["operation_id"] == operation_id
+    assert payload["action_name"] == "Build_Pylon_Screen"
+    assert payload["builder_tag"] == 0xB1
+    assert payload["ability_id"] == 881
+    assert payload["world_target"] == [22.0, 24.0]
+    assert payload["observation_game_loop"] == 102
+    assert payload["material_legality_identity"] == material_identity
+    assert payload["material_evidence_valid"] is True
+    assert payload["invalid_evidence_reasons"] == []
+    assert payload["reset_reason"] is None
+    assert payload["material_change_reason"] is None
+
+    blocked = service.record_authoritative_pre_dispatch_failure(
+        operation_id=operation_id,
+        action_name="Build_Pylon_Screen",
+        command_id="command-4",
+        failure_code="no_legal_placement",
+        attempt_id=_attempt_id(operation_id, "command-4", 3),
+        attempt_ordinal=3,
+        builder_tag=0xB1,
+        ability_id=881,
+        world_target=(22.0, 24.0),
+        placement_revision="candidate-4",
+        target_state_revision="target-stable",
+        observation_revision="observation-4",
+        observation_game_loop=103,
+        material_legality_identity=material_identity,
+    )
+    assert blocked.circuit_open is True
+    assert blocked.streak == 3
+    assert blocked.status == "defer_replan"
+    assert blocked.transition is None
+
+
+def test_authoritative_pre_dispatch_reopens_only_for_changed_material_identity() -> None:
+    service = RawPlacementService(unit_names={}, no_start_streak_threshold=3)
+    old_identity = _material_id("c")
+    new_identity = _material_id("d")
+    kwargs: dict[str, Any] = {
+        "operation_id": _operation_id("e"),
+        "action_name": "Build_Pylon_Screen",
+        "builder_tag": 0xB1,
+        "ability_id": 881,
+        "world_target": (22.0, 24.0),
+        "target_state_revision": "target-stable",
+        "observation_revision": "observation-1",
+        "observation_game_loop": 100,
+    }
+    for ordinal in range(3):
+        command_id = f"command-{ordinal}"
+        service.record_authoritative_pre_dispatch_failure(
+            **kwargs,
+            command_id=command_id,
+            failure_code="no_legal_placement",
+            attempt_id=_attempt_id(str(kwargs["operation_id"]), command_id, ordinal),
+            attempt_ordinal=ordinal,
+            placement_revision=f"candidate-{ordinal}",
+            material_legality_identity=old_identity,
+        )
+
+    assert (
+        service.authoritative_pre_dispatch_retry_allowed(
+            **kwargs,
+            material_legality_identity=old_identity,
+        )
+        is False
+    )
+    # A different candidate/hash is not proof of a material legality change.
+    assert (
+        service.authoritative_pre_dispatch_retry_allowed(
+            **{
+                **kwargs,
+                "observation_revision": "observation-new",
+                "world_target": (24.0, 24.0),
+            },
+            placement_revision="candidate-new",
+            material_legality_identity=new_identity,
+        )
+        is False
+    )
+    # A new target-state revision at the exact failed target is material evidence.
+    assert (
+        service.authoritative_pre_dispatch_retry_allowed(
+            **{
+                **kwargs,
+                "observation_revision": "observation-new",
+                "target_state_revision": "target-changed",
+            },
+            placement_revision="candidate-new",
+            material_legality_identity=new_identity,
+        )
+        is True
+    )
+    reopened = service.record_authoritative_pre_dispatch_failure(
+        **{
+            **kwargs,
+            "observation_revision": "observation-new",
+            "target_state_revision": "target-changed",
+        },
+        command_id="command-new",
+        failure_code="placement_candidate_stale",
+        attempt_id=_attempt_id(str(kwargs["operation_id"]), "command-new", 3),
+        attempt_ordinal=3,
+        placement_revision="candidate-new",
+        material_legality_identity=new_identity,
+    )
+    assert reopened.transition == "open_to_reset"
+    assert reopened.reset_reason == "material_state_changed"
+    assert reopened.material_change_reason == "target_state_changed"
+    assert reopened.streak == 1
+    assert reopened.circuit_open is False
+
+
+def test_authoritative_pre_dispatch_checkpoint_restore_and_success_reset() -> None:
+    service = RawPlacementService(unit_names={}, no_start_streak_threshold=3)
+    operation_id = _operation_id("f")
+    for ordinal in range(3):
+        command_id = f"checkpoint-{ordinal}"
+        service.record_authoritative_pre_dispatch_failure(
+            operation_id=operation_id,
+            action_name="Build_Pylon_Screen",
+            command_id=command_id,
+            failure_code="no_legal_placement",
+            attempt_id=_attempt_id(operation_id, command_id, ordinal),
+            attempt_ordinal=ordinal,
+            builder_tag=0xB1,
+            ability_id=881,
+            world_target=(22.0, 24.0),
+            target_state_revision="target",
+            material_legality_identity=_material_id("1"),
+            observation_game_loop=ordinal,
+        )
+    restored = RawPlacementService(unit_names={}, no_start_streak_threshold=3)
+    restored.restore_checkpoint_state(service.checkpoint_state())
+    state = restored.authoritative_pre_dispatch_state(operation_id)
+    assert state is not None
+    assert state.circuit_open is True
+    assert state.streak == 3
+
+    reset = restored.reset_authoritative_pre_dispatch(
+        operation_id,
+        reason="build_started",
+        command_id="success",
+        action_name="Build_Pylon_Screen",
+        attempt_id=_attempt_id(operation_id, "success", 3),
+        attempt_ordinal=3,
+    )
+    assert reset is not None
+    assert reset.transition == "open_to_reset"
+    assert reset.reset_reason == "build_started"
+    state = restored.authoritative_pre_dispatch_state(operation_id)
+    assert state is not None
+    assert state.circuit_open is False
+    assert state.streak == 0
+
+
+def test_authoritative_pre_dispatch_success_clears_closed_streak_without_open_transition() -> None:
+    service = RawPlacementService(unit_names={}, no_start_streak_threshold=3)
+    operation_id = _operation_id("2")
+    service.record_authoritative_pre_dispatch_failure(
+        operation_id=operation_id,
+        action_name="Build_Gateway_Screen",
+        command_id="gateway-failure",
+        failure_code="placement_candidate_stale",
+        attempt_id=_attempt_id(operation_id, "gateway-failure", 0),
+        attempt_ordinal=0,
+        builder_tag=0xB1,
+        ability_id=883,
+        world_target=(24.0, 28.0),
+        target_state_revision="target",
+        material_legality_identity=_material_id("3"),
+    )
+
+    reset = service.reset_authoritative_pre_dispatch(
+        operation_id,
+        reason="build_started",
+        command_id="gateway-success",
+        action_name="Build_Gateway_Screen",
+        attempt_id=_attempt_id(operation_id, "gateway-success", 1),
+        attempt_ordinal=1,
+    )
+
+    assert reset is not None
+    assert reset.status == "reset"
+    assert reset.state_transition is None
+    state = service.authoritative_pre_dispatch_state(operation_id)
+    assert state is not None
+    assert state.streak == 0
+    assert state.circuit_open is False
+
+
+def test_authoritative_pre_dispatch_operation_state_is_isolated() -> None:
+    service = RawPlacementService(unit_names={}, no_start_streak_threshold=3)
+    blocked_operation = _operation_id("4")
+    allowed_operation = _operation_id("5")
+    material_identity = _material_id("6")
+    for ordinal in range(3):
+        command_id = f"blocked-{ordinal}"
+        service.record_authoritative_pre_dispatch_failure(
+            operation_id=blocked_operation,
+            action_name="Build_Pylon_Screen",
+            command_id=command_id,
+            failure_code="no_legal_placement",
+            attempt_id=_attempt_id(blocked_operation, command_id, ordinal),
+            attempt_ordinal=ordinal,
+            builder_tag=0xB1,
+            ability_id=881,
+            world_target=(22.0, 24.0),
+            target_state_revision="target",
+            material_legality_identity=material_identity,
+        )
+
+    assert service.authoritative_pre_dispatch_state(allowed_operation) is None
+    assert service.authoritative_pre_dispatch_retry_allowed(
+        allowed_operation,
+        builder_tag=0xB1,
+        ability_id=881,
+        world_target=(22.0, 24.0),
+        target_state_revision="target",
+        material_legality_identity=material_identity,
+    )
+
+
+def test_cached_authoritative_rejection_is_a_new_command_failure_without_a_new_query() -> None:
+    service = RawPlacementService(unit_names={}, no_start_streak_threshold=3)
+    common: dict[str, Any] = {
+        "operation_id": _operation_id("7"),
+        "action_name": "Build_Pylon_Screen",
+        "builder_tag": 0xB1,
+        "ability_id": 881,
+        "world_target": (22.0, 24.0),
+        "target_state_revision": "target",
+        "material_legality_identity": _material_id("8"),
+    }
+    first = service.record_authoritative_pre_dispatch_failure(
+        **common,
+        command_id="query-rejection",
+        failure_code="placement_query_rejected",
+        attempt_id=_attempt_id(str(common["operation_id"]), "query-rejection", 1),
+        attempt_ordinal=1,
+    )
+    cached = service.record_authoritative_pre_dispatch_failure(
+        **common,
+        command_id="cached-rejection",
+        failure_code="placement_query_rejected_cached",
+        attempt_id=_attempt_id(str(common["operation_id"]), "cached-rejection", 2),
+        attempt_ordinal=2,
+    )
+    assert first.streak == 1
+    assert cached.material_duplicate is True
+    assert cached.duplicate_attempt is False
+    assert cached.streak == 2
+    assert cached.circuit_open is False
+
+
+def test_authoritative_threshold_is_fixed_independently_of_no_start_configuration() -> None:
+    service = RawPlacementService(unit_names={}, no_start_streak_threshold=1)
+    operation_id = _operation_id("9")
+    decisions = [
+        service.record_authoritative_pre_dispatch_failure(
+            operation_id=operation_id,
+            action_name="Build_Pylon_Screen",
+            command_id=f"fixed-threshold-{ordinal}",
+            failure_code="no_legal_placement",
+            attempt_id=_attempt_id(operation_id, f"fixed-threshold-{ordinal}", ordinal),
+            attempt_ordinal=ordinal,
+            builder_tag=0xB1,
+            ability_id=881,
+            world_target=(22.0, 24.0),
+            target_state_revision="stable-target",
+            material_legality_identity=_material_id("a"),
+        )
+        for ordinal in range(3)
+    ]
+
+    assert [decision.threshold for decision in decisions] == [3, 3, 3]
+    assert [decision.streak for decision in decisions] == [1, 2, 3]
+    assert [decision.state_transition for decision in decisions] == [
+        None,
+        None,
+        "closed_to_open",
+    ]
+    assert decisions[-1].circuit_open is True
+
+
+def test_missing_material_identity_cannot_reset_an_open_authoritative_circuit() -> None:
+    service = RawPlacementService(unit_names={})
+    operation_id = _operation_id("b")
+    for ordinal in range(3):
+        command_id = f"missing-material-{ordinal}"
+        opened = service.record_authoritative_pre_dispatch_failure(
+            operation_id=operation_id,
+            action_name="Build_Pylon_Screen",
+            command_id=command_id,
+            failure_code="no_legal_placement",
+            attempt_id=_attempt_id(operation_id, command_id, ordinal),
+            attempt_ordinal=ordinal,
+            builder_tag=0xB1,
+            ability_id=881,
+            world_target=(22.0, 24.0),
+            target_state_revision="stable-target",
+            material_legality_identity="build-legality:1",
+        )
+
+    assert opened.circuit_open is True
+    assert opened.material_evidence_valid is False
+    assert "material_legality_identity_invalid" in opened.invalid_evidence_reasons
+    assert (
+        service.authoritative_pre_dispatch_retry_allowed(
+            operation_id,
+            builder_tag=0xB2,
+            ability_id=881,
+            world_target=(22.0, 24.0),
+            target_state_revision="changed-target",
+            material_legality_identity=_material_id("c"),
+        )
+        is False
+    )
+    blocked = service.record_authoritative_pre_dispatch_failure(
+        operation_id=operation_id,
+        action_name="Build_Pylon_Screen",
+        command_id="missing-material-post-open",
+        failure_code="authoritative_pre_dispatch_circuit_open",
+        attempt_id=_attempt_id(operation_id, "missing-material-post-open", 4),
+        attempt_ordinal=4,
+        builder_tag=0xB2,
+        ability_id=881,
+        world_target=(22.0, 24.0),
+        target_state_revision="changed-target",
+        material_legality_identity=_material_id("c"),
+    )
+    assert blocked.circuit_open is True
+    assert blocked.streak == 3
+    assert blocked.state_transition is None
+
+
+def test_authoritative_checkpoint_rejects_non_production_threshold() -> None:
+    service = RawPlacementService(unit_names={})
+    with pytest.raises(
+        ValueError,
+        match="authoritative pre-dispatch checkpoint threshold must be exactly 3",
+    ):
+        service.restore_checkpoint_state(
+            {
+                "authoritative_pre_dispatch_operations": {
+                    _operation_id("d"): {
+                        "operation_id": _operation_id("d"),
+                        "threshold": 1,
+                    }
+                }
+            }
+        )
 
 
 def _unit(

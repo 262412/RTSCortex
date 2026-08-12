@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from rtscortex_llm_pysc2.extractor import BUILD_SPECS
 
+from rtscortex.cortex.operations import AttemptKey
 from rtscortex.evaluation.engineering import (
     REQUIRED_ENGINEERING_GATES,
     EngineeringAccumulator,
@@ -503,6 +505,788 @@ def test_semantic_build_streak_ignores_pre_dispatch_rejections(tmp_path: Path) -
     assert report["gates"]["semantic_build_failure_streak_bounded"]["passed"] is True
 
 
+def test_authoritative_pre_dispatch_operation_gate_counts_cross_revision_streak(
+    tmp_path: Path,
+) -> None:
+    operation_id = f"operation:{'a' * 64}"
+    events = []
+    for event_id, failure_code in enumerate(
+        (
+            "placement_query_rejected",
+            "placement_candidate_stale",
+            "no_legal_placement",
+        ),
+        start=1,
+    ):
+        command_id = f"build-{event_id}"
+        attempt_ordinal = event_id - 1
+        attempt_id = AttemptKey(
+            operation_id=operation_id,
+            command_id=command_id,
+            attempt_ordinal=attempt_ordinal,
+        ).attempt_id
+        events.append(
+            _event(
+                event_id,
+                "execution",
+                {
+                    "command_id": command_id,
+                    "operation_id": operation_id,
+                    "attempt_id": attempt_id,
+                    "attempt_ordinal": event_id - 1,
+                    "action_name": "Build_Gateway_Screen",
+                    "status": "failed",
+                    "execution_stage": "pre_dispatch",
+                    "failure_code": failure_code,
+                    "authoritative_pre_dispatch": {
+                        "operation_id": operation_id,
+                        "action_name": "Build_Gateway_Screen",
+                        "command_id": command_id,
+                        "failure_code": failure_code,
+                        "status": "defer_replan" if event_id == 3 else "retry",
+                        "streak": event_id,
+                        "threshold": 3,
+                        "circuit_open": event_id == 3,
+                        "duplicate_attempt": False,
+                        "attempt_id": attempt_id,
+                        "attempt_ordinal": event_id - 1,
+                        "builder_tag": 0xA,
+                        "ability_id": 883,
+                        "world_target": [40.0 + event_id, 42.0],
+                        "placement_revision": f"ordinary-revision-{event_id}",
+                        "target_state_revision": f"target-state-{event_id}",
+                        "observation_revision": f"observation-{event_id}",
+                        "observation_game_loop": event_id * 16,
+                        "material_legality_identity": ("build-legality:" + f"{event_id:064x}"),
+                        "material_evidence_valid": True,
+                        "invalid_evidence_reasons": [],
+                        "state_transition": "closed_to_open" if event_id == 3 else None,
+                        "reset_reason": None,
+                    },
+                },
+            ),
+        )
+
+    report = build_engineering_gate_report(
+        events,
+        run_dir=tmp_path,
+        natural_run_baseline_bytes_per_loop=100.0,
+    )
+
+    diagnostics = report["diagnostics"]
+    assert diagnostics["authoritative_build_pre_dispatch_failure_count"] == 3
+    assert diagnostics["authoritative_build_pre_dispatch_max_failure_streak"] == 3
+    assert diagnostics["authoritative_build_pre_dispatch_circuit_open_count"] == 1
+    assert diagnostics["authoritative_build_pre_dispatch_post_open_command_count"] == 0
+    assert diagnostics["authoritative_build_pre_dispatch_missing_identity_count"] == 0
+    assert diagnostics["authoritative_build_pre_dispatch_failure_codes"] == {
+        "no_legal_placement": 1,
+        "placement_candidate_stale": 1,
+        "placement_query_rejected": 1,
+    }
+    assert report["gates"]["authoritative_build_pre_dispatch_circuit_bounded"]["passed"] is True
+
+
+def test_authoritative_pre_dispatch_gate_rejects_post_open_command(tmp_path: Path) -> None:
+    operation_id = f"operation:{'b' * 64}"
+    events = [
+        _event(
+            1,
+            "placement_ledger_transition",
+            {
+                "command_id": "build-third",
+                "action_name": "Build_Pylon_Screen",
+                "transition": {
+                    "authoritative_pre_dispatch": {
+                        "operation_id": operation_id,
+                        "action_name": "Build_Pylon_Screen",
+                        "command_id": "build-third",
+                        "failure_code": "placement_query_rejected_cached",
+                        "status": "defer_replan",
+                        "streak": 3,
+                        "threshold": 3,
+                        "circuit_open": True,
+                        "duplicate_attempt": False,
+                        "attempt_ordinal": 2,
+                        "builder_tag": "0xa",
+                        "ability_id": 881,
+                        "world_target": [65.0, 90.0],
+                        "placement_revision": "revision-3",
+                        "target_state_revision": "target-state-3",
+                        "observation_revision": "observation-3",
+                        "observation_game_loop": 48,
+                        "material_legality_identity": "build-legality:third",
+                        "state_transition": "closed_to_open",
+                        "reset_reason": None,
+                    }
+                },
+            },
+        ),
+        _event(
+            2,
+            "command_lineage",
+            {
+                "command_id": "build-fourth",
+                "operation_id": operation_id,
+                "lineage": {
+                    "command_id": "build-fourth",
+                    "operation_id": operation_id,
+                },
+                "semantic_action": "BUILD PYLON",
+            },
+        ),
+        _event(
+            3,
+            "execution",
+            {
+                "command_id": "build-fourth",
+                "operation_id": operation_id,
+                "attempt_id": "attempt:fourth",
+                "attempt_ordinal": 3,
+                "action_name": "Build_Pylon_Screen",
+                "status": "failed",
+                "execution_stage": "pre_dispatch",
+                "failure_code": "placement_query_rejected_cached",
+            },
+        ),
+    ]
+
+    report = build_engineering_gate_report(
+        events,
+        run_dir=tmp_path,
+        natural_run_baseline_bytes_per_loop=100.0,
+    )
+
+    assert report["diagnostics"]["authoritative_build_pre_dispatch_post_open_command_count"] == 1
+    assert report["diagnostics"]["authoritative_build_pre_dispatch_post_open_rejection_count"] == 1
+    assert report["gates"]["authoritative_build_pre_dispatch_circuit_bounded"]["passed"] is False
+
+
+def test_authoritative_pre_dispatch_gate_fails_closed_without_identity(
+    tmp_path: Path,
+) -> None:
+    report = build_engineering_gate_report(
+        [
+            _event(
+                1,
+                "execution",
+                {
+                    "command_id": "identity-missing",
+                    "operation_id": "operation:missing",
+                    "attempt_id": "attempt:missing",
+                    "attempt_ordinal": 0,
+                    "action_name": "Build_Assimilator_Near",
+                    "status": "failed",
+                    "execution_stage": "pre_dispatch",
+                    "failure_code": "placement_query_rejected",
+                },
+            )
+        ],
+        run_dir=tmp_path,
+        natural_run_baseline_bytes_per_loop=100.0,
+    )
+
+    assert report["diagnostics"]["authoritative_build_pre_dispatch_missing_identity_count"] == 1
+    assert report["gates"]["authoritative_build_pre_dispatch_circuit_bounded"]["passed"] is False
+
+
+def test_authoritative_replay_deduplicates_attempt_and_requires_123_progression(
+    tmp_path: Path,
+) -> None:
+    operation_id = _strict_identity("operation", 11)
+    events = [
+        _authoritative_failure_event(
+            event_id,
+            operation_id=operation_id,
+            attempt_ordinal=event_id - 1,
+            attempt_index=event_id,
+            streak=event_id,
+            state_transition="closed_to_open" if event_id == 3 else None,
+            circuit_open=event_id == 3,
+        )
+        for event_id in range(1, 4)
+    ]
+    events.append(
+        _authoritative_failure_event(
+            4,
+            operation_id=operation_id,
+            command_id="authoritative-command-3",
+            attempt_ordinal=2,
+            attempt_index=3,
+            streak=3,
+            status="duplicate",
+            duplicate_attempt=True,
+            state_transition=None,
+            circuit_open=True,
+        )
+    )
+
+    report = build_engineering_gate_report(
+        events,
+        run_dir=tmp_path,
+        natural_run_baseline_bytes_per_loop=100.0,
+    )
+
+    diagnostics = report["diagnostics"]
+    assert diagnostics["authoritative_build_pre_dispatch_failure_count"] == 3
+    assert diagnostics["authoritative_build_pre_dispatch_max_failure_streak"] == 3
+    assert diagnostics["authoritative_build_pre_dispatch_circuit_open_count"] == 1
+    assert diagnostics["authoritative_build_pre_dispatch_duplicate_attempt_count"] == 1
+    assert diagnostics["authoritative_build_pre_dispatch_invalid_transition_count"] == 0
+    assert report["gates"]["authoritative_build_pre_dispatch_circuit_bounded"]["passed"] is True
+
+
+def test_authoritative_replay_rejects_claimed_third_failure_without_open_transition(
+    tmp_path: Path,
+) -> None:
+    operation_id = _strict_identity("operation", 12)
+    events = [
+        _authoritative_failure_event(
+            event_id,
+            operation_id=operation_id,
+            attempt_ordinal=event_id - 1,
+            attempt_index=event_id,
+            streak=event_id,
+            state_transition=None,
+            circuit_open=False,
+        )
+        for event_id in range(1, 4)
+    ]
+
+    report = build_engineering_gate_report(
+        events,
+        run_dir=tmp_path,
+        natural_run_baseline_bytes_per_loop=100.0,
+    )
+
+    diagnostics = report["diagnostics"]
+    assert diagnostics["authoritative_build_pre_dispatch_failure_count"] == 3
+    assert diagnostics["authoritative_build_pre_dispatch_missing_open_count"] == 1
+    assert diagnostics["authoritative_build_pre_dispatch_circuit_open_count"] == 0
+    assert report["gates"]["authoritative_build_pre_dispatch_circuit_bounded"]["passed"] is False
+
+
+def test_authoritative_replay_rejects_ten_failures_self_reporting_streak_one(
+    tmp_path: Path,
+) -> None:
+    operation_id = _strict_identity("operation", 120)
+    events = [
+        _authoritative_failure_event(
+            event_id,
+            operation_id=operation_id,
+            attempt_ordinal=event_id - 1,
+            attempt_index=event_id,
+            streak=1,
+            state_transition=None,
+            circuit_open=False,
+            status="retry",
+        )
+        for event_id in range(1, 11)
+    ]
+
+    report = build_engineering_gate_report(
+        events,
+        run_dir=tmp_path,
+        natural_run_baseline_bytes_per_loop=100.0,
+    )
+
+    diagnostics = report["diagnostics"]
+    assert diagnostics["authoritative_build_pre_dispatch_max_failure_streak"] == 3
+    assert diagnostics["authoritative_build_pre_dispatch_missing_open_count"] == 1
+    assert diagnostics["authoritative_build_pre_dispatch_post_open_rejection_count"] == 7
+    assert report["gates"]["authoritative_build_pre_dispatch_circuit_bounded"]["passed"] is False
+
+
+@pytest.mark.parametrize(
+    "identity_defect", ("short_material", "missing_material", "attempt_mismatch")
+)
+def test_authoritative_replay_rejects_malformed_or_mismatched_child_identity(
+    identity_defect: str,
+    tmp_path: Path,
+) -> None:
+    operation_id = _strict_identity("operation", 121)
+    event = _authoritative_failure_event(
+        1,
+        operation_id=operation_id,
+        attempt_ordinal=0,
+        attempt_index=1,
+        streak=1,
+        state_transition=None,
+        circuit_open=False,
+    )
+    nested = event.payload["authoritative_pre_dispatch"]
+    assert isinstance(nested, dict)
+    if identity_defect == "short_material":
+        nested["material_legality_identity"] = "build-legality:1"
+    elif identity_defect == "missing_material":
+        nested.pop("material_legality_identity")
+    else:
+        nested["attempt_id"] = _strict_identity("attempt", 999)
+
+    report = build_engineering_gate_report(
+        [event],
+        run_dir=tmp_path,
+        natural_run_baseline_bytes_per_loop=100.0,
+    )
+
+    assert report["diagnostics"]["authoritative_build_pre_dispatch_missing_identity_count"] == 1
+    assert report["gates"]["authoritative_build_pre_dispatch_circuit_bounded"]["passed"] is False
+
+
+def test_authoritative_replay_rejects_placement_child_without_exact_parent_identity(
+    tmp_path: Path,
+) -> None:
+    operation_id = _strict_identity("operation", 122)
+    execution = _authoritative_failure_event(
+        1,
+        operation_id=operation_id,
+        attempt_ordinal=0,
+        attempt_index=1,
+        streak=1,
+        state_transition=None,
+        circuit_open=False,
+    )
+    transition = _event(
+        2,
+        "placement_ledger_transition",
+        {
+            "command_id": execution.payload["command_id"],
+            "action_name": "Build_Pylon_Screen",
+            "transition": {
+                "authoritative_pre_dispatch": dict(execution.payload["authoritative_pre_dispatch"])
+            },
+        },
+    )
+
+    report = build_engineering_gate_report(
+        [execution, transition],
+        run_dir=tmp_path,
+        natural_run_baseline_bytes_per_loop=100.0,
+    )
+
+    assert report["diagnostics"]["authoritative_build_pre_dispatch_failure_count"] == 1
+    assert (
+        report["diagnostics"]["authoritative_build_pre_dispatch_identity_inconsistency_count"] == 1
+    )
+    assert report["gates"]["authoritative_build_pre_dispatch_circuit_bounded"]["passed"] is False
+
+
+def test_authoritative_replay_rejects_inconsistent_producer_defer_summary(
+    tmp_path: Path,
+) -> None:
+    operation_id = _strict_identity("operation", 13)
+    events = [
+        _authoritative_failure_event(
+            event_id,
+            operation_id=operation_id,
+            attempt_ordinal=event_id - 1,
+            attempt_index=event_id,
+            streak=event_id,
+            state_transition="closed_to_open" if event_id == 3 else None,
+            circuit_open=event_id == 3,
+        )
+        for event_id in range(1, 4)
+    ]
+    events.append(
+        _event(
+            4,
+            "authoritative_build_pre_dispatch_circuit_defer",
+            {
+                "operation_id": operation_id,
+                "action_name": "Build_Pylon_Screen",
+                "threshold": 3,
+                "streak": 3,
+                "failure_count": 3,
+                "opened_command_id": "not-the-opener",
+                "opened_attempt_ordinal": 2,
+                "material_legality_identity": _strict_identity("build-legality", 3),
+            },
+        )
+    )
+
+    report = build_engineering_gate_report(
+        events,
+        run_dir=tmp_path,
+        natural_run_baseline_bytes_per_loop=100.0,
+    )
+
+    assert (
+        report["diagnostics"]["authoritative_build_pre_dispatch_producer_inconsistency_count"] == 1
+    )
+    assert report["gates"]["authoritative_build_pre_dispatch_circuit_bounded"]["passed"] is False
+
+
+def test_authoritative_replay_counts_raw_open_violation_once_without_fourth_failure(
+    tmp_path: Path,
+) -> None:
+    operation_id = _strict_identity("operation", 14)
+    events = [
+        _authoritative_failure_event(
+            event_id,
+            operation_id=operation_id,
+            attempt_ordinal=event_id - 1,
+            attempt_index=event_id,
+            streak=event_id,
+            state_transition="closed_to_open" if event_id == 3 else None,
+            circuit_open=event_id == 3,
+        )
+        for event_id in range(1, 4)
+    ]
+    for event_id in (4, 5):
+        events.append(
+            _event(
+                event_id,
+                "execution",
+                {
+                    "command_id": "raw-after-open",
+                    "operation_id": operation_id,
+                    "action_name": "Build_Pylon_Screen",
+                    "status": "failed",
+                    "execution_stage": "pre_dispatch",
+                    "failure_code": "authoritative_pre_dispatch_circuit_open",
+                },
+            )
+        )
+
+    report = build_engineering_gate_report(
+        events,
+        run_dir=tmp_path,
+        natural_run_baseline_bytes_per_loop=100.0,
+    )
+
+    diagnostics = report["diagnostics"]
+    assert diagnostics["authoritative_build_pre_dispatch_failure_count"] == 3
+    assert diagnostics["authoritative_build_pre_dispatch_raw_circuit_open_violation_count"] == 1
+    assert diagnostics["authoritative_build_pre_dispatch_post_open_rejection_count"] == 1
+    assert report["gates"]["authoritative_build_pre_dispatch_circuit_bounded"]["passed"] is False
+
+
+def test_authoritative_replay_rejects_nested_parent_identity_mismatch(
+    tmp_path: Path,
+) -> None:
+    operation_id = _strict_identity("operation", 15)
+    event = _authoritative_failure_event(
+        1,
+        operation_id=operation_id,
+        attempt_ordinal=0,
+        attempt_index=1,
+        streak=1,
+        state_transition=None,
+        circuit_open=False,
+    )
+    event.payload["authoritative_pre_dispatch"]["operation_id"] = _strict_identity("operation", 16)
+
+    report = build_engineering_gate_report(
+        [event],
+        run_dir=tmp_path,
+        natural_run_baseline_bytes_per_loop=100.0,
+    )
+
+    diagnostics = report["diagnostics"]
+    assert diagnostics["authoritative_build_pre_dispatch_missing_identity_count"] == 1
+    assert diagnostics["authoritative_build_pre_dispatch_identity_inconsistency_count"] == 1
+    assert report["gates"]["authoritative_build_pre_dispatch_circuit_bounded"]["passed"] is False
+
+
+def test_authoritative_replay_accepts_material_change_open_to_reset_then_new_streak(
+    tmp_path: Path,
+) -> None:
+    operation_id = _strict_identity("operation", 17)
+    events = [
+        _authoritative_failure_event(
+            event_id,
+            operation_id=operation_id,
+            attempt_ordinal=event_id - 1,
+            attempt_index=event_id,
+            streak=event_id,
+            state_transition="closed_to_open" if event_id == 3 else None,
+            circuit_open=event_id == 3,
+        )
+        for event_id in range(1, 4)
+    ]
+    changed = _authoritative_failure_event(
+        4,
+        operation_id=operation_id,
+        attempt_ordinal=3,
+        attempt_index=4,
+        streak=1,
+        state_transition="open_to_reset",
+        circuit_open=False,
+    )
+    changed.payload["authoritative_pre_dispatch"]["status"] = "retry"
+    changed.payload["authoritative_pre_dispatch"]["reset_reason"] = "material_state_changed"
+    changed.payload["authoritative_pre_dispatch"]["material_change_reason"] = "target_state_changed"
+    events.append(changed)
+
+    report = build_engineering_gate_report(
+        events,
+        run_dir=tmp_path,
+        natural_run_baseline_bytes_per_loop=100.0,
+    )
+
+    diagnostics = report["diagnostics"]
+    assert diagnostics["authoritative_build_pre_dispatch_failure_count"] == 4
+    assert diagnostics["authoritative_build_pre_dispatch_circuit_reset_count"] == 1
+    assert diagnostics["authoritative_build_pre_dispatch_invalid_transition_count"] == 0
+    assert report["gates"]["authoritative_build_pre_dispatch_circuit_bounded"]["passed"] is True
+
+
+def test_authoritative_replay_cross_validates_core_reset_before_new_raw_attempt(
+    tmp_path: Path,
+) -> None:
+    operation_id = _strict_identity("operation", 170)
+    events = [
+        _authoritative_failure_event(
+            event_id,
+            operation_id=operation_id,
+            attempt_ordinal=event_id - 1,
+            attempt_index=event_id,
+            streak=event_id,
+            state_transition="closed_to_open" if event_id == 3 else None,
+            circuit_open=event_id == 3,
+        )
+        for event_id in range(1, 4)
+    ]
+    opener_attempt = AttemptKey(
+        operation_id=operation_id,
+        command_id="authoritative-command-3",
+        attempt_ordinal=2,
+    ).attempt_id
+    events.extend(
+        [
+            _event(
+                4,
+                "authoritative_build_pre_dispatch_circuit_defer",
+                {
+                    "operation_id": operation_id,
+                    "action_name": "Build_Pylon_Screen",
+                    "threshold": 3,
+                    "streak": 3,
+                    "failure_count": 3,
+                    "opened_command_id": "authoritative-command-3",
+                    "opened_attempt_id": opener_attempt,
+                    "opened_attempt_ordinal": 2,
+                    "material_legality_identity": _strict_identity("build-legality", 3),
+                    "blocked_semantic_material_identity": _strict_identity(
+                        "semantic-build-material", 1
+                    ),
+                    "material_evidence_valid": True,
+                    "invalid_evidence_reasons": [],
+                    "next_action": "wait_for_material_legality_change_or_new_operation",
+                },
+            ),
+            _event(
+                5,
+                "authoritative_build_pre_dispatch_circuit_reset",
+                {
+                    "operation_id": operation_id,
+                    "action_name": "Build_Pylon_Screen",
+                    "reason": "semantic_legality_material_change",
+                    "previous_semantic_material_identity": _strict_identity(
+                        "semantic-build-material", 1
+                    ),
+                    "current_semantic_material_identity": _strict_identity(
+                        "semantic-build-material", 2
+                    ),
+                    "raw_material_legality_identity": _strict_identity("build-legality", 3),
+                    "previous_builder_tag": 0xA,
+                    "bound_builder_tag": 0xB,
+                    "ability_id": 881,
+                    "world_target": [65.0, 90.0],
+                    "game_loop": 80,
+                    "operation_epoch_changed": False,
+                    "reset_from_streak": 3,
+                },
+            ),
+            _event(
+                6,
+                "command_lineage",
+                {
+                    "command_id": "authoritative-command-4",
+                    "operation_id": operation_id,
+                    "lineage": {
+                        "command_id": "authoritative-command-4",
+                        "operation_id": operation_id,
+                    },
+                    "semantic_action": "BUILD PYLON",
+                },
+            ),
+        ]
+    )
+    changed = _authoritative_failure_event(
+        7,
+        operation_id=operation_id,
+        command_id="authoritative-command-4",
+        attempt_ordinal=3,
+        attempt_index=4,
+        streak=1,
+        state_transition="open_to_reset",
+        circuit_open=False,
+        status="retry",
+    )
+    changed.payload["authoritative_pre_dispatch"]["builder_tag"] = 0xB
+    changed.payload["authoritative_pre_dispatch"]["reset_reason"] = "material_state_changed"
+    changed.payload["authoritative_pre_dispatch"]["material_change_reason"] = "builder_changed"
+    events.append(changed)
+
+    report = build_engineering_gate_report(
+        events,
+        run_dir=tmp_path,
+        natural_run_baseline_bytes_per_loop=100.0,
+    )
+
+    diagnostics = report["diagnostics"]
+    assert diagnostics["authoritative_build_pre_dispatch_failure_count"] == 4
+    assert diagnostics["authoritative_build_pre_dispatch_circuit_reset_count"] == 1
+    assert diagnostics["authoritative_build_pre_dispatch_post_open_command_count"] == 0
+    assert diagnostics["authoritative_build_pre_dispatch_producer_inconsistency_count"] == 0
+    assert report["gates"]["authoritative_build_pre_dispatch_circuit_bounded"]["passed"] is True
+
+
+def test_authoritative_replay_rejects_forged_core_material_reset(
+    tmp_path: Path,
+) -> None:
+    operation_id = _strict_identity("operation", 171)
+    events = [
+        _authoritative_failure_event(
+            event_id,
+            operation_id=operation_id,
+            attempt_ordinal=event_id - 1,
+            attempt_index=event_id,
+            streak=event_id,
+            state_transition="closed_to_open" if event_id == 3 else None,
+            circuit_open=event_id == 3,
+        )
+        for event_id in range(1, 4)
+    ]
+    events.extend(
+        [
+            _event(
+                4,
+                "authoritative_build_pre_dispatch_circuit_reset",
+                {
+                    "operation_id": operation_id,
+                    "action_name": "Build_Pylon_Screen",
+                    "reason": "semantic_legality_material_change",
+                    "previous_semantic_material_identity": _strict_identity(
+                        "semantic-build-material", 1
+                    ),
+                    "current_semantic_material_identity": _strict_identity(
+                        "semantic-build-material", 1
+                    ),
+                    "raw_material_legality_identity": _strict_identity("build-legality", 999),
+                    "previous_builder_tag": 0xA,
+                    "bound_builder_tag": 0xB,
+                    "ability_id": 881,
+                    "world_target": [65.0, 90.0],
+                    "game_loop": 80,
+                    "operation_epoch_changed": False,
+                    "reset_from_streak": 3,
+                },
+            ),
+            _event(
+                5,
+                "command_lineage",
+                {
+                    "command_id": "post-forged-reset",
+                    "operation_id": operation_id,
+                    "lineage": {
+                        "command_id": "post-forged-reset",
+                        "operation_id": operation_id,
+                    },
+                    "semantic_action": "BUILD PYLON",
+                },
+            ),
+        ]
+    )
+
+    report = build_engineering_gate_report(
+        events,
+        run_dir=tmp_path,
+        natural_run_baseline_bytes_per_loop=100.0,
+    )
+
+    assert (
+        report["diagnostics"]["authoritative_build_pre_dispatch_producer_inconsistency_count"] == 1
+    )
+    assert report["diagnostics"]["authoritative_build_pre_dispatch_post_open_command_count"] == 1
+    assert report["gates"]["authoritative_build_pre_dispatch_circuit_bounded"]["passed"] is False
+
+
+def test_authoritative_replay_deduplicates_execution_and_placement_envelopes(
+    tmp_path: Path,
+) -> None:
+    operation_id = _strict_identity("operation", 18)
+    execution = _authoritative_failure_event(
+        1,
+        operation_id=operation_id,
+        attempt_ordinal=0,
+        attempt_index=1,
+        streak=1,
+        state_transition=None,
+        circuit_open=False,
+    )
+    evidence = dict(execution.payload["authoritative_pre_dispatch"])
+    transition = _event(
+        2,
+        "placement_ledger_transition",
+        {
+            "command_id": execution.payload["command_id"],
+            "operation_id": operation_id,
+            "attempt_id": execution.payload["attempt_id"],
+            "attempt_ordinal": 0,
+            "action_name": "Build_Pylon_Screen",
+            "transition": {"authoritative_pre_dispatch": evidence},
+        },
+    )
+
+    report = build_engineering_gate_report(
+        [execution, transition],
+        run_dir=tmp_path,
+        natural_run_baseline_bytes_per_loop=100.0,
+    )
+
+    diagnostics = report["diagnostics"]
+    assert diagnostics["authoritative_build_pre_dispatch_failure_count"] == 1
+    assert diagnostics["authoritative_build_pre_dispatch_duplicate_envelope_count"] == 1
+    assert diagnostics["authoritative_build_pre_dispatch_invalid_transition_count"] == 0
+
+
+def test_authoritative_replay_requires_typed_reset_for_success(tmp_path: Path) -> None:
+    operation_id = _strict_identity("operation", 19)
+    failed = _authoritative_failure_event(
+        1,
+        operation_id=operation_id,
+        attempt_ordinal=0,
+        attempt_index=1,
+        streak=1,
+        state_transition=None,
+        circuit_open=False,
+    )
+    succeeded = _event(
+        2,
+        "execution",
+        {
+            "command_id": "successful-build",
+            "operation_id": operation_id,
+            "attempt_id": _strict_identity("attempt", 2),
+            "attempt_ordinal": 1,
+            "action_name": "Build_Pylon_Screen",
+            "status": "succeeded",
+            "execution_stage": "effect_verification",
+        },
+    )
+
+    report = build_engineering_gate_report(
+        [failed, succeeded],
+        run_dir=tmp_path,
+        natural_run_baseline_bytes_per_loop=100.0,
+    )
+
+    assert report["diagnostics"]["authoritative_build_pre_dispatch_invalid_transition_count"] == 1
+    assert report["gates"]["authoritative_build_pre_dispatch_circuit_bounded"]["passed"] is False
+
+
 def test_build_started_effect_missing_is_not_a_no_start_streak(tmp_path: Path) -> None:
     events = [
         _semantic_build_execution(
@@ -950,6 +1734,72 @@ def _attack_dispatch(
                 "name": "Attack_Unit",
                 "actor": actor,
                 "arguments": ["0xdead"],
+            },
+        },
+    )
+
+
+def _strict_identity(prefix: str, index: int) -> str:
+    return f"{prefix}:{index:064x}"
+
+
+def _authoritative_failure_event(
+    event_id: int,
+    *,
+    operation_id: str,
+    attempt_ordinal: int,
+    attempt_index: int,
+    streak: int,
+    state_transition: str | None,
+    circuit_open: bool,
+    command_id: str | None = None,
+    attempt_id: str | None = None,
+    status: str | None = None,
+    duplicate_attempt: bool = False,
+) -> StoredEvent:
+    resolved_command_id = command_id or f"authoritative-command-{attempt_index}"
+    resolved_attempt_id = (
+        attempt_id
+        or AttemptKey(
+            operation_id=operation_id,
+            command_id=resolved_command_id,
+            attempt_ordinal=attempt_ordinal,
+        ).attempt_id
+    )
+    resolved_status = status or ("defer_replan" if streak == 3 else "retry")
+    failure_code = "no_legal_placement" if attempt_index == 3 else "placement_query_rejected"
+    return _event(
+        event_id,
+        "execution",
+        {
+            "command_id": resolved_command_id,
+            "operation_id": operation_id,
+            "attempt_id": resolved_attempt_id,
+            "attempt_ordinal": attempt_ordinal,
+            "action_name": "Build_Pylon_Screen",
+            "status": "failed",
+            "execution_stage": "pre_dispatch",
+            "failure_code": failure_code,
+            "authoritative_pre_dispatch": {
+                "operation_id": operation_id,
+                "action_name": "Build_Pylon_Screen",
+                "command_id": resolved_command_id,
+                "failure_code": failure_code,
+                "status": resolved_status,
+                "streak": streak,
+                "threshold": 3,
+                "circuit_open": circuit_open,
+                "duplicate_attempt": duplicate_attempt,
+                "attempt_id": resolved_attempt_id,
+                "attempt_ordinal": attempt_ordinal,
+                "builder_tag": 0xA,
+                "ability_id": 881,
+                "world_target": [65.0, 90.0],
+                "material_legality_identity": _strict_identity("build-legality", attempt_index),
+                "material_evidence_valid": True,
+                "invalid_evidence_reasons": [],
+                "state_transition": state_transition,
+                "reset_reason": None,
             },
         },
     )

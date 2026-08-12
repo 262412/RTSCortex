@@ -147,6 +147,7 @@ class BridgeCoordinator:
         total: Optional[int] = None,
         game_loop: Optional[int] = None,
         failure_code: Optional[str] = None,
+        authoritative_pre_dispatch: Optional[dict[str, Any]] = None,
         requested_function_id: Optional[int] = None,
         emitted_function_id: Optional[int] = None,
     ) -> None:
@@ -161,6 +162,7 @@ class BridgeCoordinator:
             total=total,
             game_loop=game_loop,
             failure_code=failure_code,
+            authoritative_pre_dispatch=authoritative_pre_dispatch,
             requested_function_id=requested_function_id,
             emitted_function_id=emitted_function_id,
         )

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Sequence
@@ -31,6 +33,7 @@ REQUIRED_ENGINEERING_GATES = (
     "build_failure_rate",
     "terminal_collapse_non_recovery_macro_dispatch_count",
     "semantic_build_failure_streak_bounded",
+    "authoritative_build_pre_dispatch_circuit_bounded",
     "placement_identity_complete",
     "builder_provenance_complete",
     "builder_lease_complete",
@@ -78,6 +81,8 @@ _RETAINED_EVENT_TYPES = frozenset(
         "macro_frontier_obsolete",
         "terminal_collapse_macro_hold_released",
         "terminal_collapse_non_recovery_macro_dispatch",
+        "authoritative_build_pre_dispatch_circuit_defer",
+        "authoritative_build_pre_dispatch_circuit_reset",
         "placement_ledger_transition",
         "tactical_actor_state",
         "expansion_commitment_started",
@@ -210,6 +215,7 @@ def build_engineering_gate_report(
     ]
     defense_audit = _defense_inventory_audit(defense_evaluations)
     semantic_build_audit = _semantic_build_operation_audit(retained)
+    authoritative_pre_dispatch_audit = _authoritative_build_pre_dispatch_audit(retained)
     terminal_collapse_macro_audit = _terminal_collapse_macro_dispatch_audit(retained)
     performance = _last_payload(retained, "event_store_performance")
     recovery_events = [
@@ -290,6 +296,21 @@ def build_engineering_gate_report(
             None
             if semantic_build_audit["operation_count"] == 0
             else semantic_build_audit["max_failure_streak"] <= SEMANTIC_BUILD_FAILURE_STREAK_LIMIT
+        ),
+        "authoritative_build_pre_dispatch_circuit_bounded": (
+            authoritative_pre_dispatch_audit["max_failure_streak"]
+            <= SEMANTIC_BUILD_FAILURE_STREAK_LIMIT
+            and authoritative_pre_dispatch_audit["post_open_command_count"] == 0
+            and authoritative_pre_dispatch_audit["post_open_dispatch_count"] == 0
+            and authoritative_pre_dispatch_audit["post_open_rejection_count"] == 0
+            and authoritative_pre_dispatch_audit["missing_identity_count"] == 0
+            and authoritative_pre_dispatch_audit["identity_inconsistency_count"] == 0
+            and authoritative_pre_dispatch_audit["invalid_transition_count"] == 0
+            and authoritative_pre_dispatch_audit["missing_open_count"] == 0
+            and authoritative_pre_dispatch_audit["threshold_violation_count"] == 0
+            and authoritative_pre_dispatch_audit["producer_inconsistency_count"] == 0
+            and authoritative_pre_dispatch_audit["raw_circuit_open_violation_count"] == 0
+            and accumulator.retention_overflow_count == 0
         ),
         "placement_identity_complete": (
             None if build_count == 0 else placement_complete == build_count
@@ -399,6 +420,72 @@ def build_engineering_gate_report(
             ],
             "semantic_build_failure_classification": semantic_build_audit["failure_classification"],
             "semantic_build_operations": semantic_build_audit["operations"],
+            "authoritative_build_pre_dispatch_operation_count": (
+                authoritative_pre_dispatch_audit["operation_count"]
+            ),
+            "authoritative_build_pre_dispatch_failure_count": (
+                authoritative_pre_dispatch_audit["failure_count"]
+            ),
+            "authoritative_build_pre_dispatch_max_failure_streak": (
+                authoritative_pre_dispatch_audit["max_failure_streak"]
+            ),
+            "authoritative_build_pre_dispatch_circuit_open_count": (
+                authoritative_pre_dispatch_audit["circuit_open_count"]
+            ),
+            "authoritative_build_pre_dispatch_circuit_reset_count": (
+                authoritative_pre_dispatch_audit["circuit_reset_count"]
+            ),
+            "authoritative_build_pre_dispatch_post_open_command_count": (
+                authoritative_pre_dispatch_audit["post_open_command_count"]
+            ),
+            "authoritative_build_pre_dispatch_post_open_dispatch_count": (
+                authoritative_pre_dispatch_audit["post_open_dispatch_count"]
+            ),
+            "authoritative_build_pre_dispatch_post_open_rejection_count": (
+                authoritative_pre_dispatch_audit["post_open_rejection_count"]
+            ),
+            "authoritative_build_pre_dispatch_raw_circuit_open_violation_count": (
+                authoritative_pre_dispatch_audit["raw_circuit_open_violation_count"]
+            ),
+            "authoritative_build_pre_dispatch_missing_identity_count": (
+                authoritative_pre_dispatch_audit["missing_identity_count"]
+            ),
+            "authoritative_build_pre_dispatch_identity_inconsistency_count": (
+                authoritative_pre_dispatch_audit["identity_inconsistency_count"]
+            ),
+            "authoritative_build_pre_dispatch_invalid_transition_count": (
+                authoritative_pre_dispatch_audit["invalid_transition_count"]
+            ),
+            "authoritative_build_pre_dispatch_missing_open_count": (
+                authoritative_pre_dispatch_audit["missing_open_count"]
+            ),
+            "authoritative_build_pre_dispatch_threshold_violation_count": (
+                authoritative_pre_dispatch_audit["threshold_violation_count"]
+            ),
+            "authoritative_build_pre_dispatch_producer_inconsistency_count": (
+                authoritative_pre_dispatch_audit["producer_inconsistency_count"]
+            ),
+            "authoritative_build_pre_dispatch_duplicate_attempt_count": (
+                authoritative_pre_dispatch_audit["duplicate_attempt_count"]
+            ),
+            "authoritative_build_pre_dispatch_duplicate_envelope_count": (
+                authoritative_pre_dispatch_audit["duplicate_envelope_count"]
+            ),
+            "authoritative_build_pre_dispatch_cross_revision_retry_count": (
+                authoritative_pre_dispatch_audit["cross_revision_retry_count"]
+            ),
+            "authoritative_build_pre_dispatch_operation_epoch_change_count": (
+                authoritative_pre_dispatch_audit["operation_epoch_change_count"]
+            ),
+            "authoritative_build_pre_dispatch_failure_codes": (
+                authoritative_pre_dispatch_audit["failure_codes"]
+            ),
+            "authoritative_build_pre_dispatch_reset_reasons": (
+                authoritative_pre_dispatch_audit["reset_reasons"]
+            ),
+            "authoritative_build_pre_dispatch_operations": (
+                authoritative_pre_dispatch_audit["operations"]
+            ),
             **ledger,
             "repeated_retreat_arrival_count": retreat_repeats,
             "unchanged_attack_redispatch_count": unchanged_attacks,
@@ -506,6 +593,983 @@ def _terminal_collapse_macro_dispatch_audit(
         "dispatched_violation_count": len(dispatched_violation_ids),
         "guard_violation_count": len(guard_violation_ids),
         "raw_boundary_violation_count": len(raw_boundary_violation_ids),
+    }
+
+
+_AUTHORITATIVE_BUILD_PRE_DISPATCH_CODES = frozenset(
+    {
+        "placement_query_rejected",
+        "placement_query_rejected_cached",
+        "placement_candidate_stale",
+        "no_legal_placement",
+    }
+)
+
+
+def _typed_digest_identity(value: str | None, prefix: str) -> bool:
+    if not isinstance(value, str) or not value.startswith(prefix):
+        return False
+    digest = value[len(prefix) :]
+    return len(digest) == 64 and all(character in "0123456789abcdef" for character in digest)
+
+
+def _finite_world_point(value: Any) -> tuple[float, float] | None:
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        return None
+    if not all(
+        isinstance(item, (int, float)) and not isinstance(item, bool) and math.isfinite(float(item))
+        for item in value
+    ):
+        return None
+    return float(value[0]), float(value[1])
+
+
+def _authoritative_attempt_identity(
+    operation_id: str,
+    command_id: str,
+    attempt_ordinal: int,
+) -> str:
+    encoded = json.dumps(
+        {
+            "operation_id": operation_id,
+            "command_id": command_id,
+            "attempt_ordinal": attempt_ordinal,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    return f"attempt:{hashlib.sha256(encoded).hexdigest()}"
+
+
+def _authoritative_pre_dispatch_evidence(payload: dict[str, Any]) -> dict[str, Any] | None:
+    direct = payload.get("authoritative_pre_dispatch")
+    if isinstance(direct, dict):
+        return direct
+    transition = payload.get("transition")
+    if isinstance(transition, dict):
+        nested = transition.get("authoritative_pre_dispatch")
+        if isinstance(nested, dict):
+            return nested
+    return None
+
+
+def _authoritative_build_pre_dispatch_audit(
+    events: Sequence[StoredEvent],
+) -> dict[str, Any]:
+    """Replay the raw Build boundary instead of trusting producer summaries.
+
+    A journal contains the same decision in several envelopes (execution,
+    placement transition and sometimes the Runtime's producer/defer event).  The
+    replay below orders those envelopes by ``event_id`` and deduplicates by the
+    command/attempt identity before changing an operation's state.  This keeps a
+    repeated producer row or a raw ``circuit_open`` rejection from becoming a
+    fourth failure.
+    """
+
+    ordered = sorted(events, key=lambda event: event.event_id)
+    records_by_event: defaultdict[int, list[dict[str, Any]]] = defaultdict(list)
+    missing_identity: set[str] = set()
+    identity_inconsistency: set[str] = set()
+    failure_codes: Counter[str] = Counter()
+    reset_reasons: Counter[str] = Counter()
+    producer_inconsistency: set[str] = set()
+    missing_open: set[str] = set()
+    threshold_violations: set[str] = set()
+    operations: defaultdict[str, dict[str, Any]] = defaultdict(
+        lambda: {
+            "authoritative_failure_count": 0,
+            "max_failure_streak": 0,
+            "circuit_open_count": 0,
+            "circuit_reset_count": 0,
+            "cross_revision_retry_count": 0,
+            "duplicate_attempt_count": 0,
+            "success_reset_count": 0,
+            "invalid_transition_count": 0,
+            "producer_defer_count": 0,
+            "producer_reset_count": 0,
+            "duplicate_envelope_count": 0,
+            "action_name": None,
+            "failure_codes": Counter(),
+            "reset_reasons": Counter(),
+            "operation_epoch_change_count": 0,
+        }
+    )
+
+    def _parent_fields(event: StoredEvent) -> dict[str, Any]:
+        payload = event.payload
+        transition = payload.get("transition")
+        parent: dict[str, Any] = dict(transition) if isinstance(transition, dict) else {}
+        parent.update({key: value for key, value in payload.items() if key != "transition"})
+        command = payload.get("command")
+        if isinstance(command, dict):
+            parent = {**command, **parent}
+        return parent
+
+    def _make_record(event: StoredEvent, evidence: dict[str, Any]) -> dict[str, Any]:
+        parent = _parent_fields(event)
+        operation_id = _string_value(evidence.get("operation_id"))
+        command_id = _string_value(evidence.get("command_id"))
+        action_name = _string_value(evidence.get("action_name"))
+        attempt_ordinal = evidence.get("attempt_ordinal")
+        attempt_id = _string_value(evidence.get("attempt_id"))
+        parent_mismatch = False
+        # Both execution and placement-ledger envelopes are authoritative
+        # parents.  Every nested identity field must be present and exact;
+        # accepting a child-only identity would allow replay under a different
+        # operation or attempt.
+        for key, value in (
+            ("operation_id", operation_id),
+            ("command_id", command_id),
+            ("action_name", action_name),
+            ("attempt_ordinal", attempt_ordinal),
+        ):
+            if key in parent and parent.get(key) is not None and parent.get(key) != value:
+                parent_mismatch = True
+        parent_operation = _string_value(parent.get("operation_id"))
+        parent_command = _string_value(parent.get("command_id"))
+        parent_action = _string_value(parent.get("action_name"))
+        parent_attempt_id = _string_value(parent.get("attempt_id"))
+        if event.event_type in {"execution", "placement_ledger_transition"}:
+            parent_mismatch = parent_mismatch or any(
+                (
+                    parent_operation != operation_id,
+                    parent_command != command_id,
+                    parent_action != action_name,
+                    parent.get("attempt_ordinal") != attempt_ordinal,
+                )
+            )
+            if not _typed_digest_identity(parent_attempt_id, "attempt:"):
+                parent_mismatch = True
+            if attempt_id != parent_attempt_id:
+                parent_mismatch = True
+            attempt_id = parent_attempt_id
+        else:
+            if attempt_id is None:
+                attempt_id = parent_attempt_id
+
+        status = _string_value(evidence.get("status")) or ""
+        failure_code = _string_value(evidence.get("failure_code"))
+        if failure_code is None:
+            failure_code = _string_value(event.payload.get("failure_code"))
+        parent_failure_code = _string_value(parent.get("failure_code"))
+        if parent_failure_code is not None and parent_failure_code != failure_code:
+            parent_mismatch = True
+        if event.event_type == "execution":
+            parent_status = _string_value(parent.get("status"))
+            if status == "reset" and parent_status != "succeeded":
+                parent_mismatch = True
+            if status != "reset" and parent_status == "succeeded":
+                parent_mismatch = True
+            if isinstance(parent.get("success"), bool):
+                if status == "reset" and parent.get("success") is not True:
+                    parent_mismatch = True
+                if status != "reset" and parent.get("success") is not False:
+                    parent_mismatch = True
+        material_identity = _string_value(evidence.get("material_legality_identity"))
+        builder_tag = evidence.get("builder_tag")
+        ability_id = evidence.get("ability_id")
+        world_target = _finite_world_point(evidence.get("world_target"))
+        material_evidence_valid = evidence.get("material_evidence_valid")
+        invalid_evidence_reasons = evidence.get("invalid_evidence_reasons")
+        parent_material_identity = _string_value(parent.get("material_legality_identity"))
+        if parent_material_identity is not None and parent_material_identity != material_identity:
+            parent_mismatch = True
+        transition = _string_value(evidence.get("state_transition")) or _string_value(
+            evidence.get("transition")
+        )
+        reset_reason = _string_value(evidence.get("reset_reason"))
+        if event.event_type == "placement_ledger_transition" and status == "reset":
+            next_state = _string_value(parent.get("next_state"))
+            if not (
+                reset_reason == "build_started"
+                and next_state == "build_started"
+                or reset_reason == "effect_confirmed"
+                and next_state == "occupied"
+            ):
+                parent_mismatch = True
+        failure = failure_code in _AUTHORITATIVE_BUILD_PRE_DISPATCH_CODES and status != "reset"
+        attempt_ordinal_valid = isinstance(attempt_ordinal, int) and not isinstance(
+            attempt_ordinal, bool
+        )
+        expected_attempt_identity = (
+            _authoritative_attempt_identity(operation_id, command_id, attempt_ordinal)
+            if isinstance(operation_id, str)
+            and isinstance(command_id, str)
+            and isinstance(attempt_ordinal, int)
+            and not isinstance(attempt_ordinal, bool)
+            else None
+        )
+        identity_attempt_valid = (
+            _typed_digest_identity(attempt_id, "attempt:")
+            and _typed_digest_identity(operation_id, "operation:")
+            and command_id is not None
+            and attempt_ordinal_valid
+            and attempt_id == expected_attempt_identity
+        )
+        identity_complete = (
+            _typed_digest_identity(operation_id, "operation:")
+            and command_id is not None
+            and action_name is not None
+            and action_name.startswith("Build_")
+            and len(action_name) > len("Build_")
+            and identity_attempt_valid
+            and attempt_ordinal_valid
+            and (not failure or _typed_digest_identity(material_identity, "build-legality:"))
+            and (
+                not failure
+                or (
+                    isinstance(builder_tag, int)
+                    and not isinstance(builder_tag, bool)
+                    and builder_tag > 0
+                    and isinstance(ability_id, int)
+                    and not isinstance(ability_id, bool)
+                    and ability_id > 0
+                    and world_target is not None
+                    and material_evidence_valid is True
+                    and invalid_evidence_reasons == []
+                )
+            )
+            and not parent_mismatch
+        )
+        record = {
+            "event_id": event.event_id,
+            "event_type": event.event_type,
+            "operation_id": operation_id,
+            "command_id": command_id,
+            "action_name": action_name,
+            "attempt_id": attempt_id,
+            "attempt_ordinal": attempt_ordinal,
+            "status": status,
+            "failure_code": failure_code,
+            "failure": failure,
+            "threshold": evidence.get("threshold"),
+            "streak": evidence.get("streak"),
+            "circuit_open": evidence.get("circuit_open"),
+            "duplicate_attempt": evidence.get("duplicate_attempt"),
+            "material_duplicate": evidence.get("material_duplicate") is True,
+            "material_legality_identity": material_identity,
+            "builder_tag": builder_tag,
+            "ability_id": ability_id,
+            "world_target": world_target,
+            "material_evidence_valid": material_evidence_valid,
+            "invalid_evidence_reasons": invalid_evidence_reasons,
+            "state_transition": transition,
+            "reset_reason": reset_reason,
+            "material_change_reason": _string_value(evidence.get("material_change_reason")),
+            "placement_revision": _string_value(evidence.get("placement_revision")),
+            "operation_epoch_changed": evidence.get("operation_epoch_changed") is True,
+            "identity_complete": identity_complete,
+            "parent_mismatch": parent_mismatch,
+        }
+        return record
+
+    for event in ordered:
+        evidence = _authoritative_pre_dispatch_evidence(event.payload)
+        if evidence is None:
+            continue
+        record = _make_record(event, evidence)
+        records_by_event[event.event_id].append(record)
+
+    command_owner: dict[str, str] = {}
+    attempt_owner: dict[str, str] = {}
+    for records in records_by_event.values():
+        for record in records:
+            record["replay_valid"] = record["identity_complete"]
+            command_id = record["command_id"]
+            operation_id = record["operation_id"]
+            if command_id is not None and _typed_digest_identity(operation_id, "operation:"):
+                previous_owner = command_owner.setdefault(command_id, operation_id)
+                if previous_owner != operation_id:
+                    identity_inconsistency.add(command_id)
+                    missing_identity.add(command_id)
+            attempt_id = record["attempt_id"]
+            if attempt_id is not None and _typed_digest_identity(operation_id, "operation:"):
+                previous_attempt_owner = attempt_owner.setdefault(attempt_id, operation_id)
+                if previous_attempt_owner != operation_id:
+                    identity_inconsistency.add(attempt_id)
+                    missing_identity.add(attempt_id)
+            if record["status"] not in {"retry", "defer_replan", "duplicate", "reset"}:
+                missing_identity.add(record["command_id"] or f"event:{record['event_id']}")
+                identity_inconsistency.add(record["command_id"] or f"event:{record['event_id']}")
+            if (
+                record["status"] != "reset"
+                and record["failure_code"] not in _AUTHORITATIVE_BUILD_PRE_DISPATCH_CODES
+            ):
+                missing_identity.add(record["command_id"] or f"event:{record['event_id']}")
+                identity_inconsistency.add(record["command_id"] or f"event:{record['event_id']}")
+            if record["failure"] or record["status"] == "reset":
+                command_id = record["command_id"] or f"event:{record['event_id']}"
+                if not record["replay_valid"]:
+                    missing_identity.add(command_id)
+                if record["parent_mismatch"]:
+                    identity_inconsistency.add(command_id)
+
+    records_by_event_id = records_by_event
+    states: dict[str, dict[str, Any]] = {}
+    post_open_commands: set[str] = set()
+    post_open_dispatches: set[str] = set()
+    post_open_rejections: set[str] = set()
+    raw_circuit_open_violations: set[str] = set()
+    post_open_unknown: set[str] = set()
+    invalid_transition_count = 0
+    operation_epoch_change_count = 0
+    previous_revision_by_operation: dict[str, str] = {}
+    seen_producer_defers: set[tuple[str, str | None, str | None, Any, Any]] = set()
+    seen_producer_resets: set[tuple[str, str | None, str | None]] = set()
+
+    def _state(operation_id: str) -> dict[str, Any]:
+        return states.setdefault(
+            operation_id,
+            {
+                "streak": 0,
+                "open": False,
+                "action_name": None,
+                "opener_command": None,
+                "opener_attempt": None,
+                "opener_ordinal": None,
+                "opener_event_id": None,
+                "opener_material": None,
+                "opener_builder_tag": None,
+                "opener_ability_id": None,
+                "opener_world_target": None,
+                "blocked_semantic_material_identity": None,
+                "producer_reset_pending": False,
+                "producer_reset_previous_material": None,
+                "seen_commands": set(),
+                "seen_attempts": set(),
+                "seen_command_records": {},
+                "seen_reset_keys": set(),
+            },
+        )
+
+    def _invalid(operation_id: str | None) -> None:
+        nonlocal invalid_transition_count
+        invalid_transition_count += 1
+        if operation_id is not None:
+            operations[operation_id]["invalid_transition_count"] += 1
+
+    def _clear_state(operation_id: str, state: dict[str, Any], reason: str) -> None:
+        state["streak"] = 0
+        state["open"] = False
+        state["action_name"] = None
+        state["opener_command"] = None
+        state["opener_attempt"] = None
+        state["opener_ordinal"] = None
+        state["opener_event_id"] = None
+        state["opener_material"] = None
+        state["opener_builder_tag"] = None
+        state["opener_ability_id"] = None
+        state["opener_world_target"] = None
+        state["blocked_semantic_material_identity"] = None
+        state["producer_reset_pending"] = False
+        state["producer_reset_previous_material"] = None
+        state["seen_commands"].clear()
+        state["seen_attempts"].clear()
+        state["seen_command_records"].clear()
+        previous_revision_by_operation.pop(operation_id, None)
+        operations[operation_id]["circuit_reset_count"] += 1
+        operations[operation_id]["reset_reasons"][reason] += 1
+        reset_reasons[reason] += 1
+
+    def _record_failure(record: dict[str, Any]) -> None:
+        nonlocal operation_epoch_change_count
+        operation_id = record["operation_id"]
+        if not _typed_digest_identity(operation_id, "operation:"):
+            return
+        if not record.get("replay_valid", False):
+            # Preserve an explicitly claimed open boundary for downstream
+            # post-open checks, but do not count malformed evidence as a real
+            # failure or let it advance the independently replayed streak.
+            if record["streak"] == 3 and record["state_transition"] == "closed_to_open":
+                state = _state(operation_id)
+                state["open"] = True
+                state["opener_command"] = record["command_id"]
+                state["opener_attempt"] = record["attempt_id"] or (
+                    "ordinal",
+                    record["attempt_ordinal"],
+                )
+                state["opener_ordinal"] = record["attempt_ordinal"]
+                state["opener_event_id"] = record["event_id"]
+                state["opener_material"] = record["material_legality_identity"]
+                state["opener_builder_tag"] = record["builder_tag"]
+                state["opener_ability_id"] = record["ability_id"]
+                state["opener_world_target"] = record["world_target"]
+            return
+        operation = operations[operation_id]
+        state = _state(operation_id)
+        if not isinstance(record["threshold"], int) or isinstance(record["threshold"], bool):
+            _invalid(operation_id)
+            return
+        if not isinstance(record["streak"], int) or isinstance(record["streak"], bool):
+            _invalid(operation_id)
+            return
+        if record["duplicate_attempt"] is not None and not isinstance(
+            record["duplicate_attempt"], bool
+        ):
+            _invalid(operation_id)
+            return
+        if record["operation_epoch_changed"]:
+            operation["operation_epoch_change_count"] += 1
+            operation_epoch_change_count += 1
+            if state["streak"] and record["state_transition"] != "open_to_reset":
+                _invalid(operation_id)
+        command_id = record["command_id"]
+        if state["action_name"] is not None and record["action_name"] != state["action_name"]:
+            _invalid(operation_id)
+        elif state["action_name"] is None:
+            state["action_name"] = record["action_name"]
+            operation["action_name"] = record["action_name"]
+        attempt_key = record["attempt_id"] or (
+            "ordinal",
+            record["attempt_ordinal"],
+        )
+        duplicate = command_id in state["seen_commands"] or attempt_key in state["seen_attempts"]
+        previous_record = state["seen_command_records"].get(command_id)
+        envelope_duplicate = bool(
+            duplicate
+            and previous_record is not None
+            and previous_record.get("event_type") != record.get("event_type")
+            and previous_record.get("failure_code") == record.get("failure_code")
+            and previous_record.get("streak") == record.get("streak")
+            and previous_record.get("state_transition") == record.get("state_transition")
+        )
+        if (
+            record["duplicate_attempt"] is not None
+            and bool(record["duplicate_attempt"]) != duplicate
+            and not envelope_duplicate
+        ):
+            _invalid(operation_id)
+            if bool(record["duplicate_attempt"]) and not duplicate:
+                # A producer cannot turn a first attempt into a counted
+                # failure merely by labelling it duplicate.
+                return
+        if duplicate:
+            if envelope_duplicate:
+                operation["duplicate_envelope_count"] += 1
+            else:
+                operation["duplicate_attempt_count"] += 1
+            if not envelope_duplicate and (
+                record["status"] != "duplicate" or record["state_transition"] is not None
+            ):
+                _invalid(operation_id)
+            if record["streak"] != state["streak"] or record["circuit_open"] is not state["open"]:
+                _invalid(operation_id)
+            return
+        if record["status"] == "duplicate":
+            _invalid(operation_id)
+            return
+        if command_id is not None:
+            state["seen_commands"].add(command_id)
+            state["seen_command_records"][command_id] = record
+        state["seen_attempts"].add(attempt_key)
+
+        material_reset_consumed = False
+        if state["producer_reset_pending"] and not state["open"]:
+            producer_reset_followup = (
+                record["state_transition"] == "open_to_reset"
+                and record["reset_reason"] == "material_state_changed"
+                and record["material_change_reason"]
+                in {
+                    "builder_changed",
+                    "ability_changed",
+                    "target_state_changed",
+                    "material_state_changed",
+                    "semantic_legality_material_change",
+                }
+                and _typed_digest_identity(record["material_legality_identity"], "build-legality:")
+                and record["material_legality_identity"]
+                != state["producer_reset_previous_material"]
+            )
+            if producer_reset_followup:
+                state["producer_reset_pending"] = False
+                state["producer_reset_previous_material"] = None
+                material_reset_consumed = True
+            else:
+                _invalid(operation_id)
+        if state["open"]:
+            material_changed = (
+                record["state_transition"] == "open_to_reset"
+                and _typed_digest_identity(record["material_legality_identity"], "build-legality:")
+                and record["material_legality_identity"] != state["opener_material"]
+                and bool(record["reset_reason"])
+                and (
+                    record["operation_epoch_changed"]
+                    or record["material_change_reason"]
+                    in {
+                        "builder_changed",
+                        "ability_changed",
+                        "target_state_changed",
+                        "material_state_changed",
+                        "semantic_legality_material_change",
+                    }
+                )
+            )
+            if material_changed:
+                reason = record["reset_reason"] or "material_state_changed"
+                _clear_state(operation_id, state, reason)
+                material_reset_consumed = True
+                state["action_name"] = record["action_name"]
+                if command_id is not None:
+                    state["seen_commands"].add(command_id)
+                    state["seen_command_records"][command_id] = record
+                state["seen_attempts"].add(attempt_key)
+            else:
+                if command_id is not None and (
+                    state["opener_event_id"] is None
+                    or record["event_id"] > state["opener_event_id"]
+                ):
+                    post_open_rejections.add(command_id)
+                if record["state_transition"] is not None:
+                    _invalid(operation_id)
+                if record["status"] != "defer_replan" or record["streak"] != 3:
+                    _invalid(operation_id)
+                if record["circuit_open"] is not True:
+                    _invalid(operation_id)
+                return
+
+        expected = state["streak"] + 1
+        if expected > 3:
+            _invalid(operation_id)
+            return
+        if record["threshold"] != 3:
+            threshold_violations.add(operation_id)
+            _invalid(operation_id)
+        expected_status = "defer_replan" if expected == 3 else "retry"
+        expected_open = expected == 3
+        if record["streak"] != expected or record["status"] != expected_status:
+            _invalid(operation_id)
+        if record["circuit_open"] is not expected_open:
+            _invalid(operation_id)
+        transition = record["state_transition"]
+        if expected == 3:
+            if transition != "closed_to_open":
+                missing_open.add(operation_id)
+                _invalid(operation_id)
+            else:
+                operation["circuit_open_count"] += 1
+            state["open"] = True
+            state["opener_command"] = command_id
+            state["opener_attempt"] = attempt_key
+            state["opener_ordinal"] = record["attempt_ordinal"]
+            state["opener_event_id"] = record["event_id"]
+            state["opener_material"] = record["material_legality_identity"]
+            state["opener_builder_tag"] = record["builder_tag"]
+            state["opener_ability_id"] = record["ability_id"]
+            state["opener_world_target"] = record["world_target"]
+        elif record["streak"] == 3 and transition == "closed_to_open":
+            # Keep replay fail-closed while still treating an explicitly
+            # claimed third-failure boundary as open for downstream checks.
+            # This lets us report a post-open dispatch even when the journal
+            # omitted attempts 1/2; it never increments the valid open count.
+            state["open"] = True
+            state["opener_command"] = command_id
+            state["opener_attempt"] = attempt_key
+            state["opener_ordinal"] = record["attempt_ordinal"]
+            state["opener_event_id"] = record["event_id"]
+            state["opener_material"] = record["material_legality_identity"]
+            state["opener_builder_tag"] = record["builder_tag"]
+            state["opener_ability_id"] = record["ability_id"]
+            state["opener_world_target"] = record["world_target"]
+        elif transition is not None and not material_reset_consumed:
+            _invalid(operation_id)
+        state["streak"] = expected
+        operation["authoritative_failure_count"] += 1
+        operation["failure_codes"][record["failure_code"]] += 1
+        failure_codes[record["failure_code"]] += 1
+        operation["max_failure_streak"] = max(operation["max_failure_streak"], expected)
+        revision = record["placement_revision"]
+        previous_revision = previous_revision_by_operation.get(operation_id)
+        if revision is not None and previous_revision is not None and revision != previous_revision:
+            operation["cross_revision_retry_count"] += 1
+        if revision is not None:
+            previous_revision_by_operation[operation_id] = revision
+
+    def _record_reset(record: dict[str, Any]) -> None:
+        nonlocal operation_epoch_change_count
+        operation_id = record["operation_id"]
+        if not _typed_digest_identity(operation_id, "operation:"):
+            return
+        if not record.get("replay_valid", False):
+            return
+        operation = operations[operation_id]
+        state = _state(operation_id)
+        if state["action_name"] is not None and record["action_name"] != state["action_name"]:
+            _invalid(operation_id)
+        reset_key = (
+            record["command_id"],
+            record["reset_reason"],
+            record["state_transition"],
+        )
+        if reset_key in state["seen_reset_keys"]:
+            operation["duplicate_envelope_count"] += 1
+            return
+        state["seen_reset_keys"].add(reset_key)
+        if record["operation_epoch_changed"]:
+            operation["operation_epoch_change_count"] += 1
+            operation_epoch_change_count += 1
+        if record["threshold"] != 3:
+            threshold_violations.add(operation_id)
+        if record["threshold"] != 3 or record["status"] != "reset":
+            _invalid(operation_id)
+        if record["failure_code"] != "build_started":
+            _invalid(operation_id)
+        if record["circuit_open"] is not False or record["streak"] != 0:
+            _invalid(operation_id)
+        reason = record["reset_reason"]
+        if not reason:
+            _invalid(operation_id)
+            return
+        transition = record["state_transition"]
+        if state["producer_reset_pending"]:
+            if transition != "open_to_reset" or reason not in {
+                "build_started",
+                "effect_confirmed",
+            }:
+                _invalid(operation_id)
+            else:
+                state["producer_reset_pending"] = False
+                state["producer_reset_previous_material"] = None
+                operation["success_reset_count"] += 1
+            return
+        if state["open"]:
+            if transition != "open_to_reset":
+                _invalid(operation_id)
+        elif state["streak"]:
+            if transition is not None:
+                _invalid(operation_id)
+        else:
+            _invalid(operation_id)
+        had_state = state["open"] or state["streak"]
+        if had_state:
+            _clear_state(operation_id, state, reason)
+            operation["success_reset_count"] += 1
+
+    for event in ordered:
+        payload = event.payload
+        for record in records_by_event_id.get(event.event_id, ()):
+            operation_id = record["operation_id"]
+            if operation_id is None or not _typed_digest_identity(operation_id, "operation:"):
+                continue
+            if record["failure"]:
+                _record_failure(record)
+            elif record["status"] == "reset":
+                _record_reset(record)
+            elif record["state_transition"] is not None:
+                _invalid(operation_id)
+
+        if event.event_type == "authoritative_build_pre_dispatch_circuit_defer":
+            operation_id = _string_value(payload.get("operation_id"))
+            defer_key = (
+                operation_id or "",
+                _string_value(payload.get("material_legality_identity")),
+                _string_value(payload.get("opened_command_id")),
+                payload.get("streak"),
+                payload.get("threshold"),
+            )
+            if defer_key in seen_producer_defers:
+                continue
+            seen_producer_defers.add(defer_key)
+            if not _typed_digest_identity(operation_id, "operation:"):
+                producer_inconsistency.add(f"event:{event.event_id}")
+            else:
+                assert operation_id is not None
+                operation = operations[operation_id]
+                state = _state(operation_id)
+                operation["producer_defer_count"] += 1
+                opened_attempt_id = _string_value(payload.get("opened_attempt_id"))
+                blocked_semantic_identity = _string_value(
+                    payload.get("blocked_semantic_material_identity")
+                )
+                producer_material_valid = payload.get("material_evidence_valid")
+                producer_invalid_reasons = payload.get("invalid_evidence_reasons")
+                producer_material_contract = (
+                    producer_material_valid is True
+                    and _typed_digest_identity(
+                        blocked_semantic_identity,
+                        "semantic-build-material:",
+                    )
+                    and producer_invalid_reasons == []
+                    or producer_material_valid is False
+                    and blocked_semantic_identity is None
+                    and isinstance(producer_invalid_reasons, list)
+                    and bool(producer_invalid_reasons)
+                    and all(
+                        isinstance(reason, str) and reason for reason in producer_invalid_reasons
+                    )
+                )
+                if (
+                    not state["open"]
+                    or not (
+                        (_string_value(payload.get("action_name", "")) or "").startswith("Build_")
+                        and len(_string_value(payload.get("action_name", "")) or "") > len("Build_")
+                    )
+                    or state["action_name"] != _string_value(payload.get("action_name"))
+                    or payload.get("threshold") != 3
+                    or payload.get("streak") != 3
+                    or payload.get("failure_count") != 3
+                    or _string_value(payload.get("opened_command_id")) != state["opener_command"]
+                    or payload.get("opened_attempt_ordinal") != state["opener_ordinal"]
+                    or not isinstance(payload.get("next_action"), str)
+                    or not payload.get("next_action")
+                    or not _typed_digest_identity(opened_attempt_id, "attempt:")
+                    or opened_attempt_id != state["opener_attempt"]
+                    or _string_value(payload.get("material_legality_identity"))
+                    != state["opener_material"]
+                    or not producer_material_contract
+                ):
+                    producer_inconsistency.add(operation_id)
+                    missing_open.add(operation_id)
+                elif producer_material_valid is True:
+                    state["blocked_semantic_material_identity"] = blocked_semantic_identity
+
+        elif event.event_type == "authoritative_build_pre_dispatch_circuit_reset":
+            operation_id = _string_value(payload.get("operation_id"))
+            reason = _string_value(payload.get("reason"))
+            reset_key = (operation_id or "", reason, _string_value(payload.get("action_name")))
+            if reset_key in seen_producer_resets:
+                continue
+            seen_producer_resets.add(reset_key)
+            if not _typed_digest_identity(operation_id, "operation:") or not reason:
+                producer_inconsistency.add(f"event:{event.event_id}")
+            else:
+                assert operation_id is not None
+                operation = operations[operation_id]
+                state = _state(operation_id)
+                operation["producer_reset_count"] += 1
+                previous_semantic_identity = _string_value(
+                    payload.get("previous_semantic_material_identity")
+                )
+                current_semantic_identity = _string_value(
+                    payload.get("current_semantic_material_identity")
+                )
+                bound_builder_tag = payload.get("bound_builder_tag")
+                reset_game_loop = payload.get("game_loop")
+                reset_contract_valid = (
+                    state["open"]
+                    and reason == "semantic_legality_material_change"
+                    and (_string_value(payload.get("action_name")) or "").startswith("Build_")
+                    and state["action_name"] == _string_value(payload.get("action_name"))
+                    and payload.get("reset_from_streak") == state["streak"] == 3
+                    and _string_value(payload.get("raw_material_legality_identity"))
+                    == state["opener_material"]
+                    and _typed_digest_identity(
+                        previous_semantic_identity,
+                        "semantic-build-material:",
+                    )
+                    and _typed_digest_identity(
+                        current_semantic_identity,
+                        "semantic-build-material:",
+                    )
+                    and previous_semantic_identity != current_semantic_identity
+                    and (
+                        state["blocked_semantic_material_identity"] is None
+                        or previous_semantic_identity == state["blocked_semantic_material_identity"]
+                    )
+                    and payload.get("previous_builder_tag") == state["opener_builder_tag"]
+                    and isinstance(bound_builder_tag, int)
+                    and not isinstance(bound_builder_tag, bool)
+                    and bound_builder_tag > 0
+                    and payload.get("ability_id") == state["opener_ability_id"]
+                    and _finite_world_point(payload.get("world_target"))
+                    == state["opener_world_target"]
+                    and isinstance(reset_game_loop, int)
+                    and not isinstance(reset_game_loop, bool)
+                    and reset_game_loop >= 0
+                    and isinstance(payload.get("operation_epoch_changed"), bool)
+                )
+                if not reset_contract_valid:
+                    producer_inconsistency.add(operation_id)
+                    _invalid(operation_id)
+                else:
+                    previous_raw_material = state["opener_material"]
+                    _clear_state(operation_id, state, reason)
+                    state["producer_reset_pending"] = True
+                    state["producer_reset_previous_material"] = previous_raw_material
+                if payload.get("operation_epoch_changed") is True:
+                    operation["operation_epoch_change_count"] += 1
+                    operation_epoch_change_count += 1
+
+        # A producer/Runtime command is forbidden once the replay has opened.
+        if event.event_type == "command_lineage":
+            lineage = payload.get("lineage", payload)
+            if isinstance(lineage, dict):
+                operation_id = _string_value(lineage.get("operation_id"))
+                command_id = _string_value(lineage.get("command_id")) or _string_value(
+                    payload.get("command_id")
+                )
+                parent_operation_id = _string_value(payload.get("operation_id"))
+                parent_command_id = _string_value(payload.get("command_id"))
+                if (parent_operation_id is not None and parent_operation_id != operation_id) or (
+                    parent_command_id is not None and parent_command_id != command_id
+                ):
+                    identity_inconsistency.add(command_id or f"event:{event.event_id}")
+                    missing_identity.add(command_id or f"event:{event.event_id}")
+                lineage_state = states.get(operation_id or "")
+                if (
+                    lineage_state is not None
+                    and lineage_state["open"]
+                    and (
+                        lineage_state["opener_event_id"] is None
+                        or event.event_id > lineage_state["opener_event_id"]
+                    )
+                ):
+                    if command_id is None:
+                        post_open_unknown.add(f"event:{event.event_id}")
+                    else:
+                        post_open_commands.add(command_id)
+                elif (
+                    any(item["open"] for item in states.values())
+                    and not _typed_digest_identity(operation_id, "operation:")
+                    and (
+                        str(lineage.get("action_name", "")).startswith("Build_")
+                        or str(lineage.get("semantic_action", "")).upper().startswith("BUILD ")
+                    )
+                ):
+                    post_open_unknown.add(f"event:{event.event_id}")
+        elif event.event_type == "command_lifecycle" and payload.get("status") == "dispatched":
+            command = payload.get("command")
+            if isinstance(command, dict):
+                operation_id = _string_value(command.get("operation_id"))
+                command_id = _string_value(command.get("command_id"))
+                parent_operation_id = _string_value(payload.get("operation_id"))
+                parent_command_id = _string_value(payload.get("command_id"))
+                if (parent_operation_id is not None and parent_operation_id != operation_id) or (
+                    parent_command_id is not None and parent_command_id != command_id
+                ):
+                    identity_inconsistency.add(command_id or f"event:{event.event_id}")
+                    missing_identity.add(command_id or f"event:{event.event_id}")
+                dispatch_state = states.get(operation_id or "")
+                if (
+                    dispatch_state is not None
+                    and dispatch_state["open"]
+                    and (
+                        dispatch_state["opener_event_id"] is None
+                        or event.event_id > dispatch_state["opener_event_id"]
+                    )
+                ):
+                    if command_id is None:
+                        post_open_unknown.add(f"event:{event.event_id}")
+                    else:
+                        post_open_dispatches.add(command_id)
+                elif (
+                    any(item["open"] for item in states.values())
+                    and not _typed_digest_identity(operation_id, "operation:")
+                    and str(command.get("name", "")).startswith("Build_")
+                ):
+                    post_open_unknown.add(f"event:{event.event_id}")
+
+        raw_failure = payload.get("failure_code")
+        if event.event_type == "execution" and raw_failure in {
+            "authoritative_pre_dispatch_circuit_open",
+            "operation_no_start_circuit_open",
+        }:
+            operation_id = _string_value(payload.get("operation_id"))
+            command_id = _string_value(payload.get("command_id"))
+            raw_state = states.get(operation_id or "")
+            raw_circuit_open_violations.add(command_id or f"event:{event.event_id}")
+            if not _typed_digest_identity(operation_id, "operation:"):
+                missing_identity.add(command_id or f"event:{event.event_id}")
+            elif (
+                raw_state is not None
+                and raw_state["open"]
+                and (
+                    raw_state["opener_event_id"] is None
+                    or event.event_id > raw_state["opener_event_id"]
+                )
+            ):
+                post_open_rejections.add(command_id or f"event:{event.event_id}")
+            elif raw_state is None or not raw_state["open"]:
+                missing_open.add(operation_id or f"event:{event.event_id}")
+                _invalid(operation_id)
+
+        if (
+            event.event_type == "execution"
+            and payload.get("execution_stage") == "pre_dispatch"
+            and raw_failure in _AUTHORITATIVE_BUILD_PRE_DISPATCH_CODES
+            and not records_by_event_id.get(event.event_id)
+        ):
+            operation_id = _string_value(payload.get("operation_id"))
+            command_id = _string_value(payload.get("command_id"))
+            evidence_state = states.get(operation_id or "")
+            if (
+                evidence_state is not None
+                and evidence_state["open"]
+                and (
+                    evidence_state["opener_event_id"] is None
+                    or event.event_id > evidence_state["opener_event_id"]
+                )
+            ):
+                post_open_rejections.add(command_id or f"event:{event.event_id}")
+            else:
+                missing_identity.add(command_id or f"event:{event.event_id}")
+
+        if event.event_type == "execution" and _semantic_build_action_name(payload) is not None:
+            operation_id = _string_value(payload.get("operation_id"))
+            if _typed_digest_identity(operation_id, "operation:"):
+                success_state = states.get(operation_id or "")
+                if (
+                    success_state is not None
+                    and success_state["streak"]
+                    and payload.get("status") == "succeeded"
+                ):
+                    # The success must carry the typed reset envelope (normally
+                    # nested in the placement transition emitted by Raw).
+                    if not records_by_event_id.get(event.event_id) or not any(
+                        record["status"] == "reset"
+                        for record in records_by_event_id[event.event_id]
+                    ):
+                        _invalid(operation_id)
+
+    rendered_operations = {
+        operation_id: {
+            **{
+                key: value
+                for key, value in operation.items()
+                if key not in {"failure_codes", "reset_reasons"}
+            },
+            "failure_codes": dict(sorted(operation["failure_codes"].items())),
+            "reset_reasons": dict(sorted(operation["reset_reasons"].items())),
+        }
+        for operation_id, operation in sorted(operations.items())
+    }
+    return {
+        "operation_count": len(operations),
+        "failure_count": sum(
+            operation["authoritative_failure_count"] for operation in operations.values()
+        ),
+        "max_failure_streak": max(
+            (operation["max_failure_streak"] for operation in operations.values()),
+            default=0,
+        ),
+        "circuit_open_count": sum(
+            operation["circuit_open_count"] for operation in operations.values()
+        ),
+        "circuit_reset_count": sum(
+            operation["circuit_reset_count"] for operation in operations.values()
+        ),
+        "post_open_command_count": len(post_open_commands) + len(post_open_unknown),
+        "post_open_dispatch_count": len(post_open_dispatches),
+        "post_open_rejection_count": len(post_open_rejections),
+        "raw_circuit_open_violation_count": len(raw_circuit_open_violations),
+        "missing_identity_count": len(missing_identity),
+        "identity_inconsistency_count": len(identity_inconsistency),
+        "invalid_transition_count": invalid_transition_count,
+        "missing_open_count": len(missing_open),
+        "threshold_violation_count": len(threshold_violations),
+        "producer_inconsistency_count": len(producer_inconsistency),
+        "duplicate_attempt_count": sum(
+            operation["duplicate_attempt_count"] for operation in operations.values()
+        ),
+        "duplicate_envelope_count": sum(
+            operation["duplicate_envelope_count"] for operation in operations.values()
+        ),
+        "cross_revision_retry_count": sum(
+            operation["cross_revision_retry_count"] for operation in operations.values()
+        ),
+        "operation_epoch_change_count": operation_epoch_change_count,
+        "failure_codes": dict(sorted(failure_codes.items())),
+        "reset_reasons": dict(sorted(reset_reasons.items())),
+        "operations": rendered_operations,
     }
 
 

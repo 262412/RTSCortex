@@ -6,6 +6,9 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import math
+import os
+import re
 import time
 from dataclasses import asdict, dataclass
 from typing import Any, Literal, Protocol
@@ -27,6 +30,7 @@ from rtscortex.contracts import (
 from rtscortex.contracts.interfaces import LLMProvider
 from rtscortex.cortex import (
     AttemptKey,
+    AuthoritativeBuildCircuitState,
     CandidateCompiler,
     CandidateSelectionStatus,
     CommandLineage,
@@ -75,6 +79,7 @@ from rtscortex.cortex.race_brain import (
     selected_hima_response,
 )
 from rtscortex.memory import EventStore, StoredEvent
+from rtscortex.placement import CANONICAL_PLACEMENT_SPECS, canonical_footprint_cells
 from rtscortex.playbook import (
     CortexPlaybookReviewer,
     LessonStatus,
@@ -125,6 +130,81 @@ from rtscortex.runtime.validation import (
 _HIMA_PREVIOUS_ACTION_WINDOW_GAME_LOOPS = int(60 * 22.4)
 _MACRO_REJECTION_RETRY_GAME_LOOPS = 16
 _CORTEX_SNAPSHOT_TYPE = "cortex-engine-v1"
+_OPERATION_IDENTITY = re.compile(r"^operation:[0-9a-f]{64}$")
+_BUILD_LEGALITY_IDENTITY = re.compile(r"^build-legality:[0-9a-f]{64}$")
+_ATTEMPT_IDENTITY = re.compile(r"^attempt:[0-9a-f]{64}$")
+_EXPERIMENT_IDENTITY_VALUE = re.compile(r"^[a-z][a-z0-9_-]*$")
+
+
+def _experiment_run_identity_from_environment(seed: int) -> dict[str, Any] | None:
+    """Return the runner-bound experiment identity or reject a partial identity.
+
+    The formal and production-canary wrappers set these values on the actual
+    RTSCortex process.  Persisting them from the runtime, rather than copying a
+    status-row value during analysis, gives the analyzer an independent identity
+    boundary for each SC2 artifact.
+    """
+
+    names = {
+        "mode": "RTSCORTEX_EXPERIMENT_MODE",
+        "experiment_kind": "RTSCORTEX_EXPERIMENT_KIND",
+        "arm": "RTSCORTEX_EXPERIMENT_ARM",
+        "subject_arm": "RTSCORTEX_EXPERIMENT_SUBJECT_ARM",
+    }
+    raw = {field: os.environ.get(name) for field, name in names.items()}
+    if not any(value is not None for value in raw.values()):
+        return None
+    mode = (raw["mode"] or "").strip()
+    kind = (raw["experiment_kind"] or "").strip()
+    arm = (raw["arm"] or "").strip()
+    subject_arm = (raw["subject_arm"] or "").strip() or None
+    if not mode or not kind or not arm:
+        raise RuntimeError("experiment run identity is partial")
+    if any(_EXPERIMENT_IDENTITY_VALUE.fullmatch(value) is None for value in (mode, kind, arm)):
+        raise RuntimeError("experiment run identity contains an invalid typed value")
+    if subject_arm is not None and _EXPERIMENT_IDENTITY_VALUE.fullmatch(subject_arm) is None:
+        raise RuntimeError("experiment subject arm contains an invalid typed value")
+    if kind == "behavior":
+        if arm not in {"frozen", "evolving", "active"}:
+            raise RuntimeError("behavior experiment arm is invalid")
+        if arm in {"frozen", "evolving"} and subject_arm != arm:
+            raise RuntimeError("formal behavior subject arm must equal its behavior arm")
+        if arm == "active" and subject_arm is not None:
+            raise RuntimeError("active canary behavior cannot claim a subject arm")
+    elif kind == "calibration":
+        if arm != "shadow" or subject_arm not in {"frozen", "evolving", "active"}:
+            raise RuntimeError("calibration identity requires shadow and a typed subject arm")
+    else:
+        raise RuntimeError("experiment kind must be behavior or calibration")
+    if mode == "causal_canary" and not (
+        kind == "behavior"
+        and arm == "active"
+        and subject_arm is None
+        or kind == "calibration"
+        and arm == "shadow"
+        and subject_arm == "active"
+    ):
+        raise RuntimeError("causal canary identity has an invalid role binding")
+    return {
+        "schema_version": "1.0",
+        "source": "runner_environment",
+        "seed": int(seed),
+        "mode": mode,
+        "experiment_kind": kind,
+        "arm": arm,
+        "subject_arm": subject_arm,
+    }
+
+
+_PROTOSS_POWERED_STRUCTURE_TYPES = frozenset(
+    {
+        "cyberneticscore",
+        "forge",
+        "gateway",
+        "shieldbattery",
+        "stargate",
+    }
+)
 _RECOVERABLE_EXPANSION_FAILURE_CODES = frozenset(
     {
         "invalid_expansion_anchor",
@@ -321,6 +401,11 @@ class CortexRuntimeEngine(RuntimeEngine):
         # a placement was accepted but never started.
         self._raw_build_material_tombstones: dict[str, set[str]] = {}
         self._raw_build_material_tombstone_circuits: set[str] = set()
+        self._authoritative_build_pre_dispatch_circuits: dict[
+            str,
+            AuthoritativeBuildCircuitState,
+        ] = {}
+        self._authoritative_build_pre_dispatch_defer_signatures: set[tuple[str, str | None]] = set()
 
     async def start(self) -> None:
         """Load and validate the configured specialist before SC2 starts."""
@@ -935,6 +1020,32 @@ class CortexRuntimeEngine(RuntimeEngine):
         await super()._activate_episode(observation)
         if not changed:
             return
+        existing_experiment_identity = self.store.last_event(
+            observation.run_id,
+            observation.episode_id,
+            "experiment_run_identity",
+        )
+        experiment_identity = _experiment_run_identity_from_environment(self.config.run.seed)
+        if existing_experiment_identity is not None and experiment_identity is None:
+            raise RuntimeError(
+                "experiment identity environment is missing while recovering an identified run"
+            )
+        if experiment_identity is not None:
+            expected_identity = {
+                **experiment_identity,
+                "run_id": observation.run_id,
+                "episode_id": observation.episode_id,
+            }
+            if existing_experiment_identity is None:
+                self.store.append_event(
+                    run_id=observation.run_id,
+                    episode_id=observation.episode_id,
+                    step_id=observation.step_id,
+                    event_type="experiment_run_identity",
+                    payload=expected_identity,
+                )
+            elif existing_experiment_identity.payload != expected_identity:
+                raise RuntimeError("experiment run identity changed during runtime recovery")
         self._macro_health_announced_for = None
         self._macro_plan = None
         self._macro_proposal = None
@@ -975,6 +1086,8 @@ class CortexRuntimeEngine(RuntimeEngine):
         self._next_macro_retry_game_loop = None
         self._raw_build_material_tombstones = {}
         self._raw_build_material_tombstone_circuits = set()
+        self._authoritative_build_pre_dispatch_circuits = {}
+        self._authoritative_build_pre_dispatch_defer_signatures = set()
         self._restore_consumed_canary_fixture_rules(observation)
         self._recover_cortex_episode(observation)
         if (
@@ -1002,13 +1115,32 @@ class CortexRuntimeEngine(RuntimeEngine):
             self._restore_cortex_checkpoint(checkpoint.payload)
             checkpoint_event_id = checkpoint.through_event_id
 
-        for event in self.store.events_of_type(
-            observation.run_id,
-            observation.episode_id,
-            "placement_ledger_transition",
-            after_event_id=checkpoint_event_id,
-        ):
+        build_feedback_events = sorted(
+            (
+                event
+                for event_type in ("placement_ledger_transition", "execution")
+                for event in self.store.events_of_type(
+                    observation.run_id,
+                    observation.episode_id,
+                    event_type,
+                    after_event_id=checkpoint_event_id,
+                )
+            ),
+            key=lambda item: item.event_id,
+        )
+        for event in build_feedback_events:
             self._remember_raw_build_placement_transition(event.payload)
+            if event.event_type != "execution":
+                continue
+            report = ExecutionReport.model_validate(event.payload)
+            if self._execution_confirms_authoritative_build_reset(report):
+                assert report.operation_id is not None
+                self._authoritative_build_pre_dispatch_circuits.pop(report.operation_id, None)
+                self._authoritative_build_pre_dispatch_defer_signatures = {
+                    key
+                    for key in self._authoritative_build_pre_dispatch_defer_signatures
+                    if key[0] != report.operation_id
+                }
 
         plan_event = self.store.last_event(
             observation.run_id,
@@ -1365,6 +1497,12 @@ class CortexRuntimeEngine(RuntimeEngine):
             "raw_build_material_tombstone_circuits": sorted(
                 self._raw_build_material_tombstone_circuits
             ),
+            "authoritative_build_pre_dispatch_circuits": {
+                operation_id: state.model_dump(mode="json")
+                for operation_id, state in sorted(
+                    self._authoritative_build_pre_dispatch_circuits.items()
+                )
+            },
         }
 
     def _restore_cortex_checkpoint(self, payload: dict[str, Any]) -> None:
@@ -1464,6 +1602,17 @@ class CortexRuntimeEngine(RuntimeEngine):
             if isinstance(circuits, (list, tuple, set, frozenset))
             else set()
         )
+        authoritative_circuits = payload.get(
+            "authoritative_build_pre_dispatch_circuits",
+            {},
+        )
+        self._authoritative_build_pre_dispatch_circuits = {
+            str(operation_id): AuthoritativeBuildCircuitState.model_validate(state)
+            for operation_id, state in (
+                authoritative_circuits.items() if isinstance(authoritative_circuits, dict) else ()
+            )
+            if isinstance(state, dict)
+        }
 
     def _announce_specialist_health(self, observation: ObservationEnvelope) -> None:
         episode_key = (observation.run_id, observation.episode_id)
@@ -2929,6 +3078,62 @@ class CortexRuntimeEngine(RuntimeEngine):
             )
         )[intent.intent_id]
         self._strategic_by_legacy_intent[intent.intent_id] = strategic_intent
+        if self._authoritative_build_pre_dispatch_blocks(
+            observation,
+            strategic_intent,
+        ):
+            operation_id = strategic_intent.operation_id
+            assert operation_id is not None
+            state = self._authoritative_build_pre_dispatch_circuits[operation_id]
+            self._strategic_by_legacy_intent[intent.intent_id] = strategic_intent.model_copy(
+                update={
+                    "hard_blockers": tuple(
+                        dict.fromkeys(
+                            (
+                                *strategic_intent.hard_blockers,
+                                "authoritative_build_pre_dispatch_circuit_open",
+                            )
+                        )
+                    )
+                }
+            )
+            defer_key = (operation_id, state.blocked_semantic_material_identity)
+            if defer_key not in self._authoritative_build_pre_dispatch_defer_signatures:
+                self._authoritative_build_pre_dispatch_defer_signatures.add(defer_key)
+                self._record_cortex_event(
+                    observation,
+                    "authoritative_build_pre_dispatch_circuit_defer",
+                    {
+                        "operation_id": operation_id,
+                        "action_name": state.action_name,
+                        "streak": state.streak,
+                        "threshold": state.threshold,
+                        "failure_count": state.failure_count,
+                        "last_failure_code": state.last_failure_code,
+                        "opened_command_id": state.opened_command_id,
+                        "opened_attempt_id": (
+                            None
+                            if state.opened_command_id is None
+                            or state.opened_attempt_ordinal is None
+                            else AttemptKey(
+                                operation_id=operation_id,
+                                command_id=state.opened_command_id,
+                                attempt_ordinal=state.opened_attempt_ordinal,
+                            ).attempt_id
+                        ),
+                        "opened_attempt_ordinal": state.opened_attempt_ordinal,
+                        "opened_game_loop": state.opened_game_loop,
+                        "material_legality_identity": state.material_legality_identity,
+                        "blocked_semantic_material_identity": (
+                            state.blocked_semantic_material_identity
+                        ),
+                        "material_evidence_valid": state.material_evidence_valid,
+                        "invalid_evidence_reasons": list(state.invalid_evidence_reasons),
+                        "operation_epoch_changed": state.operation_epoch_changed,
+                        "next_action": "wait_for_material_legality_change_or_new_operation",
+                    },
+                )
+            return None
         if self._raw_build_tombstone_blocks(strategic_intent):
             operation_id = strategic_intent.operation_id
             assert operation_id is not None
@@ -3682,14 +3887,610 @@ class CortexRuntimeEngine(RuntimeEngine):
             },
         )
 
+    def _semantic_build_material_identity(
+        self,
+        observation: ObservationEnvelope,
+        intent: StrategicIntent | str,
+        *,
+        world_target: tuple[float, float] | None,
+        builder_tag: int | None,
+        ability_id: int | None,
+    ) -> str | None:
+        """Hash validated material Build legality without revision churn."""
+
+        identity, _, _ = self._semantic_build_material_evidence(
+            observation,
+            intent,
+            world_target=world_target,
+            builder_tag=builder_tag,
+            ability_id=ability_id,
+        )
+        return identity
+
+    def _semantic_build_material_evidence(
+        self,
+        observation: ObservationEnvelope,
+        intent: StrategicIntent | str,
+        *,
+        world_target: tuple[float, float] | None,
+        builder_tag: int | None,
+        ability_id: int | None,
+    ) -> tuple[str | None, tuple[str, ...], int | None]:
+        """Return a typed identity only after binding exact material evidence."""
+
+        action_names = (intent,) if isinstance(intent, str) else tuple(intent.action_names)
+        matching_actions = [
+            action for action in observation.available_actions if action.name in action_names
+        ]
+        actor_scopes = sorted(
+            {scope for action in matching_actions for scope in action.actor_scopes}
+        )
+
+        def unit_tag(unit: Any) -> int | None:
+            try:
+                parsed = int(unit.unit_id, 0)
+            except (TypeError, ValueError):
+                return None
+            return parsed if parsed > 0 else None
+
+        invalid_reasons: list[str] = []
+        if not matching_actions:
+            invalid_reasons.append("build_action_unavailable")
+        if builder_tag is None or builder_tag <= 0:
+            invalid_reasons.append("builder_tag_missing")
+        if ability_id is None or ability_id <= 0:
+            invalid_reasons.append("ability_id_missing")
+        if (
+            world_target is None
+            or len(world_target) != 2
+            or not all(math.isfinite(float(value)) for value in world_target)
+        ):
+            invalid_reasons.append("world_target_missing")
+
+        action_spec = next(
+            (
+                CANONICAL_PLACEMENT_SPECS[action_name]
+                for action_name in action_names
+                if action_name in CANONICAL_PLACEMENT_SPECS
+            ),
+            None,
+        )
+        if action_spec is None:
+            invalid_reasons.append("placement_spec_unavailable")
+
+        exact_builder = next(
+            (
+                unit
+                for unit in observation.state.own_units
+                if builder_tag is not None and unit_tag(unit) == int(builder_tag)
+            ),
+            None,
+        )
+        scope_bound_builders = [
+            unit
+            for unit in observation.state.own_units
+            if set(unit.actor_scopes) & set(actor_scopes)
+        ]
+        if exact_builder is not None and (
+            not actor_scopes or exact_builder in scope_bound_builders
+        ):
+            bound_builder = exact_builder
+        elif len(scope_bound_builders) == 1:
+            bound_builder = scope_bound_builders[0]
+        elif exact_builder is not None and not scope_bound_builders:
+            bound_builder = exact_builder
+        else:
+            bound_builder = None
+            invalid_reasons.append(
+                "builder_binding_ambiguous" if scope_bound_builders else "builder_not_observed"
+            )
+        bound_builder_tag = None if bound_builder is None else unit_tag(bound_builder)
+        if bound_builder is not None and bound_builder_tag is None:
+            invalid_reasons.append("builder_tag_invalid")
+
+        if invalid_reasons:
+            return None, tuple(dict.fromkeys(invalid_reasons)), bound_builder_tag
+
+        assert world_target is not None
+        assert action_spec is not None
+        assert bound_builder is not None
+        assert bound_builder_tag is not None
+        target_cells = canonical_footprint_cells(world_target, action_spec)
+        structure_specs = {
+            spec.structure_type.casefold(): spec for spec in CANONICAL_PLACEMENT_SPECS.values()
+        }
+
+        def occupied_cells(unit: Any) -> frozenset[tuple[int, int]]:
+            if unit.position is None:
+                return frozenset()
+            spec = structure_specs.get(unit.unit_type.casefold())
+            if spec is not None:
+                return canonical_footprint_cells(unit.position, spec)
+            return frozenset({(math.floor(unit.position[0]), math.floor(unit.position[1]))})
+
+        def occupancy_identity(unit: Any) -> list[Any]:
+            return [
+                unit.unit_id,
+                unit.unit_type,
+                unit.alliance,
+                None
+                if unit.position is None
+                else [round(unit.position[0], 2), round(unit.position[1], 2)],
+            ]
+
+        state = observation.state
+        target_occupants = [
+            unit
+            for unit in (*state.own_units, *state.visible_enemies)
+            if unit_tag(unit) != bound_builder_tag and target_cells & occupied_cells(unit)
+        ]
+        target_occupants.extend(
+            unit for unit in state.own_structures if target_cells & occupied_cells(unit)
+        )
+        powered_structure = bool(
+            action_spec is not None
+            and action_spec.structure_type.casefold() in _PROTOSS_POWERED_STRUCTURE_TYPES
+        )
+        nearby_power_sources = [
+            unit
+            for unit in state.own_structures
+            if powered_structure
+            and world_target is not None
+            and unit.position is not None
+            and unit.unit_type.casefold() == "pylon"
+            and math.dist(unit.position, world_target) <= 7.0
+        ]
+        payload = {
+            "action_names": sorted(action_names),
+            "builder_tag": bound_builder_tag,
+            "ability_id": ability_id,
+            "builder": [
+                bound_builder.unit_id,
+                bound_builder.unit_type,
+                bound_builder.alliance,
+            ],
+            "target_occupancy": sorted(
+                (occupancy_identity(unit) for unit in target_occupants),
+                key=lambda item: item[0],
+            ),
+            "nearby_power_sources": sorted(
+                (occupancy_identity(unit) for unit in nearby_power_sources),
+                key=lambda item: item[0],
+            ),
+        }
+        digest = hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        return f"semantic-build-material:{digest}", (), bound_builder_tag
+
+    def _authoritative_build_pre_dispatch_blocks(
+        self,
+        observation: ObservationEnvelope,
+        intent: StrategicIntent,
+    ) -> bool:
+        operation_id = intent.operation_id
+        if operation_id is None or not any(
+            action.startswith("Build_") for action in intent.action_names
+        ):
+            return False
+        state = self._authoritative_build_pre_dispatch_circuits.get(operation_id)
+        if state is None or not state.circuit_open:
+            return False
+        if not state.material_evidence_valid:
+            return True
+        current_identity, invalid_reasons, bound_builder_tag = (
+            self._semantic_build_material_evidence(
+                observation,
+                intent,
+                world_target=state.world_target,
+                builder_tag=state.builder_tag,
+                ability_id=state.ability_id,
+            )
+        )
+        if current_identity is None:
+            signature = (operation_id, None)
+            if signature not in self._authoritative_build_pre_dispatch_defer_signatures:
+                self._authoritative_build_pre_dispatch_defer_signatures.add(signature)
+                self._record_cortex_event(
+                    observation,
+                    "authoritative_build_pre_dispatch_invalid_evidence",
+                    {
+                        "operation_id": operation_id,
+                        "action_name": state.action_name,
+                        "reason": "current_material_evidence_invalid",
+                        "invalid_evidence_reasons": list(invalid_reasons),
+                        "builder_tag": state.builder_tag,
+                        "bound_builder_tag": bound_builder_tag,
+                        "ability_id": state.ability_id,
+                        "world_target": state.world_target,
+                        "circuit_open": True,
+                    },
+                )
+            return True
+        if current_identity == state.blocked_semantic_material_identity:
+            return True
+        self._authoritative_build_pre_dispatch_circuits.pop(operation_id, None)
+        self._authoritative_build_pre_dispatch_defer_signatures = {
+            key
+            for key in self._authoritative_build_pre_dispatch_defer_signatures
+            if key[0] != operation_id
+        }
+        self._record_cortex_event(
+            observation,
+            "authoritative_build_pre_dispatch_circuit_reset",
+            {
+                "operation_id": operation_id,
+                "action_name": state.action_name,
+                "reason": "semantic_legality_material_change",
+                "previous_semantic_material_identity": (state.blocked_semantic_material_identity),
+                "current_semantic_material_identity": current_identity,
+                "raw_material_legality_identity": state.material_legality_identity,
+                "previous_builder_tag": state.builder_tag,
+                "bound_builder_tag": bound_builder_tag,
+                "ability_id": state.ability_id,
+                "world_target": state.world_target,
+                "game_loop": observation.game_loop,
+                "operation_epoch_changed": False,
+                "reset_from_streak": state.streak,
+            },
+        )
+        return False
+
+    @staticmethod
+    def _optional_builder_tag(value: Any) -> int | None:
+        if value is None:
+            return None
+        try:
+            parsed = int(value, 0) if isinstance(value, str) else int(value)
+        except (TypeError, ValueError):
+            return None
+        return parsed if parsed > 0 else None
+
+    @staticmethod
+    def _optional_world_target(value: Any) -> tuple[float, float] | None:
+        if not isinstance(value, (list, tuple)) or len(value) != 2:
+            return None
+        try:
+            point = float(value[0]), float(value[1])
+        except (TypeError, ValueError):
+            return None
+        return point if all(math.isfinite(item) for item in point) else None
+
+    @staticmethod
+    def _optional_nonnegative_int(value: Any) -> int | None:
+        if isinstance(value, bool):
+            return None
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return None
+        return parsed if parsed >= 0 else None
+
+    def _authoritative_material_reset_is_valid(
+        self,
+        *,
+        state: AuthoritativeBuildCircuitState,
+        authoritative: dict[str, Any],
+        latest: ObservationEnvelope | None,
+    ) -> bool:
+        if not state.material_evidence_valid or latest is None:
+            return False
+        action_name = authoritative.get("action_name")
+        material_identity = authoritative.get("material_legality_identity")
+        builder_tag = self._optional_builder_tag(authoritative.get("builder_tag"))
+        ability_id = self._optional_nonnegative_int(authoritative.get("ability_id"))
+        world_target = self._optional_world_target(authoritative.get("world_target"))
+        if (
+            not isinstance(action_name, str)
+            or not action_name.startswith("Build_")
+            or not isinstance(material_identity, str)
+            or _BUILD_LEGALITY_IDENTITY.fullmatch(material_identity) is None
+            or builder_tag is None
+            or ability_id is None
+            or ability_id <= 0
+            or world_target is None
+        ):
+            return False
+        current_identity, invalid_reasons, bound_builder_tag = (
+            self._semantic_build_material_evidence(
+                latest,
+                action_name,
+                world_target=world_target,
+                builder_tag=builder_tag,
+                ability_id=ability_id,
+            )
+        )
+        if (
+            current_identity is None
+            or invalid_reasons
+            or current_identity == state.blocked_semantic_material_identity
+        ):
+            return False
+        reason = authoritative.get("material_change_reason")
+        if reason == "builder_changed":
+            return (
+                bound_builder_tag is not None
+                and state.builder_tag is not None
+                and bound_builder_tag != state.builder_tag
+                and builder_tag == bound_builder_tag
+            )
+        if reason == "ability_changed":
+            return state.ability_id is not None and ability_id != state.ability_id
+        if reason == "target_state_changed":
+            return state.world_target == world_target
+        return False
+
+    @staticmethod
+    def _authoritative_success_reset_is_valid(
+        *,
+        authoritative: dict[str, Any],
+        transition: dict[str, Any],
+    ) -> bool:
+        reset_reason = authoritative.get("reset_reason")
+        next_state = transition.get("next_state")
+        return bool(
+            reset_reason == "build_started"
+            and next_state == "build_started"
+            or reset_reason == "effect_confirmed"
+            and next_state == "occupied"
+        )
+
+    @staticmethod
+    def _execution_confirms_authoritative_build_reset(report: ExecutionReport) -> bool:
+        evidence = report.effect_evidence
+        if (
+            report.status is not ExecutionStatus.SUCCEEDED
+            or report.operation_id is None
+            or report.action_name is None
+            or not report.action_name.startswith("Build_")
+            or evidence is None
+            or evidence.effect_kind != "build"
+        ):
+            return False
+        return bool(
+            evidence.build_started
+            or evidence.new_structure_tag is not None
+            or evidence.confirmation_kind in {"builder_order", "supporting_quorum", "new_structure"}
+            or any(
+                transition.next_state in {"build_started", "occupied"}
+                for transition in evidence.placement_ledger_transitions
+            )
+        )
+
     def _remember_raw_build_placement_transition(self, payload: Any) -> None:
-        """Replay raw no-start material identities into the Cortex tombstone."""
+        """Replay raw no-start and authoritative pre-dispatch circuit state."""
 
         if not isinstance(payload, dict):
             return
         transition = payload.get("transition", payload)
         if not isinstance(transition, dict):
             return
+        authoritative = transition.get("authoritative_pre_dispatch")
+        if not isinstance(authoritative, dict):
+            authoritative = payload.get("authoritative_pre_dispatch")
+        if isinstance(authoritative, dict):
+            nested_operation = authoritative.get("operation_id")
+            parent_operation = payload.get("operation_id")
+            operation_id = next(
+                (
+                    value
+                    for value in (parent_operation, nested_operation)
+                    if isinstance(value, str) and _OPERATION_IDENTITY.fullmatch(value)
+                ),
+                None,
+            )
+            if operation_id is not None:
+                invalid_reasons: list[str] = []
+                if not isinstance(nested_operation, str) or (
+                    _OPERATION_IDENTITY.fullmatch(nested_operation) is None
+                ):
+                    invalid_reasons.append("operation_id_invalid")
+                if parent_operation != nested_operation:
+                    invalid_reasons.append("parent_operation_mismatch")
+                nested_action = authoritative.get("action_name")
+                parent_action = payload.get("action_name")
+                if not isinstance(nested_action, str) or not nested_action.startswith("Build_"):
+                    invalid_reasons.append("build_action_invalid")
+                if parent_action != nested_action:
+                    invalid_reasons.append("parent_action_mismatch")
+                nested_command = authoritative.get("command_id")
+                parent_command = payload.get("command_id")
+                if not isinstance(nested_command, str) or not nested_command:
+                    invalid_reasons.append("command_id_missing")
+                if parent_command != nested_command:
+                    invalid_reasons.append("parent_command_mismatch")
+                nested_attempt = self._optional_nonnegative_int(
+                    authoritative.get("attempt_ordinal")
+                )
+                nested_attempt_id = authoritative.get("attempt_id")
+                if (
+                    not isinstance(nested_attempt_id, str)
+                    or _ATTEMPT_IDENTITY.fullmatch(nested_attempt_id) is None
+                    or not isinstance(nested_operation, str)
+                    or _OPERATION_IDENTITY.fullmatch(nested_operation) is None
+                    or not isinstance(nested_command, str)
+                    or not nested_command
+                    or nested_attempt is None
+                    or nested_attempt_id
+                    != AttemptKey(
+                        operation_id=nested_operation,
+                        command_id=nested_command,
+                        attempt_ordinal=nested_attempt,
+                    ).attempt_id
+                ):
+                    invalid_reasons.append("attempt_id_invalid")
+                parent_attempt = self._optional_nonnegative_int(payload.get("attempt_ordinal"))
+                if parent_attempt != nested_attempt:
+                    invalid_reasons.append("parent_attempt_mismatch")
+                parent_attempt_id = payload.get("attempt_id")
+                if parent_attempt_id != nested_attempt_id:
+                    invalid_reasons.append("parent_attempt_id_mismatch")
+                if self._optional_nonnegative_int(authoritative.get("threshold")) != 3:
+                    invalid_reasons.append("authoritative_threshold_invalid")
+                status = str(authoritative.get("status") or "")
+                state_transition = str(
+                    authoritative.get("state_transition") or authoritative.get("transition") or ""
+                )
+                latest = (
+                    self._latest_observation(
+                        str(payload.get("run_id") or self._episode_key[0]),
+                        str(payload.get("episode_id") or self._episode_key[1]),
+                    )
+                    if self._episode_key is not None
+                    else None
+                )
+                if status == "reset" or state_transition == "open_to_reset":
+                    existing = self._authoritative_build_pre_dispatch_circuits.get(operation_id)
+                    reset_reason = authoritative.get("reset_reason")
+                    reset_valid = existing is not None and (
+                        self._authoritative_success_reset_is_valid(
+                            authoritative=authoritative,
+                            transition=transition,
+                        )
+                        or reset_reason == "material_state_changed"
+                        and self._authoritative_material_reset_is_valid(
+                            state=existing,
+                            authoritative=authoritative,
+                            latest=latest,
+                        )
+                    )
+                    if reset_valid and not invalid_reasons:
+                        self._authoritative_build_pre_dispatch_circuits.pop(operation_id, None)
+                        self._authoritative_build_pre_dispatch_defer_signatures = {
+                            key
+                            for key in self._authoritative_build_pre_dispatch_defer_signatures
+                            if key[0] != operation_id
+                        }
+                    elif existing is not None:
+                        retained_reasons = tuple(
+                            dict.fromkeys(
+                                (
+                                    *existing.invalid_evidence_reasons,
+                                    *invalid_reasons,
+                                    "authoritative_reset_invalid",
+                                )
+                            )
+                        )
+                        self._authoritative_build_pre_dispatch_circuits[operation_id] = (
+                            existing.model_copy(
+                                update={
+                                    "material_evidence_valid": False,
+                                    "invalid_evidence_reasons": retained_reasons,
+                                }
+                            )
+                        )
+                elif authoritative.get("circuit_open") is True:
+                    existing = self._authoritative_build_pre_dispatch_circuits.get(operation_id)
+                    if existing is not None and existing.circuit_open:
+                        # Post-open Raw feedback is a boundary violation, never a new
+                        # authoritative failure or replacement baseline.
+                        pass
+                    else:
+                        action_value = authoritative.get("action_name")
+                        action_name = (
+                            action_value
+                            if isinstance(action_value, str) and action_value.startswith("Build_")
+                            else None
+                        )
+                        world_target = self._optional_world_target(
+                            authoritative.get("world_target")
+                        )
+                        builder_tag = self._optional_builder_tag(authoritative.get("builder_tag"))
+                        ability_id = self._optional_nonnegative_int(authoritative.get("ability_id"))
+                        if world_target is None:
+                            invalid_reasons.append("world_target_missing")
+                        if builder_tag is None:
+                            invalid_reasons.append("builder_tag_missing")
+                        if ability_id is None or ability_id <= 0:
+                            invalid_reasons.append("ability_id_missing")
+                        material_value = authoritative.get("material_legality_identity")
+                        material_identity = (
+                            material_value
+                            if isinstance(material_value, str)
+                            and _BUILD_LEGALITY_IDENTITY.fullmatch(material_value)
+                            else None
+                        )
+                        if material_identity is None:
+                            invalid_reasons.append("material_legality_identity_invalid")
+                        if latest is None:
+                            blocked_semantic_identity = None
+                            invalid_reasons.append("observation_missing")
+                        elif action_name is None:
+                            blocked_semantic_identity = None
+                        else:
+                            (
+                                blocked_semantic_identity,
+                                semantic_invalid_reasons,
+                                _,
+                            ) = self._semantic_build_material_evidence(
+                                latest,
+                                action_name,
+                                world_target=world_target,
+                                builder_tag=builder_tag,
+                                ability_id=ability_id,
+                            )
+                            invalid_reasons.extend(semantic_invalid_reasons)
+                        streak_value = self._optional_nonnegative_int(authoritative.get("streak"))
+                        if streak_value is None or streak_value < 3:
+                            invalid_reasons.append("authoritative_open_streak_invalid")
+                        if state_transition != "closed_to_open":
+                            invalid_reasons.append("closed_to_open_transition_missing")
+                        opened_command_id = (
+                            nested_command
+                            if isinstance(nested_command, str) and nested_command
+                            else None
+                        )
+                        attempt_value = nested_attempt
+                        failure_value = authoritative.get("failure_code")
+                        last_failure_code = (
+                            failure_value
+                            if isinstance(failure_value, str) and failure_value
+                            else None
+                        )
+                        if last_failure_code is None:
+                            invalid_reasons.append("failure_code_missing")
+                        opened_game_loop = self._optional_nonnegative_int(
+                            authoritative.get("observation_game_loop")
+                        )
+                        if opened_game_loop is None:
+                            opened_game_loop = self._optional_nonnegative_int(
+                                transition.get("game_loop")
+                            )
+                        if opened_game_loop is None:
+                            opened_game_loop = 0
+                            invalid_reasons.append("observation_game_loop_missing")
+                        normalized_reasons = tuple(dict.fromkeys(invalid_reasons))
+                        material_evidence_valid = not normalized_reasons
+                        streak = max(3, streak_value or 3)
+                        failure_count = max(
+                            streak,
+                            self._optional_nonnegative_int(authoritative.get("failure_count"))
+                            or streak,
+                        )
+                        self._authoritative_build_pre_dispatch_circuits[operation_id] = (
+                            AuthoritativeBuildCircuitState(
+                                operation_id=operation_id,
+                                action_name=action_name,
+                                streak=streak,
+                                threshold=3,
+                                circuit_open=True,
+                                failure_count=failure_count,
+                                last_failure_code=last_failure_code,
+                                opened_command_id=opened_command_id,
+                                opened_attempt_ordinal=attempt_value,
+                                opened_game_loop=opened_game_loop,
+                                builder_tag=builder_tag,
+                                ability_id=ability_id,
+                                world_target=world_target,
+                                material_legality_identity=material_identity,
+                                blocked_semantic_material_identity=(blocked_semantic_identity),
+                                material_evidence_valid=material_evidence_valid,
+                                invalid_evidence_reasons=normalized_reasons,
+                                operation_epoch_changed=bool(
+                                    authoritative.get("operation_epoch_changed", False)
+                                ),
+                            )
+                        )
         no_start = transition.get("placement_no_start")
         if not isinstance(no_start, dict):
             no_start = payload.get("placement_no_start")
@@ -3740,6 +4541,8 @@ class CortexRuntimeEngine(RuntimeEngine):
         super().record_execution(report)
         if existing is not None:
             return
+        if report.authoritative_pre_dispatch is not None:
+            self._remember_raw_build_placement_transition(report.model_dump(mode="json"))
         if report.effect_evidence is not None:
             for placement_transition in report.effect_evidence.placement_ledger_transitions:
                 self._remember_raw_build_placement_transition(
@@ -3751,6 +4554,14 @@ class CortexRuntimeEngine(RuntimeEngine):
         if report.status is ExecutionStatus.SUCCEEDED and report.operation_id is not None:
             self._raw_build_material_tombstones.pop(report.operation_id, None)
             self._raw_build_material_tombstone_circuits.discard(report.operation_id)
+        if self._execution_confirms_authoritative_build_reset(report):
+            assert report.operation_id is not None
+            self._authoritative_build_pre_dispatch_circuits.pop(report.operation_id, None)
+            self._authoritative_build_pre_dispatch_defer_signatures = {
+                key
+                for key in self._authoritative_build_pre_dispatch_defer_signatures
+                if key[0] != report.operation_id
+            }
         self._remember_terminal_feedback(report)
         lineage = self._command_lineages.get(report.command_id)
         self._resolve_playbook_rule_evaluations(report, lineage)

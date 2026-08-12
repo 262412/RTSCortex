@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from rtscortex.contracts.models import ContractModel
 
@@ -41,6 +42,56 @@ class AttemptKey(ContractModel):
     @property
     def attempt_id(self) -> str:
         return _identity("attempt", self.model_dump(mode="json"))
+
+
+class AuthoritativeBuildCircuitState(ContractModel):
+    """Durable semantic boundary opened by authoritative Build rejections."""
+
+    operation_id: str = Field(pattern=r"^operation:[0-9a-f]{64}$")
+    action_name: str | None = Field(default=None, pattern=r"^Build_.+")
+    streak: int = Field(ge=1)
+    threshold: Literal[3] = 3
+    circuit_open: bool
+    failure_count: int = Field(ge=1)
+    last_failure_code: str | None = Field(default=None, min_length=1)
+    opened_command_id: str | None = Field(default=None, min_length=1)
+    opened_attempt_ordinal: int | None = Field(default=None, ge=0)
+    opened_game_loop: int = Field(ge=0)
+    builder_tag: int | None = Field(default=None, gt=0)
+    ability_id: int | None = Field(default=None, ge=0)
+    world_target: tuple[float, float] | None = None
+    material_legality_identity: str | None = Field(
+        default=None,
+        pattern=r"^build-legality:[0-9a-f]{64}$",
+    )
+    blocked_semantic_material_identity: str | None = Field(
+        default=None,
+        pattern=r"^semantic-build-material:[0-9a-f]{64}$",
+    )
+    material_evidence_valid: bool
+    invalid_evidence_reasons: tuple[str, ...] = ()
+    operation_epoch_changed: bool = False
+
+    @model_validator(mode="after")
+    def validate_material_evidence(self) -> AuthoritativeBuildCircuitState:
+        if self.material_evidence_valid:
+            if (
+                self.builder_tag is None
+                or self.ability_id is None
+                or self.ability_id <= 0
+                or self.world_target is None
+                or self.action_name is None
+                or self.last_failure_code is None
+                or self.opened_command_id is None
+                or self.material_legality_identity is None
+                or self.blocked_semantic_material_identity is None
+            ):
+                raise ValueError("valid circuit material evidence requires complete typed identity")
+            if self.invalid_evidence_reasons:
+                raise ValueError("valid circuit material evidence cannot include invalid reasons")
+        elif not self.invalid_evidence_reasons:
+            raise ValueError("invalid circuit material evidence requires typed reasons")
+        return self
 
 
 class PlacementReservationKey(ContractModel):
@@ -109,6 +160,7 @@ class ExpansionGoalState(ContractModel):
 
 
 __all__ = [
+    "AuthoritativeBuildCircuitState",
     "AttemptKey",
     "EngagementKey",
     "ExpansionGoalKey",

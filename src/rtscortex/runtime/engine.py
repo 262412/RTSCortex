@@ -1535,12 +1535,17 @@ class RuntimeEngine:
                 f"{event.transition.structure_type!r} != {spec.structure_type!r}"
             )
         payload = {
+            **event.transition.model_dump(mode="json"),
+            # The durable envelope owns parent identity.  Legacy transitions may not
+            # repeat these fields, so never let their nullable values overwrite it.
             "command_id": event.command_id,
+            "operation_id": event.operation_id,
+            "attempt_id": event.attempt_id,
+            "attempt_ordinal": event.attempt_ordinal,
             "action_name": event.action_name,
             "transition_id": event.transition_id,
             "builder_tag": event.builder_tag,
             "builder_lease_state": event.builder_lease_state,
-            **event.transition.model_dump(mode="json"),
         }
         retry_status = self.store.placement_transition_retry_status(
             run_id=event.run_id,
@@ -1608,9 +1613,12 @@ class RuntimeEngine:
                     step_id=report.step_id,
                     event_type="placement_ledger_transition",
                     payload={
-                        "command_id": report.command_id,
-                        "action_name": report.action_name,
                         **transition.model_dump(mode="json"),
+                        "command_id": report.command_id,
+                        "operation_id": report.operation_id,
+                        "attempt_id": report.attempt_id,
+                        "attempt_ordinal": report.attempt_ordinal,
+                        "action_name": report.action_name,
                     },
                 )
         self.store.append_event(

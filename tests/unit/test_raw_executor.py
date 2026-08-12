@@ -15,12 +15,15 @@ from rtscortex_llm_pysc2.raw_placement import (
 from rtscortex_llm_pysc2.routing import ActionRouter, RoutedActionBatch, RoutedCommand
 from rtscortex_llm_pysc2.worker import SC2RawBuildQueryCapability
 
+from rtscortex.cortex import AttemptKey
+
 pytest.importorskip("pysc2.lib.actions")
 
 
 class _Broker:
     def __init__(self) -> None:
         self.settled: list[tuple[str, bool]] = []
+        self.settled_dispatches: list[Any] = []
         self.rejected_world_targets: list[tuple[str, tuple[float, float]]] = []
         self.extractor = SimpleNamespace(
             suppress_expansion_anchor=lambda *args, **kwargs: None,
@@ -32,6 +35,7 @@ class _Broker:
 
     def settle_primitive(self, dispatch: Any, *, success: bool, **_: Any) -> None:
         self.settled.append((dispatch.command_id, success))
+        self.settled_dispatches.append(dispatch)
 
 
 class _AllowRawBuildQuery:
@@ -254,6 +258,7 @@ def _authorized_pylon_command(
     *,
     command_id: str = "authorized-pylon",
     operation_id: str | None = None,
+    attempt_ordinal: int | None = None,
     target: tuple[float, float] = (22.0, 24.0),
 ) -> RoutedCommand:
     placement_revision = _placement_revision(observation)
@@ -265,6 +270,16 @@ def _authorized_pylon_command(
         rendered_action="",
         requested_arguments=([65, 65],),
         operation_id=operation_id,
+        attempt_id=(
+            None
+            if operation_id is None or attempt_ordinal is None
+            else AttemptKey(
+                operation_id=operation_id,
+                command_id=command_id,
+                attempt_ordinal=attempt_ordinal,
+            ).attempt_id
+        ),
+        attempt_ordinal=attempt_ordinal,
         screen_world_target=target,
         screen_anchor_tag=0xB1,
         placement_candidate_id=_placement_candidate_id(
@@ -593,6 +608,80 @@ def test_placement_query_rejection_suppresses_same_target_until_state_changes() 
     )
     assert len(query.calls) == 1
     assert executor.diagnostic_snapshot["failure_code"] == "placement_query_rejected_cached"
+
+
+def test_cached_query_rejections_count_toward_operation_circuit_without_new_query() -> None:
+    broker = _Broker()
+    query = _AllowRawBuildQuery(placement_result="CantBuildLocationInvalid")
+    executor = RawActionExecutor(
+        cast(Any, broker),
+        unit_names={2: "Probe"},
+        build_query_capability=query,
+    )
+    observation = SimpleNamespace(
+        raw_units=[_unit(0xB1, 2)],
+        game_loop=[100],
+        player_common=SimpleNamespace(minerals=500, vespene=0, food_used=0, food_cap=20),
+    )
+    operation_id = "operation:" + "a" * 64
+
+    for ordinal in range(1, 4):
+        command = replace(
+            _authorized_pylon_command(
+                observation,
+                command_id=f"cached-operation-{ordinal}",
+                operation_id=operation_id,
+                target=(30.0, 25.0),
+            ),
+            attempt_ordinal=ordinal,
+        )
+        executor.enqueue(_decision(command))
+        assert (
+            executor.next_dispatch(
+                observation,
+                {"Builder": _agent("Builder-Probe-1", [0xB1])},
+            )
+            is None
+        )
+
+    assert len(query.calls) == 1
+    assert executor.diagnostic_snapshot["failure_code"] == "placement_query_rejected_cached"
+    state = executor.placement_service.authoritative_pre_dispatch_state(operation_id)
+    assert state is not None
+    assert state.streak == 3
+    assert state.circuit_open is True
+    assert executor.placement_service.active_reservation_count == 0
+    assert executor.placement_service.leased_builder_tags == frozenset()
+    assert executor.effect_inflight_count == 0
+    assert all(
+        dispatch.authoritative_pre_dispatch is not None for dispatch in broker.settled_dispatches
+    )
+    assert broker.settled_dispatches[-1].authoritative_pre_dispatch["state_transition"] == (
+        "closed_to_open"
+    )
+
+    blocked = replace(
+        _authorized_pylon_command(
+            observation,
+            command_id="cached-operation-blocked",
+            operation_id=operation_id,
+            target=(30.0, 25.0),
+        ),
+        attempt_ordinal=4,
+    )
+    executor.enqueue(_decision(blocked))
+    assert (
+        executor.next_dispatch(
+            observation,
+            {"Builder": _agent("Builder-Probe-1", [0xB1])},
+        )
+        is None
+    )
+    assert len(query.calls) == 1
+    assert executor.diagnostic_snapshot["failure_code"] == "authoritative_pre_dispatch_circuit_open"
+    assert executor.placement_service.active_reservation_count == 0
+    assert executor.placement_service.leased_builder_tags == frozenset()
+    assert executor.effect_inflight_count == 0
 
 
 def test_rejected_authorization_allows_same_target_with_different_builder() -> None:
@@ -1651,6 +1740,80 @@ def test_raw_executor_keeps_operation_circuit_open_without_new_target_state() ->
 
     assert changed_dispatch is not None
     assert changed_dispatch.builder_tag == 0xB2
+
+
+def test_raw_executor_blocks_authoritative_circuit_before_resolve() -> None:
+    broker = _Broker()
+    observation = SimpleNamespace(
+        raw_units=[_unit(0xB1, 2)],
+        game_loop=[100],
+        player_common=SimpleNamespace(minerals=500, vespene=0, food_used=0, food_cap=20),
+    )
+    placement_service = RawPlacementService(
+        unit_names={2: "Probe"},
+        no_start_streak_threshold=3,
+    )
+    target = (30.0, 25.0)
+    target_state_revision = placement_service.target_state_revision_for(
+        observation,
+        "Build_Pylon_Screen",
+        target,
+        anchor_tag=None,
+    )
+    operation_id = f"operation:{'a' * 64}"
+    material_identity = placement_service.authoritative_pre_dispatch_material_identity(
+        operation_id=operation_id,
+        builder_tag=0xB1,
+        ability_id=881,
+        world_target=target,
+        target_state_revision=target_state_revision,
+    )
+    assert material_identity is not None
+    for ordinal in range(3):
+        command_id = f"pre-dispatch-{ordinal}"
+        placement_service.record_authoritative_pre_dispatch_failure(
+            operation_id=operation_id,
+            action_name="Build_Pylon_Screen",
+            command_id=command_id,
+            failure_code="placement_candidate_stale",
+            attempt_id=AttemptKey(
+                operation_id=operation_id,
+                command_id=command_id,
+                attempt_ordinal=ordinal,
+            ).attempt_id,
+            attempt_ordinal=ordinal,
+            builder_tag=0xB1,
+            ability_id=881,
+            world_target=target,
+            target_state_revision=target_state_revision,
+            material_legality_identity=material_identity,
+        )
+    executor = RawActionExecutor(
+        cast(Any, broker),
+        unit_names={2: "Probe"},
+        placement_service=placement_service,
+    )
+    command = _authorized_pylon_command(
+        observation,
+        command_id="authoritative-circuit-retry",
+        operation_id=operation_id,
+        attempt_ordinal=3,
+        target=target,
+    )
+    executor.enqueue(_decision(command))
+
+    assert (
+        executor.next_dispatch(
+            observation,
+            {"Builder": _agent("Builder-Probe-1", [0xB1])},
+        )
+        is None
+    )
+    assert executor.diagnostic_snapshot["failure_code"] == "authoritative_pre_dispatch_circuit_open"
+    assert executor.placement_service.active_reservation_count == 0
+    assert executor.placement_service.leased_builder_tags == frozenset()
+    assert executor.effect_inflight_count == 0
+    assert broker.settled == [("authoritative-circuit-retry", False)]
 
 
 def test_failed_build_effect_temporarily_suppresses_emitted_world_target() -> None:

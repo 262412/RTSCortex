@@ -123,6 +123,7 @@ if not counterfactual_canary_is_valid(
     expected_git_sha=sys.argv[2],
     expected_evaluation_seeds=evaluation_seeds,
     approved_rule_set_sha256=readiness.get("approved_rule_set_sha256"),
+    run_set_dir=Path(sys.argv[1]).resolve().parent,
 ):
     raise SystemExit(
         "counterfactual canary is rejected or mismatched to source, seeds, or approved rules"
@@ -200,7 +201,7 @@ uv run python scripts/run_recovery_acceptance_canary.py \
 } > "${run_set_dir}/experiment-metadata.txt"
 
 status_file="${run_set_dir}/experiment-status.tsv"
-printf "experiment_kind\tmode\tseed\tarm\tsubject_arm\tarm_order\texit_code\trun_dir\tplaybook_before_sha256\tplaybook_after_sha256\tplaybook_before_snapshot\tplaybook_after_snapshot\tgit_head_before\tgit_head_after\tsuperproject_dirty_before\tsuperproject_dirty_after\tsubmodule_commit_before\tsubmodule_commit_after\tsubmodule_dirty_before\tsubmodule_dirty_after\tsubmodule_gitlink_before\tsubmodule_gitlink_after\tsubmodule_diff_sha256_before\tsubmodule_diff_sha256_after\treviewed_source_commit_before\treviewed_source_commit_after\treviewed_source_diff_sha256_before\treviewed_source_diff_sha256_after\treviewed_source_tree_sha256_before\treviewed_source_tree_sha256_after\n" \
+printf "experiment_kind\tmode\tseed\tarm\tsubject_arm\tarm_order\texit_code\trun_dir\tevents_sha256\tsummary_sha256\tplaybook_before_sha256\tplaybook_after_sha256\tplaybook_before_snapshot\tplaybook_after_snapshot\tgit_head_before\tgit_head_after\tsuperproject_dirty_before\tsuperproject_dirty_after\tsubmodule_commit_before\tsubmodule_commit_after\tsubmodule_dirty_before\tsubmodule_dirty_after\tsubmodule_gitlink_before\tsubmodule_gitlink_after\tsubmodule_diff_sha256_before\tsubmodule_diff_sha256_after\treviewed_source_commit_before\treviewed_source_commit_after\treviewed_source_diff_sha256_before\treviewed_source_diff_sha256_after\treviewed_source_tree_sha256_before\treviewed_source_tree_sha256_after\n" \
   > "${status_file}"
 overall_status=0
 
@@ -249,6 +250,10 @@ run_arm() {
     HF_HUB_OFFLINE=1 \
     TRANSFORMERS_OFFLINE=1 \
     TOKENIZERS_PARALLELISM=false \
+    RTSCORTEX_EXPERIMENT_MODE="${mode}" \
+    RTSCORTEX_EXPERIMENT_KIND=behavior \
+    RTSCORTEX_EXPERIMENT_ARM="${arm}" \
+    RTSCORTEX_EXPERIMENT_SUBJECT_ARM="${arm}" \
     uv run rtscortex run \
       --config "${config}" \
       --seed "${seed}" \
@@ -278,12 +283,21 @@ run_arm() {
       "${log_path}" \
       | tail -n 1
   )"
+  local events_sha256=""
+  local summary_sha256=""
+  if [[ -n "${run_dir}" && -f "${run_dir}/events.jsonl" ]]; then
+    events_sha256="$(sha256sum "${run_dir}/events.jsonl" | awk '{print $1}')"
+  fi
+  if [[ -n "${run_dir}" && -f "${run_dir}/summary.json" ]]; then
+    summary_sha256="$(sha256sum "${run_dir}/summary.json" | awk '{print $1}')"
+  fi
   after_sha256="$(sha256sum "${working_playbook}" | awk '{print $1}')"
   after_snapshot="${arm_dir}/seed-${seed}.after.sqlite3"
   cp "${working_playbook}" "${after_snapshot}"
   local fields=(
     "behavior" "${mode}" "${seed}" "${arm}" "${arm}" "${order}"
-    "${run_status}" "${run_dir}" "${before_sha256}" "${after_sha256}"
+    "${run_status}" "${run_dir}" "${events_sha256}" "${summary_sha256}"
+    "${before_sha256}" "${after_sha256}"
     "${before_snapshot}" "${after_snapshot}" "${git_head_before}" "${git_head_after}"
     "${dirty_before}" "${dirty_after}" "${submodule_commit_before}"
     "${submodule_commit_after}" "${submodule_dirty_before}" "${submodule_dirty_after}"
@@ -338,6 +352,10 @@ run_shadow_calibration() {
     HF_HUB_OFFLINE=1 \
     TRANSFORMERS_OFFLINE=1 \
     TOKENIZERS_PARALLELISM=false \
+    RTSCORTEX_EXPERIMENT_MODE="${mode}" \
+    RTSCORTEX_EXPERIMENT_KIND=calibration \
+    RTSCORTEX_EXPERIMENT_ARM=shadow \
+    RTSCORTEX_EXPERIMENT_SUBJECT_ARM="${subject_arm}" \
     uv run rtscortex run \
       --config "${shadow_config}" \
       --seed "${seed}" \
@@ -367,12 +385,21 @@ run_shadow_calibration() {
       "${log_path}" \
       | tail -n 1
   )"
+  local events_sha256=""
+  local summary_sha256=""
+  if [[ -n "${run_dir}" && -f "${run_dir}/events.jsonl" ]]; then
+    events_sha256="$(sha256sum "${run_dir}/events.jsonl" | awk '{print $1}')"
+  fi
+  if [[ -n "${run_dir}" && -f "${run_dir}/summary.json" ]]; then
+    summary_sha256="$(sha256sum "${run_dir}/summary.json" | awk '{print $1}')"
+  fi
   after_sha256="$(sha256sum "${shadow_playbook}" | awk '{print $1}')"
   after_snapshot="${arm_dir}/seed-${seed}.after.sqlite3"
   cp "${shadow_playbook}" "${after_snapshot}"
   local fields=(
     "calibration" "${mode}" "${seed}" "shadow" "${subject_arm}" "${order}"
-    "${run_status}" "${run_dir}" "${before_sha256}" "${after_sha256}"
+    "${run_status}" "${run_dir}" "${events_sha256}" "${summary_sha256}"
+    "${before_sha256}" "${after_sha256}"
     "${before_snapshot}" "${after_snapshot}" "${git_head_before}" "${git_head_after}"
     "${dirty_before}" "${dirty_after}" "${submodule_commit_before}"
     "${submodule_commit_after}" "${submodule_dirty_before}" "${submodule_dirty_after}"

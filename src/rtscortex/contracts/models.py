@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any, Literal
@@ -10,6 +12,23 @@ from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
 
 ProtocolVersion = Literal["1.0", "1.1"]
 CURRENT_PROTOCOL_VERSION: Literal["1.1"] = "1.1"
+
+
+def _expected_attempt_identity(
+    operation_id: str,
+    command_id: str,
+    attempt_ordinal: int,
+) -> str:
+    encoded = json.dumps(
+        {
+            "operation_id": operation_id,
+            "command_id": command_id,
+            "attempt_ordinal": attempt_ordinal,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    return f"attempt:{hashlib.sha256(encoded).hexdigest()}"
 
 
 class ContractModel(BaseModel):
@@ -291,7 +310,90 @@ class PlacementNoStartEvidence(ContractModel):
     evidence: dict[str, Any] = Field(default_factory=dict)
 
 
+class AuthoritativePreDispatchEvidence(ContractModel):
+    """Typed operation-level result from an authoritative Build boundary."""
+
+    operation_id: str | None = Field(default=None, pattern=r"^operation:[0-9a-f]{64}$")
+    action_name: str = Field(min_length=1)
+    command_id: str = Field(min_length=1)
+    failure_code: str = Field(min_length=1)
+    status: Literal["retry", "defer_replan", "duplicate", "reset"]
+    streak: int = Field(ge=0)
+    threshold: Literal[3] = 3
+    circuit_open: bool
+    duplicate_attempt: bool
+    attempt_id: str | None = Field(default=None, pattern=r"^attempt:[0-9a-f]{64}$")
+    attempt_ordinal: int | None = Field(default=None, ge=0)
+    builder_tag: int | None = Field(default=None, gt=0)
+    ability_id: int | None = Field(default=None, ge=0)
+    world_target: tuple[float, float] | None = None
+    placement_revision: str | None = None
+    target_state_revision: str | None = None
+    observation_revision: str | None = None
+    observation_game_loop: int | None = Field(default=None, ge=0)
+    material_legality_identity: str | None = Field(
+        default=None,
+        pattern=r"^build-legality:[0-9a-f]{64}$",
+    )
+    material_evidence_valid: bool = False
+    invalid_evidence_reasons: list[str] = Field(default_factory=list)
+    material_duplicate: bool = False
+    state_transition: Literal["closed_to_open", "open_to_reset"] | None = None
+    reset_reason: str | None = None
+    material_change_reason: str | None = None
+    operation_epoch_changed: bool = False
+    next_action: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_authoritative_circuit_transition(self) -> AuthoritativePreDispatchEvidence:
+        if self.state_transition == "closed_to_open" and (
+            not self.circuit_open or self.streak != 3 or self.duplicate_attempt
+        ):
+            raise ValueError("closed_to_open requires the unique third non-duplicate failure")
+        if self.state_transition == "open_to_reset" and self.circuit_open:
+            raise ValueError("open_to_reset cannot remain circuit-open")
+        if self.circuit_open and self.streak < 3:
+            raise ValueError("authoritative circuit cannot open before the third failure")
+        if self.operation_id is None:
+            if self.attempt_id is not None:
+                raise ValueError("attempt identity cannot be bound without an operation identity")
+        elif (
+            self.attempt_id is None
+            or self.attempt_ordinal is None
+            or self.attempt_id
+            != _expected_attempt_identity(
+                self.operation_id,
+                self.command_id,
+                self.attempt_ordinal,
+            )
+        ):
+            raise ValueError("authoritative attempt identity does not match its parent fields")
+        if self.material_evidence_valid and (
+            self.operation_id is None
+            or self.attempt_id is None
+            or self.builder_tag is None
+            or self.ability_id is None
+            or self.ability_id <= 0
+            or self.world_target is None
+            or self.material_legality_identity is None
+            or self.invalid_evidence_reasons
+        ):
+            raise ValueError("valid material evidence requires complete typed identity")
+        if (
+            not self.material_evidence_valid
+            and self.status != "reset"
+            and not self.invalid_evidence_reasons
+        ):
+            raise ValueError("invalid material evidence requires typed reasons")
+        return self
+
+
 class PlacementLedgerTransition(ContractModel):
+    operation_id: str | None = Field(default=None, pattern=r"^operation:[0-9a-f]{64}$")
+    command_id: str | None = Field(default=None, min_length=1)
+    action_name: str | None = Field(default=None, min_length=1)
+    attempt_id: str | None = Field(default=None, pattern=r"^attempt:[0-9a-f]{64}$")
+    attempt_ordinal: int | None = Field(default=None, ge=0)
     reservation_id: str = Field(min_length=1)
     structure_type: str = Field(min_length=1)
     footprint_cells: list[tuple[int, int]] = Field(min_length=1)
@@ -311,6 +413,22 @@ class PlacementLedgerTransition(ContractModel):
     primitive_submitted_game_loop: int | None = Field(default=None, ge=0)
     action_result: list[int] | None = None
     placement_no_start: PlacementNoStartEvidence | None = None
+    authoritative_pre_dispatch: AuthoritativePreDispatchEvidence | None = None
+
+    @model_validator(mode="after")
+    def validate_authoritative_parent_identity(self) -> PlacementLedgerTransition:
+        evidence = self.authoritative_pre_dispatch
+        if evidence is not None and (
+            evidence.operation_id != self.operation_id
+            or evidence.command_id != self.command_id
+            or evidence.action_name != self.action_name
+            or evidence.attempt_id != self.attempt_id
+            or evidence.attempt_ordinal != self.attempt_ordinal
+        ):
+            raise ValueError(
+                "nested authoritative evidence does not match its transition parent identity"
+            )
+        return self
 
 
 class PlacementLedgerEvent(ContractModel):
@@ -321,11 +439,27 @@ class PlacementLedgerEvent(ContractModel):
     episode_id: str = Field(min_length=1)
     step_id: int = Field(ge=0)
     command_id: str = Field(min_length=1)
+    operation_id: str | None = Field(default=None, pattern=r"^operation:[0-9a-f]{64}$")
+    attempt_id: str | None = Field(default=None, pattern=r"^attempt:[0-9a-f]{64}$")
+    attempt_ordinal: int | None = Field(default=None, ge=0)
     action_name: str = Field(min_length=1)
     transition_id: str = Field(pattern=r"^placement-transition:[0-9a-f]{64}$")
     builder_tag: str | None = None
     builder_lease_state: Literal["acquired", "released"] | None = None
     transition: PlacementLedgerTransition
+
+    @model_validator(mode="after")
+    def validate_authoritative_parent_identity(self) -> PlacementLedgerEvent:
+        evidence = self.transition.authoritative_pre_dispatch
+        if evidence is not None and (
+            evidence.operation_id != self.operation_id
+            or evidence.command_id != self.command_id
+            or evidence.action_name != self.action_name
+            or evidence.attempt_id != self.attempt_id
+            or evidence.attempt_ordinal != self.attempt_ordinal
+        ):
+            raise ValueError("placement authoritative evidence does not match its parent identity")
+        return self
 
 
 class EffectEvidence(ContractModel):
@@ -508,6 +642,7 @@ class ExecutionReport(ContractModel):
     status: ExecutionStatus = ExecutionStatus.FAILED
     execution_stage: ExecutionStage | None = None
     failure_code: str | None = None
+    authoritative_pre_dispatch: AuthoritativePreDispatchEvidence | None = None
     primitive_trace: list[PrimitiveTraceEntry] = Field(default_factory=list)
     effect_evidence: EffectEvidence | None = None
     failure_reason: str | None = None
@@ -553,6 +688,30 @@ class ExecutionReport(ContractModel):
                 raise ValueError("protocol 1.1 execution report is missing: " + ", ".join(missing))
             if self.status is not ExecutionStatus.SUCCEEDED and self.failure_code is None:
                 raise ValueError("protocol 1.1 non-success execution reports require failure_code")
+        authoritative_evidence = [
+            evidence
+            for evidence in (
+                self.authoritative_pre_dispatch,
+                *(
+                    transition.authoritative_pre_dispatch
+                    for transition in (
+                        ()
+                        if self.effect_evidence is None
+                        else self.effect_evidence.placement_ledger_transitions
+                    )
+                ),
+            )
+            if evidence is not None
+        ]
+        if any(
+            evidence.operation_id != self.operation_id
+            or evidence.command_id != self.command_id
+            or evidence.action_name != self.action_name
+            or evidence.attempt_id != self.attempt_id
+            or evidence.attempt_ordinal != self.attempt_ordinal
+            for evidence in authoritative_evidence
+        ):
+            raise ValueError("authoritative evidence does not match its execution parent identity")
         return self
 
 

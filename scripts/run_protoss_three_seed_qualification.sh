@@ -199,6 +199,7 @@ required = {
     "build_failure_rate": lambda value: value is not None and value <= 0.1,
     "terminal_collapse_non_recovery_macro_dispatch_count": exact_zero_integer,
     "semantic_build_failure_streak_bounded": lambda value: value is True,
+    "authoritative_build_pre_dispatch_circuit_bounded": lambda value: value is True,
     "production_confirmation_complete": lambda value: value == 1.0,
     "recovery_evidence_present": lambda value: value is True,
     "checkpoint_tail_recovery_bounded": lambda value: value is True,
@@ -219,6 +220,18 @@ valid = valid and exact_zero_integer(
 )
 valid = valid and exact_zero_integer(
     diagnostics.get("terminal_collapse_macro_lineage_unknown_count")
+)
+valid = valid and exact_zero_integer(
+    diagnostics.get("authoritative_build_pre_dispatch_post_open_command_count")
+)
+valid = valid and exact_zero_integer(
+    diagnostics.get("authoritative_build_pre_dispatch_post_open_dispatch_count")
+)
+valid = valid and exact_zero_integer(
+    diagnostics.get("authoritative_build_pre_dispatch_post_open_rejection_count")
+)
+valid = valid and exact_zero_integer(
+    diagnostics.get("authoritative_build_pre_dispatch_missing_identity_count")
 )
 valid = valid and evidence.get("expected_git_sha") == expected_git_sha
 valid = valid and evidence.get("diagnostic_only") is False

@@ -3,12 +3,16 @@ from __future__ import annotations
 import json
 import sys
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
 import scripts.analyze_playbook_experiment as analyzer
+from rtscortex.evaluation.engineering import REQUIRED_ENGINEERING_GATES
 from rtscortex.memory import StoredEvent
 from scripts.analyze_playbook_counterfactual_canary import build_canary_report
 from scripts.analyze_playbook_experiment import RunMetrics, _comparison
@@ -95,7 +99,20 @@ def _metrics(
         sampled_drop_supported=False,
         playbook_before_sha256=before,
         playbook_after_sha256=after,
+        experiment_kind="calibration" if arm == "shadow" else "behavior",
         hard_rule_kind_records=(("production-rule", "execution_guard"),),
+        gameplay_metrics={
+            "upstream_placement_rejections": 0,
+            "meaningful_command_success_rate": 0.8,
+            "completed_execution_success_rate": 0.9,
+            "build_pre_dispatch_rejection_rate": 0.01,
+        },
+        gameplay_gate_results={name: True for name in analyzer.GAMEPLAY_GATE_NAMES},
+        gameplay_acceptance_accepted=True,
+        events_sha256="e" * 64,
+        summary_sha256="f" * 64,
+        artifact_integrity_valid=True,
+        legacy_acceptance_valid=True,
     )
 
 
@@ -184,7 +201,8 @@ def _strict_matrix(
 def test_current_acceptance_matrix_can_produce_resolved_would_block() -> None:
     comparison = _comparison(_strict_matrix(), baseline_sha256="baseline")
 
-    assert comparison["gates"]["complete_unique_run_matrix"] is True
+    assert comparison["gates"]["complete_unique_run_matrix"] is False
+    assert comparison["gates"]["formal_split_contract"] is False
     assert comparison["aggregate"]["hard_rule_resolved_block_count"] > 0
     assert comparison["gates"]["hard_false_block_rate_at_most_1_percent"] is True
 
@@ -402,7 +420,7 @@ def test_comparison_separates_independent_pairs_from_sequential_learning() -> No
     assert comparison["gates"]["complete_unique_run_matrix"] is True
     assert comparison["gates"]["independent_baseline_identity"] is True
     assert comparison["gates"]["sequential_evolving_carry"] is True
-    assert comparison["accepted"] is True
+    assert comparison["accepted"] is False
 
 
 def test_comparison_rejects_noncanonical_seed_execution_order() -> None:
@@ -698,7 +716,165 @@ def test_formal_comparison_accepts_complete_counterfactual_canary() -> None:
     )
 
     assert canary["accepted"] is True
-    assert comparison["gates"]["counterfactual_canary_accepted"] is True
+    assert comparison["gates"]["counterfactual_canary_accepted"] is False
+
+
+def test_canary_has_typed_qualification_and_gameplay_acceptance() -> None:
+    behavior = replace(
+        _metrics(
+            mode="causal_canary",
+            seed=0,
+            arm="active",
+            before="baseline",
+            after="after",
+            repeated_errors=0,
+        ),
+        active_hard_block_keys=("counterfactual:shared",),
+        active_hard_block_records=(("counterfactual:shared", 100, "a" * 64),),
+    )
+    shadow = replace(
+        _metrics(
+            mode="causal_canary",
+            seed=0,
+            arm="shadow",
+            before="baseline",
+            after="baseline",
+            repeated_errors=0,
+        ),
+        resolved_counterfactual_keys=("counterfactual:shared",),
+    )
+
+    production = build_canary_report(
+        behavior,
+        shadow,
+        baseline_sha256="baseline",
+        expected_git_sha="expected",
+        readiness_evidence=_readiness(),
+    )
+    fixture = build_canary_report(
+        replace(
+            behavior,
+            mode="fixture",
+            hard_rule_kind_records=(("fixture-rule", "execution_guard"),),
+        ),
+        replace(
+            shadow,
+            mode="fixture",
+            shadow_would_block_keys=("counterfactual:shared",),
+            hard_rule_kind_records=(("fixture-rule", "execution_guard"),),
+        ),
+        baseline_sha256="baseline",
+        expected_git_sha="expected",
+        readiness_evidence=_readiness(fixture=True),
+        canary_kind="fixture",
+    )
+
+    assert production["counterfactual_qualification_accepted"] is True
+    assert production["gameplay_acceptance_accepted"] is True
+    assert production["production_authorizing_accepted"] is True
+    assert production["accepted"] is True
+    assert fixture["counterfactual_qualification_accepted"] is True
+    assert fixture["gameplay_acceptance_accepted"] is True
+    assert fixture["production_authorizing_accepted"] is False
+    assert fixture["accepted"] is True
+
+
+def test_counterfactual_canary_gate_schema_is_exact_and_fail_closed() -> None:
+    behavior = replace(
+        _metrics(
+            mode="causal_canary",
+            seed=0,
+            arm="active",
+            before="baseline",
+            after="after",
+            repeated_errors=0,
+        ),
+        active_hard_block_keys=("counterfactual:shared",),
+        active_hard_block_records=(("counterfactual:shared", 100, "a" * 64),),
+    )
+    shadow = replace(
+        _metrics(
+            mode="causal_canary",
+            seed=0,
+            arm="shadow",
+            before="baseline",
+            after="baseline",
+            repeated_errors=0,
+        ),
+        resolved_counterfactual_keys=("counterfactual:shared",),
+    )
+    canary = build_canary_report(
+        behavior,
+        shadow,
+        baseline_sha256="baseline",
+        expected_git_sha="expected",
+        readiness_evidence=_readiness(),
+    )
+
+    assert (
+        analyzer.counterfactual_canary_is_valid(
+            canary,
+            baseline_sha256="baseline",
+            expected_git_sha="expected",
+            expected_evaluation_seeds=(0, 1, 2),
+        )
+        is False
+    )
+    tamperers: tuple[Callable[[dict[str, Any]], object], ...] = (
+        lambda artifact: artifact["gates"].pop("hard_readiness_accepted"),
+        lambda artifact: artifact["gates"].update(extra=True),
+        lambda artifact: artifact["gates"].update(hard_readiness_accepted=None),
+        lambda artifact: artifact.update(schema_version="1.0"),
+        lambda artifact: artifact.update(gameplay_acceptance_accepted=None),
+    )
+    for tamper in tamperers:
+        candidate = json.loads(json.dumps(canary))
+        tamper(candidate)
+        assert (
+            analyzer.counterfactual_canary_is_valid(
+                candidate,
+                baseline_sha256="baseline",
+                expected_git_sha="expected",
+                expected_evaluation_seeds=(0, 1, 2),
+            )
+            is False
+        )
+
+
+def test_formal_comparison_rejects_missing_counterfactual_canary() -> None:
+    comparison = _comparison(_strict_matrix(), baseline_sha256="baseline")
+
+    assert comparison["gates"]["counterfactual_canary_accepted"] is False
+    assert comparison["accepted"] is False
+
+
+def test_formal_comparison_recomputes_per_run_gameplay_acceptance() -> None:
+    metrics = _strict_matrix()
+    metrics[0] = replace(
+        metrics[0],
+        gameplay_gate_results={
+            "upstream_placement_rejections": False,
+            "meaningful_command_success_rate": True,
+            "completed_execution_success_rate": True,
+            "build_pre_dispatch_rejection_rate": True,
+        },
+        gameplay_acceptance_accepted=False,
+    )
+
+    comparison = _comparison(metrics, baseline_sha256="baseline", counterfactual_canary={})
+
+    assert comparison["gates"]["all_runs_gameplay_acceptance_pass"] is False
+    assert comparison["accepted"] is False
+
+
+def test_formal_comparison_rejects_missing_or_mismatched_run_artifact_attestation() -> None:
+    metrics = _strict_matrix()
+    metrics[0] = replace(metrics[0], artifact_integrity_valid=False)
+
+    comparison = _comparison(metrics, baseline_sha256="baseline", counterfactual_canary={})
+
+    assert comparison["gates"]["run_artifact_integrity_valid"] is False
+    assert comparison["accepted"] is False
 
 
 def test_tactical_response_kind_mismatch_rejects_counterfactual_canary() -> None:
@@ -801,7 +977,7 @@ def test_production_canary_uses_full_held_out_seed_set() -> None:
 
     assert canary["execution_seed"] == 3
     assert canary["evaluation_seed_ids"] == [3, 4, 5]
-    assert comparison["gates"]["counterfactual_canary_accepted"] is True
+    assert comparison["gates"]["counterfactual_canary_accepted"] is False
 
 
 def test_formal_runner_rejects_canary_with_different_evaluation_seed_set() -> None:
@@ -1144,7 +1320,406 @@ def test_formal_comparison_accepts_an_explicit_held_out_seed_matrix() -> None:
     )
 
     assert comparison["expected_seed_ids"] == [3, 4, 5]
+    assert comparison["gates"]["complete_unique_run_matrix"] is False
+    assert comparison["gates"]["formal_split_contract"] is False
+
+
+def test_formal_split_rejects_unknown_row_and_canonical_directory_reuse() -> None:
+    metrics = _strict_matrix()
+    metrics.append(replace(metrics[0], experiment_kind="diagnostic", run_dir="/run/diagnostic"))
+    comparison = _comparison(metrics, baseline_sha256="baseline")
+
+    assert comparison["gates"]["formal_split_contract"] is False
+    assert comparison["gates"]["complete_unique_run_matrix"] is False
+    assert comparison["accepted"] is False
+
+    duplicate = _strict_matrix()
+    duplicate[1] = replace(duplicate[1], run_dir=duplicate[0].run_dir)
+    comparison = _comparison(duplicate, baseline_sha256="baseline")
+
+    assert comparison["gates"]["canonical_run_directory_identity"] is False
+    assert comparison["accepted"] is False
+
+
+def test_counterfactual_digest_rejects_nested_report_tampering() -> None:
+    behavior = replace(
+        _metrics(
+            mode="causal_canary",
+            seed=0,
+            arm="active",
+            before="baseline",
+            after="after",
+            repeated_errors=0,
+        ),
+        active_hard_block_keys=("counterfactual:shared",),
+        active_hard_block_records=(("counterfactual:shared", 100, "a" * 64),),
+    )
+    shadow = replace(
+        _metrics(
+            mode="causal_canary",
+            seed=0,
+            arm="shadow",
+            before="baseline",
+            after="baseline",
+            repeated_errors=0,
+        ),
+        resolved_counterfactual_keys=("counterfactual:shared",),
+    )
+    canary = build_canary_report(
+        behavior,
+        shadow,
+        baseline_sha256="baseline",
+        expected_git_sha="expected",
+        readiness_evidence=_readiness(),
+    )
+    canary["behavior"]["playbook_blocks"] = 99
+
+    assert (
+        analyzer.counterfactual_canary_is_valid(
+            canary,
+            baseline_sha256="baseline",
+            expected_git_sha="expected",
+            expected_evaluation_seeds=(0, 1, 2),
+        )
+        is False
+    )
+
+
+def _write_experiment_status(run_set: Path, metrics: list[RunMetrics]) -> None:
+    fields = (
+        "experiment_kind",
+        "mode",
+        "seed",
+        "arm",
+        "subject_arm",
+        "exit_code",
+        "run_dir",
+    )
+    lines = ["\t".join(fields)]
+    for metric in metrics:
+        values = {
+            "experiment_kind": metric.experiment_kind,
+            "mode": metric.mode,
+            "seed": str(metric.seed),
+            "arm": metric.arm,
+            "subject_arm": metric.subject_arm or "",
+            "exit_code": str(metric.exit_code),
+            "run_dir": metric.run_dir,
+        }
+        lines.append("\t".join(values[field] for field in fields))
+    (run_set / "experiment-status.tsv").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _canonical_canary_fixture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[dict[str, Any], RunMetrics, RunMetrics, Path, str]:
+    run_set = tmp_path / "canary-run-set"
+    behavior_dir = run_set / "behavior-run"
+    shadow_dir = run_set / "shadow-run"
+    behavior_dir.mkdir(parents=True)
+    shadow_dir.mkdir()
+    baseline_snapshot = run_set / "playbook.baseline.sqlite3"
+    baseline_snapshot.write_bytes(b"canonical-baseline")
+    baseline_sha256 = analyzer._sha256_file(baseline_snapshot)
+    readiness = _readiness()
+    readiness["baseline_sha256"] = baseline_sha256
+    (run_set / "playbook-hard-readiness.json").write_text(
+        json.dumps(readiness, sort_keys=True),
+        encoding="utf-8",
+    )
+    (run_set / "recovery-canary.json").write_text(
+        json.dumps({"passed": True}, sort_keys=True),
+        encoding="utf-8",
+    )
+    behavior = replace(
+        _metrics(
+            mode="causal_canary",
+            seed=0,
+            arm="active",
+            before=baseline_sha256,
+            after="after",
+            repeated_errors=0,
+        ),
+        run_dir=str(behavior_dir),
+        experiment_kind="behavior",
+        subject_arm=None,
+        active_hard_block_keys=("counterfactual:shared",),
+        active_hard_block_records=(("counterfactual:shared", 100, "a" * 64),),
+        counterfactual_state_records=((100, "s" * 64, "a" * 64),),
+        event_run_id="behavior-run-id",
+        event_episode_ids=("behavior-episode",),
+        events_sha256="1" * 64,
+        summary_sha256="2" * 64,
+    )
+    shadow = replace(
+        _metrics(
+            mode="causal_canary",
+            seed=0,
+            arm="shadow",
+            before=baseline_sha256,
+            after=baseline_sha256,
+            repeated_errors=0,
+        ),
+        run_dir=str(shadow_dir),
+        experiment_kind="calibration",
+        subject_arm="active",
+        resolved_counterfactual_keys=("counterfactual:shared",),
+        counterfactual_state_records=((100, "s" * 64, "a" * 64),),
+        event_run_id="shadow-run-id",
+        event_episode_ids=("shadow-episode",),
+        events_sha256="3" * 64,
+        summary_sha256="4" * 64,
+    )
+    _write_experiment_status(run_set, [behavior, shadow])
+    by_directory = {
+        behavior_dir.resolve(): behavior,
+        shadow_dir.resolve(): shadow,
+    }
+
+    def reconstructed(row: dict[str, str], **_: Any) -> RunMetrics:
+        return by_directory[Path(row["run_dir"]).resolve()]
+
+    monkeypatch.setattr(analyzer, "_run_metrics", reconstructed)
+    canary = build_canary_report(
+        behavior,
+        shadow,
+        baseline_sha256=baseline_sha256,
+        expected_git_sha="expected",
+        readiness_evidence=readiness,
+    )
+    return canary, behavior, shadow, run_set, baseline_sha256
+
+
+def test_counterfactual_canary_rebuilds_canonical_artifact_from_status_run_dirs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    canary, _behavior, _shadow, run_set, baseline_sha256 = _canonical_canary_fixture(
+        tmp_path,
+        monkeypatch,
+    )
+
+    assert analyzer.counterfactual_canary_is_valid(
+        canary,
+        baseline_sha256=baseline_sha256,
+        expected_git_sha="expected",
+        expected_evaluation_seeds=(0, 1, 2),
+        run_set_dir=run_set,
+    )
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    (
+        "wrong_run_dir",
+        "wrong_arm",
+        "empty_records",
+        "modified_gameplay",
+        "forged_hash",
+        "copied_hash",
+    ),
+)
+def test_counterfactual_canary_rejects_self_reported_evidence_tampering(
+    tamper: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    canary, behavior, _shadow, run_set, baseline_sha256 = _canonical_canary_fixture(
+        tmp_path,
+        monkeypatch,
+    )
+    candidate = json.loads(json.dumps(canary))
+    if tamper == "wrong_run_dir":
+        wrong_dir = run_set / "unreported-run"
+        wrong_dir.mkdir()
+        candidate["behavior"]["run_dir"] = str(wrong_dir)
+    elif tamper == "wrong_arm":
+        candidate["behavior"]["arm"] = "shadow"
+    elif tamper == "empty_records":
+        candidate["behavior"]["active_hard_block_records"] = []
+        candidate["behavior"]["active_hard_block_keys"] = []
+        candidate["active_hard_block_count"] = 0
+    elif tamper == "modified_gameplay":
+        candidate["behavior"]["gameplay_metrics"]["meaningful_command_success_rate"] = 1.0
+    elif tamper == "forged_hash":
+        candidate["behavior"]["events_sha256"] = "0" * 64
+    else:
+        candidate["shadow"]["events_sha256"] = behavior.events_sha256
+    candidate["canonical_report_sha256"] = analyzer._canonical_report_digest(candidate)
+
+    assert (
+        analyzer.counterfactual_canary_is_valid(
+            candidate,
+            baseline_sha256=baseline_sha256,
+            expected_git_sha="expected",
+            expected_evaluation_seeds=(0, 1, 2),
+            run_set_dir=run_set,
+        )
+        is False
+    )
+
+
+def _canonical_formal_matrix(tmp_path: Path) -> tuple[list[RunMetrics], Path]:
+    run_set = tmp_path / "formal-run-set"
+    run_set.mkdir()
+    metrics: list[RunMetrics] = []
+    for index, metric in enumerate(_strict_matrix()):
+        run_dir = run_set / f"run-{index:02d}"
+        run_dir.mkdir()
+        metrics.append(
+            replace(
+                metric,
+                run_dir=str(run_dir),
+                event_run_id=f"formal-run-{index:02d}",
+                event_episode_ids=(f"formal-episode-{index:02d}",),
+            )
+        )
+    _write_experiment_status(run_set, metrics)
+    return metrics, run_set
+
+
+def test_formal_split_accepts_exact_unique_24_row_identity_matrix(tmp_path: Path) -> None:
+    metrics, run_set = _canonical_formal_matrix(tmp_path)
+
+    comparison = _comparison(metrics, baseline_sha256="baseline", run_set_dir=run_set)
+
+    assert comparison["gates"]["formal_split_contract"] is True
+    assert comparison["gates"]["canonical_run_directory_identity"] is True
+    assert comparison["gates"]["event_identity_contract"] is True
     assert comparison["gates"]["complete_unique_run_matrix"] is True
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_gate"),
+    (
+        ("calibration_active", "formal_split_contract"),
+        ("calibration_bogus", "formal_split_contract"),
+        ("behavior_subject_mismatch", "formal_split_contract"),
+        ("shared_run_dir", "canonical_run_directory_identity"),
+        ("unknown_25th_row", "formal_split_contract"),
+    ),
+)
+def test_formal_split_rejects_adversarial_matrix_identity(
+    mutation: str,
+    expected_gate: str,
+    tmp_path: Path,
+) -> None:
+    metrics, run_set = _canonical_formal_matrix(tmp_path)
+    if mutation in {"calibration_active", "calibration_bogus"}:
+        index = next(
+            i for i, metric in enumerate(metrics) if metric.experiment_kind == "calibration"
+        )
+        metrics[index] = replace(
+            metrics[index],
+            arm="active" if mutation == "calibration_active" else "bogus",
+        )
+    elif mutation == "behavior_subject_mismatch":
+        index = next(i for i, metric in enumerate(metrics) if metric.experiment_kind == "behavior")
+        metrics[index] = replace(metrics[index], subject_arm="evolving")
+    elif mutation == "shared_run_dir":
+        metrics[1] = replace(metrics[1], run_dir=metrics[0].run_dir)
+    else:
+        extra_dir = run_set / "run-extra"
+        extra_dir.mkdir()
+        metrics.append(
+            replace(
+                metrics[0],
+                experiment_kind="diagnostic",
+                run_dir=str(extra_dir),
+                event_run_id="formal-run-extra",
+                event_episode_ids=("formal-episode-extra",),
+            )
+        )
+    _write_experiment_status(run_set, metrics)
+
+    comparison = _comparison(metrics, baseline_sha256="baseline", run_set_dir=run_set)
+
+    assert comparison["gates"][expected_gate] is False
+    assert comparison["accepted"] is False
+
+
+def test_formal_event_identity_binds_seed_arm_and_kind(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "events.jsonl").write_text("journal\n", encoding="utf-8")
+    events = [
+        StoredEvent(
+            event_id=1,
+            run_id="run-identity",
+            episode_id="episode-0",
+            step_id=1,
+            event_type="episode_result",
+            created_at="2026-07-28T00:00:00+00:00",
+            payload={"seed": 0, "arm": "shadow", "experiment_kind": "behavior"},
+        )
+    ]
+    monkeypatch.setattr(analyzer, "read_event_log", lambda _: iter(events))
+
+    valid, event_run_id, episode_ids = analyzer._validate_event_identity(
+        run_dir,
+        {
+            "experiment_kind": "behavior",
+            "seed": "0",
+            "arm": "frozen",
+        },
+    )
+
+    assert valid is False
+    assert event_run_id == "run-identity"
+    assert episode_ids == ("episode-0",)
+
+
+def test_formal_event_identity_accepts_one_exact_runtime_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "events.jsonl").write_text("journal\n", encoding="utf-8")
+    identity = {
+        "schema_version": "1.0",
+        "source": "runner_environment",
+        "run_id": "run-identity",
+        "episode_id": "episode-0",
+        "seed": 0,
+        "mode": "independent_paired",
+        "experiment_kind": "behavior",
+        "arm": "frozen",
+        "subject_arm": "frozen",
+    }
+    events = [
+        StoredEvent(
+            event_id=1,
+            run_id="run-identity",
+            episode_id="episode-0",
+            step_id=1,
+            event_type="experiment_run_identity",
+            created_at="2026-07-28T00:00:00+00:00",
+            payload=identity,
+        )
+    ]
+    monkeypatch.setattr(analyzer, "read_event_log", lambda _: iter(events))
+
+    valid, event_run_id, episode_ids = analyzer._validate_event_identity(
+        run_dir,
+        {
+            "experiment_kind": "behavior",
+            "mode": "independent_paired",
+            "seed": "0",
+            "arm": "frozen",
+            "subject_arm": "frozen",
+            "run_id": "run-identity",
+            "episode_id": "episode-0",
+        },
+    )
+
+    assert valid is True
+    assert event_run_id == "run-identity"
+    assert episode_ids == ("episode-0",)
 
 
 def test_run_metrics_streams_events_and_normalizes_error_exposure(
@@ -1240,6 +1815,88 @@ def test_run_metrics_streams_events_and_normalizes_error_exposure(
     assert metrics.writer_queue_peak == 3
     assert metrics.writer_lag_ms_p95 == 2.5
     assert metrics.sampled_drop_supported is False
+
+
+def test_run_metrics_recomputes_gameplay_gates_and_verifies_status_hashes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = tmp_path / "attested-run"
+    run_dir.mkdir()
+    events_path = run_dir / "events.jsonl"
+    events_path.write_text("journal\n", encoding="utf-8")
+    summary: dict[str, Any] = {
+        "format_version": "1.0",
+        "source_journal": "events.jsonl",
+        "runs": {"run": {"episodes": {"episode": {"hard_acceptance": {"passed": True}}}}},
+    }
+    (run_dir / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
+    execution = SimpleNamespace(
+        upstream_placement_rejections=0,
+        meaningful_action_success_rate=0.8,
+        completed_execution_success_rate=0.9,
+        build_pre_dispatch_rejection_rate=0.01,
+    )
+    monkeypatch.setattr(analyzer, "read_event_log", lambda _: iter(()))
+    monkeypatch.setattr(analyzer, "compute_execution_metrics", lambda _: execution)
+    monkeypatch.setattr(analyzer, "_build_run_summary", lambda _: summary)
+    monkeypatch.setattr(
+        analyzer,
+        "build_engineering_gate_report",
+        lambda *args, **kwargs: {
+            "gates": {name: {"passed": True} for name in REQUIRED_ENGINEERING_GATES},
+            "missing_required_metrics": [],
+            "accepted": True,
+        },
+    )
+    row = {
+        "mode": "independent_paired",
+        "seed": "0",
+        "arm": "frozen",
+        "exit_code": "0",
+        "run_dir": str(run_dir),
+        "events_sha256": analyzer._sha256_file(events_path),
+        "summary_sha256": analyzer._sha256_file(run_dir / "summary.json"),
+        "playbook_before_sha256": "before",
+        "playbook_after_sha256": "after",
+    }
+
+    metrics = analyzer._run_metrics(row)
+
+    assert metrics.gameplay_metrics == {
+        "upstream_placement_rejections": 0,
+        "meaningful_command_success_rate": 0.8,
+        "completed_execution_success_rate": 0.9,
+        "build_pre_dispatch_rejection_rate": 0.01,
+    }
+    assert metrics.gameplay_acceptance_accepted is True
+    assert metrics.artifact_integrity_valid is True
+    assert metrics.legacy_acceptance_valid is True
+
+    tampered = analyzer._run_metrics({**row, "events_sha256": "0" * 64})
+    assert tampered.artifact_integrity_valid is False
+
+    summary["runs"]["run"]["episodes"]["episode"]["hard_acceptance"]["passed"] = False
+    (run_dir / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
+    row_with_false_legacy = {
+        **row,
+        "summary_sha256": analyzer._sha256_file(run_dir / "summary.json"),
+    }
+    monkeypatch.setattr(analyzer, "_build_run_summary", lambda _: summary)
+    false_legacy = analyzer._run_metrics(row_with_false_legacy)
+    assert false_legacy.artifact_integrity_valid is True
+    assert false_legacy.legacy_acceptance_valid is False
+    assert false_legacy.gameplay_acceptance_accepted is False
+
+    summary["runs"]["run"]["episodes"]["episode"]["hard_acceptance"]["passed"] = True
+    (run_dir / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
+    row_with_canonical_mismatch = {
+        **row,
+        "summary_sha256": analyzer._sha256_file(run_dir / "summary.json"),
+    }
+    monkeypatch.setattr(analyzer, "_build_run_summary", lambda _: {**summary, "runs": {}})
+    canonical_mismatch = analyzer._run_metrics(row_with_canonical_mismatch)
+    assert canonical_mismatch.artifact_integrity_valid is False
 
 
 def test_false_blocks_are_preserved_when_hard_rule_becomes_suspended(

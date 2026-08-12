@@ -23,6 +23,7 @@ from rtscortex.contracts import (
     ActionBatch,
     ActionCommand,
     ActionSource,
+    AuthoritativePreDispatchEvidence,
     AvailableAction,
     EconomyState,
     EpisodeOutcome,
@@ -37,6 +38,7 @@ from rtscortex.contracts import (
 )
 from rtscortex.cortex import (
     AttemptKey,
+    AuthoritativeBuildCircuitState,
     CommandLineage,
     CortexRole,
     DeterministicSituationAnalyzer,
@@ -287,6 +289,32 @@ def _macro_observation(
     )
 
 
+def _with_builder(
+    observation: ObservationEnvelope,
+    *,
+    tag: int = 0xA,
+) -> ObservationEnvelope:
+    return observation.model_copy(
+        update={
+            "state": observation.state.model_copy(
+                update={
+                    "own_units": [
+                        *observation.state.own_units,
+                        UnitState(
+                            unit_id=hex(tag),
+                            unit_type="Probe",
+                            alliance="self",
+                            position=(60.0, 85.0),
+                            actor_scopes=("Builder/Probe-1",),
+                            status="ready",
+                        ),
+                    ]
+                }
+            )
+        }
+    )
+
+
 def _terminal_macro_observation(
     *,
     step_id: int,
@@ -332,6 +360,66 @@ def _terminal_macro_observation(
 
 def _store(tmp_path: Path) -> EventStore:
     return EventStore(tmp_path / "events.sqlite3", tmp_path / "events.jsonl")
+
+
+def test_runtime_persists_exact_formal_runner_identity_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("RTSCORTEX_EXPERIMENT_MODE", "independent_paired")
+    monkeypatch.setenv("RTSCORTEX_EXPERIMENT_KIND", "behavior")
+    monkeypatch.setenv("RTSCORTEX_EXPERIMENT_ARM", "frozen")
+    monkeypatch.setenv("RTSCORTEX_EXPERIMENT_SUBJECT_ARM", "frozen")
+    runtime = CortexRuntimeEngine(
+        config=_config(tmp_path, macro=False),
+        store=_store(tmp_path),
+        provider=FakeProvider(),
+    )
+    observation = _macro_observation(step_id=0, game_loop=0)
+
+    async def exercise() -> None:
+        await runtime._activate_episode(observation)
+        await runtime._activate_episode(observation.model_copy(update={"step_id": 1}))
+
+    asyncio.run(exercise())
+
+    events = runtime.store.events_of_type(
+        observation.run_id,
+        observation.episode_id,
+        "experiment_run_identity",
+    )
+    assert len(events) == 1
+    assert events[0].payload == {
+        "schema_version": "1.0",
+        "source": "runner_environment",
+        "run_id": observation.run_id,
+        "episode_id": observation.episode_id,
+        "seed": runtime.config.run.seed,
+        "mode": "independent_paired",
+        "experiment_kind": "behavior",
+        "arm": "frozen",
+        "subject_arm": "frozen",
+    }
+    asyncio.run(runtime.close())
+
+
+def test_runtime_rejects_role_mismatched_runner_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("RTSCORTEX_EXPERIMENT_MODE", "causal_canary")
+    monkeypatch.setenv("RTSCORTEX_EXPERIMENT_KIND", "calibration")
+    monkeypatch.setenv("RTSCORTEX_EXPERIMENT_ARM", "active")
+    monkeypatch.setenv("RTSCORTEX_EXPERIMENT_SUBJECT_ARM", "active")
+    runtime = CortexRuntimeEngine(
+        config=_config(tmp_path, macro=False),
+        store=_store(tmp_path),
+        provider=FakeProvider(),
+    )
+
+    with pytest.raises(RuntimeError, match="calibration identity requires shadow"):
+        asyncio.run(runtime._activate_episode(_macro_observation(step_id=0, game_loop=0)))
+    asyncio.run(runtime.close())
 
 
 @pytest.mark.parametrize("unit_type", ["Phoenix", "VoidRay"])
@@ -1147,6 +1235,737 @@ def test_raw_build_tombstones_checkpoint_and_recovery_tail(tmp_path: Path) -> No
             operation_id: {"build-legality:checkpoint", "build-legality:tail"}
         }
         assert recovered._raw_build_material_tombstone_circuits == {operation_id}
+        await recovered.close()
+
+    asyncio.run(recover())
+
+
+def test_authoritative_build_circuit_blocks_before_candidate_and_lineage(
+    tmp_path: Path,
+) -> None:
+    runtime = CortexRuntimeEngine(
+        config=_config(tmp_path, macro=False),
+        store=_store(tmp_path),
+        provider=FakeProvider(),
+    )
+    observation = _with_builder(_macro_observation(step_id=1, game_loop=32))
+    runtime._current_situation = DeterministicSituationAnalyzer().assess(observation)
+    intent = TacticalIntent(
+        intent_id="authoritative-build-circuit-intent",
+        run_id=observation.run_id,
+        episode_id=observation.episode_id,
+        step_id=observation.step_id,
+        created_game_loop=observation.game_loop,
+        objective="Construct a Pylon",
+        action_names=["Build_Pylon_Screen"],
+        actor_scopes=["Builder/Probe-1"],
+        source_id="test",
+        source_version="1",
+        ttl_game_loops=16,
+    )
+    strategic = runtime._strategic_adapter.adapt(intent)
+    assert strategic.operation_id is not None
+    material_identity = runtime._semantic_build_material_identity(
+        observation,
+        strategic,
+        world_target=(65.0, 90.0),
+        builder_tag=0xA,
+        ability_id=881,
+    )
+    assert material_identity is not None
+    runtime._authoritative_build_pre_dispatch_circuits[strategic.operation_id] = (
+        AuthoritativeBuildCircuitState(
+            operation_id=strategic.operation_id,
+            action_name="Build_Pylon_Screen",
+            streak=3,
+            threshold=3,
+            circuit_open=True,
+            failure_count=3,
+            last_failure_code="placement_query_rejected_cached",
+            opened_command_id="build-third",
+            opened_attempt_ordinal=2,
+            opened_game_loop=31,
+            builder_tag=0xA,
+            ability_id=881,
+            world_target=(65.0, 90.0),
+            material_legality_identity=f"build-legality:{'a' * 64}",
+            blocked_semantic_material_identity=material_identity,
+            material_evidence_valid=True,
+        )
+    )
+
+    assert runtime._compile_intent(observation, intent) is None
+    assert runtime._attempt_ordinals == {}
+    assert not runtime.store.events_of_type(
+        observation.run_id,
+        observation.episode_id,
+        "role_intent_emitted",
+    )
+    assert not runtime.store.events_of_type(
+        observation.run_id,
+        observation.episode_id,
+        "candidate_set_built",
+    )
+    assert not runtime.store.events_of_type(
+        observation.run_id,
+        observation.episode_id,
+        "command_lineage",
+    )
+    deferred = runtime.store.events_of_type(
+        observation.run_id,
+        observation.episode_id,
+        "authoritative_build_pre_dispatch_circuit_defer",
+    )
+    assert len(deferred) == 1
+    assert deferred[0].payload["operation_id"] == strategic.operation_id
+    asyncio.run(runtime.close())
+
+
+def test_authoritative_build_circuit_replays_top_level_execution_evidence(
+    tmp_path: Path,
+) -> None:
+    runtime = CortexRuntimeEngine(
+        config=_config(tmp_path, macro=False),
+        store=_store(tmp_path),
+        provider=FakeProvider(),
+    )
+    observation = _with_builder(_macro_observation(step_id=1, game_loop=32))
+    intent = TacticalIntent(
+        intent_id="authoritative-build-replay-intent",
+        run_id=observation.run_id,
+        episode_id=observation.episode_id,
+        step_id=observation.step_id,
+        created_game_loop=observation.game_loop,
+        objective="Construct a Pylon",
+        action_names=["Build_Pylon_Screen"],
+        actor_scopes=["Builder/Probe-1"],
+        source_id="test",
+        source_version="1",
+        ttl_game_loops=16,
+    )
+    strategic = runtime._strategic_adapter.adapt(intent)
+    assert strategic.operation_id is not None
+    command_id = "authoritative-third"
+    attempt_id = AttemptKey(
+        operation_id=strategic.operation_id,
+        command_id=command_id,
+        attempt_ordinal=2,
+    ).attempt_id
+
+    async def activate() -> None:
+        await runtime._activate_episode(observation)
+
+    asyncio.run(activate())
+    runtime.store.append_event(
+        run_id=observation.run_id,
+        episode_id=observation.episode_id,
+        step_id=observation.step_id,
+        event_type="observation",
+        payload=observation,
+    )
+    runtime._current_situation = DeterministicSituationAnalyzer().assess(observation)
+    runtime._remember_raw_build_placement_transition(
+        {
+            "run_id": observation.run_id,
+            "episode_id": observation.episode_id,
+            "command_id": command_id,
+            "operation_id": strategic.operation_id,
+            "attempt_id": attempt_id,
+            "attempt_ordinal": 2,
+            "action_name": "Build_Pylon_Screen",
+            "authoritative_pre_dispatch": {
+                "operation_id": strategic.operation_id,
+                "action_name": "Build_Pylon_Screen",
+                "command_id": command_id,
+                "failure_code": "placement_query_rejected_cached",
+                "status": "defer_replan",
+                "streak": 3,
+                "threshold": 3,
+                "circuit_open": True,
+                "duplicate_attempt": False,
+                "attempt_id": attempt_id,
+                "attempt_ordinal": 2,
+                "builder_tag": 0xA,
+                "ability_id": 881,
+                "world_target": [65.0, 90.0],
+                "observation_game_loop": 32,
+                "material_legality_identity": f"build-legality:{'2' * 64}",
+                "material_evidence_valid": True,
+                "invalid_evidence_reasons": [],
+                "state_transition": "closed_to_open",
+                "next_action": "replan",
+            },
+        }
+    )
+
+    assert strategic.operation_id in runtime._authoritative_build_pre_dispatch_circuits
+    assert runtime._compile_intent(observation, intent) is None
+    assert not runtime.store.events_of_type(
+        observation.run_id,
+        observation.episode_id,
+        "command_lineage",
+    )
+    asyncio.run(runtime.close())
+
+
+def test_authoritative_build_circuit_without_replay_observation_stays_fail_closed(
+    tmp_path: Path,
+) -> None:
+    runtime = CortexRuntimeEngine(
+        config=_config(tmp_path, macro=False),
+        store=_store(tmp_path),
+        provider=FakeProvider(),
+    )
+    observation = _with_builder(_macro_observation(step_id=1, game_loop=32))
+    runtime._current_situation = DeterministicSituationAnalyzer().assess(observation)
+    intent = TacticalIntent(
+        intent_id="authoritative-build-missing-observation",
+        run_id=observation.run_id,
+        episode_id=observation.episode_id,
+        step_id=observation.step_id,
+        created_game_loop=observation.game_loop,
+        objective="Construct a Pylon",
+        action_names=["Build_Pylon_Screen"],
+        actor_scopes=["Builder/Probe-1"],
+        source_id="test",
+        source_version="1",
+        ttl_game_loops=16,
+    )
+    strategic = runtime._strategic_adapter.adapt(intent)
+    assert strategic.operation_id is not None
+    command_id = "authoritative-no-observation-third"
+    attempt_id = AttemptKey(
+        operation_id=strategic.operation_id,
+        command_id=command_id,
+        attempt_ordinal=2,
+    ).attempt_id
+    runtime._remember_raw_build_placement_transition(
+        {
+            "run_id": observation.run_id,
+            "episode_id": observation.episode_id,
+            "operation_id": strategic.operation_id,
+            "command_id": command_id,
+            "action_name": "Build_Pylon_Screen",
+            "attempt_id": attempt_id,
+            "attempt_ordinal": 2,
+            "authoritative_pre_dispatch": {
+                "operation_id": strategic.operation_id,
+                "action_name": "Build_Pylon_Screen",
+                "command_id": command_id,
+                "failure_code": "placement_query_rejected",
+                "status": "defer_replan",
+                "streak": 3,
+                "threshold": 3,
+                "circuit_open": True,
+                "duplicate_attempt": False,
+                "attempt_id": attempt_id,
+                "attempt_ordinal": 2,
+                "builder_tag": 0xA,
+                "ability_id": 881,
+                "world_target": [65.0, 90.0],
+                "observation_game_loop": 32,
+                "material_legality_identity": f"build-legality:{'3' * 64}",
+                "state_transition": "closed_to_open",
+                "next_action": "replan",
+            },
+        }
+    )
+
+    state = runtime._authoritative_build_pre_dispatch_circuits[strategic.operation_id]
+    assert state.circuit_open is True
+    assert state.material_evidence_valid is False
+    assert "observation_missing" in state.invalid_evidence_reasons
+    assert state.blocked_semantic_material_identity is None
+    assert runtime._compile_intent(observation, intent) is None
+    assert (
+        runtime._compile_intent(
+            observation.model_copy(update={"step_id": 2, "game_loop": 48}),
+            intent.model_copy(update={"step_id": 2, "created_game_loop": 48}),
+        )
+        is None
+    )
+    assert runtime._command_states == {}
+    assert runtime._attempt_ordinals == {}
+    for event_type in ("role_intent_emitted", "candidate_set_built", "command_lineage"):
+        assert not runtime.store.events_of_type(
+            observation.run_id,
+            observation.episode_id,
+            event_type,
+        )
+    deferred = runtime.store.events_of_type(
+        observation.run_id,
+        observation.episode_id,
+        "authoritative_build_pre_dispatch_circuit_defer",
+    )
+    assert len(deferred) == 1
+    assert deferred[0].payload["material_evidence_valid"] is False
+    assert deferred[0].payload["invalid_evidence_reasons"] == ["observation_missing"]
+    asyncio.run(runtime.close())
+
+
+def test_authoritative_build_circuit_ignores_revision_and_candidate_churn(
+    tmp_path: Path,
+) -> None:
+    runtime = CortexRuntimeEngine(
+        config=_config(tmp_path, macro=False),
+        store=_store(tmp_path),
+        provider=FakeProvider(),
+    )
+    observation = _with_builder(_macro_observation(step_id=1, game_loop=32))
+    runtime._current_situation = DeterministicSituationAnalyzer().assess(observation)
+    intent = TacticalIntent(
+        intent_id="authoritative-build-churn-intent",
+        run_id=observation.run_id,
+        episode_id=observation.episode_id,
+        step_id=observation.step_id,
+        created_game_loop=observation.game_loop,
+        objective="Construct a Pylon",
+        action_names=["Build_Pylon_Screen"],
+        actor_scopes=["Builder/Probe-1"],
+        source_id="test",
+        source_version="1",
+        ttl_game_loops=16,
+    )
+    strategic = runtime._strategic_adapter.adapt(intent)
+    assert strategic.operation_id is not None
+    blocked = runtime._semantic_build_material_identity(
+        observation,
+        strategic,
+        world_target=(65.0, 90.0),
+        builder_tag=0xA,
+        ability_id=881,
+    )
+    assert blocked is not None
+    runtime._authoritative_build_pre_dispatch_circuits[strategic.operation_id] = (
+        AuthoritativeBuildCircuitState(
+            operation_id=strategic.operation_id,
+            action_name="Build_Pylon_Screen",
+            streak=3,
+            threshold=3,
+            circuit_open=True,
+            failure_count=3,
+            last_failure_code="placement_candidate_stale",
+            opened_command_id="build-third",
+            opened_attempt_ordinal=2,
+            opened_game_loop=31,
+            builder_tag=0xA,
+            ability_id=881,
+            world_target=(65.0, 90.0),
+            material_legality_identity=f"build-legality:{'b' * 64}",
+            blocked_semantic_material_identity=blocked,
+            material_evidence_valid=True,
+        )
+    )
+    churned_action = observation.available_actions[0].model_copy(
+        update={"argument_candidates": [[[66, 91]]]}
+    )
+    churned = observation.model_copy(
+        update={
+            "step_id": 2,
+            "game_loop": 48,
+            "available_actions": [churned_action],
+            "state": observation.state.model_copy(
+                update={
+                    "own_units": [
+                        *observation.state.own_units,
+                        UnitState(
+                            unit_id="0xc",
+                            unit_type="Probe",
+                            alliance="self",
+                            position=(5.0, 5.0),
+                            status="ready",
+                        ),
+                    ]
+                }
+            ),
+        }
+    )
+    runtime._current_situation = DeterministicSituationAnalyzer().assess(churned)
+
+    assert (
+        runtime._compile_intent(
+            churned,
+            intent.model_copy(update={"step_id": 2, "created_game_loop": 48}),
+        )
+        is None
+    )
+    assert strategic.operation_id in runtime._authoritative_build_pre_dispatch_circuits
+    moved_unrelated_probe = churned.model_copy(
+        update={
+            "step_id": 3,
+            "game_loop": 64,
+            "state": churned.state.model_copy(
+                update={
+                    "own_units": [
+                        observation.state.own_units[0],
+                        churned.state.own_units[-1].model_copy(update={"position": (8.0, 7.0)}),
+                    ]
+                }
+            ),
+        }
+    )
+    assert (
+        runtime._semantic_build_material_identity(
+            moved_unrelated_probe,
+            strategic,
+            world_target=(65.0, 90.0),
+            builder_tag=0xA,
+            ability_id=881,
+        )
+        == blocked
+    )
+    assert (
+        runtime._semantic_build_material_identity(
+            observation.model_copy(update={"step_id": 4, "game_loop": 80}),
+            strategic,
+            world_target=(65.0, 90.0),
+            builder_tag=0xA,
+            ability_id=881,
+        )
+        == blocked
+    )
+    asyncio.run(runtime.close())
+
+
+def test_authoritative_build_circuit_reopens_on_explicit_builder_rebind(
+    tmp_path: Path,
+) -> None:
+    runtime = CortexRuntimeEngine(
+        config=_config(tmp_path, macro=False),
+        store=_store(tmp_path),
+        provider=FakeProvider(),
+    )
+    observation = _with_builder(_macro_observation(step_id=1, game_loop=32))
+    runtime._current_situation = DeterministicSituationAnalyzer().assess(observation)
+    intent = TacticalIntent(
+        intent_id="authoritative-build-material-change-intent",
+        run_id=observation.run_id,
+        episode_id=observation.episode_id,
+        step_id=observation.step_id,
+        created_game_loop=observation.game_loop,
+        objective="Construct a Pylon",
+        action_names=["Build_Pylon_Screen"],
+        actor_scopes=["Builder/Probe-1"],
+        source_id="test",
+        source_version="1",
+        ttl_game_loops=16,
+    )
+    strategic = runtime._strategic_adapter.adapt(intent)
+    assert strategic.operation_id is not None
+    blocked = runtime._semantic_build_material_identity(
+        observation,
+        strategic,
+        world_target=(65.0, 90.0),
+        builder_tag=0xA,
+        ability_id=881,
+    )
+    assert blocked is not None
+    runtime._authoritative_build_pre_dispatch_circuits[strategic.operation_id] = (
+        AuthoritativeBuildCircuitState(
+            operation_id=strategic.operation_id,
+            action_name="Build_Pylon_Screen",
+            streak=3,
+            threshold=3,
+            circuit_open=True,
+            failure_count=3,
+            last_failure_code="placement_query_rejected",
+            opened_command_id="build-third",
+            opened_attempt_ordinal=2,
+            opened_game_loop=31,
+            builder_tag=0xA,
+            ability_id=881,
+            world_target=(65.0, 90.0),
+            material_legality_identity=f"build-legality:{'c' * 64}",
+            blocked_semantic_material_identity=blocked,
+            material_evidence_valid=True,
+        )
+    )
+    changed = observation.model_copy(
+        update={
+            "step_id": 2,
+            "game_loop": 48,
+            "state": observation.state.model_copy(
+                update={
+                    "own_units": [
+                        UnitState(
+                            unit_id="0xb",
+                            unit_type="Probe",
+                            alliance="self",
+                            status="ready",
+                            actor_scopes=("Builder/Probe-1",),
+                        )
+                    ]
+                }
+            ),
+        }
+    )
+    runtime._current_situation = DeterministicSituationAnalyzer().assess(changed)
+
+    prepared = runtime._compile_intent(
+        changed,
+        intent.model_copy(update={"step_id": 2, "created_game_loop": 48}),
+    )
+    assert prepared is not None
+    assert strategic.operation_id not in runtime._authoritative_build_pre_dispatch_circuits
+    resets = runtime.store.events_of_type(
+        observation.run_id,
+        observation.episode_id,
+        "authoritative_build_pre_dispatch_circuit_reset",
+    )
+    assert len(resets) == 1
+    assert resets[0].payload["reason"] == "semantic_legality_material_change"
+    asyncio.run(runtime.close())
+
+
+def test_authoritative_build_circuit_reopens_when_exact_target_obstruction_clears(
+    tmp_path: Path,
+) -> None:
+    runtime = CortexRuntimeEngine(
+        config=_config(tmp_path, macro=False),
+        store=_store(tmp_path),
+        provider=FakeProvider(),
+    )
+    base = _with_builder(_macro_observation(step_id=1, game_loop=32))
+    blocked_observation = base.model_copy(
+        update={
+            "state": base.state.model_copy(
+                update={
+                    "visible_enemies": [
+                        UnitState(
+                            unit_id="0xenemy",
+                            unit_type="Zergling",
+                            alliance="enemy",
+                            position=(65.0, 90.0),
+                        )
+                    ]
+                }
+            )
+        }
+    )
+    runtime._current_situation = DeterministicSituationAnalyzer().assess(blocked_observation)
+    intent = TacticalIntent(
+        intent_id="authoritative-build-obstruction-change-intent",
+        run_id=base.run_id,
+        episode_id=base.episode_id,
+        step_id=base.step_id,
+        created_game_loop=base.game_loop,
+        objective="Construct a Pylon",
+        action_names=["Build_Pylon_Screen"],
+        actor_scopes=["Builder/Probe-1"],
+        source_id="test",
+        source_version="1",
+        ttl_game_loops=16,
+    )
+    strategic = runtime._strategic_adapter.adapt(intent)
+    assert strategic.operation_id is not None
+    blocked_identity = runtime._semantic_build_material_identity(
+        blocked_observation,
+        strategic,
+        world_target=(65.0, 90.0),
+        builder_tag=0xA,
+        ability_id=881,
+    )
+    assert blocked_identity is not None
+    runtime._authoritative_build_pre_dispatch_circuits[strategic.operation_id] = (
+        AuthoritativeBuildCircuitState(
+            operation_id=strategic.operation_id,
+            action_name="Build_Pylon_Screen",
+            streak=3,
+            threshold=3,
+            circuit_open=True,
+            failure_count=3,
+            last_failure_code="placement_query_rejected",
+            opened_command_id="build-third",
+            opened_attempt_ordinal=2,
+            opened_game_loop=31,
+            builder_tag=0xA,
+            ability_id=881,
+            world_target=(65.0, 90.0),
+            material_legality_identity=f"build-legality:{'d' * 64}",
+            blocked_semantic_material_identity=blocked_identity,
+            material_evidence_valid=True,
+        )
+    )
+    cleared = base.model_copy(update={"step_id": 2, "game_loop": 48})
+    runtime._current_situation = DeterministicSituationAnalyzer().assess(cleared)
+
+    prepared = runtime._compile_intent(
+        cleared,
+        intent.model_copy(update={"step_id": 2, "created_game_loop": 48}),
+    )
+
+    assert prepared is not None
+    assert strategic.operation_id not in runtime._authoritative_build_pre_dispatch_circuits
+    resets = runtime.store.events_of_type(
+        base.run_id,
+        base.episode_id,
+        "authoritative_build_pre_dispatch_circuit_reset",
+    )
+    assert len(resets) == 1
+    assert resets[0].payload["reason"] == "semantic_legality_material_change"
+    asyncio.run(runtime.close())
+
+
+def test_authoritative_build_circuit_checkpoint_round_trip(tmp_path: Path) -> None:
+    observation = _macro_observation(step_id=2, game_loop=64)
+    operation_id = f"operation:{'b' * 64}"
+    first = CortexRuntimeEngine(
+        config=_config(tmp_path, macro=False),
+        store=_store(tmp_path),
+        provider=FakeProvider(),
+    )
+
+    async def checkpoint() -> None:
+        await first._activate_episode(observation)
+        first._authoritative_build_pre_dispatch_circuits[operation_id] = (
+            AuthoritativeBuildCircuitState(
+                operation_id=operation_id,
+                action_name="Build_Gateway_Screen",
+                streak=3,
+                threshold=3,
+                circuit_open=True,
+                failure_count=3,
+                last_failure_code="placement_query_rejected_cached",
+                opened_command_id="gateway-third",
+                opened_attempt_ordinal=2,
+                opened_game_loop=63,
+                builder_tag=0xB,
+                ability_id=883,
+                world_target=(42.0, 39.0),
+                material_legality_identity=f"build-legality:{'e' * 64}",
+                blocked_semantic_material_identity=f"semantic-build-material:{'f' * 64}",
+                material_evidence_valid=True,
+            )
+        )
+        first._record_cortex_checkpoint(observation)
+        await first.close()
+
+    asyncio.run(checkpoint())
+    recovered = CortexRuntimeEngine(
+        config=_config(tmp_path, macro=False),
+        store=_store(tmp_path),
+        provider=FakeProvider(),
+    )
+
+    async def recover() -> None:
+        await recovered._activate_episode(
+            observation.model_copy(update={"step_id": 3, "game_loop": 65})
+        )
+        state = recovered._authoritative_build_pre_dispatch_circuits[operation_id]
+        assert state.circuit_open is True
+        assert state.streak == 3
+        assert state.material_legality_identity == f"build-legality:{'e' * 64}"
+        await recovered.close()
+
+    asyncio.run(recover())
+
+
+def test_authoritative_build_circuit_recovers_execution_feedback_after_checkpoint(
+    tmp_path: Path,
+) -> None:
+    observation = _macro_observation(step_id=2, game_loop=64)
+    operation_id = f"operation:{'c' * 64}"
+    first = CortexRuntimeEngine(
+        config=_config(tmp_path, macro=False),
+        store=_store(tmp_path),
+        provider=FakeProvider(),
+    )
+
+    async def checkpoint_before_failure() -> None:
+        await first._activate_episode(observation)
+        first.store.append_event(
+            run_id=observation.run_id,
+            episode_id=observation.episode_id,
+            step_id=observation.step_id,
+            event_type="observation",
+            payload=observation,
+        )
+        first._record_cortex_checkpoint(observation)
+        command_id = "tail-authoritative-third"
+        attempt_id = AttemptKey(
+            operation_id=operation_id,
+            command_id=command_id,
+            attempt_ordinal=2,
+        ).attempt_id
+        command = ActionCommand(
+            command_id=command_id,
+            operation_id=operation_id,
+            attempt_id=attempt_id,
+            attempt_ordinal=2,
+            actor="Builder/Probe-1",
+            name="Build_Gateway_Screen",
+            arguments=[[42, 39]],
+            priority=70,
+            ttl_game_loops=32,
+            created_game_loop=observation.game_loop,
+            source=ActionSource.PLANNER,
+        )
+        first._transition_command(command, CommandStatus.DISPATCHED, observation)
+        first.store.append_event(
+            run_id=observation.run_id,
+            episode_id=observation.episode_id,
+            step_id=observation.step_id,
+            event_type="execution",
+            payload=ExecutionReport(
+                run_id=observation.run_id,
+                episode_id=observation.episode_id,
+                step_id=observation.step_id,
+                command_id=command_id,
+                operation_id=operation_id,
+                attempt_id=attempt_id,
+                attempt_ordinal=2,
+                success=False,
+                action_name="Build_Gateway_Screen",
+                actor="Builder/Probe-1",
+                source=ActionSource.PLANNER,
+                requested_arguments=[[42, 39]],
+                resolved_arguments=[[42, 39]],
+                status=ExecutionStatus.FAILED,
+                execution_stage=ExecutionStage.PRE_DISPATCH,
+                failure_code="placement_query_rejected_cached",
+                authoritative_pre_dispatch=AuthoritativePreDispatchEvidence.model_validate(
+                    {
+                        "operation_id": operation_id,
+                        "action_name": "Build_Gateway_Screen",
+                        "command_id": "tail-authoritative-third",
+                        "failure_code": "placement_query_rejected_cached",
+                        "status": "defer_replan",
+                        "streak": 3,
+                        "threshold": 3,
+                        "circuit_open": True,
+                        "duplicate_attempt": False,
+                        "attempt_id": attempt_id,
+                        "attempt_ordinal": 2,
+                        "builder_tag": 0xB,
+                        "ability_id": 883,
+                        "world_target": [42.0, 39.0],
+                        "observation_game_loop": 64,
+                        "material_legality_identity": f"build-legality:{'1' * 64}",
+                        "material_evidence_valid": True,
+                        "invalid_evidence_reasons": [],
+                        "state_transition": "closed_to_open",
+                        "next_action": "replan",
+                    }
+                ),
+            ),
+        )
+        await first.close()
+
+    asyncio.run(checkpoint_before_failure())
+    recovered = CortexRuntimeEngine(
+        config=_config(tmp_path, macro=False),
+        store=_store(tmp_path),
+        provider=FakeProvider(),
+    )
+
+    async def recover() -> None:
+        await recovered._activate_episode(
+            observation.model_copy(update={"step_id": 3, "game_loop": 65})
+        )
+        state = recovered._authoritative_build_pre_dispatch_circuits[operation_id]
+        assert state.circuit_open is True
+        assert state.streak == 3
+        assert state.opened_command_id == "tail-authoritative-third"
         await recovered.close()
 
     asyncio.run(recover())

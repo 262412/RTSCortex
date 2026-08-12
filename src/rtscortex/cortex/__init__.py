@@ -85,6 +85,7 @@ from rtscortex.cortex.models import (
 )
 from rtscortex.cortex.operations import (
     AttemptKey,
+    AuthoritativeBuildCircuitState,
     EngagementKey,
     ExpansionGoalKey,
     ExpansionGoalState,
@@ -143,6 +144,7 @@ from rtscortex.cortex.terminal import (
 
 __all__ = [
     "ArmyReadiness",
+    "AuthoritativeBuildCircuitState",
     "AttemptKey",
     "BaseAssessment",
     "CandidateCompilationError",
