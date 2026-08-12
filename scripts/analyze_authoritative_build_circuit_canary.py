@@ -377,6 +377,8 @@ def _replay_phases(events: Sequence[Mapping[str, Any]], *, expected_seed: int) -
         raise CanaryArtifactError("Core defer did not observe command_count=0")
     if core.get("idle_reason") != "plan_commands_deferred":
         raise CanaryArtifactError("Core defer idle_reason is not plan_commands_deferred")
+    if core.get("planner_pending") is not False:
+        raise CanaryArtifactError("Core defer was recorded while planner remained pending")
     if (
         _positive_int(core.get("builder_tag"), label="core_defer_observed.builder_tag")
         != initial_builder

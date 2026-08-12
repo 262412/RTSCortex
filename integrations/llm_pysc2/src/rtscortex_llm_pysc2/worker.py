@@ -2138,6 +2138,7 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
                         if decision.action_batch.get("idle_reason") is None
                         else str(decision.action_batch["idle_reason"])
                     ),
+                    planner_pending=decision.action_batch.get("planner_pending"),
                     game_loop=game_loop,
                     observation_revision=observation_revision,
                     builder_tag=_current_raw_builder_tag(self),

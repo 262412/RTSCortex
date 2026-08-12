@@ -85,6 +85,7 @@ def _observe_failure(
     controller.observe_runtime_decision(
         (command,),
         idle_reason=None,
+        planner_pending=False,
         game_loop=ordinal * 10 + 1,
         observation_revision=f"revision-{ordinal}",
         builder_tag=100,
@@ -121,9 +122,24 @@ def test_canary_requires_three_failures_core_defer_and_real_effect(tmp_path: Pat
 
     assert controller.phase == "awaiting_core_defer"
     assert controller.required_builder_tag == 100
+    waiting = controller.observe_runtime_decision(
+        (),
+        idle_reason="waiting_for_planner",
+        planner_pending=True,
+        game_loop=39,
+        observation_revision="revision-planner-pending",
+        builder_tag=100,
+        reservation_count=0,
+        leased_builder_tags=(),
+        effect_inflight_count=0,
+        authoritative_state=_state(3, circuit_open=True),
+    )
+    assert not waiting.core_defer_observed
+    assert controller.phase == "awaiting_core_defer"
     result = controller.observe_runtime_decision(
         (),
         idle_reason="plan_commands_deferred",
+        planner_pending=False,
         game_loop=40,
         observation_revision="revision-core",
         builder_tag=100,
@@ -144,6 +160,7 @@ def test_canary_requires_three_failures_core_defer_and_real_effect(tmp_path: Pat
     controller.observe_runtime_decision(
         (reset,),
         idle_reason=None,
+        planner_pending=False,
         game_loop=42,
         observation_revision="revision-reset-command",
         builder_tag=200,
@@ -243,6 +260,7 @@ def test_canary_fails_if_held_command_sees_the_same_revision_twice(tmp_path: Pat
     controller.observe_runtime_decision(
         (command,),
         idle_reason=None,
+        planner_pending=False,
         game_loop=1,
         observation_revision="same",
         builder_tag=100,
@@ -267,17 +285,19 @@ def test_canary_fails_if_held_command_sees_the_same_revision_twice(tmp_path: Pat
 
 
 @pytest.mark.parametrize(
-    ("commands", "idle_reason", "builder_tag"),
+    ("commands", "idle_reason", "planner_pending", "builder_tag"),
     [
-        ((_command(3),), "plan_commands_deferred", 100),
-        ((), "no_legal_action", 100),
-        ((), "plan_commands_deferred", 200),
+        ((_command(3),), "plan_commands_deferred", False, 100),
+        ((), "no_legal_action", False, 100),
+        ((), "waiting_for_planner", False, 100),
+        ((), "plan_commands_deferred", False, 200),
     ],
 )
 def test_canary_fails_closed_at_the_core_open_boundary(
     tmp_path: Path,
     commands: tuple[RoutedCommand, ...],
     idle_reason: str,
+    planner_pending: bool,
     builder_tag: int,
 ) -> None:
     controller = AuthoritativeBuildCircuitCanary(
@@ -293,6 +313,7 @@ def test_canary_fails_closed_at_the_core_open_boundary(
         controller.observe_runtime_decision(
             commands,
             idle_reason=idle_reason,
+            planner_pending=planner_pending,
             game_loop=40,
             observation_revision="revision-core",
             builder_tag=builder_tag,

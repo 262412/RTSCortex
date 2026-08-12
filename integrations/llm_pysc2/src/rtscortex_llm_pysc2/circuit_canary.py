@@ -123,6 +123,7 @@ class AuthoritativeBuildCircuitCanary:
         commands: Sequence[RoutedCommand],
         *,
         idle_reason: str | None,
+        planner_pending: bool | None,
         game_loop: int,
         observation_revision: str,
         builder_tag: int | None,
@@ -132,6 +133,9 @@ class AuthoritativeBuildCircuitCanary:
         authoritative_state: Any | None,
     ) -> CanaryRuntimeDecision:
         """Inspect a real Runtime result before Raw translation begins."""
+
+        if type(planner_pending) is not bool:
+            self._fail("planner_pending_missing_or_invalid", game_loop, observation_revision)
 
         build_commands = tuple(command for command in commands if command.name.startswith("Build_"))
         if len(build_commands) > 1:
@@ -174,8 +178,6 @@ class AuthoritativeBuildCircuitCanary:
                     observation_revision,
                     command=commands[0],
                 )
-            if idle_reason != "plan_commands_deferred":
-                self._fail("core_defer_idle_reason_mismatch", game_loop, observation_revision)
             if builder_tag != self.initial_builder_tag:
                 self._fail("core_defer_builder_material_changed", game_loop, observation_revision)
             if authoritative_state is None:
@@ -193,6 +195,18 @@ class AuthoritativeBuildCircuitCanary:
                     game_loop,
                     observation_revision,
                 )
+            if idle_reason == "waiting_for_planner":
+                if planner_pending is not True:
+                    self._fail(
+                        "core_defer_planner_pending_mismatch",
+                        game_loop,
+                        observation_revision,
+                    )
+                return CanaryRuntimeDecision()
+            if idle_reason != "plan_commands_deferred":
+                self._fail("core_defer_idle_reason_mismatch", game_loop, observation_revision)
+            if planner_pending is not False:
+                self._fail("core_defer_planner_still_pending", game_loop, observation_revision)
             self.phase = "rebind_pending"
             self._write(
                 "core_defer_observed",
@@ -202,6 +216,7 @@ class AuthoritativeBuildCircuitCanary:
                 builder_tag=builder_tag,
                 command_count=len(commands),
                 idle_reason=idle_reason,
+                planner_pending=planner_pending,
                 authoritative_state=state,
                 reservation_count=reservation_count,
                 leased_builder_tags=sorted(int(tag) for tag in leased_builder_tags),

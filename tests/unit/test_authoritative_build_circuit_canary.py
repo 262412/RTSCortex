@@ -150,6 +150,7 @@ def _valid_phases() -> list[dict[str, object]]:
                 reason="authoritative_build_pre_dispatch_circuit_defer",
                 command_count=0,
                 idle_reason="plan_commands_deferred",
+                planner_pending=False,
                 builder_tag=100,
                 authoritative_state={"streak": 3, "circuit_open": True},
                 **_zero(),
@@ -593,7 +594,7 @@ def test_runtime_replay_rejects_forged_or_incomplete_evidence(mutation: str) -> 
 
 @pytest.mark.parametrize(
     "mutation",
-    ("streak", "open_transition", "query", "submission", "ownership"),
+    ("streak", "open_transition", "planner", "query", "submission", "ownership"),
 )
 def test_replay_rejects_tampered_phase_evidence(mutation: str) -> None:
     events = _valid_phases()
@@ -601,6 +602,8 @@ def test_replay_rejects_tampered_phase_evidence(mutation: str) -> None:
         events[2]["authoritative_streak"] = 3
     elif mutation == "open_transition":
         events[7]["transition"] = None
+    elif mutation == "planner":
+        events[8]["planner_pending"] = True
     elif mutation == "query":
         events[11]["query_result"] = "Success (cached)"
     elif mutation == "submission":
