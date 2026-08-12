@@ -253,8 +253,20 @@ class ProviderSettings(SettingsModel):
     completion_cost_per_million_tokens: float = Field(default=0.0, ge=0.0)
 
 
+class AuthoritativeBuildCircuitCanarySettings(SettingsModel):
+    """Explicitly gated live stimulus for the authoritative Build circuit."""
+
+    enabled: bool = False
+    mode: Literal["stale_candidate_then_builder_rebind"] = "stale_candidate_then_builder_rebind"
+    failure_attempts: Literal[3] = 3
+    hold_observations: Literal[1] = 1
+
+
 class EvaluationSettings(SettingsModel):
     seeds: list[int] = Field(default_factory=lambda: [0, 1, 2], min_length=1)
+    authoritative_build_circuit_canary: AuthoritativeBuildCircuitCanarySettings = Field(
+        default_factory=AuthoritativeBuildCircuitCanarySettings
+    )
 
 
 class ConsoleSettings(SettingsModel):
@@ -283,6 +295,28 @@ class ExperimentConfig(SettingsModel):
 
     @model_validator(mode="after")
     def validate_race_brain_matches_agent(self) -> ExperimentConfig:
+        canary = self.evaluation.authoritative_build_circuit_canary
+        if canary.enabled:
+            if (
+                self.environment.adapter != "llm_pysc2"
+                or self.environment.execution_action_space != "raw"
+                or self.environment.max_steps is None
+                or self.environment.agent_race != "protoss"
+                or self.agent.variant != "cortex"
+                or self.cortex.macro.kind != "scripted"
+                or self.cortex.macro.scripted_actions != ["Pylon"]
+                or not self.cortex.macro.required
+                or self.runtime.max_actions != 1
+                or self.environment.expansion_scout_enabled
+                or self.cortex.playbook.enabled
+                or self.reflex.enabled
+                or len(self.evaluation.seeds) != 1
+            ):
+                raise ValueError(
+                    "authoritative Build circuit canary requires one bounded raw Protoss "
+                    "Cortex Pylon action, max_actions=1, one seed, and scout/Playbook/reflex "
+                    "disabled"
+                )
         if self.agent.variant == "cortex" and self.environment.agent_race == "random":
             raise ValueError("Cortex live mode requires a concrete agent_race")
         if self.cortex.macro.kind == "hima":

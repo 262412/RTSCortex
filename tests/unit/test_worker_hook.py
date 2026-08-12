@@ -14,6 +14,7 @@ from typing import Any, cast
 import pytest
 from rtscortex_llm_pysc2.addon import ADDON_SPECS
 from rtscortex_llm_pysc2.broker import PrimitiveDispatch, SharedDecisionBroker
+from rtscortex_llm_pysc2.circuit_canary import AuthoritativeBuildCircuitCanary
 from rtscortex_llm_pysc2.coordinator import BridgeCoordinator
 from rtscortex_llm_pysc2.extractor import (
     PRODUCTION_STRUCTURE_NAMES,
@@ -66,6 +67,7 @@ from rtscortex_llm_pysc2.worker import (
     _isolate_next_action,
     _normalize_new_unit_queue,
     _pending_plan_idle_delay,
+    _pin_authoritative_canary_builder,
     _prepare_runtime_observation_bypass,
     _prime_deterministic_gas_rebalance,
     _producer_is_visible,
@@ -792,6 +794,62 @@ def test_worker_settings_prefer_canonical_runtime_environment(
     assert settings.orchestration_primitive_budget == 20
     assert settings.expansion_scout_enabled is True
     assert settings.expansion_scout_interval_game_loops == 96
+
+
+def test_worker_settings_accept_exact_authoritative_build_canary_contract(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("RTSCORTEX_RUN_ID", "run-canary")
+    monkeypatch.setenv("RTSCORTEX_EPISODE_ID", "episode-0")
+    monkeypatch.setenv("RTSCORTEX_EXECUTION_ACTION_SPACE", "raw")
+    monkeypatch.setenv("RTSCORTEX_AUTHORITATIVE_BUILD_CIRCUIT_CANARY", "true")
+    monkeypatch.setenv(
+        "RTSCORTEX_AUTHORITATIVE_BUILD_CIRCUIT_CANARY_MODE",
+        "stale_candidate_then_builder_rebind",
+    )
+    monkeypatch.setenv("RTSCORTEX_AUTHORITATIVE_BUILD_CIRCUIT_CANARY_FAILURE_ATTEMPTS", "3")
+    monkeypatch.setenv("RTSCORTEX_AUTHORITATIVE_BUILD_CIRCUIT_CANARY_HOLD_OBSERVATIONS", "1")
+    monkeypatch.setenv(
+        "RTSCORTEX_AUTHORITATIVE_BUILD_CIRCUIT_CANARY_JOURNAL",
+        str(tmp_path / "circuit.jsonl"),
+    )
+
+    settings = WorkerSettings.from_environment()
+
+    assert settings.authoritative_build_circuit_canary is True
+    assert settings.authoritative_build_circuit_canary_failure_attempts == 3
+    assert settings.authoritative_build_circuit_canary_hold_observations == 1
+    assert settings.authoritative_build_circuit_canary_journal == str(tmp_path / "circuit.jsonl")
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("RTSCORTEX_EXECUTION_ACTION_SPACE", "features"),
+        ("RTSCORTEX_AUTHORITATIVE_BUILD_CIRCUIT_CANARY_MODE", "unknown"),
+        ("RTSCORTEX_AUTHORITATIVE_BUILD_CIRCUIT_CANARY_FAILURE_ATTEMPTS", "2"),
+        ("RTSCORTEX_AUTHORITATIVE_BUILD_CIRCUIT_CANARY_HOLD_OBSERVATIONS", "2"),
+    ],
+)
+def test_worker_settings_reject_broader_authoritative_canary_contract(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    name: str,
+    value: str,
+) -> None:
+    monkeypatch.setenv("RTSCORTEX_RUN_ID", "run-canary")
+    monkeypatch.setenv("RTSCORTEX_EPISODE_ID", "episode-0")
+    monkeypatch.setenv("RTSCORTEX_EXECUTION_ACTION_SPACE", "raw")
+    monkeypatch.setenv("RTSCORTEX_AUTHORITATIVE_BUILD_CIRCUIT_CANARY", "true")
+    monkeypatch.setenv(
+        "RTSCORTEX_AUTHORITATIVE_BUILD_CIRCUIT_CANARY_JOURNAL",
+        str(tmp_path / "circuit.jsonl"),
+    )
+    monkeypatch.setenv(name, value)
+
+    with pytest.raises(RuntimeError, match="authoritative Build circuit canary requires"):
+        WorkerSettings.from_environment()
 
 
 def test_production_camera_waits_for_exact_producer_feature_observation() -> None:
@@ -1856,6 +1914,103 @@ def test_raw_worker_controller_preserves_active_placement_lease_after_builder_re
 
     assert action is not None
     assert action.arguments == ["now", [30], 500]
+
+
+def test_authoritative_canary_pins_distinct_feature_visible_ready_probe(
+    tmp_path: Path,
+) -> None:
+    controller = AuthoritativeBuildCircuitCanary(
+        run_id="run-canary",
+        episode_id="episode-0",
+        seed=0,
+        journal_path=tmp_path / "journal.jsonl",
+    )
+    controller.initial_builder_tag = 10
+    controller.operation_id = "operation:" + "a" * 64
+    controller.semantic_action = "Pylon"
+    controller.phase = "rebind_pending"
+    team = {
+        "name": "Builder-Probe-1",
+        "unit_type": [84],
+        "unit_tags": [10],
+        "unit_tags_selected": [10],
+    }
+    builder = SimpleNamespace(
+        teams=[team],
+        team_unit_tag_curr=10,
+        team_unit_team_curr="Builder-Probe-1",
+    )
+    placement = SimpleNamespace(
+        leased_builder_tags=frozenset({30}),
+        builder_lease_owner=lambda _tag: None,
+    )
+    main_agent = SimpleNamespace(
+        agents={"Builder": builder},
+        decision_broker=SimpleNamespace(extractor=SimpleNamespace(unit_names={84: "Probe"})),
+        raw_executor=SimpleNamespace(placement_service=placement),
+    )
+    original = _raw_probe(10, 20.0)
+    replacement = _raw_probe(20, 21.0)
+    leased = _raw_probe(30, 22.0)
+    offscreen = _raw_probe(40, 23.0)
+    observation = SimpleNamespace(
+        raw_units=[original, replacement, leased, offscreen],
+        feature_units=[
+            SimpleNamespace(tag=10, alliance=1, is_on_screen=True),
+            SimpleNamespace(tag=20, alliance=1, is_on_screen=True),
+            SimpleNamespace(tag=30, alliance=1, is_on_screen=True),
+        ],
+    )
+
+    assert _pin_authoritative_canary_builder(
+        main_agent,
+        observation,
+        controller,
+        game_loop=100,
+        observation_revision="revision-100",
+    )
+    assert controller.replacement_builder_tag == 20
+    assert controller.phase == "awaiting_reset_command"
+    assert team["unit_tags"] == [20]
+    assert builder.team_unit_tag_curr == 20
+
+
+def test_authoritative_canary_waits_when_no_distinct_feature_visible_probe(
+    tmp_path: Path,
+) -> None:
+    controller = AuthoritativeBuildCircuitCanary(
+        run_id="run-canary",
+        episode_id="episode-0",
+        seed=0,
+        journal_path=tmp_path / "journal.jsonl",
+    )
+    controller.initial_builder_tag = 10
+    controller.phase = "rebind_pending"
+    builder = SimpleNamespace(teams=[])
+    main_agent = SimpleNamespace(
+        agents={"Builder": builder},
+        decision_broker=SimpleNamespace(extractor=SimpleNamespace(unit_names={84: "Probe"})),
+        raw_executor=SimpleNamespace(
+            placement_service=SimpleNamespace(
+                leased_builder_tags=frozenset(),
+                builder_lease_owner=lambda _tag: None,
+            )
+        ),
+    )
+    observation = SimpleNamespace(
+        raw_units=[_raw_probe(10, 20.0), _raw_probe(20, 21.0)],
+        feature_units=[SimpleNamespace(tag=10, alliance=1, is_on_screen=True)],
+    )
+
+    assert not _pin_authoritative_canary_builder(
+        main_agent,
+        observation,
+        controller,
+        game_loop=100,
+        observation_revision="revision-100",
+    )
+    assert controller.replacement_builder_tag is None
+    assert controller.phase == "rebind_pending"
 
 
 def test_raw_worker_controller_clears_assignment_when_worker_gains_placement_lease(

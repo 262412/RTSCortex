@@ -13,11 +13,13 @@ from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, replace
 from functools import partial
 from numbers import Integral, Real
+from pathlib import Path
 from typing import Any, Optional, Protocol
 
 from rtscortex_llm_pysc2.ability import ABILITY_SPECS, ability_spec
 from rtscortex_llm_pysc2.addon import ADDON_SPECS, addon_spec
 from rtscortex_llm_pysc2.broker import PrimitiveDispatch, SharedDecisionBroker
+from rtscortex_llm_pysc2.circuit_canary import AuthoritativeBuildCircuitCanary
 from rtscortex_llm_pysc2.clock import FixedRateGameClock, InitialPlanningBarrier
 from rtscortex_llm_pysc2.coordinator import BridgeCoordinator
 from rtscortex_llm_pysc2.effect_verifier import (
@@ -59,8 +61,9 @@ from rtscortex_llm_pysc2.raw_executor import (
     RawBuildAuthorization,
     RawDispatch,
 )
-from rtscortex_llm_pysc2.raw_placement import RawPlacementService
+from rtscortex_llm_pysc2.raw_placement import RawPlacementService, _placement_revision
 from rtscortex_llm_pysc2.research import RESEARCH_SPECS, research_spec
+from rtscortex_llm_pysc2.routing import RoutedCommand
 from rtscortex_llm_pysc2.terminal import (
     TerminalArmyReadiness,
     TerminalCollapseState,
@@ -225,6 +228,11 @@ class WorkerSettings:
     console_enabled: bool = False
     console_frame_fps: float = 2.0
     console_jpeg_quality: int = 75
+    authoritative_build_circuit_canary: bool = False
+    authoritative_build_circuit_canary_mode: str = "stale_candidate_then_builder_rebind"
+    authoritative_build_circuit_canary_failure_attempts: int = 3
+    authoritative_build_circuit_canary_hold_observations: int = 1
+    authoritative_build_circuit_canary_journal: Optional[str] = None
 
     @classmethod
     def from_environment(cls) -> WorkerSettings:
@@ -305,6 +313,40 @@ class WorkerSettings:
         )
         if execution_action_space not in {"features", "raw"}:
             raise RuntimeError("RTSCORTEX_EXECUTION_ACTION_SPACE must be 'features' or 'raw'")
+        authoritative_build_circuit_canary = _environment_bool(
+            "RTSCORTEX_AUTHORITATIVE_BUILD_CIRCUIT_CANARY",
+            False,
+        )
+        authoritative_mode = os.environ.get(
+            "RTSCORTEX_AUTHORITATIVE_BUILD_CIRCUIT_CANARY_MODE",
+            "stale_candidate_then_builder_rebind",
+        )
+        authoritative_failure_attempts = int(
+            os.environ.get(
+                "RTSCORTEX_AUTHORITATIVE_BUILD_CIRCUIT_CANARY_FAILURE_ATTEMPTS",
+                "3",
+            )
+        )
+        authoritative_hold_observations = int(
+            os.environ.get(
+                "RTSCORTEX_AUTHORITATIVE_BUILD_CIRCUIT_CANARY_HOLD_OBSERVATIONS",
+                "1",
+            )
+        )
+        authoritative_journal = os.environ.get(
+            "RTSCORTEX_AUTHORITATIVE_BUILD_CIRCUIT_CANARY_JOURNAL"
+        )
+        if authoritative_build_circuit_canary and (
+            execution_action_space != "raw"
+            or authoritative_mode != "stale_candidate_then_builder_rebind"
+            or authoritative_failure_attempts != 3
+            or authoritative_hold_observations != 1
+            or not authoritative_journal
+        ):
+            raise RuntimeError(
+                "authoritative Build circuit canary requires raw execution, threshold 3, "
+                "one held observation, and a journal path"
+            )
         return cls(
             run_id=run_id,
             episode_id=episode_id,
@@ -331,6 +373,11 @@ class WorkerSettings:
             console_enabled=console_enabled,
             console_frame_fps=console_frame_fps,
             console_jpeg_quality=console_jpeg_quality,
+            authoritative_build_circuit_canary=authoritative_build_circuit_canary,
+            authoritative_build_circuit_canary_mode=authoritative_mode,
+            authoritative_build_circuit_canary_failure_attempts=(authoritative_failure_attempts),
+            authoritative_build_circuit_canary_hold_observations=(authoritative_hold_observations),
+            authoritative_build_circuit_canary_journal=authoritative_journal,
         )
 
 
@@ -1797,6 +1844,23 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
             unit_names=unit_names,
             placement_service=placement_service,
         )
+        self.authoritative_build_circuit_canary: AuthoritativeBuildCircuitCanary | None = None
+        if self.worker_settings.authoritative_build_circuit_canary:
+            journal = self.worker_settings.authoritative_build_circuit_canary_journal
+            if journal is None:
+                raise RuntimeError("enabled authoritative Build circuit canary has no journal")
+            self.authoritative_build_circuit_canary = AuthoritativeBuildCircuitCanary(
+                run_id=self.worker_settings.run_id,
+                episode_id=self.worker_settings.episode_id,
+                seed=self.worker_settings.seed,
+                journal_path=Path(journal).expanduser().resolve(),
+                failure_attempts=(
+                    self.worker_settings.authoritative_build_circuit_canary_failure_attempts
+                ),
+                hold_observations=(
+                    self.worker_settings.authoritative_build_circuit_canary_hold_observations
+                ),
+            )
         self._rtscortex_raw_dispatch_diagnostic_snapshot: dict[str, Any] = {}
         self.raw_decision_scheduler = RawDecisionScheduler()
         self._rtscortex_accept_visible_team_unit = True
@@ -1996,19 +2060,55 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
             self.agents,
             game_loop=_observation_game_loop(obs.observation),
         )
+        game_loop = _observation_game_loop(obs.observation)
+        observation_revision = _placement_revision(obs.observation)
+        circuit_canary = self.authoritative_build_circuit_canary
+        if circuit_canary is not None:
+            reservation_count, leased_tags, inflight_count = (
+                _authoritative_canary_execution_ownership(self)
+            )
+            circuit_canary.observe_effect_reports(
+                effect_reports,
+                game_loop=game_loop,
+                observation_revision=observation_revision,
+                reservation_count=reservation_count,
+                leased_builder_tags=leased_tags,
+                effect_inflight_count=inflight_count,
+                authoritative_state=(
+                    None
+                    if circuit_canary.operation_id is None
+                    else self.raw_executor.placement_service.authoritative_pre_dispatch_state(
+                        circuit_canary.operation_id
+                    )
+                ),
+            )
         if _is_terminal(obs):
+            if circuit_canary is not None:
+                circuit_canary.observe_terminal(
+                    game_loop=game_loop,
+                    observation_revision=observation_revision,
+                )
             return _finish_terminal(self, obs, _base_agent_step, _raw_no_op)
 
         _base_agent_step(self, obs)
-        game_loop = _observation_game_loop(obs.observation)
         _sync_raw_team_membership(self, obs.observation)
+        canary_builder_ready = True
+        if circuit_canary is not None and circuit_canary.requires_builder_pin:
+            canary_builder_ready = _pin_authoritative_canary_builder(
+                self,
+                obs.observation,
+                circuit_canary,
+                game_loop=game_loop,
+                observation_revision=observation_revision,
+            )
         self.decision_broker.extractor.observe_expansion_resources(
             obs.observation,
             self.agents,
         )
 
         emergency_signature = _raw_emergency_signature(obs.observation)
-        if self.raw_decision_scheduler.should_decide(
+        suppress_worker_actions = False
+        if canary_builder_ready and self.raw_decision_scheduler.should_decide(
             game_loop=game_loop,
             queued_count=self.raw_executor.queued_count,
             inflight_count=self.raw_executor.effect_inflight_count,
@@ -2020,21 +2120,64 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
                 self.agents,
                 step_id=int(self.steps),
             )
+            if circuit_canary is not None:
+                reservation_count, leased_tags, inflight_count = (
+                    _authoritative_canary_execution_ownership(self)
+                )
+                authoritative_state = (
+                    None
+                    if circuit_canary.operation_id is None
+                    else self.raw_executor.placement_service.authoritative_pre_dispatch_state(
+                        circuit_canary.operation_id
+                    )
+                )
+                canary_decision = circuit_canary.observe_runtime_decision(
+                    _routed_decision_commands(decision),
+                    idle_reason=(
+                        None
+                        if decision.action_batch.get("idle_reason") is None
+                        else str(decision.action_batch["idle_reason"])
+                    ),
+                    game_loop=game_loop,
+                    observation_revision=observation_revision,
+                    builder_tag=_current_raw_builder_tag(self),
+                    reservation_count=reservation_count,
+                    leased_builder_tags=leased_tags,
+                    effect_inflight_count=inflight_count,
+                    authoritative_state=authoritative_state,
+                )
+                suppress_worker_actions = canary_decision.core_defer_observed
             self.raw_executor.enqueue(decision)
             self.raw_decision_scheduler.record_decision(
                 game_loop=game_loop,
                 emergency_signature=emergency_signature,
             )
 
-        with self.runtime_client.profiler.measure("raw_translate_dispatch"):
-            dispatch = self.raw_executor.next_dispatch(
-                obs.observation,
-                self.agents,
-                terminal_collapse=_raw_terminal_collapse(
-                    obs.observation,
-                    unit_names=self.decision_broker.extractor.unit_names,
-                ),
+        hold_raw_dispatch = bool(
+            (
+                circuit_canary is not None
+                and circuit_canary.should_hold_raw_dispatch(
+                    observation_revision=observation_revision
+                )
             )
+            or (
+                circuit_canary is not None
+                and not canary_builder_ready
+                and self.raw_executor.queued_count > 0
+            )
+        )
+        if hold_raw_dispatch:
+            dispatch = None
+        else:
+            with self.runtime_client.profiler.measure("raw_translate_dispatch"):
+                dispatch = self.raw_executor.next_dispatch(
+                    obs.observation,
+                    self.agents,
+                    terminal_collapse=_raw_terminal_collapse(
+                        obs.observation,
+                        unit_names=self.decision_broker.extractor.unit_names,
+                    ),
+                )
         self._rtscortex_raw_dispatch_diagnostic_snapshot = dict(
             self.raw_executor.diagnostic_snapshot
         )
@@ -2052,12 +2195,19 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
                 dispatch.command.command_id,
                 game_loop=game_loop,
             )
+            self._rtscortex_raw_dispatch_diagnostic_snapshot = dict(
+                self.raw_executor.diagnostic_snapshot
+            )
             action = dispatch.action
         else:
-            gas_action = self.gas_worker_controller.next_raw_action(
-                self,
-                obs.observation,
-                game_loop=game_loop,
+            gas_action = (
+                None
+                if hold_raw_dispatch or suppress_worker_actions
+                else self.gas_worker_controller.next_raw_action(
+                    self,
+                    obs.observation,
+                    game_loop=game_loop,
+                )
             )
             if gas_action is not None and _raw_worker_action_has_builder_lease_conflict(
                 self,
@@ -2070,6 +2220,28 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
                 self.transport_noop_primitives += 1
             else:
                 action = gas_action
+
+        if circuit_canary is not None and not hold_raw_dispatch:
+            authoritative_state = (
+                None
+                if circuit_canary.operation_id is None
+                else self.raw_executor.placement_service.authoritative_pre_dispatch_state(
+                    circuit_canary.operation_id
+                )
+            )
+            reservation_count, leased_tags, inflight_count = (
+                _authoritative_canary_execution_ownership(self)
+            )
+            circuit_canary.observe_raw_result(
+                dispatch=dispatch,
+                diagnostic=self._rtscortex_raw_dispatch_diagnostic_snapshot,
+                game_loop=game_loop,
+                observation_revision=observation_revision,
+                authoritative_state=authoritative_state,
+                reservation_count=reservation_count,
+                leased_builder_tags=leased_tags,
+                effect_inflight_count=inflight_count,
+            )
 
         if self.initial_planning_barrier.blocks_steps:
             self.initial_planning_barrier.release()
@@ -2115,6 +2287,19 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
             self._rtscortex_raw_dispatch_diagnostic_snapshot = dict(
                 self.raw_executor.diagnostic_snapshot
             )
+            circuit_canary = self.authoritative_build_circuit_canary
+            if circuit_canary is not None:
+                reservation_count, leased_tags, inflight_count = (
+                    _authoritative_canary_execution_ownership(self)
+                )
+                circuit_canary.observe_primitive_submitted(
+                    pending_raw,
+                    game_loop=submitted_loop,
+                    diagnostic=self._rtscortex_raw_dispatch_diagnostic_snapshot,
+                    reservation_count=reservation_count,
+                    leased_builder_tags=leased_tags,
+                    effect_inflight_count=inflight_count,
+                )
         self.runtime_client.profiler.observe_milliseconds(
             "pysc2_environment_step",
             float(elapsed_seconds) * 1_000,
@@ -3276,6 +3461,118 @@ def _reserved_builder_worker_tags(main_agent: Any) -> set[int]:
             continue
         tags.update(int(tag) for tag in team.get("unit_tags", ()) if int(tag) > 0)
     return tags
+
+
+def _authoritative_canary_execution_ownership(
+    main_agent: Any,
+) -> tuple[int, tuple[int, ...], int]:
+    raw_executor = main_agent.raw_executor
+    placement_service = raw_executor.placement_service
+    return (
+        int(placement_service.active_reservation_count),
+        tuple(sorted(int(tag) for tag in placement_service.leased_builder_tags)),
+        int(raw_executor.effect_inflight_count),
+    )
+
+
+def _routed_decision_commands(decision: Any) -> tuple[RoutedCommand, ...]:
+    routed = {
+        command.command_id: command
+        for route in decision.routes.values()
+        for command in route.commands
+    }
+    return tuple(
+        routed[str(value["command_id"])] for value in decision.action_batch.get("commands", ())
+    )
+
+
+def _current_raw_builder_tag(main_agent: Any) -> int | None:
+    builder = getattr(main_agent, "agents", {}).get("Builder")
+    if builder is None:
+        return None
+    value = getattr(builder, "team_unit_tag_curr", None)
+    if value is None or int(value) <= 0:
+        return None
+    return int(value)
+
+
+def _pin_authoritative_canary_builder(
+    main_agent: Any,
+    observation: Any,
+    controller: AuthoritativeBuildCircuitCanary,
+    *,
+    game_loop: int,
+    observation_revision: str,
+) -> bool:
+    """Pin the exact real, feature-visible Builder required by the canary phase."""
+
+    unit_names = main_agent.decision_broker.extractor.unit_names
+    placement_service = main_agent.raw_executor.placement_service
+    desired = controller.required_builder_tag
+    select_replacement = desired is None
+    feature_visible = {
+        int(_observation_value(unit, "tag", 0))
+        for unit in _observation_value(observation, "feature_units", ())
+        if int(_observation_value(unit, "alliance", 0)) == 1
+        and bool(_observation_value(unit, "is_on_screen", True))
+    }
+    candidates = [
+        unit
+        for unit in _observation_value(observation, "raw_units", ())
+        if _worker_unit_name(unit, unit_names) == "Probe"
+        and _raw_builder_ready(unit)
+        and int(_observation_value(unit, "tag", 0)) in feature_visible
+        and (
+            int(_observation_value(unit, "tag", 0)) not in placement_service.leased_builder_tags
+            or placement_service.builder_lease_owner(int(_observation_value(unit, "tag", 0)))
+            in {
+                controller.final_command_id,
+                getattr(controller.current_command, "command_id", None),
+            }
+        )
+        and (
+            not select_replacement
+            or int(_observation_value(unit, "tag", 0)) != controller.initial_builder_tag
+        )
+    ]
+    if desired is not None:
+        candidates = [
+            unit for unit in candidates if int(_observation_value(unit, "tag", 0)) == desired
+        ]
+    if not candidates:
+        return False
+    selected = min(candidates, key=lambda unit: int(_observation_value(unit, "tag", 0)))
+    selected_tag = int(_observation_value(selected, "tag", 0))
+    selected_type = int(_observation_value(selected, "unit_type", 0))
+    builder = getattr(main_agent, "agents", {}).get("Builder")
+    if builder is None:
+        return False
+    team_name: str | None = None
+    for team in getattr(builder, "teams", ()):
+        if not isinstance(team, dict):
+            continue
+        if selected_type in {int(value) for value in team.get("unit_type", ())}:
+            team["unit_tags"] = [selected_tag]
+            team["unit_tags_selected"] = [selected_tag]
+            team_name = str(team.get("name", ""))
+        elif str(team.get("name", "")) != "Empty":
+            team["unit_tags"] = []
+            team["unit_tags_selected"] = []
+    if not team_name:
+        return False
+    builder.team_unit_tag_list = [selected_tag]
+    builder.team_unit_team_list = [team_name]
+    builder.team_unit_obs_list = []
+    builder.team_unit_tag_curr = selected_tag
+    builder.team_unit_team_curr = team_name
+    builder.enable = True
+    if selected_tag != controller.initial_builder_tag:
+        controller.bind_replacement_builder(
+            selected_tag,
+            game_loop=game_loop,
+            observation_revision=observation_revision,
+        )
+    return True
 
 
 def _rebind_builder_to_selected_worker(main_agent: Any, observation: Any) -> bool:

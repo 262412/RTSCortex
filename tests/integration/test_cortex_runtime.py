@@ -1687,13 +1687,14 @@ def test_authoritative_build_circuit_reopens_on_explicit_builder_rebind(
             "state": observation.state.model_copy(
                 update={
                     "own_units": [
+                        observation.state.own_units[-1].model_copy(update={"actor_scopes": ()}),
                         UnitState(
                             unit_id="0xb",
                             unit_type="Probe",
                             alliance="self",
                             status="ready",
                             actor_scopes=("Builder/Probe-1",),
-                        )
+                        ),
                     ]
                 }
             ),

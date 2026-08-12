@@ -5,12 +5,16 @@ import pytest
 from rtscortex.cli.app import _active_model_label, _live_worker_environment
 from rtscortex.config import (
     AgentSettings,
+    AuthoritativeBuildCircuitCanarySettings,
     CortexHIMAEnsembleMemberSettings,
     CortexMacroSettings,
     CortexSettings,
     EnvironmentSettings,
+    EvaluationSettings,
     ExperimentConfig,
     ProviderSettings,
+    ReflexSettings,
+    RuntimeSettings,
 )
 from rtscortex.runtime.live import LiveWorkerSpec
 
@@ -83,3 +87,45 @@ def test_live_worker_environment_propagates_the_configured_agent_race(
     assert environment["SC2PATH"] == "/tmp/StarCraftII"
     assert environment["RTSCORTEX_PLACEMENT_OUTBOX_PATH"] == "/tmp/run/placement-outbox.sqlite3"
     assert environment["PYTHONPATH"] == "/tmp/reviewed/LLM-PySC2:/existing/python/path"
+
+
+def test_live_worker_environment_propagates_authoritative_canary_contract() -> None:
+    config = ExperimentConfig(
+        environment=EnvironmentSettings(
+            adapter="llm_pysc2",
+            execution_action_space="raw",
+            agent_race="protoss",
+            max_steps=1024,
+            expansion_scout_enabled=False,
+        ),
+        runtime=RuntimeSettings(max_actions=1),
+        agent=AgentSettings(variant="cortex"),
+        cortex=CortexSettings(
+            macro=CortexMacroSettings(kind="scripted", scripted_actions=["Pylon"]),
+        ),
+        reflex=ReflexSettings(enabled=False),
+        evaluation=EvaluationSettings(
+            seeds=[7],
+            authoritative_build_circuit_canary=(
+                AuthoritativeBuildCircuitCanarySettings(enabled=True)
+            ),
+        ),
+    )
+    worker = LiveWorkerSpec(command=("python",), sc2_path=Path("/tmp/StarCraftII"))
+
+    environment = _live_worker_environment(
+        config,
+        worker,
+        authoritative_circuit_canary_journal_path=Path("/tmp/run/circuit.jsonl"),
+    )
+
+    assert environment["RTSCORTEX_AUTHORITATIVE_BUILD_CIRCUIT_CANARY"] == "true"
+    assert (
+        environment["RTSCORTEX_AUTHORITATIVE_BUILD_CIRCUIT_CANARY_MODE"]
+        == "stale_candidate_then_builder_rebind"
+    )
+    assert environment["RTSCORTEX_AUTHORITATIVE_BUILD_CIRCUIT_CANARY_FAILURE_ATTEMPTS"] == "3"
+    assert environment["RTSCORTEX_AUTHORITATIVE_BUILD_CIRCUIT_CANARY_HOLD_OBSERVATIONS"] == "1"
+    assert environment["RTSCORTEX_AUTHORITATIVE_BUILD_CIRCUIT_CANARY_JOURNAL"] == (
+        "/tmp/run/circuit.jsonl"
+    )

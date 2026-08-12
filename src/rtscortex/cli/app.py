@@ -115,7 +115,9 @@ def _live_worker_environment(
     live_worker: LiveWorkerSpec,
     *,
     placement_outbox_path: Path | None = None,
+    authoritative_circuit_canary_journal_path: Path | None = None,
 ) -> dict[str, str]:
+    circuit_canary = config.evaluation.authoritative_build_circuit_canary
     environment = {
         "SC2PATH": str(live_worker.sc2_path),
         "RTSCORTEX_AGENT_RACE": config.environment.agent_race,
@@ -150,6 +152,14 @@ def _live_worker_environment(
         "RTSCORTEX_CONSOLE_JPEG_QUALITY": str(config.console.jpeg_quality),
         "RTSCORTEX_CONSOLE_RGB_SCREEN_SIZE": str(config.console.rgb_screen_size),
         "RTSCORTEX_CONSOLE_RGB_MINIMAP_SIZE": str(config.console.rgb_minimap_size),
+        "RTSCORTEX_AUTHORITATIVE_BUILD_CIRCUIT_CANARY": str(circuit_canary.enabled).lower(),
+        "RTSCORTEX_AUTHORITATIVE_BUILD_CIRCUIT_CANARY_MODE": circuit_canary.mode,
+        "RTSCORTEX_AUTHORITATIVE_BUILD_CIRCUIT_CANARY_FAILURE_ATTEMPTS": str(
+            circuit_canary.failure_attempts
+        ),
+        "RTSCORTEX_AUTHORITATIVE_BUILD_CIRCUIT_CANARY_HOLD_OBSERVATIONS": str(
+            circuit_canary.hold_observations
+        ),
     }
     if config.environment.simulation_speed_multiplier is not None:
         environment["RTSCORTEX_SIMULATION_SPEED_MULTIPLIER"] = str(
@@ -158,6 +168,12 @@ def _live_worker_environment(
     if placement_outbox_path is not None:
         environment["RTSCORTEX_PLACEMENT_OUTBOX_PATH"] = str(
             placement_outbox_path.expanduser().resolve()
+        )
+    if circuit_canary.enabled:
+        if authoritative_circuit_canary_journal_path is None:
+            raise ValueError("enabled authoritative circuit canary requires a journal path")
+        environment["RTSCORTEX_AUTHORITATIVE_BUILD_CIRCUIT_CANARY_JOURNAL"] = str(
+            authoritative_circuit_canary_journal_path.expanduser().resolve()
         )
     if live_worker.python_path:
         existing_python_path = os.environ.get("PYTHONPATH")
@@ -623,6 +639,9 @@ def run_experiment(
                 config,
                 live_worker,
                 placement_outbox_path=run_dir / "placement-transition-outbox.sqlite3",
+                authoritative_circuit_canary_journal_path=(
+                    run_dir / "authoritative-build-circuit-canary.jsonl"
+                ),
             )
             console_hub: LiveConsoleHub | None = None
             console_api = None

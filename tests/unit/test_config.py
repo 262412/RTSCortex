@@ -14,6 +14,7 @@ from rtscortex.config import (
     EnvironmentSettings,
     ExperimentConfig,
     RuntimeSettings,
+    load_config,
 )
 
 
@@ -251,3 +252,47 @@ def test_hima_ensemble_race_must_match_agent() -> None:
                 },
             }
         )
+
+
+def test_authoritative_build_circuit_canary_profile_is_narrow_and_bounded() -> None:
+    project_root = Path(__file__).resolve().parents[2]
+    config = load_config(
+        project_root
+        / "configs/experiments/live_simple64_hima_protoss_authoritative_build_circuit_canary.yaml"
+    )
+
+    assert config.evaluation.authoritative_build_circuit_canary.enabled is True
+    assert config.environment.execution_action_space == "raw"
+    assert config.environment.max_steps == 1024
+    assert config.cortex.macro.scripted_actions == ["Pylon"]
+    assert config.runtime.max_actions == 1
+    assert config.reflex.enabled is False
+    assert config.cortex.playbook.enabled is False
+
+
+@pytest.mark.parametrize(
+    ("section", "field", "value"),
+    [
+        ("environment", "execution_action_space", "features"),
+        ("environment", "max_steps", None),
+        ("environment", "agent_race", "terran"),
+        ("environment", "expansion_scout_enabled", True),
+        ("runtime", "max_actions", 2),
+        ("reflex", "enabled", True),
+    ],
+)
+def test_authoritative_build_circuit_canary_rejects_broader_profiles(
+    section: str,
+    field: str,
+    value: object,
+) -> None:
+    project_root = Path(__file__).resolve().parents[2]
+    config = load_config(
+        project_root
+        / "configs/experiments/live_simple64_hima_protoss_authoritative_build_circuit_canary.yaml"
+    )
+    payload = config.model_dump(mode="python")
+    payload[section][field] = value
+
+    with pytest.raises(ValidationError, match="authoritative Build circuit canary requires"):
+        ExperimentConfig.model_validate(payload)
