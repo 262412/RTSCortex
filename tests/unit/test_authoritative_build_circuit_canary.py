@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -501,6 +502,61 @@ def test_runtime_events_are_authoritative_for_the_canary_path() -> None:
     assert report["runtime_success_count"] == 1
 
 
+def _runtime_events_with_opening_lifecycle(status: str) -> list[StoredEvent]:
+    runtime_events = [
+        replace(event, event_id=event.event_id + 1) if event.event_id >= 4 else event
+        for event in _valid_runtime_events()
+    ]
+    operation_id = "operation:" + "a" * 64
+    command_id = "command-2"
+    runtime_events.insert(
+        3,
+        _runtime_event(
+            4,
+            "command_lifecycle",
+            {
+                "status": status,
+                "reason": "placement_candidate_stale" if status == "failed" else None,
+                "command": {
+                    "operation_id": operation_id,
+                    "command_id": command_id,
+                    "attempt_id": _attempt(operation_id, command_id, 2),
+                    "attempt_ordinal": 2,
+                    "name": "Build_Pylon_Screen",
+                },
+            },
+        ),
+    )
+    return runtime_events
+
+
+def test_runtime_replay_ignores_opening_command_terminal_after_open_event() -> None:
+    phase_events = _valid_phases()
+    phase_replay = _replay_phases(phase_events, expected_seed=7)
+
+    report = _replay_runtime_events(
+        _runtime_events_with_opening_lifecycle("failed"),
+        phase_events=phase_events,
+        phase_replay=phase_replay,
+    )
+
+    assert report["post_open_command_count"] == 0
+    assert report["post_open_dispatch_count"] == 0
+    assert report["post_open_raw_rejection_count"] == 0
+
+
+def test_runtime_replay_rejects_opening_command_redispatch_after_open_event() -> None:
+    phase_events = _valid_phases()
+    phase_replay = _replay_phases(phase_events, expected_seed=7)
+
+    with pytest.raises(CanaryArtifactError, match="post-open command"):
+        _replay_runtime_events(
+            _runtime_events_with_opening_lifecycle("dispatched"),
+            phase_events=phase_events,
+            phase_replay=phase_replay,
+        )
+
+
 def test_analyzer_rejects_tampered_hash_and_wrong_run_dir(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -533,6 +589,49 @@ def test_analyzer_rejects_tampered_hash_and_wrong_run_dir(
     )
     with pytest.raises(CanaryArtifactError, match="run_dir attestation"):
         analyze_canary_run(run_set, expected_git_sha="a" * 40, seed=7)
+
+
+def test_summary_canonical_check_compares_json_round_trip(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "events.jsonl").write_text("events\n", encoding="utf-8")
+    canonical = {
+        "runs": {
+            "run-canary": {
+                "episodes": {
+                    "episode-0": {
+                        "cortex": {"race_limitations": ()},
+                    }
+                }
+            }
+        }
+    }
+    (run_dir / "summary.json").write_text(
+        json.dumps(canonical, sort_keys=True),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(analyzer, "read_event_log", lambda _path: ())
+    monkeypatch.setattr(analyzer, "_build_run_summary", lambda _events: canonical)
+
+    assert analyzer._summary_artifact_is_canonical(
+        run_dir,
+        run_id="run-canary",
+        episode_id="episode-0",
+    )
+
+    forged_canonical: dict[str, Any] = json.loads(json.dumps(canonical))
+    forged_canonical["runs"]["run-canary"]["episodes"]["episode-0"]["cortex"][
+        "race_limitations"
+    ] = ["forged"]
+    monkeypatch.setattr(analyzer, "_build_run_summary", lambda _events: forged_canonical)
+    assert not analyzer._summary_artifact_is_canonical(
+        run_dir,
+        run_id="run-canary",
+        episode_id="episode-0",
+    )
 
 
 @pytest.mark.parametrize(

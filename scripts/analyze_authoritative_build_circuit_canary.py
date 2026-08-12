@@ -735,8 +735,18 @@ def _replay_runtime_events(
         )
     if sum(value == "closed_to_open" for value in transitions) != 1:
         raise CanaryArtifactError("runtime has more than one closed_to_open transition")
-    open_event, _open_payload, open_evidence = failures[-1]
+    open_event, open_payload, open_evidence = failures[-1]
     open_event_id = _runtime_event_id(open_event)
+    opening_command_id = _required_string(
+        open_payload,
+        "command_id",
+        phase="closed_to_open execution",
+    )
+    opening_attempt_id = _required_string(
+        open_evidence,
+        "attempt_id",
+        phase="closed_to_open execution",
+    )
 
     defer_events = [
         event
@@ -828,6 +838,16 @@ def _replay_runtime_events(
             command = payload.get("command")
             if isinstance(command, Mapping) and _runtime_command_operation(command) == operation_id:
                 command_id = str(command.get("command_id") or f"event:{event_id}")
+                opening_terminal = (
+                    payload.get("status") == "failed"
+                    and payload.get("reason") == "placement_candidate_stale"
+                    and command_id == opening_command_id
+                    and command.get("attempt_id") == opening_attempt_id
+                    and command.get("attempt_ordinal") == 2
+                    and command.get("name") == _RUNTIME_ACTION
+                )
+                if opening_terminal:
+                    continue
                 post_open_command_ids.add(command_id)
                 if payload.get("status") == "dispatched":
                     post_open_dispatch_ids.add(command_id)
@@ -1013,7 +1033,7 @@ def _summary_artifact_is_canonical(run_dir: Path, *, run_id: str, episode_id: st
     try:
         summary = json.loads(summary_path.read_text(encoding="utf-8"))
         events = tuple(read_event_log(events_path))
-        canonical = _build_run_summary(events)
+        canonical = json.loads(json.dumps(_build_run_summary(events), sort_keys=True))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
         return False
     if summary != canonical:
