@@ -2005,6 +2005,72 @@ def test_raw_preflight_atomically_authorizes_exact_builder_without_ownership() -
     assert dispatch.builder_tag == 0xB2
 
 
+def test_raw_preflight_keeps_request_and_raw_observation_revisions_distinct() -> None:
+    broker = _Broker()
+    service = RawPlacementService(unit_names={2: "Probe"})
+    executor = RawActionExecutor(
+        cast(Any, broker),
+        unit_names={2: "Probe"},
+        placement_service=service,
+    )
+    operation_id = f"operation:{'9' * 64}"
+    target = (30.0, 25.0)
+    baseline = SimpleNamespace(
+        raw_units=[_unit(0xB1, 2)],
+        feature_units=[],
+        game_loop=[100],
+        player_common=SimpleNamespace(minerals=500, vespene=0, food_used=0, food_cap=20),
+    )
+    _open_authoritative_raw_circuit(
+        service,
+        baseline,
+        operation_id=operation_id,
+        builder_tag=0xB1,
+        target=target,
+    )
+    current = SimpleNamespace(
+        raw_units=[_unit(0xB2, 2)],
+        feature_units=[],
+        game_loop=[116],
+        player_common=baseline.player_common,
+    )
+    request = _raw_preflight_request(
+        service,
+        current,
+        operation_id=operation_id,
+        target=target,
+        builder_tag=0xB2,
+    )
+    core_observation_revision = "core-observation-fingerprint"
+    request = replace(
+        request,
+        request_id=authoritative_build_preflight_request_id(
+            operation_id=request.operation_id,
+            operation_epoch=request.operation_epoch,
+            action_name=request.action_name,
+            actor=request.actor,
+            requested_arguments=[list(value) for value in request.requested_arguments],
+            opened_command_id=request.opened_command_id,
+            opened_attempt_id=request.opened_attempt_id,
+            opened_attempt_ordinal=request.opened_attempt_ordinal,
+            blocked_material_legality_identity=(request.blocked_material_legality_identity),
+            observation_revision=core_observation_revision,
+            observation_game_loop=request.observation_game_loop,
+        ),
+        observation_revision=core_observation_revision,
+    )
+
+    result = executor.preflight_authoritative_build(
+        request,
+        current,
+        {"Builder": _agent("Builder-Probe-1", [0xB2])},
+    )
+
+    assert result.authorized is True
+    assert result.observation_revision == _placement_revision(current)
+    assert result.observation_revision != request.observation_revision
+
+
 @pytest.mark.parametrize(
     "mutation",
     [

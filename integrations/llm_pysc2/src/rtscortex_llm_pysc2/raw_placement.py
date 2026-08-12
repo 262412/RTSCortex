@@ -1343,6 +1343,8 @@ class RawPlacementService:
         opened_attempt_id: str,
         opened_attempt_ordinal: int,
         blocked_material_legality_identity: str,
+        request_observation_revision: str | None,
+        request_observation_game_loop: int | None,
         builder_tag: int | None,
         ability_id: int | None,
         world_target: tuple[float, float] | None,
@@ -1429,10 +1431,11 @@ class RawPlacementService:
                 opened_attempt_id=str(opened_attempt_id),
                 opened_attempt_ordinal=int(opened_attempt_ordinal),
                 blocked_material_legality_identity=str(blocked_material_legality_identity),
-                observation_revision=str(observation_revision),
-                observation_game_loop=int(observation_game_loop),
+                observation_revision=str(request_observation_revision),
+                observation_game_loop=int(request_observation_game_loop),
             )
-            if observation_revision is not None and observation_game_loop is not None
+            if request_observation_revision is not None
+            and request_observation_game_loop is not None
             else None
         )
         material_identity = self.authoritative_pre_dispatch_material_identity(
@@ -1468,6 +1471,16 @@ class RawPlacementService:
                             ),
                             ("action_name_invalid", not str(action_name).startswith("Build_")),
                             ("actor_missing", not str(actor)),
+                            (
+                                "request_observation_revision_missing",
+                                request_observation_revision is None
+                                or not str(request_observation_revision),
+                            ),
+                            (
+                                "request_observation_game_loop_missing",
+                                request_observation_game_loop is None
+                                or int(request_observation_game_loop) < 0,
+                            ),
                             ("opened_command_id_missing", not str(opened_command_id)),
                             (
                                 "opened_attempt_id_invalid",

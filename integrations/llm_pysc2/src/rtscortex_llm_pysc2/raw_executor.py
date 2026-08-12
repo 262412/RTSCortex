@@ -375,6 +375,8 @@ class RawActionExecutor:
             opened_attempt_id=request.opened_attempt_id,
             opened_attempt_ordinal=request.opened_attempt_ordinal,
             blocked_material_legality_identity=(request.blocked_material_legality_identity),
+            request_observation_revision=request.observation_revision,
+            request_observation_game_loop=request.observation_game_loop,
             builder_tag=builder_tag,
             ability_id=ability_id,
             world_target=world_target,
