@@ -12,9 +12,15 @@ from rtscortex_llm_pysc2.raw_placement import (
     _placement_candidate_id,
     _placement_revision,
 )
-from rtscortex_llm_pysc2.routing import ActionRouter, RoutedActionBatch, RoutedCommand
+from rtscortex_llm_pysc2.routing import (
+    ActionRouter,
+    RoutedActionBatch,
+    RoutedBuildPreflightRequest,
+    RoutedCommand,
+)
 from rtscortex_llm_pysc2.worker import SC2RawBuildQueryCapability
 
+from rtscortex.contracts import authoritative_build_preflight_request_id
 from rtscortex.cortex import AttemptKey
 
 pytest.importorskip("pysc2.lib.actions")
@@ -260,6 +266,8 @@ def _authorized_pylon_command(
     operation_id: str | None = None,
     attempt_ordinal: int | None = None,
     target: tuple[float, float] = (22.0, 24.0),
+    builder_tag: int = 0xB1,
+    authoritative_build_preflight: dict[str, Any] | None = None,
 ) -> RoutedCommand:
     placement_revision = _placement_revision(observation)
     return RoutedCommand(
@@ -281,16 +289,126 @@ def _authorized_pylon_command(
         ),
         attempt_ordinal=attempt_ordinal,
         screen_world_target=target,
-        screen_anchor_tag=0xB1,
+        screen_anchor_tag=builder_tag,
         placement_candidate_id=_placement_candidate_id(
             "Build_Pylon_Screen",
             target,
-            0xB1,
+            builder_tag,
             placement_revision,
             2,
             False,
         ),
         placement_revision=placement_revision,
+        authoritative_build_preflight=authoritative_build_preflight,
+    )
+
+
+def _open_authoritative_raw_circuit(
+    placement_service: RawPlacementService,
+    observation: Any,
+    *,
+    operation_id: str,
+    builder_tag: int,
+    target: tuple[float, float],
+) -> None:
+    target_state_revision = placement_service.target_state_revision_for(
+        observation,
+        "Build_Pylon_Screen",
+        target,
+        anchor_tag=None,
+    )
+    material_identity = placement_service.authoritative_pre_dispatch_material_identity(
+        operation_id=operation_id,
+        builder_tag=builder_tag,
+        ability_id=881,
+        world_target=target,
+        target_state_revision=target_state_revision,
+    )
+    assert material_identity is not None
+    for ordinal in range(3):
+        command_id = f"open-{ordinal}"
+        placement_service.record_authoritative_pre_dispatch_failure(
+            operation_id=operation_id,
+            action_name="Build_Pylon_Screen",
+            command_id=command_id,
+            failure_code="placement_candidate_stale",
+            attempt_id=AttemptKey(
+                operation_id=operation_id,
+                command_id=command_id,
+                attempt_ordinal=ordinal,
+            ).attempt_id,
+            attempt_ordinal=ordinal,
+            builder_tag=builder_tag,
+            ability_id=881,
+            world_target=target,
+            target_state_revision=target_state_revision,
+            observation_revision=_placement_revision(observation),
+            observation_game_loop=int(observation.game_loop[0]),
+            material_legality_identity=material_identity,
+        )
+
+
+def _raw_preflight_request(
+    placement_service: RawPlacementService,
+    observation: Any,
+    *,
+    operation_id: str,
+    target: tuple[float, float],
+    builder_tag: int,
+) -> RoutedBuildPreflightRequest:
+    state = placement_service.authoritative_pre_dispatch_state(operation_id)
+    assert state is not None
+    assert state.circuit_open is True
+    assert state.blocked_material_legality_identity is not None
+    opened_attempt_id = AttemptKey(
+        operation_id=operation_id,
+        command_id="open-2",
+        attempt_ordinal=2,
+    ).attempt_id
+    observation_revision = _placement_revision(observation)
+    observation_game_loop = int(observation.game_loop[0])
+    requested_arguments = [[65, 65]]
+    request_id = authoritative_build_preflight_request_id(
+        operation_id=operation_id,
+        operation_epoch=0,
+        action_name="Build_Pylon_Screen",
+        actor="Builder/Builder-Probe-1",
+        requested_arguments=requested_arguments,
+        opened_command_id="open-2",
+        opened_attempt_id=opened_attempt_id,
+        opened_attempt_ordinal=2,
+        blocked_material_legality_identity=state.blocked_material_legality_identity,
+        observation_revision=observation_revision,
+        observation_game_loop=observation_game_loop,
+    )
+    return RoutedBuildPreflightRequest(
+        request_id=request_id,
+        run_id="run-raw",
+        episode_id="episode-raw",
+        step_id=2,
+        operation_id=operation_id,
+        operation_epoch=0,
+        action_name="Build_Pylon_Screen",
+        actor="Builder/Builder-Probe-1",
+        team_name="Builder-Probe-1",
+        requested_arguments=([65, 65],),
+        opened_command_id="open-2",
+        opened_attempt_id=opened_attempt_id,
+        opened_attempt_ordinal=2,
+        blocked_material_legality_identity=(state.blocked_material_legality_identity),
+        observation_revision=observation_revision,
+        observation_game_loop=observation_game_loop,
+        screen_world_target=target,
+        screen_anchor_tag=builder_tag,
+        placement_candidate_id=_placement_candidate_id(
+            "Build_Pylon_Screen",
+            target,
+            builder_tag,
+            _placement_revision(observation),
+            2,
+            False,
+        ),
+        placement_revision=_placement_revision(observation),
     )
 
 
@@ -679,6 +797,7 @@ def test_cached_query_rejections_count_toward_operation_circuit_without_new_quer
     )
     assert len(query.calls) == 1
     assert executor.diagnostic_snapshot["failure_code"] == "authoritative_pre_dispatch_circuit_open"
+    assert executor.diagnostic_snapshot["primitive_constructed"] is False
     assert executor.placement_service.active_reservation_count == 0
     assert executor.placement_service.leased_builder_tags == frozenset()
     assert executor.effect_inflight_count == 0
@@ -1753,7 +1872,9 @@ def test_raw_executor_blocks_authoritative_circuit_before_resolve() -> None:
         unit_names={2: "Probe"},
         no_start_streak_threshold=3,
     )
-    target = (30.0, 25.0)
+    # The Builder is far enough away that a normal legal command would emit an
+    # approach-only Move.  An open authoritative circuit must stop earlier.
+    target = (45.0, 45.0)
     target_state_revision = placement_service.target_state_revision_for(
         observation,
         "Build_Pylon_Screen",
@@ -1814,6 +1935,280 @@ def test_raw_executor_blocks_authoritative_circuit_before_resolve() -> None:
     assert executor.placement_service.leased_builder_tags == frozenset()
     assert executor.effect_inflight_count == 0
     assert broker.settled == [("authoritative-circuit-retry", False)]
+    assert all(dispatch.function_name != "Move_Move_pt" for dispatch in broker.settled_dispatches)
+
+
+def test_raw_preflight_atomically_authorizes_exact_builder_without_ownership() -> None:
+    broker = _Broker()
+    service = RawPlacementService(unit_names={2: "Probe"})
+    executor = RawActionExecutor(
+        cast(Any, broker),
+        unit_names={2: "Probe"},
+        placement_service=service,
+    )
+    operation_id = f"operation:{'b' * 64}"
+    target = (30.0, 25.0)
+    baseline = SimpleNamespace(
+        raw_units=[_unit(0xB1, 2)],
+        feature_units=[],
+        game_loop=[100],
+        player_common=SimpleNamespace(minerals=500, vespene=0, food_used=0, food_cap=20),
+    )
+    _open_authoritative_raw_circuit(
+        service,
+        baseline,
+        operation_id=operation_id,
+        builder_tag=0xB1,
+        target=target,
+    )
+    current = SimpleNamespace(
+        raw_units=[_unit(0xB2, 2), _unit(0xB3, 2)],
+        feature_units=[],
+        game_loop=[116],
+        player_common=baseline.player_common,
+    )
+    request = _raw_preflight_request(
+        service,
+        current,
+        operation_id=operation_id,
+        target=target,
+        builder_tag=0xB2,
+    )
+
+    result = executor.preflight_authoritative_build(
+        request,
+        current,
+        {"Builder": _agent("Builder-Probe-1", [0xB2, 0xB3])},
+    )
+
+    assert result.authorized is True
+    assert result.state_transition == "open_to_reset"
+    assert result.builder_tag == 0xB2
+    assert service.active_reservation_count == 0
+    assert service.leased_builder_tags == frozenset()
+    assert executor.effect_inflight_count == 0
+    command = _authorized_pylon_command(
+        current,
+        command_id="authorized-fresh-command",
+        operation_id=operation_id,
+        attempt_ordinal=3,
+        target=target,
+        builder_tag=0xB2,
+        authoritative_build_preflight=result.to_dict(),
+    )
+    executor.enqueue(_decision(command))
+    dispatch = executor.next_dispatch(
+        current,
+        {"Builder": _agent("Builder-Probe-1", [0xB2, 0xB3])},
+    )
+    assert dispatch is not None
+    assert dispatch.builder_tag == 0xB2
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing",
+        "builder",
+        "ability",
+        "target",
+        "rounding",
+        "material",
+        "epoch",
+        "expired",
+    ],
+)
+def test_raw_preflight_authorization_mismatch_fails_before_ownership(
+    mutation: str,
+) -> None:
+    broker = _Broker()
+    service = RawPlacementService(unit_names={2: "Probe"})
+    executor = RawActionExecutor(
+        cast(Any, broker),
+        unit_names={2: "Probe"},
+        placement_service=service,
+    )
+    operation_id = f"operation:{'c' * 64}"
+    target = (45.0, 45.0)
+    baseline = SimpleNamespace(
+        raw_units=[_unit(0xB1, 2, x=20, y=20)],
+        feature_units=[],
+        game_loop=[100],
+        player_common=SimpleNamespace(minerals=500, vespene=0, food_used=0, food_cap=20),
+    )
+    _open_authoritative_raw_circuit(
+        service,
+        baseline,
+        operation_id=operation_id,
+        builder_tag=0xB1,
+        target=target,
+    )
+    current = SimpleNamespace(
+        raw_units=[_unit(0xB2, 2, x=20, y=20)],
+        feature_units=[],
+        game_loop=[116],
+        player_common=baseline.player_common,
+    )
+    request = _raw_preflight_request(
+        service,
+        current,
+        operation_id=operation_id,
+        target=target,
+        builder_tag=0xB2,
+    )
+    result = executor.preflight_authoritative_build(
+        request,
+        current,
+        {"Builder": _agent("Builder-Probe-1", [0xB2])},
+    )
+    assert result.authorized is True
+    dispatch_observation = current
+    dispatch_target = target
+    dispatch_builder = 0xB2
+    authorization: dict[str, Any] | None = result.to_dict()
+    if mutation == "missing":
+        authorization = None
+    elif mutation == "builder":
+        dispatch_builder = 0xB3
+        dispatch_observation = SimpleNamespace(
+            raw_units=[_unit(0xB3, 2, x=20, y=20)],
+            feature_units=[],
+            game_loop=[117],
+            player_common=baseline.player_common,
+        )
+    elif mutation == "target":
+        dispatch_target = (46.0, 45.0)
+    elif mutation == "rounding":
+        dispatch_target = (45.6, 45.0)
+    elif mutation == "ability":
+        assert authorization is not None
+        authorization["ability_id"] = 882
+    elif mutation == "material":
+        assert authorization is not None
+        authorization["material_legality_identity"] = "build-legality:" + "f" * 64
+    elif mutation == "epoch":
+        assert authorization is not None
+        authorization["operation_epoch"] = 1
+    elif mutation == "expired":
+        dispatch_observation = SimpleNamespace(
+            raw_units=current.raw_units,
+            feature_units=[],
+            game_loop=[300],
+            player_common=baseline.player_common,
+        )
+    command = _authorized_pylon_command(
+        dispatch_observation,
+        command_id=f"authorization-{mutation}",
+        operation_id=operation_id,
+        attempt_ordinal=3,
+        target=dispatch_target,
+        builder_tag=dispatch_builder,
+        authoritative_build_preflight=authorization,
+    )
+    executor.enqueue(_decision(command))
+
+    dispatch = executor.next_dispatch(
+        dispatch_observation,
+        {"Builder": _agent("Builder-Probe-1", [dispatch_builder])},
+    )
+
+    assert dispatch is None
+    assert executor.diagnostic_snapshot["failure_code"] == (
+        "authoritative_pre_dispatch_authorization_invalid"
+    )
+    assert service.active_reservation_count == 0
+    assert service.leased_builder_tags == frozenset()
+    assert executor.effect_inflight_count == 0
+    assert broker.settled == [(f"authorization-{mutation}", False)]
+
+
+def test_raw_preflight_authorization_is_single_use() -> None:
+    broker = _Broker()
+    service = RawPlacementService(unit_names={2: "Probe"})
+    executor = RawActionExecutor(
+        cast(Any, broker),
+        unit_names={2: "Probe"},
+        placement_service=service,
+    )
+    operation_id = f"operation:{'d' * 64}"
+    target = (30.0, 25.0)
+    baseline = SimpleNamespace(
+        raw_units=[_unit(0xB1, 2)],
+        feature_units=[],
+        game_loop=[100],
+        player_common=SimpleNamespace(minerals=500, vespene=0, food_used=0, food_cap=20),
+    )
+    _open_authoritative_raw_circuit(
+        service,
+        baseline,
+        operation_id=operation_id,
+        builder_tag=0xB1,
+        target=target,
+    )
+    current = SimpleNamespace(
+        raw_units=[_unit(0xB2, 2)],
+        feature_units=[],
+        game_loop=[116],
+        player_common=baseline.player_common,
+    )
+    request = _raw_preflight_request(
+        service,
+        current,
+        operation_id=operation_id,
+        target=target,
+        builder_tag=0xB2,
+    )
+    result = executor.preflight_authoritative_build(
+        request,
+        current,
+        {"Builder": _agent("Builder-Probe-1", [0xB2])},
+    )
+    first = _authorized_pylon_command(
+        current,
+        command_id="authorization-first",
+        operation_id=operation_id,
+        attempt_ordinal=3,
+        target=target,
+        builder_tag=0xB2,
+        authoritative_build_preflight=result.to_dict(),
+    )
+    executor.enqueue(_decision(first))
+    assert (
+        executor.next_dispatch(
+            current,
+            {"Builder": _agent("Builder-Probe-1", [0xB2])},
+        )
+        is not None
+    )
+    executor.observe_reports(
+        [{"command_id": first.command_id, "status": "succeeded"}],
+        {},
+        game_loop=120,
+    )
+    replay = _authorized_pylon_command(
+        current,
+        command_id="authorization-replay",
+        operation_id=operation_id,
+        attempt_ordinal=4,
+        target=target,
+        builder_tag=0xB2,
+        authoritative_build_preflight=result.to_dict(),
+    )
+    executor.enqueue(_decision(replay))
+
+    assert (
+        executor.next_dispatch(
+            current,
+            {"Builder": _agent("Builder-Probe-1", [0xB2])},
+        )
+        is None
+    )
+    assert executor.diagnostic_snapshot["failure_code"] == (
+        "authoritative_pre_dispatch_authorization_invalid"
+    )
+    assert service.active_reservation_count == 0
+    assert service.leased_builder_tags == frozenset()
+    assert executor.effect_inflight_count == 0
 
 
 def test_failed_build_effect_temporarily_suppresses_emitted_world_target() -> None:

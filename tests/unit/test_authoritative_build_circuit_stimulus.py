@@ -7,12 +7,21 @@ from types import SimpleNamespace
 
 import pytest
 from rtscortex_llm_pysc2.circuit_canary import AuthoritativeBuildCircuitCanary
-from rtscortex_llm_pysc2.routing import RoutedCommand
+from rtscortex_llm_pysc2.routing import RoutedBuildPreflightRequest, RoutedCommand
+
+from rtscortex.contracts import (
+    authoritative_build_preflight_authorization_id,
+    authoritative_build_preflight_request_id,
+)
 
 OPERATION_ID = "operation:" + "a" * 64
 
 
-def _command(ordinal: int) -> RoutedCommand:
+def _command(
+    ordinal: int,
+    *,
+    authorization: dict[str, object] | None = None,
+) -> RoutedCommand:
     command_id = f"command-{ordinal}"
     attempt_id = (
         "attempt:"
@@ -40,16 +49,109 @@ def _command(ordinal: int) -> RoutedCommand:
         semantic_action="BUILD PYLON",
         placement_candidate_id="candidate:" + "b" * 64,
         placement_revision=f"revision-{ordinal}",
+        authoritative_build_preflight=authorization,
     )
 
 
-def _state(streak: int, *, circuit_open: bool) -> dict[str, object]:
+def _state(
+    streak: int,
+    *,
+    circuit_open: bool,
+    pending_authorization_id: str | None = None,
+) -> dict[str, object]:
     return {
         "operation_id": OPERATION_ID,
         "streak": streak,
         "threshold": 3,
         "circuit_open": circuit_open,
+        "pending_authorization_id": pending_authorization_id,
     }
+
+
+def _preflight() -> tuple[RoutedBuildPreflightRequest, dict[str, object]]:
+    opened_attempt_id = _command(2).attempt_id
+    assert opened_attempt_id is not None
+    arguments: list[object] = []
+    request_id = authoritative_build_preflight_request_id(
+        operation_id=OPERATION_ID,
+        operation_epoch=0,
+        action_name="Build_Pylon_Screen",
+        actor="Builder/Probe",
+        requested_arguments=arguments,
+        opened_command_id="command-2",
+        opened_attempt_id=opened_attempt_id,
+        opened_attempt_ordinal=2,
+        blocked_material_legality_identity="build-legality:" + "c" * 64,
+        observation_revision="revision-preflight",
+        observation_game_loop=42,
+    )
+    request = RoutedBuildPreflightRequest(
+        request_id=request_id,
+        run_id="run-canary",
+        episode_id="episode-0",
+        step_id=42,
+        operation_id=OPERATION_ID,
+        operation_epoch=0,
+        action_name="Build_Pylon_Screen",
+        actor="Builder/Probe",
+        team_name="Probe",
+        requested_arguments=(),
+        opened_command_id="command-2",
+        opened_attempt_id=opened_attempt_id,
+        opened_attempt_ordinal=2,
+        blocked_material_legality_identity="build-legality:" + "c" * 64,
+        observation_revision="revision-preflight",
+        observation_game_loop=42,
+    )
+    target = (31.0, 30.0)
+    material = "build-legality:" + "d" * 64
+    authorization_id = authoritative_build_preflight_authorization_id(
+        request_id=request_id,
+        operation_id=OPERATION_ID,
+        operation_epoch=0,
+        action_name="Build_Pylon_Screen",
+        builder_tag=200,
+        ability_id=881,
+        world_target=target,
+        target_state_revision="target-preflight",
+        material_legality_identity=material,
+        observation_revision="revision-preflight",
+        observation_game_loop=42,
+        expires_game_loop=154,
+    )
+    result: dict[str, object] = {
+        "protocol_version": "1.1",
+        "request_id": request_id,
+        "authorization_id": authorization_id,
+        "run_id": "run-canary",
+        "episode_id": "episode-0",
+        "step_id": 42,
+        "operation_id": OPERATION_ID,
+        "operation_epoch": 0,
+        "action_name": "Build_Pylon_Screen",
+        "actor": "Builder/Probe",
+        "requested_arguments": [],
+        "opened_command_id": "command-2",
+        "opened_attempt_id": opened_attempt_id,
+        "opened_attempt_ordinal": 2,
+        "blocked_material_legality_identity": "build-legality:" + "c" * 64,
+        "status": "authorized",
+        "authorized": True,
+        "reason": "authoritative_material_change",
+        "circuit_open": False,
+        "builder_tag": 200,
+        "ability_id": 881,
+        "world_target": [31.0, 30.0],
+        "target_state_revision": "target-preflight",
+        "material_legality_identity": material,
+        "observation_revision": "revision-preflight",
+        "observation_game_loop": 42,
+        "expires_game_loop": 154,
+        "state_transition": "open_to_reset",
+        "material_change_reason": "builder_changed",
+        "invalid_evidence_reasons": [],
+    }
+    return request, result
 
 
 def _failure_diagnostic(command: RoutedCommand, streak: int) -> dict[str, object]:
@@ -156,7 +258,27 @@ def test_canary_requires_three_failures_core_defer_and_real_effect(tmp_path: Pat
         observation_revision="revision-rebind",
     )
     assert controller.required_builder_tag == 200
-    reset = _command(3)
+    preflight_request, preflight_result = _preflight()
+    authorization_id = str(preflight_result["authorization_id"])
+    preflight_decision = controller.observe_runtime_decision(
+        (),
+        preflight_results=((preflight_request, preflight_result),),
+        idle_reason="plan_commands_deferred",
+        planner_pending=False,
+        game_loop=42,
+        observation_revision="revision-preflight",
+        builder_tag=200,
+        reservation_count=0,
+        leased_builder_tags=(),
+        effect_inflight_count=0,
+        authoritative_state=_state(
+            0,
+            circuit_open=False,
+            pending_authorization_id=authorization_id,
+        ),
+    )
+    assert preflight_decision.core_defer_observed
+    reset = _command(3, authorization=preflight_result)
     controller.observe_runtime_decision(
         (reset,),
         idle_reason=None,
@@ -167,7 +289,11 @@ def test_canary_requires_three_failures_core_defer_and_real_effect(tmp_path: Pat
         reservation_count=0,
         leased_builder_tags=(),
         effect_inflight_count=0,
-        authoritative_state=_state(3, circuit_open=True),
+        authoritative_state=_state(
+            0,
+            circuit_open=False,
+            pending_authorization_id=authorization_id,
+        ),
     )
     dispatch = SimpleNamespace(command=reset, approach_only=False)
     diagnostic = {
@@ -185,7 +311,7 @@ def test_canary_requires_three_failures_core_defer_and_real_effect(tmp_path: Pat
         diagnostic=diagnostic,
         game_loop=43,
         observation_revision="revision-query",
-        authoritative_state=_state(3, circuit_open=True),
+        authoritative_state=_state(0, circuit_open=False),
         reservation_count=1,
         leased_builder_tags=(200,),
         effect_inflight_count=1,
@@ -240,6 +366,7 @@ def test_canary_requires_three_failures_core_defer_and_real_effect(tmp_path: Pat
         "circuit_open_observed",
         "core_defer_observed",
         "builder_rebound",
+        "preflight_authorized",
         "reset_command_observed",
         "reset_dispatch_observed",
         "reset_dispatch_submitted",

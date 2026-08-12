@@ -23,13 +23,14 @@ from rtscortex_llm_pysc2.observation import split_actor
 from rtscortex_llm_pysc2.production import production_spec
 from rtscortex_llm_pysc2.raw_placement import (
     _AUTHORITATIVE_PRE_DISPATCH_FAILURE_CODES,
+    RawAuthoritativeBuildPreflightResult,
     RawPlacementFailure,
     RawPlacementService,
     _placement_candidate_id,
     _placement_revision,
 )
 from rtscortex_llm_pysc2.research import research_spec
-from rtscortex_llm_pysc2.routing import RoutedCommand
+from rtscortex_llm_pysc2.routing import RoutedBuildPreflightRequest, RoutedCommand
 from rtscortex_llm_pysc2.terminal import TerminalCollapseReason
 
 _BUILD_RAW_FUNCTIONS = {
@@ -63,6 +64,7 @@ _NONSPATIAL_BUILD_FAILURE_CODES = frozenset(
         "placement_query_unavailable",
         "placement_query_rejected_cached",
         "authoritative_pre_dispatch_circuit_open",
+        "authoritative_pre_dispatch_authorization_invalid",
         "placement_candidate_stale",
         "no_legal_placement",
         TerminalCollapseReason.NON_RECOVERY_MACRO_DISPATCH.value,
@@ -288,6 +290,99 @@ class RawActionExecutor:
                     f"raw_action_integrity_error: command {command_id!r} has no route"
                 )
             self._commands.append(command)
+
+    def preflight_authoritative_build(
+        self,
+        request: RoutedBuildPreflightRequest,
+        observation: Any,
+        agents: Mapping[str, Any],
+    ) -> RawAuthoritativeBuildPreflightResult:
+        """Resolve exact Raw build identity without creating gameplay ownership."""
+
+        self.placement_service.observe(observation, require_feature_visibility=False)
+        invalid_reasons: list[str] = []
+        builder_tag: int | None = None
+        ability_id: int | None = None
+        world_target: tuple[float, float] | None = None
+        target_state_revision: str | None = None
+        eligibility = raw_build_eligibility(
+            observation,
+            request.action_name,
+            self.unit_names,
+        )
+        if not eligibility.eligible:
+            invalid_reasons.append(eligibility.failure_code or "build_not_eligible")
+        try:
+            builder_tags, _ = _resolve_builder_tags(
+                request,
+                observation,
+                agents,
+                unit_names=self.unit_names,
+                leased_builder_tags=self.placement_service.leased_builder_tags,
+                owned_lease_builder_tags=(),
+                freshness_blocked_builder_tags=self._freshness_blocked_builders(
+                    _game_loop(observation)
+                ),
+            )
+            builder_tag = builder_tags[0]
+        except _RawDispatchDeferral as error:
+            invalid_reasons.append(error.code)
+        try:
+            actions = importlib.import_module("pysc2.lib.actions")
+            function = getattr(
+                actions.RAW_FUNCTIONS,
+                _BUILD_RAW_FUNCTIONS[request.action_name],
+            )
+            ability_id = int(getattr(function, "ability_id", 0)) or None
+        except (AttributeError, KeyError, ModuleNotFoundError):
+            invalid_reasons.append("build_ability_unavailable")
+        world_target = _pre_dispatch_world_target(
+            request,
+            observation,
+            request.action_name,
+        )
+        target_state_revision = _pre_dispatch_target_state_revision(
+            self.placement_service,
+            observation=observation,
+            action_name=request.action_name,
+            world_target=world_target,
+            anchor_tag=(
+                None if request.action_name.endswith("_Screen") else request.screen_anchor_tag
+            ),
+        )
+        if builder_tag is not None and ability_id is not None and world_target is not None:
+            capability = self.build_query_capability
+            if capability is None:
+                invalid_reasons.append("placement_query_unavailable")
+            else:
+                query = capability.authorize_build(
+                    builder_tag=builder_tag,
+                    ability_id=ability_id,
+                    world_target=world_target,
+                )
+                if query.ability_available is not True:
+                    invalid_reasons.append("builder_ability_unavailable")
+                if query.placement_query_status != "Success":
+                    invalid_reasons.append("placement_query_rejected")
+        return self.placement_service.authorize_authoritative_pre_dispatch_preflight(
+            request_id=request.request_id,
+            operation_id=request.operation_id,
+            operation_epoch=request.operation_epoch,
+            action_name=request.action_name,
+            actor=request.actor,
+            requested_arguments=request.requested_arguments,
+            opened_command_id=request.opened_command_id,
+            opened_attempt_id=request.opened_attempt_id,
+            opened_attempt_ordinal=request.opened_attempt_ordinal,
+            blocked_material_legality_identity=(request.blocked_material_legality_identity),
+            builder_tag=builder_tag,
+            ability_id=ability_id,
+            world_target=world_target,
+            target_state_revision=target_state_revision,
+            observation_revision=_placement_revision(observation),
+            observation_game_loop=_game_loop(observation),
+            invalid_evidence_reasons=tuple(dict.fromkeys(invalid_reasons)),
+        )
 
     def record_rejection(
         self,
@@ -576,21 +671,55 @@ class RawActionExecutor:
                     eligibility.failure_code,
                     eligibility.reason or eligibility.failure_code,
                 )
-            actor_tags, builder_state = _resolve_builder_tags(
-                command,
-                observation,
-                agents,
-                unit_names=self.unit_names,
-                leased_builder_tags=self.placement_service.leased_builder_tags,
-                owned_lease_builder_tags=tuple(
-                    tag
-                    for tag in self.placement_service.leased_builder_tags
-                    if self.placement_service.builder_lease_owner(tag) == command.command_id
-                ),
-                freshness_blocked_builder_tags=self._freshness_blocked_builders(
-                    _game_loop(observation)
-                ),
+            preflight_authorization = command.authoritative_build_preflight
+            required_builder_tag = (
+                None
+                if preflight_authorization is None
+                else _positive_int(preflight_authorization.get("builder_tag"))
             )
+            authorization_epoch = (
+                None
+                if preflight_authorization is None
+                else _nonnegative_int(preflight_authorization.get("operation_epoch"))
+            )
+            try:
+                actor_tags, builder_state = _resolve_builder_tags(
+                    command,
+                    observation,
+                    agents,
+                    unit_names=self.unit_names,
+                    leased_builder_tags=self.placement_service.leased_builder_tags,
+                    owned_lease_builder_tags=tuple(
+                        tag
+                        for tag in self.placement_service.leased_builder_tags
+                        if self.placement_service.builder_lease_owner(tag) == command.command_id
+                    ),
+                    freshness_blocked_builder_tags=self._freshness_blocked_builders(
+                        _game_loop(observation)
+                    ),
+                    required_builder_tag=required_builder_tag,
+                )
+            except _RawDispatchDeferral as error:
+                if preflight_authorization is None:
+                    raise
+                self.placement_service.consume_authoritative_pre_dispatch_authorization(
+                    authorization_id=str(preflight_authorization.get("authorization_id") or ""),
+                    request_id=str(preflight_authorization.get("request_id") or ""),
+                    operation_id=str(command.operation_id or ""),
+                    operation_epoch=(-1 if authorization_epoch is None else authorization_epoch),
+                    action_name=name,
+                    builder_tag=None,
+                    ability_id=None,
+                    world_target=None,
+                    target_state_revision=None,
+                    material_legality_identity=None,
+                    observation_game_loop=_game_loop(observation),
+                    authorization_claim=preflight_authorization,
+                )
+                raise _RawDispatchFailure(
+                    "authoritative_pre_dispatch_authorization_invalid",
+                    f"{name} authorized Builder is no longer dispatch-ready",
+                ) from error
             if name.endswith("_Screen") and (
                 command.placement_candidate_id is None or command.placement_revision is None
             ):
@@ -635,14 +764,65 @@ class RawActionExecutor:
                 world_target=pre_dispatch_target,
                 target_state_revision=pre_dispatch_target_state_revision,
             )
-            if command.operation_id is not None and not _authoritative_pre_dispatch_retry_allowed(
-                self.placement_service,
-                operation_id=command.operation_id,
-                builder_tag=builder_tag,
-                ability_id=ability_id,
-                world_target=pre_dispatch_target,
-                target_state_revision=pre_dispatch_target_state_revision,
-                material_legality_identity=pre_dispatch_material_identity,
+            authoritative_state = (
+                None
+                if command.operation_id is None
+                else self.placement_service.authoritative_pre_dispatch_state(command.operation_id)
+            )
+            if preflight_authorization is not None:
+                validated = self.placement_service.consume_authoritative_pre_dispatch_authorization(
+                    authorization_id=str(preflight_authorization.get("authorization_id") or ""),
+                    request_id=str(preflight_authorization.get("request_id") or ""),
+                    operation_id=str(command.operation_id or ""),
+                    operation_epoch=(-1 if authorization_epoch is None else authorization_epoch),
+                    action_name=name,
+                    builder_tag=builder_tag,
+                    ability_id=ability_id,
+                    world_target=pre_dispatch_target,
+                    target_state_revision=pre_dispatch_target_state_revision,
+                    material_legality_identity=pre_dispatch_material_identity,
+                    observation_game_loop=_game_loop(observation),
+                    authorization_claim=preflight_authorization,
+                    consume=False,
+                )
+                if validated.status != "validated":
+                    raise _RawDispatchFailure(
+                        "authoritative_pre_dispatch_authorization_invalid",
+                        f"{name} exact Raw preflight authorization is missing, "
+                        "stale, or mismatched",
+                    )
+            elif (
+                authoritative_state is not None
+                and authoritative_state.pending_authorization_id is not None
+            ):
+                self.placement_service.consume_authoritative_pre_dispatch_authorization(
+                    authorization_id=authoritative_state.pending_authorization_id,
+                    request_id="build-preflight:" + "0" * 64,
+                    operation_id=str(command.operation_id or ""),
+                    operation_epoch=0,
+                    action_name=name,
+                    builder_tag=builder_tag,
+                    ability_id=ability_id,
+                    world_target=pre_dispatch_target,
+                    target_state_revision=pre_dispatch_target_state_revision,
+                    material_legality_identity=pre_dispatch_material_identity,
+                    observation_game_loop=_game_loop(observation),
+                    authorization_claim=preflight_authorization,
+                )
+                raise _RawDispatchFailure(
+                    "authoritative_pre_dispatch_authorization_invalid",
+                    f"{name} omitted its pending exact Raw preflight authorization",
+                )
+            elif command.operation_id is not None and not (
+                _authoritative_pre_dispatch_retry_allowed(
+                    self.placement_service,
+                    operation_id=command.operation_id,
+                    builder_tag=builder_tag,
+                    ability_id=ability_id,
+                    world_target=pre_dispatch_target,
+                    target_state_revision=pre_dispatch_target_state_revision,
+                    material_legality_identity=pre_dispatch_material_identity,
+                )
             ):
                 decision = _record_authoritative_pre_dispatch_failure(
                     self.placement_service,
@@ -805,6 +985,31 @@ class RawActionExecutor:
                     approach_only=True,
                     approach_target=placement.world_target,
                 )
+            if preflight_authorization is not None:
+                consumed = self.placement_service.consume_authoritative_pre_dispatch_authorization(
+                    authorization_id=str(preflight_authorization.get("authorization_id") or ""),
+                    request_id=str(preflight_authorization.get("request_id") or ""),
+                    operation_id=str(command.operation_id or ""),
+                    operation_epoch=(-1 if authorization_epoch is None else authorization_epoch),
+                    action_name=name,
+                    builder_tag=builder_tag,
+                    ability_id=ability_id,
+                    world_target=pre_dispatch_target,
+                    target_state_revision=pre_dispatch_target_state_revision,
+                    material_legality_identity=pre_dispatch_material_identity,
+                    observation_game_loop=_game_loop(observation),
+                    authorization_claim=preflight_authorization,
+                )
+                if consumed.status != "consumed":
+                    self.placement_service.release_command(
+                        command.command_id,
+                        game_loop=_game_loop(observation),
+                        reason="authoritative_pre_dispatch_authorization_invalid",
+                    )
+                    raise _RawDispatchFailure(
+                        "authoritative_pre_dispatch_authorization_invalid",
+                        f"{name} exact Raw preflight authorization could not be consumed",
+                    )
             if self.placement_service.build_authorization_was_rejected(
                 operation_id=command.operation_id,
                 builder_tag=builder_tag,
@@ -1048,6 +1253,14 @@ class RawActionExecutor:
                 )
         if authorization.ability_id is None:
             authorization = replace(authorization, ability_id=int(ability_id))
+        if command.authoritative_build_preflight is not None:
+            authorization = replace(
+                authorization,
+                details={
+                    **dict(authorization.details),
+                    "authoritative_build_preflight": dict(command.authoritative_build_preflight),
+                },
+            )
         self.placement_service.record_build_authorization(
             command.command_id,
             ability_id=int(ability_id),
@@ -1212,8 +1425,28 @@ def _call_optional_service_method(method: Any, values: Mapping[str, Any]) -> Any
     return method(**accepted)
 
 
+def _positive_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _nonnegative_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 else None
+
+
 def _pre_dispatch_world_target(
-    command: RoutedCommand,
+    command: RoutedCommand | RoutedBuildPreflightRequest,
     observation: Any,
     action_name: str,
 ) -> tuple[float, float] | None:
@@ -1397,7 +1630,7 @@ def _record_authoritative_pre_dispatch_failure(
 
 
 def _resolve_builder_tags(
-    command: RoutedCommand,
+    command: RoutedCommand | RoutedBuildPreflightRequest,
     observation: Any,
     agents: Mapping[str, Any],
     *,
@@ -1405,6 +1638,7 @@ def _resolve_builder_tags(
     leased_builder_tags: Collection[int],
     owned_lease_builder_tags: Collection[int],
     freshness_blocked_builder_tags: Collection[int],
+    required_builder_tag: int | None = None,
 ) -> tuple[tuple[int, ...], list[dict[str, Any]]]:
     """Bind a build command to fresh, complete, idle workers in this snapshot."""
 
@@ -1512,6 +1746,14 @@ def _resolve_builder_tags(
             tag,
         )
     )
+    if required_builder_tag is not None:
+        if required_builder_tag in ready:
+            return (required_builder_tag,), state
+        raise _RawDispatchDeferral(
+            "builder_not_ready",
+            f"{command.name} authorized Builder {hex(required_builder_tag)} is not ready",
+            details={"builder_state": state},
+        )
     if ready:
         return (ready[0],), state
     raise _RawDispatchDeferral(

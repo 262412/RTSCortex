@@ -23,6 +23,8 @@ from rtscortex.contracts import (
     ActionBatch,
     ActionCommand,
     ActionSource,
+    AuthoritativeBuildPreflightRequest,
+    AuthoritativeBuildPreflightResult,
     AuthoritativePreDispatchEvidence,
     AvailableAction,
     EconomyState,
@@ -35,6 +37,7 @@ from rtscortex.contracts import (
     ProductionItem,
     SC2State,
     UnitState,
+    authoritative_build_preflight_authorization_id,
 )
 from rtscortex.cortex import (
     AttemptKey,
@@ -360,6 +363,57 @@ def _terminal_macro_observation(
 
 def _store(tmp_path: Path) -> EventStore:
     return EventStore(tmp_path / "events.sqlite3", tmp_path / "events.jsonl")
+
+
+def _record_authorized_build_preflight(
+    runtime: CortexRuntimeEngine,
+    request: AuthoritativeBuildPreflightRequest,
+    *,
+    builder_tag: int,
+    world_target: tuple[float, float] = (65.0, 90.0),
+    material_change_reason: str = "builder_changed",
+) -> AuthoritativeBuildPreflightResult:
+    values = request.model_dump(mode="json")
+    target_state_revision = "target-state:changed"
+    material_identity = f"build-legality:{'e' * 64}"
+    observation_revision = "raw-observation:changed"
+    expires_game_loop = int(values["observation_game_loop"]) + 112
+    authorization_id = authoritative_build_preflight_authorization_id(
+        request_id=values["request_id"],
+        operation_id=values["operation_id"],
+        operation_epoch=values["operation_epoch"],
+        action_name=values["action_name"],
+        builder_tag=builder_tag,
+        ability_id=881,
+        world_target=world_target,
+        target_state_revision=target_state_revision,
+        material_legality_identity=material_identity,
+        observation_revision=observation_revision,
+        observation_game_loop=values["observation_game_loop"],
+        expires_game_loop=expires_game_loop,
+    )
+    result = AuthoritativeBuildPreflightResult.model_validate(
+        {
+            **values,
+            "authorization_id": authorization_id,
+            "status": "authorized",
+            "authorized": True,
+            "reason": "authoritative_material_change",
+            "circuit_open": False,
+            "builder_tag": builder_tag,
+            "ability_id": 881,
+            "world_target": world_target,
+            "target_state_revision": target_state_revision,
+            "material_legality_identity": material_identity,
+            "observation_revision": observation_revision,
+            "observation_game_loop": values["observation_game_loop"],
+            "expires_game_loop": expires_game_loop,
+            "state_transition": "open_to_reset",
+            "material_change_reason": material_change_reason,
+        }
+    )
+    runtime.record_authoritative_build_preflight(result)
+    return result
 
 
 def test_runtime_persists_exact_formal_runner_identity_once(
@@ -1701,12 +1755,23 @@ def test_authoritative_build_circuit_reopens_on_explicit_builder_rebind(
         }
     )
     runtime._current_situation = DeterministicSituationAnalyzer().assess(changed)
+    runtime._episode_key = (changed.run_id, changed.episode_id)
 
+    rebound_intent = intent.model_copy(update={"step_id": 2, "created_game_loop": 48})
     prepared = runtime._compile_intent(
         changed,
-        intent.model_copy(update={"step_id": 2, "created_game_loop": 48}),
+        rebound_intent,
     )
+    assert prepared is None
+    request = runtime._authoritative_build_preflight_outbound[-1]
+    authorization = _record_authorized_build_preflight(
+        runtime,
+        request,
+        builder_tag=0xB,
+    )
+    prepared = runtime._compile_intent(changed, rebound_intent)
     assert prepared is not None
+    assert prepared.command.authoritative_build_preflight == authorization
     assert strategic.operation_id not in runtime._authoritative_build_pre_dispatch_circuits
     resets = runtime.store.events_of_type(
         observation.run_id,
@@ -1714,7 +1779,7 @@ def test_authoritative_build_circuit_reopens_on_explicit_builder_rebind(
         "authoritative_build_pre_dispatch_circuit_reset",
     )
     assert len(resets) == 1
-    assert resets[0].payload["reason"] == "semantic_legality_material_change"
+    assert resets[0].payload["reason"] == "raw_preflight_authorized"
     asyncio.run(runtime.close())
 
 
@@ -1789,13 +1854,24 @@ def test_authoritative_build_circuit_reopens_when_exact_target_obstruction_clear
     )
     cleared = base.model_copy(update={"step_id": 2, "game_loop": 48})
     runtime._current_situation = DeterministicSituationAnalyzer().assess(cleared)
+    runtime._episode_key = (cleared.run_id, cleared.episode_id)
 
+    cleared_intent = intent.model_copy(update={"step_id": 2, "created_game_loop": 48})
     prepared = runtime._compile_intent(
         cleared,
-        intent.model_copy(update={"step_id": 2, "created_game_loop": 48}),
+        cleared_intent,
     )
-
+    assert prepared is None
+    request = runtime._authoritative_build_preflight_outbound[-1]
+    authorization = _record_authorized_build_preflight(
+        runtime,
+        request,
+        builder_tag=0xA,
+        material_change_reason="target_state_changed",
+    )
+    prepared = runtime._compile_intent(cleared, cleared_intent)
     assert prepared is not None
+    assert prepared.command.authoritative_build_preflight == authorization
     assert strategic.operation_id not in runtime._authoritative_build_pre_dispatch_circuits
     resets = runtime.store.events_of_type(
         base.run_id,
@@ -1803,7 +1879,7 @@ def test_authoritative_build_circuit_reopens_when_exact_target_obstruction_clear
         "authoritative_build_pre_dispatch_circuit_reset",
     )
     assert len(resets) == 1
-    assert resets[0].payload["reason"] == "semantic_legality_material_change"
+    assert resets[0].payload["reason"] == "raw_preflight_authorized"
     asyncio.run(runtime.close())
 
 

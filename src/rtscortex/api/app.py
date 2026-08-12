@@ -14,6 +14,7 @@ from rtscortex.console.models import FrameKind
 from rtscortex.contracts import (
     CURRENT_PROTOCOL_VERSION,
     ActionBatch,
+    AuthoritativeBuildPreflightResult,
     EpisodeResult,
     ExecutionReport,
     ObservationEnvelope,
@@ -71,6 +72,17 @@ def create_app(
     async def execution(report: ExecutionReport) -> dict[str, str]:
         _require_current_protocol(report.protocol_version)
         engine.record_execution(report)
+        return {"status": "recorded"}
+
+    @app.post("/v1/build/preflight")
+    async def authoritative_build_preflight(
+        result: AuthoritativeBuildPreflightResult,
+    ) -> dict[str, str]:
+        _require_current_protocol(result.protocol_version)
+        try:
+            engine.record_authoritative_build_preflight(result)
+        except RuntimeError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
         return {"status": "recorded"}
 
     @app.post("/v1/placement/transition")

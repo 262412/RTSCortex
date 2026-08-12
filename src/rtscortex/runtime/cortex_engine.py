@@ -20,18 +20,22 @@ from rtscortex.contracts import (
     ActionBatch,
     ActionCommand,
     ActionSource,
+    AuthoritativeBuildPreflightRequest,
+    AuthoritativeBuildPreflightResult,
     EpisodeResult,
     ExecutionReport,
     ExecutionStatus,
     IdleReason,
     ObservationEnvelope,
     PlacementLedgerEvent,
+    authoritative_build_preflight_request_id,
 )
 from rtscortex.contracts.interfaces import LLMProvider
 from rtscortex.cortex import (
     AttemptKey,
     AuthoritativeBuildCircuitState,
     CandidateCompiler,
+    CandidateSelection,
     CandidateSelectionStatus,
     CommandLineage,
     CortexRole,
@@ -66,6 +70,7 @@ from rtscortex.cortex import (
     is_terminal_collapse,
     macro_goal_spec,
     macro_plan_from_hima,
+    observation_fingerprint,
     runtime_frontier,
     townhall_recovery_runtime_actions,
 )
@@ -257,6 +262,15 @@ class _PreparedCommand:
 
 
 @dataclass(frozen=True)
+class _AuthorizedBuildPreflightCompile:
+    """One silent candidate selection already authorized by exact Raw identity."""
+
+    context: FastExecutorContext
+    selection: CandidateSelection
+    authorization: AuthoritativeBuildPreflightResult
+
+
+@dataclass(frozen=True)
 class _TerminalCollapseMacroHold:
     plan_id: str
     townhall_recovery_availability_signature: tuple[str, ...]
@@ -406,6 +420,22 @@ class CortexRuntimeEngine(RuntimeEngine):
             AuthoritativeBuildCircuitState,
         ] = {}
         self._authoritative_build_pre_dispatch_defer_signatures: set[tuple[str, str | None]] = set()
+        self._authoritative_build_preflight_requests: dict[
+            str,
+            AuthoritativeBuildPreflightRequest,
+        ] = {}
+        self._authoritative_build_preflight_results: dict[
+            str,
+            AuthoritativeBuildPreflightResult,
+        ] = {}
+        self._authoritative_build_preflight_request_signatures: set[tuple[str, str, str, str]] = (
+            set()
+        )
+        self._authoritative_build_preflight_outbound: list[AuthoritativeBuildPreflightRequest] = []
+        self._authorized_build_preflight_compiles: dict[
+            str,
+            _AuthorizedBuildPreflightCompile,
+        ] = {}
 
     async def start(self) -> None:
         """Load and validate the configured specialist before SC2 starts."""
@@ -433,6 +463,8 @@ class CortexRuntimeEngine(RuntimeEngine):
         await self._activate_episode(observation)
         self._strategic_by_legacy_intent = {}
         self._pending_strategic_arbitration = None
+        self._authoritative_build_preflight_outbound = []
+        self._authorized_build_preflight_compiles = {}
         self.store.append_event(
             run_id=observation.run_id,
             episode_id=observation.episode_id,
@@ -733,6 +765,7 @@ class CortexRuntimeEngine(RuntimeEngine):
             planner_pending=self._macro_task is not None,
             idle_reason=idle_reason,
             commands=accepted_commands,
+            authoritative_build_preflight_requests=(self._authoritative_build_preflight_outbound),
             rejected_commands=rejected_commands,
         )
         self.store.append_event(
@@ -1088,6 +1121,11 @@ class CortexRuntimeEngine(RuntimeEngine):
         self._raw_build_material_tombstone_circuits = set()
         self._authoritative_build_pre_dispatch_circuits = {}
         self._authoritative_build_pre_dispatch_defer_signatures = set()
+        self._authoritative_build_preflight_requests = {}
+        self._authoritative_build_preflight_results = {}
+        self._authoritative_build_preflight_request_signatures = set()
+        self._authoritative_build_preflight_outbound = []
+        self._authorized_build_preflight_compiles = {}
         self._restore_consumed_canary_fixture_rules(observation)
         self._recover_cortex_episode(observation)
         if (
@@ -3081,6 +3119,8 @@ class CortexRuntimeEngine(RuntimeEngine):
         if self._authoritative_build_pre_dispatch_blocks(
             observation,
             strategic_intent,
+            legacy_intent=intent,
+            goal_progress=goal_progress,
         ):
             operation_id = strategic_intent.operation_id
             assert operation_id is not None
@@ -3169,11 +3209,6 @@ class CortexRuntimeEngine(RuntimeEngine):
                 "intent": strategic_intent.model_dump(mode="json"),
             },
         )
-        busy_actors = tuple(
-            lifecycle.command.actor
-            for lifecycle in self._command_states.values()
-            if lifecycle.status is CommandStatus.DISPATCHED
-        )
         self._record_cortex_event(
             observation,
             "intent_emitted",
@@ -3184,19 +3219,22 @@ class CortexRuntimeEngine(RuntimeEngine):
                 "action_name": intent.action_names[0],
             },
         )
-        active_snapshot = self._active_plan_snapshot()
-        context = self._candidate_compiler.compile(
-            observation,
-            intent,
-            goal_progress=goal_progress,
-            busy_actors=busy_actors,
-            recent_commands=() if active_snapshot is None else active_snapshot.commands,
+        authorized_compile = self._authorized_build_preflight_compiles.pop(
+            intent.intent_id,
+            None,
         )
-        context = self._guard_candidate_context(
-            observation,
-            strategic_intent,
-            context,
-        )
+        if authorized_compile is None:
+            context, selection = self._compile_candidate_selection(
+                observation,
+                intent,
+                strategic_intent,
+                goal_progress=goal_progress,
+            )
+            authorization = None
+        else:
+            context = authorized_compile.context
+            selection = authorized_compile.selection
+            authorization = authorized_compile.authorization
         self._record_cortex_event(
             observation,
             "candidate_set_built",
@@ -3209,7 +3247,6 @@ class CortexRuntimeEngine(RuntimeEngine):
                 ],
             },
         )
-        selection = self._executor.select(context)
         self._record_cortex_event(
             observation,
             "executor_selection",
@@ -3253,6 +3290,7 @@ class CortexRuntimeEngine(RuntimeEngine):
             command = command.model_copy(
                 update={
                     "operation_id": strategic_intent.operation_id,
+                    "authoritative_build_preflight": authorization,
                 }
             )
         assert selection.candidate_id is not None
@@ -3282,6 +3320,36 @@ class CortexRuntimeEngine(RuntimeEngine):
             semantic_action=semantic_action,
             macro_step_ordinal=macro_step_ordinal,
         )
+
+    def _compile_candidate_selection(
+        self,
+        observation: ObservationEnvelope,
+        intent: MacroIntent | TacticalIntent | ReflexIntent,
+        strategic_intent: StrategicIntent,
+        *,
+        goal_progress: GoalProgressReport | None,
+    ) -> tuple[FastExecutorContext, CandidateSelection]:
+        """Compile and select without emitting candidate or command lineage events."""
+
+        busy_actors = tuple(
+            lifecycle.command.actor
+            for lifecycle in self._command_states.values()
+            if lifecycle.status is CommandStatus.DISPATCHED
+        )
+        active_snapshot = self._active_plan_snapshot()
+        context = self._candidate_compiler.compile(
+            observation,
+            intent,
+            goal_progress=goal_progress,
+            busy_actors=busy_actors,
+            recent_commands=() if active_snapshot is None else active_snapshot.commands,
+        )
+        context = self._guard_candidate_context(
+            observation,
+            strategic_intent,
+            context,
+        )
+        return context, self._executor.select(context)
 
     def _bind_dispatch_attempt(self, prepared: _PreparedCommand) -> _PreparedCommand:
         operation_id = prepared.lineage.operation_id
@@ -3884,6 +3952,11 @@ class CortexRuntimeEngine(RuntimeEngine):
                 "macro_step_ordinal": prepared.macro_step_ordinal,
                 "terminal_collapse": terminal_collapse,
                 "townhall_recovery": townhall_recovery,
+                "authoritative_build_preflight": (
+                    None
+                    if prepared.command.authoritative_build_preflight is None
+                    else prepared.command.authoritative_build_preflight.model_dump(mode="json")
+                ),
             },
         )
 
@@ -4067,6 +4140,9 @@ class CortexRuntimeEngine(RuntimeEngine):
         self,
         observation: ObservationEnvelope,
         intent: StrategicIntent,
+        *,
+        legacy_intent: MacroIntent | TacticalIntent | ReflexIntent,
+        goal_progress: GoalProgressReport | None,
     ) -> bool:
         operation_id = intent.operation_id
         if operation_id is None or not any(
@@ -4076,65 +4152,225 @@ class CortexRuntimeEngine(RuntimeEngine):
         state = self._authoritative_build_pre_dispatch_circuits.get(operation_id)
         if state is None or not state.circuit_open:
             return False
-        if not state.material_evidence_valid:
-            return True
-        current_identity, invalid_reasons, bound_builder_tag = (
-            self._semantic_build_material_evidence(
-                observation,
-                intent,
-                world_target=state.world_target,
-                builder_tag=state.builder_tag,
-                ability_id=state.ability_id,
+        authorization = self._authoritative_build_preflight_results.get(operation_id)
+        current_identity: str | None = None
+        invalid_reasons: tuple[str, ...] = ()
+        bound_builder_tag: int | None = None
+        if authorization is None:
+            if not state.material_evidence_valid:
+                return True
+            current_identity, invalid_reasons, bound_builder_tag = (
+                self._semantic_build_material_evidence(
+                    observation,
+                    intent,
+                    world_target=state.world_target,
+                    builder_tag=state.builder_tag,
+                    ability_id=state.ability_id,
+                )
             )
+            if current_identity is None:
+                signature = (operation_id, None)
+                if signature not in self._authoritative_build_pre_dispatch_defer_signatures:
+                    self._authoritative_build_pre_dispatch_defer_signatures.add(signature)
+                    self._record_cortex_event(
+                        observation,
+                        "authoritative_build_pre_dispatch_invalid_evidence",
+                        {
+                            "operation_id": operation_id,
+                            "action_name": state.action_name,
+                            "reason": "current_material_evidence_invalid",
+                            "invalid_evidence_reasons": list(invalid_reasons),
+                            "builder_tag": state.builder_tag,
+                            "bound_builder_tag": bound_builder_tag,
+                            "ability_id": state.ability_id,
+                            "world_target": state.world_target,
+                            "circuit_open": True,
+                        },
+                    )
+                return True
+            if current_identity == state.blocked_semantic_material_identity:
+                return True
+
+        context, selection = self._compile_candidate_selection(
+            observation,
+            legacy_intent,
+            intent,
+            goal_progress=goal_progress,
         )
-        if current_identity is None:
-            signature = (operation_id, None)
-            if signature not in self._authoritative_build_pre_dispatch_defer_signatures:
-                self._authoritative_build_pre_dispatch_defer_signatures.add(signature)
+        if selection.status is CandidateSelectionStatus.ABSTAINED:
+            return True
+        candidate = next(
+            (item for item in context.candidates if item.candidate_id == selection.candidate_id),
+            None,
+        )
+        if candidate is None or candidate.action_name != state.action_name:
+            return True
+
+        request = self._authoritative_build_preflight_requests.get(operation_id)
+        if authorization is not None:
+            authorization_matches = bool(
+                request is not None
+                and authorization.request_id == request.request_id
+                and authorization.authorized
+                and authorization.operation_id == operation_id
+                and authorization.operation_epoch == request.operation_epoch
+                and authorization.action_name == candidate.action_name
+                and authorization.actor == candidate.actor
+                and authorization.requested_arguments == candidate.arguments
+                and authorization.opened_command_id == state.opened_command_id
+                and authorization.opened_attempt_ordinal == state.opened_attempt_ordinal
+                and authorization.blocked_material_legality_identity
+                == state.material_legality_identity
+                and authorization.expires_game_loop is not None
+                and observation.game_loop <= authorization.expires_game_loop
+            )
+            if authorization_matches:
+                self._authoritative_build_pre_dispatch_circuits.pop(operation_id, None)
+                self._authoritative_build_preflight_requests.pop(operation_id, None)
+                self._authoritative_build_preflight_results.pop(operation_id, None)
+                self._authoritative_build_pre_dispatch_defer_signatures = {
+                    key
+                    for key in self._authoritative_build_pre_dispatch_defer_signatures
+                    if key[0] != operation_id
+                }
+                self._authoritative_build_preflight_request_signatures = {
+                    key
+                    for key in self._authoritative_build_preflight_request_signatures
+                    if key[0] != operation_id
+                }
+                self._authorized_build_preflight_compiles[legacy_intent.intent_id] = (
+                    _AuthorizedBuildPreflightCompile(
+                        context=context,
+                        selection=selection,
+                        authorization=authorization,
+                    )
+                )
                 self._record_cortex_event(
                     observation,
-                    "authoritative_build_pre_dispatch_invalid_evidence",
+                    "authoritative_build_pre_dispatch_circuit_reset",
                     {
                         "operation_id": operation_id,
+                        "operation_epoch": authorization.operation_epoch,
                         "action_name": state.action_name,
-                        "reason": "current_material_evidence_invalid",
-                        "invalid_evidence_reasons": list(invalid_reasons),
-                        "builder_tag": state.builder_tag,
-                        "bound_builder_tag": bound_builder_tag,
-                        "ability_id": state.ability_id,
-                        "world_target": state.world_target,
-                        "circuit_open": True,
+                        "reason": "raw_preflight_authorized",
+                        "state_transition": "open_to_reset",
+                        "authorization_id": authorization.authorization_id,
+                        "request_id": authorization.request_id,
+                        "opened_command_id": state.opened_command_id,
+                        "opened_attempt_id": authorization.opened_attempt_id,
+                        "opened_attempt_ordinal": state.opened_attempt_ordinal,
+                        "blocked_material_legality_identity": (state.material_legality_identity),
+                        "builder_tag": authorization.builder_tag,
+                        "ability_id": authorization.ability_id,
+                        "world_target": authorization.world_target,
+                        "target_state_revision": authorization.target_state_revision,
+                        "material_legality_identity": (authorization.material_legality_identity),
+                        "observation_revision": authorization.observation_revision,
+                        "authorization_game_loop": (authorization.observation_game_loop),
+                        "expires_game_loop": authorization.expires_game_loop,
+                        "material_change_reason": authorization.material_change_reason,
+                        "reset_from_streak": state.streak,
                     },
                 )
+                return False
+            self._record_cortex_event(
+                observation,
+                "authoritative_build_pre_dispatch_invalid_evidence",
+                {
+                    "operation_id": operation_id,
+                    "action_name": state.action_name,
+                    "reason": "authorization_candidate_mismatch_or_expired",
+                    "authorization_id": authorization.authorization_id,
+                    "request_id": authorization.request_id,
+                    "candidate_action_name": candidate.action_name,
+                    "candidate_actor": candidate.actor,
+                    "candidate_arguments": candidate.arguments,
+                    "current_game_loop": observation.game_loop,
+                    "expires_game_loop": authorization.expires_game_loop,
+                    "circuit_open": True,
+                },
+            )
+            self._authoritative_build_preflight_results.pop(operation_id, None)
+            self._authoritative_build_preflight_requests.pop(operation_id, None)
+            self._authoritative_build_preflight_request_signatures = {
+                key
+                for key in self._authoritative_build_preflight_request_signatures
+                if key[0] != operation_id
+            }
+
+        if (
+            state.opened_command_id is None
+            or state.opened_attempt_ordinal is None
+            or state.material_legality_identity is None
+        ):
             return True
-        if current_identity == state.blocked_semantic_material_identity:
+        opened_attempt_id = AttemptKey(
+            operation_id=operation_id,
+            command_id=state.opened_command_id,
+            attempt_ordinal=state.opened_attempt_ordinal,
+        ).attempt_id
+        candidate_signature = json.dumps(
+            {
+                "action_name": candidate.action_name,
+                "actor": candidate.actor,
+                "arguments": candidate.arguments,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        request_signature = (
+            operation_id,
+            current_identity or "authorization-invalidated",
+            candidate.action_name,
+            candidate_signature,
+        )
+        if request_signature in self._authoritative_build_preflight_request_signatures:
             return True
-        self._authoritative_build_pre_dispatch_circuits.pop(operation_id, None)
-        self._authoritative_build_pre_dispatch_defer_signatures = {
-            key
-            for key in self._authoritative_build_pre_dispatch_defer_signatures
-            if key[0] != operation_id
-        }
+        revision = observation_fingerprint(observation)
+        request_id = authoritative_build_preflight_request_id(
+            operation_id=operation_id,
+            operation_epoch=0,
+            action_name=candidate.action_name,
+            actor=candidate.actor,
+            requested_arguments=candidate.arguments,
+            opened_command_id=state.opened_command_id,
+            opened_attempt_id=opened_attempt_id,
+            opened_attempt_ordinal=state.opened_attempt_ordinal,
+            blocked_material_legality_identity=state.material_legality_identity,
+            observation_revision=revision,
+            observation_game_loop=observation.game_loop,
+        )
+        preflight = AuthoritativeBuildPreflightRequest(
+            request_id=request_id,
+            run_id=observation.run_id,
+            episode_id=observation.episode_id,
+            step_id=observation.step_id,
+            operation_id=operation_id,
+            operation_epoch=0,
+            action_name=candidate.action_name,
+            actor=candidate.actor,
+            requested_arguments=candidate.arguments,
+            opened_command_id=state.opened_command_id,
+            opened_attempt_id=opened_attempt_id,
+            opened_attempt_ordinal=state.opened_attempt_ordinal,
+            blocked_material_legality_identity=state.material_legality_identity,
+            observation_revision=revision,
+            observation_game_loop=observation.game_loop,
+        )
+        self._authoritative_build_preflight_request_signatures.add(request_signature)
+        self._authoritative_build_preflight_requests[operation_id] = preflight
+        self._authoritative_build_preflight_outbound.append(preflight)
         self._record_cortex_event(
             observation,
-            "authoritative_build_pre_dispatch_circuit_reset",
+            "authoritative_build_pre_dispatch_preflight_requested",
             {
-                "operation_id": operation_id,
-                "action_name": state.action_name,
-                "reason": "semantic_legality_material_change",
-                "previous_semantic_material_identity": (state.blocked_semantic_material_identity),
-                "current_semantic_material_identity": current_identity,
-                "raw_material_legality_identity": state.material_legality_identity,
-                "previous_builder_tag": state.builder_tag,
-                "bound_builder_tag": bound_builder_tag,
-                "ability_id": state.ability_id,
-                "world_target": state.world_target,
-                "game_loop": observation.game_loop,
-                "operation_epoch_changed": False,
-                "reset_from_streak": state.streak,
+                "request": preflight.model_dump(mode="json"),
+                "semantic_material_hint": current_identity,
+                "bound_builder_hint": bound_builder_tag,
+                "side_effect_free": True,
             },
         )
-        return False
+        return True
 
     @staticmethod
     def _optional_builder_tag(value: Any) -> int | None:
@@ -4341,21 +4577,16 @@ class CortexRuntimeEngine(RuntimeEngine):
                 )
                 if status == "reset" or state_transition == "open_to_reset":
                     existing = self._authoritative_build_pre_dispatch_circuits.get(operation_id)
-                    reset_reason = authoritative.get("reset_reason")
                     reset_valid = existing is not None and (
                         self._authoritative_success_reset_is_valid(
                             authoritative=authoritative,
                             transition=transition,
                         )
-                        or reset_reason == "material_state_changed"
-                        and self._authoritative_material_reset_is_valid(
-                            state=existing,
-                            authoritative=authoritative,
-                            latest=latest,
-                        )
                     )
                     if reset_valid and not invalid_reasons:
                         self._authoritative_build_pre_dispatch_circuits.pop(operation_id, None)
+                        self._authoritative_build_preflight_requests.pop(operation_id, None)
+                        self._authoritative_build_preflight_results.pop(operation_id, None)
                         self._authoritative_build_pre_dispatch_defer_signatures = {
                             key
                             for key in self._authoritative_build_pre_dispatch_defer_signatures
@@ -4386,6 +4617,13 @@ class CortexRuntimeEngine(RuntimeEngine):
                         # authoritative failure or replacement baseline.
                         pass
                     else:
+                        self._authoritative_build_preflight_requests.pop(operation_id, None)
+                        self._authoritative_build_preflight_results.pop(operation_id, None)
+                        self._authoritative_build_preflight_request_signatures = {
+                            key
+                            for key in self._authoritative_build_preflight_request_signatures
+                            if key[0] != operation_id
+                        }
                         action_value = authoritative.get("action_name")
                         action_name = (
                             action_value
@@ -4519,6 +4757,71 @@ class CortexRuntimeEngine(RuntimeEngine):
         if no_start.get("circuit_open") is True:
             self._raw_build_material_tombstone_circuits.add(operation_id)
 
+    def record_authoritative_build_preflight(
+        self,
+        result: AuthoritativeBuildPreflightResult,
+    ) -> None:
+        """Accept Raw authorization only for the exact still-open Core generation."""
+
+        request = self._authoritative_build_preflight_requests.get(result.operation_id)
+        state = self._authoritative_build_pre_dispatch_circuits.get(result.operation_id)
+        reasons: list[str] = []
+        if self._episode_key != (result.run_id, result.episode_id):
+            reasons.append("episode_identity_mismatch")
+        if request is None:
+            reasons.append("preflight_request_missing")
+        elif result.request_id != request.request_id:
+            reasons.append("preflight_request_mismatch")
+        if state is None or not state.circuit_open:
+            reasons.append("core_circuit_not_open")
+        else:
+            if result.action_name != state.action_name:
+                reasons.append("open_action_mismatch")
+            if result.opened_command_id != state.opened_command_id:
+                reasons.append("open_command_mismatch")
+            if result.opened_attempt_ordinal != state.opened_attempt_ordinal:
+                reasons.append("open_attempt_mismatch")
+            if result.blocked_material_legality_identity != state.material_legality_identity:
+                reasons.append("blocked_material_identity_mismatch")
+        if request is not None:
+            if result.operation_epoch != request.operation_epoch:
+                reasons.append("operation_epoch_mismatch")
+            if result.action_name != request.action_name:
+                reasons.append("request_action_mismatch")
+            if result.actor != request.actor:
+                reasons.append("request_actor_mismatch")
+            if result.requested_arguments != request.requested_arguments:
+                reasons.append("request_arguments_mismatch")
+            if result.opened_attempt_id != request.opened_attempt_id:
+                reasons.append("request_attempt_identity_mismatch")
+        if result.operation_id in self._authoritative_build_preflight_results:
+            reasons.append("preflight_result_replayed")
+        accepted = not reasons
+        self.store.append_event(
+            run_id=result.run_id,
+            episode_id=result.episode_id,
+            step_id=result.step_id,
+            event_type="authoritative_build_pre_dispatch_preflight",
+            payload={
+                "result": result.model_dump(mode="json"),
+                "accepted_by_core": accepted,
+                "invalid_evidence_reasons": reasons,
+            },
+        )
+        if not accepted:
+            if request is not None and request.request_id == result.request_id:
+                self._authoritative_build_preflight_requests.pop(result.operation_id, None)
+                self._authoritative_build_preflight_request_signatures = {
+                    key
+                    for key in self._authoritative_build_preflight_request_signatures
+                    if key[0] != result.operation_id
+                }
+            return
+        if result.authorized:
+            self._authoritative_build_preflight_results[result.operation_id] = result
+        else:
+            self._authoritative_build_preflight_requests.pop(result.operation_id, None)
+
     def record_placement_transition(
         self,
         event: PlacementLedgerEvent,
@@ -4557,6 +4860,13 @@ class CortexRuntimeEngine(RuntimeEngine):
         if self._execution_confirms_authoritative_build_reset(report):
             assert report.operation_id is not None
             self._authoritative_build_pre_dispatch_circuits.pop(report.operation_id, None)
+            self._authoritative_build_preflight_requests.pop(report.operation_id, None)
+            self._authoritative_build_preflight_results.pop(report.operation_id, None)
+            self._authoritative_build_preflight_request_signatures = {
+                key
+                for key in self._authoritative_build_preflight_request_signatures
+                if key[0] != report.operation_id
+            }
             self._authoritative_build_pre_dispatch_defer_signatures = {
                 key
                 for key in self._authoritative_build_pre_dispatch_defer_signatures

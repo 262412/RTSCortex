@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NoReturn
 
-from rtscortex_llm_pysc2.routing import RoutedCommand
+from rtscortex_llm_pysc2.routing import RoutedBuildPreflightRequest, RoutedCommand
 
 _OPERATION_ID = re.compile(r"operation:[0-9a-f]{64}\Z")
 _ATTEMPT_ID = re.compile(r"attempt:[0-9a-f]{64}\Z")
@@ -79,6 +79,7 @@ class AuthoritativeBuildCircuitCanary:
         self.current_command: RoutedCommand | None = None
         self.current_revision: str | None = None
         self.final_command_id: str | None = None
+        self.preflight_authorization_id: str | None = None
         self._last_attempt_ordinal: int | None = None
         self._hold_pending = False
         self._event_index = 0
@@ -122,6 +123,7 @@ class AuthoritativeBuildCircuitCanary:
         self,
         commands: Sequence[RoutedCommand],
         *,
+        preflight_results: Sequence[tuple[RoutedBuildPreflightRequest, Mapping[str, Any]]] = (),
         idle_reason: str | None,
         planner_pending: bool | None,
         game_loop: int,
@@ -225,6 +227,67 @@ class AuthoritativeBuildCircuitCanary:
             return CanaryRuntimeDecision(core_defer_observed=True)
 
         if self.phase == "awaiting_reset_command":
+            if preflight_results:
+                if len(preflight_results) != 1 or commands:
+                    self._fail(
+                        "preflight_not_side_effect_free",
+                        game_loop,
+                        observation_revision,
+                    )
+                if reservation_count or leased_builder_tags or effect_inflight_count:
+                    self._fail(
+                        "preflight_execution_ownership_not_empty",
+                        game_loop,
+                        observation_revision,
+                    )
+                request, result = preflight_results[0]
+                if (
+                    request.operation_id != self.operation_id
+                    or request.action_name != _RUNTIME_ACTION
+                    or request.opened_attempt_ordinal != 2
+                    or result.get("request_id") != request.request_id
+                    or result.get("operation_id") != self.operation_id
+                    or result.get("action_name") != _RUNTIME_ACTION
+                    or result.get("authorized") is not True
+                    or result.get("state_transition") != "open_to_reset"
+                    or _tag(result.get("builder_tag")) != self.replacement_builder_tag
+                    or not isinstance(result.get("authorization_id"), str)
+                ):
+                    self._fail(
+                        "preflight_authorization_identity_invalid",
+                        game_loop,
+                        observation_revision,
+                    )
+                raw_state = self._state_dict(authoritative_state)
+                if (
+                    int(raw_state.get("streak", -1)) != 0
+                    or raw_state.get("circuit_open") is not False
+                    or raw_state.get("pending_authorization_id") != result.get("authorization_id")
+                ):
+                    self._fail(
+                        "preflight_raw_reset_not_atomic",
+                        game_loop,
+                        observation_revision,
+                    )
+                self.preflight_authorization_id = str(result["authorization_id"])
+                self._write(
+                    "preflight_authorized",
+                    game_loop=game_loop,
+                    observation_revision=observation_revision,
+                    reason="raw_exact_identity_open_to_reset",
+                    builder_tag=self.initial_builder_tag,
+                    replacement_builder_tag=self.replacement_builder_tag,
+                    request_id=request.request_id,
+                    authorization_id=self.preflight_authorization_id,
+                    preflight_request={**request.__dict__},
+                    preflight_result=dict(result),
+                    authoritative_state=raw_state,
+                    command_count=0,
+                    reservation_count=reservation_count,
+                    leased_builder_tags=[],
+                    effect_inflight_count=effect_inflight_count,
+                )
+                return CanaryRuntimeDecision(core_defer_observed=True)
             if not build_commands:
                 return CanaryRuntimeDecision()
             if len(commands) != 1:
@@ -235,12 +298,24 @@ class AuthoritativeBuildCircuitCanary:
                 )
             raw_state = self._state_dict(authoritative_state)
             if (
-                int(raw_state.get("streak", -1)) != self.failure_attempts
+                int(raw_state.get("streak", -1)) != 0
                 or int(raw_state.get("threshold", -1)) != self.failure_attempts
-                or raw_state.get("circuit_open") is not True
+                or raw_state.get("circuit_open") is not False
+                or raw_state.get("pending_authorization_id") != self.preflight_authorization_id
             ):
-                self._fail("reset_command_raw_circuit_not_open", game_loop, observation_revision)
+                self._fail(
+                    "reset_command_raw_authorization_missing",
+                    game_loop,
+                    observation_revision,
+                )
             command = build_commands[0]
+            command_authorization = command.authoritative_build_preflight
+            if (
+                not isinstance(command_authorization, Mapping)
+                or command_authorization.get("authorization_id") != self.preflight_authorization_id
+                or _tag(command_authorization.get("builder_tag")) != self.replacement_builder_tag
+            ):
+                self._fail("reset_command_authorization_mismatch", game_loop, observation_revision)
             self._bind_command(command, builder_tag=builder_tag, require_replacement=True)
             self.current_command = command
             self.final_command_id = command.command_id
@@ -252,7 +327,9 @@ class AuthoritativeBuildCircuitCanary:
                 command=command,
                 builder_tag=builder_tag,
                 replacement_builder_tag=self.replacement_builder_tag,
-                reason="validated_builder_material_change",
+                reason="raw_preflight_authorized",
+                authorization_id=self.preflight_authorization_id,
+                authoritative_build_preflight=dict(command_authorization),
                 command_count=len(commands),
                 idle_reason=idle_reason,
                 authoritative_state=raw_state,
@@ -329,11 +406,16 @@ class AuthoritativeBuildCircuitCanary:
             self._fail("reset_dispatch_builder_mismatch", game_loop, observation_revision)
         raw_state = self._state_dict(authoritative_state)
         if (
-            int(raw_state.get("streak", -1)) != self.failure_attempts
+            int(raw_state.get("streak", -1)) != 0
             or int(raw_state.get("threshold", -1)) != self.failure_attempts
-            or raw_state.get("circuit_open") is not True
+            or raw_state.get("circuit_open") is not False
+            or raw_state.get("pending_authorization_id") is not None
         ):
-            self._fail("reset_dispatch_raw_circuit_not_open", game_loop, observation_revision)
+            self._fail(
+                "reset_dispatch_raw_authorization_not_consumed",
+                game_loop,
+                observation_revision,
+            )
         if (
             reservation_count != 1
             or tuple(int(tag) for tag in leased_builder_tags) != (self.replacement_builder_tag,)

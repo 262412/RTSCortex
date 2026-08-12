@@ -208,6 +208,13 @@ class RuntimeClient:
         response = self.client.post("/v1/execution", json=report)
         response.raise_for_status()
 
+    def authoritative_build_preflight(self, result: dict[str, Any]) -> None:
+        response = self.client.post(
+            "/v1/build/preflight",
+            json=result,
+        )
+        response.raise_for_status()
+
     def placement_transition(self, event: dict[str, Any]) -> None:
         if self._placement_outbox is None:
             self._deliver_placement_transition(event)

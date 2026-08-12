@@ -21,6 +21,8 @@ from rtscortex.contracts.models import (
     ActionBatch,
     ActionCommand,
     ActionSource,
+    AuthoritativeBuildPreflightRequest,
+    AuthoritativeBuildPreflightResult,
     AuthoritativePreDispatchEvidence,
     AvailableAction,
     EconomyState,
@@ -41,6 +43,8 @@ from rtscortex.contracts.models import (
     ProtocolVersion,
     SC2State,
     UnitState,
+    authoritative_build_preflight_authorization_id,
+    authoritative_build_preflight_request_id,
 )
 
 __all__ = [
@@ -49,6 +53,8 @@ __all__ = [
     "ActionBatch",
     "ActionCommand",
     "ActionSource",
+    "AuthoritativeBuildPreflightRequest",
+    "AuthoritativeBuildPreflightResult",
     "AuthoritativePreDispatchEvidence",
     "ActivePlanSnapshot",
     "AgentContext",
@@ -82,4 +88,6 @@ __all__ = [
     "SC2State",
     "UnitState",
     "WorldModel",
+    "authoritative_build_preflight_authorization_id",
+    "authoritative_build_preflight_request_id",
 ]

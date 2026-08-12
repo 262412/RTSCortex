@@ -36,6 +36,7 @@ class RoutedCommand:
     semantic_source_role: str | None = None
     semantic_action: str | None = None
     townhall_recovery: bool | None = None
+    authoritative_build_preflight: Mapping[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -68,7 +69,43 @@ class RoutedCommand:
             payload["semantic_action"] = self.semantic_action
         if self.townhall_recovery is not None:
             payload["townhall_recovery"] = self.townhall_recovery
+        if self.authoritative_build_preflight is not None:
+            payload["authoritative_build_preflight"] = dict(self.authoritative_build_preflight)
         return payload
+
+
+@dataclass(frozen=True)
+class RoutedBuildPreflightRequest:
+    """Raw-routed request that never enters the gameplay command queue."""
+
+    request_id: str
+    run_id: str
+    episode_id: str
+    step_id: int
+    operation_id: str
+    operation_epoch: int
+    action_name: str
+    actor: str
+    team_name: str
+    requested_arguments: tuple[Any, ...]
+    opened_command_id: str
+    opened_attempt_id: str
+    opened_attempt_ordinal: int
+    blocked_material_legality_identity: str
+    observation_revision: str
+    observation_game_loop: int
+    screen_world_target: tuple[float, float] | None = None
+    screen_anchor_tag: int | None = None
+    placement_candidate_id: str | None = None
+    placement_revision: str | None = None
+
+    @property
+    def name(self) -> str:
+        return self.action_name
+
+    @property
+    def command_id(self) -> str:
+        return self.request_id
 
 
 @dataclass(frozen=True)
@@ -82,9 +119,10 @@ class RoutedActionBatch:
     team_order: tuple[str, ...]
     commands: tuple[RoutedCommand, ...]
     action_text: str
+    authoritative_build_preflight_requests: tuple[RoutedBuildPreflightRequest, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "protocol_version": self.protocol_version,
             "run_id": self.run_id,
             "episode_id": self.episode_id,
@@ -95,6 +133,20 @@ class RoutedActionBatch:
             "commands": [command.to_dict() for command in self.commands],
             "action_text": self.action_text,
         }
+        if self.authoritative_build_preflight_requests:
+            payload["authoritative_build_preflight_requests"] = [
+                {
+                    **request.__dict__,
+                    "requested_arguments": list(request.requested_arguments),
+                    "screen_world_target": (
+                        None
+                        if request.screen_world_target is None
+                        else list(request.screen_world_target)
+                    ),
+                }
+                for request in self.authoritative_build_preflight_requests
+            ]
+        return payload
 
 
 class ActionRouter:
@@ -192,6 +244,68 @@ class ActionRouter:
                         if command.get("townhall_recovery") is None
                         else bool(command["townhall_recovery"])
                     ),
+                    authoritative_build_preflight=(
+                        None
+                        if command.get("authoritative_build_preflight") is None
+                        else _mapping(
+                            command["authoritative_build_preflight"],
+                            "authoritative_build_preflight",
+                        )
+                    ),
+                )
+            )
+
+        preflight_requests: list[RoutedBuildPreflightRequest] = []
+        for value in batch.get("authoritative_build_preflight_requests", ()):
+            request = _mapping(value, "authoritative_build_preflight_request")
+            actor = str(request["actor"])
+            command_agent, team_name = split_actor(actor)
+            if command_agent != agent_name:
+                continue
+            if team_name not in commands_by_team:
+                raise ValueError(f"actor {actor!r} is absent from the current team order")
+            action_name = str(request["action_name"])
+            preflight_specification = specifications.get((action_name, actor))
+            if preflight_specification is None:
+                raise ValueError(
+                    f"preflight action {action_name!r} is unavailable for actor {actor!r}"
+                )
+            arguments = _list(request["requested_arguments"], "preflight arguments")
+            if len(arguments) != len(preflight_specification.argument_names):
+                raise ValueError(f"preflight action {action_name!r} has an invalid argument count")
+            screen_metadata = preflight_specification.screen_metadata(actor, arguments)
+            preflight_requests.append(
+                RoutedBuildPreflightRequest(
+                    request_id=str(request["request_id"]),
+                    run_id=str(request["run_id"]),
+                    episode_id=str(request["episode_id"]),
+                    step_id=int(request["step_id"]),
+                    operation_id=str(request["operation_id"]),
+                    operation_epoch=int(request["operation_epoch"]),
+                    action_name=action_name,
+                    actor=actor,
+                    team_name=team_name,
+                    requested_arguments=tuple(arguments),
+                    opened_command_id=str(request["opened_command_id"]),
+                    opened_attempt_id=str(request["opened_attempt_id"]),
+                    opened_attempt_ordinal=int(request["opened_attempt_ordinal"]),
+                    blocked_material_legality_identity=str(
+                        request["blocked_material_legality_identity"]
+                    ),
+                    observation_revision=str(request["observation_revision"]),
+                    observation_game_loop=int(request["observation_game_loop"]),
+                    screen_world_target=(
+                        None if screen_metadata is None else screen_metadata.world_target
+                    ),
+                    screen_anchor_tag=(
+                        None if screen_metadata is None else screen_metadata.anchor_tag
+                    ),
+                    placement_candidate_id=(
+                        None if screen_metadata is None else screen_metadata.placement_candidate_id
+                    ),
+                    placement_revision=(
+                        None if screen_metadata is None else screen_metadata.placement_revision
+                    ),
                 )
             )
 
@@ -216,6 +330,7 @@ class ActionRouter:
             agent_name=agent_name,
             team_order=order,
             commands=tuple(routed_commands),
+            authoritative_build_preflight_requests=tuple(preflight_requests),
             action_text="\n".join(lines),
         )
 

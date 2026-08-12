@@ -31,6 +31,70 @@ def _expected_attempt_identity(
     return f"attempt:{hashlib.sha256(encoded).hexdigest()}"
 
 
+def authoritative_build_preflight_request_id(
+    *,
+    operation_id: str,
+    operation_epoch: int,
+    action_name: str,
+    actor: str,
+    requested_arguments: list[Any],
+    opened_command_id: str,
+    opened_attempt_id: str,
+    opened_attempt_ordinal: int,
+    blocked_material_legality_identity: str,
+    observation_revision: str,
+    observation_game_loop: int,
+) -> str:
+    payload = {
+        "operation_id": operation_id,
+        "operation_epoch": operation_epoch,
+        "action_name": action_name,
+        "actor": actor,
+        "requested_arguments": requested_arguments,
+        "opened_command_id": opened_command_id,
+        "opened_attempt_id": opened_attempt_id,
+        "opened_attempt_ordinal": opened_attempt_ordinal,
+        "blocked_material_legality_identity": blocked_material_legality_identity,
+        "observation_revision": observation_revision,
+        "observation_game_loop": observation_game_loop,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return f"build-preflight:{hashlib.sha256(encoded).hexdigest()}"
+
+
+def authoritative_build_preflight_authorization_id(
+    *,
+    request_id: str,
+    operation_id: str,
+    operation_epoch: int,
+    action_name: str,
+    builder_tag: int,
+    ability_id: int,
+    world_target: tuple[float, float],
+    target_state_revision: str,
+    material_legality_identity: str,
+    observation_revision: str,
+    observation_game_loop: int,
+    expires_game_loop: int,
+) -> str:
+    payload = {
+        "request_id": request_id,
+        "operation_id": operation_id,
+        "operation_epoch": operation_epoch,
+        "action_name": action_name,
+        "builder_tag": builder_tag,
+        "ability_id": ability_id,
+        "world_target": [float(world_target[0]), float(world_target[1])],
+        "target_state_revision": target_state_revision,
+        "material_legality_identity": material_legality_identity,
+        "observation_revision": observation_revision,
+        "observation_game_loop": observation_game_loop,
+        "expires_game_loop": expires_game_loop,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return f"build-preflight-authorization:{hashlib.sha256(encoded).hexdigest()}"
+
+
 class ContractModel(BaseModel):
     """Base model shared by all immutable public contracts."""
 
@@ -220,6 +284,152 @@ class ObservationEnvelope(ContractModel):
         return self
 
 
+class AuthoritativeBuildPreflightRequest(ContractModel):
+    """Core request for a side-effect-free Raw circuit reset decision."""
+
+    protocol_version: ProtocolVersion = CURRENT_PROTOCOL_VERSION
+    request_id: str = Field(pattern=r"^build-preflight:[0-9a-f]{64}$")
+    run_id: str = Field(min_length=1)
+    episode_id: str = Field(min_length=1)
+    step_id: int = Field(ge=0)
+    operation_id: str = Field(pattern=r"^operation:[0-9a-f]{64}$")
+    operation_epoch: int = Field(default=0, ge=0)
+    action_name: str = Field(pattern=r"^Build_.+")
+    actor: str = Field(min_length=1)
+    requested_arguments: list[Any] = Field(default_factory=list)
+    opened_command_id: str = Field(min_length=1)
+    opened_attempt_id: str = Field(pattern=r"^attempt:[0-9a-f]{64}$")
+    opened_attempt_ordinal: int = Field(ge=0)
+    blocked_material_legality_identity: str = Field(pattern=r"^build-legality:[0-9a-f]{64}$")
+    observation_revision: str = Field(min_length=1)
+    observation_game_loop: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def validate_canonical_identity(self) -> AuthoritativeBuildPreflightRequest:
+        if self.opened_attempt_id != _expected_attempt_identity(
+            self.operation_id,
+            self.opened_command_id,
+            self.opened_attempt_ordinal,
+        ):
+            raise ValueError("preflight opener attempt identity is not canonical")
+        expected = authoritative_build_preflight_request_id(
+            operation_id=self.operation_id,
+            operation_epoch=self.operation_epoch,
+            action_name=self.action_name,
+            actor=self.actor,
+            requested_arguments=self.requested_arguments,
+            opened_command_id=self.opened_command_id,
+            opened_attempt_id=self.opened_attempt_id,
+            opened_attempt_ordinal=self.opened_attempt_ordinal,
+            blocked_material_legality_identity=self.blocked_material_legality_identity,
+            observation_revision=self.observation_revision,
+            observation_game_loop=self.observation_game_loop,
+        )
+        if self.request_id != expected:
+            raise ValueError("preflight request identity is not canonical")
+        return self
+
+
+class AuthoritativeBuildPreflightResult(ContractModel):
+    """Raw result that either keeps the circuit open or authorizes one command."""
+
+    protocol_version: ProtocolVersion = CURRENT_PROTOCOL_VERSION
+    request_id: str = Field(pattern=r"^build-preflight:[0-9a-f]{64}$")
+    authorization_id: str | None = Field(
+        default=None,
+        pattern=r"^build-preflight-authorization:[0-9a-f]{64}$",
+    )
+    run_id: str = Field(min_length=1)
+    episode_id: str = Field(min_length=1)
+    step_id: int = Field(ge=0)
+    operation_id: str = Field(pattern=r"^operation:[0-9a-f]{64}$")
+    operation_epoch: int = Field(default=0, ge=0)
+    action_name: str = Field(pattern=r"^Build_.+")
+    actor: str = Field(min_length=1)
+    requested_arguments: list[Any] = Field(default_factory=list)
+    opened_command_id: str = Field(min_length=1)
+    opened_attempt_id: str = Field(pattern=r"^attempt:[0-9a-f]{64}$")
+    opened_attempt_ordinal: int = Field(ge=0)
+    blocked_material_legality_identity: str = Field(pattern=r"^build-legality:[0-9a-f]{64}$")
+    status: Literal["authorized", "deferred"]
+    authorized: bool
+    reason: str = Field(min_length=1)
+    circuit_open: bool
+    builder_tag: int | None = Field(default=None, gt=0)
+    ability_id: int | None = Field(default=None, gt=0)
+    world_target: tuple[float, float] | None = None
+    target_state_revision: str | None = None
+    material_legality_identity: str | None = Field(
+        default=None,
+        pattern=r"^build-legality:[0-9a-f]{64}$",
+    )
+    observation_revision: str | None = None
+    observation_game_loop: int | None = Field(default=None, ge=0)
+    expires_game_loop: int | None = Field(default=None, ge=0)
+    state_transition: Literal["open_to_reset"] | None = None
+    material_change_reason: (
+        Literal[
+            "builder_changed",
+            "ability_changed",
+            "target_state_changed",
+            "operation_epoch_changed",
+        ]
+        | None
+    ) = None
+    invalid_evidence_reasons: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_preflight_result(self) -> AuthoritativeBuildPreflightResult:
+        if self.opened_attempt_id != _expected_attempt_identity(
+            self.operation_id,
+            self.opened_command_id,
+            self.opened_attempt_ordinal,
+        ):
+            raise ValueError("preflight result opener identity is not canonical")
+        if self.authorized:
+            if (
+                self.status != "authorized"
+                or self.circuit_open
+                or self.authorization_id is None
+                or self.builder_tag is None
+                or self.ability_id is None
+                or self.world_target is None
+                or self.target_state_revision is None
+                or self.material_legality_identity is None
+                or self.observation_revision is None
+                or self.observation_game_loop is None
+                or self.expires_game_loop is None
+                or self.expires_game_loop < self.observation_game_loop
+                or self.state_transition != "open_to_reset"
+                or self.material_change_reason is None
+                or self.invalid_evidence_reasons
+            ):
+                raise ValueError("authorized preflight requires complete exact Raw identity")
+            expected = authoritative_build_preflight_authorization_id(
+                request_id=self.request_id,
+                operation_id=self.operation_id,
+                operation_epoch=self.operation_epoch,
+                action_name=self.action_name,
+                builder_tag=self.builder_tag,
+                ability_id=self.ability_id,
+                world_target=self.world_target,
+                target_state_revision=self.target_state_revision,
+                material_legality_identity=self.material_legality_identity,
+                observation_revision=self.observation_revision,
+                observation_game_loop=self.observation_game_loop,
+                expires_game_loop=self.expires_game_loop,
+            )
+            if self.authorization_id != expected:
+                raise ValueError("preflight authorization identity is not canonical")
+        elif (
+            self.status != "deferred"
+            or self.authorization_id is not None
+            or self.state_transition is not None
+        ):
+            raise ValueError("deferred preflight cannot carry an authorization transition")
+        return self
+
+
 class ActionCommand(ContractModel):
     command_id: str
     operation_id: str | None = Field(default=None, pattern=r"^operation:[0-9a-f]{64}$")
@@ -245,6 +455,23 @@ class ActionCommand(ContractModel):
         default=None,
         exclude_if=lambda value: value is None,
     )
+    authoritative_build_preflight: AuthoritativeBuildPreflightResult | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+
+    @model_validator(mode="after")
+    def validate_authoritative_build_preflight(self) -> ActionCommand:
+        authorization = self.authoritative_build_preflight
+        if authorization is not None and (
+            not authorization.authorized
+            or authorization.operation_id != self.operation_id
+            or authorization.action_name != self.name
+            or authorization.actor != self.actor
+            or authorization.requested_arguments != self.arguments
+        ):
+            raise ValueError("command does not exactly match its Build preflight authorization")
+        return self
 
 
 class ActionBatch(ContractModel):
@@ -258,6 +485,9 @@ class ActionBatch(ContractModel):
     planner_pending: bool = False
     idle_reason: IdleReason | None = None
     commands: list[ActionCommand] = Field(default_factory=list)
+    authoritative_build_preflight_requests: list[AuthoritativeBuildPreflightRequest] = Field(
+        default_factory=list
+    )
     rejected_commands: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")

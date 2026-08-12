@@ -9,6 +9,10 @@ from typing import Any
 import pytest
 
 import scripts.analyze_authoritative_build_circuit_canary as analyzer
+from rtscortex.contracts import (
+    authoritative_build_preflight_authorization_id,
+    authoritative_build_preflight_request_id,
+)
 from rtscortex.memory import StoredEvent
 from scripts.analyze_authoritative_build_circuit_canary import (
     CanaryArtifactError,
@@ -75,6 +79,75 @@ def _zero() -> dict[str, Any]:
     }
 
 
+def _preflight_evidence() -> tuple[dict[str, object], dict[str, object]]:
+    operation_id = "operation:" + "a" * 64
+    opened_attempt_id = _attempt(operation_id, "command-2", 2)
+    request: dict[str, object] = {
+        "protocol_version": "1.1",
+        "run_id": "run-canary",
+        "episode_id": "episode-0",
+        "step_id": 10,
+        "operation_id": operation_id,
+        "operation_epoch": 0,
+        "action_name": "Build_Pylon_Screen",
+        "actor": "Builder/Probe",
+        "requested_arguments": [],
+        "opened_command_id": "command-2",
+        "opened_attempt_id": opened_attempt_id,
+        "opened_attempt_ordinal": 2,
+        "blocked_material_legality_identity": "build-legality:" + "2" * 64,
+        "observation_revision": "obs-preflight",
+        "observation_game_loop": 10,
+    }
+    request["request_id"] = authoritative_build_preflight_request_id(
+        operation_id=operation_id,
+        operation_epoch=0,
+        action_name="Build_Pylon_Screen",
+        actor="Builder/Probe",
+        requested_arguments=[],
+        opened_command_id="command-2",
+        opened_attempt_id=opened_attempt_id,
+        opened_attempt_ordinal=2,
+        blocked_material_legality_identity="build-legality:" + "2" * 64,
+        observation_revision="obs-preflight",
+        observation_game_loop=10,
+    )
+    material = "build-legality:" + "f" * 64
+    result: dict[str, object] = {
+        **request,
+        "authorization_id": authoritative_build_preflight_authorization_id(
+            request_id=str(request["request_id"]),
+            operation_id=operation_id,
+            operation_epoch=0,
+            action_name="Build_Pylon_Screen",
+            builder_tag=200,
+            ability_id=881,
+            world_target=(31.0, 30.0),
+            target_state_revision="target-revalidated",
+            material_legality_identity=material,
+            observation_revision="obs-preflight",
+            observation_game_loop=10,
+            expires_game_loop=122,
+        ),
+        "status": "authorized",
+        "authorized": True,
+        "reason": "authoritative_material_change",
+        "circuit_open": False,
+        "builder_tag": 200,
+        "ability_id": 881,
+        "world_target": [31.0, 30.0],
+        "target_state_revision": "target-revalidated",
+        "material_legality_identity": material,
+        "observation_revision": "obs-preflight",
+        "observation_game_loop": 10,
+        "expires_game_loop": 122,
+        "state_transition": "open_to_reset",
+        "material_change_reason": "builder_changed",
+        "invalid_evidence_reasons": [],
+    }
+    return request, result
+
+
 def _valid_phases() -> list[dict[str, object]]:
     operation_id = "operation:" + "a" * 64
     action = "BUILD PYLON"
@@ -122,6 +195,8 @@ def _valid_phases() -> list[dict[str, object]]:
         )
     reset_command = "command-reset"
     reset_attempt = _attempt(operation_id, reset_command, 3)
+    preflight_request, preflight_result = _preflight_evidence()
+    authorization_id = str(preflight_result["authorization_id"])
     events.extend(
         [
             _event(
@@ -169,17 +244,48 @@ def _valid_phases() -> list[dict[str, object]]:
             ),
             _event(
                 len(events),
+                "preflight_authorized",
+                operation_id=operation_id,
+                action=action,
+                game_loop=10,
+                observation_revision="obs-preflight",
+                builder_tag=100,
+                replacement_builder_tag=200,
+                reason="raw_exact_identity_open_to_reset",
+                request_id=preflight_request["request_id"],
+                authorization_id=authorization_id,
+                preflight_request=preflight_request,
+                preflight_result=preflight_result,
+                authoritative_state={
+                    "streak": 0,
+                    "threshold": 3,
+                    "circuit_open": False,
+                    "pending_authorization_id": authorization_id,
+                },
+                command_count=0,
+                **_zero(),
+            ),
+            _event(
+                len(events),
                 "reset_command_observed",
                 operation_id=operation_id,
                 action=action,
                 command_id=reset_command,
                 attempt_id=reset_attempt,
                 attempt_ordinal=3,
-                game_loop=10,
+                game_loop=11,
                 observation_revision="obs-reset-command",
                 builder_tag=200,
                 replacement_builder_tag=200,
-                reason="validated_builder_material_change",
+                reason="raw_preflight_authorized",
+                authorization_id=authorization_id,
+                authoritative_build_preflight=preflight_result,
+                authoritative_state={
+                    "streak": 0,
+                    "threshold": 3,
+                    "circuit_open": False,
+                    "pending_authorization_id": authorization_id,
+                },
                 **_zero(),
             ),
             _event(
@@ -203,6 +309,12 @@ def _valid_phases() -> list[dict[str, object]]:
                     "target_legality_fingerprint": "sc2:fingerprint-reset",
                     "primitive_constructed": True,
                     "primitive_submitted": False,
+                },
+                authoritative_state={
+                    "streak": 0,
+                    "threshold": 3,
+                    "circuit_open": False,
+                    "pending_authorization_id": None,
                 },
             ),
             _event(
@@ -327,6 +439,18 @@ def _valid_runtime_events() -> list[StoredEvent]:
         )
     third_attempt = _attempt(operation_id, "command-2", 2)
     reset_attempt = _attempt(operation_id, "command-reset", 3)
+    preflight_request, preflight_result = _preflight_evidence()
+    authorization_id = preflight_result["authorization_id"]
+    authorized_command = {
+        "command_id": "command-reset",
+        "actor": "Builder/Probe",
+        "name": "Build_Pylon_Screen",
+        "arguments": [],
+        "operation_id": operation_id,
+        "attempt_id": reset_attempt,
+        "attempt_ordinal": 3,
+        "authoritative_build_preflight": preflight_result,
+    }
     events.extend(
         [
             _runtime_event(
@@ -350,25 +474,74 @@ def _valid_runtime_events() -> list[StoredEvent]:
             ),
             _runtime_event(
                 5,
-                "authoritative_build_pre_dispatch_circuit_reset",
+                "authoritative_build_pre_dispatch_preflight_requested",
                 {
-                    "operation_id": operation_id,
-                    "action_name": "Build_Pylon_Screen",
-                    "reason": "semantic_legality_material_change",
-                    "previous_semantic_material_identity": "semantic-build-material:" + "1" * 64,
-                    "current_semantic_material_identity": "semantic-build-material:" + "2" * 64,
-                    "raw_material_legality_identity": "build-legality:" + "2" * 64,
-                    "previous_builder_tag": 100,
-                    "bound_builder_tag": 200,
-                    "ability_id": 881,
-                    "world_target": [32.0, 30.0],
-                    "game_loop": 80,
-                    "reset_from_streak": 3,
-                    "operation_epoch_changed": False,
+                    "request": preflight_request,
+                    "semantic_material_hint": "semantic-build-material:" + "2" * 64,
+                    "bound_builder_hint": 200,
+                    "side_effect_free": True,
                 },
             ),
             _runtime_event(
                 6,
+                "authoritative_build_pre_dispatch_preflight",
+                {
+                    "result": preflight_result,
+                    "accepted_by_core": True,
+                    "invalid_evidence_reasons": [],
+                },
+            ),
+            _runtime_event(
+                7,
+                "authoritative_build_pre_dispatch_circuit_reset",
+                {
+                    "operation_id": operation_id,
+                    "operation_epoch": 0,
+                    "action_name": "Build_Pylon_Screen",
+                    "reason": "raw_preflight_authorized",
+                    "state_transition": "open_to_reset",
+                    "authorization_id": authorization_id,
+                    "request_id": preflight_request["request_id"],
+                    "opened_command_id": "command-2",
+                    "opened_attempt_id": third_attempt,
+                    "opened_attempt_ordinal": 2,
+                    "blocked_material_legality_identity": "build-legality:" + "2" * 64,
+                    "builder_tag": 200,
+                    "ability_id": 881,
+                    "world_target": reset_world_target,
+                    "target_state_revision": "target-revalidated",
+                    "material_legality_identity": reset_material_identity,
+                    "observation_revision": "obs-preflight",
+                    "authorization_game_loop": 10,
+                    "expires_game_loop": 122,
+                    "material_change_reason": "builder_changed",
+                    "reset_from_streak": 3,
+                },
+            ),
+            _runtime_event(
+                8,
+                "command_lineage",
+                {
+                    "lineage": {
+                        "operation_id": operation_id,
+                        "command_id": "command-reset",
+                        "action_name": "Build_Pylon_Screen",
+                    },
+                    "command_id": "command-reset",
+                    "authoritative_build_preflight": preflight_result,
+                },
+            ),
+            _runtime_event(
+                9,
+                "command_lifecycle",
+                {
+                    "status": "dispatched",
+                    "reason": None,
+                    "command": authorized_command,
+                },
+            ),
+            _runtime_event(
+                10,
                 "placement_ledger_transition",
                 {
                     "operation_id": operation_id,
@@ -404,14 +577,14 @@ def _valid_runtime_events() -> list[StoredEvent]:
                         "material_legality_identity": reset_material_identity,
                         "material_evidence_valid": True,
                         "invalid_evidence_reasons": [],
-                        "state_transition": "open_to_reset",
+                        "state_transition": None,
                         "reset_reason": "build_started",
                         "next_action": "retry",
                     },
                 },
             ),
             _runtime_event(
-                7,
+                11,
                 "placement_ledger_transition",
                 {
                     "operation_id": operation_id,
@@ -430,7 +603,7 @@ def _valid_runtime_events() -> list[StoredEvent]:
                 },
             ),
             _runtime_event(
-                8,
+                12,
                 "execution",
                 {
                     "operation_id": operation_id,
@@ -554,25 +727,27 @@ def test_runtime_events_are_authoritative_for_the_canary_path() -> None:
         "post_open_command_count": 0,
         "post_open_dispatch_count": 0,
         "post_open_rejection_count": 0,
+        "post_open_primitive_count": 0,
+        "post_open_approach_primitive_count": 0,
         "consistent": True,
     }
 
 
-def test_runtime_replay_exposes_general_engineering_circuit_disagreement() -> None:
+def test_runtime_replay_rejects_general_engineering_circuit_disagreement() -> None:
     phase_events = _valid_phases()
     phase_replay = _replay_phases(phase_events, expected_seed=7)
     runtime_events = _valid_runtime_events()
-    runtime_events[4].payload["raw_material_legality_identity"] = "build-legality:" + "e" * 64
-
-    report = _replay_runtime_events(
-        runtime_events,
-        phase_events=phase_events,
-        phase_replay=phase_replay,
+    lineage = next(event for event in runtime_events if event.event_type == "command_lineage")
+    lineage.payload["authoritative_build_preflight"]["authorization_id"] = (
+        "build-preflight-authorization:" + "e" * 64
     )
 
-    assert report["raw_success_reset_provenance_consistent"] is True
-    assert report["engineering_authoritative_circuit_consistent"] is False
-    assert report["engineering_authoritative_circuit"]["invalid_transition_count"] == 1
+    with pytest.raises(CanaryArtifactError):
+        _replay_runtime_events(
+            runtime_events,
+            phase_events=phase_events,
+            phase_replay=phase_replay,
+        )
 
 
 @pytest.mark.parametrize(
@@ -597,7 +772,7 @@ def test_runtime_replay_rejects_forged_success_reset_material_provenance(
     phase_events = _valid_phases()
     phase_replay = _replay_phases(phase_events, expected_seed=7)
     runtime_events = _valid_runtime_events()
-    reset_transition = next(event for event in runtime_events if event.event_id == 6).payload
+    reset_transition = next(event for event in runtime_events if event.event_id == 10).payload
     reset_evidence = reset_transition["authoritative_pre_dispatch"]
     assert isinstance(reset_evidence, dict)
     success_effect = runtime_events[-1].payload["effect_evidence"]
@@ -831,7 +1006,7 @@ def test_runtime_replay_rejects_forged_or_incomplete_evidence(mutation: str) -> 
     elif mutation == "zero":
         runtime_events = []
     elif mutation == "release":
-        runtime_events = [event for event in runtime_events if event.event_id != 7]
+        runtime_events = [event for event in runtime_events if event.event_id != 11]
     elif mutation == "material":
         runtime_events[0].payload["authoritative_pre_dispatch"]["material_legality_identity"] = (
             "build-legality:1"
@@ -858,9 +1033,9 @@ def test_replay_rejects_tampered_phase_evidence(mutation: str) -> None:
     elif mutation == "planner":
         events[8]["planner_pending"] = True
     elif mutation == "query":
-        events[11]["query_result"] = "Success (cached)"
+        events[12]["query_result"] = "Success (cached)"
     elif mutation == "submission":
-        events[12]["primitive_submitted"] = False
+        events[13]["primitive_submitted"] = False
     else:
         events[7]["effect_inflight_count"] = 1
 

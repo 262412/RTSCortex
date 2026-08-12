@@ -19,6 +19,8 @@ from rtscortex_llm_pysc2.raw_placement import (
     build_material_legality_identity,
 )
 
+from rtscortex.contracts import authoritative_build_preflight_request_id
+
 
 def _operation_id(marker: str) -> str:
     return f"operation:{marker * 64}"
@@ -39,6 +41,60 @@ def _attempt_id(operation_id: str, command_id: str, ordinal: int) -> str:
         separators=(",", ":"),
     ).encode()
     return f"attempt:{hashlib.sha256(encoded).hexdigest()}"
+
+
+def _preflight_request_id(
+    operation_id: str,
+    *,
+    screen_target: tuple[int, int] = (30, 25),
+    operation_epoch: int = 0,
+) -> str:
+    opened_attempt_id = _attempt_id(operation_id, "preflight-open-2", 2)
+    return authoritative_build_preflight_request_id(
+        operation_id=operation_id,
+        operation_epoch=operation_epoch,
+        action_name="Build_Pylon_Screen",
+        actor="Builder/Builder-Probe-1",
+        requested_arguments=[[screen_target[0], screen_target[1]]],
+        opened_command_id="preflight-open-2",
+        opened_attempt_id=opened_attempt_id,
+        opened_attempt_ordinal=2,
+        blocked_material_legality_identity=_material_id("a"),
+        observation_revision="observation-new",
+        observation_game_loop=116,
+    )
+
+
+def _open_authoritative_circuit(
+    service: RawPlacementService,
+    *,
+    operation_id: str,
+    builder_tag: int = 0xB1,
+    ability_id: int = 881,
+    world_target: tuple[float, float] = (22.0, 24.0),
+    target_state_revision: str = "target-stable",
+    material_identity: str | None = None,
+) -> tuple[str, str]:
+    identity = material_identity or _material_id("a")
+    opened_command_id = "preflight-open-2"
+    for ordinal in range(3):
+        command_id = f"preflight-open-{ordinal}"
+        service.record_authoritative_pre_dispatch_failure(
+            operation_id=operation_id,
+            action_name="Build_Pylon_Screen",
+            command_id=command_id,
+            failure_code="placement_query_rejected",
+            attempt_id=_attempt_id(operation_id, command_id, ordinal),
+            attempt_ordinal=ordinal,
+            builder_tag=builder_tag,
+            ability_id=ability_id,
+            world_target=world_target,
+            target_state_revision=target_state_revision,
+            observation_revision=f"observation-{ordinal}",
+            observation_game_loop=100 + ordinal,
+            material_legality_identity=identity,
+        )
+    return opened_command_id, _attempt_id(operation_id, opened_command_id, 2)
 
 
 def test_authoritative_pre_dispatch_circuit_counts_exact_failures_without_placement_state() -> None:
@@ -119,7 +175,7 @@ def test_authoritative_pre_dispatch_circuit_counts_exact_failures_without_placem
     assert blocked.transition is None
 
 
-def test_authoritative_pre_dispatch_reopens_only_for_changed_material_identity() -> None:
+def test_authoritative_pre_dispatch_remains_open_until_authorized_preflight() -> None:
     service = RawPlacementService(unit_names={}, no_start_streak_threshold=3)
     old_identity = _material_id("c")
     new_identity = _material_id("d")
@@ -165,7 +221,9 @@ def test_authoritative_pre_dispatch_reopens_only_for_changed_material_identity()
         )
         is False
     )
-    # A new target-state revision at the exact failed target is material evidence.
+    # Even real target-side change is only a preflight hint.  The retry helper
+    # cannot create the forbidden "retry allowed while Raw is still open"
+    # intermediate state; the typed preflight performs the atomic reset.
     assert (
         service.authoritative_pre_dispatch_retry_allowed(
             **{
@@ -176,9 +234,9 @@ def test_authoritative_pre_dispatch_reopens_only_for_changed_material_identity()
             placement_revision="candidate-new",
             material_legality_identity=new_identity,
         )
-        is True
+        is False
     )
-    reopened = service.record_authoritative_pre_dispatch_failure(
+    still_open = service.record_authoritative_pre_dispatch_failure(
         **{
             **kwargs,
             "observation_revision": "observation-new",
@@ -191,11 +249,316 @@ def test_authoritative_pre_dispatch_reopens_only_for_changed_material_identity()
         placement_revision="candidate-new",
         material_legality_identity=new_identity,
     )
-    assert reopened.transition == "open_to_reset"
-    assert reopened.reset_reason == "material_state_changed"
-    assert reopened.material_change_reason == "target_state_changed"
-    assert reopened.streak == 1
-    assert reopened.circuit_open is False
+    assert still_open.transition is None
+    assert still_open.reset_reason is None
+    assert still_open.material_change_reason is None
+    assert still_open.streak == 3
+    assert still_open.circuit_open is True
+    assert still_open.next_action == "preflight_required"
+
+
+def test_authoritative_preflight_keeps_open_circuit_for_coordinate_only_churn() -> None:
+    service = RawPlacementService(unit_names={}, no_start_streak_threshold=3)
+    operation_id = _operation_id("9")
+    opened_command_id, opened_attempt_id = _open_authoritative_circuit(
+        service,
+        operation_id=operation_id,
+    )
+
+    result = service.authorize_authoritative_pre_dispatch_preflight(
+        request_id=_preflight_request_id(operation_id, screen_target=(31, 25)),
+        operation_id=operation_id,
+        operation_epoch=0,
+        action_name="Build_Pylon_Screen",
+        actor="Builder/Builder-Probe-1",
+        requested_arguments=((31, 25),),
+        opened_command_id=opened_command_id,
+        opened_attempt_id=opened_attempt_id,
+        opened_attempt_ordinal=2,
+        blocked_material_legality_identity=_material_id("a"),
+        builder_tag=0xB1,
+        ability_id=881,
+        world_target=(23.0, 24.0),
+        target_state_revision="target-stable",
+        observation_revision="observation-new",
+        observation_game_loop=116,
+    )
+
+    assert result.authorized is False
+    assert result.status == "deferred"
+    assert result.reason == "material_change_not_authoritative"
+    assert result.state_transition is None
+    state = service.authoritative_pre_dispatch_state(operation_id)
+    assert state is not None
+    assert state.circuit_open is True
+    assert state.streak == 3
+
+
+def test_authoritative_preflight_rejects_noncanonical_request_identity() -> None:
+    service = RawPlacementService(unit_names={}, no_start_streak_threshold=3)
+    operation_id = _operation_id("4")
+    opened_command_id, opened_attempt_id = _open_authoritative_circuit(
+        service,
+        operation_id=operation_id,
+    )
+
+    result = service.authorize_authoritative_pre_dispatch_preflight(
+        request_id="build-preflight:" + "f" * 64,
+        operation_id=operation_id,
+        operation_epoch=0,
+        action_name="Build_Pylon_Screen",
+        actor="Builder/Builder-Probe-1",
+        requested_arguments=((30, 25),),
+        opened_command_id=opened_command_id,
+        opened_attempt_id=opened_attempt_id,
+        opened_attempt_ordinal=2,
+        blocked_material_legality_identity=_material_id("a"),
+        builder_tag=0xB2,
+        ability_id=881,
+        world_target=(22.0, 24.0),
+        target_state_revision="target-stable",
+        observation_revision="observation-new",
+        observation_game_loop=116,
+    )
+
+    assert result.authorized is False
+    assert result.status == "deferred"
+    assert "request_id_invalid" in result.invalid_evidence_reasons
+    state = service.authoritative_pre_dispatch_state(operation_id)
+    assert state is not None
+    assert state.circuit_open is True
+    assert state.streak == 3
+
+
+def test_authoritative_preflight_atomically_resets_and_authorizes_exact_builder_change() -> None:
+    service = RawPlacementService(unit_names={}, no_start_streak_threshold=3)
+    operation_id = _operation_id("8")
+    opened_command_id, opened_attempt_id = _open_authoritative_circuit(
+        service,
+        operation_id=operation_id,
+    )
+    request_id = _preflight_request_id(operation_id)
+
+    result = service.authorize_authoritative_pre_dispatch_preflight(
+        request_id=request_id,
+        operation_id=operation_id,
+        operation_epoch=0,
+        action_name="Build_Pylon_Screen",
+        actor="Builder/Builder-Probe-1",
+        requested_arguments=((30, 25),),
+        opened_command_id=opened_command_id,
+        opened_attempt_id=opened_attempt_id,
+        opened_attempt_ordinal=2,
+        blocked_material_legality_identity=_material_id("a"),
+        builder_tag=0xB2,
+        ability_id=881,
+        world_target=(22.0, 24.0),
+        target_state_revision="target-stable",
+        observation_revision="observation-new",
+        observation_game_loop=116,
+    )
+
+    assert result.authorized is True
+    assert result.status == "authorized"
+    assert result.state_transition == "open_to_reset"
+    assert result.material_change_reason == "builder_changed"
+    assert result.authorization_id is not None
+    state = service.authoritative_pre_dispatch_state(operation_id)
+    assert state is not None
+    assert state.circuit_open is False
+    assert state.streak == 0
+    assert state.pending_authorization_id == result.authorization_id
+
+    replay = service.authorize_authoritative_pre_dispatch_preflight(
+        request_id=request_id,
+        operation_id=operation_id,
+        operation_epoch=0,
+        action_name="Build_Pylon_Screen",
+        actor="Builder/Builder-Probe-1",
+        requested_arguments=((30, 25),),
+        opened_command_id=opened_command_id,
+        opened_attempt_id=opened_attempt_id,
+        opened_attempt_ordinal=2,
+        blocked_material_legality_identity=_material_id("a"),
+        builder_tag=0xB2,
+        ability_id=881,
+        world_target=(22.0, 24.0),
+        target_state_revision="target-stable",
+        observation_revision="observation-new",
+        observation_game_loop=116,
+    )
+    assert replay.authorized is False
+    assert replay.reason == "preflight_request_replayed"
+
+
+@pytest.mark.parametrize(
+    ("change", "expected_reason"),
+    [
+        ("ability", "ability_changed"),
+        ("target_state", "target_state_changed"),
+        ("operation_epoch", "operation_epoch_changed"),
+    ],
+)
+def test_authoritative_preflight_atomically_authorizes_other_material_changes(
+    change: str,
+    expected_reason: str,
+) -> None:
+    service = RawPlacementService(unit_names={}, no_start_streak_threshold=3)
+    operation_id = _operation_id("5")
+    opened_command_id, opened_attempt_id = _open_authoritative_circuit(
+        service,
+        operation_id=operation_id,
+    )
+    operation_epoch = 1 if change == "operation_epoch" else 0
+    result = service.authorize_authoritative_pre_dispatch_preflight(
+        request_id=_preflight_request_id(
+            operation_id,
+            operation_epoch=operation_epoch,
+        ),
+        operation_id=operation_id,
+        operation_epoch=operation_epoch,
+        action_name="Build_Pylon_Screen",
+        actor="Builder/Builder-Probe-1",
+        requested_arguments=((30, 25),),
+        opened_command_id=opened_command_id,
+        opened_attempt_id=opened_attempt_id,
+        opened_attempt_ordinal=2,
+        blocked_material_legality_identity=_material_id("a"),
+        builder_tag=0xB1,
+        ability_id=882 if change == "ability" else 881,
+        world_target=(22.0, 24.0),
+        target_state_revision=("target-changed" if change == "target_state" else "target-stable"),
+        observation_revision="observation-new",
+        observation_game_loop=116,
+    )
+
+    assert result.authorized is True
+    assert result.state_transition == "open_to_reset"
+    assert result.material_change_reason == expected_reason
+    state = service.authoritative_pre_dispatch_state(operation_id)
+    assert state is not None
+    assert state.circuit_open is False
+    assert state.streak == 0
+    assert state.operation_epoch == operation_epoch
+
+
+@pytest.mark.parametrize(
+    "changed_field",
+    ["builder", "ability", "target", "material", "epoch", "expired"],
+)
+def test_authoritative_preflight_consumption_is_exact_single_use_and_fail_closed(
+    changed_field: str,
+) -> None:
+    service = RawPlacementService(unit_names={}, no_start_streak_threshold=3)
+    operation_id = _operation_id("7")
+    opened_command_id, opened_attempt_id = _open_authoritative_circuit(
+        service,
+        operation_id=operation_id,
+    )
+    authorization = service.authorize_authoritative_pre_dispatch_preflight(
+        request_id=_preflight_request_id(operation_id),
+        operation_id=operation_id,
+        operation_epoch=0,
+        action_name="Build_Pylon_Screen",
+        actor="Builder/Builder-Probe-1",
+        requested_arguments=((30, 25),),
+        opened_command_id=opened_command_id,
+        opened_attempt_id=opened_attempt_id,
+        opened_attempt_ordinal=2,
+        blocked_material_legality_identity=_material_id("a"),
+        builder_tag=0xB2,
+        ability_id=881,
+        world_target=(22.0, 24.0),
+        target_state_revision="target-stable",
+        observation_revision="observation-new",
+        observation_game_loop=116,
+    )
+    assert authorization.authorization_id is not None
+    values: dict[str, Any] = {
+        "authorization_id": authorization.authorization_id,
+        "request_id": authorization.request_id,
+        "operation_id": operation_id,
+        "operation_epoch": 0,
+        "action_name": "Build_Pylon_Screen",
+        "builder_tag": 0xB2,
+        "ability_id": 881,
+        "world_target": (22.0, 24.0),
+        "target_state_revision": "target-stable",
+        "material_legality_identity": authorization.material_legality_identity,
+        "observation_game_loop": 117,
+    }
+    if changed_field == "builder":
+        values["builder_tag"] = 0xB3
+    elif changed_field == "ability":
+        values["ability_id"] = 883
+    elif changed_field == "target":
+        values["world_target"] = (23.0, 24.0)
+    elif changed_field == "material":
+        values["material_legality_identity"] = _material_id("f")
+    elif changed_field == "epoch":
+        values["operation_epoch"] = 1
+    elif changed_field == "expired":
+        assert authorization.expires_game_loop is not None
+        values["observation_game_loop"] = authorization.expires_game_loop + 1
+
+    consumed = service.consume_authoritative_pre_dispatch_authorization(**values)
+    assert consumed.authorized is False
+    assert consumed.status == "deferred"
+    state = service.authoritative_pre_dispatch_state(operation_id)
+    assert state is not None
+    assert state.circuit_open is True
+    assert state.streak == 3
+
+
+def test_authoritative_preflight_checkpoint_drops_pending_authorization_and_reopens() -> None:
+    service = RawPlacementService(unit_names={}, no_start_streak_threshold=3)
+    operation_id = _operation_id("6")
+    opened_command_id, opened_attempt_id = _open_authoritative_circuit(
+        service,
+        operation_id=operation_id,
+    )
+    authorization = service.authorize_authoritative_pre_dispatch_preflight(
+        request_id=_preflight_request_id(operation_id),
+        operation_id=operation_id,
+        operation_epoch=0,
+        action_name="Build_Pylon_Screen",
+        actor="Builder/Builder-Probe-1",
+        requested_arguments=((30, 25),),
+        opened_command_id=opened_command_id,
+        opened_attempt_id=opened_attempt_id,
+        opened_attempt_ordinal=2,
+        blocked_material_legality_identity=_material_id("a"),
+        builder_tag=0xB2,
+        ability_id=881,
+        world_target=(22.0, 24.0),
+        target_state_revision="target-stable",
+        observation_revision="observation-new",
+        observation_game_loop=116,
+    )
+    assert authorization.authorized is True
+
+    restored = RawPlacementService(unit_names={}, no_start_streak_threshold=3)
+    restored.restore_checkpoint_state(service.checkpoint_state())
+    state = restored.authoritative_pre_dispatch_state(operation_id)
+    assert state is not None
+    assert state.circuit_open is True
+    assert state.streak == 3
+    assert state.pending_authorization_id is None
+    consumed = restored.consume_authoritative_pre_dispatch_authorization(
+        authorization_id=str(authorization.authorization_id),
+        request_id=authorization.request_id,
+        operation_id=operation_id,
+        operation_epoch=0,
+        action_name="Build_Pylon_Screen",
+        builder_tag=0xB2,
+        ability_id=881,
+        world_target=(22.0, 24.0),
+        target_state_revision="target-stable",
+        material_legality_identity=authorization.material_legality_identity,
+        observation_game_loop=117,
+    )
+    assert consumed.authorized is False
+    assert consumed.reason == "authorization_missing_or_replayed"
 
 
 def test_authoritative_pre_dispatch_checkpoint_restore_and_success_reset() -> None:

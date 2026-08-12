@@ -24,6 +24,7 @@ from rtscortex.contracts import (
     ActionBatch,
     ActionCommand,
     ActionSource,
+    AuthoritativeBuildPreflightResult,
     EpisodeResult,
     EpisodeSummary,
     ExecutionReport,
@@ -1581,6 +1582,13 @@ class RuntimeEngine:
             payload=payload,
         )
         return result.status
+
+    def record_authoritative_build_preflight(
+        self,
+        result: AuthoritativeBuildPreflightResult,
+    ) -> None:
+        del result
+        raise RuntimeError("authoritative Build preflight requires the Cortex runtime")
 
     def _record_execution_from(
         self,

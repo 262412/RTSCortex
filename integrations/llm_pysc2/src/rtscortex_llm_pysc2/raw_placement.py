@@ -116,6 +116,11 @@ _AUTHORITATIVE_PRE_DISPATCH_STREAK_THRESHOLD = 3
 _OPERATION_IDENTITY = re.compile(r"^operation:[0-9a-f]{64}$")
 _ATTEMPT_IDENTITY = re.compile(r"^attempt:[0-9a-f]{64}$")
 _BUILD_LEGALITY_IDENTITY = re.compile(r"^build-legality:[0-9a-f]{64}$")
+_BUILD_PREFLIGHT_REQUEST_IDENTITY = re.compile(r"^build-preflight:[0-9a-f]{64}$")
+_BUILD_PREFLIGHT_AUTHORIZATION_IDENTITY = re.compile(
+    r"^build-preflight-authorization:[0-9a-f]{64}$"
+)
+_AUTHORITATIVE_PREFLIGHT_TTL_GAME_LOOPS = 112
 
 
 class RawPlacementNoStartStatus(str, Enum):  # noqa: UP042 - PySC2 bridge supports Python 3.9
@@ -225,6 +230,7 @@ class RawAuthoritativePreDispatchState:
     threshold: int
     circuit_open: bool
     last_status: str
+    operation_epoch: int = 0
     last_command_id: str | None = None
     last_attempt_ordinal: int | None = None
     last_builder_tag: int | None = None
@@ -237,6 +243,7 @@ class RawAuthoritativePreDispatchState:
     last_observation_game_loop: int | None = None
     last_material_legality_identity: str | None = None
     blocked_material_legality_identity: str | None = None
+    pending_authorization_id: str | None = None
     failed_authorization_material_legality_identities: tuple[str, ...] = ()
     seen_attempt_ordinals: tuple[int, ...] = ()
     seen_command_ids: tuple[str, ...] = ()
@@ -249,6 +256,7 @@ class RawAuthoritativePreDispatchState:
             "threshold": self.threshold,
             "circuit_open": self.circuit_open,
             "last_status": self.last_status,
+            "operation_epoch": self.operation_epoch,
             "last_command_id": self.last_command_id,
             "last_attempt_ordinal": self.last_attempt_ordinal,
             "last_builder_tag": self.last_builder_tag,
@@ -265,11 +273,79 @@ class RawAuthoritativePreDispatchState:
             "last_observation_game_loop": self.last_observation_game_loop,
             "last_material_legality_identity": self.last_material_legality_identity,
             "blocked_material_legality_identity": self.blocked_material_legality_identity,
+            "pending_authorization_id": self.pending_authorization_id,
             "failed_authorization_material_legality_identities": list(
                 self.failed_authorization_material_legality_identities
             ),
             "seen_attempt_ordinals": list(self.seen_attempt_ordinals),
             "seen_command_ids": list(self.seen_command_ids),
+        }
+
+
+@dataclass(frozen=True)
+class RawAuthoritativeBuildPreflightResult:
+    """Side-effect-free Core/Raw handshake for one circuit-open Build retry."""
+
+    request_id: str
+    operation_id: str
+    operation_epoch: int
+    action_name: str
+    actor: str
+    requested_arguments: tuple[Any, ...]
+    opened_command_id: str
+    opened_attempt_id: str
+    opened_attempt_ordinal: int
+    blocked_material_legality_identity: str
+    status: str
+    authorized: bool
+    reason: str
+    circuit_open: bool
+    builder_tag: int | None = None
+    ability_id: int | None = None
+    world_target: tuple[float, float] | None = None
+    target_state_revision: str | None = None
+    material_legality_identity: str | None = None
+    observation_revision: str | None = None
+    observation_game_loop: int | None = None
+    expires_game_loop: int | None = None
+    authorization_id: str | None = None
+    state_transition: str | None = None
+    material_change_reason: str | None = None
+    invalid_evidence_reasons: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "protocol_version": "1.1",
+            "request_id": self.request_id,
+            "authorization_id": self.authorization_id,
+            "operation_id": self.operation_id,
+            "operation_epoch": self.operation_epoch,
+            "action_name": self.action_name,
+            "actor": self.actor,
+            "requested_arguments": list(self.requested_arguments),
+            "opened_command_id": self.opened_command_id,
+            "opened_attempt_id": self.opened_attempt_id,
+            "opened_attempt_ordinal": self.opened_attempt_ordinal,
+            "blocked_material_legality_identity": self.blocked_material_legality_identity,
+            "status": self.status,
+            "authorized": self.authorized,
+            "reason": self.reason,
+            "circuit_open": self.circuit_open,
+            "builder_tag": self.builder_tag,
+            "ability_id": self.ability_id,
+            "world_target": (
+                None
+                if self.world_target is None
+                else [float(self.world_target[0]), float(self.world_target[1])]
+            ),
+            "target_state_revision": self.target_state_revision,
+            "material_legality_identity": self.material_legality_identity,
+            "observation_revision": self.observation_revision,
+            "observation_game_loop": self.observation_game_loop,
+            "expires_game_loop": self.expires_game_loop,
+            "state_transition": self.state_transition,
+            "material_change_reason": self.material_change_reason,
+            "invalid_evidence_reasons": list(self.invalid_evidence_reasons),
         }
 
 
@@ -383,6 +459,7 @@ class _OperationAuthoritativePreDispatchLedger:
     operation_id: str
     threshold: int
     action_name: str | None = None
+    operation_epoch: int = 0
     streak: int = 0
     circuit_open: bool = False
     last_status: str = RawAuthoritativePreDispatchStatus.RESET.value
@@ -401,6 +478,15 @@ class _OperationAuthoritativePreDispatchLedger:
     failed_authorization_material_legality_identities: set[str] = field(default_factory=set)
     seen_attempt_ordinals: set[int] = field(default_factory=set)
     seen_command_ids: set[str] = field(default_factory=set)
+
+
+@dataclass(frozen=True)
+class _PendingAuthoritativeBuildPreflight:
+    result: RawAuthoritativeBuildPreflightResult
+    previous_streak: int
+    previous_status: str
+    previous_operation_epoch: int
+    previous_blocked_material_legality_identity: str
 
 
 def _footprint_cells(
@@ -517,6 +603,39 @@ def _authoritative_attempt_identity(
     return f"attempt:{digest}"
 
 
+def _authoritative_build_preflight_request_identity(
+    *,
+    operation_id: str,
+    operation_epoch: int,
+    action_name: str,
+    actor: str,
+    requested_arguments: Sequence[Any],
+    opened_command_id: str,
+    opened_attempt_id: str,
+    opened_attempt_ordinal: int,
+    blocked_material_legality_identity: str,
+    observation_revision: str,
+    observation_game_loop: int,
+) -> str:
+    payload = {
+        "operation_id": operation_id,
+        "operation_epoch": operation_epoch,
+        "action_name": action_name,
+        "actor": actor,
+        "requested_arguments": list(requested_arguments),
+        "opened_command_id": opened_command_id,
+        "opened_attempt_id": opened_attempt_id,
+        "opened_attempt_ordinal": opened_attempt_ordinal,
+        "blocked_material_legality_identity": blocked_material_legality_identity,
+        "observation_revision": observation_revision,
+        "observation_game_loop": observation_game_loop,
+    }
+    digest = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    return f"build-preflight:{digest}"
+
+
 def build_material_legality_identity(
     *,
     operation_id: str | None,
@@ -583,6 +702,16 @@ class RawPlacementService:
             str,
             _OperationAuthoritativePreDispatchLedger,
         ] = {}
+        self._pending_authoritative_build_preflights: dict[
+            str,
+            _PendingAuthoritativeBuildPreflight,
+        ] = {}
+        self._consumed_authoritative_build_preflights: dict[
+            str,
+            RawAuthoritativeBuildPreflightResult,
+        ] = {}
+        self._seen_authoritative_build_preflight_request_ids: set[str] = set()
+        self._consumed_authoritative_build_preflight_authorization_ids: set[str] = set()
         self._command_targets: dict[str, RawPlacementReservation] = {}
         self._observed_occupancy: dict[int, _SpatialExclusion] = {}
         self._builder_leases: dict[int, str] = {}
@@ -789,9 +918,28 @@ class RawPlacementService:
                     "operation_id": ledger.operation_id,
                     "threshold": ledger.threshold,
                     "action_name": ledger.action_name,
-                    "streak": ledger.streak,
-                    "circuit_open": ledger.circuit_open,
-                    "last_status": ledger.last_status,
+                    "operation_epoch": (
+                        self._pending_authoritative_build_preflights[
+                            operation_id
+                        ].previous_operation_epoch
+                        if operation_id in self._pending_authoritative_build_preflights
+                        else ledger.operation_epoch
+                    ),
+                    "streak": (
+                        self._pending_authoritative_build_preflights[operation_id].previous_streak
+                        if operation_id in self._pending_authoritative_build_preflights
+                        else ledger.streak
+                    ),
+                    "circuit_open": (
+                        True
+                        if operation_id in self._pending_authoritative_build_preflights
+                        else ledger.circuit_open
+                    ),
+                    "last_status": (
+                        RawAuthoritativePreDispatchStatus.DEFER_REPLAN.value
+                        if operation_id in self._pending_authoritative_build_preflights
+                        else ledger.last_status
+                    ),
                     "last_command_id": ledger.last_command_id,
                     "last_attempt_ordinal": ledger.last_attempt_ordinal,
                     "last_builder_tag": ledger.last_builder_tag,
@@ -803,7 +951,13 @@ class RawPlacementService:
                     "last_observation_revision": ledger.last_observation_revision,
                     "last_observation_game_loop": ledger.last_observation_game_loop,
                     "last_material_legality_identity": ledger.last_material_legality_identity,
-                    "blocked_material_legality_identity": ledger.blocked_material_legality_identity,
+                    "blocked_material_legality_identity": (
+                        self._pending_authoritative_build_preflights[
+                            operation_id
+                        ].previous_blocked_material_legality_identity
+                        if operation_id in self._pending_authoritative_build_preflights
+                        else ledger.blocked_material_legality_identity
+                    ),
                     "failed_authorization_material_legality_identities": sorted(
                         ledger.failed_authorization_material_legality_identities
                     ),
@@ -812,6 +966,17 @@ class RawPlacementService:
                 }
                 for operation_id, ledger in self._operation_authoritative_pre_dispatch.items()
             },
+            "authoritative_build_preflight_seen_request_ids": sorted(
+                self._seen_authoritative_build_preflight_request_ids
+            ),
+            "authoritative_build_preflight_consumed_authorization_ids": sorted(
+                self._consumed_authoritative_build_preflight_authorization_ids
+                | {
+                    pending.result.authorization_id
+                    for pending in self._pending_authoritative_build_preflights.values()
+                    if pending.result.authorization_id is not None
+                }
+            ),
             "permanent_exclusions": [
                 {
                     "world_target": exclusion.world_target,
@@ -916,10 +1081,16 @@ class RawPlacementService:
                     raise ValueError(
                         "authoritative pre-dispatch checkpoint threshold must be exactly 3"
                     )
+                restored_operation_epoch = int(raw.get("operation_epoch", 0))
+                if restored_operation_epoch < 0:
+                    raise ValueError(
+                        "authoritative pre-dispatch checkpoint operation epoch must be non-negative"
+                    )
                 authoritative_ledger = _OperationAuthoritativePreDispatchLedger(
                     operation_id=str(raw.get("operation_id", operation_id)),
                     threshold=_AUTHORITATIVE_PRE_DISPATCH_STREAK_THRESHOLD,
                     action_name=_optional_str(raw.get("action_name")),
+                    operation_epoch=restored_operation_epoch,
                     streak=int(raw.get("streak", 0)),
                     circuit_open=bool(raw.get("circuit_open", False)),
                     last_status=str(
@@ -956,6 +1127,29 @@ class RawPlacementService:
                     seen_command_ids={str(value) for value in raw.get("seen_command_ids", ())},
                 )
                 self._operation_authoritative_pre_dispatch[str(operation_id)] = authoritative_ledger
+        seen_preflight_requests = state.get(
+            "authoritative_build_preflight_seen_request_ids",
+            (),
+        )
+        self._seen_authoritative_build_preflight_request_ids = (
+            {str(value) for value in seen_preflight_requests}
+            if isinstance(seen_preflight_requests, (list, tuple, set, frozenset))
+            else set()
+        )
+        consumed_preflight_authorizations = state.get(
+            "authoritative_build_preflight_consumed_authorization_ids",
+            (),
+        )
+        self._consumed_authoritative_build_preflight_authorization_ids = (
+            {str(value) for value in consumed_preflight_authorizations}
+            if isinstance(
+                consumed_preflight_authorizations,
+                (list, tuple, set, frozenset),
+            )
+            else set()
+        )
+        self._pending_authoritative_build_preflights = {}
+        self._consumed_authoritative_build_preflights = {}
         permanent = state.get("permanent_exclusions", ())
         if isinstance(permanent, Sequence) and not isinstance(permanent, (str, bytes)):
             self._permanent_exclusions = [
@@ -1037,6 +1231,7 @@ class RawPlacementService:
             threshold=ledger.threshold,
             circuit_open=ledger.circuit_open,
             last_status=ledger.last_status,
+            operation_epoch=ledger.operation_epoch,
             last_command_id=ledger.last_command_id,
             last_attempt_ordinal=ledger.last_attempt_ordinal,
             last_builder_tag=ledger.last_builder_tag,
@@ -1049,6 +1244,12 @@ class RawPlacementService:
             last_observation_game_loop=ledger.last_observation_game_loop,
             last_material_legality_identity=ledger.last_material_legality_identity,
             blocked_material_legality_identity=ledger.blocked_material_legality_identity,
+            pending_authorization_id=(
+                None
+                if (pending := self._pending_authoritative_build_preflights.get(str(operation_id)))
+                is None
+                else pending.result.authorization_id
+            ),
             failed_authorization_material_legality_identities=tuple(
                 sorted(ledger.failed_authorization_material_legality_identities)
             ),
@@ -1124,36 +1325,443 @@ class RawPlacementService:
         observation_revision: str | None = None,
         observation_game_loop: int | None = None,
     ) -> bool:
-        """Allow a circuit-open operation only with a changed stable material identity."""
+        """Never infer an open-to-reset transition from dispatch-time fields."""
 
         ledger = self._operation_authoritative_pre_dispatch.get(str(operation_id))
-        if ledger is None or not ledger.circuit_open:
-            return True
-        current_identity = self.authoritative_pre_dispatch_material_identity(
-            operation_id=operation_id,
+        return ledger is None or not ledger.circuit_open
+
+    def authorize_authoritative_pre_dispatch_preflight(
+        self,
+        *,
+        request_id: str,
+        operation_id: str,
+        operation_epoch: int,
+        action_name: str,
+        actor: str,
+        requested_arguments: Sequence[Any],
+        opened_command_id: str,
+        opened_attempt_id: str,
+        opened_attempt_ordinal: int,
+        blocked_material_legality_identity: str,
+        builder_tag: int | None,
+        ability_id: int | None,
+        world_target: tuple[float, float] | None,
+        target_state_revision: str | None,
+        observation_revision: str | None,
+        observation_game_loop: int | None,
+        invalid_evidence_reasons: Sequence[str] = (),
+    ) -> RawAuthoritativeBuildPreflightResult:
+        """Atomically reset one open Raw circuit and mint one exact authorization."""
+
+        normalized_operation = str(operation_id)
+        normalized_request = str(request_id)
+        normalized_arguments = tuple(deepcopy(tuple(requested_arguments)))
+        base: dict[str, Any] = {
+            "request_id": normalized_request,
+            "operation_id": normalized_operation,
+            "operation_epoch": int(operation_epoch),
+            "action_name": str(action_name),
+            "actor": str(actor),
+            "requested_arguments": normalized_arguments,
+            "opened_command_id": str(opened_command_id),
+            "opened_attempt_id": str(opened_attempt_id),
+            "opened_attempt_ordinal": int(opened_attempt_ordinal),
+            "blocked_material_legality_identity": str(blocked_material_legality_identity),
+            "builder_tag": None if builder_tag is None else int(builder_tag),
+            "ability_id": None if ability_id is None else int(ability_id),
+            "world_target": world_target,
+            "target_state_revision": (
+                None if target_state_revision is None else str(target_state_revision)
+            ),
+            "observation_revision": (
+                None if observation_revision is None else str(observation_revision)
+            ),
+            "observation_game_loop": (
+                None if observation_game_loop is None else int(observation_game_loop)
+            ),
+        }
+        ledger = self._operation_authoritative_pre_dispatch.get(normalized_operation)
+        pending = self._pending_authoritative_build_preflights.get(normalized_operation)
+        if pending is not None:
+            if pending.result.request_id == normalized_request:
+                return RawAuthoritativeBuildPreflightResult(
+                    **base,
+                    status="deferred",
+                    authorized=False,
+                    reason="preflight_request_replayed",
+                    circuit_open=False,
+                    material_legality_identity=pending.result.material_legality_identity,
+                    expires_game_loop=pending.result.expires_game_loop,
+                    invalid_evidence_reasons=("preflight_request_replayed",),
+                )
+            self._invalidate_pending_authoritative_build_preflight(
+                normalized_operation,
+                reason="authorization_superseded",
+            )
+            ledger = self._operation_authoritative_pre_dispatch.get(normalized_operation)
+        if normalized_request in self._seen_authoritative_build_preflight_request_ids:
+            return RawAuthoritativeBuildPreflightResult(
+                **base,
+                status="deferred",
+                authorized=False,
+                reason="preflight_request_replayed",
+                circuit_open=bool(ledger is not None and ledger.circuit_open),
+                invalid_evidence_reasons=("preflight_request_replayed",),
+            )
+
+        expected_attempt = (
+            _authoritative_attempt_identity(
+                normalized_operation,
+                str(opened_command_id),
+                int(opened_attempt_ordinal),
+            )
+            if _OPERATION_IDENTITY.fullmatch(normalized_operation) is not None
+            else None
+        )
+        expected_request = (
+            _authoritative_build_preflight_request_identity(
+                operation_id=normalized_operation,
+                operation_epoch=int(operation_epoch),
+                action_name=str(action_name),
+                actor=str(actor),
+                requested_arguments=normalized_arguments,
+                opened_command_id=str(opened_command_id),
+                opened_attempt_id=str(opened_attempt_id),
+                opened_attempt_ordinal=int(opened_attempt_ordinal),
+                blocked_material_legality_identity=str(blocked_material_legality_identity),
+                observation_revision=str(observation_revision),
+                observation_game_loop=int(observation_game_loop),
+            )
+            if observation_revision is not None and observation_game_loop is not None
+            else None
+        )
+        material_identity = self.authoritative_pre_dispatch_material_identity(
+            operation_id=normalized_operation,
+            builder_tag=builder_tag,
+            ability_id=ability_id,
+            world_target=world_target,
+            target_state_revision=target_state_revision,
+        )
+        invalid_reasons = tuple(
+            dict.fromkeys(
+                (
+                    *invalid_evidence_reasons,
+                    *(
+                        reason
+                        for reason, invalid in (
+                            (
+                                "request_id_invalid",
+                                _BUILD_PREFLIGHT_REQUEST_IDENTITY.fullmatch(normalized_request)
+                                is None
+                                or expected_request is None
+                                or normalized_request != expected_request,
+                            ),
+                            (
+                                "operation_id_invalid",
+                                _OPERATION_IDENTITY.fullmatch(normalized_operation) is None,
+                            ),
+                            ("operation_epoch_invalid", int(operation_epoch) < 0),
+                            (
+                                "operation_epoch_regressed",
+                                ledger is not None
+                                and int(operation_epoch) < ledger.operation_epoch,
+                            ),
+                            ("action_name_invalid", not str(action_name).startswith("Build_")),
+                            ("actor_missing", not str(actor)),
+                            ("opened_command_id_missing", not str(opened_command_id)),
+                            (
+                                "opened_attempt_id_invalid",
+                                _ATTEMPT_IDENTITY.fullmatch(str(opened_attempt_id)) is None
+                                or expected_attempt is None
+                                or str(opened_attempt_id) != expected_attempt,
+                            ),
+                            (
+                                "blocked_material_legality_identity_invalid",
+                                _BUILD_LEGALITY_IDENTITY.fullmatch(
+                                    str(blocked_material_legality_identity)
+                                )
+                                is None,
+                            ),
+                            ("builder_tag_missing", not _is_positive_int(builder_tag)),
+                            ("ability_id_missing", not _is_positive_int(ability_id)),
+                            ("world_target_missing", not _is_finite_point(world_target)),
+                            (
+                                "target_state_revision_missing",
+                                target_state_revision is None or not str(target_state_revision),
+                            ),
+                            (
+                                "observation_revision_missing",
+                                observation_revision is None or not str(observation_revision),
+                            ),
+                            (
+                                "observation_game_loop_missing",
+                                observation_game_loop is None or int(observation_game_loop) < 0,
+                            ),
+                            ("material_legality_identity_invalid", material_identity is None),
+                        )
+                        if invalid
+                    ),
+                )
+            )
+        )
+        generation_matches = bool(
+            ledger is not None
+            and ledger.circuit_open
+            and ledger.action_name == str(action_name)
+            and ledger.last_command_id == str(opened_command_id)
+            and ledger.last_attempt_ordinal == int(opened_attempt_ordinal)
+            and str(opened_attempt_id) == expected_attempt
+            and ledger.blocked_material_legality_identity == str(blocked_material_legality_identity)
+        )
+        if not generation_matches:
+            invalid_reasons = (*invalid_reasons, "open_generation_mismatch")
+        self._seen_authoritative_build_preflight_request_ids.add(normalized_request)
+        if invalid_reasons or ledger is None:
+            return RawAuthoritativeBuildPreflightResult(
+                **base,
+                status="deferred",
+                authorized=False,
+                reason="invalid_preflight_evidence",
+                circuit_open=bool(ledger is not None and ledger.circuit_open),
+                material_legality_identity=material_identity,
+                invalid_evidence_reasons=invalid_reasons,
+            )
+        material_change_reason = self._authoritative_pre_dispatch_material_change_reason(
+            ledger,
+            operation_epoch=int(operation_epoch),
+            builder_tag=builder_tag,
+            ability_id=ability_id,
+            world_target=world_target,
+            target_state_revision=target_state_revision,
+        )
+        if material_change_reason is None:
+            return RawAuthoritativeBuildPreflightResult(
+                **base,
+                status="deferred",
+                authorized=False,
+                reason="material_change_not_authoritative",
+                circuit_open=True,
+                material_legality_identity=material_identity,
+                invalid_evidence_reasons=("material_change_not_authoritative",),
+            )
+
+        assert material_identity is not None
+        assert builder_tag is not None
+        assert ability_id is not None
+        assert world_target is not None
+        assert target_state_revision is not None
+        assert observation_revision is not None
+        assert observation_game_loop is not None
+        expires_game_loop = int(observation_game_loop) + _AUTHORITATIVE_PREFLIGHT_TTL_GAME_LOOPS
+        authorization_payload = {
+            "request_id": normalized_request,
+            "operation_id": normalized_operation,
+            "operation_epoch": int(operation_epoch),
+            "action_name": str(action_name),
+            "builder_tag": int(builder_tag),
+            "ability_id": int(ability_id),
+            "world_target": [float(world_target[0]), float(world_target[1])],
+            "target_state_revision": str(target_state_revision),
+            "material_legality_identity": material_identity,
+            "observation_revision": str(observation_revision),
+            "observation_game_loop": int(observation_game_loop),
+            "expires_game_loop": expires_game_loop,
+        }
+        authorization_id = (
+            "build-preflight-authorization:"
+            + hashlib.sha256(
+                json.dumps(
+                    authorization_payload,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+            ).hexdigest()
+        )
+        result = RawAuthoritativeBuildPreflightResult(
+            **base,
+            status="authorized",
+            authorized=True,
+            reason="authoritative_material_change",
+            circuit_open=False,
+            material_legality_identity=material_identity,
+            expires_game_loop=expires_game_loop,
+            authorization_id=authorization_id,
+            state_transition="open_to_reset",
+            material_change_reason=material_change_reason,
+        )
+        self._pending_authoritative_build_preflights[normalized_operation] = (
+            _PendingAuthoritativeBuildPreflight(
+                result=result,
+                previous_streak=ledger.streak,
+                previous_status=ledger.last_status,
+                previous_operation_epoch=ledger.operation_epoch,
+                previous_blocked_material_legality_identity=str(
+                    ledger.blocked_material_legality_identity
+                ),
+            )
+        )
+        ledger.streak = 0
+        ledger.circuit_open = False
+        ledger.operation_epoch = int(operation_epoch)
+        ledger.blocked_material_legality_identity = None
+        ledger.last_status = RawAuthoritativePreDispatchStatus.RESET.value
+        return result
+
+    def consume_authoritative_pre_dispatch_authorization(
+        self,
+        *,
+        authorization_id: str,
+        request_id: str,
+        operation_id: str,
+        operation_epoch: int,
+        action_name: str,
+        builder_tag: int | None,
+        ability_id: int | None,
+        world_target: tuple[float, float] | None,
+        target_state_revision: str | None,
+        material_legality_identity: str | None,
+        observation_game_loop: int,
+        authorization_claim: Mapping[str, Any] | None = None,
+        consume: bool = True,
+    ) -> RawAuthoritativeBuildPreflightResult:
+        """Consume one authorization exactly once before reservation or approach."""
+
+        normalized_operation = str(operation_id)
+        pending = self._pending_authoritative_build_preflights.get(normalized_operation)
+        if (
+            pending is None
+            or str(authorization_id)
+            in self._consumed_authoritative_build_preflight_authorization_ids
+        ):
+            return self._authorization_consumption_failure(
+                operation_id=normalized_operation,
+                request_id=str(request_id),
+                authorization_id=str(authorization_id),
+                reason="authorization_missing_or_replayed",
+            )
+        expected = pending.result
+        expected_claim = expected.to_dict()
+        claim_matches = authorization_claim is None or all(
+            authorization_claim.get(key) == value for key, value in expected_claim.items()
+        )
+        actual_material = self.authoritative_pre_dispatch_material_identity(
+            operation_id=normalized_operation,
             builder_tag=builder_tag,
             ability_id=ability_id,
             world_target=world_target,
             target_state_revision=target_state_revision,
             material_legality_identity=material_legality_identity,
         )
-        if current_identity is None or ledger.blocked_material_legality_identity is None:
-            return False
-        return (
-            self._authoritative_pre_dispatch_material_change_reason(
-                ledger,
-                builder_tag=builder_tag,
-                ability_id=ability_id,
-                world_target=world_target,
-                target_state_revision=target_state_revision,
-            )
-            is not None
+        matches = bool(
+            _BUILD_PREFLIGHT_AUTHORIZATION_IDENTITY.fullmatch(str(authorization_id))
+            and claim_matches
+            and str(authorization_id) == expected.authorization_id
+            and str(request_id) == expected.request_id
+            and int(operation_epoch) == expected.operation_epoch
+            and str(action_name) == expected.action_name
+            and builder_tag == expected.builder_tag
+            and ability_id == expected.ability_id
+            and world_target == expected.world_target
+            and target_state_revision == expected.target_state_revision
+            and actual_material == expected.material_legality_identity
+            and int(observation_game_loop) <= int(expected.expires_game_loop or -1)
         )
+        if not matches:
+            self._invalidate_pending_authoritative_build_preflight(
+                normalized_operation,
+                reason="authorization_identity_mismatch_or_expired",
+            )
+            return self._authorization_consumption_failure(
+                operation_id=normalized_operation,
+                request_id=str(request_id),
+                authorization_id=str(authorization_id),
+                reason="authorization_identity_mismatch_or_expired",
+            )
+        if not consume:
+            return replace(expected, status="validated", reason="authorization_validated")
+        self._pending_authoritative_build_preflights.pop(normalized_operation, None)
+        self._consumed_authoritative_build_preflight_authorization_ids.add(str(authorization_id))
+        self._consumed_authoritative_build_preflights[normalized_operation] = expected
+        return replace(expected, status="consumed", reason="authorization_consumed")
+
+    def _authorization_consumption_failure(
+        self,
+        *,
+        operation_id: str,
+        request_id: str,
+        authorization_id: str,
+        reason: str,
+    ) -> RawAuthoritativeBuildPreflightResult:
+        ledger = self._operation_authoritative_pre_dispatch.get(operation_id)
+        return RawAuthoritativeBuildPreflightResult(
+            request_id=request_id,
+            authorization_id=authorization_id,
+            operation_id=operation_id,
+            operation_epoch=0,
+            action_name=(
+                "Build_Unknown" if ledger is None else ledger.action_name or "Build_Unknown"
+            ),
+            actor="unknown",
+            requested_arguments=(),
+            opened_command_id=(
+                "unknown" if ledger is None else ledger.last_command_id or "unknown"
+            ),
+            opened_attempt_id=(
+                _authoritative_attempt_identity(
+                    operation_id,
+                    ledger.last_command_id,
+                    ledger.last_attempt_ordinal,
+                )
+                if ledger is not None
+                and ledger.last_command_id is not None
+                and ledger.last_attempt_ordinal is not None
+                else f"attempt:{'0' * 64}"
+            ),
+            opened_attempt_ordinal=(
+                0
+                if ledger is None or ledger.last_attempt_ordinal is None
+                else ledger.last_attempt_ordinal
+            ),
+            blocked_material_legality_identity=(
+                f"build-legality:{'0' * 64}"
+                if ledger is None or ledger.blocked_material_legality_identity is None
+                else ledger.blocked_material_legality_identity
+            ),
+            status="deferred",
+            authorized=False,
+            reason=reason,
+            circuit_open=bool(ledger is not None and ledger.circuit_open),
+            invalid_evidence_reasons=(reason,),
+        )
+
+    def _invalidate_pending_authoritative_build_preflight(
+        self,
+        operation_id: str,
+        *,
+        reason: str,
+    ) -> None:
+        pending = self._pending_authoritative_build_preflights.pop(operation_id, None)
+        ledger = self._operation_authoritative_pre_dispatch.get(operation_id)
+        if pending is None or ledger is None:
+            return
+        if pending.result.authorization_id is not None:
+            self._consumed_authoritative_build_preflight_authorization_ids.add(
+                pending.result.authorization_id
+            )
+        ledger.streak = pending.previous_streak
+        ledger.circuit_open = True
+        ledger.operation_epoch = pending.previous_operation_epoch
+        ledger.last_status = RawAuthoritativePreDispatchStatus.DEFER_REPLAN.value
+        ledger.blocked_material_legality_identity = (
+            pending.previous_blocked_material_legality_identity
+        )
+        ledger.last_failure_code = reason
 
     @staticmethod
     def _authoritative_pre_dispatch_material_change_reason(
         ledger: _OperationAuthoritativePreDispatchLedger,
         *,
+        operation_epoch: int,
         builder_tag: int | None,
         ability_id: int | None,
         world_target: tuple[float, float] | None,
@@ -1161,6 +1769,8 @@ class RawPlacementService:
     ) -> str | None:
         """Recognize only state changes that can alter the failed authorization."""
 
+        if int(operation_epoch) > ledger.operation_epoch:
+            return "operation_epoch_changed"
         normalized_builder = None if builder_tag is None else int(builder_tag)
         if (
             normalized_builder is not None
@@ -1214,6 +1824,11 @@ class RawPlacementService:
 
         normalized_operation = None if operation_id is None else str(operation_id)
         normalized_attempt = None if attempt_id is None else str(attempt_id)
+        if normalized_operation is not None:
+            self._consumed_authoritative_build_preflights.pop(
+                normalized_operation,
+                None,
+            )
         if normalized_operation is not None and _OPERATION_IDENTITY.fullmatch(normalized_operation):
             expected_attempt = (
                 None
@@ -1322,30 +1937,14 @@ class RawPlacementService:
             status = RawAuthoritativePreDispatchStatus.DUPLICATE.value
             next_action = "defer_replan" if ledger.circuit_open else "retry"
         elif ledger.circuit_open:
-            material_change_reason = (
-                self._authoritative_pre_dispatch_material_change_reason(
-                    ledger,
-                    builder_tag=builder_tag,
-                    ability_id=ability_id,
-                    world_target=world_target,
-                    target_state_revision=target_state_revision,
-                )
-                if material_evidence_valid and ledger.blocked_material_legality_identity is not None
-                else None
-            )
-            if material_change_reason is not None:
-                ledger.streak = 0
-                ledger.circuit_open = False
-                ledger.blocked_material_legality_identity = None
-                transition = "open_to_reset"
-                reset_reason = "material_state_changed"
-                ledger.last_status = RawAuthoritativePreDispatchStatus.RESET.value
-            else:
-                ledger.seen_command_ids.add(str(command_id))
-                if attempt_ordinal is not None:
-                    ledger.seen_attempt_ordinals.add(int(attempt_ordinal))
-                status = RawAuthoritativePreDispatchStatus.DEFER_REPLAN.value
-                next_action = "replan"
+            # Dispatch-time evidence cannot close an already-open circuit. Only
+            # the side-effect-free preflight handshake may mint an authorization
+            # and atomically perform open_to_reset.
+            ledger.seen_command_ids.add(str(command_id))
+            if attempt_ordinal is not None:
+                ledger.seen_attempt_ordinals.add(int(attempt_ordinal))
+            status = RawAuthoritativePreDispatchStatus.DEFER_REPLAN.value
+            next_action = "preflight_required"
         if not duplicate_attempt and not ledger.circuit_open:
             ledger.seen_command_ids.add(str(command_id))
             if attempt_ordinal is not None:
@@ -1519,7 +2118,24 @@ class RawPlacementService:
                 invalid_evidence_reasons=invalid_evidence_reasons,
                 next_action="replan" if ledger.circuit_open else "retry",
             )
-        had_state = ledger.streak > 0 or ledger.circuit_open
+        pending = self._pending_authoritative_build_preflights.pop(
+            normalized_operation,
+            None,
+        )
+        consumed_preflight = self._consumed_authoritative_build_preflights.pop(
+            normalized_operation,
+            None,
+        )
+        if pending is not None and pending.result.authorization_id is not None:
+            self._consumed_authoritative_build_preflight_authorization_ids.add(
+                pending.result.authorization_id
+            )
+        had_state = bool(
+            ledger.streak > 0
+            or ledger.circuit_open
+            or pending is not None
+            or consumed_preflight is not None
+        )
         was_open = ledger.circuit_open
         ledger.streak = 0
         ledger.circuit_open = False

@@ -18,6 +18,10 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+from rtscortex.contracts import (
+    authoritative_build_preflight_authorization_id,
+    authoritative_build_preflight_request_id,
+)
 from rtscortex.evaluation.engineering import authoritative_build_pre_dispatch_audit
 from rtscortex.evaluation.report import _build_run_summary
 from rtscortex.memory import read_event_log
@@ -27,6 +31,8 @@ _SHA64_RE = re.compile(r"[0-9a-f]{64}\Z")
 _OPERATION_RE = re.compile(r"operation:[0-9a-f]{64}\Z")
 _ATTEMPT_RE = re.compile(r"attempt:[0-9a-f]{64}\Z")
 _BUILD_LEGALITY_RE = re.compile(r"build-legality:[0-9a-f]{64}\Z")
+_PREFLIGHT_REQUEST_RE = re.compile(r"build-preflight:[0-9a-f]{64}\Z")
+_PREFLIGHT_AUTHORIZATION_RE = re.compile(r"build-preflight-authorization:[0-9a-f]{64}\Z")
 _SEMANTIC_MATERIAL_RE = re.compile(r"semantic-build-material:[0-9a-f]{64}\Z")
 _CANARY_JOURNAL_NAME = "authoritative-build-circuit-canary.jsonl"
 _PHASE_EVENT_TYPE = "authoritative_build_circuit_canary_phase"
@@ -44,6 +50,7 @@ _PHASES = (
     "circuit_open_observed",
     "core_defer_observed",
     "builder_rebound",
+    "preflight_authorized",
     "reset_command_observed",
     "reset_dispatch_observed",
     "reset_dispatch_submitted",
@@ -191,6 +198,128 @@ def _dispatch_authority(payload: Mapping[str, Any], *, phase: str) -> Mapping[st
     if not isinstance(fingerprint, str) or not fingerprint:
         raise CanaryArtifactError(f"{phase}: target legality fingerprint is missing")
     return merged
+
+
+def _canonical_preflight_phase(
+    payload: Mapping[str, Any],
+    *,
+    operation_id: str,
+    opening_command_id: str,
+    opening_attempt_id: str,
+    replacement_builder: int,
+) -> tuple[str, Mapping[str, Any], Mapping[str, Any]]:
+    """Validate the side-effect-free Raw authorization journal phase."""
+
+    phase = "preflight_authorized"
+    request = payload.get("preflight_request")
+    result = payload.get("preflight_result")
+    if not isinstance(request, Mapping) or not isinstance(result, Mapping):
+        raise CanaryArtifactError(f"{phase}: request/result evidence is missing")
+    arguments = request.get("requested_arguments")
+    if not isinstance(arguments, list):
+        raise CanaryArtifactError(f"{phase}: requested_arguments is not canonical")
+    request_id = request.get("request_id")
+    try:
+        expected_request_id = authoritative_build_preflight_request_id(
+            operation_id=str(request["operation_id"]),
+            operation_epoch=int(request["operation_epoch"]),
+            action_name=str(request["action_name"]),
+            actor=str(request["actor"]),
+            requested_arguments=arguments,
+            opened_command_id=str(request["opened_command_id"]),
+            opened_attempt_id=str(request["opened_attempt_id"]),
+            opened_attempt_ordinal=int(request["opened_attempt_ordinal"]),
+            blocked_material_legality_identity=str(request["blocked_material_legality_identity"]),
+            observation_revision=str(request["observation_revision"]),
+            observation_game_loop=int(request["observation_game_loop"]),
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise CanaryArtifactError(f"{phase}: request identity is malformed") from error
+    if (
+        not isinstance(request_id, str)
+        or _PREFLIGHT_REQUEST_RE.fullmatch(request_id) is None
+        or request_id != expected_request_id
+        or request.get("operation_id") != operation_id
+        or request.get("operation_epoch") != 0
+        or request.get("action_name") != _RUNTIME_ACTION
+        or request.get("opened_command_id") != opening_command_id
+        or request.get("opened_attempt_id") != opening_attempt_id
+        or request.get("opened_attempt_ordinal") != 2
+        or _BUILD_LEGALITY_RE.fullmatch(str(request.get("blocked_material_legality_identity", "")))
+        is None
+    ):
+        raise CanaryArtifactError(f"{phase}: request does not bind the open generation")
+
+    world_target = _runtime_world_target(result.get("world_target"), phase=phase)
+    authorization_id = result.get("authorization_id")
+    try:
+        expected_authorization_id = authoritative_build_preflight_authorization_id(
+            request_id=request_id,
+            operation_id=str(result["operation_id"]),
+            operation_epoch=int(result["operation_epoch"]),
+            action_name=str(result["action_name"]),
+            builder_tag=int(result["builder_tag"]),
+            ability_id=int(result["ability_id"]),
+            world_target=world_target,
+            target_state_revision=str(result["target_state_revision"]),
+            material_legality_identity=str(result["material_legality_identity"]),
+            observation_revision=str(result["observation_revision"]),
+            observation_game_loop=int(result["observation_game_loop"]),
+            expires_game_loop=int(result["expires_game_loop"]),
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise CanaryArtifactError(f"{phase}: authorization identity is malformed") from error
+    shared_fields = (
+        "request_id",
+        "operation_id",
+        "operation_epoch",
+        "action_name",
+        "actor",
+        "requested_arguments",
+        "opened_command_id",
+        "opened_attempt_id",
+        "opened_attempt_ordinal",
+        "blocked_material_legality_identity",
+    )
+    if (
+        any(result.get(field) != request.get(field) for field in shared_fields)
+        or not isinstance(authorization_id, str)
+        or _PREFLIGHT_AUTHORIZATION_RE.fullmatch(authorization_id) is None
+        or authorization_id != expected_authorization_id
+        or result.get("authorized") is not True
+        or result.get("status") != "authorized"
+        or result.get("circuit_open") is not False
+        or result.get("state_transition") != "open_to_reset"
+        or result.get("material_change_reason") != "builder_changed"
+        or _runtime_builder_tag(result.get("builder_tag"), phase=phase) != replacement_builder
+        or _runtime_ability_id(result.get("ability_id"), phase=phase) <= 0
+        or _BUILD_LEGALITY_RE.fullmatch(str(result.get("material_legality_identity", ""))) is None
+        or not isinstance(result.get("target_state_revision"), str)
+        or not result.get("target_state_revision")
+        or not isinstance(result.get("observation_revision"), str)
+        or not result.get("observation_revision")
+        or type(result.get("observation_game_loop")) is not int
+        or type(result.get("expires_game_loop")) is not int
+        or result["expires_game_loop"] < result["observation_game_loop"]
+        or result.get("invalid_evidence_reasons") != []
+    ):
+        raise CanaryArtifactError(f"{phase}: authorization is not exact and canonical")
+    if (
+        payload.get("request_id") != request_id
+        or payload.get("authorization_id") != authorization_id
+    ):
+        raise CanaryArtifactError(f"{phase}: parent preflight identity mismatch")
+    state = payload.get("authoritative_state")
+    if not isinstance(state, Mapping) or (
+        state.get("streak") != 0
+        or state.get("circuit_open") is not False
+        or state.get("pending_authorization_id") != authorization_id
+    ):
+        raise CanaryArtifactError(f"{phase}: Raw reset/authorization was not atomic")
+    if payload.get("command_count") != 0:
+        raise CanaryArtifactError(f"{phase}: preflight created a gameplay command")
+    _zero_ownership(payload, phase=phase)
+    return authorization_id, request, result
 
 
 def _read_phase_journal(path: Path) -> list[dict[str, Any]]:
@@ -409,6 +538,23 @@ def _replay_phases(events: Sequence[Mapping[str, Any]], *, expected_seed: int) -
     }:
         raise CanaryArtifactError("builder rebound did not observe a fresh material revision")
 
+    preflight = next(event for event in events if event["phase"] == "preflight_authorized")
+    _operation(preflight, phase="preflight_authorized", expected=operation_id)
+    _semantic_action(preflight, phase="preflight_authorized", expected=action)
+    if preflight.get("reason") != "raw_exact_identity_open_to_reset":
+        raise CanaryArtifactError("preflight authorization reason is not authoritative")
+    if preflight.get("builder_tag") != initial_builder:
+        raise CanaryArtifactError("preflight opener Builder changed")
+    if preflight.get("replacement_builder_tag") != replacement_builder:
+        raise CanaryArtifactError("preflight replacement Builder changed")
+    authorization_id, _preflight_request, preflight_result = _canonical_preflight_phase(
+        preflight,
+        operation_id=operation_id,
+        opening_command_id=str(open_event["command_id"]),
+        opening_attempt_id=str(open_event["attempt_id"]),
+        replacement_builder=replacement_builder,
+    )
+
     reset_command = next(event for event in events if event["phase"] == "reset_command_observed")
     reset_operation, reset_attempt, reset_ordinal = _identity(
         reset_command, phase="reset_command_observed"
@@ -419,8 +565,22 @@ def _replay_phases(events: Sequence[Mapping[str, Any]], *, expected_seed: int) -
         )
     _semantic_action(reset_command, phase="reset_command_observed", expected=action)
     _runtime_action(reset_command, phase="reset_command_observed")
-    if reset_command.get("reason") != "validated_builder_material_change":
-        raise CanaryArtifactError("reset command does not prove material builder change")
+    if reset_command.get("reason") != "raw_preflight_authorized":
+        raise CanaryArtifactError("reset command does not reference Raw authorization")
+    if reset_command.get("authorization_id") != authorization_id:
+        raise CanaryArtifactError("reset command authorization identity changed")
+    command_authorization = reset_command.get("authoritative_build_preflight")
+    if not isinstance(command_authorization, Mapping) or dict(command_authorization) != dict(
+        preflight_result
+    ):
+        raise CanaryArtifactError("reset command does not carry the exact Raw authorization")
+    raw_state = reset_command.get("authoritative_state")
+    if not isinstance(raw_state, Mapping) or (
+        raw_state.get("streak") != 0
+        or raw_state.get("circuit_open") is not False
+        or raw_state.get("pending_authorization_id") != authorization_id
+    ):
+        raise CanaryArtifactError("reset command did not observe pending Raw authorization")
     reset_builder = _positive_int(
         reset_command.get("builder_tag"), label="reset_command.builder_tag"
     )
@@ -455,6 +615,13 @@ def _replay_phases(events: Sequence[Mapping[str, Any]], *, expected_seed: int) -
             raise CanaryArtifactError(f"{phase}: authority snapshot lacks primitive construction")
     if dispatch.get("primitive_submitted") is not False:
         raise CanaryArtifactError("reset_dispatch_observed prematurely claims submission")
+    dispatch_state = dispatch.get("authoritative_state")
+    if not isinstance(dispatch_state, Mapping) or (
+        dispatch_state.get("streak") != 0
+        or dispatch_state.get("circuit_open") is not False
+        or dispatch_state.get("pending_authorization_id") is not None
+    ):
+        raise CanaryArtifactError("reset dispatch did not consume the exact Raw authorization")
     if submitted.get("primitive_submitted") is not True:
         raise CanaryArtifactError("reset_dispatch_submitted does not prove submission")
     submitted_authority = _dispatch_authority(submitted, phase="reset_dispatch_submitted")
@@ -512,6 +679,7 @@ def _replay_phases(events: Sequence[Mapping[str, Any]], *, expected_seed: int) -
         "failure_attempt_ids": failure_attempts,
         "failure_attempt_ordinals": failure_ordinals,
         "reset_attempt_id": reset_attempt,
+        "preflight_authorization_id": authorization_id,
         "initial_builder_tag": initial_builder,
         "replacement_builder_tag": replacement_builder,
         "failure_count": len(failure_events),
@@ -701,8 +869,10 @@ def _runtime_validate_success_reset_contract(
                 f"raw success reset: {field} does not match successful reservation/effect"
             )
 
-    if nested.get("state_transition") != "open_to_reset":
-        raise CanaryArtifactError("raw success reset: nested state transition is not open_to_reset")
+    if nested.get("state_transition") is not None:
+        raise CanaryArtifactError(
+            "raw success reset: open_to_reset must occur only in the preflight authorization"
+        )
     if nested.get("failure_code") != "build_started":
         raise CanaryArtifactError(
             "raw success reset: nested reset failure_code is not build_started"
@@ -841,6 +1011,8 @@ def _runtime_engineering_circuit_contract(
         "post_open_command_count": audit.get("post_open_command_count"),
         "post_open_dispatch_count": audit.get("post_open_dispatch_count"),
         "post_open_rejection_count": audit.get("post_open_rejection_count"),
+        "post_open_primitive_count": audit.get("post_open_primitive_count"),
+        "post_open_approach_primitive_count": audit.get("post_open_approach_primitive_count"),
     }
     metrics["consistent"] = metrics == {
         "failure_count": 3,
@@ -852,6 +1024,8 @@ def _runtime_engineering_circuit_contract(
         "post_open_command_count": 0,
         "post_open_dispatch_count": 0,
         "post_open_rejection_count": 0,
+        "post_open_primitive_count": 0,
+        "post_open_approach_primitive_count": 0,
     }
     return metrics
 
@@ -1022,6 +1196,133 @@ def _replay_runtime_events(
     if defer.get("builder_tag") is not None and defer.get("builder_tag") != initial_builder:
         raise CanaryArtifactError("runtime Core defer Builder changed before rebind")
 
+    preflight_request_events = [
+        event
+        for event in ordered
+        if _runtime_event_type(event) == "authoritative_build_pre_dispatch_preflight_requested"
+        and isinstance(_runtime_payload(event).get("request"), Mapping)
+        and _runtime_payload(event)["request"].get("operation_id") == operation_id
+    ]
+    preflight_result_events = [
+        event
+        for event in ordered
+        if _runtime_event_type(event) == "authoritative_build_pre_dispatch_preflight"
+        and isinstance(_runtime_payload(event).get("result"), Mapping)
+        and _runtime_payload(event)["result"].get("operation_id") == operation_id
+    ]
+    if len(preflight_request_events) != 1 or len(preflight_result_events) != 1:
+        raise CanaryArtifactError(
+            "runtime must contain exactly one preflight request and authorization"
+        )
+    preflight_request_event = preflight_request_events[0]
+    preflight_result_event = preflight_result_events[0]
+    preflight_request_payload = _runtime_payload(preflight_request_event)
+    preflight_result_payload = _runtime_payload(preflight_result_event)
+    request = preflight_request_payload["request"]
+    result = preflight_result_payload["result"]
+    assert isinstance(request, Mapping)
+    assert isinstance(result, Mapping)
+    if not (
+        _runtime_event_id(defer_event)
+        < _runtime_event_id(preflight_request_event)
+        < _runtime_event_id(preflight_result_event)
+    ):
+        raise CanaryArtifactError("runtime preflight did not follow the open/defer boundary")
+    request_arguments = request.get("requested_arguments")
+    if not isinstance(request_arguments, list):
+        raise CanaryArtifactError("runtime preflight requested_arguments is malformed")
+    try:
+        expected_request_id = authoritative_build_preflight_request_id(
+            operation_id=str(request["operation_id"]),
+            operation_epoch=int(request["operation_epoch"]),
+            action_name=str(request["action_name"]),
+            actor=str(request["actor"]),
+            requested_arguments=request_arguments,
+            opened_command_id=str(request["opened_command_id"]),
+            opened_attempt_id=str(request["opened_attempt_id"]),
+            opened_attempt_ordinal=int(request["opened_attempt_ordinal"]),
+            blocked_material_legality_identity=str(request["blocked_material_legality_identity"]),
+            observation_revision=str(request["observation_revision"]),
+            observation_game_loop=int(request["observation_game_loop"]),
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise CanaryArtifactError("runtime preflight request is malformed") from error
+    request_id = request.get("request_id")
+    if (
+        request_id != expected_request_id
+        or not isinstance(request_id, str)
+        or _PREFLIGHT_REQUEST_RE.fullmatch(request_id) is None
+        or request.get("operation_id") != operation_id
+        or request.get("operation_epoch") != 0
+        or request.get("action_name") != _RUNTIME_ACTION
+        or request.get("opened_command_id") != opening_command_id
+        or request.get("opened_attempt_id") != opening_attempt_id
+        or request.get("opened_attempt_ordinal") != 2
+        or request.get("blocked_material_legality_identity")
+        != open_evidence.get("material_legality_identity")
+        or preflight_request_payload.get("side_effect_free") is not True
+    ):
+        raise CanaryArtifactError("runtime preflight request does not bind the open generation")
+    result_world_target = _runtime_world_target(
+        result.get("world_target"), phase="runtime preflight"
+    )
+    try:
+        expected_authorization_id = authoritative_build_preflight_authorization_id(
+            request_id=request_id,
+            operation_id=str(result["operation_id"]),
+            operation_epoch=int(result["operation_epoch"]),
+            action_name=str(result["action_name"]),
+            builder_tag=int(result["builder_tag"]),
+            ability_id=int(result["ability_id"]),
+            world_target=result_world_target,
+            target_state_revision=str(result["target_state_revision"]),
+            material_legality_identity=str(result["material_legality_identity"]),
+            observation_revision=str(result["observation_revision"]),
+            observation_game_loop=int(result["observation_game_loop"]),
+            expires_game_loop=int(result["expires_game_loop"]),
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise CanaryArtifactError("runtime preflight authorization is malformed") from error
+    authorization_id = result.get("authorization_id")
+    shared_preflight_fields = (
+        "request_id",
+        "operation_id",
+        "operation_epoch",
+        "action_name",
+        "actor",
+        "requested_arguments",
+        "opened_command_id",
+        "opened_attempt_id",
+        "opened_attempt_ordinal",
+        "blocked_material_legality_identity",
+    )
+    if (
+        any(result.get(field) != request.get(field) for field in shared_preflight_fields)
+        or authorization_id != expected_authorization_id
+        or not isinstance(authorization_id, str)
+        or _PREFLIGHT_AUTHORIZATION_RE.fullmatch(authorization_id) is None
+        or result.get("authorized") is not True
+        or result.get("status") != "authorized"
+        or result.get("circuit_open") is not False
+        or result.get("state_transition") != "open_to_reset"
+        or result.get("material_change_reason") != "builder_changed"
+        or result.get("builder_tag") != replacement_builder
+        or _runtime_ability_id(result.get("ability_id"), phase="runtime preflight") <= 0
+        or _BUILD_LEGALITY_RE.fullmatch(str(result.get("material_legality_identity", ""))) is None
+        or not isinstance(result.get("target_state_revision"), str)
+        or not result.get("target_state_revision")
+        or not isinstance(result.get("observation_revision"), str)
+        or not result.get("observation_revision")
+        or type(result.get("observation_game_loop")) is not int
+        or type(result.get("expires_game_loop")) is not int
+        or result["expires_game_loop"] < result["observation_game_loop"]
+        or result.get("invalid_evidence_reasons") != []
+        or preflight_result_payload.get("accepted_by_core") is not True
+        or preflight_result_payload.get("invalid_evidence_reasons") != []
+        or authorization_id != phase_replay.get("preflight_authorization_id")
+    ):
+        raise CanaryArtifactError("runtime preflight authorization is not exact")
+
     reset_events = [
         event
         for event in ordered
@@ -1032,34 +1333,33 @@ def _replay_runtime_events(
         raise CanaryArtifactError("runtime must contain exactly one Core circuit reset")
     reset_event = reset_events[0]
     reset = _runtime_payload(reset_event)
-    if _runtime_event_id(reset_event) <= _runtime_event_id(defer_event):
-        raise CanaryArtifactError("Core circuit reset precedes the Core defer")
+    if _runtime_event_id(reset_event) <= _runtime_event_id(preflight_result_event):
+        raise CanaryArtifactError("Core circuit reset precedes Raw authorization")
     if (
         reset.get("action_name") != _RUNTIME_ACTION
-        or reset.get("reason") != "semantic_legality_material_change"
+        or reset.get("reason") != "raw_preflight_authorized"
+        or reset.get("state_transition") != "open_to_reset"
+        or reset.get("authorization_id") != authorization_id
+        or reset.get("request_id") != request_id
+        or reset.get("operation_epoch") != result.get("operation_epoch")
+        or reset.get("opened_command_id") != opening_command_id
+        or reset.get("opened_attempt_id") != opening_attempt_id
+        or reset.get("opened_attempt_ordinal") != 2
+        or reset.get("blocked_material_legality_identity")
+        != open_evidence.get("material_legality_identity")
         or reset.get("reset_from_streak") != 3
-        or reset.get("previous_builder_tag") != initial_builder
-        or reset.get("bound_builder_tag") != replacement_builder
-        or reset.get("operation_epoch_changed") is not False
+        or reset.get("builder_tag") != replacement_builder
+        or reset.get("ability_id") != result.get("ability_id")
+        or _runtime_world_target(reset.get("world_target"), phase="Core reset")
+        != result_world_target
+        or reset.get("target_state_revision") != result.get("target_state_revision")
+        or reset.get("material_legality_identity") != result.get("material_legality_identity")
+        or reset.get("observation_revision") != result.get("observation_revision")
+        or reset.get("authorization_game_loop") != result.get("observation_game_loop")
+        or reset.get("expires_game_loop") != result.get("expires_game_loop")
+        or reset.get("material_change_reason") != result.get("material_change_reason")
     ):
-        raise CanaryArtifactError("Core circuit reset does not prove the Builder material change")
-    for key in (
-        "previous_semantic_material_identity",
-        "current_semantic_material_identity",
-    ):
-        if (
-            not isinstance(reset.get(key), str)
-            or _SEMANTIC_MATERIAL_RE.fullmatch(reset[key]) is None
-        ):
-            raise CanaryArtifactError(f"Core circuit reset lacks {key}")
-    raw_material_identity = reset.get("raw_material_legality_identity")
-    if (
-        not isinstance(raw_material_identity, str)
-        or _BUILD_LEGALITY_RE.fullmatch(raw_material_identity) is None
-    ):
-        raise CanaryArtifactError("Core circuit reset lacks raw_material_legality_identity")
-    if reset["previous_semantic_material_identity"] == reset["current_semantic_material_identity"]:
-        raise CanaryArtifactError("Core circuit reset did not change semantic material identity")
+        raise CanaryArtifactError("Core circuit reset does not exactly match Raw authorization")
 
     reset_event_id = _runtime_event_id(reset_event)
     post_open_command_ids: set[str] = set()
@@ -1159,6 +1459,54 @@ def _replay_runtime_events(
     if _runtime_event_id(success_event) <= reset_event_id:
         raise CanaryArtifactError("ordinal 3 execution precedes Core circuit reset")
 
+    success_command_id = success.get("command_id")
+    authorized_lineages = [
+        event
+        for event in ordered
+        if _runtime_event_type(event) == "command_lineage"
+        and _runtime_payload(event).get("command_id") == success_command_id
+    ]
+    authorized_dispatches = [
+        event
+        for event in ordered
+        if _runtime_event_type(event) == "command_lifecycle"
+        and _runtime_payload(event).get("status") == "dispatched"
+        and isinstance(_runtime_payload(event).get("command"), Mapping)
+        and _runtime_payload(event)["command"].get("command_id") == success_command_id
+    ]
+    if len(authorized_lineages) != 1 or len(authorized_dispatches) != 1:
+        raise CanaryArtifactError(
+            "runtime must contain one authorized lineage and one authorized dispatch"
+        )
+    lineage_event = authorized_lineages[0]
+    dispatch_event = authorized_dispatches[0]
+    lineage_payload = _runtime_payload(lineage_event)
+    dispatch_command = _runtime_payload(dispatch_event)["command"]
+    assert isinstance(dispatch_command, Mapping)
+    lineage = lineage_payload.get("lineage")
+    command_authorization = dispatch_command.get("authoritative_build_preflight")
+    if (
+        not (
+            reset_event_id
+            < _runtime_event_id(lineage_event)
+            <= _runtime_event_id(dispatch_event)
+            < _runtime_event_id(success_event)
+        )
+        or not isinstance(lineage, Mapping)
+        or lineage.get("operation_id") != operation_id
+        or lineage_payload.get("authoritative_build_preflight") != result
+        or command_authorization != result
+        or dispatch_command.get("operation_id") != operation_id
+        or dispatch_command.get("attempt_id") != success.get("attempt_id")
+        or dispatch_command.get("attempt_ordinal") != 3
+        or dispatch_command.get("name") != _RUNTIME_ACTION
+        or dispatch_command.get("actor") != result.get("actor")
+        or dispatch_command.get("arguments") != result.get("requested_arguments")
+    ):
+        raise CanaryArtifactError(
+            "fresh command lineage/dispatch does not exactly match Raw authorization"
+        )
+
     raw_reset_events: list[Any] = []
     released_transition_observed = False
     for event in ordered:
@@ -1208,11 +1556,10 @@ def _replay_runtime_events(
             raise CanaryArtifactError("raw reset parent/nested identity mismatch")
         if parent_action != _RUNTIME_ACTION:
             raise CanaryArtifactError("raw reset action is not Build_Pylon_Screen")
-        if (
-            evidence.get("attempt_ordinal") != 3
-            or evidence.get("state_transition") != "open_to_reset"
-        ):
-            raise CanaryArtifactError("raw reset evidence is not the ordinal 3 open_to_reset")
+        if evidence.get("attempt_ordinal") != 3 or evidence.get("state_transition") is not None:
+            raise CanaryArtifactError(
+                "raw success reset must not repeat the preflight open_to_reset transition"
+            )
         if evidence.get("attempt_id") != _expected_attempt_id(
             operation_id, str(success["command_id"]), 3
         ):
@@ -1250,6 +1597,8 @@ def _replay_runtime_events(
         "runtime_failure_count": len(failures),
         "runtime_open_count": 1,
         "runtime_core_defer_count": len(defer_events),
+        "runtime_preflight_request_count": len(preflight_request_events),
+        "runtime_preflight_authorization_count": len(preflight_result_events),
         "runtime_core_reset_count": len(reset_events),
         "runtime_raw_reset_count": len(raw_reset_events),
         "runtime_released_ownership": released_transition_observed,
@@ -1260,6 +1609,10 @@ def _replay_runtime_events(
         "post_open_command_count": len(post_open_command_ids),
         "post_open_dispatch_count": len(post_open_dispatch_ids),
         "post_open_raw_rejection_count": len(post_open_raw_rejections),
+        "post_open_primitive_count": engineering_circuit["post_open_primitive_count"],
+        "post_open_approach_primitive_count": engineering_circuit[
+            "post_open_approach_primitive_count"
+        ],
         "raw_circuit_open_rejection_count": len(post_open_raw_rejections),
         "open_event_id": open_event_id,
         "defer_event_id": _runtime_event_id(defer_event),

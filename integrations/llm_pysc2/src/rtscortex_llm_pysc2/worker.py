@@ -63,7 +63,7 @@ from rtscortex_llm_pysc2.raw_executor import (
 )
 from rtscortex_llm_pysc2.raw_placement import RawPlacementService, _placement_revision
 from rtscortex_llm_pysc2.research import RESEARCH_SPECS, research_spec
-from rtscortex_llm_pysc2.routing import RoutedCommand
+from rtscortex_llm_pysc2.routing import RoutedBuildPreflightRequest, RoutedCommand
 from rtscortex_llm_pysc2.terminal import (
     TerminalArmyReadiness,
     TerminalCollapseState,
@@ -2120,6 +2120,28 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
                 self.agents,
                 step_id=int(self.steps),
             )
+            preflight_request_ids: set[str] = set()
+            preflight_records: list[tuple[RoutedBuildPreflightRequest, Mapping[str, Any]]] = []
+            for route in decision.routes.values():
+                for request in route.authoritative_build_preflight_requests:
+                    if request.request_id in preflight_request_ids:
+                        continue
+                    preflight_request_ids.add(request.request_id)
+                    preflight_result = self.raw_executor.preflight_authoritative_build(
+                        request,
+                        obs.observation,
+                        self.agents,
+                    )
+                    preflight_payload = {
+                        **preflight_result.to_dict(),
+                        "run_id": request.run_id,
+                        "episode_id": request.episode_id,
+                        "step_id": request.step_id,
+                    }
+                    preflight_records.append((request, preflight_payload))
+                    self.runtime_client.authoritative_build_preflight(preflight_payload)
+            if preflight_request_ids:
+                suppress_worker_actions = True
             if circuit_canary is not None:
                 reservation_count, leased_tags, inflight_count = (
                     _authoritative_canary_execution_ownership(self)
@@ -2133,6 +2155,7 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
                 )
                 canary_decision = circuit_canary.observe_runtime_decision(
                     _routed_decision_commands(decision),
+                    preflight_results=preflight_records,
                     idle_reason=(
                         None
                         if decision.action_batch.get("idle_reason") is None
@@ -2147,7 +2170,9 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
                     effect_inflight_count=inflight_count,
                     authoritative_state=authoritative_state,
                 )
-                suppress_worker_actions = canary_decision.core_defer_observed
+                suppress_worker_actions = bool(
+                    suppress_worker_actions or canary_decision.core_defer_observed
+                )
             self.raw_executor.enqueue(decision)
             self.raw_decision_scheduler.record_decision(
                 game_loop=game_loop,

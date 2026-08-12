@@ -5,6 +5,10 @@ from pathlib import Path
 import pytest
 from rtscortex_llm_pysc2.extractor import BUILD_SPECS
 
+from rtscortex.contracts import (
+    authoritative_build_preflight_authorization_id,
+    authoritative_build_preflight_request_id,
+)
 from rtscortex.cortex.operations import AttemptKey
 from rtscortex.evaluation.engineering import (
     REQUIRED_ENGINEERING_GATES,
@@ -31,6 +35,143 @@ def _event(
         event_type=event_type,
         created_at=f"2026-07-28T00:00:{event_id:02d}+00:00",
         payload=payload,
+    )
+
+
+def _authoritative_preflight_events(
+    *,
+    start_event_id: int,
+    operation_id: str,
+    opener_command_id: str,
+    opener_attempt_ordinal: int,
+    blocked_material_identity: str,
+    builder_tag: int,
+    action_name: str = "Build_Pylon_Screen",
+    actor: str = "Builder/Builder-Probe-1",
+    arguments: list[object] | None = None,
+) -> tuple[list[StoredEvent], dict[str, object]]:
+    resolved_arguments = [[65, 90]] if arguments is None else arguments
+    opened_attempt_id = AttemptKey(
+        operation_id=operation_id,
+        command_id=opener_command_id,
+        attempt_ordinal=opener_attempt_ordinal,
+    ).attempt_id
+    request_id = authoritative_build_preflight_request_id(
+        operation_id=operation_id,
+        operation_epoch=0,
+        action_name=action_name,
+        actor=actor,
+        requested_arguments=resolved_arguments,
+        opened_command_id=opener_command_id,
+        opened_attempt_id=opened_attempt_id,
+        opened_attempt_ordinal=opener_attempt_ordinal,
+        blocked_material_legality_identity=blocked_material_identity,
+        observation_revision="core-observation:80",
+        observation_game_loop=80,
+    )
+    request: dict[str, object] = {
+        "protocol_version": "1.1",
+        "request_id": request_id,
+        "run_id": "run",
+        "episode_id": "episode",
+        "step_id": start_event_id,
+        "operation_id": operation_id,
+        "operation_epoch": 0,
+        "action_name": action_name,
+        "actor": actor,
+        "requested_arguments": resolved_arguments,
+        "opened_command_id": opener_command_id,
+        "opened_attempt_id": opened_attempt_id,
+        "opened_attempt_ordinal": opener_attempt_ordinal,
+        "blocked_material_legality_identity": blocked_material_identity,
+        "observation_revision": "core-observation:80",
+        "observation_game_loop": 80,
+    }
+    target_state_revision = "target-state:changed"
+    material_identity = _strict_identity("build-legality", 700)
+    authorization_id = authoritative_build_preflight_authorization_id(
+        request_id=request_id,
+        operation_id=operation_id,
+        operation_epoch=0,
+        action_name=action_name,
+        builder_tag=builder_tag,
+        ability_id=881,
+        world_target=(65.0, 90.0),
+        target_state_revision=target_state_revision,
+        material_legality_identity=material_identity,
+        observation_revision="raw-observation:80",
+        observation_game_loop=80,
+        expires_game_loop=192,
+    )
+    result: dict[str, object] = {
+        **request,
+        "authorization_id": authorization_id,
+        "status": "authorized",
+        "authorized": True,
+        "reason": "authoritative_material_change",
+        "circuit_open": False,
+        "builder_tag": builder_tag,
+        "ability_id": 881,
+        "world_target": [65.0, 90.0],
+        "target_state_revision": target_state_revision,
+        "material_legality_identity": material_identity,
+        "observation_revision": "raw-observation:80",
+        "observation_game_loop": 80,
+        "expires_game_loop": 192,
+        "state_transition": "open_to_reset",
+        "material_change_reason": "builder_changed",
+        "invalid_evidence_reasons": [],
+    }
+    return (
+        [
+            _event(
+                start_event_id,
+                "authoritative_build_pre_dispatch_preflight_requested",
+                {
+                    "request": request,
+                    "semantic_material_hint": _strict_identity("semantic-build-material", 700),
+                    "bound_builder_hint": builder_tag,
+                    "side_effect_free": True,
+                },
+            ),
+            _event(
+                start_event_id + 1,
+                "authoritative_build_pre_dispatch_preflight",
+                {
+                    "result": result,
+                    "accepted_by_core": True,
+                    "invalid_evidence_reasons": [],
+                },
+            ),
+            _event(
+                start_event_id + 2,
+                "authoritative_build_pre_dispatch_circuit_reset",
+                {
+                    "operation_id": operation_id,
+                    "operation_epoch": 0,
+                    "action_name": action_name,
+                    "reason": "raw_preflight_authorized",
+                    "state_transition": "open_to_reset",
+                    "authorization_id": authorization_id,
+                    "request_id": request_id,
+                    "opened_command_id": opener_command_id,
+                    "opened_attempt_id": opened_attempt_id,
+                    "opened_attempt_ordinal": opener_attempt_ordinal,
+                    "blocked_material_legality_identity": blocked_material_identity,
+                    "builder_tag": builder_tag,
+                    "ability_id": 881,
+                    "world_target": [65.0, 90.0],
+                    "target_state_revision": target_state_revision,
+                    "material_legality_identity": material_identity,
+                    "observation_revision": "raw-observation:80",
+                    "authorization_game_loop": 80,
+                    "expires_game_loop": 192,
+                    "material_change_reason": "builder_changed",
+                    "reset_from_streak": 3,
+                },
+            ),
+        ],
+        result,
     )
 
 
@@ -988,7 +1129,73 @@ def test_authoritative_replay_rejects_nested_parent_identity_mismatch(
     assert report["gates"]["authoritative_build_pre_dispatch_circuit_bounded"]["passed"] is False
 
 
-def test_authoritative_replay_accepts_material_change_open_to_reset_then_new_streak(
+def test_authoritative_replay_counts_post_open_approach_and_build_primitives(
+    tmp_path: Path,
+) -> None:
+    operation_id = _strict_identity("operation", 160)
+    events = [
+        _authoritative_failure_event(
+            event_id,
+            operation_id=operation_id,
+            attempt_ordinal=event_id - 1,
+            attempt_index=event_id,
+            streak=event_id,
+            state_transition="closed_to_open" if event_id == 3 else None,
+            circuit_open=event_id == 3,
+        )
+        for event_id in range(1, 4)
+    ]
+    events.append(
+        _event(
+            4,
+            "execution",
+            {
+                "command_id": "post-open-primitives",
+                "operation_id": operation_id,
+                "action_name": "Build_Pylon_Screen",
+                "status": "failed",
+                "success": False,
+                "execution_stage": "pre_dispatch",
+                "failure_code": "authoritative_pre_dispatch_circuit_open",
+                "primitive_trace": [
+                    {
+                        "function": "Move_Move_pt",
+                        "accepted": True,
+                        "origin": "translator",
+                    },
+                    {
+                        "function": "Move_Move_pt",
+                        "accepted": True,
+                        "origin": "translator",
+                    },
+                    {
+                        "function": "Build_Pylon_pt",
+                        "accepted": True,
+                        "origin": "translator",
+                    },
+                    {
+                        "function": "raw_pre_dispatch",
+                        "accepted": False,
+                        "origin": "translator",
+                    },
+                ],
+            },
+        )
+    )
+
+    report = build_engineering_gate_report(
+        events,
+        run_dir=tmp_path,
+        natural_run_baseline_bytes_per_loop=100.0,
+    )
+
+    diagnostics = report["diagnostics"]
+    assert diagnostics["authoritative_build_pre_dispatch_post_open_primitive_count"] == 3
+    assert diagnostics["authoritative_build_pre_dispatch_post_open_approach_primitive_count"] == 2
+    assert report["gates"]["authoritative_build_pre_dispatch_circuit_bounded"]["passed"] is False
+
+
+def test_authoritative_replay_rejects_failure_record_as_material_reset(
     tmp_path: Path,
 ) -> None:
     operation_id = _strict_identity("operation", 17)
@@ -1025,10 +1232,11 @@ def test_authoritative_replay_accepts_material_change_open_to_reset_then_new_str
     )
 
     diagnostics = report["diagnostics"]
-    assert diagnostics["authoritative_build_pre_dispatch_failure_count"] == 4
-    assert diagnostics["authoritative_build_pre_dispatch_circuit_reset_count"] == 1
-    assert diagnostics["authoritative_build_pre_dispatch_invalid_transition_count"] == 0
-    assert report["gates"]["authoritative_build_pre_dispatch_circuit_bounded"]["passed"] is True
+    assert diagnostics["authoritative_build_pre_dispatch_failure_count"] == 3
+    assert diagnostics["authoritative_build_pre_dispatch_circuit_reset_count"] == 0
+    assert diagnostics["authoritative_build_pre_dispatch_post_open_rejection_count"] == 1
+    assert diagnostics["authoritative_build_pre_dispatch_invalid_transition_count"] >= 1
+    assert report["gates"]["authoritative_build_pre_dispatch_circuit_bounded"]["passed"] is False
 
 
 def test_authoritative_replay_cross_validates_core_reset_before_new_raw_attempt(
@@ -1052,54 +1260,42 @@ def test_authoritative_replay_cross_validates_core_reset_before_new_raw_attempt(
         command_id="authoritative-command-3",
         attempt_ordinal=2,
     ).attempt_id
+    events.append(
+        _event(
+            4,
+            "authoritative_build_pre_dispatch_circuit_defer",
+            {
+                "operation_id": operation_id,
+                "action_name": "Build_Pylon_Screen",
+                "threshold": 3,
+                "streak": 3,
+                "failure_count": 3,
+                "opened_command_id": "authoritative-command-3",
+                "opened_attempt_id": opener_attempt,
+                "opened_attempt_ordinal": 2,
+                "material_legality_identity": _strict_identity("build-legality", 3),
+                "blocked_semantic_material_identity": _strict_identity(
+                    "semantic-build-material", 1
+                ),
+                "material_evidence_valid": True,
+                "invalid_evidence_reasons": [],
+                "next_action": "wait_for_material_legality_change_or_new_operation",
+            },
+        )
+    )
+    preflight_events, authorization = _authoritative_preflight_events(
+        start_event_id=5,
+        operation_id=operation_id,
+        opener_command_id="authoritative-command-3",
+        opener_attempt_ordinal=2,
+        blocked_material_identity=_strict_identity("build-legality", 3),
+        builder_tag=0xB,
+    )
+    events.extend(preflight_events)
     events.extend(
         [
             _event(
-                4,
-                "authoritative_build_pre_dispatch_circuit_defer",
-                {
-                    "operation_id": operation_id,
-                    "action_name": "Build_Pylon_Screen",
-                    "threshold": 3,
-                    "streak": 3,
-                    "failure_count": 3,
-                    "opened_command_id": "authoritative-command-3",
-                    "opened_attempt_id": opener_attempt,
-                    "opened_attempt_ordinal": 2,
-                    "material_legality_identity": _strict_identity("build-legality", 3),
-                    "blocked_semantic_material_identity": _strict_identity(
-                        "semantic-build-material", 1
-                    ),
-                    "material_evidence_valid": True,
-                    "invalid_evidence_reasons": [],
-                    "next_action": "wait_for_material_legality_change_or_new_operation",
-                },
-            ),
-            _event(
-                5,
-                "authoritative_build_pre_dispatch_circuit_reset",
-                {
-                    "operation_id": operation_id,
-                    "action_name": "Build_Pylon_Screen",
-                    "reason": "semantic_legality_material_change",
-                    "previous_semantic_material_identity": _strict_identity(
-                        "semantic-build-material", 1
-                    ),
-                    "current_semantic_material_identity": _strict_identity(
-                        "semantic-build-material", 2
-                    ),
-                    "raw_material_legality_identity": _strict_identity("build-legality", 3),
-                    "previous_builder_tag": 0xA,
-                    "bound_builder_tag": 0xB,
-                    "ability_id": 881,
-                    "world_target": [65.0, 90.0],
-                    "game_loop": 80,
-                    "operation_epoch_changed": False,
-                    "reset_from_streak": 3,
-                },
-            ),
-            _event(
-                6,
+                8,
                 "command_lineage",
                 {
                     "command_id": "authoritative-command-4",
@@ -1109,24 +1305,40 @@ def test_authoritative_replay_cross_validates_core_reset_before_new_raw_attempt(
                         "operation_id": operation_id,
                     },
                     "semantic_action": "BUILD PYLON",
+                    "authoritative_build_preflight": authorization,
+                },
+            ),
+            _event(
+                9,
+                "command_lifecycle",
+                {
+                    "command_id": "authoritative-command-4",
+                    "operation_id": operation_id,
+                    "status": "dispatched",
+                    "command": {
+                        "command_id": "authoritative-command-4",
+                        "operation_id": operation_id,
+                        "name": "Build_Pylon_Screen",
+                        "actor": "Builder/Builder-Probe-1",
+                        "arguments": [[65, 90]],
+                        "authoritative_build_preflight": authorization,
+                    },
                 },
             ),
         ]
     )
     changed = _authoritative_failure_event(
-        7,
+        10,
         operation_id=operation_id,
         command_id="authoritative-command-4",
         attempt_ordinal=3,
         attempt_index=4,
         streak=1,
-        state_transition="open_to_reset",
+        state_transition=None,
         circuit_open=False,
         status="retry",
     )
     changed.payload["authoritative_pre_dispatch"]["builder_tag"] = 0xB
-    changed.payload["authoritative_pre_dispatch"]["reset_reason"] = "material_state_changed"
-    changed.payload["authoritative_pre_dispatch"]["material_change_reason"] = "builder_changed"
     events.append(changed)
 
     report = build_engineering_gate_report(
