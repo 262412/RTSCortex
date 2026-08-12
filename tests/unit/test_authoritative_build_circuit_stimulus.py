@@ -37,7 +37,7 @@ def _command(ordinal: int) -> RoutedCommand:
         operation_id=OPERATION_ID,
         attempt_id=attempt_id,
         attempt_ordinal=ordinal,
-        semantic_action="Pylon",
+        semantic_action="BUILD PYLON",
         placement_candidate_id="candidate:" + "b" * 64,
         placement_revision=f"revision-{ordinal}",
     )
@@ -312,7 +312,7 @@ def test_canary_rejects_effect_success_without_new_structure_evidence(tmp_path: 
     )
     controller.phase = "awaiting_effect"
     controller.operation_id = OPERATION_ID
-    controller.semantic_action = "Pylon"
+    controller.semantic_action = "BUILD PYLON"
     controller.final_command_id = "command-3"
 
     with pytest.raises(RuntimeError, match="reset_build_effect_not_new_structure"):

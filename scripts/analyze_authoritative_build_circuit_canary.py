@@ -31,7 +31,7 @@ _CANARY_JOURNAL_NAME = "authoritative-build-circuit-canary.jsonl"
 _PHASE_EVENT_TYPE = "authoritative_build_circuit_canary_phase"
 _CANARY_SCHEMA_VERSION = "1.0"
 _CANARY_MODE = "stale_candidate_then_builder_rebind"
-_SEMANTIC_ACTION = "Pylon"
+_SEMANTIC_ACTION = "BUILD PYLON"
 _RUNTIME_ACTION = "Build_Pylon_Screen"
 _RAW_CIRCUIT_OPEN_CODES = frozenset(
     {"authoritative_pre_dispatch_circuit_open", "operation_no_start_circuit_open"}
@@ -603,7 +603,7 @@ def _runtime_identity(
 def _runtime_action_fields(payload: Mapping[str, Any], *, phase: str) -> None:
     semantic_action = payload.get("semantic_action")
     if semantic_action is not None and semantic_action != _SEMANTIC_ACTION:
-        raise CanaryArtifactError(f"{phase}: runtime semantic_action is not Pylon")
+        raise CanaryArtifactError(f"{phase}: runtime semantic_action is not {_SEMANTIC_ACTION}")
     runtime_action = payload.get("runtime_action")
     if runtime_action is not None and runtime_action != _RUNTIME_ACTION:
         raise CanaryArtifactError(f"{phase}: runtime_action is not Build_Pylon_Screen")

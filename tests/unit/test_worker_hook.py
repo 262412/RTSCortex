@@ -1927,7 +1927,7 @@ def test_authoritative_canary_pins_distinct_feature_visible_ready_probe(
     )
     controller.initial_builder_tag = 10
     controller.operation_id = "operation:" + "a" * 64
-    controller.semantic_action = "Pylon"
+    controller.semantic_action = "BUILD PYLON"
     controller.phase = "rebind_pending"
     team = {
         "name": "Builder-Probe-1",

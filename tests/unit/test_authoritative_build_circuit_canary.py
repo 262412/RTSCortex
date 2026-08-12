@@ -49,7 +49,7 @@ def _event(
         "game_loop": game_loop,
         "observation_revision": observation_revision,
         "operation_id": operation_id,
-        "semantic_action": None if action is None else "Pylon",
+        "semantic_action": None if action is None else "BUILD PYLON",
         "reason": "test",
     }
     if action is not None:
@@ -76,7 +76,7 @@ def _zero() -> dict[str, Any]:
 
 def _valid_phases() -> list[dict[str, object]]:
     operation_id = "operation:" + "a" * 64
-    action = "Pylon"
+    action = "BUILD PYLON"
     events: list[dict[str, object]] = [
         _event(0, "initialized", game_loop=0, observation_revision="obs-0", action=None),
     ]
@@ -291,7 +291,7 @@ def _valid_runtime_events() -> list[StoredEvent]:
                     "attempt_id": attempt_id,
                     "attempt_ordinal": ordinal,
                     "action_name": "Build_Pylon_Screen",
-                    "semantic_action": "Pylon",
+                    "semantic_action": "BUILD PYLON",
                     "runtime_action": "Build_Pylon_Screen",
                     "status": "failed",
                     "success": False,
@@ -401,7 +401,7 @@ def _valid_runtime_events() -> list[StoredEvent]:
                     "attempt_id": reset_attempt,
                     "attempt_ordinal": 3,
                     "action_name": "Build_Pylon_Screen",
-                    "semantic_action": "Pylon",
+                    "semantic_action": "BUILD PYLON",
                     "runtime_action": "Build_Pylon_Screen",
                     "status": "succeeded",
                     "success": True,
@@ -536,7 +536,16 @@ def test_analyzer_rejects_tampered_hash_and_wrong_run_dir(
 
 @pytest.mark.parametrize(
     "mutation",
-    ("missing", "idle", "post_open", "zero", "release", "material", "effect"),
+    (
+        "missing",
+        "idle",
+        "post_open",
+        "zero",
+        "release",
+        "material",
+        "semantic",
+        "effect",
+    ),
 )
 def test_runtime_replay_rejects_forged_or_incomplete_evidence(mutation: str) -> None:
     phase_events = _valid_phases()
@@ -573,6 +582,8 @@ def test_runtime_replay_rejects_forged_or_incomplete_evidence(mutation: str) -> 
         runtime_events[0].payload["authoritative_pre_dispatch"]["material_legality_identity"] = (
             "build-legality:1"
         )
+    elif mutation == "semantic":
+        runtime_events[0].payload["semantic_action"] = "Pylon"
     else:
         runtime_events[-1].payload["effect_evidence"]["observed_structure_tag"] = ""
 

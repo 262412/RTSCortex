@@ -24,6 +24,8 @@ _OPERATION_ID = re.compile(r"operation:[0-9a-f]{64}\Z")
 _ATTEMPT_ID = re.compile(r"attempt:[0-9a-f]{64}\Z")
 _BUILD_LEGALITY_ID = re.compile(r"build-legality:[0-9a-f]{64}\Z")
 _MODE = "stale_candidate_then_builder_rebind"
+_SEMANTIC_ACTION = "BUILD PYLON"
+_RUNTIME_ACTION = "Build_Pylon_Screen"
 
 
 def _tag(value: Any) -> int:
@@ -613,7 +615,7 @@ class AuthoritativeBuildCircuitCanary:
         attempt_id = command.attempt_id
         ordinal = command.attempt_ordinal
         semantic_action = command.semantic_action or command.name
-        if command.name != "Build_Pylon_Screen" or semantic_action != "Pylon":
+        if command.name != _RUNTIME_ACTION or semantic_action != _SEMANTIC_ACTION:
             raise RuntimeError("canary command is not the dedicated Pylon action")
         if operation_id is None or _OPERATION_ID.fullmatch(operation_id) is None:
             raise RuntimeError("canary Build command has invalid operation identity")
