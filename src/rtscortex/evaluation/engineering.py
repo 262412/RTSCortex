@@ -669,6 +669,29 @@ def _authoritative_attempt_identity(
     return f"attempt:{hashlib.sha256(encoded).hexdigest()}"
 
 
+def _build_material_legality_identity(
+    *,
+    operation_id: str,
+    builder_tag: int,
+    ability_id: int,
+    world_target: tuple[float, float],
+    target_legality_fingerprint: str | None,
+    target_state_revision: str,
+) -> str:
+    """Rebuild the Raw placement material identity from durable evidence."""
+
+    payload = {
+        "operation_id": operation_id,
+        "builder_tag": builder_tag,
+        "ability_id": ability_id,
+        "world_target": [float(world_target[0]), float(world_target[1])],
+        "target_legality_fingerprint": target_legality_fingerprint,
+        "target_state_revision": target_state_revision,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return f"build-legality:{hashlib.sha256(encoded).hexdigest()}"
+
+
 def _authoritative_pre_dispatch_evidence(payload: dict[str, Any]) -> dict[str, Any] | None:
     direct = payload.get("authoritative_pre_dispatch")
     if isinstance(direct, dict):
@@ -797,6 +820,8 @@ def authoritative_build_pre_dispatch_audit(
         builder_tag = evidence.get("builder_tag")
         ability_id = evidence.get("ability_id")
         world_target = _finite_world_point(evidence.get("world_target"))
+        target_state_revision = _string_value(evidence.get("target_state_revision"))
+        target_legality_fingerprint = _string_value(parent.get("target_legality_fingerprint"))
         material_evidence_valid = evidence.get("material_evidence_valid")
         invalid_evidence_reasons = evidence.get("invalid_evidence_reasons")
         parent_material_identity = _string_value(parent.get("material_legality_identity"))
@@ -859,7 +884,7 @@ def authoritative_build_pre_dispatch_audit(
                 not material_identity_required
                 or _typed_digest_identity(material_identity, "build-legality:")
             )
-            and (not success_reset or bool(_string_value(evidence.get("target_state_revision"))))
+            and (not success_reset or bool(target_state_revision))
             and (
                 not material_identity_required
                 or (
@@ -896,6 +921,10 @@ def authoritative_build_pre_dispatch_audit(
             "builder_tag": builder_tag,
             "ability_id": ability_id,
             "world_target": world_target,
+            "target_state_revision": target_state_revision,
+            "target_legality_fingerprint": target_legality_fingerprint,
+            "placement_query_result": _string_value(parent.get("placement_query_result")),
+            "available_ability_query": _string_value(parent.get("available_ability_query")),
             "material_evidence_valid": material_evidence_valid,
             "invalid_evidence_reasons": invalid_evidence_reasons,
             "state_transition": transition,
@@ -965,6 +994,8 @@ def authoritative_build_pre_dispatch_audit(
     seen_producer_resets: set[tuple[str, str | None, str | None]] = set()
     preflight_requests: dict[str, dict[str, Any]] = {}
     released_preflight_authorizations: dict[str, dict[str, Any]] = {}
+    authorized_lineage_commands: dict[str, str] = {}
+    authorized_dispatched_commands: dict[str, str] = {}
 
     def _state(operation_id: str) -> dict[str, Any]:
         return states.setdefault(
@@ -1245,21 +1276,48 @@ def authoritative_build_pre_dispatch_audit(
         transition = record["state_transition"]
         authorization = released_preflight_authorizations.get(operation_id)
         if authorization is not None and not state["open"] and not state["streak"]:
+            authorization_id = _string_value(authorization.get("authorization_id"))
+            command_id = record["command_id"]
+            target_state_revision = record["target_state_revision"]
+            target_fingerprint = record["target_legality_fingerprint"]
+            successor_material = (
+                _build_material_legality_identity(
+                    operation_id=operation_id,
+                    builder_tag=record["builder_tag"],
+                    ability_id=record["ability_id"],
+                    world_target=record["world_target"],
+                    target_legality_fingerprint=target_fingerprint,
+                    target_state_revision=target_state_revision,
+                )
+                if isinstance(record["builder_tag"], int)
+                and isinstance(record["ability_id"], int)
+                and record["world_target"] is not None
+                and target_state_revision is not None
+                and _typed_digest_identity(target_fingerprint, "sc2:")
+                else None
+            )
             authorized_success = bool(
                 transition is None
                 and reason in {"build_started", "effect_confirmed"}
+                and authorization_id is not None
+                and authorized_lineage_commands.get(operation_id) == command_id
+                and authorized_dispatched_commands.get(operation_id) == command_id
                 and record["action_name"] == authorization.get("action_name")
                 and record["builder_tag"] == authorization.get("builder_tag")
                 and record["ability_id"] == authorization.get("ability_id")
                 and record["world_target"] == _finite_world_point(authorization.get("world_target"))
-                and record["material_legality_identity"]
-                == authorization.get("material_legality_identity")
+                and target_state_revision == authorization.get("target_state_revision")
+                and record["placement_query_result"] == "Success"
+                and record["available_ability_query"] == "available"
+                and record["material_legality_identity"] == successor_material
             )
             if not authorized_success:
                 _invalid(operation_id)
             else:
                 operation["success_reset_count"] += 1
                 released_preflight_authorizations.pop(operation_id, None)
+                authorized_lineage_commands.pop(operation_id, None)
+                authorized_dispatched_commands.pop(operation_id, None)
             return
         if state["producer_reset_pending"]:
             if transition != "open_to_reset" or reason not in {
@@ -1334,6 +1392,28 @@ def authoritative_build_pre_dispatch_audit(
         world_target = _finite_world_point(result.get("world_target"))
         if world_target is None:
             return False
+        material_identity = _string_value(result.get("material_legality_identity"))
+        operation_id = _string_value(result.get("operation_id"))
+        target_state_revision = _string_value(result.get("target_state_revision"))
+        builder_tag = _positive_unit_tag(result.get("builder_tag"))
+        ability_id = result.get("ability_id")
+        canonical_material = (
+            _build_material_legality_identity(
+                operation_id=operation_id,
+                builder_tag=builder_tag,
+                ability_id=ability_id,
+                world_target=world_target,
+                target_legality_fingerprint=None,
+                target_state_revision=target_state_revision,
+            )
+            if operation_id is not None
+            and builder_tag is not None
+            and isinstance(ability_id, int)
+            and not isinstance(ability_id, bool)
+            and ability_id > 0
+            and target_state_revision is not None
+            else None
+        )
         try:
             expected = authoritative_build_preflight_authorization_id(
                 request_id=str(result["request_id"]),
@@ -1362,9 +1442,10 @@ def authoritative_build_pre_dispatch_audit(
             and not isinstance(result.get("ability_id"), bool)
             and result["ability_id"] > 0
             and _typed_digest_identity(
-                _string_value(result.get("material_legality_identity")),
+                material_identity,
                 "build-legality:",
             )
+            and material_identity == canonical_material
             and isinstance(result.get("observation_game_loop"), int)
             and isinstance(result.get("expires_game_loop"), int)
             and result["expires_game_loop"] >= result["observation_game_loop"]
@@ -1629,12 +1710,19 @@ def authoritative_build_pre_dispatch_audit(
                 authorization = released_preflight_authorizations.get(operation_id or "")
                 command_authorization = payload.get("authoritative_build_preflight")
                 if authorization is not None:
-                    if not isinstance(command_authorization, dict) or (
-                        command_authorization.get("authorization_id")
-                        != authorization.get("authorization_id")
-                    ):
+                    command_contract_valid = bool(
+                        command_id is not None
+                        and isinstance(command_authorization, dict)
+                        and command_authorization == authorization
+                    )
+                    previous_command = authorized_lineage_commands.get(operation_id or "")
+                    if not command_contract_valid or previous_command not in {None, command_id}:
                         producer_inconsistency.add(operation_id or f"event:{event.event_id}")
                         _invalid(operation_id)
+                    else:
+                        assert operation_id is not None
+                        assert command_id is not None
+                        authorized_lineage_commands[operation_id] = command_id
                 elif (
                     any(item["open"] for item in states.values())
                     and not _typed_digest_identity(operation_id, "operation:")
@@ -1674,15 +1762,19 @@ def authoritative_build_pre_dispatch_audit(
                 if authorization is not None:
                     exact_command_contract = bool(
                         isinstance(command_authorization, dict)
-                        and command_authorization.get("authorization_id")
-                        == authorization.get("authorization_id")
+                        and command_authorization == authorization
                         and command.get("name") == authorization.get("action_name")
                         and command.get("actor") == authorization.get("actor")
                         and command.get("arguments") == authorization.get("requested_arguments")
                     )
-                    if not exact_command_contract:
+                    previous_command = authorized_dispatched_commands.get(operation_id or "")
+                    if not exact_command_contract or previous_command not in {None, command_id}:
                         producer_inconsistency.add(operation_id or f"event:{event.event_id}")
                         _invalid(operation_id)
+                    else:
+                        assert operation_id is not None
+                        assert command_id is not None
+                        authorized_dispatched_commands[operation_id] = command_id
                 elif (
                     any(item["open"] for item in states.values())
                     and not _typed_digest_identity(operation_id, "operation:")

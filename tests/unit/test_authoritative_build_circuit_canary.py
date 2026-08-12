@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from rtscortex_llm_pysc2.raw_placement import build_material_legality_identity
 
 import scripts.analyze_authoritative_build_circuit_canary as analyzer
 from rtscortex.contracts import (
@@ -112,7 +113,14 @@ def _preflight_evidence() -> tuple[dict[str, object], dict[str, object]]:
         observation_revision="obs-preflight",
         observation_game_loop=10,
     )
-    material = "build-legality:" + "f" * 64
+    material = build_material_legality_identity(
+        operation_id=operation_id,
+        builder_tag=200,
+        ability_id=881,
+        world_target=(31.0, 30.0),
+        target_legality_fingerprint=None,
+        target_state_revision="target-revalidated",
+    )
     result: dict[str, object] = {
         **request,
         "authorization_id": authoritative_build_preflight_authorization_id(
@@ -391,7 +399,15 @@ def _runtime_event(event_id: int, event_type: str, payload: dict[str, object]) -
 
 def _valid_runtime_events() -> list[StoredEvent]:
     operation_id = "operation:" + "a" * 64
-    reset_material_identity = "build-legality:" + "f" * 64
+    target_legality_fingerprint = "sc2:" + "f" * 64
+    reset_material_identity = build_material_legality_identity(
+        operation_id=operation_id,
+        builder_tag=200,
+        ability_id=881,
+        world_target=(31.0, 30.0),
+        target_legality_fingerprint=target_legality_fingerprint,
+        target_state_revision="target-revalidated",
+    )
     reset_world_target = [31.0, 30.0]
     reset_reservation_id = "placement:command-reset"
     events: list[StoredEvent] = []
@@ -510,7 +526,7 @@ def _valid_runtime_events() -> list[StoredEvent]:
                     "ability_id": 881,
                     "world_target": reset_world_target,
                     "target_state_revision": "target-revalidated",
-                    "material_legality_identity": reset_material_identity,
+                    "material_legality_identity": preflight_result["material_legality_identity"],
                     "observation_revision": "obs-preflight",
                     "authorization_game_loop": 10,
                     "expires_game_loop": 122,
@@ -555,6 +571,9 @@ def _valid_runtime_events() -> list[StoredEvent]:
                     "ability_id": 881,
                     "world_target": reset_world_target,
                     "target_state_revision": "target-revalidated",
+                    "target_legality_fingerprint": target_legality_fingerprint,
+                    "available_ability_query": "available",
+                    "placement_query_result": "Success",
                     "material_legality_identity": reset_material_identity,
                     "next_state": "build_started",
                     "release_reason": "build_start_observed",

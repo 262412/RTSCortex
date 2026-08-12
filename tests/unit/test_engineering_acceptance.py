@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 from rtscortex_llm_pysc2.extractor import BUILD_SPECS
+from rtscortex_llm_pysc2.raw_placement import build_material_legality_identity
 
 from rtscortex.contracts import (
     authoritative_build_preflight_authorization_id,
@@ -88,7 +89,14 @@ def _authoritative_preflight_events(
         "observation_game_loop": 80,
     }
     target_state_revision = "target-state:changed"
-    material_identity = _strict_identity("build-legality", 700)
+    material_identity = build_material_legality_identity(
+        operation_id=operation_id,
+        builder_tag=builder_tag,
+        ability_id=881,
+        world_target=(65.0, 90.0),
+        target_legality_fingerprint=None,
+        target_state_revision=target_state_revision,
+    )
     authorization_id = authoritative_build_preflight_authorization_id(
         request_id=request_id,
         operation_id=operation_id,
@@ -1355,6 +1363,235 @@ def test_authoritative_replay_cross_validates_core_reset_before_new_raw_attempt(
     assert report["gates"]["authoritative_build_pre_dispatch_circuit_bounded"]["passed"] is True
 
 
+def test_authoritative_replay_accepts_query_bound_success_after_preflight(
+    tmp_path: Path,
+) -> None:
+    operation_id = _strict_identity("operation", 172)
+    events = [
+        _authoritative_failure_event(
+            event_id,
+            operation_id=operation_id,
+            attempt_ordinal=event_id - 1,
+            attempt_index=event_id,
+            streak=event_id,
+            state_transition="closed_to_open" if event_id == 3 else None,
+            circuit_open=event_id == 3,
+        )
+        for event_id in range(1, 4)
+    ]
+    preflight_events, authorization = _authoritative_preflight_events(
+        start_event_id=4,
+        operation_id=operation_id,
+        opener_command_id="authoritative-command-3",
+        opener_attempt_ordinal=2,
+        blocked_material_identity=_strict_identity("build-legality", 3),
+        builder_tag=0xB,
+    )
+    events.extend(preflight_events)
+    command_id = "authoritative-command-4"
+    events.extend(
+        _authorized_command_events(
+            start_event_id=7,
+            operation_id=operation_id,
+            command_id=command_id,
+            authorization=authorization,
+        )
+    )
+    target_fingerprint = _strict_identity("sc2", 172)
+    success_material = build_material_legality_identity(
+        operation_id=operation_id,
+        builder_tag=0xB,
+        ability_id=881,
+        world_target=(65.0, 90.0),
+        target_legality_fingerprint=target_fingerprint,
+        target_state_revision="target-state:changed",
+    )
+    events.append(
+        _authoritative_success_reset_event(
+            9,
+            operation_id=operation_id,
+            command_id=command_id,
+            world_target=(65.0, 90.0),
+            target_state_revision="target-state:changed",
+            target_legality_fingerprint=target_fingerprint,
+            material_identity=success_material,
+            state_transition=None,
+        )
+    )
+    events.extend(
+        _authorized_command_events(
+            start_event_id=10,
+            operation_id=operation_id,
+            command_id="ordinary-command-after-success",
+            authorization=None,
+        )
+    )
+
+    report = build_engineering_gate_report(
+        events,
+        run_dir=tmp_path,
+        natural_run_baseline_bytes_per_loop=100.0,
+    )
+
+    diagnostics = report["diagnostics"]
+    operation = diagnostics["authoritative_build_pre_dispatch_operations"][operation_id]
+    assert operation["success_reset_count"] == 1
+    assert diagnostics["authoritative_build_pre_dispatch_invalid_transition_count"] == 0
+    assert diagnostics["authoritative_build_pre_dispatch_producer_inconsistency_count"] == 0
+    assert diagnostics["authoritative_build_pre_dispatch_post_open_command_count"] == 0
+    assert report["gates"]["authoritative_build_pre_dispatch_circuit_bounded"]["passed"] is True
+
+
+def test_authoritative_replay_reconstructs_preflight_material_identity(
+    tmp_path: Path,
+) -> None:
+    operation_id = _strict_identity("operation", 174)
+    events = [
+        _authoritative_failure_event(
+            event_id,
+            operation_id=operation_id,
+            attempt_ordinal=event_id - 1,
+            attempt_index=event_id,
+            streak=event_id,
+            state_transition="closed_to_open" if event_id == 3 else None,
+            circuit_open=event_id == 3,
+        )
+        for event_id in range(1, 4)
+    ]
+    preflight_events, authorization = _authoritative_preflight_events(
+        start_event_id=4,
+        operation_id=operation_id,
+        opener_command_id="authoritative-command-3",
+        opener_attempt_ordinal=2,
+        blocked_material_identity=_strict_identity("build-legality", 3),
+        builder_tag=0xB,
+    )
+    forged_material = _strict_identity("build-legality", 999)
+    authorization["material_legality_identity"] = forged_material
+    forged_authorization_id = authoritative_build_preflight_authorization_id(
+        request_id=str(authorization["request_id"]),
+        operation_id=operation_id,
+        operation_epoch=0,
+        action_name="Build_Pylon_Screen",
+        builder_tag=0xB,
+        ability_id=881,
+        world_target=(65.0, 90.0),
+        target_state_revision="target-state:changed",
+        material_legality_identity=forged_material,
+        observation_revision="raw-observation:80",
+        observation_game_loop=80,
+        expires_game_loop=192,
+    )
+    authorization["authorization_id"] = forged_authorization_id
+    reset_payload = preflight_events[-1].payload
+    reset_payload["authorization_id"] = forged_authorization_id
+    reset_payload["material_legality_identity"] = forged_material
+    events.extend(preflight_events)
+
+    report = build_engineering_gate_report(
+        events,
+        run_dir=tmp_path,
+        natural_run_baseline_bytes_per_loop=100.0,
+    )
+
+    assert report["diagnostics"]["authoritative_build_pre_dispatch_invalid_transition_count"] >= 1
+    assert (
+        report["diagnostics"]["authoritative_build_pre_dispatch_producer_inconsistency_count"] >= 1
+    )
+    assert report["gates"]["authoritative_build_pre_dispatch_circuit_bounded"]["passed"] is False
+
+
+@pytest.mark.parametrize(
+    "defect",
+    (
+        "forged_material",
+        "builder_mismatch",
+        "ability_mismatch",
+        "target_mismatch",
+        "target_state_mismatch",
+        "missing_command_authorization",
+    ),
+)
+def test_authoritative_replay_rejects_preflight_success_identity_drift(
+    defect: str,
+    tmp_path: Path,
+) -> None:
+    operation_id = _strict_identity("operation", 173)
+    events = [
+        _authoritative_failure_event(
+            event_id,
+            operation_id=operation_id,
+            attempt_ordinal=event_id - 1,
+            attempt_index=event_id,
+            streak=event_id,
+            state_transition="closed_to_open" if event_id == 3 else None,
+            circuit_open=event_id == 3,
+        )
+        for event_id in range(1, 4)
+    ]
+    preflight_events, authorization = _authoritative_preflight_events(
+        start_event_id=4,
+        operation_id=operation_id,
+        opener_command_id="authoritative-command-3",
+        opener_attempt_ordinal=2,
+        blocked_material_identity=_strict_identity("build-legality", 3),
+        builder_tag=0xB,
+    )
+    events.extend(preflight_events)
+    command_authorization = None if defect == "missing_command_authorization" else authorization
+    command_id = "authoritative-command-4"
+    events.extend(
+        _authorized_command_events(
+            start_event_id=7,
+            operation_id=operation_id,
+            command_id=command_id,
+            authorization=command_authorization,
+        )
+    )
+    builder_tag = 0xC if defect == "builder_mismatch" else 0xB
+    ability_id = 883 if defect == "ability_mismatch" else 881
+    world_target = (66.0, 90.0) if defect == "target_mismatch" else (65.0, 90.0)
+    target_state_revision = (
+        "target-state:different" if defect == "target_state_mismatch" else "target-state:changed"
+    )
+    target_fingerprint = _strict_identity("sc2", 173)
+    success_material = build_material_legality_identity(
+        operation_id=operation_id,
+        builder_tag=builder_tag,
+        ability_id=ability_id,
+        world_target=world_target,
+        target_legality_fingerprint=target_fingerprint,
+        target_state_revision=target_state_revision,
+    )
+    if defect == "forged_material":
+        success_material = _strict_identity("build-legality", 999)
+    events.append(
+        _authoritative_success_reset_event(
+            9,
+            operation_id=operation_id,
+            command_id=command_id,
+            builder_tag=builder_tag,
+            ability_id=ability_id,
+            world_target=world_target,
+            target_state_revision=target_state_revision,
+            target_legality_fingerprint=target_fingerprint,
+            material_identity=success_material,
+            state_transition=None,
+        )
+    )
+
+    report = build_engineering_gate_report(
+        events,
+        run_dir=tmp_path,
+        natural_run_baseline_bytes_per_loop=100.0,
+    )
+
+    operation = report["diagnostics"]["authoritative_build_pre_dispatch_operations"][operation_id]
+    assert operation["success_reset_count"] == 0
+    assert report["diagnostics"]["authoritative_build_pre_dispatch_invalid_transition_count"] >= 1
+    assert report["gates"]["authoritative_build_pre_dispatch_circuit_bounded"]["passed"] is False
+
+
 def test_authoritative_replay_rejects_forged_core_material_reset(
     tmp_path: Path,
 ) -> None:
@@ -2121,13 +2358,20 @@ def _authoritative_success_reset_event(
     command_id: str = "authoritative-success",
     attempt_ordinal: int = 3,
     reset_reason: str = "build_started",
+    builder_tag: int = 0xB,
+    ability_id: int = 881,
+    world_target: tuple[float, float] = (64.0, 90.0),
+    target_state_revision: str = "revalidated-target",
+    target_legality_fingerprint: str | None = None,
+    material_identity: str | None = None,
+    state_transition: str | None = "open_to_reset",
 ) -> StoredEvent:
     attempt_id = AttemptKey(
         operation_id=operation_id,
         command_id=command_id,
         attempt_ordinal=attempt_ordinal,
     ).attempt_id
-    material_identity = _strict_identity("build-legality", 500)
+    resolved_material_identity = material_identity or _strict_identity("build-legality", 500)
     next_state = "build_started" if reset_reason == "build_started" else "occupied"
     return _event(
         event_id,
@@ -2138,11 +2382,18 @@ def _authoritative_success_reset_event(
             "attempt_id": attempt_id,
             "attempt_ordinal": attempt_ordinal,
             "action_name": "Build_Pylon_Screen",
-            "builder_tag": "0xb",
-            "ability_id": 881,
-            "world_target": [64.0, 90.0],
-            "target_state_revision": "revalidated-target",
-            "material_legality_identity": material_identity,
+            "builder_tag": hex(builder_tag),
+            "ability_id": ability_id,
+            "world_target": list(world_target),
+            "target_state_revision": target_state_revision,
+            "target_legality_fingerprint": target_legality_fingerprint,
+            "available_ability_query": (
+                "available" if target_legality_fingerprint is not None else None
+            ),
+            "placement_query_result": (
+                "Success" if target_legality_fingerprint is not None else None
+            ),
+            "material_legality_identity": resolved_material_identity,
             "previous_state": "reserved",
             "next_state": next_state,
             "authoritative_pre_dispatch": {
@@ -2157,18 +2408,60 @@ def _authoritative_success_reset_event(
                 "duplicate_attempt": False,
                 "attempt_id": attempt_id,
                 "attempt_ordinal": attempt_ordinal,
-                "builder_tag": 0xB,
-                "ability_id": 881,
-                "world_target": [64.0, 90.0],
-                "target_state_revision": "revalidated-target",
-                "material_legality_identity": material_identity,
+                "builder_tag": builder_tag,
+                "ability_id": ability_id,
+                "world_target": list(world_target),
+                "target_state_revision": target_state_revision,
+                "material_legality_identity": resolved_material_identity,
                 "material_evidence_valid": True,
                 "invalid_evidence_reasons": [],
-                "state_transition": "open_to_reset",
+                "state_transition": state_transition,
                 "reset_reason": reset_reason,
             },
         },
     )
+
+
+def _authorized_command_events(
+    *,
+    start_event_id: int,
+    operation_id: str,
+    command_id: str,
+    authorization: dict[str, object] | None,
+) -> list[StoredEvent]:
+    return [
+        _event(
+            start_event_id,
+            "command_lineage",
+            {
+                "command_id": command_id,
+                "operation_id": operation_id,
+                "lineage": {
+                    "command_id": command_id,
+                    "operation_id": operation_id,
+                },
+                "semantic_action": "BUILD PYLON",
+                "authoritative_build_preflight": authorization,
+            },
+        ),
+        _event(
+            start_event_id + 1,
+            "command_lifecycle",
+            {
+                "command_id": command_id,
+                "operation_id": operation_id,
+                "status": "dispatched",
+                "command": {
+                    "command_id": command_id,
+                    "operation_id": operation_id,
+                    "name": "Build_Pylon_Screen",
+                    "actor": "Builder/Builder-Probe-1",
+                    "arguments": [[65, 90]],
+                    "authoritative_build_preflight": authorization,
+                },
+            },
+        ),
+    ]
 
 
 def _combat_execution(
