@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+set -o noclobber
 export PYTHONDONTWRITEBYTECODE=1
 
 if [[ $# -ne 5 || "$2" != "--expected-git-sha" || "$4" != "--seed" ]]; then
@@ -27,12 +28,19 @@ if [[ ! -f "${config_path}" ]]; then
   exit 2
 fi
 
-mkdir -p "${run_set_dir}"
+claim_python="${RTSCORTEX_CLAIM_PYTHON:-python3}"
+"${claim_python}" "${repo_dir}/scripts/qualification_attempt.py" claim \
+  "${run_set_dir}" \
+  --expected-git-sha "${expected_git_sha}" \
+  --slurm-job-id "${SLURM_JOB_ID:-unknown}" \
+  --slurm-restart-count "${SLURM_RESTART_COUNT:-0}"
 run_set_dir="$(readlink -f "${run_set_dir}")"
 reviewed_source_root="${run_set_dir}/reviewed-source"
 status_path="${run_set_dir}/canary-attestation.json"
 report_path="${run_set_dir}/authoritative-build-circuit-canary.json"
 log_path="${run_set_dir}/run.log"
+attempt_manifest="${run_set_dir}/attempt-manifest.json"
+: > "${log_path}"
 
 cd "${repo_dir}"
 export PYTHONPATH="${repo_dir}/src:${repo_dir}/integrations/llm_pysc2/src${PYTHONPATH:+:${PYTHONPATH}}"
@@ -72,7 +80,7 @@ SC2PATH="/mnt/scratch/users/tbczhang/StarCraftII" \
   TOKENIZERS_PARALLELISM=false \
   RTSCORTEX_REVIEWED_SOURCE_ROOT="$(readlink -f "${reviewed_source_root}")" \
   uv run rtscortex run --config "${config_path}" --seed "${seed}" \
-  2>&1 | tee "${log_path}"
+  2>&1 | tee -a "${log_path}"
 run_status=${PIPESTATUS[0]}
 set -e
 
@@ -128,6 +136,7 @@ if [[ "${git_head_after}" != "${expected_git_sha}" \
 fi
 
 export CANARY_ATTESTATION_PATH="${status_path}"
+export CANARY_ATTEMPT_MANIFEST="${attempt_manifest}"
 export CANARY_EXPECTED_GIT_SHA="${expected_git_sha}"
 export CANARY_SEED="${seed}"
 export CANARY_RUN_DIR="${run_dir}"
@@ -158,16 +167,20 @@ export CANARY_CONFIG_PATH="${config_path}"
 export CANARY_CONFIG_SHA256="$(sha256sum "${config_path}" | awk '{print $1}')"
 
 uv run python - <<'PY'
-import json
 import os
 from pathlib import Path
+
+from scripts.qualification_attempt import attempt_fields, create_only_json, load_attempt_manifest
 
 def value(name: str) -> str:
     return os.environ.get(name, "")
 
+attempt = load_attempt_manifest(Path(value("CANARY_ATTEMPT_MANIFEST")).parent)
 attestation = {
     "schema_version": "1.0",
     "artifact_kind": "authoritative-build-circuit-canary",
+    **attempt_fields(attempt),
+    "attempt": attempt_fields(attempt),
     "diagnostic_only": True,
     "expected_git_sha": value("CANARY_EXPECTED_GIT_SHA"),
     "seed": int(value("CANARY_SEED")),
@@ -203,9 +216,7 @@ attestation = {
         "reviewed_source_tree_sha256_after": value("CANARY_REVIEWED_TREE_AFTER"),
     },
 }
-Path(value("CANARY_ATTESTATION_PATH")).write_text(
-    json.dumps(attestation, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-)
+create_only_json(value("CANARY_ATTESTATION_PATH"), attestation)
 PY
 
 set +e

@@ -1442,6 +1442,278 @@ def test_authoritative_replay_accepts_query_bound_success_after_preflight(
     assert report["gates"]["authoritative_build_pre_dispatch_circuit_bounded"]["passed"] is True
 
 
+def test_authoritative_replay_processes_two_reset_generations_for_one_operation(
+    tmp_path: Path,
+) -> None:
+    operation_id = _strict_identity("operation", 175)
+    events = [
+        _authoritative_failure_event(
+            event_id,
+            operation_id=operation_id,
+            attempt_ordinal=event_id - 1,
+            attempt_index=event_id,
+            streak=event_id,
+            state_transition="closed_to_open" if event_id == 3 else None,
+            circuit_open=event_id == 3,
+        )
+        for event_id in range(1, 4)
+    ]
+    preflight_events, authorization = _authoritative_preflight_events(
+        start_event_id=4,
+        operation_id=operation_id,
+        opener_command_id="authoritative-command-3",
+        opener_attempt_ordinal=2,
+        blocked_material_identity=_strict_identity("build-legality", 3),
+        builder_tag=0xB,
+    )
+    events.extend(preflight_events)
+    first_command_id = "authoritative-command-4"
+    events.extend(
+        _authorized_command_events(
+            start_event_id=7,
+            operation_id=operation_id,
+            command_id=first_command_id,
+            authorization=authorization,
+        )
+    )
+    first_fingerprint = _strict_identity("sc2", 175)
+    events.append(
+        _authoritative_success_reset_event(
+            9,
+            operation_id=operation_id,
+            command_id=first_command_id,
+            world_target=(65.0, 90.0),
+            target_state_revision="target-state:changed",
+            target_legality_fingerprint=first_fingerprint,
+            material_identity=build_material_legality_identity(
+                operation_id=operation_id,
+                builder_tag=0xB,
+                ability_id=881,
+                world_target=(65.0, 90.0),
+                target_legality_fingerprint=first_fingerprint,
+                target_state_revision="target-state:changed",
+            ),
+            state_transition=None,
+        )
+    )
+
+    events.extend(
+        _authoritative_failure_event(
+            event_id,
+            operation_id=operation_id,
+            attempt_ordinal=event_id - 6,
+            attempt_index=event_id - 5,
+            streak=event_id - 9,
+            state_transition="closed_to_open" if event_id == 12 else None,
+            circuit_open=event_id == 12,
+        )
+        for event_id in range(10, 13)
+    )
+    second_preflight_events, second_authorization = _authoritative_preflight_events(
+        start_event_id=13,
+        operation_id=operation_id,
+        opener_command_id="authoritative-command-7",
+        opener_attempt_ordinal=6,
+        blocked_material_identity=_strict_identity("build-legality", 7),
+        builder_tag=0xC,
+    )
+    events.extend(second_preflight_events)
+    second_command_id = "authoritative-command-8"
+    events.extend(
+        _authorized_command_events(
+            start_event_id=16,
+            operation_id=operation_id,
+            command_id=second_command_id,
+            authorization=second_authorization,
+        )
+    )
+    second_fingerprint = _strict_identity("sc2", 176)
+    events.append(
+        _authoritative_success_reset_event(
+            18,
+            operation_id=operation_id,
+            command_id=second_command_id,
+            builder_tag=0xC,
+            world_target=(65.0, 90.0),
+            target_state_revision="target-state:changed",
+            target_legality_fingerprint=second_fingerprint,
+            material_identity=build_material_legality_identity(
+                operation_id=operation_id,
+                builder_tag=0xC,
+                ability_id=881,
+                world_target=(65.0, 90.0),
+                target_legality_fingerprint=second_fingerprint,
+                target_state_revision="target-state:changed",
+            ),
+            state_transition=None,
+        )
+    )
+
+    report = build_engineering_gate_report(
+        events,
+        run_dir=tmp_path,
+        natural_run_baseline_bytes_per_loop=100.0,
+    )
+
+    diagnostics = report["diagnostics"]
+    operation = diagnostics["authoritative_build_pre_dispatch_operations"][operation_id]
+    assert diagnostics["authoritative_build_pre_dispatch_failure_count"] == 6
+    assert diagnostics["authoritative_build_pre_dispatch_circuit_open_count"] == 2
+    assert diagnostics["authoritative_build_pre_dispatch_circuit_reset_count"] == 2
+    assert diagnostics["authoritative_build_pre_dispatch_post_open_command_count"] == 0
+    assert diagnostics["authoritative_build_pre_dispatch_post_open_dispatch_count"] == 0
+    assert diagnostics["authoritative_build_pre_dispatch_invalid_transition_count"] == 0
+    assert operation["success_reset_count"] == 2
+    assert report["gates"]["authoritative_build_pre_dispatch_circuit_bounded"]["passed"] is True
+
+
+def test_authoritative_replay_only_exact_duplicate_reset_envelope_is_idempotent(
+    tmp_path: Path,
+) -> None:
+    operation_id = _strict_identity("operation", 177)
+    events = [
+        _authoritative_failure_event(
+            event_id,
+            operation_id=operation_id,
+            attempt_ordinal=event_id - 1,
+            attempt_index=event_id,
+            streak=event_id,
+            state_transition="closed_to_open" if event_id == 3 else None,
+            circuit_open=event_id == 3,
+        )
+        for event_id in range(1, 4)
+    ]
+    preflight_events, _ = _authoritative_preflight_events(
+        start_event_id=4,
+        operation_id=operation_id,
+        opener_command_id="authoritative-command-3",
+        opener_attempt_ordinal=2,
+        blocked_material_identity=_strict_identity("build-legality", 3),
+        builder_tag=0xB,
+    )
+    events.extend(preflight_events)
+    reset = preflight_events[-1]
+    events.append(_event(7, reset.event_type, dict(reset.payload)))
+
+    report = build_engineering_gate_report(
+        events,
+        run_dir=tmp_path,
+        natural_run_baseline_bytes_per_loop=100.0,
+    )
+
+    diagnostics = report["diagnostics"]
+    assert diagnostics["authoritative_build_pre_dispatch_duplicate_envelope_count"] == 1
+    assert diagnostics["authoritative_build_pre_dispatch_invalid_transition_count"] == 0
+
+
+@pytest.mark.parametrize("conflict", ("payload", "request", "opener", "material"))
+def test_authoritative_replay_rejects_conflicting_duplicate_reset_payload(
+    conflict: str,
+    tmp_path: Path,
+) -> None:
+    operation_id = _strict_identity("operation", 178)
+    events = [
+        _authoritative_failure_event(
+            event_id,
+            operation_id=operation_id,
+            attempt_ordinal=event_id - 1,
+            attempt_index=event_id,
+            streak=event_id,
+            state_transition="closed_to_open" if event_id == 3 else None,
+            circuit_open=event_id == 3,
+        )
+        for event_id in range(1, 4)
+    ]
+    preflight_events, _ = _authoritative_preflight_events(
+        start_event_id=4,
+        operation_id=operation_id,
+        opener_command_id="authoritative-command-3",
+        opener_attempt_ordinal=2,
+        blocked_material_identity=_strict_identity("build-legality", 3),
+        builder_tag=0xB,
+    )
+    events.extend(preflight_events)
+    conflicting_payload = dict(preflight_events[-1].payload)
+    if conflict == "payload":
+        conflicting_payload["reset_from_streak"] = 2
+    elif conflict == "request":
+        conflicting_payload["request_id"] = _strict_identity("build-preflight", 998)
+    elif conflict == "opener":
+        conflicting_payload["opened_command_id"] = "different-opened-command"
+        conflicting_payload["opened_attempt_id"] = AttemptKey(
+            operation_id=operation_id,
+            command_id="different-opened-command",
+            attempt_ordinal=2,
+        ).attempt_id
+    else:
+        conflicting_payload["material_legality_identity"] = _strict_identity("build-legality", 998)
+    events.append(_event(7, preflight_events[-1].event_type, conflicting_payload))
+
+    report = build_engineering_gate_report(
+        events,
+        run_dir=tmp_path,
+        natural_run_baseline_bytes_per_loop=100.0,
+    )
+
+    diagnostics = report["diagnostics"]
+    assert diagnostics["authoritative_build_pre_dispatch_invalid_transition_count"] >= 1
+    assert diagnostics["authoritative_build_pre_dispatch_producer_inconsistency_count"] >= 1
+    assert report["gates"]["authoritative_build_pre_dispatch_circuit_bounded"]["passed"] is False
+
+
+@pytest.mark.parametrize(
+    "missing_field",
+    (
+        "authorization_id",
+        "request_id",
+        "opened_command_id",
+        "opened_attempt_id",
+        "opened_attempt_ordinal",
+    ),
+)
+def test_authoritative_replay_rejects_duplicate_reset_missing_generation_identity(
+    missing_field: str,
+    tmp_path: Path,
+) -> None:
+    operation_id = _strict_identity("operation", 179)
+    events = [
+        _authoritative_failure_event(
+            event_id,
+            operation_id=operation_id,
+            attempt_ordinal=event_id - 1,
+            attempt_index=event_id,
+            streak=event_id,
+            state_transition="closed_to_open" if event_id == 3 else None,
+            circuit_open=event_id == 3,
+        )
+        for event_id in range(1, 4)
+    ]
+    preflight_events, _ = _authoritative_preflight_events(
+        start_event_id=4,
+        operation_id=operation_id,
+        opener_command_id="authoritative-command-3",
+        opener_attempt_ordinal=2,
+        blocked_material_identity=_strict_identity("build-legality", 3),
+        builder_tag=0xB,
+    )
+    events.extend(preflight_events)
+    missing_identity_payload = dict(preflight_events[-1].payload)
+    missing_identity_payload.pop(missing_field)
+    events.append(_event(7, preflight_events[-1].event_type, missing_identity_payload))
+
+    report = build_engineering_gate_report(
+        events,
+        run_dir=tmp_path,
+        natural_run_baseline_bytes_per_loop=100.0,
+    )
+
+    diagnostics = report["diagnostics"]
+    assert diagnostics["authoritative_build_pre_dispatch_missing_identity_count"] >= 1
+    assert diagnostics["authoritative_build_pre_dispatch_invalid_transition_count"] >= 1
+    assert diagnostics["authoritative_build_pre_dispatch_producer_inconsistency_count"] >= 1
+    assert report["gates"]["authoritative_build_pre_dispatch_circuit_bounded"]["passed"] is False
+
+
 def test_authoritative_replay_reconstructs_preflight_material_identity(
     tmp_path: Path,
 ) -> None:
@@ -1659,6 +1931,77 @@ def test_authoritative_replay_rejects_forged_core_material_reset(
         report["diagnostics"]["authoritative_build_pre_dispatch_producer_inconsistency_count"] == 1
     )
     assert report["diagnostics"]["authoritative_build_pre_dispatch_post_open_command_count"] == 1
+    assert report["gates"]["authoritative_build_pre_dispatch_circuit_bounded"]["passed"] is False
+
+
+def test_authoritative_replay_rejects_auth_mismatch_reset_and_counts_post_open(
+    tmp_path: Path,
+) -> None:
+    operation_id = _strict_identity("operation", 180)
+    events = [
+        _authoritative_failure_event(
+            event_id,
+            operation_id=operation_id,
+            attempt_ordinal=event_id - 1,
+            attempt_index=event_id,
+            streak=event_id,
+            state_transition="closed_to_open" if event_id == 3 else None,
+            circuit_open=event_id == 3,
+        )
+        for event_id in range(1, 4)
+    ]
+    preflight_events, authorization = _authoritative_preflight_events(
+        start_event_id=4,
+        operation_id=operation_id,
+        opener_command_id="authoritative-command-3",
+        opener_attempt_ordinal=2,
+        blocked_material_identity=_strict_identity("build-legality", 3),
+        builder_tag=0xB,
+    )
+    forged_authorization_id = authoritative_build_preflight_authorization_id(
+        request_id=str(authorization["request_id"]),
+        operation_id=operation_id,
+        operation_epoch=0,
+        action_name="Build_Pylon_Screen",
+        builder_tag=0xB,
+        ability_id=881,
+        world_target=(65.0, 90.0),
+        target_state_revision="target-state:changed",
+        material_legality_identity=str(authorization["material_legality_identity"]),
+        observation_revision="raw-observation:80",
+        observation_game_loop=80,
+        expires_game_loop=193,
+    )
+    reset_payload = preflight_events[-1].payload
+    reset_payload["authorization_id"] = forged_authorization_id
+    events.extend(preflight_events)
+    events.append(
+        _event(
+            7,
+            "command_lineage",
+            {
+                "command_id": "post-mismatched-reset",
+                "operation_id": operation_id,
+                "lineage": {
+                    "command_id": "post-mismatched-reset",
+                    "operation_id": operation_id,
+                },
+                "semantic_action": "BUILD PYLON",
+            },
+        )
+    )
+
+    report = build_engineering_gate_report(
+        events,
+        run_dir=tmp_path,
+        natural_run_baseline_bytes_per_loop=100.0,
+    )
+
+    diagnostics = report["diagnostics"]
+    assert diagnostics["authoritative_build_pre_dispatch_circuit_reset_count"] == 0
+    assert diagnostics["authoritative_build_pre_dispatch_producer_inconsistency_count"] >= 1
+    assert diagnostics["authoritative_build_pre_dispatch_invalid_transition_count"] >= 1
+    assert diagnostics["authoritative_build_pre_dispatch_post_open_command_count"] == 1
     assert report["gates"]["authoritative_build_pre_dispatch_circuit_bounded"]["passed"] is False
 
 

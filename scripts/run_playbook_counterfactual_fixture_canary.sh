@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+set -o noclobber
 export PYTHONDONTWRITEBYTECODE=1
 
 if [[ $# -ne 5 ]]; then
@@ -26,12 +27,18 @@ recovery_placeholder="${run_set_dir}/recovery-not-required.json"
 reviewed_source_root="${run_set_dir}/reviewed-source"
 status_file="${run_set_dir}/experiment-status.tsv"
 
-mkdir -p "${run_set_dir}"
+claim_python="${RTSCORTEX_CLAIM_PYTHON:-python3}"
+"${claim_python}" "${repo_dir}/scripts/qualification_attempt.py" claim \
+  "${run_set_dir}" \
+  --expected-git-sha "${expected_git_sha}" \
+  --slurm-job-id "${SLURM_JOB_ID:-unknown}" \
+  --slurm-restart-count "${SLURM_RESTART_COUNT:-0}"
 run_set_dir="$(readlink -f "${run_set_dir}")"
 baseline_snapshot="${run_set_dir}/playbook.canary-fixture.sqlite3"
 readiness_evidence="${run_set_dir}/playbook-hard-readiness.json"
 recovery_placeholder="${run_set_dir}/recovery-not-required.json"
 status_file="${run_set_dir}/experiment-status.tsv"
+attempt_manifest="${run_set_dir}/attempt-manifest.json"
 
 cd "${repo_dir}"
 git_head="$(git rev-parse HEAD)"
@@ -47,7 +54,6 @@ if [[ "${git_head}" != "${expected_git_sha}" \
   exit 2
 fi
 
-rm -f "${baseline_snapshot}" "${baseline_snapshot}-shm" "${baseline_snapshot}-wal"
 uv run rtscortex playbook create-canary-fixture \
   --database "${baseline_snapshot}" \
   --expected-git-sha "${expected_git_sha}" \
@@ -79,8 +85,24 @@ reviewed_source_tree_sha256="$(
     "${reviewed_llm_pysc2}" --field reviewed_tree_sha256
 )"
 
-printf '{"accepted":false,"skipped":true,"reason":"bounded fixture canary does not claim recovery acceptance"}\n' \
-  > "${recovery_placeholder}"
+uv run python - "${attempt_manifest}" "${recovery_placeholder}" <<'PY'
+import sys
+from pathlib import Path
+
+from scripts.qualification_attempt import attempt_fields, create_only_json, load_attempt_manifest
+
+manifest = load_attempt_manifest(Path(sys.argv[1]).parent)
+create_only_json(
+    sys.argv[2],
+    {
+        "accepted": False,
+        "skipped": True,
+        "reason": "bounded fixture canary does not claim recovery acceptance",
+        **attempt_fields(manifest),
+        "attempt": attempt_fields(manifest),
+    },
+)
+PY
 printf "experiment_kind\tmode\tseed\tarm\tsubject_arm\tarm_order\texit_code\trun_dir\tplaybook_before_sha256\tplaybook_after_sha256\tplaybook_before_snapshot\tplaybook_after_snapshot\tgit_head_before\tgit_head_after\tsuperproject_dirty_before\tsuperproject_dirty_after\tsubmodule_commit_before\tsubmodule_commit_after\tsubmodule_dirty_before\tsubmodule_dirty_after\tsubmodule_gitlink_before\tsubmodule_gitlink_after\tsubmodule_diff_sha256_before\tsubmodule_diff_sha256_after\treviewed_source_commit_before\treviewed_source_commit_after\treviewed_source_diff_sha256_before\treviewed_source_diff_sha256_after\treviewed_source_tree_sha256_before\treviewed_source_tree_sha256_after\n" \
   > "${status_file}"
 
@@ -100,6 +122,7 @@ run_arm() {
   local before_sha256
   before_sha256="$(sha256sum "${working_playbook}" | awk '{print $1}')"
   local log_path="${arm_dir}/seed-${seed}.log"
+  : > "${log_path}"
   local submodule_diff_sha256
   submodule_diff_sha256="$(git -C third_party/LLM-PySC2 diff --binary | sha256sum | awk '{print $1}')"
   local reviewed_commit_before
@@ -125,7 +148,7 @@ run_arm() {
     TRANSFORMERS_OFFLINE=1 \
     TOKENIZERS_PARALLELISM=false \
     uv run rtscortex run --config "${config}" --seed "${seed}" \
-    2>&1 | tee "${log_path}"
+    2>&1 | tee -a "${log_path}"
   local run_status=${PIPESTATUS[0]}
   set -e
   local run_dir

@@ -627,6 +627,72 @@ def _typed_digest_identity(value: str | None, prefix: str) -> bool:
     return len(digest) == 64 and all(character in "0123456789abcdef" for character in digest)
 
 
+def _canonical_payload_fingerprint(payload: dict[str, Any]) -> str | None:
+    """Return a stable digest for one durable event envelope.
+
+    Event identity is intentionally excluded: the payload is the envelope's
+    durable content, while ``event_id`` is only the journal position.  Sorting
+    keys makes equivalent JSON objects compare identically on replay.
+    """
+
+    try:
+        encoded = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode()
+    except (TypeError, ValueError):
+        return None
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _authoritative_reset_generation_identity(
+    payload: dict[str, Any],
+) -> tuple[str, str, str, str, str, int] | None:
+    """Build the stable identity for one Raw circuit-reset generation."""
+
+    operation_id = _string_value(payload.get("operation_id"))
+    authorization_id = _string_value(payload.get("authorization_id"))
+    request_id = _string_value(payload.get("request_id"))
+    opened_command_id = _string_value(payload.get("opened_command_id"))
+    opened_attempt_id = _string_value(payload.get("opened_attempt_id"))
+    opened_attempt_ordinal = payload.get("opened_attempt_ordinal")
+    if operation_id is None:
+        return None
+    if not (
+        _typed_digest_identity(operation_id, "operation:")
+        and _typed_digest_identity(authorization_id, "build-preflight-authorization:")
+        and _typed_digest_identity(request_id, "build-preflight:")
+        and opened_command_id is not None
+        and _typed_digest_identity(opened_attempt_id, "attempt:")
+        and isinstance(opened_attempt_ordinal, int)
+        and not isinstance(opened_attempt_ordinal, bool)
+        and opened_attempt_ordinal >= 0
+        and opened_attempt_id
+        == _authoritative_attempt_identity(
+            operation_id,
+            opened_command_id,
+            opened_attempt_ordinal,
+        )
+    ):
+        return None
+    assert operation_id is not None
+    assert authorization_id is not None
+    assert request_id is not None
+    assert opened_command_id is not None
+    assert opened_attempt_id is not None
+    return (
+        operation_id,
+        authorization_id,
+        request_id,
+        opened_command_id,
+        opened_attempt_id,
+        opened_attempt_ordinal,
+    )
+
+
 def _finite_world_point(value: Any) -> tuple[float, float] | None:
     if not isinstance(value, (list, tuple)) or len(value) != 2:
         return None
@@ -991,7 +1057,7 @@ def authoritative_build_pre_dispatch_audit(
     operation_epoch_change_count = 0
     previous_revision_by_operation: dict[str, str] = {}
     seen_producer_defers: set[tuple[str, str | None, str | None, Any, Any]] = set()
-    seen_producer_resets: set[tuple[str, str | None, str | None]] = set()
+    seen_producer_resets: dict[tuple[str, str, str, str, str, int], str] = {}
     preflight_requests: dict[str, dict[str, Any]] = {}
     released_preflight_authorizations: dict[str, dict[str, Any]] = {}
     authorized_lineage_commands: dict[str, str] = {}
@@ -1626,14 +1692,22 @@ def authoritative_build_pre_dispatch_audit(
         elif event.event_type == "authoritative_build_pre_dispatch_circuit_reset":
             operation_id = _string_value(payload.get("operation_id"))
             reason = _string_value(payload.get("reason"))
-            reset_key = (operation_id or "", reason, _string_value(payload.get("action_name")))
-            if reset_key in seen_producer_resets:
-                continue
-            seen_producer_resets.add(reset_key)
-            if not _typed_digest_identity(operation_id, "operation:") or not reason:
-                producer_inconsistency.add(f"event:{event.event_id}")
+            generation_identity = _authoritative_reset_generation_identity(payload)
+            payload_fingerprint = _canonical_payload_fingerprint(payload)
+            identity_key = operation_id or f"event:{event.event_id}"
+            if generation_identity is None or payload_fingerprint is None or not reason:
+                producer_inconsistency.add(identity_key)
+                missing_identity.add(identity_key)
+                _invalid(operation_id)
+            elif generation_identity in seen_producer_resets:
+                validated_operation_id = generation_identity[0]
+                if seen_producer_resets[generation_identity] == payload_fingerprint:
+                    operations[validated_operation_id]["duplicate_envelope_count"] += 1
+                else:
+                    producer_inconsistency.add(validated_operation_id)
+                    _invalid(validated_operation_id)
             else:
-                assert operation_id is not None
+                operation_id = generation_identity[0]
                 operation = operations[operation_id]
                 state = _state(operation_id)
                 operation["producer_reset_count"] += 1
@@ -1678,6 +1752,7 @@ def authoritative_build_pre_dispatch_audit(
                     assert isinstance(authorization, dict)
                     _clear_state(operation_id, state, reason)
                     released_preflight_authorizations[operation_id] = authorization
+                    seen_producer_resets[generation_identity] = payload_fingerprint
 
         # A producer/Runtime command is forbidden once the replay has opened.
         if event.event_type == "command_lineage":

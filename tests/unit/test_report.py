@@ -25,6 +25,7 @@ from rtscortex.evaluation.report import (
     AcceptanceGate,
     ReportError,
     _hard_acceptance_summary,
+    _load_qualification_evidence,
     render_timeline,
     write_run_reports,
     write_timeline_report,
@@ -69,13 +70,24 @@ def _qualification_evidence(
     expected_git_sha: str,
     diagnostic_only: bool = False,
 ) -> Path:
+    attempt = {
+        "run_set_id": tmp_path.name,
+        "expected_git_sha": expected_git_sha,
+        "attempt_id": "attempt:" + "a" * 32,
+        "slurm_job_id": "test-job",
+        "slurm_restart_count": 0,
+        "started_at": "2026-01-01T00:00:00+00:00",
+    }
     recovery = tmp_path / "recovery-canary.json"
     recovery.write_text(
         json.dumps(
             {
                 "format_version": "1.1",
+                **attempt,
+                "attempt": attempt,
                 "git_sha": expected_git_sha,
                 "expected_git_sha": expected_git_sha,
+                "seed_ids": [0, 1, 2],
                 "passed": True,
                 "recovery_evidence_present": True,
                 "checkpoint_tail_recovery_bounded": True,
@@ -101,7 +113,9 @@ def _qualification_evidence(
                 "format_version": "1.0",
                 "evidence_kind": "three-seed-qualification",
                 "diagnostic_only": diagnostic_only,
-                "expected_git_sha": expected_git_sha,
+                **attempt,
+                "attempt": attempt,
+                "seed_ids": [0, 1, 2],
                 "recovery_evidence": {
                     "path": str(recovery),
                     "sha256": _sha256(recovery),
@@ -115,6 +129,26 @@ def _qualification_evidence(
         encoding="utf-8",
     )
     return manifest
+
+
+def test_formal_qualification_evidence_requires_complete_attempt_provenance(
+    tmp_path: Path,
+) -> None:
+    manifest_path = _qualification_evidence(tmp_path, expected_git_sha="f" * 40)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    for field in (
+        "run_set_id",
+        "attempt_id",
+        "slurm_job_id",
+        "slurm_restart_count",
+        "started_at",
+        "attempt",
+    ):
+        manifest.pop(field)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ReportError, match="attempt provenance"):
+        _load_qualification_evidence(manifest_path)
 
 
 def test_qualification_evidence_reaches_engineering_report_call_path(

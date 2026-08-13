@@ -166,6 +166,46 @@ def _load_qualification_evidence(
     if not isinstance(diagnostic_only, bool):
         raise ReportError("qualification evidence diagnostic_only must be explicit")
 
+    attempt_field_names = (
+        "run_set_id",
+        "expected_git_sha",
+        "attempt_id",
+        "slurm_job_id",
+        "slurm_restart_count",
+        "started_at",
+    )
+    attempt_fields_present = tuple(field for field in attempt_field_names if field in manifest)
+    if not diagnostic_only and len(attempt_fields_present) != len(attempt_field_names):
+        raise ReportError("formal qualification evidence has incomplete attempt provenance")
+    if attempt_fields_present and len(attempt_fields_present) != len(attempt_field_names):
+        raise ReportError("qualification evidence has partial attempt provenance")
+    has_attempt_provenance = len(attempt_fields_present) == len(attempt_field_names)
+    attempt_payload = {field: manifest.get(field) for field in attempt_field_names}
+    if has_attempt_provenance:
+        if (
+            not isinstance(attempt_payload["slurm_restart_count"], int)
+            or isinstance(attempt_payload["slurm_restart_count"], bool)
+            or attempt_payload["slurm_restart_count"] != 0
+            or not all(
+                isinstance(attempt_payload[field], str) and attempt_payload[field]
+                for field in (
+                    "run_set_id",
+                    "expected_git_sha",
+                    "attempt_id",
+                    "slurm_job_id",
+                    "started_at",
+                )
+            )
+            or attempt_payload["run_set_id"] != resolved_manifest.parent.name
+            or re.fullmatch(r"attempt:[0-9a-f]{32}", str(attempt_payload["attempt_id"])) is None
+            or manifest.get("attempt") != attempt_payload
+        ):
+            raise ReportError("qualification evidence attempt provenance is invalid")
+
+    seed_ids = manifest.get("seed_ids")
+    if not diagnostic_only and seed_ids != [0, 1, 2]:
+        raise ReportError("formal qualification evidence must bind source seeds 0, 1, and 2")
+
     recovery_path, recovery_sha = _verified_evidence_file(
         resolved_manifest,
         manifest.get("recovery_evidence"),
@@ -178,6 +218,19 @@ def _load_qualification_evidence(
         or recovery.get("expected_git_sha") != expected_git_sha
     ):
         raise ReportError("recovery evidence is not bound to expected_git_sha")
+
+    if has_attempt_provenance:
+        if (
+            any(recovery.get(field) != value for field, value in attempt_payload.items())
+            or recovery.get("attempt") != attempt_payload
+        ):
+            raise ReportError(
+                "recovery evidence attempt provenance does not match qualification evidence"
+            )
+        if recovery.get("seed_ids") != seed_ids:
+            raise ReportError(
+                "recovery evidence seed provenance does not match qualification evidence"
+            )
 
     baseline_path, baseline_sha = _verified_evidence_file(
         resolved_manifest,
@@ -197,6 +250,7 @@ def _load_qualification_evidence(
         "evidence_kind": "three-seed-qualification",
         "diagnostic_only": diagnostic_only,
         "expected_git_sha": expected_git_sha,
+        "seed_ids": seed_ids,
         "recovery_evidence": {
             "path": str(recovery_path),
             "sha256": recovery_sha,
@@ -208,6 +262,30 @@ def _load_qualification_evidence(
             "bytes_per_game_loop": float(baseline_value),
         },
     }
+    if has_attempt_provenance:
+        evidence.update(attempt_payload)
+        evidence["attempt"] = dict(attempt_payload)
+    source_reference = manifest.get("source_attestation")
+    if source_reference is not None:
+        source_path, source_sha = _verified_evidence_file(
+            resolved_manifest,
+            source_reference,
+            label="source attestation",
+        )
+        source = _read_json_object(source_path, label="source attestation")
+        if source.get("expected_git_sha", source.get("git_sha")) != expected_git_sha:
+            raise ReportError("source attestation is not bound to expected_git_sha")
+        if has_attempt_provenance and (
+            any(source.get(field) != value for field, value in attempt_payload.items())
+            or source.get("attempt") != attempt_payload
+        ):
+            raise ReportError(
+                "source attestation attempt provenance does not match qualification evidence"
+            )
+        evidence["source_attestation"] = {
+            "path": str(source_path),
+            "sha256": source_sha,
+        }
     if diagnostic_only:
         return None, None, expected_git_sha, evidence
     return float(baseline_value), recovery, expected_git_sha, evidence

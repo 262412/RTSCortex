@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+set -o noclobber
 export PYTHONDONTWRITEBYTECODE=1
 
 if [[ $# -ne 4 || "$3" != "--expected-git-sha" ]]; then
@@ -36,8 +37,12 @@ if [[ ! -x "${core_python}" || ! -x "${core_cli}" ]]; then
   exit 2
 fi
 export PYTHONPATH="${repo_dir}/src:${repo_dir}/integrations/llm_pysc2/src${PYTHONPATH:+:${PYTHONPATH}}"
-
-mkdir -p "${run_set_dir}"
+claim_python="${RTSCORTEX_CLAIM_PYTHON:-${core_python}}"
+"${claim_python}" "${repo_dir}/scripts/qualification_attempt.py" claim \
+  "${run_set_dir}" \
+  --expected-git-sha "${expected_git_sha}" \
+  --slurm-job-id "${SLURM_JOB_ID:-unknown}" \
+  --slurm-restart-count "${SLURM_RESTART_COUNT:-0}"
 run_set_dir="$(readlink -f "${run_set_dir}")"
 baseline="${run_set_dir}/playbook.soft-baseline.sqlite3"
 probe_output="${run_set_dir}/playbook.hard-shadow-probe.sqlite3"
@@ -50,9 +55,10 @@ recovery_evidence="${run_set_dir}/recovery-canary.json"
 qualification_evidence="${run_set_dir}/qualification-evidence.json"
 reviewed_source_root="${run_set_dir}/reviewed-source"
 status_file="${run_set_dir}/hard-qualification-status.tsv"
+attempt_manifest="${run_set_dir}/attempt-manifest.json"
 
 cd "${repo_dir}"
-exec 9>"${lock_path}"
+exec 9>>"${lock_path}"
 if ! flock -n 9; then
   echo "another Protoss Playbook experiment owns ${lock_path}" >&2
   exit 1
@@ -75,26 +81,34 @@ fi
 git status --short > "${run_set_dir}/source-status.txt"
 "${core_python}" scripts/run_recovery_acceptance_canary.py \
   --expected-git-sha "${expected_git_sha}" \
+  --attempt-manifest "${attempt_manifest}" \
+  --seed-ids "0,1,2" \
   --output "${recovery_evidence}"
 
 "${core_python}" - \
+  "${attempt_manifest}" \
   "${expected_git_sha}" \
   "${recovery_evidence}" \
   "${engineering_baseline}" \
   "${qualification_evidence}" <<'PY'
 import hashlib
-import json
 import sys
 from pathlib import Path
 
-expected_git_sha, recovery_raw, baseline_raw, output_raw = sys.argv[1:]
+from scripts.qualification_attempt import attempt_fields, create_only_json, load_attempt_manifest
+
+manifest_raw, expected_git_sha, recovery_raw, baseline_raw, output_raw = sys.argv[1:]
+attempt = load_attempt_manifest(Path(manifest_raw).parent)
 recovery = Path(recovery_raw).resolve()
 baseline = Path(baseline_raw).resolve()
 payload = {
     "format_version": "1.0",
     "evidence_kind": "three-seed-qualification",
     "diagnostic_only": False,
+    **attempt_fields(attempt),
+    "attempt": attempt_fields(attempt),
     "expected_git_sha": expected_git_sha,
+    "seed_ids": [0, 1, 2],
     "recovery_evidence": {
         "path": str(recovery),
         "sha256": hashlib.sha256(recovery.read_bytes()).hexdigest(),
@@ -104,10 +118,7 @@ payload = {
         "sha256": hashlib.sha256(baseline.read_bytes()).hexdigest(),
     },
 }
-Path(output_raw).write_text(
-    json.dumps(payload, indent=2, sort_keys=True) + "\n",
-    encoding="utf-8",
-)
+create_only_json(output_raw, payload)
 PY
 
 "${core_python}" scripts/prepare_reviewed_llm_pysc2_runtime.py \
@@ -263,6 +274,7 @@ while IFS=$'\t' read -r batch_id batch_index probe_path probe_sha256; do
     reviewed_diff_before="${source_reviewed_diff_sha256}"
     reviewed_tree_before="${source_reviewed_tree_sha256}"
     log_path="${run_set_dir}/${batch_id}.seed-${seed}.log"
+    : > "${log_path}"
     run_dir=""
     if ! attestation_matches; then
       echo "source attestation changed before ${batch_id} seed ${seed}" >&2
@@ -277,7 +289,7 @@ while IFS=$'\t' read -r batch_id batch_index probe_path probe_sha256; do
           --config "${config}" \
           --seed "${seed}" \
           --qualification-evidence "${qualification_evidence}" \
-        2>&1 | tee "${log_path}"
+        2>&1 | tee -a "${log_path}"
       run_status=${PIPESTATUS[0]}
       set -e
       run_dir="$(sed -n -e 's/^Run directory: //p' -e 's/^Artifacts: //p' "${log_path}" | tail -n 1)"

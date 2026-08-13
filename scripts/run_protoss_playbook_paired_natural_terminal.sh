@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+set -o noclobber
 export PYTHONDONTWRITEBYTECODE=1
 
 if [[ $# -ne 6 && $# -ne 8 ]]; then
@@ -54,14 +55,20 @@ if [[ ! -f "${baseline_source}" ]]; then
   exit 2
 fi
 
-mkdir -p "${run_set_dir}"
+claim_python="${RTSCORTEX_CLAIM_PYTHON:-python3}"
+"${claim_python}" "${repo_dir}/scripts/qualification_attempt.py" claim \
+  "${run_set_dir}" \
+  --expected-git-sha "${expected_git_sha}" \
+  --slurm-job-id "${SLURM_JOB_ID:-unknown}" \
+  --slurm-restart-count "${SLURM_RESTART_COUNT:-0}"
 run_set_dir="$(readlink -f "${run_set_dir}")"
 recovery_evidence="${run_set_dir}/recovery-canary.json"
 readiness_evidence="${run_set_dir}/playbook-hard-readiness.json"
 reviewed_source_root="${run_set_dir}/reviewed-source"
 baseline_snapshot="${run_set_dir}/playbook.baseline.sqlite3"
+attempt_manifest="${run_set_dir}/attempt-manifest.json"
 
-exec 9>"${lock_path}"
+exec 9>>"${lock_path}"
 if ! flock -n 9; then
   echo "another Protoss Playbook experiment owns ${lock_path}" >&2
   exit 1
@@ -179,6 +186,8 @@ source_matches_baseline() {
 
 uv run python scripts/run_recovery_acceptance_canary.py \
   --expected-git-sha "${expected_git_sha}" \
+  --attempt-manifest "${attempt_manifest}" \
+  --seed-ids "${seed_csv}" \
   --output "${recovery_evidence}"
 {
   echo "started_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -245,6 +254,7 @@ run_arm() {
   before_snapshot="${arm_dir}/seed-${seed}.before.sqlite3"
   cp "${working_playbook}" "${before_snapshot}"
   log_path="${arm_dir}/seed-${seed}.log"
+  : > "${log_path}"
   set +e
   SC2PATH="/mnt/scratch/users/tbczhang/StarCraftII" \
     HF_HUB_OFFLINE=1 \
@@ -259,7 +269,7 @@ run_arm() {
       --seed "${seed}" \
       --console \
       --console-port 8765 \
-    2>&1 | tee "${log_path}"
+    2>&1 | tee -a "${log_path}"
   run_status=${PIPESTATUS[0]}
   set -e
   capture_source_attestation
@@ -347,6 +357,7 @@ run_shadow_calibration() {
   before_snapshot="${arm_dir}/seed-${seed}.before.sqlite3"
   cp "${shadow_playbook}" "${before_snapshot}"
   log_path="${arm_dir}/seed-${seed}.log"
+  : > "${log_path}"
   set +e
   SC2PATH="/mnt/scratch/users/tbczhang/StarCraftII" \
     HF_HUB_OFFLINE=1 \
@@ -361,7 +372,7 @@ run_shadow_calibration() {
       --seed "${seed}" \
       --console \
       --console-port 8765 \
-    2>&1 | tee "${log_path}"
+    2>&1 | tee -a "${log_path}"
   run_status=${PIPESTATUS[0]}
   set -e
   capture_source_attestation

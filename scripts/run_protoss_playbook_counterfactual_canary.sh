@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+set -o noclobber
 export PYTHONDONTWRITEBYTECODE=1
 
 if [[ $# -ne 8 || "$3" != "--expected-git-sha" || "$5" != "--execution-seed" || "$7" != "--evaluation-seeds" ]]; then
@@ -49,7 +50,12 @@ active_playbook="${output_root}/cortex-playbook-evolving-working.sqlite3"
 shadow_playbook="${output_root}/cortex-playbook-counterfactual-shadow.sqlite3"
 lock_path="${output_root}/protoss-playbook-paired.lock"
 
-mkdir -p "${run_set_dir}"
+claim_python="${RTSCORTEX_CLAIM_PYTHON:-python3}"
+"${claim_python}" "${repo_dir}/scripts/qualification_attempt.py" claim \
+  "${run_set_dir}" \
+  --expected-git-sha "${expected_git_sha}" \
+  --slurm-job-id "${SLURM_JOB_ID:-unknown}" \
+  --slurm-restart-count "${SLURM_RESTART_COUNT:-0}"
 run_set_dir="$(readlink -f "${run_set_dir}")"
 baseline_snapshot="${run_set_dir}/playbook.baseline.sqlite3"
 cp "${baseline_source}" "${baseline_snapshot}"
@@ -58,9 +64,10 @@ recovery_evidence="${run_set_dir}/recovery-canary.json"
 readiness_evidence="${run_set_dir}/playbook-hard-readiness.json"
 reviewed_source_root="${run_set_dir}/reviewed-source"
 status_file="${run_set_dir}/experiment-status.tsv"
+attempt_manifest="${run_set_dir}/attempt-manifest.json"
 
 cd "${repo_dir}"
-exec 9>"${lock_path}"
+exec 9>>"${lock_path}"
 if ! flock -n 9; then
   echo "another Protoss Playbook experiment owns ${lock_path}" >&2
   exit 1
@@ -109,6 +116,8 @@ reviewed_source_tree_sha256="$(
 
 uv run python scripts/run_recovery_acceptance_canary.py \
   --expected-git-sha "${expected_git_sha}" \
+  --attempt-manifest "${attempt_manifest}" \
+  --seed-ids "${evaluation_seed_csv}" \
   --output "${recovery_evidence}"
 
 printf "experiment_kind\tmode\tseed\tarm\tsubject_arm\tarm_order\texit_code\trun_dir\tevents_sha256\tsummary_sha256\tplaybook_before_sha256\tplaybook_after_sha256\tplaybook_before_snapshot\tplaybook_after_snapshot\tgit_head_before\tgit_head_after\tsuperproject_dirty_before\tsuperproject_dirty_after\tsubmodule_commit_before\tsubmodule_commit_after\tsubmodule_dirty_before\tsubmodule_dirty_after\tsubmodule_gitlink_before\tsubmodule_gitlink_after\tsubmodule_diff_sha256_before\tsubmodule_diff_sha256_after\treviewed_source_commit_before\treviewed_source_commit_after\treviewed_source_diff_sha256_before\treviewed_source_diff_sha256_after\treviewed_source_tree_sha256_before\treviewed_source_tree_sha256_after\n" > "${status_file}"
@@ -129,6 +138,7 @@ run_canary_arm() {
   local before_sha256
   before_sha256="$(sha256sum "${working_playbook}" | awk '{print $1}')"
   local log_path="${arm_dir}/seed-${seed}.log"
+  : > "${log_path}"
   local reviewed_commit_before
   reviewed_commit_before="$(git -C "${reviewed_llm_pysc2}" rev-parse HEAD)"
   local reviewed_diff_before
@@ -160,7 +170,7 @@ run_canary_arm() {
       --seed "${seed}" \
       --console \
       --console-port 8765 \
-    2>&1 | tee "${log_path}"
+    2>&1 | tee -a "${log_path}"
   local run_status=${PIPESTATUS[0]}
   set -e
   local run_dir
