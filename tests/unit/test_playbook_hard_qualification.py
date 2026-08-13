@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import hashlib
 import json
 from dataclasses import replace
@@ -39,12 +40,110 @@ from scripts.prepare_playbook_hard_qualification import (
     ProbeBatchCapacityError,
     _create_probe_batch,
     _eligible_parent,
+    _load_source_rows,
     _partition_probe_batches,
 )
 
 GIT_SHA = "a" * 40
 BASELINE_SHA = "b" * 64
 PROBE_SHA = "c" * 64
+
+
+def _write_source_status_fixture(
+    tmp_path: Path,
+    *,
+    reviewed_tree_after: str = "5" * 64,
+) -> tuple[Path, tuple[Path, ...]]:
+    columns = (
+        "seed",
+        "exit_code",
+        "run_dir",
+        "accepted",
+        "git_head_before",
+        "git_head_after",
+        "submodule_commit_before",
+        "submodule_commit_after",
+        "reviewed_commit_before",
+        "reviewed_commit_after",
+        "reviewed_tree_sha256_before",
+        "reviewed_tree_sha256_after",
+    )
+    run_directories: list[Path] = []
+    rows: list[dict[str, str]] = []
+    for seed in (0, 1, 2):
+        run_directory = tmp_path / f"source-{seed}"
+        run_directory.mkdir()
+        (run_directory / "engineering-gates.json").write_text(
+            json.dumps(
+                {
+                    "accepted": True,
+                    "evidence": {
+                        "diagnostic_only": False,
+                        "expected_git_sha": GIT_SHA,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        (run_directory / "events.jsonl").write_text("", encoding="utf-8")
+        (run_directory / "worker.stderr.log").write_text(
+            "Version: B75689 (SC2.4.10)\n",
+            encoding="utf-8",
+        )
+        (run_directory / "config.yaml").write_text(
+            "environment:\n  agent_race: protoss\n  opponent_race: zerg\n  scenario: Simple64\n",
+            encoding="utf-8",
+        )
+        run_directories.append(run_directory)
+        rows.append(
+            {
+                "seed": str(seed),
+                "exit_code": "0",
+                "run_dir": str(run_directory),
+                "accepted": "true",
+                "git_head_before": GIT_SHA,
+                "git_head_after": GIT_SHA,
+                "submodule_commit_before": "8" * 40,
+                "submodule_commit_after": "8" * 40,
+                "reviewed_commit_before": "8" * 40,
+                "reviewed_commit_after": "8" * 40,
+                "reviewed_tree_sha256_before": "5" * 64,
+                "reviewed_tree_sha256_after": reviewed_tree_after,
+            }
+        )
+    status_path = tmp_path / "qualification-status.tsv"
+    with status_path.open("w", encoding="utf-8", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=columns, delimiter="\t")
+        writer.writeheader()
+        writer.writerows(rows)
+    return status_path, tuple(run_directories)
+
+
+def test_load_source_rows_accepts_source_qualification_reviewed_tree_schema(
+    tmp_path: Path,
+) -> None:
+    status_path, run_directories = _write_source_status_fixture(tmp_path)
+
+    source_rows, sc2_build, _, source_git_sha, attestation = _load_source_rows(
+        status_path,
+        run_directories,
+        sc2_patch="4.10",
+    )
+
+    assert [row["seed_id"] for row in source_rows] == [0, 1, 2]
+    assert sc2_build == "B75689"
+    assert source_git_sha == GIT_SHA
+    assert attestation["reviewed_tree"] == "5" * 64
+
+
+def test_load_source_rows_rejects_changed_reviewed_tree_sha256(tmp_path: Path) -> None:
+    status_path, run_directories = _write_source_status_fixture(
+        tmp_path,
+        reviewed_tree_after="6" * 64,
+    )
+
+    with pytest.raises(ValueError, match="failed attestation: reviewed_tree"):
+        _load_source_rows(status_path, run_directories, sc2_patch="4.10")
 
 
 def _parent() -> PlaybookRule:

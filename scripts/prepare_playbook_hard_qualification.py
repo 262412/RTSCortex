@@ -129,8 +129,8 @@ def _load_source_rows(
                 == row.get("submodule_commit_before")
             ),
             "reviewed_tree": (
-                bool(row.get("reviewed_tree_before"))
-                and row.get("reviewed_tree_before") == row.get("reviewed_tree_after")
+                bool(row.get("reviewed_tree_sha256_before"))
+                and row.get("reviewed_tree_sha256_before") == row.get("reviewed_tree_sha256_after")
             ),
         }
         failures = [name for name, accepted in checks.items() if not accepted]
@@ -154,7 +154,7 @@ def _load_source_rows(
                 "git_sha": source_git_sha,
                 "submodule_commit": row["submodule_commit_before"],
                 "reviewed_commit": row["reviewed_commit_before"],
-                "reviewed_tree": row["reviewed_tree_before"],
+                "reviewed_tree": row["reviewed_tree_sha256_before"],
                 "sc2_build": sc2_build,
                 "sc2_patch": observed_patch,
             },
