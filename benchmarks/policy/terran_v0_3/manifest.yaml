@@ -1,0 +1,345 @@
+format_version: '0.2'
+corpus_id: terran-v0.3
+race: terran
+protocol_version: '1.1'
+fixtures_file: fixtures.jsonl
+fixture_count: 48
+fixtures_sha256: eff349ced4aaa555bf144534fd9cf1dadc5e799de696d4c3c66ebc999c3f7946
+fixtures_per_stratum: 8
+minimum_game_loop_gap: 224
+max_per_episode_per_stratum: 4
+minimum_episodes_per_stratum: 2
+minimum_seeds: 3
+minimum_condition_fixtures_per_phase: 2
+stratum_counts:
+  early: 8
+  technology: 8
+  production: 8
+  combat: 8
+  blocked: 8
+  in_progress: 8
+condition_phase_counts:
+  blocked:
+    early: 2
+    technology: 2
+    production: 2
+    combat: 2
+  in_progress:
+    early: 2
+    technology: 2
+    production: 2
+    combat: 2
+seeds:
+- 0
+- 1
+- 2
+episode_keys:
+- cortex-20260718T222336311105Z-966b7e0b:episode-0
+- cortex-20260718T222746639079Z-4977fb2b:episode-0
+- cortex-20260718T224010465461Z-faa93f6f:episode-0
+- cortex-20260718T225630329063Z-970f43d0:episode-0
+- cortex-20260718T230635223671Z-30d1e346:episode-0
+- cortex-20260718T231522644770Z-3cae0ae9:episode-0
+- cortex-20260718T234358494948Z-1d5675d6:episode-0
+- cortex-20260718T235731509216Z-061515e1:episode-0
+- cortex-20260719T001408815747Z-dec48093:episode-0
+- cortex-20260719T004505628038Z-edb6302b:episode-0
+- cortex-20260719T005419006119Z-bd959392:episode-0
+- cortex-20260719T010841267211Z-e7bf6a57:episode-0
+- cortex-20260719T012132155822Z-4dcefb5e:episode-0
+- cortex-20260719T013422512543Z-589dcc5c:episode-0
+- cortex-20260719T014717311861Z-4d5d9d7d:episode-0
+- cortex-20260719T020745892034Z-ff6d7f14:episode-0
+- cortex-20260719T023618898910Z-fff37260:episode-0
+- cortex-20260719T092258929609Z-fa2a29c3:episode-0
+- cortex-20260719T092631592073Z-16fda5b2:episode-0
+fixture_ids:
+- terran-v0.3:early:seed-0-bootstrap:event-2
+- terran-v0.3:early:seed-0-combat:event-2
+- terran-v0.3:early:seed-0-depot:event-56
+- terran-v0.3:early:seed-0-melee-a:event-94
+- terran-v0.3:early:seed-0-melee-b:event-132
+- terran-v0.3:early:seed-0-opening-a:event-134
+- terran-v0.3:early:seed-0-opening-b:event-132
+- terran-v0.3:early:seed-0-targeted-capture:event-48
+- terran-v0.3:technology:seed-0-combat:event-136
+- terran-v0.3:technology:seed-0-depot:event-138
+- terran-v0.3:technology:seed-0-melee-a:event-346
+- terran-v0.3:technology:seed-0-melee-b:event-468
+- terran-v0.3:technology:seed-0-opening-a:event-139
+- terran-v0.3:technology:seed-0-opening-b:event-330
+- terran-v0.3:technology:seed-0-opening-c:event-444
+- terran-v0.3:technology:seed-0-regression-a:event-329
+- terran-v0.3:production:seed-0-combat:event-160
+- terran-v0.3:production:seed-0-melee-a:event-199
+- terran-v0.3:production:seed-0-melee-b:event-237
+- terran-v0.3:production:seed-0-melee-c:event-271
+- terran-v0.3:production:seed-0-opening-a:event-168
+- terran-v0.3:production:seed-0-opening-b:event-311
+- terran-v0.3:production:seed-0-opening-c:event-374
+- terran-v0.3:production:seed-0-opening-d:event-412
+- terran-v0.3:combat:seed-0-combat:event-796
+- terran-v0.3:combat:seed-0-regression-a:event-687
+- terran-v0.3:combat:seed-1-addon:event-852
+- terran-v0.3:combat:seed-1-combat:event-864
+- terran-v0.3:combat:seed-1-regression-a:event-964
+- terran-v0.3:combat:seed-1-regression-b:event-1012
+- terran-v0.3:combat:seed-2-combat:event-823
+- terran-v0.3:combat:seed-2-long-a:event-828
+- terran-v0.3:blocked:seed-0-combat:event-149
+- terran-v0.3:blocked:seed-0-targeted-capture:event-118
+- terran-v0.3:blocked:seed-0-depot:event-144
+- terran-v0.3:blocked:seed-0-regression-a:event-573
+- terran-v0.3:blocked:seed-0-combat:event-328
+- terran-v0.3:blocked:seed-0-opening-c:event-438
+- terran-v0.3:blocked:seed-2-combat:event-1265
+- terran-v0.3:blocked:seed-2-combat:event-1774
+- terran-v0.3:in_progress:seed-0-targeted-capture:event-159
+- terran-v0.3:in_progress:seed-2-targeted-capture:event-58
+- terran-v0.3:in_progress:seed-0-depot:event-164
+- terran-v0.3:in_progress:seed-0-opening-b:event-473
+- terran-v0.3:in_progress:seed-0-combat:event-221
+- terran-v0.3:in_progress:seed-0-melee-a:event-259
+- terran-v0.3:in_progress:seed-0-combat:event-828
+- terran-v0.3:in_progress:seed-1-addon:event-909
+sources:
+- source_id: seed-0-bootstrap
+  journal_path: ~/scratch/outputs/RTSCortex/cortex-20260718T222336311105Z-966b7e0b/events.jsonl
+  journal_sha256: a67827de946d356cf9ba9d0a5b46254945f52aa37557cd588b237a40bc03e89e
+  seed: 0
+  map_name: Simple64
+  observation_count: 7
+  run_ids:
+  - cortex-20260718T222336311105Z-966b7e0b
+  episode_keys:
+  - cortex-20260718T222336311105Z-966b7e0b:episode-0
+- source_id: seed-0-depot
+  journal_path: ~/scratch/outputs/RTSCortex/cortex-20260718T222746639079Z-4977fb2b/events.jsonl
+  journal_sha256: 70128426e5ea6d60ace26507eba1bb87d4e8d09f76d5e0bab612a196a5073658
+  seed: 0
+  map_name: Simple64
+  observation_count: 44
+  run_ids:
+  - cortex-20260718T222746639079Z-4977fb2b
+  episode_keys:
+  - cortex-20260718T222746639079Z-4977fb2b:episode-0
+- source_id: seed-0-opening-a
+  journal_path: ~/scratch/outputs/RTSCortex/cortex-20260718T224010465461Z-faa93f6f/events.jsonl
+  journal_sha256: 5c1a54a465ea6650035d83280361807ce96cd8c363f12fe5d1ba021b64a93d82
+  seed: 0
+  map_name: Simple64
+  observation_count: 95
+  run_ids:
+  - cortex-20260718T224010465461Z-faa93f6f
+  episode_keys:
+  - cortex-20260718T224010465461Z-faa93f6f:episode-0
+- source_id: seed-0-opening-b
+  journal_path: ~/scratch/outputs/RTSCortex/cortex-20260718T231522644770Z-3cae0ae9/events.jsonl
+  journal_sha256: 02825184deb934177f9a5ac6b0eec6e3c6ddc6c1bdfe2418cb65a6483ad27bc7
+  seed: 0
+  map_name: Simple64
+  observation_count: 108
+  run_ids:
+  - cortex-20260718T231522644770Z-3cae0ae9
+  episode_keys:
+  - cortex-20260718T231522644770Z-3cae0ae9:episode-0
+- source_id: seed-0-opening-c
+  journal_path: ~/scratch/outputs/RTSCortex/cortex-20260718T225630329063Z-970f43d0/events.jsonl
+  journal_sha256: a75fa58b38069b25988d97e9750065a9e083a715bf648cf0957362522cc0df43
+  seed: 0
+  map_name: Simple64
+  observation_count: 107
+  run_ids:
+  - cortex-20260718T225630329063Z-970f43d0
+  episode_keys:
+  - cortex-20260718T225630329063Z-970f43d0:episode-0
+- source_id: seed-0-opening-d
+  journal_path: ~/scratch/outputs/RTSCortex/cortex-20260718T230635223671Z-30d1e346/events.jsonl
+  journal_sha256: 6e6f67254a1acc858584a6da69aac77938e36da0c0c890433ed7da5678b2c641
+  seed: 0
+  map_name: Simple64
+  observation_count: 100
+  run_ids:
+  - cortex-20260718T230635223671Z-30d1e346
+  episode_keys:
+  - cortex-20260718T230635223671Z-30d1e346:episode-0
+- source_id: seed-0-watchdog-characterization
+  journal_path: ~/scratch/outputs/RTSCortex/cortex-20260718T234115822045Z-d27fcc68/events.jsonl
+  journal_sha256: b74b30faec88f85e256e22fbd89dbfa5a44accd0890fd40dbde76fe2abd9a9f1
+  seed: 0
+  map_name: Simple64
+  observation_count: 36
+  run_ids:
+  - cortex-20260718T234115822045Z-d27fcc68
+  episode_keys:
+  - cortex-20260718T234115822045Z-d27fcc68:episode-0
+- source_id: seed-0-melee-a
+  journal_path: ~/scratch/outputs/RTSCortex/cortex-20260718T234358494948Z-1d5675d6/events.jsonl
+  journal_sha256: 1e1cd218bb0f83d5c78352a47fed73d94a02c3bd5c26dc609d751084b7173861
+  seed: 0
+  map_name: Simple64
+  observation_count: 132
+  run_ids:
+  - cortex-20260718T234358494948Z-1d5675d6
+  episode_keys:
+  - cortex-20260718T234358494948Z-1d5675d6:episode-0
+- source_id: seed-0-regression-a
+  journal_path: ~/scratch/outputs/RTSCortex/cortex-20260718T235731509216Z-061515e1/events.jsonl
+  journal_sha256: b8d509287a43dcf3eff5705cdeb10d833390e8ceef21a6177bc665e6ee87ab46
+  seed: 0
+  map_name: Simple64
+  observation_count: 135
+  run_ids:
+  - cortex-20260718T235731509216Z-061515e1
+  episode_keys:
+  - cortex-20260718T235731509216Z-061515e1:episode-0
+- source_id: seed-0-regression-b
+  journal_path: ~/scratch/outputs/RTSCortex/cortex-20260719T002408540000Z-3f8ab6ff/events.jsonl
+  journal_sha256: 9409a18feaf58390c44f1ce28996ec774971ef0ca43b0799e3b7877c2daa0663
+  seed: 0
+  map_name: Simple64
+  observation_count: 134
+  run_ids:
+  - cortex-20260719T002408540000Z-3f8ab6ff
+  episode_keys:
+  - cortex-20260719T002408540000Z-3f8ab6ff:episode-0
+- source_id: seed-0-melee-b
+  journal_path: ~/scratch/outputs/RTSCortex/cortex-20260719T001408815747Z-dec48093/events.jsonl
+  journal_sha256: d21c2a7a91cf7ba0d7e0c5dadec1bcbe401370027047168b13d415d64f221b82
+  seed: 0
+  map_name: Simple64
+  observation_count: 132
+  run_ids:
+  - cortex-20260719T001408815747Z-dec48093
+  episode_keys:
+  - cortex-20260719T001408815747Z-dec48093:episode-0
+- source_id: seed-0-melee-c
+  journal_path: ~/scratch/outputs/RTSCortex/cortex-20260719T004505628038Z-edb6302b/events.jsonl
+  journal_sha256: 7fa27b23bc17a1c4cd41af7261b11586d6f03bea16b393ff274ca149ee2a68ba
+  seed: 0
+  map_name: Simple64
+  observation_count: 151
+  run_ids:
+  - cortex-20260719T004505628038Z-edb6302b
+  episode_keys:
+  - cortex-20260719T004505628038Z-edb6302b:episode-0
+- source_id: seed-0-combat
+  journal_path: ~/scratch/outputs/RTSCortex/cortex-20260719T005419006119Z-bd959392/events.jsonl
+  journal_sha256: 8ea6d2599ea5bfa5e042ca9e3c0ed2aa2b8ea3b83101636180301a48d24899ef
+  seed: 0
+  map_name: Simple64
+  observation_count: 218
+  run_ids:
+  - cortex-20260719T005419006119Z-bd959392
+  episode_keys:
+  - cortex-20260719T005419006119Z-bd959392:episode-0
+- source_id: seed-1-regression-a
+  journal_path: ~/scratch/outputs/RTSCortex/cortex-20260719T010841267211Z-e7bf6a57/events.jsonl
+  journal_sha256: 1ae5465404ef0258cade596b0425b88bbe504a54196cbfd6e47d5cdf246fd6dd
+  seed: 1
+  map_name: Simple64
+  observation_count: 221
+  run_ids:
+  - cortex-20260719T010841267211Z-e7bf6a57
+  episode_keys:
+  - cortex-20260719T010841267211Z-e7bf6a57:episode-0
+- source_id: seed-1-opening
+  journal_path: ~/scratch/outputs/RTSCortex/cortex-20260719T010610961859Z-6a15637e/events.jsonl
+  journal_sha256: 8b1d5138d5dd3e30a4099a0dbad1ff98b3e6936c2088725506de2489879a85c1
+  seed: 1
+  map_name: Simple64
+  observation_count: 37
+  run_ids:
+  - cortex-20260719T010610961859Z-6a15637e
+  episode_keys:
+  - cortex-20260719T010610961859Z-6a15637e:episode-0
+- source_id: seed-1-addon
+  journal_path: ~/scratch/outputs/RTSCortex/cortex-20260719T012132155822Z-4dcefb5e/events.jsonl
+  journal_sha256: 47b53d50129440ff9dd9a1786bb6f172e9b975c409e3b69bf47d8ced6afc84c4
+  seed: 1
+  map_name: Simple64
+  observation_count: 222
+  run_ids:
+  - cortex-20260719T012132155822Z-4dcefb5e
+  episode_keys:
+  - cortex-20260719T012132155822Z-4dcefb5e:episode-0
+- source_id: seed-1-regression-b
+  journal_path: ~/scratch/outputs/RTSCortex/cortex-20260719T014717311861Z-4d5d9d7d/events.jsonl
+  journal_sha256: 78ca72c58531a688e1e455b5d761c144f460a68e1cbad4a0b537ac641ac7347c
+  seed: 1
+  map_name: Simple64
+  observation_count: 221
+  run_ids:
+  - cortex-20260719T014717311861Z-4d5d9d7d
+  episode_keys:
+  - cortex-20260719T014717311861Z-4d5d9d7d:episode-0
+- source_id: seed-1-combat
+  journal_path: ~/scratch/outputs/RTSCortex/cortex-20260719T013422512543Z-589dcc5c/events.jsonl
+  journal_sha256: 9ec8818b4e040a8690cd3084e7e11f76280825dcb42f2696c14b2e9f2ad0c434
+  seed: 1
+  map_name: Simple64
+  observation_count: 221
+  run_ids:
+  - cortex-20260719T013422512543Z-589dcc5c
+  episode_keys:
+  - cortex-20260719T013422512543Z-589dcc5c:episode-0
+- source_id: seed-2-tech
+  journal_path: ~/scratch/outputs/RTSCortex/cortex-20260719T015816827396Z-94cc07e5/events.jsonl
+  journal_sha256: 952ea7ff9c04df132ce2cc271274cab5dbda27a2923e237e582beaa49ee1849c
+  seed: 2
+  map_name: Simple64
+  observation_count: 221
+  run_ids:
+  - cortex-20260719T015816827396Z-94cc07e5
+  episode_keys:
+  - cortex-20260719T015816827396Z-94cc07e5:episode-0
+- source_id: seed-2-long-a
+  journal_path: ~/scratch/outputs/RTSCortex/cortex-20260719T020745892034Z-ff6d7f14/events.jsonl
+  journal_sha256: 1171a6d48997ca4c03fe27048eea613171854c4f21f9c609875955c2806aa133
+  seed: 2
+  map_name: Simple64
+  observation_count: 321
+  run_ids:
+  - cortex-20260719T020745892034Z-ff6d7f14
+  episode_keys:
+  - cortex-20260719T020745892034Z-ff6d7f14:episode-0
+- source_id: seed-2-long-b
+  journal_path: ~/scratch/outputs/RTSCortex/cortex-20260719T022315239381Z-b1f4454d/events.jsonl
+  journal_sha256: 789c6f3d369a9309e7d8bf8530c3719f28da4a99a42f2486cb5f99026a214807
+  seed: 2
+  map_name: Simple64
+  observation_count: 321
+  run_ids:
+  - cortex-20260719T022315239381Z-b1f4454d
+  episode_keys:
+  - cortex-20260719T022315239381Z-b1f4454d:episode-0
+- source_id: seed-2-combat
+  journal_path: ~/scratch/outputs/RTSCortex/cortex-20260719T023618898910Z-fff37260/events.jsonl
+  journal_sha256: 562e69ac0c8082dad26cd07c447609da38f1a604a2dca0a4d658457cf0cb79a7
+  seed: 2
+  map_name: Simple64
+  observation_count: 317
+  run_ids:
+  - cortex-20260719T023618898910Z-fff37260
+  episode_keys:
+  - cortex-20260719T023618898910Z-fff37260:episode-0
+- source_id: seed-0-targeted-capture
+  journal_path: ~/scratch/outputs/RTSCortex/cortex-20260719T092258929609Z-fa2a29c3/events.jsonl
+  journal_sha256: 3321651a8558d2fef17c5033a119e546bc88a6b0866c265864f52f3cbcc5efdc
+  seed: 0
+  map_name: Simple64
+  observation_count: 99
+  run_ids:
+  - cortex-20260719T092258929609Z-fa2a29c3
+  episode_keys:
+  - cortex-20260719T092258929609Z-fa2a29c3:episode-0
+- source_id: seed-2-targeted-capture
+  journal_path: ~/scratch/outputs/RTSCortex/cortex-20260719T092631592073Z-16fda5b2/events.jsonl
+  journal_sha256: 8fb831e45b9f77d859cc5ae759c8348a68571f9fe07426b32c4a7b945b6f7394
+  seed: 2
+  map_name: Simple64
+  observation_count: 97
+  run_ids:
+  - cortex-20260719T092631592073Z-16fda5b2
+  episode_keys:
+  - cortex-20260719T092631592073Z-16fda5b2:episode-0

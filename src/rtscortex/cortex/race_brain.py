@@ -423,7 +423,11 @@ def _proposal_score(
         score += min(len(response.proposal.steps), 10) * 0.1
         reasons.append("ordered plan depth")
     if any(
-        diagnostic.code == "truncated_action_prefix_recovered"
+        diagnostic.code
+        in {
+            "truncated_action_prefix_recovered",
+            "truncated_counted_prefix_recovered",
+        }
         for diagnostic in response.proposal.diagnostics
     ):
         score -= 10.0
@@ -459,7 +463,10 @@ def _playbook_avoid_actions(
 
 def _member_proposal_is_valid(member: RaceBrainMemberProposal) -> bool:
     if member.frontier is None:
-        return False
+        # A recognized plan can contain only future capabilities that this
+        # Runtime does not own. That is a capability gap, not a degraded model
+        # member. Empty/unparseable proposals remain invalid.
+        return bool(member.response.proposal.steps)
     return member.frontier.classification not in {
         PolicyActionClassification.PARSE_ERROR,
         PolicyActionClassification.ILLEGAL_ACTION,

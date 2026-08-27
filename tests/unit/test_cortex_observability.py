@@ -89,6 +89,16 @@ def test_cortex_observability_projects_lineage_and_executor_invariants() -> None
         ),
         _event(9, "specialist_failed", {"role": "macro", "model_id": "hima-a"}),
         _event(10, "specialist_recovered", {"role": "macro", "model_id": "hima-a"}),
+        _event(
+            11,
+            "situation_assessed",
+            {
+                "phase": "combat",
+                "threat_level": "critical",
+                "threat_score": 9.5,
+                "threat_evidence": ["building_under_attack", "empty_army_overwhelmed"],
+            },
+        ),
     ]
 
     metrics = compute_cortex_observability(events)
@@ -110,6 +120,13 @@ def test_cortex_observability_projects_lineage_and_executor_invariants() -> None
     assert metrics.command_lineage_coverage == 0.5
     assert metrics.specialist_failure_counts == {"macro": 1}
     assert metrics.specialist_recovery_counts == {"macro": 1}
+    assert metrics.threat_level_counts == {"critical": 1}
+    assert metrics.max_threat_score == 9.5
+    assert metrics.threat_evidence_coverage == 1.0
+    assert metrics.threat_evidence_counts == {
+        "building_under_attack": 1,
+        "empty_army_overwhelmed": 1,
+    }
 
 
 def test_cortex_timeline_renders_semantic_pipeline_events() -> None:
@@ -122,6 +139,8 @@ def test_cortex_timeline_renders_semantic_pipeline_events() -> None:
                 "assessment": {
                     "game_phase": "early",
                     "threat_level": "low",
+                    "threat_score": 1.5,
+                    "threat_evidence": ["visible_enemy_contact"],
                     "army_readiness": "not_ready",
                 },
             },
@@ -199,6 +218,8 @@ def test_cortex_timeline_renders_semantic_pipeline_events() -> None:
     assert "`hima`/`hima-a`" in report
     assert "| 0 | 0 | 1 | 0/0 | 0 | 2 | 0 |" in report
     assert "Situation assessed by `deterministic`: phase `early`" in report
+    assert "score `1.5`" in report
+    assert "evidence `visible_enemy_contact`" in report
     assert "Macro plan `plan-1` from `hima-a` accepted with `2` steps" in report
     assert "macro intent `intent-1`: `Build_Pylon_Screen`" in report
     assert "Built `1` executable candidates" in report
@@ -218,6 +239,23 @@ def test_legacy_journal_has_non_applicable_cortex_projection() -> None:
     assert metrics.observed is False
     assert metrics.as_dict()["event_counts"] == {}
     assert "### Cortex observability" not in report
+
+
+@pytest.mark.parametrize(
+    "event_type",
+    [
+        "macro_frontier_obsolete",
+        "terminal_collapse_macro_hold_released",
+        "terminal_collapse_non_recovery_macro_dispatch",
+    ],
+)
+def test_terminal_collapse_events_are_retained_in_cortex_observability(
+    event_type: str,
+) -> None:
+    metrics = compute_cortex_observability([_event(1, event_type, {"reason": "typed"})])
+
+    assert metrics.observed is True
+    assert metrics.event_counts[event_type] == 1
 
 
 def test_cortex_invariants_are_scoped_to_the_intent_and_selection() -> None:

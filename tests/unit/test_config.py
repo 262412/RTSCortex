@@ -14,6 +14,7 @@ from rtscortex.config import (
     EnvironmentSettings,
     ExperimentConfig,
     RuntimeSettings,
+    load_config,
 )
 
 
@@ -32,6 +33,9 @@ def test_environment_settings_accept_melee_runtime_controls() -> None:
         action_effect_timeout_game_loops=96,
         observation_gap_watchdog_game_loops=448,
         observation_gap_hard_limit_game_loops=1792,
+        orchestration_primitive_budget=20,
+        expansion_scout_enabled=True,
+        expansion_scout_interval_game_loops=96,
     )
 
     assert settings.opponent_race == "zerg"
@@ -44,6 +48,43 @@ def test_environment_settings_accept_melee_runtime_controls() -> None:
     assert settings.action_effect_timeout_game_loops == 96
     assert settings.observation_gap_watchdog_game_loops == 448
     assert settings.observation_gap_hard_limit_game_loops == 1792
+    assert settings.orchestration_primitive_budget == 20
+    assert settings.expansion_scout_enabled is True
+    assert settings.expansion_scout_interval_game_loops == 96
+
+
+def test_live_environment_accepts_natural_terminal_without_step_limits() -> None:
+    settings = EnvironmentSettings(
+        adapter="llm_pysc2",
+        max_steps=None,
+        game_steps_per_episode=None,
+    )
+
+    assert settings.max_steps is None
+    assert settings.game_steps_per_episode is None
+
+
+def test_live_environment_accepts_explicit_pysc2_no_limit_sentinel() -> None:
+    settings = EnvironmentSettings(
+        adapter="llm_pysc2",
+        max_steps=None,
+        game_steps_per_episode=0,
+    )
+
+    assert settings.game_steps_per_episode == 0
+
+
+def test_live_environment_rejects_negative_pysc2_step_limit() -> None:
+    with pytest.raises(ValidationError):
+        EnvironmentSettings(
+            adapter="llm_pysc2",
+            game_steps_per_episode=-1,
+        )
+
+
+def test_mock_environment_requires_finite_step_limit() -> None:
+    with pytest.raises(ValidationError, match="finite max_steps"):
+        EnvironmentSettings(adapter="mock", max_steps=None)
 
 
 @pytest.mark.parametrize("multiplier", [0.0, -0.1, 1.01])
@@ -63,6 +104,11 @@ def test_environment_settings_rejects_inverted_observation_gap_limits() -> None:
             observation_gap_watchdog_game_loops=448,
             observation_gap_hard_limit_game_loops=448,
         )
+
+
+def test_environment_settings_rejects_too_small_orchestration_budget() -> None:
+    with pytest.raises(ValidationError):
+        EnvironmentSettings(orchestration_primitive_budget=3)
 
 
 def test_runtime_command_ttl_defaults_to_planning_interval() -> None:
@@ -206,3 +252,47 @@ def test_hima_ensemble_race_must_match_agent() -> None:
                 },
             }
         )
+
+
+def test_authoritative_build_circuit_canary_profile_is_narrow_and_bounded() -> None:
+    project_root = Path(__file__).resolve().parents[2]
+    config = load_config(
+        project_root
+        / "configs/experiments/live_simple64_hima_protoss_authoritative_build_circuit_canary.yaml"
+    )
+
+    assert config.evaluation.authoritative_build_circuit_canary.enabled is True
+    assert config.environment.execution_action_space == "raw"
+    assert config.environment.max_steps == 1024
+    assert config.cortex.macro.scripted_actions == ["Pylon"]
+    assert config.runtime.max_actions == 1
+    assert config.reflex.enabled is False
+    assert config.cortex.playbook.enabled is False
+
+
+@pytest.mark.parametrize(
+    ("section", "field", "value"),
+    [
+        ("environment", "execution_action_space", "features"),
+        ("environment", "max_steps", None),
+        ("environment", "agent_race", "terran"),
+        ("environment", "expansion_scout_enabled", True),
+        ("runtime", "max_actions", 2),
+        ("reflex", "enabled", True),
+    ],
+)
+def test_authoritative_build_circuit_canary_rejects_broader_profiles(
+    section: str,
+    field: str,
+    value: object,
+) -> None:
+    project_root = Path(__file__).resolve().parents[2]
+    config = load_config(
+        project_root
+        / "configs/experiments/live_simple64_hima_protoss_authoritative_build_circuit_canary.yaml"
+    )
+    payload = config.model_dump(mode="python")
+    payload[section][field] = value
+
+    with pytest.raises(ValidationError, match="authoritative Build circuit canary requires"):
+        ExperimentConfig.model_validate(payload)

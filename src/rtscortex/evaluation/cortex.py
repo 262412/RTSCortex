@@ -18,7 +18,16 @@ CORTEX_EVENT_TYPES = frozenset(
         "tactical_policy_shadow",
         "macro_plan_accepted",
         "macro_plan_rejected",
+        "macro_frontier_deferred",
+        "macro_frontier_obsolete",
+        "macro_frontier_preempted",
+        "macro_structure_deferred",
+        "macro_step_deduplicated",
         "macro_step_updated",
+        "expansion_commitment_started",
+        "expansion_anchor_rejected",
+        "expansion_commitment_terminal",
+        "tactical_target_state",
         "intent_emitted",
         "role_intent_emitted",
         "intent_arbitrated",
@@ -31,12 +40,15 @@ CORTEX_EVENT_TYPES = frozenset(
         "specialist_recovered",
         "race_brain_coordinated",
         "macro_proposal_revalidated",
+        "terminal_collapse_macro_hold_released",
+        "terminal_collapse_non_recovery_macro_dispatch",
         "playbook_retrieved",
         "playbook_rule_applied",
         "playbook_rule_updated",
         "playbook_case_recorded",
         "playbook_lesson_candidate",
         "playbook_lesson_promoted",
+        "strategic_consequence_attributed",
         "postgame_review_completed",
     }
 )
@@ -77,6 +89,7 @@ class CortexObservabilityMetrics:
     playbook_block_count: int = 0
     playbook_shadow_block_count: int = 0
     playbook_rule_update_count: int = 0
+    strategic_consequence_counts: dict[str, int] = field(default_factory=dict)
     role_lineage_coverage: float = 0.0
     active_race: str | None = None
     race_macro_contract_ready: bool | None = None
@@ -88,6 +101,10 @@ class CortexObservabilityMetrics:
     race_brain_degraded_members: int = 0
     race_brain_unique_frontier_contributions: dict[str, int] = field(default_factory=dict)
     race_brain_proposal_diversity: float = 0.0
+    threat_level_counts: dict[str, int] = field(default_factory=dict)
+    threat_evidence_counts: dict[str, int] = field(default_factory=dict)
+    threat_evidence_coverage: float = 0.0
+    max_threat_score: float = 0.0
 
     def as_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -128,6 +145,7 @@ def compute_cortex_observability(
     playbook_applications = 0
     playbook_blocks = 0
     playbook_shadow_blocks = 0
+    strategic_consequences: Counter[str] = Counter()
     race_profile_payload: dict[str, Any] = {}
     current_phase = "unknown"
     race_brain_selected: Counter[str] = Counter()
@@ -135,13 +153,31 @@ def compute_cortex_observability(
     race_brain_unique_contributions: Counter[str] = Counter()
     race_brain_degraded_members = 0
     race_brain_diversities: list[float] = []
+    threat_levels: Counter[str] = Counter()
+    threat_evidence: Counter[str] = Counter()
+    threat_observations = 0
+    threat_observations_with_evidence = 0
+    max_threat_score = 0.0
 
     for event in cortex_events:
         payload = _object(event.payload)
         if event.event_type == "race_profile_activated":
             race_profile_payload = payload
         elif event.event_type == "situation_assessed":
-            current_phase = _text(payload, "phase", "game_phase") or current_phase
+            assessment = _object(payload.get("assessment")) or payload
+            current_phase = _text(assessment, "phase", "game_phase") or current_phase
+            level = _text(assessment, "threat_level", "threat") or "unknown"
+            threat_levels[level] += 1
+            threat_observations += 1
+            evidence = assessment.get("threat_evidence")
+            if isinstance(evidence, list | tuple):
+                recorded = [item for item in evidence if isinstance(item, str)]
+                if recorded:
+                    threat_observations_with_evidence += 1
+                    threat_evidence.update(recorded)
+            score = assessment.get("threat_score")
+            if isinstance(score, int | float) and not isinstance(score, bool):
+                max_threat_score = max(max_threat_score, float(score))
         elif event.event_type == "race_brain_coordinated":
             selected_member = _text(payload, "selected_member_id")
             if selected_member is not None:
@@ -204,6 +240,9 @@ def compute_cortex_observability(
                 playbook_blocks += 1
             if payload.get("reason") == "shadow_would_block":
                 playbook_shadow_blocks += 1
+        elif event.event_type == "strategic_consequence_attributed":
+            consequence_type = _text(payload, "consequence_type") or "unknown"
+            strategic_consequences[consequence_type] += 1
         elif event.event_type == "macro_plan_accepted":
             plan_id = _text(payload, "plan_id") or _text(_object(payload.get("plan")), "plan_id")
             if plan_id is not None:
@@ -254,6 +293,45 @@ def compute_cortex_observability(
             latency = payload.get("latency_ms")
             if isinstance(latency, int | float) and not isinstance(latency, bool):
                 macro_latencies.append(float(latency))
+
+    retention = next(
+        (
+            event.payload
+            for event in reversed(events)
+            if event.event_type == "event_retention_summary"
+        ),
+        None,
+    )
+    if isinstance(retention, dict):
+        retained_counts = retention.get("event_counts")
+        if isinstance(retained_counts, dict):
+            for event_type, raw_counts in retained_counts.items():
+                if event_type in CORTEX_EVENT_TYPES and isinstance(raw_counts, dict):
+                    raw = raw_counts.get("raw")
+                    if isinstance(raw, int) and not isinstance(raw, bool):
+                        event_counts[event_type] = raw
+        aggregates = retention.get("aggregates")
+        situation = aggregates.get("situation_assessed") if isinstance(aggregates, dict) else None
+        if isinstance(situation, dict):
+            levels = situation.get("threat_level_counts")
+            evidence_counts = situation.get("threat_evidence_counts")
+            if isinstance(levels, dict):
+                threat_levels = Counter({str(key): int(value) for key, value in levels.items()})
+            if isinstance(evidence_counts, dict):
+                threat_evidence = Counter(
+                    {str(key): int(value) for key, value in evidence_counts.items()}
+                )
+            threat_observations = int(situation.get("logical_count", threat_observations))
+            threat_observations_with_evidence = int(
+                situation.get(
+                    "threat_with_evidence_count",
+                    threat_observations_with_evidence,
+                )
+            )
+            max_threat_score = max(
+                max_threat_score,
+                float(situation.get("max_threat_score", 0.0)),
+            )
 
     dispatched = _dispatched_command_ids(events)
     lineage_counts: Counter[str] = Counter()
@@ -355,6 +433,7 @@ def compute_cortex_observability(
         playbook_block_count=playbook_blocks,
         playbook_shadow_block_count=playbook_shadow_blocks,
         playbook_rule_update_count=event_counts.get("playbook_rule_updated", 0),
+        strategic_consequence_counts=dict(sorted(strategic_consequences.items())),
         role_lineage_coverage=role_coverage,
         active_race=_text(race_profile_payload, "race"),
         race_macro_contract_ready=_optional_bool(
@@ -383,6 +462,12 @@ def compute_cortex_observability(
             if race_brain_diversities
             else 0.0
         ),
+        threat_level_counts=dict(sorted(threat_levels.items())),
+        threat_evidence_counts=dict(sorted(threat_evidence.items())),
+        threat_evidence_coverage=(
+            threat_observations_with_evidence / threat_observations if threat_observations else 0.0
+        ),
+        max_threat_score=max_threat_score,
     )
 
 

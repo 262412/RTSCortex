@@ -12,11 +12,13 @@ from rtscortex_llm_pysc2.extractor import TimeStepExtractor
 from rtscortex_llm_pysc2.hook import RuntimeDecisionBroker, RuntimeQueryMixin
 from rtscortex_llm_pysc2.observation import ObservationMapper, canonical_actor, split_actor
 from rtscortex_llm_pysc2.protocol import RuntimeClient
+from rtscortex_llm_pysc2.raw_placement import RawPlacementService
 from rtscortex_llm_pysc2.routing import ActionRouter, RoutedActionBatch, RoutedCommand
 
 __all__ = [
     "ActionRouter",
     "ActionEffectVerifier",
+    "RawPlacementService",
     "BridgeCoordinator",
     "BridgeDecision",
     "DEFAULT_ACTION_EFFECT_TIMEOUT_GAME_LOOPS",

@@ -9,7 +9,7 @@ import json
 import time
 from dataclasses import asdict, dataclass
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 
 from rtscortex.agents import (
     ActionModule,
@@ -24,6 +24,7 @@ from rtscortex.contracts import (
     ActionBatch,
     ActionCommand,
     ActionSource,
+    AuthoritativeBuildPreflightResult,
     EpisodeResult,
     EpisodeSummary,
     ExecutionReport,
@@ -31,6 +32,7 @@ from rtscortex.contracts import (
     ExecutionStatus,
     IdleReason,
     ObservationEnvelope,
+    PlacementLedgerEvent,
 )
 from rtscortex.contracts.interfaces import (
     ActivePlanSnapshot,
@@ -41,6 +43,7 @@ from rtscortex.contracts.interfaces import (
     ModuleResult,
 )
 from rtscortex.memory import EventStore
+from rtscortex.placement import CANONICAL_PLACEMENT_SPECS
 from rtscortex.progress import (
     PROTOSS_SIMPLE64_ACTION_SPECS,
     GoalProgressReport,
@@ -128,6 +131,17 @@ _ALLOWED_COMMAND_TRANSITIONS = {
 }
 
 _PROGRESS_ACTION_NAMES = frozenset(action.name for action in PROTOSS_SIMPLE64_ACTION_SPECS)
+_RUNTIME_CHECKPOINT_INTERVAL_GAME_LOOPS = 224
+_RUNTIME_RECOVERY_TAIL_EVENT_LIMIT = 4096
+_RUNTIME_SNAPSHOT_TYPE = "runtime-engine-v1"
+
+
+def _optional_int(value: object) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, int | str):
+        return int(value)
+    raise TypeError(f"expected integer-compatible checkpoint value, got {type(value).__name__}")
 
 
 class RuntimeEngine:
@@ -185,6 +199,7 @@ class RuntimeEngine:
         self._last_execution: ExecutionReport | None = None
         self._episode_key: tuple[str, str] | None = None
         self._last_goal_progress_fingerprint: str | None = None
+        self._last_runtime_checkpoint_game_loop: int | None = None
 
     async def start(self) -> None:
         """Prepare optional runtime resources before an episode starts.
@@ -328,12 +343,13 @@ class RuntimeEngine:
                 "reflex_candidates": [
                     command.model_dump(mode="json") for command in reflex_candidates
                 ],
-                "busy_actor_candidates": [
-                    command.model_dump(mode="json") for command in busy_actor_candidates
-                ],
-                "validated_candidates": [
-                    command.model_dump(mode="json") for command in candidate_outcome.accepted
-                ],
+                "candidate_counts": {
+                    "planner": len(planner_candidates),
+                    "reflex": len(reflex_candidates),
+                    "busy_actor": len(busy_actor_candidates),
+                    "validated": len(candidate_outcome.accepted),
+                    "selected": len(accepted_commands),
+                },
                 "goal_progress": (
                     None
                     if dispatch_goal_progress is None
@@ -354,6 +370,7 @@ class RuntimeEngine:
         for command in batch.commands:
             self._decision_by_command_id[command.command_id] = batch
         self._request_replan_if_exhausted()
+        self._record_runtime_checkpoint_if_due(observation)
         return batch
 
     def _agent_context(
@@ -646,11 +663,34 @@ class RuntimeEngine:
         self._decision_by_command_id = {}
         self._last_execution = None
         self._last_goal_progress_fingerprint = None
+        self._last_runtime_checkpoint_game_loop = None
+
+        checkpoint = self.store.latest_snapshot(
+            observation.run_id,
+            observation.episode_id,
+            _RUNTIME_SNAPSHOT_TYPE,
+        )
+        checkpoint_event_id = 0
+        recovery_tail_event_count = 0
+        if checkpoint is not None:
+            self._restore_runtime_checkpoint(checkpoint.payload)
+            self._last_runtime_checkpoint_game_loop = int(checkpoint.payload["game_loop"])
+            checkpoint_event_id = checkpoint.through_event_id
+            recovery_tail = self.store.events_after(
+                observation.run_id,
+                checkpoint_event_id,
+                _RUNTIME_RECOVERY_TAIL_EVENT_LIMIT + 1,
+                episode_id=observation.episode_id,
+            )
+            recovery_tail_event_count = len(recovery_tail)
+            if recovery_tail_event_count > _RUNTIME_RECOVERY_TAIL_EVENT_LIMIT:
+                raise RuntimeError("runtime recovery tail exceeds the bounded checkpoint contract")
 
         decision_events = self.store.events_of_type(
             observation.run_id,
             observation.episode_id,
             "decision",
+            after_event_id=checkpoint_event_id,
         )
         for decision_event in decision_events:
             decision = ActionBatch.model_validate(decision_event.payload["batch"])
@@ -661,6 +701,7 @@ class RuntimeEngine:
             observation.run_id,
             observation.episode_id,
             "execution",
+            after_event_id=checkpoint_event_id,
         )
         if execution_event is not None:
             self._last_execution = ExecutionReport.model_validate(execution_event.payload)
@@ -668,6 +709,7 @@ class RuntimeEngine:
             observation.run_id,
             observation.episode_id,
             "episode_result",
+            after_event_id=checkpoint_event_id,
         )
         if episode_result_event is not None:
             recovered_result = EpisodeResult.model_validate(episode_result_event.payload)
@@ -677,6 +719,7 @@ class RuntimeEngine:
             observation.run_id,
             observation.episode_id,
             "planner_started",
+            after_event_id=checkpoint_event_id,
         )
         if planner_started_event is not None:
             self._last_planner_started_game_loop = int(
@@ -687,8 +730,9 @@ class RuntimeEngine:
             observation.run_id,
             observation.episode_id,
             "plan_accepted",
+            after_event_id=checkpoint_event_id,
         )
-        plan_uses_lifecycle_protocol = False
+        plan_uses_lifecycle_protocol = checkpoint is not None
         if plan_event is not None:
             plan_uses_lifecycle_protocol = (
                 plan_event.payload.get("lifecycle_protocol") == CURRENT_PROTOCOL_VERSION
@@ -715,6 +759,7 @@ class RuntimeEngine:
             observation.run_id,
             observation.episode_id,
             "command_lifecycle",
+            after_event_id=checkpoint_event_id,
         )
         for event in lifecycle_events:
             command = ActionCommand.model_validate(event.payload["command"])
@@ -731,6 +776,7 @@ class RuntimeEngine:
             observation.run_id,
             observation.episode_id,
             "execution",
+            after_event_id=checkpoint_event_id,
         ):
             report = ExecutionReport.model_validate(event.payload)
             fingerprint = self._execution_fingerprint(report)
@@ -799,6 +845,172 @@ class RuntimeEngine:
                     reason="legacy runtime state cannot prove command was not dispatched",
                 )
                 self._urgent_replan_requested = True
+        if checkpoint is not None:
+            self.store.append_event(
+                run_id=observation.run_id,
+                episode_id=observation.episode_id,
+                step_id=observation.step_id,
+                event_type="runtime_recovery_completed",
+                payload={
+                    "checkpoint_event_id": checkpoint_event_id,
+                    "tail_event_count": recovery_tail_event_count,
+                    "tail_event_limit": _RUNTIME_RECOVERY_TAIL_EVENT_LIMIT,
+                },
+            )
+
+    def _record_runtime_checkpoint_if_due(
+        self,
+        observation: ObservationEnvelope,
+        *,
+        force: bool = False,
+    ) -> bool:
+        previous = self._last_runtime_checkpoint_game_loop
+        if (
+            not force
+            and previous is not None
+            and observation.game_loop - previous < _RUNTIME_CHECKPOINT_INTERVAL_GAME_LOOPS
+        ):
+            return False
+        self.store.record_snapshot(
+            run_id=observation.run_id,
+            episode_id=observation.episode_id,
+            snapshot_type=_RUNTIME_SNAPSHOT_TYPE,
+            step_id=observation.step_id,
+            payload=self._runtime_checkpoint_payload(observation.game_loop),
+        )
+        self._last_runtime_checkpoint_game_loop = observation.game_loop
+        return True
+
+    def _runtime_checkpoint_payload(self, game_loop: int) -> dict[str, Any]:
+        active_decisions = {
+            command_id: decision.model_dump(mode="json")
+            for command_id, decision in self._decision_by_command_id.items()
+            if (lifecycle := self._command_states.get(command_id)) is not None
+            and lifecycle.status
+            in {
+                CommandStatus.PENDING,
+                CommandStatus.DEFERRED,
+                CommandStatus.DISPATCHED,
+            }
+        }
+        return {
+            "format_version": "1",
+            "game_loop": game_loop,
+            "cached_plan": (
+                None
+                if self._cached_plan is None
+                else {
+                    "strategic_goal": self._cached_plan.strategic_goal,
+                    "summary": self._cached_plan.summary,
+                    "commands": [
+                        command.model_dump(mode="json") for command in self._cached_plan.commands
+                    ],
+                    "source_step_id": self._cached_plan.source_step_id,
+                    "created_game_loop": self._cached_plan.created_game_loop,
+                    "goal_spec": (
+                        None
+                        if self._cached_plan.goal_spec is None
+                        else self._cached_plan.goal_spec.model_dump(mode="json")
+                    ),
+                }
+            ),
+            "last_planner_started_game_loop": self._last_planner_started_game_loop,
+            "last_plan_accepted_game_loop": self._last_plan_accepted_game_loop,
+            "urgent_replan_requested": self._urgent_replan_requested,
+            "last_alerts": list(self._last_alerts),
+            "last_planner_failure": (
+                None if self._last_planner_failure is None else self._last_planner_failure.value
+            ),
+            "command_states": [
+                {
+                    "command": lifecycle.command.model_dump(mode="json"),
+                    "status": lifecycle.status.value,
+                    "reason": lifecycle.reason,
+                }
+                for lifecycle in self._command_states.values()
+            ],
+            "reported_command_reasons": [
+                list(item) for item in sorted(self._reported_command_reasons)
+            ],
+            "terminal_execution_fingerprints": dict(self._terminal_execution_fingerprints),
+            "episode_result_fingerprint": self._episode_result_fingerprint,
+            "last_decision": (
+                None if self._last_decision is None else self._last_decision.model_dump(mode="json")
+            ),
+            "active_decisions": active_decisions,
+            "last_execution": (
+                None
+                if self._last_execution is None
+                else self._last_execution.model_dump(mode="json")
+            ),
+            "last_goal_progress_fingerprint": self._last_goal_progress_fingerprint,
+        }
+
+    def _restore_runtime_checkpoint(self, payload: dict[str, Any]) -> None:
+        if payload.get("format_version") != "1":
+            raise RuntimeError("unsupported Runtime recovery snapshot version")
+        cached_plan = payload.get("cached_plan")
+        if isinstance(cached_plan, dict):
+            goal_payload = cached_plan.get("goal_spec")
+            self._cached_plan = PlanState(
+                strategic_goal=str(cached_plan["strategic_goal"]),
+                summary=str(cached_plan["summary"]),
+                commands=[
+                    ActionCommand.model_validate(command) for command in cached_plan["commands"]
+                ],
+                source_step_id=int(cached_plan["source_step_id"]),
+                created_game_loop=int(cached_plan["created_game_loop"]),
+                goal_spec=(None if goal_payload is None else GoalSpec.model_validate(goal_payload)),
+            )
+        self._last_planner_started_game_loop = _optional_int(
+            payload.get("last_planner_started_game_loop")
+        )
+        self._last_plan_accepted_game_loop = _optional_int(
+            payload.get("last_plan_accepted_game_loop")
+        )
+        self._urgent_replan_requested = bool(payload.get("urgent_replan_requested"))
+        self._last_alerts = tuple(str(alert) for alert in payload.get("last_alerts", ()))
+        planner_failure = payload.get("last_planner_failure")
+        self._last_planner_failure = (
+            None if planner_failure is None else IdleReason(str(planner_failure))
+        )
+        for item in payload.get("command_states", ()):
+            command = ActionCommand.model_validate(item["command"])
+            reason = item.get("reason")
+            self._command_states[command.command_id] = CommandLifecycle(
+                command=command,
+                status=CommandStatus(str(item["status"])),
+                reason=None if reason is None else str(reason),
+            )
+        self._reported_command_reasons = {
+            (str(item[0]), str(item[1])) for item in payload.get("reported_command_reasons", ())
+        }
+        self._terminal_execution_fingerprints = {
+            str(command_id): str(fingerprint)
+            for command_id, fingerprint in dict(
+                payload.get("terminal_execution_fingerprints", {})
+            ).items()
+        }
+        result_fingerprint = payload.get("episode_result_fingerprint")
+        self._episode_result_fingerprint = (
+            None if result_fingerprint is None else str(result_fingerprint)
+        )
+        last_decision = payload.get("last_decision")
+        self._last_decision = (
+            None if last_decision is None else ActionBatch.model_validate(last_decision)
+        )
+        self._decision_by_command_id = {
+            str(command_id): ActionBatch.model_validate(decision)
+            for command_id, decision in dict(payload.get("active_decisions", {})).items()
+        }
+        last_execution = payload.get("last_execution")
+        self._last_execution = (
+            None if last_execution is None else ExecutionReport.model_validate(last_execution)
+        )
+        progress_fingerprint = payload.get("last_goal_progress_fingerprint")
+        self._last_goal_progress_fingerprint = (
+            None if progress_fingerprint is None else str(progress_fingerprint)
+        )
 
     def _accept_plan(self, plan: PlanState, observation: ObservationEnvelope) -> None:
         command_ids = [command.command_id for command in plan.commands]
@@ -1095,7 +1307,21 @@ class RuntimeEngine:
     ) -> bool:
         lifecycle = CommandLifecycle(command=command, status=status, reason=reason)
         current = self._command_states.get(command.command_id)
-        if current is not None and current.command != command:
+        dispatch_attempt_binding = (
+            current is not None
+            and current.status in _ACTIONABLE_COMMAND_STATUSES
+            and status is CommandStatus.DISPATCHED
+            and current.command.attempt_id is None
+            and command.attempt_id is not None
+            and current.command.model_copy(
+                update={
+                    "attempt_id": command.attempt_id,
+                    "attempt_ordinal": command.attempt_ordinal,
+                }
+            )
+            == command
+        )
+        if current is not None and current.command != command and not dispatch_attempt_binding:
             raise RuntimeError(
                 f"command ID {command.command_id!r} was reused with different semantics"
             )
@@ -1243,11 +1469,126 @@ class RuntimeEngine:
             payload=payload,
         )
 
+    def record_performance_profile(self, payload: dict[str, object]) -> None:
+        """Persist cumulative worker phases together with event-store persistence cost."""
+
+        run_id = payload.get("run_id")
+        episode_id = payload.get("episode_id")
+        step_id = payload.get("step_id")
+        game_loop = payload.get("game_loop")
+        phases = payload.get("phases")
+        if (
+            not isinstance(run_id, str)
+            or not isinstance(episode_id, str)
+            or not isinstance(step_id, int)
+            or isinstance(step_id, bool)
+            or not isinstance(game_loop, int)
+            or isinstance(game_loop, bool)
+            or not isinstance(phases, dict)
+        ):
+            raise ValueError("invalid runtime performance profile payload")
+        performance = self.store.performance_snapshot()
+        enriched_phases = dict(phases)
+        enriched_phases["event_emission_persistence"] = {
+            "count": performance.enqueued_events,
+            "total_ms": performance.append_latency_ms_mean * performance.enqueued_events,
+            "mean_ms": performance.append_latency_ms_mean,
+            "max_ms": performance.writer_lag_ms_max,
+            "writer_lag_ms_p95": performance.writer_lag_ms_p95,
+        }
+        self.store.append_event(
+            run_id=run_id,
+            episode_id=episode_id,
+            step_id=step_id,
+            event_type="runtime_phase_profile",
+            payload={
+                **payload,
+                "game_loop": game_loop,
+                "phases": enriched_phases,
+            },
+        )
+
     def record_execution(self, report: ExecutionReport) -> None:
         self._record_execution_from(
             report,
             allowed_from={CommandStatus.DISPATCHED},
         )
+
+    def record_placement_transition(
+        self,
+        event: PlacementLedgerEvent,
+    ) -> Literal["recorded", "already_recorded"]:
+        """Persist one placement state change independently of command terminal state."""
+
+        if self._episode_key != (event.run_id, event.episode_id):
+            raise RuntimeError(
+                "placement transition does not match the active runtime episode: "
+                f"{event.run_id!r}/{event.episode_id!r}"
+            )
+        spec = CANONICAL_PLACEMENT_SPECS.get(event.action_name)
+        if spec is None or not event.action_name.startswith("Build_"):
+            raise RuntimeError(
+                f"placement transition action is not a canonical build: {event.action_name!r}"
+            )
+        if event.transition.structure_type != spec.structure_type:
+            raise RuntimeError(
+                "placement transition structure does not match canonical build action: "
+                f"{event.transition.structure_type!r} != {spec.structure_type!r}"
+            )
+        payload = {
+            **event.transition.model_dump(mode="json"),
+            # The durable envelope owns parent identity.  Legacy transitions may not
+            # repeat these fields, so never let their nullable values overwrite it.
+            "command_id": event.command_id,
+            "operation_id": event.operation_id,
+            "attempt_id": event.attempt_id,
+            "attempt_ordinal": event.attempt_ordinal,
+            "action_name": event.action_name,
+            "transition_id": event.transition_id,
+            "builder_tag": event.builder_tag,
+            "builder_lease_state": event.builder_lease_state,
+        }
+        retry_status = self.store.placement_transition_retry_status(
+            run_id=event.run_id,
+            episode_id=event.episode_id,
+            step_id=event.step_id,
+            transition_id=event.transition_id,
+            payload=payload,
+        )
+        if retry_status == "already_recorded":
+            return retry_status
+        lifecycle = self._command_states.get(event.command_id)
+        if lifecycle is None:
+            raise RuntimeError(
+                f"placement transition references unknown command {event.command_id!r}"
+            )
+        if (
+            not lifecycle.command.name.startswith("Build_")
+            or lifecycle.command.name not in CANONICAL_PLACEMENT_SPECS
+        ):
+            raise RuntimeError(
+                f"placement transition command is not a canonical build: {lifecycle.command.name!r}"
+            )
+        if lifecycle.command.name != event.action_name:
+            raise RuntimeError(
+                f"placement transition action {event.action_name!r} does not match "
+                f"command {lifecycle.command.name!r}"
+            )
+        result = self.store.append_placement_transition(
+            run_id=event.run_id,
+            episode_id=event.episode_id,
+            step_id=event.step_id,
+            transition_id=event.transition_id,
+            payload=payload,
+        )
+        return result.status
+
+    def record_authoritative_build_preflight(
+        self,
+        result: AuthoritativeBuildPreflightResult,
+    ) -> None:
+        del result
+        raise RuntimeError("authoritative Build preflight requires the Cortex runtime")
 
     def _record_execution_from(
         self,
@@ -1272,6 +1613,22 @@ class RuntimeEngine:
                 f"state {lifecycle.status.value!r}"
             )
         self._validate_execution_identity(report, lifecycle.command)
+        if report.effect_evidence is not None:
+            for transition in report.effect_evidence.placement_ledger_transitions:
+                self.store.append_event(
+                    run_id=report.run_id,
+                    episode_id=report.episode_id,
+                    step_id=report.step_id,
+                    event_type="placement_ledger_transition",
+                    payload={
+                        **transition.model_dump(mode="json"),
+                        "command_id": report.command_id,
+                        "operation_id": report.operation_id,
+                        "attempt_id": report.attempt_id,
+                        "attempt_ordinal": report.attempt_ordinal,
+                        "action_name": report.action_name,
+                    },
+                )
         self.store.append_event(
             run_id=report.run_id,
             episode_id=report.episode_id,
@@ -1387,6 +1744,19 @@ class RuntimeEngine:
                     CommandStatus.DISPATCHED,
                 },
             )
+        self.store.flush()
+        self.store.append_retention_summary(
+            run_id=result.run_id,
+            episode_id=result.episode_id,
+            step_id=result.steps,
+        )
+        self.store.append_event(
+            run_id=result.run_id,
+            episode_id=result.episode_id,
+            step_id=result.steps,
+            event_type="event_store_performance",
+            payload=asdict(self.store.performance_snapshot()),
+        )
         self.store.record_episode(result)
         lessons = self.store.lessons(result.run_id, result.episode_id)
         self.store.record_episode_summary(
@@ -1406,6 +1776,16 @@ class RuntimeEngine:
             )
         )
         self._episode_result_fingerprint = fingerprint
+        self.store.record_snapshot(
+            run_id=result.run_id,
+            episode_id=result.episode_id,
+            snapshot_type=_RUNTIME_SNAPSHOT_TYPE,
+            step_id=result.steps,
+            payload=self._runtime_checkpoint_payload(result.steps),
+        )
+        # Episode terminal state is a durability boundary: callers may inspect
+        # or restart immediately after this synchronous method returns.
+        self.store.flush()
 
     @staticmethod
     def _episode_fingerprint(result: EpisodeResult) -> str:

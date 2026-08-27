@@ -13,6 +13,10 @@ from rtscortex.contracts import (
     AvailableAction,
     ObservationEnvelope,
 )
+from rtscortex.targeting import (
+    attackable_enemies_for_actor,
+    living_targetable_enemies,
+)
 
 
 class ActionArbiter:
@@ -266,14 +270,33 @@ def _attack_invariant_failure(
     if not command.arguments:
         return _ActionFailure("Attack_Unit requires an enemy target")
     target = _normalize_tag(command.arguments[0])
-    enemy_ids = {_normalize_tag(enemy.unit_id) for enemy in observation.state.visible_enemies}
+    enemy_ids = {
+        _normalize_tag(enemy.unit_id)
+        for enemy in attackable_enemies_for_actor(
+            observation,
+            command.actor,
+            current_screen_only=False,
+        )
+    }
     if target in enemy_ids:
         return None
     own_ids = {
         _normalize_tag(unit.unit_id)
         for unit in [*observation.state.own_units, *observation.state.own_structures]
     }
-    reason = "friendly_target" if target in own_ids else "target_not_visible"
+    visible_enemy_ids = {
+        _normalize_tag(enemy.unit_id)
+        for enemy in living_targetable_enemies(observation.state.visible_enemies)
+    }
+    reason = (
+        "friendly_target"
+        if target in own_ids
+        else (
+            "target_not_attackable_by_actor"
+            if target in visible_enemy_ids
+            else "target_not_visible"
+        )
+    )
     return _ActionFailure(reason)
 
 
@@ -343,7 +366,12 @@ def _precondition_failure(
     state = observation.state
     supply_free = state.economy.supply_cap - state.economy.supply_used
     unit_ids = {
-        unit.unit_id for unit in [*state.own_units, *state.own_structures, *state.visible_enemies]
+        unit.unit_id
+        for unit in [
+            *state.own_units,
+            *state.own_structures,
+            *living_targetable_enemies(state.visible_enemies),
+        ]
     }
     checks = {
         "min_minerals": state.economy.minerals,
@@ -396,13 +424,16 @@ def _precondition_failure(
         elif name == "enemy_target_exists":
             if not isinstance(expected, str):
                 return _ActionFailure("precondition 'enemy_target_exists' must be a unit ID")
-            enemy_ids = {_normalize_tag(enemy.unit_id) for enemy in state.visible_enemies}
+            enemy_ids = {
+                _normalize_tag(enemy.unit_id)
+                for enemy in living_targetable_enemies(state.visible_enemies)
+            }
             if _normalize_tag(expected) not in enemy_ids:
                 return _ActionFailure("precondition 'enemy_target_exists' is not satisfied")
         elif name == "enemy_visible":
             if not isinstance(expected, bool):
                 return _ActionFailure("precondition 'enemy_visible' must be boolean")
-            if bool(state.visible_enemies) is not expected:
+            if bool(living_targetable_enemies(state.visible_enemies)) is not expected:
                 return _ActionFailure("precondition 'enemy_visible' is not satisfied")
         else:
             return _ActionFailure(f"unsupported precondition {name!r}")

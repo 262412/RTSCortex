@@ -74,6 +74,7 @@ class LiveWorkerSpec:
 
     command: tuple[str, ...]
     sc2_path: Path
+    python_path: tuple[Path, ...] = ()
 
 
 class _EmbeddedUvicornServer(uvicorn.Server):
@@ -99,6 +100,13 @@ def prepare_live_worker(
     scenario = live_scenario_spec(config.environment.scenario)
 
     values = os.environ if environment is None else environment
+    reviewed_source_root = values.get("RTSCORTEX_REVIEWED_SOURCE_ROOT")
+    source_project_root = (
+        Path(reviewed_source_root).expanduser().resolve() if reviewed_source_root else project_root
+    )
+    reviewed_python_path = (
+        (source_project_root / "third_party" / "LLM-PySC2",) if reviewed_source_root else ()
+    )
     worker_python = _worker_python(config, values)
     sc2_path = _sc2_path(config, values)
     errors: list[str] = []
@@ -118,6 +126,11 @@ def prepare_live_worker(
         else:
             probe_environment = dict(values)
             probe_environment["PYGAME_HIDE_SUPPORT_PROMPT"] = "1"
+            if reviewed_python_path:
+                probe_environment["PYTHONPATH"] = _prepend_python_path(
+                    reviewed_python_path,
+                    probe_environment.get("PYTHONPATH"),
+                )
             probe = subprocess.run(
                 [
                     str(worker_python),
@@ -154,104 +167,117 @@ def prepare_live_worker(
         if not map_path.is_file():
             errors.append(f"scenario map is missing: {map_path}")
 
-    if not waiting_response_patch_is_applied(project_root):
+    if not waiting_response_patch_is_applied(source_project_root):
         errors.append(
             "the LLM-PySC2 waiting-response patch is not applied; see "
             "integrations/llm_pysc2/patches/README.md"
         )
-    if not random_seed_patch_is_applied(project_root):
+    if not random_seed_patch_is_applied(source_project_root):
         errors.append(
             "the PySC2 random-seed patch is not applied; see "
             "integrations/llm_pysc2/patches/README.md"
         )
-    if not build_feature_plane_patch_is_applied(project_root):
+    if not build_feature_plane_patch_is_applied(source_project_root):
         errors.append(
             "the LLM-PySC2 build-coordinate patch is not applied; see "
             "integrations/llm_pysc2/patches/README.md"
         )
-    if not translation_result_patch_is_applied(project_root):
+    if not translation_result_patch_is_applied(source_project_root):
         errors.append(
             "the LLM-PySC2 translation-result patch is not applied; see "
             "integrations/llm_pysc2/patches/README.md"
         )
-    if not near_placement_patch_is_applied(project_root):
+    if not near_placement_patch_is_applied(source_project_root):
         errors.append(
             "the LLM-PySC2 near-placement patch is not applied; see "
             "integrations/llm_pysc2/patches/README.md"
         )
-    if not pretranslation_abort_patch_is_applied(project_root):
+    if not pretranslation_abort_patch_is_applied(source_project_root):
         errors.append(
             "the LLM-PySC2 pre-translation abort patch is not applied; see "
             "integrations/llm_pysc2/patches/README.md"
         )
-    if not transient_unit_grace_patch_is_applied(project_root):
+    if not transient_unit_grace_patch_is_applied(source_project_root):
         errors.append(
             "the LLM-PySC2 transient-unit grace patch is not applied; see "
             "integrations/llm_pysc2/patches/README.md"
         )
-    if not nexus_resource_clearance_patch_is_applied(project_root):
+    if not nexus_resource_clearance_patch_is_applied(source_project_root):
         errors.append(
             "the LLM-PySC2 Nexus resource-clearance patch is not applied; see "
             "integrations/llm_pysc2/patches/README.md"
         )
-    if not nexus_exact_screen_scale_patch_is_applied(project_root):
+    if not nexus_exact_screen_scale_patch_is_applied(source_project_root):
         errors.append(
             "the LLM-PySC2 Nexus exact-screen-scale patch is not applied; see "
             "integrations/llm_pysc2/patches/README.md"
         )
-    if not max_frames_episode_hook_patch_is_applied(project_root):
+    if not max_frames_episode_hook_patch_is_applied(source_project_root):
         errors.append(
             "the PySC2 max-frame episode hook patch is not applied; see "
             "integrations/llm_pysc2/patches/README.md"
         )
-    if not atomic_log_directory_patch_is_applied(project_root):
+    if not atomic_log_directory_patch_is_applied(source_project_root):
         errors.append(
             "the LLM-PySC2 concurrent log-directory patch is not applied; see "
             "integrations/llm_pysc2/patches/README.md"
         )
-    if not gas_rebalance_worker_management_patch_is_applied(project_root):
+    if not gas_rebalance_worker_management_patch_is_applied(source_project_root):
         errors.append(
             "the LLM-PySC2 gas-rebalance worker-management patch is not applied; see "
             "integrations/llm_pysc2/patches/README.md"
         )
-    if not reserved_builder_worker_patch_is_applied(project_root):
+    if not reserved_builder_worker_patch_is_applied(source_project_root):
         errors.append(
             "the LLM-PySC2 reserved-builder worker patch is not applied; see "
             "integrations/llm_pysc2/patches/README.md"
         )
-    if not worker_workplace_refresh_patch_is_applied(project_root):
+    if not worker_workplace_refresh_patch_is_applied(source_project_root):
         errors.append(
             "the LLM-PySC2 worker-workplace refresh patch is not applied; see "
             "integrations/llm_pysc2/patches/README.md"
         )
-    if not observation_gap_watchdog_patch_is_applied(project_root):
+    if not observation_gap_watchdog_patch_is_applied(source_project_root):
         errors.append(
             "the LLM-PySC2 observation-gap watchdog patch is not applied; see "
             "integrations/llm_pysc2/patches/README.md"
         )
-    if not visible_team_selection_patch_is_applied(project_root):
+    if not visible_team_selection_patch_is_applied(source_project_root):
         errors.append(
             "the LLM-PySC2 visible-team selection patch is not applied; see "
             "integrations/llm_pysc2/patches/README.md"
         )
-    if not camera_settlement_noop_patch_is_applied(project_root):
+    if not camera_settlement_noop_patch_is_applied(source_project_root):
         errors.append(
             "the LLM-PySC2 camera-settlement yield patch is not applied; see "
             "integrations/llm_pysc2/patches/README.md"
         )
-    if not exact_single_unit_selection_patch_is_applied(project_root):
+    if not exact_single_unit_selection_patch_is_applied(source_project_root):
         errors.append(
             "the LLM-PySC2 exact single-unit selection patch is not applied; see "
             "integrations/llm_pysc2/patches/README.md"
         )
-    if not transport_noop_actor_bypass_patch_is_applied(project_root):
+    if not transport_noop_actor_bypass_patch_is_applied(source_project_root):
         errors.append(
             "the LLM-PySC2 transport-noop actor bypass patch is not applied; see "
             "integrations/llm_pysc2/patches/README.md"
         )
-    if not gather_screen_target_patch_is_applied(project_root):
+    if not gather_screen_target_patch_is_applied(source_project_root):
         errors.append(
             "the LLM-PySC2 gather-target validation patch is not applied; see "
+            "integrations/llm_pysc2/patches/README.md"
+        )
+    if not gas_stop_selection_patch_is_applied(source_project_root):
+        errors.append(
+            "the LLM-PySC2 gas stop-worker selection patch is not applied; see "
+            "integrations/llm_pysc2/patches/README.md"
+        )
+    if (
+        config.environment.execution_action_space == "raw"
+        and not raw_available_actions_printer_patch_is_applied(source_project_root)
+    ):
+        errors.append(
+            "the PySC2 RAW observation printer patch is not applied; see "
             "integrations/llm_pysc2/patches/README.md"
         )
 
@@ -278,6 +304,8 @@ def prepare_live_worker(
         config.environment.opponent_build,
         "--step_mul",
         str(config.environment.step_mul),
+        "--action_space",
+        config.environment.execution_action_space.upper(),
     ]
     if config.environment.game_steps_per_episode is not None:
         command.extend(
@@ -293,8 +321,6 @@ def prepare_live_worker(
                 str(config.console.rgb_screen_size),
                 "--rgb_minimap_size",
                 str(config.console.rgb_minimap_size),
-                "--action_space",
-                "FEATURES",
             ]
         )
     command.extend(
@@ -303,13 +329,23 @@ def prepare_live_worker(
             "1",
             "--render=false",
             "--save_replay=false",
-            "--max_agent_steps",
-            str(config.environment.max_steps),
-            "--random_seed",
-            str(config.run.seed),
         ]
     )
-    return LiveWorkerSpec(command=tuple(command), sc2_path=sc2_path)
+    if config.environment.max_steps is not None:
+        command.extend(["--max_agent_steps", str(config.environment.max_steps)])
+    command.extend(["--random_seed", str(config.run.seed)])
+    return LiveWorkerSpec(
+        command=tuple(command),
+        sc2_path=sc2_path,
+        python_path=reviewed_python_path,
+    )
+
+
+def _prepend_python_path(paths: Sequence[Path], existing: str | None) -> str:
+    values = [*(str(path) for path in paths)]
+    if existing:
+        values.append(existing)
+    return os.pathsep.join(values)
 
 
 def live_scenario_spec(scenario: str) -> LiveScenarioSpec:
@@ -341,6 +377,10 @@ def ensure_console_port_available(port: int) -> None:
         raise LiveEnvironmentError(f"invalid console port: {port}")
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            # Uvicorn enables address reuse on its listener. Mirror that behavior
+            # here so a just-finished Console connection in TIME_WAIT does not
+            # make the next sequential episode look like a live port conflict.
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             probe.bind(("127.0.0.1", port))
     except OSError as error:
         raise LiveEnvironmentError(
@@ -587,6 +627,7 @@ class LiveProcessSupervisor:
                 "RTSCORTEX_SCENARIO": self.scenario,
                 "RTSCORTEX_SEED": str(self.seed),
                 "RTSCORTEX_WORKER_METRICS_PATH": str(self._worker_metrics_path),
+                "RTSCORTEX_LLM_LOG_DIR": str((self.run_dir / "llm-log").resolve()),
                 "PYGAME_HIDE_SUPPORT_PROMPT": "1",
             }
         )
@@ -1079,6 +1120,35 @@ def gather_screen_target_patch_is_applied(project_root: Path) -> bool:
     if not source.is_file():
         return False
     return "_rtscortex_validate_gather_target" in source.read_text(encoding="utf-8")
+
+
+def gas_stop_selection_patch_is_applied(project_root: Path) -> bool:
+    """Return whether stop-worker selection uses a clamped feature coordinate."""
+
+    source = project_root / "third_party/LLM-PySC2/llm_pysc2/agents/main_agent_funcs.py"
+    if not source.is_file():
+        return False
+    text = source.read_text(encoding="utf-8")
+    return (
+        "min(max(0, unit.x), self.size_screen - 1)" in text
+        and "select_point('select', (x, y))" in text
+    )
+
+
+def raw_available_actions_printer_patch_is_applied(project_root: Path) -> bool:
+    """Return whether the PySC2 diagnostic wrapper accepts RAW observations."""
+
+    source = project_root / "third_party/LLM-PySC2/pysc2/env/available_actions_printer.py"
+    if not source.is_file():
+        return False
+    text = source.read_text(encoding="utf-8")
+    return all(
+        marker in text
+        for marker in (
+            'available_actions = obs.observation.get("available_actions")',
+            "if available_actions is None:",
+        )
+    )
 
 
 def _signal_process(worker: asyncio.subprocess.Process, sig: signal.Signals) -> None:

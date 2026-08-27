@@ -1,0 +1,71 @@
+run:
+  output_root: ~/scratch/outputs/RTSCortex
+  runtime_root: ~/fastscratch/rtscortex_runtime
+  seed: 0
+environment:
+  adapter: llm_pysc2
+  execution_action_space: raw
+  scenario: Simple64
+  max_steps: 1024
+  agent_race: protoss
+  opponent_race: zerg
+  opponent_difficulty: very_easy
+  opponent_build: macro
+  step_mul: 1
+  game_steps_per_episode: 1024
+  simulation_speed_multiplier: 1.0
+  pause_until_first_plan: true
+  sc2_path: ~/scratch/StarCraftII
+  action_effect_timeout_game_loops: 112
+  observation_gap_watchdog_game_loops: 112
+  observation_gap_hard_limit_game_loops: 448
+  expansion_scout_enabled: false
+  worker_python: ~/fastscratch/envs/rtscortex-llm-pysc2/bin/python
+runtime:
+  deterministic: true
+  planning_interval_game_loops: 16
+  planner_command_ttl_game_loops: 112
+  planner_timeout_seconds: 15.0
+  max_actions: 1
+agent:
+  variant: cortex
+cortex:
+  situation:
+    kind: deterministic
+  arbiter:
+    mode: active
+    switch_margin: 1.0
+    max_intents: 1
+  macro:
+    kind: scripted
+    scripted_objective: Exercise the authoritative Build circuit with real SC2 evidence.
+    scripted_actions:
+      - Pylon
+    required: true
+    interval_game_loops: 112
+    plan_ttl_game_loops: 2048
+    timeout_seconds: 15.0
+  tactical:
+    kind: deterministic
+  executor:
+    kind: deterministic
+    timeout_ms: 10.0
+    fallback: deterministic
+  playbook:
+    enabled: false
+reflex:
+  enabled: false
+  low_health_threshold: 0.25
+  target_latency_ms: 50.0
+provider:
+  kind: fake
+  model: authoritative-build-circuit-canary
+evaluation:
+  seeds: [0]
+  authoritative_build_circuit_canary:
+    enabled: true
+    mode: stale_candidate_then_builder_rebind
+    failure_attempts: 3
+    hold_observations: 1
+console:
+  enabled: false

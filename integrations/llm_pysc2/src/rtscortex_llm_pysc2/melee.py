@@ -42,6 +42,7 @@ _ACTION_NAMES = {
     },
     "Developer": {
         "No_Operation",
+        "Train_Probe",
         "Train_Zealot",
         "Train_Stalker",
         "Train_Adept",
@@ -97,6 +98,21 @@ _ACTION_NAMES = {
 }
 
 
+class _TrainProbeQuick:
+    """Lazy feature-function proxy so the core contract tests do not require PySC2."""
+
+    id = 485
+    name = "Train_Probe_quick"
+
+    def __call__(self, *args: Any) -> Any:
+        from pysc2.lib.actions import FUNCTIONS  # type: ignore[import-not-found]
+
+        return FUNCTIONS.Train_Probe_quick(*args)
+
+
+_TRAIN_PROBE_QUICK = _TrainProbeQuick()
+
+
 class RTSCortexMeleeConfig(ProtossAgentConfig):  # type: ignore[misc]
     """Retain the supported Protoss macro chain and its combat groups."""
 
@@ -115,6 +131,13 @@ class RTSCortexMeleeConfig(ProtossAgentConfig):  # type: ignore[misc]
         }
         for agent_name in _SINGLE_TEAM_AGENTS:
             self.AGENTS[agent_name]["team"] = self.AGENTS[agent_name]["team"][:1]
+            team = self.AGENTS[agent_name]["team"][0]
+            # RTSCortex owns actor membership by raw unit tag but does not own a
+            # durable create/update lifecycle for SC2 UI control groups.  Recall
+            # would therefore depend on stale external UI state.  Select all
+            # living units of the actor's exact type from its current viewport.
+            team["game_group"] = -1
+            team["select_type"] = "select_all_type"
         for agent_name, agent in self.AGENTS.items():
             allowed = _ACTION_NAMES[agent_name]
             for unit_type, actions in agent["action"].items():
@@ -128,9 +151,28 @@ class RTSCortexMeleeConfig(ProtossAgentConfig):  # type: ignore[misc]
         # keeps the dedicated Builder Probe reserved while ordinary workers are
         # stopped and reassigned deterministically by the Bridge.
         self.ENABLE_AUTO_WORKER_MANAGE = True
-        self.ENABLE_AUTO_WORKER_TRAINING = True
+        # Probe production belongs to the RTSCortex Economy controller so every
+        # attempt has command lineage, producer provenance, and effect evidence.
+        self.ENABLE_AUTO_WORKER_TRAINING = False
+        _ensure_probe_training(self.AGENTS)
         _ensure_assimilator_camera_settlement(self.AGENTS)
+        _ensure_attack_target_reacquisition(self.AGENTS)
         _ensure_no_operation(self.AGENTS)
+
+
+def _ensure_probe_training(agents: dict[str, dict[str, Any]]) -> None:
+    """Expose tracked Nexus production through the Developer Empty team."""
+
+    actions = agents["Developer"]["action"]["EmptyGroup"]
+    if any(action["name"] == "Train_Probe" for action in actions):
+        return
+    actions.append(
+        {
+            "name": "Train_Probe",
+            "arg": [],
+            "func": [(485, _TRAIN_PROBE_QUICK, ("queued",))],
+        }
+    )
 
 
 def _ensure_no_operation(agents: dict[str, dict[str, Any]]) -> None:
@@ -161,6 +203,27 @@ def _ensure_assimilator_camera_settlement(agents: dict[str, dict[str, Any]]) -> 
         deepcopy(nexus_functions[1]),
         assimilator_functions[-1],
     ]
+
+
+def _ensure_attack_target_reacquisition(agents: dict[str, dict[str, Any]]) -> None:
+    """Move to the exact enemy tag after selecting the combat control group."""
+
+    nexus_functions = list(_find_action(agents, "Build_Nexus_Near").get("func", ()))
+    if len(nexus_functions) < 2 or [int(item[0]) for item in nexus_functions[:2]] != [573, 0]:
+        raise RuntimeError("pinned Protoss camera-settlement contract changed")
+    for agent in agents.values():
+        for actions in agent["action"].values():
+            for action in actions:
+                if action["name"] != "Attack_Unit":
+                    continue
+                functions = list(action.get("func", ()))
+                if not functions or int(functions[-1][0]) != 12:
+                    raise RuntimeError("pinned Protoss Attack_Unit contract changed")
+                action["func"] = [
+                    deepcopy(nexus_functions[0]),
+                    deepcopy(nexus_functions[1]),
+                    functions[-1],
+                ]
 
 
 def _find_action(

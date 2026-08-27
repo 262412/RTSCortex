@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
 from rtscortex_llm_pysc2.addon import ADDON_SPECS, AddonSpec
 from rtscortex_llm_pysc2.effect_verifier import ActionEffectVerifier
 from rtscortex_llm_pysc2.inject_effect_verifier import (
@@ -10,7 +11,443 @@ from rtscortex_llm_pysc2.inject_effect_verifier import (
 )
 from rtscortex_llm_pysc2.morph import MORPH_SPECS, MorphSpec
 from rtscortex_llm_pysc2.production import PRODUCTION_SPECS, ProductionSpec
+from rtscortex_llm_pysc2.raw_placement import RawPlacementService
 from rtscortex_llm_pysc2.routing import RoutedCommand
+
+from rtscortex.contracts import EffectEvidence
+
+
+def test_attack_effect_requires_damage_after_pysc2_acceptance() -> None:
+    verifier = ActionEffectVerifier(timeout_game_loops=32)
+    command = _attack_command()
+    assert verifier.track(command) is True
+    verifier.prepare(
+        command.command_id,
+        _attack_observation(100, health=150),
+        None,
+        actor_tags=(0xA00,),
+    )
+    verifier.accept_primitive(command.command_id, game_loop=104)
+
+    assert verifier.observe(_attack_observation(108, health=150)) == []
+    verdicts = verifier.observe(_attack_observation(112, health=125))
+
+    assert len(verdicts) == 1
+    assert verdicts[0].success is True
+    assert verdicts[0].evidence is not None
+    assert verdicts[0].evidence["effect_kind"] == "combat"
+    assert verdicts[0].evidence["confirmation_kind"] == "target_damaged"
+    assert verdicts[0].evidence["target_health_delta"] == 25
+
+
+def test_attack_effect_does_not_treat_lost_target_as_confirmed_kill() -> None:
+    verifier = ActionEffectVerifier(timeout_game_loops=16)
+    command = _attack_command()
+    verifier.track(command)
+    verifier.prepare(
+        command.command_id,
+        _attack_observation(100, health=20),
+        None,
+        actor_tags=(0xA00,),
+    )
+    verifier.accept_primitive(command.command_id, game_loop=104)
+
+    assert verifier.observe(_attack_observation(108, health=None)) == []
+    verdicts = verifier.observe(_attack_observation(120, health=None))
+
+    assert [verdict.success for verdict in verdicts] == [False]
+    assert [verdict.failure_code for verdict in verdicts] == ["combat_target_lost"]
+    assert verdicts[0].evidence is not None
+    assert verdicts[0].evidence["confirmation_kind"] is None
+
+
+def test_attack_regeneration_cannot_emit_negative_protocol_evidence() -> None:
+    verifier = ActionEffectVerifier(timeout_game_loops=16)
+    command = _attack_command()
+    verifier.track(command)
+    verifier.prepare(
+        command.command_id,
+        _attack_observation(100, health=13),
+        None,
+        actor_tags=(0xA00,),
+    )
+    verifier.accept_primitive(command.command_id, game_loop=104)
+
+    assert verifier.observe(_attack_observation(108, health=14)) == []
+    assert verifier.observe(_attack_observation(112, health=None)) == []
+    verdict = verifier.observe(_attack_observation(120, health=None))[0]
+
+    assert verdict.failure_code == "combat_target_lost"
+    assert verdict.evidence is not None
+    assert verdict.evidence["target_health_delta"] == 0
+    EffectEvidence.model_validate(verdict.evidence)
+
+
+def test_attack_effect_times_out_when_target_health_does_not_change() -> None:
+    verifier = ActionEffectVerifier(timeout_game_loops=16)
+    command = _attack_command()
+    verifier.track(command)
+    verifier.prepare(
+        command.command_id,
+        _attack_observation(100, health=150),
+        None,
+        actor_tags=(0xA00,),
+    )
+    verifier.accept_primitive(command.command_id, game_loop=104)
+
+    verdicts = verifier.observe(_attack_observation(120, health=150))
+
+    assert [verdict.failure_code for verdict in verdicts] == ["combat_effect_not_observed"]
+
+
+def test_unrelated_damage_does_not_confirm_attack() -> None:
+    verifier = ActionEffectVerifier(timeout_game_loops=16)
+    command = _attack_command()
+    verifier.track(command)
+    verifier.prepare(
+        command.command_id,
+        _attack_observation(100, health=150, actor_order_target=None),
+        None,
+        actor_tags=(0xA00,),
+    )
+    verifier.accept_primitive(command.command_id, game_loop=104)
+
+    assert verifier.observe(_attack_observation(112, health=100, actor_order_target=None)) == []
+    verdict = verifier.observe(_attack_observation(120, health=100, actor_order_target=None))[0]
+
+    assert verdict.success is False
+    assert verdict.failure_code == "combat_actor_order_unbound"
+
+
+def test_overwritten_attack_order_can_be_reissued() -> None:
+    verifier = ActionEffectVerifier(timeout_game_loops=32)
+    command = _attack_command()
+    verifier.track(command)
+    verifier.prepare(
+        command.command_id,
+        _attack_observation(100, health=150),
+        None,
+        actor_tags=(0xA00,),
+    )
+    verifier.accept_primitive(command.command_id, game_loop=104)
+    assert verifier.observe(_attack_observation(108, health=150)) == []
+
+    assert verifier.observe(_attack_observation(112, health=150, actor_order_target=None)) == []
+    verdict = verifier.observe(_attack_observation(116, health=150, actor_order_target=None))[0]
+
+    assert verdict.success is False
+    assert verdict.failure_code == "combat_order_replaced"
+
+
+def test_damage_after_order_replacement_does_not_confirm_old_attack() -> None:
+    verifier = ActionEffectVerifier(timeout_game_loops=32)
+    command = _attack_command()
+    verifier.track(command)
+    verifier.prepare(
+        command.command_id,
+        _attack_observation(100, health=150),
+        None,
+        actor_tags=(0xA00,),
+    )
+    verifier.accept_primitive(command.command_id, game_loop=104)
+    assert verifier.observe(_attack_observation(108, health=150)) == []
+
+    assert verifier.observe(_attack_observation(112, health=100, actor_order_target=None)) == []
+    verdict = verifier.observe(_attack_observation(116, health=100, actor_order_target=None))[0]
+
+    assert verdict.success is False
+    assert verdict.failure_code == "combat_order_replaced"
+    assert verdict.evidence is not None
+    assert verdict.evidence["actor_order_bound"] is False
+    assert verdict.evidence["actor_order_ever_bound"] is True
+
+
+def test_non_attack_targeted_order_does_not_bind_combat_command() -> None:
+    verifier = ActionEffectVerifier(timeout_game_loops=16)
+    command = _attack_command()
+    verifier.track(command)
+    verifier.prepare(
+        command.command_id,
+        _attack_observation(100, health=150, actor_order_ability_id=4),
+        None,
+        actor_tags=(0xA00,),
+    )
+    verifier.accept_primitive(command.command_id, game_loop=104)
+
+    assert verifier.observe(_attack_observation(112, health=100, actor_order_ability_id=4)) == []
+    verdict = verifier.observe(_attack_observation(120, health=100, actor_order_ability_id=4))[0]
+
+    assert verdict.success is False
+    assert verdict.failure_code == "combat_actor_order_unbound"
+
+
+def test_missing_actor_after_prior_binding_cannot_claim_damage() -> None:
+    verifier = ActionEffectVerifier(timeout_game_loops=32)
+    command = _attack_command()
+    verifier.track(command)
+    verifier.prepare(
+        command.command_id,
+        _attack_observation(100, health=150),
+        None,
+        actor_tags=(0xA00,),
+    )
+    verifier.accept_primitive(command.command_id, game_loop=104)
+    assert verifier.observe(_attack_observation(108, health=150)) == []
+
+    assert verifier.observe(_attack_observation(112, health=100, actor_tags=())) == []
+    verdict = verifier.observe(_attack_observation(116, health=100, actor_tags=()))[0]
+
+    assert verdict.success is False
+    assert verdict.failure_code == "combat_order_replaced"
+
+
+def test_one_health_delta_confirms_at_most_one_combat_engagement() -> None:
+    verifier = ActionEffectVerifier(timeout_game_loops=32)
+    first = _attack_command()
+    second = RoutedCommand(
+        command_id="command-attack-2",
+        actor="CombatGroup1/Stalker-1",
+        team_name="Stalker-1",
+        name="Attack_Unit",
+        source="planner",
+        requested_arguments=("0xdef",),
+        resolved_arguments=("0xdef",),
+        rendered_action="<Attack_Unit(0xdef)>",
+    )
+    for command, actor_tag in ((first, 0xA01), (second, 0xA02)):
+        verifier.track(command)
+        verifier.prepare(
+            command.command_id,
+            _attack_observation(100, health=150, actor_tags=(0xA01, 0xA02)),
+            None,
+            actor_tags=(actor_tag,),
+        )
+        verifier.accept_primitive(command.command_id, game_loop=104)
+
+    verdicts = verifier.observe(_attack_observation(112, health=125, actor_tags=(0xA01, 0xA02)))
+
+    assert [verdict.command_id for verdict in verdicts] == ["command-attack"]
+    assert verifier.is_tracked("command-attack-2") is True
+    assert verifier.observe(_attack_observation(116, health=125, actor_tags=(0xA01, 0xA02))) == []
+
+
+def test_target_removal_terminalizes_all_exact_bound_commands_in_engagement() -> None:
+    verifier = ActionEffectVerifier(timeout_game_loops=32)
+    first = _attack_command()
+    second = RoutedCommand(
+        command_id="command-attack-2",
+        actor="CombatGroup1/Stalker-1",
+        team_name="Stalker-1",
+        name="Attack_Unit",
+        source="planner",
+        requested_arguments=("0xdef",),
+        resolved_arguments=("0xdef",),
+        rendered_action="<Attack_Unit(0xdef)>",
+    )
+    for command, actor_tag in ((first, 0xA01), (second, 0xA02)):
+        verifier.track(command)
+        verifier.prepare(
+            command.command_id,
+            _attack_observation(100, health=25, actor_tags=(0xA01, 0xA02)),
+            None,
+            actor_tags=(actor_tag,),
+        )
+        verifier.accept_primitive(command.command_id, game_loop=104)
+    verifier.observe(_attack_observation(108, health=25, actor_tags=(0xA01, 0xA02)))
+
+    verdicts = verifier.observe(
+        _attack_observation(
+            112,
+            health=None,
+            actor_tags=(0xA01, 0xA02),
+            dead_tags=(0xDEF,),
+        )
+    )
+
+    assert len(verdicts) == 2
+    assert verdicts[0].command_id == "command-attack"
+    assert verdicts[0].success is True
+    assert verdicts[0].evidence is not None
+    assert verdicts[0].evidence["confirmation_kind"] == "target_removed"
+    assert verdicts[1].command_id == "command-attack-2"
+    assert verdicts[1].success is False
+    assert verdicts[1].status == "cancelled"
+    assert verdicts[1].failure_code == "engagement_target_eliminated"
+    assert verdicts[1].evidence is not None
+    assert verdicts[1].evidence["confirmation_kind"] == "satisfied_by_peer"
+    assert verifier.is_tracked(first.command_id) is False
+    assert verifier.is_tracked(second.command_id) is False
+
+
+def test_target_death_with_same_frame_order_clear_neutralizes_bound_peers() -> None:
+    verifier = ActionEffectVerifier(timeout_game_loops=32)
+    first = _attack_command()
+    second = _second_attack_command()
+    for command, actor_tag in ((first, 0xA01), (second, 0xA02)):
+        verifier.track(command)
+        verifier.prepare(
+            command.command_id,
+            _attack_observation(100, health=25, actor_tags=(0xA01, 0xA02)),
+            None,
+            actor_tags=(actor_tag,),
+        )
+        verifier.accept_primitive(command.command_id, game_loop=104)
+    assert verifier.observe(_attack_observation(108, health=25, actor_tags=(0xA01, 0xA02))) == []
+
+    verdicts = verifier.observe(
+        _attack_observation(
+            112,
+            health=None,
+            actor_order_target=None,
+            actor_tags=(0xA01, 0xA02),
+            dead_tags=(0xDEF,),
+        )
+    )
+
+    assert [(verdict.command_id, verdict.status) for verdict in verdicts] == [
+        ("command-attack", "succeeded"),
+        ("command-attack-2", "cancelled"),
+    ]
+    assert verdicts[1].failure_code == "engagement_target_eliminated"
+    assert verdicts[1].evidence is not None
+    assert verdicts[1].evidence["actor_order_bound"] is False
+    assert verdicts[1].evidence["actor_order_ever_bound"] is True
+
+
+def test_previously_replaced_peer_is_not_satisfied_by_target_death() -> None:
+    verifier = ActionEffectVerifier(timeout_game_loops=32)
+    first = _attack_command()
+    second = _second_attack_command()
+    for command, actor_tag in ((first, 0xA01), (second, 0xA02)):
+        verifier.track(command)
+        verifier.prepare(
+            command.command_id,
+            _attack_observation(100, health=25, actor_tags=(0xA01, 0xA02)),
+            None,
+            actor_tags=(actor_tag,),
+        )
+        verifier.accept_primitive(command.command_id, game_loop=104)
+    assert verifier.observe(_attack_observation(108, health=25, actor_tags=(0xA01, 0xA02))) == []
+    assert (
+        verifier.observe(
+            _attack_observation(
+                112,
+                health=25,
+                actor_tags=(0xA01, 0xA02),
+                actor_order_targets={0xA01: 0xDEF, 0xA02: None},
+            )
+        )
+        == []
+    )
+    replaced = verifier.observe(
+        _attack_observation(
+            116,
+            health=25,
+            actor_tags=(0xA01, 0xA02),
+            actor_order_targets={0xA01: 0xDEF, 0xA02: None},
+        )
+    )
+
+    assert [(verdict.command_id, verdict.failure_code) for verdict in replaced] == [
+        ("command-attack-2", "combat_order_replaced")
+    ]
+    kill = verifier.observe(
+        _attack_observation(
+            120,
+            health=None,
+            actor_tags=(0xA01, 0xA02),
+            actor_order_targets={0xA01: 0xDEF, 0xA02: None},
+            dead_tags=(0xDEF,),
+        )
+    )
+    assert [(verdict.command_id, verdict.status) for verdict in kill] == [
+        ("command-attack", "succeeded")
+    ]
+
+
+def test_target_death_with_actor_temporarily_missing_does_not_create_false_target_lost() -> None:
+    verifier = ActionEffectVerifier(timeout_game_loops=32)
+    first = _attack_command()
+    second = _second_attack_command()
+    for command, actor_tag in ((first, 0xA01), (second, 0xA02)):
+        verifier.track(command)
+        verifier.prepare(
+            command.command_id,
+            _attack_observation(100, health=25, actor_tags=(0xA01, 0xA02)),
+            None,
+            actor_tags=(actor_tag,),
+        )
+        verifier.accept_primitive(command.command_id, game_loop=104)
+    assert verifier.observe(_attack_observation(108, health=25, actor_tags=(0xA01, 0xA02))) == []
+
+    verdicts = verifier.observe(
+        _attack_observation(
+            112,
+            health=None,
+            actor_tags=(0xA01,),
+            dead_tags=(0xDEF,),
+        )
+    )
+
+    assert [(verdict.command_id, verdict.status) for verdict in verdicts] == [
+        ("command-attack", "succeeded"),
+        ("command-attack-2", "cancelled"),
+    ]
+    assert all(verdict.failure_code != "combat_target_lost" for verdict in verdicts)
+
+
+def test_stimpack_research_is_confirmed_by_exact_barracks_order() -> None:
+    verifier = ActionEffectVerifier(timeout_game_loops=112)
+    command = RoutedCommand(
+        command_id="research-stim",
+        actor="Developer/Empty",
+        team_name="Empty",
+        name="Research_Stimpack",
+        source="planner",
+        rendered_action="<Research_Stimpack()>",
+    )
+    verifier.track(command)
+    verifier.prepare(command.command_id, _research_observation(100, []), None, producer_tag=0xB00)
+    verifier.accept_primitive(command.command_id, game_loop=104)
+
+    verdicts = verifier.observe(_research_observation(108, [730]))
+
+    assert len(verdicts) == 1
+    assert verdicts[0].success is True
+    assert verdicts[0].evidence is not None
+    assert verdicts[0].evidence["effect_kind"] == "research"
+    assert verdicts[0].evidence["producer_tag"] == "0xb00"
+    assert verdicts[0].evidence["expected_upgrade"] == "Stimpack"
+    assert verdicts[0].evidence["expected_order_id"] == 451
+    assert verdicts[0].evidence["confirmation_kind"] == "producer_order"
+
+
+def test_mule_calldown_is_confirmed_only_by_a_new_mule_tag() -> None:
+    verifier = ActionEffectVerifier(timeout_game_loops=112)
+    command = RoutedCommand(
+        command_id="mule-1",
+        actor="Developer/Empty",
+        team_name="Empty",
+        name="Effect_CalldownMULE_Screen",
+        source="reflex",
+        requested_arguments=([44, 52],),
+        resolved_arguments=([44, 52],),
+        rendered_action="<Effect_CalldownMULE_Screen([44,52])>",
+    )
+    verifier.track(command)
+    verifier.prepare(command.command_id, _mule_observation(200), None, producer_tag=0xC00)
+    verifier.accept_primitive(command.command_id, game_loop=204)
+
+    assert verifier.observe(_mule_observation(208, energy=25)) == []
+    verdicts = verifier.observe(_mule_observation(212, energy=25, mule_tags=[0xD00]))
+
+    assert len(verdicts) == 1
+    assert verdicts[0].success is True
+    assert verdicts[0].evidence is not None
+    assert verdicts[0].evidence["effect_kind"] == "ability"
+    assert verdicts[0].evidence["producer_tag"] == "0xc00"
+    assert verdicts[0].evidence["new_unit_tag"] == "0xd00"
+    assert verdicts[0].evidence["confirmation_kind"] == "new_unit"
 
 
 def test_build_effect_is_confirmed_when_target_structure_appears() -> None:
@@ -63,6 +500,95 @@ def test_tracked_build_blocks_auto_worker_management_until_terminal() -> None:
     )
 
     assert verifier.blocks_auto_worker_management is False
+
+
+@pytest.mark.parametrize(
+    "terminal",
+    ["success", "failure", "cancel", "episode_terminal"],
+)
+def test_build_effect_terminal_releases_exact_builder_lease(terminal: str) -> None:
+    placement_service = RawPlacementService(unit_names={})
+    verifier = ActionEffectVerifier(
+        timeout_game_loops=112,
+        placement_service=placement_service,
+    )
+    command = _build_command(command_id=f"leased-builder-{terminal}")
+    baseline = _observation(game_loop=100, minerals=250)
+    placement_service.resolve(
+        command_id=command.command_id,
+        action_name=command.name,
+        requested_arguments=command.requested_arguments,
+        observation=baseline,
+        world_target=(31.875, 30.0),
+        builder_tag=0xABC,
+    )
+    verifier.track(command)
+    verifier.prepare(command.command_id, baseline, 0xABC)
+    verifier.accept_primitive(command.command_id, game_loop=101)
+
+    assert placement_service.leased_builder_tags == frozenset({0xABC})
+
+    if terminal == "success":
+        verdicts = verifier.observe(
+            _observation(
+                game_loop=112,
+                minerals=150,
+                structures=["Nexus", "Pylon"],
+                builder_orders=[35],
+            )
+        )
+        assert [verdict.status for verdict in verdicts] == ["succeeded"]
+    elif terminal == "failure":
+        assert (
+            verifier.observe(_observation(game_loop=102, minerals=150, builder_orders=[35])) == []
+        )
+        verdicts = verifier.observe(_observation(game_loop=550, minerals=250, builder_orders=[154]))
+        assert [verdict.failure_code for verdict in verdicts] == ["build_started_effect_missing"]
+    elif terminal == "cancel":
+        verifier.cancel(command.command_id)
+    else:
+        verdicts = verifier.fail_pending("episode ended before gameplay effect was confirmed")
+        assert [verdict.failure_code for verdict in verdicts] == ["episode_ended_unconfirmed"]
+
+    assert placement_service.leased_builder_tags == frozenset()
+
+
+def test_build_effect_uses_raw_placement_service_target_as_single_authority() -> None:
+    placement_service = RawPlacementService(unit_names={})
+    verifier = ActionEffectVerifier(
+        timeout_game_loops=112,
+        placement_service=placement_service,
+    )
+    command = _build_command()
+    baseline = _observation(game_loop=100, minerals=250)
+    placement_service.resolve(
+        command_id=command.command_id,
+        action_name=command.name,
+        requested_arguments=command.requested_arguments,
+        observation=baseline,
+        world_target=(31.875, 30.0),
+    )
+    verifier.track(command)
+    verifier.prepare(command.command_id, baseline, 0xABC)
+    verifier.accept_primitive(command.command_id, game_loop=104)
+    placement_service.release_command(command.command_id, game_loop=105)
+
+    verdicts = verifier.observe(
+        _observation(
+            game_loop=126,
+            minerals=150,
+            structures=["Nexus", "Pylon"],
+        )
+    )
+
+    assert [verdict.success for verdict in verdicts] == [True]
+    assert verdicts[0].evidence is not None
+    assert verdicts[0].evidence["target_position"] == (32.0, 30.0)
+    assert verdicts[0].evidence["requested_target_position"] == (31.875, 30.0)
+    assert verdicts[0].evidence["final_validated_target_position"] == (32.0, 30.0)
+    assert verdicts[0].evidence["validated_target_position"] == (32.0, 30.0)
+    assert verdicts[0].evidence["emitted_target_position"] == (32.0, 30.0)
+    assert verdicts[0].evidence["verified_target_position"] == (32.0, 30.0)
 
 
 def test_build_effect_uses_world_target_after_camera_moves() -> None:
@@ -265,10 +791,12 @@ def test_same_structure_at_another_position_does_not_confirm_effect() -> None:
     pylon["x"] = 60
     pylon["y"] = 60
 
+    assert verifier.observe(observation) == []
+    observation["game_loop"] = 141
     verdict = verifier.observe(observation)[0]
 
     assert verdict.success is False
-    assert verdict.failure_code == "no_build_order_observed"
+    assert verdict.failure_code == "build_started_effect_missing"
 
 
 def test_concurrent_same_type_builds_match_new_tags_one_to_one() -> None:
@@ -338,7 +866,7 @@ def test_claimed_structure_tag_is_not_reused_across_observations() -> None:
     assert verifier.observe(one_new_pylon) == []
 
     timeout_observation = _observation(
-        game_loop=121,
+        game_loop=181,
         minerals=300,
         structures=["Nexus", "Pylon"],
     )
@@ -368,7 +896,10 @@ def test_resource_and_builder_order_are_diagnostic_only() -> None:
 
     assert len(verdicts) == 1
     assert verdicts[0].success is False
-    assert verdicts[0].failure_code == "target_not_created"
+    assert verdicts[0].failure_code == "build_started_effect_missing"
+    assert verdicts[0].evidence is not None
+    assert verdicts[0].evidence["build_started"] is True
+    assert verdicts[0].evidence["build_start_confirmation_kind"] == "builder_order"
 
 
 def test_build_effect_times_out_with_diagnostic_evidence() -> None:
@@ -398,6 +929,155 @@ def test_build_effect_times_out_with_diagnostic_evidence() -> None:
     assert "primitive did not establish construction" in reason
 
 
+def test_no_start_timeout_classifies_stale_builder_order() -> None:
+    verifier = ActionEffectVerifier(timeout_game_loops=10)
+    command = RoutedCommand(
+        command_id="command-gateway-after-pylon",
+        actor="Builder/Builder-Probe-1",
+        team_name="Builder-Probe-1",
+        name="Build_Gateway_Screen",
+        source="planner",
+        requested_arguments=([65, 65],),
+        resolved_arguments=([65, 65],),
+        rendered_action="<Build_Gateway_Screen([65,65])>",
+    )
+    verifier.track(command)
+    verifier.prepare(
+        command.command_id,
+        _observation(game_loop=100, minerals=250, builder_orders=[35]),
+        0xABC,
+    )
+    verifier.accept_primitive(command.command_id, game_loop=101)
+
+    verdict = verifier.observe(_observation(game_loop=111, minerals=250, builder_orders=[35]))[0]
+
+    assert verdict.failure_code == "no_build_start_evidence"
+    assert verdict.evidence is not None
+    assert verdict.evidence["failure_classification"] == "builder_not_ready"
+    assert verdict.evidence["baseline_builder_orders"] == [35]
+    assert verdict.evidence["classification_basis"] == ["builder_had_prior_build_order"]
+
+
+def test_no_start_timeout_classifies_dynamic_target_obstruction() -> None:
+    verifier = ActionEffectVerifier(timeout_game_loops=10)
+    command = _build_command()
+    baseline = _observation(game_loop=100, minerals=250, builder_orders=[])
+    verifier.track(command)
+    verifier.prepare(command.command_id, baseline, 0xABC)
+    verifier.accept_primitive(command.command_id, game_loop=101)
+
+    obstructed = _observation(game_loop=111, minerals=250, builder_orders=[])
+    obstructed["raw_units"].append(
+        {
+            "tag": 0xBAD,
+            "unit_type": "Zergling",
+            "alliance": 4,
+            "x": 31.875,
+            "y": 30.0,
+            "radius": 0.375,
+            "health": 35,
+            "health_max": 35,
+            "display_type": 1,
+        }
+    )
+
+    verdict = verifier.observe(obstructed)[0]
+
+    assert verdict.failure_code == "no_build_start_evidence"
+    assert verdict.evidence is not None
+    assert verdict.evidence["failure_classification"] == "dynamic_target_obstruction"
+    assert verdict.evidence["classification_basis"] == ["dynamic_unit_inside_footprint"]
+    assert verdict.evidence["nearby_enemy_units"] == ["0xbad"]
+
+
+def test_no_start_timeout_does_not_call_nearby_corner_unit_a_footprint_blocker() -> None:
+    verifier = ActionEffectVerifier(timeout_game_loops=10)
+    command = _build_command()
+    verifier.track(command)
+    verifier.prepare(
+        command.command_id,
+        _observation(game_loop=100, minerals=250, builder_orders=[]),
+        0xABC,
+    )
+    verifier.accept_primitive(command.command_id, game_loop=101)
+
+    obstructed = _observation(game_loop=111, minerals=250, builder_orders=[])
+    obstructed["raw_units"].append(
+        {
+            "tag": 0xBAD,
+            "unit_type": "Zergling",
+            "alliance": 4,
+            "x": 32.65,
+            "y": 30.77,
+            "radius": 0.1,
+            "health": 35,
+            "health_max": 35,
+            "display_type": 1,
+        }
+    )
+
+    verdict = verifier.observe(obstructed)[0]
+
+    assert verdict.failure_code == "no_build_start_evidence"
+    assert verdict.evidence is not None
+    assert verdict.evidence["failure_classification"] == "gameplay_no_start_unknown"
+    assert verdict.evidence["nearby_dynamic_occupants"] == []
+    assert verdict.evidence["nearby_enemy_units"] == ["0xbad"]
+
+
+def test_no_start_timeout_ignores_snapshot_enemy_as_dynamic_evidence() -> None:
+    verifier = ActionEffectVerifier(timeout_game_loops=10)
+    command = _build_command()
+    verifier.track(command)
+    verifier.prepare(
+        command.command_id,
+        _observation(game_loop=100, minerals=250, builder_orders=[]),
+        0xABC,
+    )
+    verifier.accept_primitive(command.command_id, game_loop=101)
+
+    snapshot = _observation(game_loop=111, minerals=250, builder_orders=[])
+    snapshot["raw_units"].append(
+        {
+            "tag": 0xBAD,
+            "unit_type": "Zergling",
+            "alliance": 4,
+            "display_type": 2,
+            "x": 31.875,
+            "y": 30.0,
+            "radius": 0.375,
+            "health": 35,
+            "health_max": 35,
+        }
+    )
+
+    verdict = verifier.observe(snapshot)[0]
+
+    assert verdict.evidence is not None
+    assert verdict.evidence["failure_classification"] == "gameplay_no_start_unknown"
+    assert verdict.evidence["nearby_dynamic_occupants"] == []
+    assert verdict.evidence["nearby_enemy_units"] == []
+
+
+def test_no_start_timeout_without_specific_evidence_stays_unknown() -> None:
+    verifier = ActionEffectVerifier(timeout_game_loops=10)
+    command = _build_command()
+    verifier.track(command)
+    verifier.prepare(
+        command.command_id,
+        _observation(game_loop=100, minerals=250, builder_orders=[]),
+        0xABC,
+    )
+    verifier.accept_primitive(command.command_id, game_loop=101)
+
+    verdict = verifier.observe(_observation(game_loop=111, minerals=250, builder_orders=[]))[0]
+
+    assert verdict.failure_code == "no_build_start_evidence"
+    assert verdict.evidence is not None
+    assert verdict.evidence["failure_classification"] == "gameplay_no_start_unknown"
+    assert verdict.evidence["classification_basis"] == ["no_authoritative_rejection_evidence"]
+
+
 def test_build_effect_diagnostic_identifies_replaced_worker_order() -> None:
     verifier = ActionEffectVerifier(timeout_game_loops=10)
     command = _build_command()
@@ -414,7 +1094,7 @@ def test_build_effect_diagnostic_identifies_replaced_worker_order() -> None:
     verdict = verifier.observe(_observation(game_loop=141, minerals=250, builder_orders=[154]))[0]
 
     assert verdict.success is False
-    assert verdict.failure_code == "worker_order_replaced"
+    assert verdict.failure_code == "build_started_effect_missing"
     assert "observed and later changed" in (verdict.failure_reason or "")
 
 
@@ -426,10 +1106,10 @@ def test_post_order_grace_expires_at_32_loops_without_structure() -> None:
     verifier.accept_primitive(command.command_id, game_loop=101)
 
     assert verifier.observe(_observation(game_loop=105, minerals=150, builder_orders=[35])) == []
-    assert verifier.observe(_observation(game_loop=136, minerals=150, builder_orders=[])) == []
-    verdict = verifier.observe(_observation(game_loop=137, minerals=150, builder_orders=[]))[0]
+    assert verifier.observe(_observation(game_loop=140, minerals=150, builder_orders=[])) == []
+    verdict = verifier.observe(_observation(game_loop=141, minerals=150, builder_orders=[]))[0]
 
-    assert verdict.failure_code == "target_not_created"
+    assert verdict.failure_code == "build_started_effect_missing"
 
 
 def test_active_nexus_order_extends_timeout_until_effect_is_visible() -> None:
@@ -479,7 +1159,7 @@ def test_active_build_order_extension_has_a_hard_limit() -> None:
     verdict = verifier.observe(_observation(game_loop=221, minerals=100, builder_orders=[34]))[0]
 
     assert verdict.success is False
-    assert verdict.failure_code == "target_not_created"
+    assert verdict.failure_code == "build_started_effect_missing"
     assert verdict.evidence is not None
     assert verdict.evidence["elapsed_game_loops"] == 120
     assert verdict.evidence["effective_timeout_game_loops"] == 120
@@ -499,7 +1179,7 @@ def test_changed_order_without_observed_build_order_is_not_called_replaced() -> 
     verdict = verifier.observe(_observation(game_loop=111, minerals=250, builder_orders=[154]))[0]
 
     assert verdict.success is False
-    assert verdict.failure_code == "no_build_order_observed"
+    assert verdict.failure_code == "no_build_start_evidence"
     assert "automatic worker" not in (verdict.failure_reason or "")
 
 
@@ -513,6 +1193,8 @@ def test_move_minimap_uses_builder_motion_instead_of_global_camera_position() ->
         command.command_id,
         _move_observation(game_loop=100, center=(8, 8), builder_position=(30, 30)),
         0xABC,
+        actor_tags=(0xABC,),
+        minimap_transform=(1.0, 0.0, 0.0, 64.0, 63.0),
     )
     verifier.accept_primitive(command.command_id, game_loop=101)
 
@@ -523,8 +1205,14 @@ def test_move_minimap_uses_builder_motion_instead_of_global_camera_position() ->
         == []
     )
     assert verifier.blocks_auto_worker_management is False
+    assert (
+        verifier.observe(
+            _move_observation(game_loop=103, center=(8, 8), builder_position=(31.5, 30))
+        )
+        == []
+    )
     verdict = verifier.observe(
-        _move_observation(game_loop=103, center=(8, 8), builder_position=(31.5, 30))
+        _move_observation(game_loop=200, center=(8, 8), builder_position=(48, 16))
     )[0]
 
     assert verdict.success is True
@@ -536,16 +1224,16 @@ def test_move_minimap_uses_builder_motion_instead_of_global_camera_position() ->
     assert verdict.evidence["builder_tag"] == "0xabc"
     assert verdict.evidence["dispatched_loop"] == 100
     assert verdict.evidence["accepted_loop"] == 101
-    assert verdict.evidence["confirmed_loop"] == 103
-    assert verdict.evidence["baseline_builder_position"] == (30.0, 30.0)
-    assert verdict.evidence["observed_builder_position"] == (31.5, 30.0)
-    assert verdict.evidence["builder_displacement"] == 1.5
+    assert verdict.evidence["confirmed_loop"] == 200
+    assert verdict.evidence["baseline_builder_position"] == (30.0, 34.0)
+    assert verdict.evidence["observed_builder_position"] == (48.0, 48.0)
+    assert verdict.evidence["builder_displacement"] > 22
     assert verdict.evidence["move_order_seen"] is False
-    assert verdict.evidence["effective_timeout_game_loops"] == 10
+    assert verdict.evidence["effective_timeout_game_loops"] == 261
     assert verifier.is_tracked(command.command_id) is False
 
 
-def test_move_minimap_accepts_raw_move_order_before_position_changes() -> None:
+def test_move_minimap_treats_raw_move_order_as_progress_not_arrival() -> None:
     verifier = ActionEffectVerifier(timeout_game_loops=10)
     command = _move_command()
     verifier.track(command)
@@ -553,14 +1241,27 @@ def test_move_minimap_accepts_raw_move_order_before_position_changes() -> None:
         command.command_id,
         _move_observation(game_loop=100, center=(8, 8), builder_position=(30, 30)),
         0xABC,
+        actor_tags=(0xABC,),
+        minimap_transform=(1.0, 0.0, 0.0, 64.0, 63.0),
     )
     verifier.accept_primitive(command.command_id, game_loop=101)
 
+    assert (
+        verifier.observe(
+            _move_observation(
+                game_loop=102,
+                center=(8, 8),
+                builder_position=(30, 30),
+                builder_orders=[13],
+            )
+        )
+        == []
+    )
     verdict = verifier.observe(
         _move_observation(
-            game_loop=102,
+            game_loop=200,
             center=(8, 8),
-            builder_position=(30, 30),
+            builder_position=(48, 16),
             builder_orders=[13],
         )
     )[0]
@@ -568,10 +1269,10 @@ def test_move_minimap_accepts_raw_move_order_before_position_changes() -> None:
     assert verdict.success is True
     assert verdict.evidence is not None
     assert verdict.evidence["move_order_seen"] is True
-    assert verdict.evidence["builder_displacement"] == 0.0
+    assert verdict.evidence["builder_displacement"] > 20.0
 
 
-def test_move_minimap_times_out_after_one_base_window_without_unit_effect() -> None:
+def test_move_minimap_recognizes_concrete_raw_move_order_547() -> None:
     verifier = ActionEffectVerifier(timeout_game_loops=10)
     command = _move_command()
     verifier.track(command)
@@ -579,27 +1280,124 @@ def test_move_minimap_times_out_after_one_base_window_without_unit_effect() -> N
         command.command_id,
         _move_observation(game_loop=100, center=(8, 8), builder_position=(30, 30)),
         0xABC,
+        actor_tags=(0xABC,),
+        minimap_transform=None,
     )
     verifier.accept_primitive(command.command_id, game_loop=101)
 
     assert (
         verifier.observe(
-            _move_observation(game_loop=110, center=(48, 48), builder_position=(30, 30))
+            _move_observation(
+                game_loop=102,
+                center=(8, 8),
+                builder_position=(31, 30),
+                builder_orders=[547],
+            )
+        )
+        == []
+    )
+
+
+def test_move_minimap_derives_timeout_from_initial_target_distance() -> None:
+    verifier = ActionEffectVerifier(timeout_game_loops=10)
+    command = _move_command()
+    verifier.track(command)
+    verifier.prepare(
+        command.command_id,
+        _move_observation(game_loop=100, center=(8, 8), builder_position=(30, 30)),
+        0xABC,
+        actor_tags=(0xABC,),
+        minimap_transform=(1.0, 0.0, 0.0, 64.0, 63.0),
+    )
+    verifier.accept_primitive(command.command_id, game_loop=101)
+
+    assert (
+        verifier.observe(
+            _move_observation(
+                game_loop=361,
+                center=(48, 48),
+                builder_position=(30, 30),
+                builder_orders=[13],
+            )
         )
         == []
     )
     verdict = verifier.observe(
-        _move_observation(game_loop=111, center=(48, 48), builder_position=(30, 30))
+        _move_observation(
+            game_loop=362,
+            center=(48, 48),
+            builder_position=(30, 30),
+            builder_orders=[13],
+        )
     )[0]
 
     assert verdict.success is False
     assert verdict.status == "failed"
     assert verdict.failure_code == "effect_timeout"
-    assert "did not start after 10 game loops" in (verdict.failure_reason or "")
+    assert "did not arrive after 261 game loops" in (verdict.failure_reason or "")
     assert verdict.evidence is not None
     assert verdict.evidence["confirmed_loop"] is None
-    assert verdict.evidence["elapsed_game_loops"] == 10
-    assert verdict.evidence["effective_timeout_game_loops"] == 10
+    assert verdict.evidence["elapsed_game_loops"] == 261
+    assert verdict.evidence["effective_timeout_game_loops"] == 261
+
+
+def test_move_minimap_rejects_acceptance_without_actor_move_order() -> None:
+    verifier = ActionEffectVerifier(timeout_game_loops=112)
+    command = _move_command()
+    verifier.track(command)
+    verifier.prepare(
+        command.command_id,
+        _move_observation(game_loop=100, center=(8, 8), builder_position=(30, 30)),
+        0xABC,
+        actor_tags=(0xABC,),
+        minimap_transform=(1.0, 0.0, 0.0, 64.0, 63.0),
+    )
+    verifier.accept_primitive(command.command_id, game_loop=101)
+
+    verdict = verifier.observe(
+        _move_observation(
+            game_loop=117,
+            center=(8, 8),
+            builder_position=(30, 30),
+        )
+    )[0]
+
+    assert verdict.success is False
+    assert verdict.failure_code == "move_order_not_observed"
+    assert verdict.evidence is not None
+    assert verdict.evidence["actor_tags"] == ["0xabc"]
+
+
+def test_move_minimap_uses_actor_semantics_when_the_unit_disappears() -> None:
+    verifier = ActionEffectVerifier(timeout_game_loops=10)
+    command = _move_command()
+    verifier.track(command)
+    verifier.prepare(
+        command.command_id,
+        _move_observation(game_loop=100, center=(8, 8), builder_position=(30, 30)),
+        0xABC,
+        actor_tags=(0xABC,),
+        minimap_transform=(1.0, 0.0, 0.0, 64.0, 63.0),
+    )
+    verifier.accept_primitive(command.command_id, game_loop=101)
+    missing_actor = _move_observation(
+        game_loop=362,
+        center=(48, 48),
+        builder_position=(30, 30),
+    )
+    missing_actor["raw_units"] = [
+        unit for unit in missing_actor["raw_units"] if unit["tag"] != 0xABC
+    ]
+
+    verdict = verifier.observe(missing_actor)[0]
+
+    assert verdict.success is False
+    assert verdict.failure_code == "actor_not_observable"
+    assert "actor is not observable" in (verdict.failure_reason or "")
+    assert verdict.evidence is not None
+    assert verdict.evidence["actor_tag"] == "0xabc"
+    assert verdict.evidence["baseline_actor_position"] == (30.0, 34.0)
+    assert verdict.evidence["observed_actor_position"] is None
 
 
 def test_move_minimap_is_unconfirmed_when_episode_ends_in_transit() -> None:
@@ -610,6 +1408,8 @@ def test_move_minimap_is_unconfirmed_when_episode_ends_in_transit() -> None:
         command.command_id,
         _move_observation(game_loop=100, center=(8, 8), builder_position=(30, 30)),
         0xABC,
+        actor_tags=(0xABC,),
+        minimap_transform=(1.0, 0.0, 0.0, 64.0, 63.0),
     )
     verifier.accept_primitive(command.command_id, game_loop=101)
     assert (
@@ -689,7 +1489,7 @@ def test_stargate_raw_build_order_marks_order_seen_for_diagnostics() -> None:
     verdict = verifier.observe(_observation(game_loop=141, minerals=500, builder_orders=[154]))[0]
 
     assert verdict.success is False
-    assert verdict.failure_code == "worker_order_replaced"
+    assert verdict.failure_code == "build_started_effect_missing"
     assert verdict.evidence is not None
     assert verdict.evidence["order_seen"] is True
     assert verdict.evidence["order_last_seen_game_loop"] == 105
@@ -813,6 +1613,44 @@ def test_queen_creep_tumor_confirms_a_new_structure_at_the_selected_position() -
     assert verdict.evidence is not None
     assert verdict.evidence["effect_kind"] == "build"
     assert verdict.evidence["target_type"] == "CreepTumorQueen"
+    assert verdict.evidence["order_seen"] is True
+
+
+def test_chained_creep_tumor_accepts_the_burrowed_target_form() -> None:
+    verifier = ActionEffectVerifier(timeout_game_loops=10)
+    command = RoutedCommand(
+        command_id="command-creep-chain",
+        actor="CombatGroup4/CreepTumor-1",
+        team_name="CreepTumor-1",
+        name="Build_CreepTumor_Tumor_Screen",
+        source="reflex",
+        requested_arguments=([65, 65],),
+        resolved_arguments=([65, 65],),
+        rendered_action="<Build_CreepTumor_Tumor_Screen([65,65])>",
+    )
+    verifier.track(command)
+    baseline = _observation(game_loop=100, minerals=250, builder_orders=[])
+    baseline["raw_units"][0]["unit_type"] = "CreepTumorBurrowed"
+    verifier.prepare(command.command_id, baseline, 0xABC)
+    verifier.accept_primitive(command.command_id, game_loop=101)
+    current = _observation(
+        game_loop=102,
+        minerals=250,
+        structures=["Nexus", "CreepTumorBurrowed"],
+        builder_orders=[190],
+    )
+    current["raw_units"][0]["unit_type"] = "CreepTumorBurrowed"
+    tumor = next(
+        unit for unit in current["raw_units"][1:] if unit["unit_type"] == "CreepTumorBurrowed"
+    )
+    tumor["x"] = 31.875
+    tumor["y"] = 30
+
+    verdict = verifier.observe(current)[0]
+
+    assert verdict.success is True
+    assert verdict.evidence is not None
+    assert verdict.evidence["target_type"] == "CreepTumor"
     assert verdict.evidence["order_seen"] is True
 
 
@@ -1611,6 +2449,79 @@ def _move_command() -> RoutedCommand:
     )
 
 
+def _attack_command() -> RoutedCommand:
+    return RoutedCommand(
+        command_id="command-attack",
+        actor="CombatGroup0/Zealot-1",
+        team_name="Zealot-1",
+        name="Attack_Unit",
+        source="planner",
+        requested_arguments=("0xdef",),
+        resolved_arguments=("0xdef",),
+        rendered_action="<Attack_Unit(0xdef)>",
+    )
+
+
+def _second_attack_command() -> RoutedCommand:
+    return RoutedCommand(
+        command_id="command-attack-2",
+        actor="CombatGroup1/Stalker-1",
+        team_name="Stalker-1",
+        name="Attack_Unit",
+        source="planner",
+        requested_arguments=("0xdef",),
+        resolved_arguments=("0xdef",),
+        rendered_action="<Attack_Unit(0xdef)>",
+    )
+
+
+def _attack_observation(
+    game_loop: int,
+    *,
+    health: float | None,
+    actor_order_target: int | None = 0xDEF,
+    actor_order_ability_id: int = 23,
+    actor_tags: tuple[int, ...] = (0xA00,),
+    actor_order_targets: dict[int, int | None] | None = None,
+    dead_tags: tuple[int, ...] = (),
+) -> dict[str, Any]:
+    raw_units: list[dict[str, Any]] = []
+    for actor_tag in actor_tags:
+        target = (
+            actor_order_target
+            if actor_order_targets is None
+            else actor_order_targets.get(actor_tag, actor_order_target)
+        )
+        raw_units.append(
+            {
+                "tag": actor_tag,
+                "unit_type": "Stalker",
+                "alliance": 1,
+                "orders": (
+                    []
+                    if target is None
+                    else [
+                        {
+                            "ability_id": actor_order_ability_id,
+                            "target_unit_tag": target,
+                        }
+                    ]
+                ),
+            }
+        )
+    if health is not None:
+        raw_units.append(
+            {
+                "tag": 0xDEF,
+                "unit_type": "Hatchery",
+                "alliance": 4,
+                "health": health,
+                "shield": 0,
+            }
+        )
+    return {"game_loop": game_loop, "raw_units": raw_units, "dead_units": dead_tags}
+
+
 def _observation(
     *,
     game_loop: int,
@@ -1690,3 +2601,49 @@ def _move_observation(
             camera[y][x] = 1
     observation["feature_minimap"] = {"camera": camera}
     return observation
+
+
+def _research_observation(game_loop: int, orders: list[int]) -> dict[str, Any]:
+    return {
+        "game_loop": game_loop,
+        "player_common": {"minerals": 500, "vespene": 500},
+        "upgrades": [],
+        "raw_units": [
+            {
+                "tag": 0xB00,
+                "unit_type": "Barracks",
+                "alliance": 1,
+                "order_length": len(orders),
+                **{f"order_id_{index}": order for index, order in enumerate(orders)},
+            }
+        ],
+    }
+
+
+def _mule_observation(
+    game_loop: int,
+    *,
+    energy: float = 75,
+    mule_tags: list[int] | None = None,
+) -> dict[str, Any]:
+    return {
+        "game_loop": game_loop,
+        "raw_units": [
+            {
+                "tag": 0xC00,
+                "unit_type": "OrbitalCommand",
+                "alliance": 1,
+                "energy": energy,
+                "order_length": 0,
+            },
+            *[
+                {
+                    "tag": tag,
+                    "unit_type": "MULE",
+                    "alliance": 1,
+                    "order_length": 0,
+                }
+                for tag in mule_tags or []
+            ],
+        ],
+    }

@@ -28,9 +28,17 @@ const EVENT_TITLES: Record<string, string> = {
   situation_assessed: "战况分析完成",
   situation_shadow_assessed: "影子战况模型已完成分析",
   tactical_policy_shadow: "影子战术策略已完成评估",
+  tactical_target_state: "战斗目标状态已更新",
   macro_plan_accepted: "专用宏观计划已采用",
   macro_plan_rejected: "专用宏观计划被拒绝",
+  macro_frontier_deferred: "宏观动作正在等待条件",
+  macro_frontier_preempted: "阻塞动作已切换到后备方案",
+  macro_structure_deferred: "同类建筑在建，动作已延后",
+  macro_step_deduplicated: "饱和宏观步骤已跳过",
   macro_step_updated: "宏观计划步骤已更新",
+  expansion_commitment_started: "扩张承诺已建立",
+  expansion_anchor_rejected: "扩张候选点已排除",
+  expansion_commitment_terminal: "扩张承诺已终结",
   intent_emitted: "决策意图已生成",
   role_intent_emitted: "职责 Agent 已提交意图",
   intent_arbitrated: "战略意图已仲裁",
@@ -49,6 +57,7 @@ const EVENT_TITLES: Record<string, string> = {
   playbook_case_recorded: "关键决策案例已记录",
   playbook_lesson_candidate: "候选战术经验已更新",
   playbook_lesson_promoted: "战术经验已晋升",
+  strategic_consequence_attributed: "战略后果已归因",
   postgame_review_completed: "赛后复盘已完成",
   episode_summary: "对局总结",
   episode_result: "对局结果",
@@ -117,6 +126,9 @@ const FIELD_LABELS: Record<string, string> = {
   assessment: "战况分析",
   game_phase: "游戏阶段",
   threat_level: "威胁等级",
+  threat_score: "威胁评分",
+  threat_evidence: "威胁证据",
+  threat_hysteresis_until_game_loop: "威胁保持至",
   army_readiness: "军队准备度",
   information_gaps: "信息缺口",
   source_kind: "分析来源",
@@ -134,12 +146,25 @@ const FIELD_LABELS: Record<string, string> = {
   quality: "决策质量",
   failure_owner: "失败归属",
   consequence: "观察到的后果",
+  consequence_id: "战略后果 ID",
+  consequence_type: "战略后果类型",
+  effect: "规则影响",
+  objective: "纠正目标",
+  start_game_loop: "证据起始时刻",
+  end_game_loop: "证据结束时刻",
+  source_event_ids: "来源事件 ID",
+  condition: "适用战况",
+  explanation: "归因说明",
   statement: "战术经验",
   rule_kind: "规则类型",
   recommended_action: "建议动作",
   avoid_action: "应避免动作",
+  recommended_role: "建议职责",
+  avoid_role: "应避免职责",
   support_count: "支持对局数",
   contradiction_count: "矛盾对局数",
+  strategic_consequence_count: "战略后果数量",
+  strategic_consequence_counts: "战略后果分类",
   plan_id: "计划 ID",
   macro_plan_id: "宏观计划 ID",
   intent: "决策意图",
@@ -228,6 +253,7 @@ const FIELD_LABELS: Record<string, string> = {
   elapsed_game_loops: "验证耗时",
   target_type: "目标类型",
   new_structure_tag: "新建筑 Tag",
+  actor_tag: "执行单位 Tag",
   builder_tag: "建造工 Tag",
   target_tag: "目标 Tag",
   target_position: "目标位置",
@@ -245,11 +271,21 @@ const FIELD_LABELS: Record<string, string> = {
   baseline_producer_orders: "生产建筑原有订单",
   producer_orders: "生产建筑当前订单",
   production_order_seen: "观察到生产订单",
-  confirmation_kind: "生产确认方式",
+  confirmation_kind: "效果确认方式",
+  expected_upgrade: "预期科技升级",
+  expected_upgrade_id: "预期升级 ID",
+  baseline_upgrade_ids: "原有升级 ID",
+  upgrade_ids: "当前升级 ID",
   resource_delta: "资源变化",
   mineral_delta: "晶体矿变化",
   builder_displacement: "建造工位移",
+  baseline_actor_position: "执行单位初始位置",
+  observed_actor_position: "执行单位观测位置",
+  actor_displacement: "执行单位位移",
   move_order_seen: "观察到移动订单",
+  baseline_target_health: "目标初始生命/护盾",
+  observed_target_health: "目标当前生命/护盾",
+  target_health_delta: "目标承受伤害",
   active_order_extension: "因活动订单延长验证",
   alerts: "告警",
   available_actions: "当前可用动作",
@@ -322,7 +358,9 @@ const ACTION_LABELS: Record<string, string> = {
   Build_SpineCrawler_Screen: "建造脊针爬虫",
   Build_SporeCrawler_Screen: "建造孢子爬虫",
   Build_CreepTumor_Queen_Screen: "虫后放置菌毯肿瘤",
+  Build_CreepTumor_Tumor_Screen: "菌毯肿瘤继续扩散",
   Effect_InjectLarva: "虫后向基地注入幼虫",
+  Effect_CalldownMULE_Screen: "呼叫矿骡采矿",
   Train_Drone: "变异工蜂",
   Train_Probe: "训练探机",
   Train_Zealot: "训练狂热者",
@@ -332,6 +370,7 @@ const ACTION_LABELS: Record<string, string> = {
   Train_Oracle: "训练先知",
   Train_Phoenix: "训练凤凰战机",
   Train_Marine: "训练陆战队员",
+  Train_SCV: "训练 SCV",
   Train_Marauder: "训练劫掠者",
   Train_Hellion: "训练恶火",
   Train_SiegeTank: "训练攻城坦克",
@@ -343,6 +382,7 @@ const ACTION_LABELS: Record<string, string> = {
   Train_Roach: "变异蟑螂",
   Train_Hydralisk: "变异刺蛇",
   Research_Stimpack: "研究兴奋剂",
+  Morph_OrbitalCommand: "升级为轨道指挥部",
   Research_Warp_Gate: "研究折跃门",
   Research_WarpGate: "研究折跃门",
   Retreat: "撤退",
@@ -393,12 +433,15 @@ const VALUE_LABELS: Record<string, string> = {
   addon: "附属建筑",
   morph: "建筑变形",
   inject: "幼虫注入",
+  research: "科技研究",
+  ability: "经济技能",
   producer_order: "生产订单",
   producer_morph: "生产者变形",
   source_morph: "来源建筑变形",
   target_buff: "目标获得状态效果",
   new_unit: "新单位出现",
   new_structure: "新建筑出现",
+  upgrade_observed: "科技升级已完成",
   upgrade: "科技升级",
   goal_dependency: "前序目标尚未完成",
   missing_prerequisite: "缺少科技前置条件",
@@ -429,7 +472,7 @@ const VALUE_LABELS: Record<string, string> = {
   noop_baseline: "空动作基线",
   early: "开局阶段",
   technology: "科技阶段",
-  combat: "战斗阶段",
+  combat: "战斗",
   low: "低",
   medium: "中",
   high: "高",
@@ -441,10 +484,23 @@ const VALUE_LABELS: Record<string, string> = {
   engaged: "正在交战",
   strategy: "战略规则",
   execution_guard: "执行保护规则",
+  threat_unanswered: "威胁未处理",
+  expansion_delayed: "扩张延迟",
+  production_imbalance: "生产结构失衡",
+  timing_attack_failed: "Timing 进攻失败",
+  unnecessary_retreat: "不必要撤退",
+  advantage_not_converted: "优势未转化",
+  successful_key_decision: "成功关键决策",
+  prefer: "优先采用",
+  avoid: "降低优先级",
+  require: "必须采用",
+  forbid: "禁止采用",
   not_ready: "尚未准备",
   abstain: "主动放弃选择",
   friendly_target: "目标属于己方",
   target_not_visible: "目标当前不可见",
+  target_damaged: "精确目标已受伤",
+  target_removed: "精确目标已消失",
   no_legal_placement: "没有合法建造位置",
   need_power: "建造位置缺少水晶塔能量场",
   blocked: "建造位置被阻挡",
@@ -461,10 +517,17 @@ const VALUE_LABELS: Record<string, string> = {
   production_provenance_missing: "生产效果证据缺少必要来源信息",
   actor_not_available: "执行者当前不可用",
   actor_selection_timeout: "连续尝试后仍无法选中执行者",
+  orchestration_budget_exceeded: "相机/选择操作链超过预算",
+  observation_gap_watchdog_recovery: "观察看门狗已强制恢复操作链",
+  combat_target_baseline_missing: "攻击目标基线缺失",
+  combat_effect_not_observed: "未观察到目标受到伤害",
   no_build_order_observed: "未观察到建造订单",
   worker_order_replaced: "工人订单被替换",
   target_not_created: "目标建筑未出现",
   builder_not_observable: "无法继续观察建造工",
+  no_build_start_evidence: "未观察到可靠的开工证据",
+  build_started_effect_missing: "已确认开工但目标建筑未出现",
+  actor_not_observable: "无法继续观察执行单位",
   producer_not_observable: "无法继续观察生产建筑",
   no_production_order_observed: "未观察到生产订单",
   production_order_replaced: "生产订单被替换",
@@ -483,6 +546,19 @@ const VALUE_LABELS: Record<string, string> = {
   inject_source_not_observable: "无法继续观察执行注入的虫后",
   inject_target_not_observable: "无法继续观察被注入的基地",
   no_inject_effect_observed: "未观察到幼虫注入订单或状态效果",
+  research_source_unavailable: "研究来源建筑当前不可用",
+  research_source_invalidated: "研究来源建筑在执行前失效",
+  research_provenance_missing: "研究效果缺少精确来源信息",
+  research_source_not_selected: "未能选中研究来源建筑",
+  research_producer_not_observable: "无法继续观察研究来源建筑",
+  no_research_order_observed: "未观察到科技研究订单",
+  research_order_replaced: "科技研究订单被替换",
+  ability_source_unavailable: "技能来源建筑当前不可用",
+  ability_source_invalidated: "技能来源建筑在执行前失效",
+  ability_provenance_missing: "技能效果缺少精确来源信息",
+  ability_source_not_selected: "未能选中技能来源建筑",
+  mule_source_not_observable: "无法继续观察轨道指挥部",
+  no_mule_spawn_observed: "未观察到新矿骡出现",
   episode_ended_unconfirmed: "对局结束时效果仍未确认",
   episode_ended_before_dispatch: "对局结束前动作尚未派发",
   worker_terminated_before_execution_report: "Worker 终止前未回报执行结果",
@@ -622,6 +698,8 @@ export function semanticScalar(value: string | number | boolean | null, key?: st
     "effect_kind",
     "confirmation_kind",
     "rule_kind",
+    "consequence_type",
+    "effect",
     "role",
     "source_kind",
     "game_phase",
@@ -712,8 +790,29 @@ export function eventSummary(event: StoredEvent): string {
     const source = readString(payload, "source_kind", "source_id", "source", "model") ?? "unknown";
     const phase = readString(assessment, "game_phase", "phase") ?? "unknown";
     const threat = readString(assessment, "threat_level", "threat") ?? "unknown";
+    const threatScore = readNumber(assessment, "threat_score");
+    const threatEvidence = asArray(assessment.threat_evidence)
+      .filter((item): item is string => typeof item === "string")
+      .slice(0, 2);
     const readiness = readString(assessment, "army_readiness", "readiness") ?? "unknown";
-    return `来源：${semanticScalar(source, "source_kind")} · 阶段：${semanticScalar(phase, "game_phase")} · 威胁：${semanticScalar(threat, "threat_level")} · 军队：${semanticScalar(readiness, "army_readiness")}`;
+    return `来源：${semanticScalar(source, "source_kind")} · 阶段：${semanticScalar(phase, "game_phase")} · 威胁：${semanticScalar(threat, "threat_level")}${threatScore === undefined ? "" : ` (${threatScore.toFixed(1)})`}${threatEvidence.length ? ` · 证据：${threatEvidence.join("、")}` : ""} · 军队：${semanticScalar(readiness, "army_readiness")}`;
+  }
+  if (event.event_type === "tactical_target_state") {
+    const actor = readString(payload, "actor") ?? "未知部队";
+    const target = readString(payload, "target_tag") ?? "未知目标";
+    const transition = readString(payload, "transition") ?? "updated";
+    const failures = readNumber(payload, "failure_count") ?? 0;
+    return `${actor} · 目标 ${target} · ${semanticScalar(transition)}${failures ? ` · 连续失败 ${failures} 次` : ""}`;
+  }
+  if (event.event_type === "expansion_commitment_started") {
+    return `承诺 ${readString(payload, "commitment_id") ?? "unknown"} · 将持续寻找扩张点直至成功、耗尽或明确取消`;
+  }
+  if (event.event_type === "expansion_anchor_rejected") {
+    return `候选 ${readString(payload, "anchor") ?? "unknown"} 已永久排除 · ${semanticScalar(readString(payload, "failure_code") ?? "unknown")}`;
+  }
+  if (event.event_type === "expansion_commitment_terminal") {
+    const state = readString(payload, "terminal_state") ?? "unknown";
+    return `扩张承诺结束：${semanticScalar(state)} · 已评估 ${asArray(payload.evaluated_anchors).length} 个候选`;
   }
   if (event.event_type === "macro_plan_accepted" || event.event_type === "macro_plan_rejected") {
     const plan = asObject(payload.plan) ?? payload;
@@ -750,6 +849,21 @@ export function eventSummary(event: StoredEvent): string {
     const consequence = readString(payload, "consequence");
     return `${actionLabel(semanticAction, false)} · ${semanticScalar(quality)}${consequence ? ` · ${truncate(consequence)}` : ""}`;
   }
+  if (event.event_type === "strategic_consequence_attributed") {
+    const consequenceType = readString(payload, "consequence_type") ?? "unknown";
+    const role = readString(payload, "role");
+    const semanticAction = readString(payload, "semantic_action");
+    const explanation = readString(payload, "explanation");
+    const startLoop = readNumber(payload, "start_game_loop");
+    const endLoop = readNumber(payload, "end_game_loop");
+    return [
+      semanticScalar(consequenceType, "consequence_type"),
+      role ? semanticScalar(role, "role") : undefined,
+      semanticAction ? actionLabel(semanticAction, false) : undefined,
+      startLoop === undefined || endLoop === undefined ? undefined : `loop ${startLoop}–${endLoop}`,
+      explanation ? truncate(explanation) : undefined,
+    ].filter(Boolean).join(" · ");
+  }
   if (event.event_type === "playbook_lesson_candidate" || event.event_type === "playbook_lesson_promoted") {
     const statement = readString(payload, "statement") ?? "战术经验已更新";
     const support = readNumber(payload, "support_count") ?? 0;
@@ -760,7 +874,8 @@ export function eventSummary(event: StoredEvent): string {
   if (event.event_type === "postgame_review_completed") {
     const cases = readNumber(payload, "case_count") ?? 0;
     const lessons = readNumber(payload, "lesson_update_count") ?? 0;
-    return `复盘 ${cases} 个关键决策 · 更新 ${lessons} 条战术经验`;
+    const consequences = readNumber(payload, "strategic_consequence_count") ?? 0;
+    return `归因 ${consequences} 个战略后果 · 复盘 ${cases} 个关键决策 · 更新 ${lessons} 条战术经验`;
   }
   if (event.event_type === "macro_step_updated") {
     const step = asObject(payload.step) ?? payload;
@@ -771,6 +886,18 @@ export function eventSummary(event: StoredEvent): string {
     const repeat = readNumber(step, "repeat") ?? 1;
     const reason = readString(step, "reason");
     return `${actionLabel(runtimeAction ?? semanticAction, false)} · ${semanticScalar(stepStatus)} · ${completed}/${repeat}${reason ? ` · ${semanticScalar(reason)}` : ""}`;
+  }
+  if (["macro_frontier_deferred", "macro_frontier_preempted", "macro_structure_deferred"].includes(event.event_type)) {
+    const action = readString(payload, "blocked_runtime_action", "runtime_action", "blocked_action", "semantic_action") ?? "unknown";
+    const reason = readString(payload, "reason", "blocked_reason") ?? "unknown";
+    const fallback = readString(payload, "fallback_runtime_action", "fallback_action");
+    const target = readString(payload, "target_structure");
+    return [
+      actionLabel(action, false),
+      semanticScalar(reason),
+      fallback ? `后备：${actionLabel(fallback, false)}` : undefined,
+      target ? `等待 ${semanticScalar(target)}` : undefined,
+    ].filter(Boolean).join(" · ");
   }
   if (event.event_type === "intent_emitted") {
     const intent = asObject(payload.intent) ?? payload;
@@ -967,12 +1094,31 @@ export function eventSemanticPayload(event: StoredEvent): JsonValue {
       ["source_kind", payload.source_kind ?? payload.source ?? payload.model],
       ["game_phase", assessment.game_phase ?? assessment.phase],
       ["threat_level", assessment.threat_level ?? assessment.threat],
+      ["threat_score", assessment.threat_score],
+      ["threat_evidence", assessment.threat_evidence],
+      ["threat_hysteresis_until_game_loop", assessment.threat_hysteresis_until_game_loop],
       ["army_readiness", assessment.army_readiness ?? assessment.readiness],
       ["information_gaps", assessment.information_gaps],
       ["assessment", payload.assessment],
     ]);
   }
-  if (["race_profile_activated", "tactical_policy_shadow", "playbook_rule_updated", "macro_plan_accepted", "macro_plan_rejected", "macro_step_updated", "intent_emitted", "role_intent_emitted", "intent_arbitrated", "intent_arbiter_shadow_diff", "candidate_set_built", "executor_selection", "command_lineage", "specialist_failed", "specialist_ready", "specialist_recovered", "playbook_rule_applied"].includes(event.event_type)) {
+  if (event.event_type === "strategic_consequence_attributed") {
+    return compactObject([
+      ["consequence_type", payload.consequence_type],
+      ["quality", payload.quality],
+      ["effect", payload.effect],
+      ["role", payload.role],
+      ["semantic_action", payload.semantic_action],
+      ["objective", payload.objective],
+      ["start_game_loop", payload.start_game_loop],
+      ["end_game_loop", payload.end_game_loop],
+      ["condition", payload.condition],
+      ["explanation", payload.explanation],
+      ["evidence", payload.evidence],
+      ["source_event_ids", payload.source_event_ids],
+    ]);
+  }
+  if (["race_profile_activated", "tactical_policy_shadow", "playbook_rule_updated", "macro_plan_accepted", "macro_plan_rejected", "macro_frontier_deferred", "macro_frontier_preempted", "macro_structure_deferred", "macro_step_updated", "intent_emitted", "role_intent_emitted", "intent_arbitrated", "intent_arbiter_shadow_diff", "candidate_set_built", "executor_selection", "command_lineage", "specialist_failed", "specialist_ready", "specialist_recovered", "playbook_rule_applied"].includes(event.event_type)) {
     return compactObject([
       ["race", payload.race],
       ["macro_contract_ready", payload.macro_contract_ready],
@@ -991,6 +1137,8 @@ export function eventSemanticPayload(event: StoredEvent): JsonValue {
       ["reason", payload.reason ?? payload.failure_code ?? payload.failure_reason ?? payload.message],
       ["latency_ms", payload.latency_ms],
       ["fallback_reason", payload.fallback_reason],
+      ["fallback_action", payload.fallback_runtime_action ?? payload.fallback_action],
+      ["target_structure", payload.target_structure],
       ["plan", payload.plan],
       ["steps", payload.step],
       ["intent", payload.intent],

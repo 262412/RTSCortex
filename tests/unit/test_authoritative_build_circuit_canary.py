@@ -1,0 +1,1062 @@
+from __future__ import annotations
+
+import hashlib
+import json
+from dataclasses import replace
+from pathlib import Path
+from typing import Any
+
+import pytest
+from rtscortex_llm_pysc2.raw_placement import build_material_legality_identity
+
+import scripts.analyze_authoritative_build_circuit_canary as analyzer
+from rtscortex.contracts import (
+    authoritative_build_preflight_authorization_id,
+    authoritative_build_preflight_request_id,
+)
+from rtscortex.memory import StoredEvent
+from scripts.analyze_authoritative_build_circuit_canary import (
+    CanaryArtifactError,
+    _expected_attempt_id,
+    _replay_phases,
+    _replay_runtime_events,
+    analyze_canary_run,
+)
+
+
+def _attempt(operation_id: str, command_id: str, ordinal: int) -> str:
+    return _expected_attempt_id(operation_id, command_id, ordinal)
+
+
+def _event(
+    index: int,
+    phase: str,
+    *,
+    operation_id: str | None = None,
+    action: str | None = "Build_Pylon_Screen",
+    command_id: str | None = None,
+    attempt_id: str | None = None,
+    attempt_ordinal: int | None = None,
+    game_loop: int,
+    observation_revision: str | None = None,
+    builder_tag: int | None = None,
+    **values: Any,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "event_type": "authoritative_build_circuit_canary_phase",
+        "schema_version": "1.0",
+        "diagnostic_only": True,
+        "mode": "stale_candidate_then_builder_rebind",
+        "event_index": index,
+        "run_id": "run-canary",
+        "episode_id": "episode-0",
+        "seed": 7,
+        "phase": phase,
+        "game_loop": game_loop,
+        "observation_revision": observation_revision,
+        "operation_id": operation_id,
+        "semantic_action": None if action is None else "BUILD PYLON",
+        "reason": "test",
+    }
+    if action is not None:
+        payload["runtime_action"] = "Build_Pylon_Screen"
+    if command_id is not None:
+        payload["command_id"] = command_id
+    if attempt_id is not None:
+        payload["attempt_id"] = attempt_id
+    if attempt_ordinal is not None:
+        payload["attempt_ordinal"] = attempt_ordinal
+    if builder_tag is not None:
+        payload["builder_tag"] = builder_tag
+    payload.update(values)
+    return payload
+
+
+def _zero() -> dict[str, Any]:
+    return {
+        "reservation_count": 0,
+        "leased_builder_tags": [],
+        "effect_inflight_count": 0,
+    }
+
+
+def _preflight_evidence() -> tuple[dict[str, object], dict[str, object]]:
+    operation_id = "operation:" + "a" * 64
+    opened_attempt_id = _attempt(operation_id, "command-2", 2)
+    request: dict[str, object] = {
+        "protocol_version": "1.1",
+        "run_id": "run-canary",
+        "episode_id": "episode-0",
+        "step_id": 10,
+        "operation_id": operation_id,
+        "operation_epoch": 0,
+        "action_name": "Build_Pylon_Screen",
+        "actor": "Builder/Probe",
+        "requested_arguments": [],
+        "opened_command_id": "command-2",
+        "opened_attempt_id": opened_attempt_id,
+        "opened_attempt_ordinal": 2,
+        "blocked_material_legality_identity": "build-legality:" + "2" * 64,
+        "observation_revision": "obs-preflight",
+        "observation_game_loop": 10,
+    }
+    request["request_id"] = authoritative_build_preflight_request_id(
+        operation_id=operation_id,
+        operation_epoch=0,
+        action_name="Build_Pylon_Screen",
+        actor="Builder/Probe",
+        requested_arguments=[],
+        opened_command_id="command-2",
+        opened_attempt_id=opened_attempt_id,
+        opened_attempt_ordinal=2,
+        blocked_material_legality_identity="build-legality:" + "2" * 64,
+        observation_revision="obs-preflight",
+        observation_game_loop=10,
+    )
+    material = build_material_legality_identity(
+        operation_id=operation_id,
+        builder_tag=200,
+        ability_id=881,
+        world_target=(31.0, 30.0),
+        target_legality_fingerprint=None,
+        target_state_revision="target-revalidated",
+    )
+    result: dict[str, object] = {
+        **request,
+        "authorization_id": authoritative_build_preflight_authorization_id(
+            request_id=str(request["request_id"]),
+            operation_id=operation_id,
+            operation_epoch=0,
+            action_name="Build_Pylon_Screen",
+            builder_tag=200,
+            ability_id=881,
+            world_target=(31.0, 30.0),
+            target_state_revision="target-revalidated",
+            material_legality_identity=material,
+            observation_revision="obs-preflight",
+            observation_game_loop=10,
+            expires_game_loop=122,
+        ),
+        "status": "authorized",
+        "authorized": True,
+        "reason": "authoritative_material_change",
+        "circuit_open": False,
+        "builder_tag": 200,
+        "ability_id": 881,
+        "world_target": [31.0, 30.0],
+        "target_state_revision": "target-revalidated",
+        "material_legality_identity": material,
+        "observation_revision": "obs-preflight",
+        "observation_game_loop": 10,
+        "expires_game_loop": 122,
+        "state_transition": "open_to_reset",
+        "material_change_reason": "builder_changed",
+        "invalid_evidence_reasons": [],
+    }
+    return request, result
+
+
+def _valid_phases() -> list[dict[str, object]]:
+    operation_id = "operation:" + "a" * 64
+    action = "BUILD PYLON"
+    events: list[dict[str, object]] = [
+        _event(0, "initialized", game_loop=0, observation_revision="obs-0", action=None),
+    ]
+    for index in range(3):
+        command_id = f"command-{index}"
+        attempt_id = _attempt(operation_id, command_id, index)
+        events.append(
+            _event(
+                len(events),
+                "failure_command_held",
+                operation_id=operation_id,
+                action=action,
+                command_id=command_id,
+                attempt_id=attempt_id,
+                attempt_ordinal=index,
+                game_loop=index * 2 + 1,
+                observation_revision=f"obs-{index + 1}",
+                builder_tag=100,
+                **_zero(),
+            )
+        )
+        events.append(
+            _event(
+                len(events),
+                "authoritative_failure_observed",
+                operation_id=operation_id,
+                action=action,
+                command_id=command_id,
+                attempt_id=attempt_id,
+                attempt_ordinal=index,
+                game_loop=index * 2 + 2,
+                observation_revision=f"obs-{index + 1}",
+                builder_tag=100,
+                authoritative_streak=index + 1,
+                authoritative_threshold=3,
+                circuit_open=index == 2,
+                transition="closed_to_open" if index == 2 else None,
+                duplicate_attempt=False,
+                reason="placement_candidate_stale",
+                **_zero(),
+            )
+        )
+    reset_command = "command-reset"
+    reset_attempt = _attempt(operation_id, reset_command, 3)
+    preflight_request, preflight_result = _preflight_evidence()
+    authorization_id = str(preflight_result["authorization_id"])
+    events.extend(
+        [
+            _event(
+                len(events),
+                "circuit_open_observed",
+                operation_id=operation_id,
+                action=action,
+                command_id="command-2",
+                attempt_id=_attempt(operation_id, "command-2", 2),
+                attempt_ordinal=2,
+                game_loop=7,
+                observation_revision="obs-3",
+                builder_tag=100,
+                authoritative_streak=3,
+                authoritative_threshold=3,
+                circuit_open=True,
+                transition="closed_to_open",
+                **_zero(),
+            ),
+            _event(
+                len(events),
+                "core_defer_observed",
+                operation_id=operation_id,
+                action=action,
+                game_loop=8,
+                observation_revision="obs-core",
+                reason="authoritative_build_pre_dispatch_circuit_defer",
+                command_count=0,
+                idle_reason="plan_commands_deferred",
+                planner_pending=False,
+                builder_tag=100,
+                authoritative_state={"streak": 3, "circuit_open": True},
+                **_zero(),
+            ),
+            _event(
+                len(events),
+                "builder_rebound",
+                operation_id=operation_id,
+                action=action,
+                game_loop=9,
+                observation_revision="obs-rebound",
+                builder_tag=100,
+                replacement_builder_tag=200,
+                reason="fresh_ready_unleased_builder_observed",
+            ),
+            _event(
+                len(events),
+                "preflight_authorized",
+                operation_id=operation_id,
+                action=action,
+                game_loop=10,
+                observation_revision="obs-preflight",
+                builder_tag=100,
+                replacement_builder_tag=200,
+                reason="raw_exact_identity_open_to_reset",
+                request_id=preflight_request["request_id"],
+                authorization_id=authorization_id,
+                preflight_request=preflight_request,
+                preflight_result=preflight_result,
+                authoritative_state={
+                    "streak": 0,
+                    "threshold": 3,
+                    "circuit_open": False,
+                    "pending_authorization_id": authorization_id,
+                },
+                command_count=0,
+                **_zero(),
+            ),
+            _event(
+                len(events),
+                "reset_command_observed",
+                operation_id=operation_id,
+                action=action,
+                command_id=reset_command,
+                attempt_id=reset_attempt,
+                attempt_ordinal=3,
+                game_loop=11,
+                observation_revision="obs-reset-command",
+                builder_tag=200,
+                replacement_builder_tag=200,
+                reason="raw_preflight_authorized",
+                authorization_id=authorization_id,
+                authoritative_build_preflight=preflight_result,
+                authoritative_state={
+                    "streak": 0,
+                    "threshold": 3,
+                    "circuit_open": False,
+                    "pending_authorization_id": authorization_id,
+                },
+                **_zero(),
+            ),
+            _event(
+                len(events),
+                "reset_dispatch_observed",
+                operation_id=operation_id,
+                action=action,
+                command_id=reset_command,
+                attempt_id=reset_attempt,
+                attempt_ordinal=3,
+                game_loop=11,
+                observation_revision="obs-reset-command",
+                builder_tag=200,
+                replacement_builder_tag=200,
+                query_result="Success",
+                primitive_constructed=True,
+                primitive_submitted=False,
+                raw_diagnostic={
+                    "placement_query_result": "Success",
+                    "available_ability_query": "available",
+                    "target_legality_fingerprint": "sc2:fingerprint-reset",
+                    "primitive_constructed": True,
+                    "primitive_submitted": False,
+                },
+                authoritative_state={
+                    "streak": 0,
+                    "threshold": 3,
+                    "circuit_open": False,
+                    "pending_authorization_id": None,
+                },
+            ),
+            _event(
+                len(events),
+                "reset_dispatch_submitted",
+                operation_id=operation_id,
+                action=action,
+                command_id=reset_command,
+                attempt_id=reset_attempt,
+                attempt_ordinal=3,
+                game_loop=12,
+                observation_revision="obs-reset-command",
+                builder_tag=200,
+                replacement_builder_tag=200,
+                query_result="Success",
+                primitive_constructed=True,
+                primitive_submitted=True,
+                primitive_submitted_game_loop=12,
+                raw_diagnostic={
+                    "placement_query_result": "Success",
+                    "available_ability_query": "available",
+                    "target_legality_fingerprint": "sc2:fingerprint-reset",
+                    "primitive_constructed": True,
+                    "primitive_submitted": True,
+                },
+            ),
+            _event(
+                len(events),
+                "effect_confirmed",
+                operation_id=operation_id,
+                action=action,
+                command_id=reset_command,
+                game_loop=13,
+                observation_revision="obs-effect",
+                builder_tag=200,
+                primitive_submitted=True,
+                effect_status="succeeded",
+                effect_evidence={
+                    "effect_kind": "build",
+                    "build_started": True,
+                    "observed_structure_tag": "0xfeed",
+                    "confirmation_kind": "new_structure",
+                },
+                **_zero(),
+            ),
+            _event(
+                len(events),
+                "complete",
+                operation_id=operation_id,
+                action=action,
+                command_id=reset_command,
+                game_loop=13,
+                observation_revision="obs-effect",
+                **_zero(),
+            ),
+        ]
+    )
+    for index, event in enumerate(events):
+        event["event_index"] = index
+    return events
+
+
+def _runtime_event(event_id: int, event_type: str, payload: dict[str, object]) -> StoredEvent:
+    return StoredEvent(
+        event_id=event_id,
+        run_id="run-canary",
+        episode_id="episode-0",
+        step_id=event_id,
+        event_type=event_type,
+        created_at=f"2026-08-12T00:00:{event_id:02d}+00:00",
+        payload=payload,
+    )
+
+
+def _valid_runtime_events() -> list[StoredEvent]:
+    operation_id = "operation:" + "a" * 64
+    target_legality_fingerprint = "sc2:" + "f" * 64
+    reset_material_identity = build_material_legality_identity(
+        operation_id=operation_id,
+        builder_tag=200,
+        ability_id=881,
+        world_target=(31.0, 30.0),
+        target_legality_fingerprint=target_legality_fingerprint,
+        target_state_revision="target-revalidated",
+    )
+    reset_world_target = [31.0, 30.0]
+    reset_reservation_id = "placement:command-reset"
+    events: list[StoredEvent] = []
+    for ordinal in range(3):
+        command_id = f"command-{ordinal}"
+        attempt_id = _attempt(operation_id, command_id, ordinal)
+        events.append(
+            _runtime_event(
+                ordinal + 1,
+                "execution",
+                {
+                    "operation_id": operation_id,
+                    "command_id": command_id,
+                    "attempt_id": attempt_id,
+                    "attempt_ordinal": ordinal,
+                    "action_name": "Build_Pylon_Screen",
+                    "semantic_action": "BUILD PYLON",
+                    "runtime_action": "Build_Pylon_Screen",
+                    "status": "failed",
+                    "success": False,
+                    "execution_stage": "pre_dispatch",
+                    "failure_code": "placement_candidate_stale",
+                    "authoritative_pre_dispatch": {
+                        "operation_id": operation_id,
+                        "command_id": command_id,
+                        "attempt_id": attempt_id,
+                        "attempt_ordinal": ordinal,
+                        "action_name": "Build_Pylon_Screen",
+                        "failure_code": "placement_candidate_stale",
+                        "status": "defer_replan" if ordinal == 2 else "retry",
+                        "streak": ordinal + 1,
+                        "threshold": 3,
+                        "circuit_open": ordinal == 2,
+                        "duplicate_attempt": False,
+                        "builder_tag": 100,
+                        "ability_id": 881,
+                        "world_target": [30.0 + ordinal, 30.0],
+                        "material_legality_identity": "build-legality:" + str(ordinal) * 64,
+                        "material_evidence_valid": True,
+                        "invalid_evidence_reasons": [],
+                        "state_transition": "closed_to_open" if ordinal == 2 else None,
+                    },
+                },
+            )
+        )
+    third_attempt = _attempt(operation_id, "command-2", 2)
+    reset_attempt = _attempt(operation_id, "command-reset", 3)
+    preflight_request, preflight_result = _preflight_evidence()
+    authorization_id = preflight_result["authorization_id"]
+    authorized_command = {
+        "command_id": "command-reset",
+        "actor": "Builder/Probe",
+        "name": "Build_Pylon_Screen",
+        "arguments": [],
+        "operation_id": operation_id,
+        "attempt_id": reset_attempt,
+        "attempt_ordinal": 3,
+        "authoritative_build_preflight": preflight_result,
+    }
+    events.extend(
+        [
+            _runtime_event(
+                4,
+                "authoritative_build_pre_dispatch_circuit_defer",
+                {
+                    "operation_id": operation_id,
+                    "action_name": "Build_Pylon_Screen",
+                    "streak": 3,
+                    "threshold": 3,
+                    "failure_count": 3,
+                    "opened_command_id": "command-2",
+                    "opened_attempt_id": third_attempt,
+                    "opened_attempt_ordinal": 2,
+                    "material_legality_identity": "build-legality:" + "2" * 64,
+                    "blocked_semantic_material_identity": ("semantic-build-material:" + "1" * 64),
+                    "material_evidence_valid": True,
+                    "invalid_evidence_reasons": [],
+                    "next_action": "wait_for_material_legality_change_or_new_operation",
+                },
+            ),
+            _runtime_event(
+                5,
+                "authoritative_build_pre_dispatch_preflight_requested",
+                {
+                    "request": preflight_request,
+                    "semantic_material_hint": "semantic-build-material:" + "2" * 64,
+                    "bound_builder_hint": 200,
+                    "side_effect_free": True,
+                },
+            ),
+            _runtime_event(
+                6,
+                "authoritative_build_pre_dispatch_preflight",
+                {
+                    "result": preflight_result,
+                    "accepted_by_core": True,
+                    "invalid_evidence_reasons": [],
+                },
+            ),
+            _runtime_event(
+                7,
+                "authoritative_build_pre_dispatch_circuit_reset",
+                {
+                    "operation_id": operation_id,
+                    "operation_epoch": 0,
+                    "action_name": "Build_Pylon_Screen",
+                    "reason": "raw_preflight_authorized",
+                    "state_transition": "open_to_reset",
+                    "authorization_id": authorization_id,
+                    "request_id": preflight_request["request_id"],
+                    "opened_command_id": "command-2",
+                    "opened_attempt_id": third_attempt,
+                    "opened_attempt_ordinal": 2,
+                    "blocked_material_legality_identity": "build-legality:" + "2" * 64,
+                    "builder_tag": 200,
+                    "ability_id": 881,
+                    "world_target": reset_world_target,
+                    "target_state_revision": "target-revalidated",
+                    "material_legality_identity": preflight_result["material_legality_identity"],
+                    "observation_revision": "obs-preflight",
+                    "authorization_game_loop": 10,
+                    "expires_game_loop": 122,
+                    "material_change_reason": "builder_changed",
+                    "reset_from_streak": 3,
+                },
+            ),
+            _runtime_event(
+                8,
+                "command_lineage",
+                {
+                    "lineage": {
+                        "operation_id": operation_id,
+                        "command_id": "command-reset",
+                        "action_name": "Build_Pylon_Screen",
+                    },
+                    "command_id": "command-reset",
+                    "authoritative_build_preflight": preflight_result,
+                },
+            ),
+            _runtime_event(
+                9,
+                "command_lifecycle",
+                {
+                    "status": "dispatched",
+                    "reason": None,
+                    "command": authorized_command,
+                },
+            ),
+            _runtime_event(
+                10,
+                "placement_ledger_transition",
+                {
+                    "operation_id": operation_id,
+                    "command_id": "command-reset",
+                    "attempt_id": reset_attempt,
+                    "attempt_ordinal": 3,
+                    "action_name": "Build_Pylon_Screen",
+                    "builder_tag": "0xc8",
+                    "builder_lease_state": None,
+                    "reservation_id": reset_reservation_id,
+                    "ability_id": 881,
+                    "world_target": reset_world_target,
+                    "target_state_revision": "target-revalidated",
+                    "target_legality_fingerprint": target_legality_fingerprint,
+                    "available_ability_query": "available",
+                    "placement_query_result": "Success",
+                    "material_legality_identity": reset_material_identity,
+                    "next_state": "build_started",
+                    "release_reason": "build_start_observed",
+                    "authoritative_pre_dispatch": {
+                        "operation_id": operation_id,
+                        "command_id": "command-reset",
+                        "attempt_id": reset_attempt,
+                        "attempt_ordinal": 3,
+                        "action_name": "Build_Pylon_Screen",
+                        "failure_code": "build_started",
+                        "status": "reset",
+                        "streak": 0,
+                        "threshold": 3,
+                        "circuit_open": False,
+                        "duplicate_attempt": False,
+                        "builder_tag": 200,
+                        "ability_id": 881,
+                        "world_target": reset_world_target,
+                        "target_state_revision": "target-revalidated",
+                        "material_legality_identity": reset_material_identity,
+                        "material_evidence_valid": True,
+                        "invalid_evidence_reasons": [],
+                        "state_transition": None,
+                        "reset_reason": "build_started",
+                        "next_action": "retry",
+                    },
+                },
+            ),
+            _runtime_event(
+                11,
+                "placement_ledger_transition",
+                {
+                    "operation_id": operation_id,
+                    "command_id": "command-reset",
+                    "attempt_id": reset_attempt,
+                    "attempt_ordinal": 3,
+                    "action_name": "Build_Pylon_Screen",
+                    "builder_tag": "0xc8",
+                    "builder_lease_state": "released",
+                    "reservation_id": reset_reservation_id,
+                    "ability_id": 881,
+                    "world_target": reset_world_target,
+                    "material_legality_identity": reset_material_identity,
+                    "next_state": "occupied",
+                    "release_reason": "effect_confirmed",
+                },
+            ),
+            _runtime_event(
+                12,
+                "execution",
+                {
+                    "operation_id": operation_id,
+                    "command_id": "command-reset",
+                    "attempt_id": reset_attempt,
+                    "attempt_ordinal": 3,
+                    "action_name": "Build_Pylon_Screen",
+                    "semantic_action": "BUILD PYLON",
+                    "runtime_action": "Build_Pylon_Screen",
+                    "status": "succeeded",
+                    "success": True,
+                    "effect_evidence": {
+                        "effect_kind": "build",
+                        "reservation_id": reset_reservation_id,
+                        "builder_tag": "0xc8",
+                        "ability_id": 881,
+                        "target_position": reset_world_target,
+                        "emitted_target_position": reset_world_target,
+                        "verified_target_position": reset_world_target,
+                        "material_legality_identity": reset_material_identity,
+                        "build_started": True,
+                        "observed_structure_tag": "0xfeed",
+                        "confirmation_kind": "new_structure",
+                    },
+                },
+            ),
+        ]
+    )
+    return events
+
+
+def _artifact_fixture(tmp_path: Path) -> tuple[Path, Path, dict[str, Any]]:
+    run_set = tmp_path / "run-set"
+    run_dir = run_set / "actual-run"
+    run_dir.mkdir(parents=True)
+    (run_set / "canonical-run").symlink_to(run_dir, target_is_directory=True)
+    phase_path = run_dir / "authoritative-build-circuit-canary.jsonl"
+    phase_path.write_text(
+        "\n".join(json.dumps(event, sort_keys=True) for event in _valid_phases()) + "\n",
+        encoding="utf-8",
+    )
+    events_path = run_dir / "events.jsonl"
+    events_path.write_text("runtime-events\n", encoding="utf-8")
+    summary_path = run_dir / "summary.json"
+    summary_path.write_text("{}\n", encoding="utf-8")
+    expected_sha = "a" * 40
+    source_hash = "c" * 64
+    source_commit = "b" * 40
+    source = {
+        "git_head_before": expected_sha,
+        "git_head_after": expected_sha,
+        "superproject_dirty_before": "false",
+        "superproject_dirty_after": "false",
+        "submodule_commit_before": source_commit,
+        "submodule_commit_after": source_commit,
+        "submodule_dirty_before": "false",
+        "submodule_dirty_after": "false",
+        "submodule_gitlink_before": source_commit,
+        "submodule_gitlink_after": source_commit,
+        "submodule_diff_sha256_before": source_hash,
+        "submodule_diff_sha256_after": source_hash,
+        "reviewed_source_commit_before": source_commit,
+        "reviewed_source_commit_after": source_commit,
+        "reviewed_source_diff_sha256_before": source_hash,
+        "reviewed_source_diff_sha256_after": source_hash,
+        "reviewed_source_tree_sha256_before": source_hash,
+        "reviewed_source_tree_sha256_after": source_hash,
+    }
+    attestation = {
+        "diagnostic_only": True,
+        "expected_git_sha": expected_sha,
+        "seed": 7,
+        "exit_code": 0,
+        "run_dir": str(run_dir.resolve()),
+        "canary_journal_path": str(phase_path.resolve()),
+        "canary_journal_sha256": hashlib.sha256(phase_path.read_bytes()).hexdigest(),
+        "events_path": str(events_path.resolve()),
+        "events_sha256": hashlib.sha256(events_path.read_bytes()).hexdigest(),
+        "summary_path": str(summary_path.resolve()),
+        "summary_sha256": hashlib.sha256(summary_path.read_bytes()).hexdigest(),
+        "source_attestation": source,
+    }
+    (run_set / "canary-attestation.json").write_text(
+        json.dumps(attestation, sort_keys=True), encoding="utf-8"
+    )
+    return run_set, run_dir, attestation
+
+
+def test_replay_accepts_exact_three_failure_real_reset_path() -> None:
+    report = _replay_phases(_valid_phases(), expected_seed=7)
+
+    assert report["failure_count"] == 3
+    assert report["open_count"] == 1
+    assert report["material_reset_count"] == 1
+    assert report["success_reset_count"] == 1
+    assert report["primitive_submission_count"] == 1
+    assert report["post_open_rejection_count"] == 0
+
+
+def test_runtime_events_are_authoritative_for_the_canary_path() -> None:
+    phase_events = _valid_phases()
+    phase_replay = _replay_phases(phase_events, expected_seed=7)
+    report = _replay_runtime_events(
+        _valid_runtime_events(), phase_events=phase_events, phase_replay=phase_replay
+    )
+
+    assert report["runtime_failure_count"] == 3
+    assert report["runtime_core_defer_count"] == 1
+    assert report["runtime_core_reset_count"] == 1
+    assert report["runtime_raw_reset_count"] == 1
+    assert report["runtime_success_count"] == 1
+    assert report["raw_success_reset_provenance_consistent"] is True
+    assert report["engineering_authoritative_circuit_consistent"] is True
+    assert report["engineering_authoritative_circuit"] == {
+        "failure_count": 3,
+        "open_count": 1,
+        "success_reset_count": 1,
+        "missing_identity_count": 0,
+        "identity_inconsistency_count": 0,
+        "invalid_transition_count": 0,
+        "post_open_command_count": 0,
+        "post_open_dispatch_count": 0,
+        "post_open_rejection_count": 0,
+        "post_open_primitive_count": 0,
+        "post_open_approach_primitive_count": 0,
+        "consistent": True,
+    }
+
+
+def test_runtime_replay_rejects_general_engineering_circuit_disagreement() -> None:
+    phase_events = _valid_phases()
+    phase_replay = _replay_phases(phase_events, expected_seed=7)
+    runtime_events = _valid_runtime_events()
+    lineage = next(event for event in runtime_events if event.event_type == "command_lineage")
+    lineage.payload["authoritative_build_preflight"]["authorization_id"] = (
+        "build-preflight-authorization:" + "e" * 64
+    )
+
+    with pytest.raises(CanaryArtifactError):
+        _replay_runtime_events(
+            runtime_events,
+            phase_events=phase_events,
+            phase_replay=phase_replay,
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "nested_material_identity",
+        "parent_material_identity",
+        "material_valid",
+        "invalid_reasons",
+        "effect_material_identity",
+        "effect_builder",
+        "effect_ability",
+        "effect_target",
+        "parent_target",
+        "target_state_revision",
+        "reservation_id",
+    ),
+)
+def test_runtime_replay_rejects_forged_success_reset_material_provenance(
+    mutation: str,
+) -> None:
+    phase_events = _valid_phases()
+    phase_replay = _replay_phases(phase_events, expected_seed=7)
+    runtime_events = _valid_runtime_events()
+    reset_transition = next(event for event in runtime_events if event.event_id == 10).payload
+    reset_evidence = reset_transition["authoritative_pre_dispatch"]
+    assert isinstance(reset_evidence, dict)
+    success_effect = runtime_events[-1].payload["effect_evidence"]
+    assert isinstance(success_effect, dict)
+    if mutation == "nested_material_identity":
+        reset_evidence["material_legality_identity"] = "build-legality:" + "A" * 64
+    elif mutation == "parent_material_identity":
+        reset_transition["material_legality_identity"] = "build-legality:" + "e" * 64
+    elif mutation == "material_valid":
+        reset_evidence["material_evidence_valid"] = False
+    elif mutation == "invalid_reasons":
+        reset_evidence["invalid_evidence_reasons"] = ["forged"]
+    elif mutation == "effect_material_identity":
+        success_effect["material_legality_identity"] = "build-legality:" + "e" * 64
+    elif mutation == "effect_builder":
+        success_effect["builder_tag"] = "0xc9"
+    elif mutation == "effect_ability":
+        success_effect["ability_id"] = 882
+    elif mutation == "effect_target":
+        success_effect["target_position"] = [32.0, 30.0]
+    elif mutation == "parent_target":
+        reset_transition.pop("world_target")
+    elif mutation == "target_state_revision":
+        reset_evidence["target_state_revision"] = "forged-target-state"
+    else:
+        reset_transition["reservation_id"] = "placement:forged"
+
+    with pytest.raises(CanaryArtifactError, match="reset|reservation|material|effect"):
+        _replay_runtime_events(
+            runtime_events,
+            phase_events=phase_events,
+            phase_replay=phase_replay,
+        )
+
+
+def _runtime_events_with_opening_lifecycle(status: str) -> list[StoredEvent]:
+    runtime_events = [
+        replace(event, event_id=event.event_id + 1) if event.event_id >= 4 else event
+        for event in _valid_runtime_events()
+    ]
+    operation_id = "operation:" + "a" * 64
+    command_id = "command-2"
+    runtime_events.insert(
+        3,
+        _runtime_event(
+            4,
+            "command_lifecycle",
+            {
+                "status": status,
+                "reason": "placement_candidate_stale" if status == "failed" else None,
+                "command": {
+                    "operation_id": operation_id,
+                    "command_id": command_id,
+                    "attempt_id": _attempt(operation_id, command_id, 2),
+                    "attempt_ordinal": 2,
+                    "name": "Build_Pylon_Screen",
+                },
+            },
+        ),
+    )
+    return runtime_events
+
+
+def test_runtime_replay_ignores_opening_command_terminal_after_open_event() -> None:
+    phase_events = _valid_phases()
+    phase_replay = _replay_phases(phase_events, expected_seed=7)
+
+    report = _replay_runtime_events(
+        _runtime_events_with_opening_lifecycle("failed"),
+        phase_events=phase_events,
+        phase_replay=phase_replay,
+    )
+
+    assert report["post_open_command_count"] == 0
+    assert report["post_open_dispatch_count"] == 0
+    assert report["post_open_raw_rejection_count"] == 0
+
+
+def test_runtime_replay_rejects_opening_command_redispatch_after_open_event() -> None:
+    phase_events = _valid_phases()
+    phase_replay = _replay_phases(phase_events, expected_seed=7)
+
+    with pytest.raises(CanaryArtifactError, match="post-open command"):
+        _replay_runtime_events(
+            _runtime_events_with_opening_lifecycle("dispatched"),
+            phase_events=phase_events,
+            phase_replay=phase_replay,
+        )
+
+
+def test_analyzer_rejects_tampered_hash_and_wrong_run_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_set, run_dir, attestation = _artifact_fixture(tmp_path)
+    monkeypatch.setattr(analyzer, "_summary_artifact_is_canonical", lambda *args, **kwargs: True)
+    monkeypatch.setattr(analyzer, "read_event_log", lambda _path: _valid_runtime_events())
+    monkeypatch.setattr(
+        analyzer,
+        "_replay_runtime_events",
+        lambda *args, **kwargs: {
+            "runtime_raw_reset_count": 1,
+            "engineering_authoritative_circuit_consistent": True,
+        },
+    )
+    report = analyze_canary_run(run_set, expected_git_sha="a" * 40, seed=7)
+    assert report["accepted"] is True
+
+    attestation["events_sha256"] = "0" * 64
+    (run_set / "canary-attestation.json").write_text(
+        json.dumps(attestation, sort_keys=True), encoding="utf-8"
+    )
+    with pytest.raises(CanaryArtifactError, match="events.jsonl SHA"):
+        analyze_canary_run(run_set, expected_git_sha="a" * 40, seed=7)
+
+    attestation["events_sha256"] = hashlib.sha256(
+        (run_dir / "events.jsonl").read_bytes()
+    ).hexdigest()
+    attestation["run_dir"] = str((run_set / "wrong-run").resolve())
+    (run_set / "canary-attestation.json").write_text(
+        json.dumps(attestation, sort_keys=True), encoding="utf-8"
+    )
+    with pytest.raises(CanaryArtifactError, match="run_dir attestation"):
+        analyze_canary_run(run_set, expected_git_sha="a" * 40, seed=7)
+
+
+def test_analyzer_fails_closed_when_general_engineering_circuit_disagrees(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_set, _run_dir, _attestation = _artifact_fixture(tmp_path)
+    monkeypatch.setattr(analyzer, "_summary_artifact_is_canonical", lambda *args, **kwargs: True)
+    monkeypatch.setattr(analyzer, "read_event_log", lambda _path: _valid_runtime_events())
+    monkeypatch.setattr(
+        analyzer,
+        "_replay_runtime_events",
+        lambda *args, **kwargs: {
+            "runtime_raw_reset_count": 1,
+            "engineering_authoritative_circuit_consistent": False,
+        },
+    )
+
+    report = analyze_canary_run(run_set, expected_git_sha="a" * 40, seed=7)
+
+    assert report["accepted"] is False
+    assert report["gates"]["engineering_authoritative_circuit_consistent"] is False
+
+
+def test_summary_canonical_check_compares_json_round_trip(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "events.jsonl").write_text("events\n", encoding="utf-8")
+    canonical = {
+        "runs": {
+            "run-canary": {
+                "episodes": {
+                    "episode-0": {
+                        "cortex": {"race_limitations": ()},
+                    }
+                }
+            }
+        }
+    }
+    (run_dir / "summary.json").write_text(
+        json.dumps(canonical, sort_keys=True),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(analyzer, "read_event_log", lambda _path: ())
+    monkeypatch.setattr(analyzer, "_build_run_summary", lambda _events: canonical)
+
+    assert analyzer._summary_artifact_is_canonical(
+        run_dir,
+        run_id="run-canary",
+        episode_id="episode-0",
+    )
+
+    forged_canonical: dict[str, Any] = json.loads(json.dumps(canonical))
+    forged_canonical["runs"]["run-canary"]["episodes"]["episode-0"]["cortex"][
+        "race_limitations"
+    ] = ["forged"]
+    monkeypatch.setattr(analyzer, "_build_run_summary", lambda _events: forged_canonical)
+    assert not analyzer._summary_artifact_is_canonical(
+        run_dir,
+        run_id="run-canary",
+        episode_id="episode-0",
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "missing",
+        "idle",
+        "post_open",
+        "zero",
+        "release",
+        "material",
+        "semantic",
+        "effect",
+    ),
+)
+def test_runtime_replay_rejects_forged_or_incomplete_evidence(mutation: str) -> None:
+    phase_events = _valid_phases()
+    phase_replay = _replay_phases(phase_events, expected_seed=7)
+    runtime_events = _valid_runtime_events()
+    if mutation == "missing":
+        runtime_events = runtime_events[1:]
+    elif mutation == "idle":
+        phase_events[8]["idle_reason"] = "no_legal_action"
+        with pytest.raises(CanaryArtifactError):
+            _replay_phases(phase_events, expected_seed=7)
+        return
+    elif mutation == "post_open":
+        runtime_events.insert(
+            3,
+            _runtime_event(
+                4,
+                "command_lifecycle",
+                {
+                    "status": "dispatched",
+                    "command": {
+                        "command_id": "forged-after-open",
+                        "operation_id": "operation:" + "a" * 64,
+                    },
+                },
+            ),
+        )
+        runtime_events = [event if event.event_id < 4 else event for event in runtime_events]
+    elif mutation == "zero":
+        runtime_events = []
+    elif mutation == "release":
+        runtime_events = [event for event in runtime_events if event.event_id != 11]
+    elif mutation == "material":
+        runtime_events[0].payload["authoritative_pre_dispatch"]["material_legality_identity"] = (
+            "build-legality:1"
+        )
+    elif mutation == "semantic":
+        runtime_events[0].payload["semantic_action"] = "Pylon"
+    else:
+        runtime_events[-1].payload["effect_evidence"]["observed_structure_tag"] = ""
+
+    with pytest.raises(CanaryArtifactError):
+        _replay_runtime_events(runtime_events, phase_events=phase_events, phase_replay=phase_replay)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("streak", "open_transition", "planner", "query", "submission", "ownership"),
+)
+def test_replay_rejects_tampered_phase_evidence(mutation: str) -> None:
+    events = _valid_phases()
+    if mutation == "streak":
+        events[2]["authoritative_streak"] = 3
+    elif mutation == "open_transition":
+        events[7]["transition"] = None
+    elif mutation == "planner":
+        events[8]["planner_pending"] = True
+    elif mutation == "query":
+        events[12]["query_result"] = "Success (cached)"
+    elif mutation == "submission":
+        events[13]["primitive_submitted"] = False
+    else:
+        events[7]["effect_inflight_count"] = 1
+
+    with pytest.raises(CanaryArtifactError):
+        _replay_phases(events, expected_seed=7)

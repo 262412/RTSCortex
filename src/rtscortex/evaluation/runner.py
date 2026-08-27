@@ -37,14 +37,17 @@ async def run_mock_episode(
     seed: int,
 ) -> EpisodeResult:
     await runtime.start()
+    max_steps = config.environment.max_steps
+    if max_steps is None:
+        raise ValueError("mock evaluation requires a finite environment.max_steps")
     adapter = MockSC2Adapter(
         scenario=config.environment.scenario,
-        max_steps=config.environment.max_steps,
+        max_steps=max_steps,
     )
     observation = await adapter.reset(run_id=run_id, episode_id=episode_id, seed=seed)
     steps = 0
     try:
-        while not adapter.done and steps < config.environment.max_steps:
+        while not adapter.done and steps < max_steps:
             batch = await runtime.tick(observation)
             observation, reports = await adapter.step(batch)
             for report in reports:
@@ -213,11 +216,12 @@ def _write_markdown_report(
             "## Meaningful outcomes",
             "",
             (
-                "| Variant | Commands | Succeeded | Failed | Cancelled | Unconfirmed | "
+                "| Variant | Commands | Succeeded | Failed | Peer-satisfied | "
+                "Cancelled | Unconfirmed | "
                 "Meaningful success | Completed success | Backlog | Terminal coverage | "
                 "Unexpected terminal | Failure classification | Transport NoOps |"
             ),
-            "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+            "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
         ]
     )
     for display_variant, metrics in variants.items():
@@ -226,6 +230,7 @@ def _write_markdown_report(
             f"| `{display_variant}` | {execution['meaningful_commands']} | "
             f"{execution['meaningful_successes']} | "
             f"{execution['meaningful_failures']} | "
+            f"{execution['meaningful_satisfied_by_peer']} | "
             f"{execution['meaningful_cancelled']} | "
             f"{execution['meaningful_unconfirmed']} | "
             f"{execution['meaningful_action_success_rate']:.3f} | "

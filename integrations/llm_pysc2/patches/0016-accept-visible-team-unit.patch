@@ -1,11 +1,30 @@
 diff --git a/llm_pysc2/agents/main_agent_funcs.py b/llm_pysc2/agents/main_agent_funcs.py
 --- a/llm_pysc2/agents/main_agent_funcs.py
 +++ b/llm_pysc2/agents/main_agent_funcs.py
-@@ -78,6 +78,9 @@ def get_camera_func_smart(self, obs, tag, threshold=0.15, team=None):
+@@ -42,6 +42,17 @@ def get_camera_func_smart(self, obs, tag, threshold=0.15, team=None):
+ 
+     logger.debug(f"[ID {self.log_id}] get_camera_func_smart(): team['obs'] mode")
+     agent_name = self.AGENT_NAMES[self.agent_id]
++    edge_margin = max(2, int(self.size_screen * 0.02))
++    current_unit_is_usable = unit_f is not None and \
++        edge_margin <= unit_f.x < self.size_screen - edge_margin and \
++        edge_margin <= unit_f.y < self.size_screen - edge_margin
++    builder_is_centered = unit_f is not None and \
++        abs(unit_f.x - self.size_screen / 2) < threshold * self.size_screen and \
++        abs(unit_f.y - self.size_screen / 2) < threshold * self.size_screen
++    if getattr(self, '_rtscortex_accept_visible_team_unit', False) and \
++        current_unit_is_usable and (agent_name != 'Builder' or builder_is_centered):
++      logger.debug(f"[ID {self.log_id}] {agent_name} {team['name']}: use current visible unit")
++      return (0, actions.FUNCTIONS.no_op())
+     if len(team['obs']) != len(team['pos']):
+       logger.error(f"[ID {self.log_id}] {agent_name} {team['name']} len(team['obs']) != len(team['pos'])")
+     # elif unit_r is None:
+@@ -78,6 +89,10 @@ def get_camera_func_smart(self, obs, tag, threshold=0.15, team=None):
      self.last_two_camera_pos.append([x, y])
      return (573, actions.FUNCTIONS.llm_pysc2_move_camera((x, y)))  # 有这个单位，但是屏幕上没找到
    elif (unit_r is not None) and (unit_f is not None) and \
 +      (not getattr(self, '_rtscortex_accept_visible_team_unit', False) or
++       self.AGENT_NAMES[self.agent_id] == 'Builder' or
 +       not (max(2, int(self.size_screen * 0.02)) <= unit_f.x < self.size_screen - max(2, int(self.size_screen * 0.02)) and
 +            max(2, int(self.size_screen * 0.02)) <= unit_f.y < self.size_screen - max(2, int(self.size_screen * 0.02)))) and \
        not (abs(unit_f.x - self.size_screen / 2) < threshold * self.size_screen and

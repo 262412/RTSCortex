@@ -73,6 +73,7 @@ class ExecutionMetrics:
     meaningful_commands: int
     meaningful_successes: int
     meaningful_failures: int
+    meaningful_satisfied_by_peer: int
     meaningful_cancelled: int
     meaningful_unconfirmed: int
     meaningful_action_success_rate: float
@@ -190,6 +191,7 @@ class EpisodeMetrics:
                 "meaningful_commands": self.execution.meaningful_commands,
                 "meaningful_successes": self.execution.meaningful_successes,
                 "meaningful_failures": self.execution.meaningful_failures,
+                "meaningful_satisfied_by_peer": (self.execution.meaningful_satisfied_by_peer),
                 "meaningful_cancelled": self.execution.meaningful_cancelled,
                 "meaningful_unconfirmed": self.execution.meaningful_unconfirmed,
                 "meaningful_action_success_rate": (self.execution.meaningful_action_success_rate),
@@ -458,8 +460,12 @@ def aggregate_episode_metrics(metrics: list[EpisodeMetrics]) -> dict[str, Any]:
     meaningful_commands = sum(item.execution.meaningful_commands for item in metrics)
     meaningful_successes = sum(item.execution.meaningful_successes for item in metrics)
     meaningful_failures = sum(item.execution.meaningful_failures for item in metrics)
+    meaningful_satisfied_by_peer = sum(
+        item.execution.meaningful_satisfied_by_peer for item in metrics
+    )
     meaningful_cancelled = sum(item.execution.meaningful_cancelled for item in metrics)
     meaningful_unconfirmed = sum(item.execution.meaningful_unconfirmed for item in metrics)
+    actionable_meaningful = meaningful_commands - meaningful_satisfied_by_peer
     completed_meaningful = meaningful_successes + meaningful_failures
     terminal_backlog = meaningful_cancelled + meaningful_unconfirmed
     build_funnel = _merge_counts([item.execution.build_funnel for item in metrics])
@@ -513,17 +519,18 @@ def aggregate_episode_metrics(metrics: list[EpisodeMetrics]) -> dict[str, Any]:
         "meaningful_commands": meaningful_commands,
         "meaningful_successes": meaningful_successes,
         "meaningful_failures": meaningful_failures,
+        "meaningful_satisfied_by_peer": meaningful_satisfied_by_peer,
         "meaningful_cancelled": meaningful_cancelled,
         "meaningful_unconfirmed": meaningful_unconfirmed,
         "meaningful_action_success_rate": (
-            meaningful_successes / meaningful_commands if meaningful_commands else 0.0
+            meaningful_successes / actionable_meaningful if actionable_meaningful else 0.0
         ),
         "completed_meaningful_commands": completed_meaningful,
         "completed_execution_success_rate": (
             meaningful_successes / completed_meaningful if completed_meaningful else 0.0
         ),
         "terminal_backlog_rate": (
-            terminal_backlog / meaningful_commands if meaningful_commands else 0.0
+            terminal_backlog / actionable_meaningful if actionable_meaningful else 0.0
         ),
         "status_counts": _merge_counts([item.execution.status_counts for item in metrics]),
         "failure_by_stage": _merge_counts([item.execution.failure_by_stage for item in metrics]),
@@ -716,6 +723,7 @@ def compute_execution_metrics(events: list[StoredEvent]) -> ExecutionMetrics:
     control_noop_successes = 0
     meaningful_successes = 0
     meaningful_failures = 0
+    meaningful_satisfied_by_peer = 0
     meaningful_cancelled = 0
     meaningful_unconfirmed = 0
     build_translator_accepted_ids: set[str] = set()
@@ -747,6 +755,9 @@ def compute_execution_metrics(events: list[StoredEvent]) -> ExecutionMetrics:
         action_name = str(payload.get("action_name") or command.get("name") or "unknown")
         actor = str(payload.get("actor") or command.get("actor") or "unknown")
         status = _execution_status(payload)
+        stage = str(payload.get("execution_stage") or _infer_execution_stage(payload, status))
+        code = str(payload.get("failure_code") or _infer_failure_code(payload, status))
+        satisfied_by_peer = code == "engagement_target_eliminated"
         _increment(status_counts, status)
         _increment(command_by_action_actor, f"{action_name} / {actor}")
         is_noop = _is_noop(action_name, payload.get("pysc2_function"), command_id)
@@ -756,6 +767,8 @@ def compute_execution_metrics(events: list[StoredEvent]) -> ExecutionMetrics:
                 control_noop_successes += 1
         elif status == "succeeded":
             meaningful_successes += 1
+        elif satisfied_by_peer:
+            meaningful_satisfied_by_peer += 1
         elif status == "failed":
             meaningful_failures += 1
         elif status == "cancelled":
@@ -763,9 +776,7 @@ def compute_execution_metrics(events: list[StoredEvent]) -> ExecutionMetrics:
         else:
             meaningful_unconfirmed += 1
 
-        stage = str(payload.get("execution_stage") or _infer_execution_stage(payload, status))
-        code = str(payload.get("failure_code") or _infer_failure_code(payload, status))
-        if status != "succeeded":
+        if status != "succeeded" and not satisfied_by_peer:
             failure_reports += 1
             if payload.get("execution_stage") and payload.get("failure_code"):
                 explicitly_classified_failures += 1
@@ -806,6 +817,8 @@ def compute_execution_metrics(events: list[StoredEvent]) -> ExecutionMetrics:
                 "worker_order_replaced",
                 "target_not_created",
                 "builder_not_observable",
+                "no_build_start_evidence",
+                "build_started_effect_missing",
             }:
                 build_effect_timeout_ids.add(command_id)
             final_translator = _final_translator_primitive(payload)
@@ -910,8 +923,13 @@ def compute_execution_metrics(events: list[StoredEvent]) -> ExecutionMetrics:
                     production_confirmation_latencies[command_id] = latency
 
     meaningful_commands = (
-        meaningful_successes + meaningful_failures + meaningful_cancelled + meaningful_unconfirmed
+        meaningful_successes
+        + meaningful_failures
+        + meaningful_satisfied_by_peer
+        + meaningful_cancelled
+        + meaningful_unconfirmed
     )
+    actionable_meaningful = meaningful_commands - meaningful_satisfied_by_peer
     completed_meaningful = meaningful_successes + meaningful_failures
     build_selected_ids = _build_selected_ids(commands)
     build_proposed_ids = build_selected_ids | _build_candidate_ids(decisions)
@@ -995,17 +1013,18 @@ def compute_execution_metrics(events: list[StoredEvent]) -> ExecutionMetrics:
         meaningful_commands=meaningful_commands,
         meaningful_successes=meaningful_successes,
         meaningful_failures=meaningful_failures,
+        meaningful_satisfied_by_peer=meaningful_satisfied_by_peer,
         meaningful_cancelled=meaningful_cancelled,
         meaningful_unconfirmed=meaningful_unconfirmed,
         meaningful_action_success_rate=(
-            meaningful_successes / meaningful_commands if meaningful_commands else 0.0
+            meaningful_successes / actionable_meaningful if actionable_meaningful else 0.0
         ),
         completed_meaningful_commands=completed_meaningful,
         completed_execution_success_rate=(
             meaningful_successes / completed_meaningful if completed_meaningful else 0.0
         ),
         terminal_backlog_rate=(
-            terminal_backlog / meaningful_commands if meaningful_commands else 0.0
+            terminal_backlog / actionable_meaningful if actionable_meaningful else 0.0
         ),
         status_counts=status_counts,
         failure_by_stage=failure_by_stage,

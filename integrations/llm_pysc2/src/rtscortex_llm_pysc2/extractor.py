@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+from rtscortex_llm_pysc2.ability import ability_spec
 from rtscortex_llm_pysc2.addon import addon_spec
 from rtscortex_llm_pysc2.inject_effect_verifier import (
     INJECT_ACTION,
@@ -20,6 +21,8 @@ from rtscortex_llm_pysc2.production import (
     production_spec,
     production_spec_for_order,
 )
+from rtscortex_llm_pysc2.raw_placement import RawPlacementService
+from rtscortex_llm_pysc2.research import research_spec, research_spec_for_order
 
 SUPPORTED_ARGUMENTS = frozenset({"minimap", "screen", "tag"})
 SCREEN_WORLD_GRID = 24.0
@@ -27,6 +30,8 @@ TERRAN_ADDON_GAS_CLEARANCE_WORLD = 7.0
 ALLIANCES = {1: "self", 2: "ally", 3: "neutral", 4: "enemy"}
 SC2_ALERT_NAMES = {6: "building_under_attack", 19: "unit_under_attack"}
 QUEEN_CONTROLLER_ACTIONS = frozenset({INJECT_ACTION, "Build_CreepTumor_Queen_Screen"})
+TUMOR_CONTROLLER_ACTION = "Build_CreepTumor_Tumor_Screen"
+MULE_ACTION = "Effect_CalldownMULE_Screen"
 TOWNHALL_NAMES = frozenset(
     {
         "nexus",
@@ -36,6 +41,20 @@ TOWNHALL_NAMES = frozenset(
         "commandcenter",
         "orbitalcommand",
         "planetaryfortress",
+    }
+)
+PRODUCTION_STRUCTURE_NAMES = frozenset(
+    {
+        "gateway",
+        "warpgate",
+        "roboticsfacility",
+        "stargate",
+        "barracks",
+        "factory",
+        "starport",
+        "hatchery",
+        "lair",
+        "hive",
     }
 )
 
@@ -54,12 +73,21 @@ class BuildSpec:
 
 
 @dataclass(frozen=True)
+class RawBuildEligibility:
+    eligible: bool
+    failure_code: str | None = None
+    reason: str | None = None
+
+
+@dataclass(frozen=True)
 class ScreenCandidateProvenance:
     """Bridge-private link from an observed screen candidate to world space."""
 
     screen_target: tuple[int, int]
     world_target: tuple[float, float]
     anchor_tag: int
+    placement_candidate_id: str | None = None
+    placement_revision: str | None = None
 
 
 BUILD_SPECS = {
@@ -221,6 +249,14 @@ BUILD_SPECS = {
         0,
         requires_creep=True,
     ),
+    TUMOR_CONTROLLER_ACTION: BuildSpec(
+        "CreepTumor",
+        "screen",
+        1,
+        False,
+        0,
+        requires_creep=True,
+    ),
 }
 
 # PySC2's ``FeatureUnit.order_id_*`` fields expose the pinned RAW action IDs
@@ -253,6 +289,7 @@ BUILD_RAW_FUNCTION_IDS = {
     "SpineCrawler": 218,
     "SporeCrawler": 220,
     "CreepTumorQueen": 189,
+    "CreepTumor": 190,
 }
 TERRAN_BUILD_RAW_FUNCTION_IDS = frozenset(
     BUILD_RAW_FUNCTION_IDS[spec.target_structure]
@@ -271,13 +308,11 @@ TERRAN_BUILD_RAW_FUNCTION_IDS = frozenset(
     }
 )
 
-SCREEN_POINT_ACTIONS = frozenset({"Move_Screen", "Ability_Blink_Screen"})
+SCREEN_POINT_ACTIONS = frozenset({"Move_Screen", "Ability_Blink_Screen", MULE_ACTION})
 MINIMAP_POINT_ACTIONS = frozenset({"Move_Minimap"})
 SELECT_BLINK_ACTION = "Select_Unit_Blink_Screen"
-PRODUCTION_ACTION_PREFIXES = ("Train_", "Research_")
+PRODUCTION_ACTION_PREFIXES = ("Train_",)
 MIN_PRODUCTION_SOURCE_HEALTH_FRACTION = 0.2
-RESEARCH_PREREQUISITES = {"Research_WarpGate": ("CyberneticsCore",)}
-RESEARCH_COSTS = {"Research_WarpGate": (50, 50, 0)}
 
 
 def semantic_argument_candidates(
@@ -285,6 +320,9 @@ def semantic_argument_candidates(
     action_name: str,
     *,
     unit_names: Mapping[int, str],
+    builder_tags: Optional[Collection[int]] = None,
+    known_expansion_resources: Sequence[Any] = (),
+    excluded_expansion_anchors: Collection[int] = (),
 ) -> Optional[list[list[Any]]]:
     """Return the single semantic candidate domain used at observe and dispatch time."""
 
@@ -293,6 +331,36 @@ def semantic_argument_candidates(
         action_name,
         unit_names=unit_names,
         include_home_minimap=True,
+        builder_tags=builder_tags,
+        known_expansion_resources=known_expansion_resources,
+        excluded_expansion_anchors=excluded_expansion_anchors,
+    )
+
+
+def minimap_scout_candidates(observation: Any) -> list[list[int]]:
+    """Return unexplored pathable minimap points for camera scouting."""
+
+    return _movement_minimap_candidates(
+        observation,
+        include_home=False,
+        fill_map=True,
+    )
+
+
+def expansion_anchor_candidates(
+    observation: Any,
+    *,
+    unit_names: Mapping[int, str],
+    known_expansion_resources: Sequence[Any],
+    excluded_expansion_anchors: Collection[int] = (),
+) -> list[int]:
+    """Return persistent resource-cluster anchors independent of current camera position."""
+
+    return _expansion_anchor_candidates(
+        observation,
+        unit_names,
+        known_resources=known_expansion_resources,
+        excluded_anchors=excluded_expansion_anchors,
     )
 
 
@@ -307,6 +375,8 @@ def is_source_bound_action(action_name: str) -> bool:
         is_production_action(action_name)
         or addon_spec(action_name) is not None
         or morph_spec(action_name) is not None
+        or research_spec(action_name) is not None
+        or ability_spec(action_name) is not None
     )
 
 
@@ -323,10 +393,14 @@ def production_source_tag(
     action_name = str(action.get("name", ""))
     if not is_source_bound_action(action_name):
         return None
-    spec = production_spec(action_name) or addon_spec(action_name) or morph_spec(action_name)
-    cost = (
-        None if spec is None else (spec.minerals, spec.vespene, spec.supply)
-    ) or RESEARCH_COSTS.get(action_name)
+    spec = (
+        production_spec(action_name)
+        or addon_spec(action_name)
+        or morph_spec(action_name)
+        or research_spec(action_name)
+        or ability_spec(action_name)
+    )
+    cost = None if spec is None else (spec.minerals, spec.vespene, spec.supply)
     if cost is not None and not _production_cost_is_available(observation, *cost):
         return None
     source_types = {
@@ -334,32 +408,69 @@ def production_source_tag(
         for function_id in _action_function_ids(action)
         if function_id in action_source_types
     }
-    if len(source_types) != 1:
+    source_names = (
+        {
+            spec.producer_type,
+            *getattr(spec, "alternate_producer_types", ()),
+        }
+        if spec is not None
+        else set()
+    )
+    if not source_names and len(source_types) != 1:
         return None
     raw_units = list(_value(observation, "raw_units", ()))
-    prerequisites = (
-        spec.prerequisites if spec is not None else RESEARCH_PREREQUISITES.get(action_name, ())
-    )
+    percent_build_progress = _raw_units_use_percent_build_progress(raw_units)
+    prerequisites = spec.prerequisites if spec is not None else ()
     completed_structures = {
         _unit_name(unit, unit_names)
         for unit in raw_units
-        if int(_value(unit, "alliance", 0)) == 1 and _build_progress(unit) >= 1.0
+        if int(_value(unit, "alliance", 0)) == 1
+        and _normalized_build_progress(unit, percent_scale=percent_build_progress) >= 1.0
     }
     if not set(prerequisites).issubset(completed_structures):
         return None
-    source_type = next(iter(source_types))
+    research = research_spec(action_name)
+    if research is not None:
+        if research.upgrade_id in {int(value) for value in _value(observation, "upgrades", ())}:
+            return None
+        if any(
+            (active_spec := research_spec_for_order(order_id)) is not None
+            and active_spec.action_name == research.action_name
+            for unit in raw_units
+            if int(_value(unit, "alliance", 0)) == 1
+            for order_id, _ in _unit_order_entries(unit)
+        ):
+            return None
+    source_type = next(iter(source_types)) if source_types else None
     excluded = {int(tag) for tag in excluded_source_tags}
+    addon_by_tag = {
+        int(_value(unit, "tag", 0)): _unit_name(unit, unit_names)
+        for unit in raw_units
+        if int(_value(unit, "alliance", 0)) == 1
+    }
+    required_addon = getattr(spec, "required_addon_type", None)
+    minimum_energy = float(getattr(spec, "minimum_energy", 0.0))
+    requires_idle = bool(getattr(spec, "requires_idle", True))
     candidates = [
         unit
         for unit in raw_units
         if int(_value(unit, "alliance", 0)) == 1
-        and int(_value(unit, "unit_type", 0)) == source_type
-        and _build_progress(unit) >= 1.0
+        and (
+            _unit_name(unit, unit_names) in source_names
+            if source_names
+            else int(_value(unit, "unit_type", 0)) == source_type
+        )
+        and _normalized_build_progress(unit, percent_scale=percent_build_progress) >= 1.0
         and _health_fraction(unit) >= MIN_PRODUCTION_SOURCE_HEALTH_FRACTION
-        and int(_value(unit, "active", 0)) == 0
+        and (not requires_idle or int(_value(unit, "active", 0)) == 0)
+        and float(_value(unit, "energy", 0.0)) >= minimum_energy
         and int(_value(unit, "tag", 0)) > 0
         and int(_value(unit, "tag", 0)) not in excluded
         and (addon_spec(action_name) is None or int(_value(unit, "add_on_tag", 0)) == 0)
+        and (
+            required_addon is None
+            or addon_by_tag.get(int(_value(unit, "add_on_tag", 0))) == required_addon
+        )
     ]
     if not candidates:
         return None
@@ -367,7 +478,7 @@ def production_source_tag(
     # not sort or skip ahead, otherwise the cached producer provenance can
     # silently refer to a different building than translator primitive 573.
     selected = candidates[0]
-    if int(_value(selected, "order_length", 0)) != 0:
+    if requires_idle and int(_value(selected, "order_length", 0)) != 0:
         return None
     return int(_value(selected, "tag", 0))
 
@@ -387,6 +498,45 @@ def _production_cost_is_available(
         and int(_value(player, "vespene", 0)) >= vespene
         and free_supply >= supply
     )
+
+
+def production_dispatch_failure(
+    observation: Any,
+    action_name: str,
+    *,
+    unit_names: Mapping[int, str],
+    required_function_id: int | None = None,
+) -> str | None:
+    """Revalidate production prerequisites and capability at final dispatch."""
+
+    spec = production_spec(action_name)
+    if spec is None:
+        return None
+    if not _production_cost_is_available(
+        observation,
+        spec.minerals,
+        spec.vespene,
+        spec.supply,
+    ):
+        return f"{action_name} resources or supply are no longer sufficient"
+    raw_units = list(_value(observation, "raw_units", ()))
+    percent_scale = _raw_units_use_percent_build_progress(raw_units)
+    completed = {
+        _unit_name(unit, unit_names)
+        for unit in raw_units
+        if int(_value(unit, "alliance", 0)) == 1
+        and _normalized_build_progress(unit, percent_scale=percent_scale) >= 1.0
+    }
+    missing = tuple(name for name in spec.prerequisites if name not in completed)
+    if missing:
+        return f"{action_name} requires completed {', '.join(missing)}"
+    if required_function_id is not None:
+        available = _value(observation, "available_actions", None)
+        if available is not None and int(required_function_id) not in {
+            int(value) for value in available
+        }:
+            return f"{action_name} is not currently available at final dispatch"
+    return None
 
 
 def nexus_placement_footprint_is_visible(
@@ -418,6 +568,144 @@ def nexus_placement_footprint_is_visible(
     )
 
 
+def world_build_target_is_legal(
+    observation: Any,
+    action_name: str,
+    world_target: tuple[float, float],
+    *,
+    preferred_anchor_tag: int | None = None,
+    unit_names: Mapping[int, str],
+    builder_tags: Collection[int] = (),
+    world_to_minimap_transform: tuple[float, float, float, float, float] | None = None,
+) -> bool:
+    """Validate the exact world target against the current feature-layer state."""
+
+    spec = BUILD_SPECS.get(action_name)
+    if spec is None:
+        return False
+    feature_screen = _value(observation, "feature_screen", None)
+    if feature_screen is not None:
+        projected = _world_to_screen_target(
+            observation,
+            world_target,
+            preferred_anchor_tag=preferred_anchor_tag,
+        )
+        dimensions = _screen_dimensions(observation)
+        if (
+            projected is not None
+            and dimensions is not None
+            and 0 <= projected[0] < dimensions[1]
+            and 0 <= projected[1] < dimensions[0]
+        ):
+            if spec.placement_kind == "expansion" and not (
+                nexus_placement_footprint_is_visible(observation, projected)
+            ):
+                return False
+            return _build_screen_position_is_legal(
+                observation,
+                spec,
+                projected,
+                unit_names=unit_names,
+                builder_tags=builder_tags or None,
+            )
+    if spec.placement_kind == "expansion" and world_to_minimap_transform is not None:
+        return _world_minimap_build_target_is_legal(
+            observation,
+            spec,
+            world_target,
+            world_to_minimap_transform=world_to_minimap_transform,
+            builder_tags=builder_tags,
+        )
+    # Geometry-only tests omit all live observation state. A live dispatch
+    # without a current screen or full-map transform must fail closed.
+    return _value(observation, "player_common", _value(observation, "player", None)) is None
+
+
+def _world_minimap_build_target_is_legal(
+    observation: Any,
+    spec: BuildSpec,
+    world_target: tuple[float, float],
+    *,
+    world_to_minimap_transform: tuple[float, float, float, float, float],
+    builder_tags: Collection[int],
+) -> bool:
+    feature_minimap = _value(observation, "feature_minimap", None)
+    buildable = _value(feature_minimap, "buildable", None)
+    pathable = _value(feature_minimap, "pathable", None)
+    visibility = _value(feature_minimap, "visibility_map", None)
+    player_relative = _value(feature_minimap, "player_relative", None)
+    dimensions = _plane_dimensions(buildable)
+    if dimensions is None or any(
+        _plane_dimensions(plane) != dimensions for plane in (pathable, visibility, player_relative)
+    ):
+        return False
+    height, width = dimensions
+    scale, x_offset, y_offset, world_range, _ = world_to_minimap_transform
+    center_x = (float(world_target[0]) + x_offset) * scale
+    center_y = (world_range - float(world_target[1]) + y_offset) * scale
+    half_extent = float(spec.footprint) * scale / 2
+    min_x, max_x = math.ceil(center_x - half_extent), math.floor(center_x + half_extent)
+    min_y, max_y = math.ceil(center_y - half_extent), math.floor(center_y + half_extent)
+    if min_x <= 0 or min_y <= 0 or max_x >= width or max_y >= height:
+        return False
+    footprint = {(x, y) for y in range(min_y, max_y + 1) for x in range(min_x, max_x + 1)}
+    if any(
+        int(visibility[y][x]) != 2
+        or int(buildable[y][x]) != 1
+        or int(pathable[y][x]) != 1
+        or int(player_relative[y][x]) != 0
+        for x, y in footprint
+    ):
+        return False
+    if not builder_tags:
+        return True
+    wanted_builders = {int(tag) for tag in builder_tags}
+    starts = {
+        (
+            int(round((float(_value(unit, "x", 0.0)) + x_offset) * scale)),
+            int(round((world_range - float(_value(unit, "y", 0.0)) + y_offset) * scale)),
+        )
+        for unit in _value(observation, "raw_units", ())
+        if int(_value(unit, "alliance", 0)) == 1 and int(_value(unit, "tag", 0)) in wanted_builders
+    }
+    starts = {
+        point
+        for point in starts
+        if 0 <= point[0] < width
+        and 0 <= point[1] < height
+        and int(pathable[point[1]][point[0]]) == 1
+    }
+    if not starts:
+        return False
+    approach = {
+        (x, y)
+        for y in range(min_y - 1, max_y + 2)
+        for x in range(min_x - 1, max_x + 2)
+        if 0 <= x < width
+        and 0 <= y < height
+        and (x, y) not in footprint
+        and int(pathable[y][x]) == 1
+    }
+    frontier = list(starts)
+    reached = set(starts)
+    while frontier:
+        x, y = frontier.pop()
+        if (x, y) in approach:
+            return True
+        for neighbor in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)):
+            neighbor_x, neighbor_y = neighbor
+            if (
+                neighbor in reached
+                or neighbor in footprint
+                or not (0 <= neighbor_x < width and 0 <= neighbor_y < height)
+                or int(pathable[neighbor_y][neighbor_x]) != 1
+            ):
+                continue
+            reached.add(neighbor)
+            frontier.append(neighbor)
+    return False
+
+
 class TimeStepExtractor:
     """Read only the stable fields used by the v1 observation contract.
 
@@ -435,6 +723,8 @@ class TimeStepExtractor:
         upgrade_names: Optional[Mapping[int, str]] = None,
         building_types: Sequence[int] = (),
         action_source_types: Optional[Mapping[int, int]] = None,
+        raw_action_mode: bool = False,
+        placement_service: Optional[RawPlacementService] = None,
     ) -> None:
         self.run_id = run_id
         self.episode_id = episode_id
@@ -447,6 +737,110 @@ class TimeStepExtractor:
             int(function_id): int(unit_type)
             for function_id, unit_type in (action_source_types or {}).items()
         }
+        self.raw_action_mode = bool(raw_action_mode)
+        self.placement_service = placement_service or RawPlacementService(
+            unit_names=self.unit_names
+        )
+        self._expansion_candidates_exhausted = False
+        self._expansion_scout_alerts: tuple[str, ...] = ()
+        self._raw_expansion_generation = 1
+        self._raw_known_candidate_tags: set[int] = set()
+        self._raw_expansion_initialized = False
+        self._latest_game_loop = 0
+
+    @property
+    def known_expansion_resources(self) -> tuple[dict[str, Any], ...]:
+        return self.placement_service.known_resources
+
+    @property
+    def _known_expansion_resources(self) -> dict[int, dict[str, Any]]:
+        """Compatibility view backed by the single placement-service store."""
+
+        return self.placement_service._known_resources  # noqa: SLF001
+
+    @property
+    def suppressed_expansion_anchors(self) -> frozenset[int]:
+        return self.placement_service.suppressed_anchors
+
+    def set_expansion_candidates_exhausted(self, exhausted: bool) -> None:
+        self._expansion_candidates_exhausted = bool(exhausted)
+
+    def set_expansion_scout_alerts(self, alerts: Sequence[str]) -> None:
+        self._expansion_scout_alerts = tuple(str(alert) for alert in alerts)
+
+    def suppress_expansion_anchor(
+        self,
+        tag: int,
+        *,
+        game_loop: int,
+    ) -> None:
+        self._latest_game_loop = max(self._latest_game_loop, int(game_loop))
+        self.placement_service.suppress_anchor(int(tag))
+
+    def suppress_build_world_target(
+        self,
+        action_name: str,
+        target: Sequence[int | float],
+    ) -> None:
+        """Permanently quarantine one failed world-space build region."""
+
+        self.placement_service.suppress_world_target(action_name, target)
+
+    def observe_expansion_resources(
+        self,
+        observation: Any,
+        agents: Mapping[str, Any],
+    ) -> None:
+        """Update persistent anchors on every Worker frame, not only Runtime ticks."""
+
+        self.placement_service.observe(
+            observation,
+            require_feature_visibility=not self.raw_action_mode,
+        )
+        self._latest_game_loop = int(_scalar(_value(observation, "game_loop", 0)))
+        if self.raw_action_mode:
+            self._update_raw_expansion_state(observation)
+        known = self.known_expansion_resources
+        suppressed = self.suppressed_expansion_anchors
+        for agent in agents.values():
+            agent._rtscortex_known_expansion_resources = known
+            agent._rtscortex_suppressed_expansion_anchors = suppressed
+            agent._rtscortex_raw_placement_service = self.placement_service
+
+    def _update_raw_expansion_state(self, observation: Any) -> None:
+        all_candidates = set(
+            _expansion_anchor_candidates(
+                observation,
+                self.unit_names,
+                known_resources=self.known_expansion_resources,
+                excluded_anchors=(),
+            )
+        )
+        newly_discovered = all_candidates - self._raw_known_candidate_tags
+        if self._raw_expansion_initialized and newly_discovered:
+            self._raw_expansion_generation += 1
+        self._raw_known_candidate_tags.update(all_candidates)
+        self._raw_expansion_initialized = True
+        available = sorted(all_candidates - self.suppressed_expansion_anchors)
+        if available:
+            state = "candidate_available"
+        elif all_candidates and self.suppressed_expansion_anchors.intersection(all_candidates):
+            state = "all_candidates_exhausted"
+        else:
+            state = "not_discovered_yet"
+        self._expansion_candidates_exhausted = state == "all_candidates_exhausted"
+        available_text = ",".join(hex(tag) for tag in available) or "none"
+        rejected_text = (
+            ",".join(hex(tag) for tag in sorted(self.suppressed_expansion_anchors)) or "none"
+        )
+        evaluated = len(all_candidates.intersection(self.suppressed_expansion_anchors))
+        self._expansion_scout_alerts = (
+            f"expansion_scout_state={state}",
+            f"expansion_scout_generation={self._raw_expansion_generation}",
+            f"expansion_scout_waypoints={evaluated}/{len(all_candidates)}",
+            f"expansion_scout_available_anchors={available_text}",
+            f"expansion_scout_rejected_anchors={rejected_text}",
+        )
 
     def extract(
         self,
@@ -462,6 +856,11 @@ class TimeStepExtractor:
             raise ValueError("PySC2 observation has no player data")
 
         raw_units = list(_value(observation, "raw_units", ()))
+        percent_build_progress = _raw_units_use_percent_build_progress(raw_units)
+        self.observe_expansion_resources(observation, agents)
+        self.placement_service.reset_diagnostics()
+        minimap_transform = _world_to_minimap_transform(agents)
+        self.placement_service.set_world_to_minimap_transform(minimap_transform)
         teams = _extract_team_actions(
             agents,
             fallback_observation=observation,
@@ -472,6 +871,8 @@ class TimeStepExtractor:
                 if int(_value(unit, "alliance", 0)) == 1
             },
             action_source_types=self.action_source_types,
+            rejected_build_world_targets=self.placement_service.quarantined_targets,
+            raw_action_mode=self.raw_action_mode,
         )
         text_observation = "\n\n".join(
             f"[{name}]\n{text_observations[name]}" for name in sorted(text_observations)
@@ -487,18 +888,53 @@ class TimeStepExtractor:
                 observation,
                 unit_names=self.unit_names,
             ),
-            "units": [self._extract_unit(unit) for unit in raw_units],
+            "units": [
+                self._extract_unit(
+                    unit,
+                    minimap_transform=minimap_transform,
+                    percent_build_progress=percent_build_progress,
+                )
+                for unit in raw_units
+            ],
             "upgrades": [
                 self.upgrade_names.get(int(value), f"upgrade:{int(value)}")
                 for value in _value(observation, "upgrades", ())
             ],
             "teams": teams,
             "text_observation": text_observation,
-            "alerts": [_alert_name(value) for value in _value(observation, "alerts", ())],
+            "alerts": [
+                *[_alert_name(value) for value in _value(observation, "alerts", ())],
+                *self._expansion_scout_alerts,
+                *self.placement_service.placement_alerts,
+                *(
+                    ["expansion_candidates_exhausted"]
+                    if self._expansion_candidates_exhausted
+                    else []
+                ),
+            ],
             "image_uri": None,
         }
 
-    def _extract_unit(self, unit: Any) -> dict[str, Any]:
+    def _remember_expansion_resources(
+        self,
+        raw_units: Sequence[Any],
+        feature_units: Sequence[Any],
+    ) -> None:
+        """Compatibility seam backed by the placement service's single store."""
+
+        self.placement_service.observe_units(
+            raw_units,
+            feature_units,
+            require_feature_visibility=not self.raw_action_mode,
+        )
+
+    def _extract_unit(
+        self,
+        unit: Any,
+        *,
+        minimap_transform: Optional[tuple[float, float, float, float, float]],
+        percent_build_progress: bool,
+    ) -> dict[str, Any]:
         unit_type = int(_value(unit, "unit_type", 0))
         is_structure = unit_type in self.building_types
         health = float(_value(unit, "health", 0.0))
@@ -506,23 +942,53 @@ class TimeStepExtractor:
         health_max = float(_value(unit, "health_max", 0.0))
         if health_max <= 0:
             health_max = health / health_ratio if health_ratio > 0 else max(health, 1.0)
+        shield = float(_value(unit, "shield", 0.0))
+        shield_max = float(_value(unit, "shield_max", 0.0))
         order_length = int(_value(unit, "order_length", 0))
         status = "idle" if order_length == 0 else "active"
         build_progress = _value(unit, "build_progress", None)
         if is_structure and build_progress is not None:
-            normalized_progress = float(build_progress)
-            if normalized_progress > 1.0:
-                normalized_progress /= 100.0
+            normalized_progress = _normalized_build_progress(
+                unit,
+                percent_scale=percent_build_progress,
+            )
             if normalized_progress < 1.0:
                 status = "constructing"
+        minimap_position = None
+        if self.raw_action_mode:
+            minimap_position = [
+                float(_value(unit, "x", 0.0)),
+                float(_value(unit, "y", 0.0)),
+            ]
+        elif minimap_transform is not None:
+            scale, x_offset, y_offset, world_range, maximum = minimap_transform
+            minimap_position = [
+                max(
+                    0.0,
+                    min(
+                        maximum,
+                        (float(_value(unit, "x", 0.0)) + x_offset) * scale,
+                    ),
+                ),
+                max(
+                    0.0,
+                    min(
+                        maximum,
+                        (world_range - float(_value(unit, "y", 0.0)) + y_offset) * scale,
+                    ),
+                ),
+            ]
         return {
             "tag": int(_value(unit, "tag", 0)),
             "unit_type": self.unit_names.get(unit_type, f"unit:{unit_type}"),
             "alliance": ALLIANCES.get(int(_value(unit, "alliance", 0)), "neutral"),
             "is_structure": is_structure,
             "position": [float(_value(unit, "x", 0.0)), float(_value(unit, "y", 0.0))],
+            "minimap_position": minimap_position,
             "health": health,
             "health_max": health_max,
+            "shield": shield,
+            "shield_max": shield_max,
             "energy": float(_value(unit, "energy", 0.0)),
             "status": status,
         }
@@ -563,7 +1029,10 @@ def _extract_production_queue(
             continue
         for order_id, progress in _unit_order_entries(unit):
             spec = production_spec_for_order(order_id)
-            if spec is None or spec.producer_type != producer_type:
+            if spec is None or producer_type not in {
+                spec.producer_type,
+                *spec.alternate_producer_types,
+            }:
                 continue
             producer_counts[spec.action_name] += 1
             result.append(
@@ -635,10 +1104,13 @@ def _extract_team_actions(
     unit_names: Mapping[int, str],
     owned_unit_types: set[int],
     action_source_types: Mapping[int, int],
+    rejected_build_world_targets: Mapping[str, Sequence[tuple[float, float]]],
+    raw_action_mode: bool = False,
 ) -> list[dict[str, Any]]:
     teams = []
     for agent_name in sorted(agents):
         agent = agents[agent_name]
+        _prioritize_creep_tumor_source(agent)
         team_definitions = {
             str(team["name"]): team for team in agent.config.AGENTS[agent_name]["team"]
         }
@@ -655,6 +1127,12 @@ def _extract_team_actions(
                 if index >= len(team_observations)
                 else team_observations[index].observation
             )
+            actor_tags = (
+                (int(agent.team_unit_tag_list[index]),)
+                if index < len(getattr(agent, "team_unit_tag_list", ()))
+                and int(agent.team_unit_tag_list[index]) > 0
+                else tuple(int(tag) for tag in team.get("unit_tags", ()) if int(tag) > 0)
+            )
             actions = _available_team_actions(
                 agent,
                 team,
@@ -663,15 +1141,60 @@ def _extract_team_actions(
                 unit_names=unit_names,
                 owned_unit_types=owned_unit_types,
                 action_source_types=action_source_types,
+                rejected_build_world_targets=rejected_build_world_targets,
+                raw_action_mode=raw_action_mode,
+                actor_tags=actor_tags,
             )
-            teams.append(
-                {
-                    "agent_name": agent_name,
-                    "team_name": str(team_name),
-                    "available_actions": actions,
-                }
-            )
+            team_snapshot: dict[str, Any] = {
+                "agent_name": agent_name,
+                "team_name": str(team_name),
+                "available_actions": actions,
+            }
+            if actor_tags:
+                team_snapshot["unit_tags"] = sorted(set(actor_tags))
+            teams.append(team_snapshot)
     return teams
+
+
+def _prioritize_creep_tumor_source(agent: Any) -> None:
+    """Put the next mature tumor first without duplicating one logical actor.
+
+    Upstream records one observation per single-selected tumor, while RTSCortex
+    intentionally exposes one logical team. Reordering all three parallel lists
+    keeps the observation used for availability and the tag later used for
+    execution identical.
+    """
+
+    if getattr(agent, "name", "") != "CombatGroup4":
+        return
+    observations = list(getattr(agent, "team_unit_obs_list", ()))
+    tags = list(getattr(agent, "team_unit_tag_list", ()))
+    teams = list(getattr(agent, "team_unit_team_list", ()))
+    if not (len(observations) == len(tags) == len(teams)):
+        return
+    source_index = next(
+        (
+            index
+            for index, timestep in enumerate(observations)
+            if 47
+            in {
+                int(value)
+                for value in _value(
+                    _value(timestep, "observation", timestep),
+                    "available_actions",
+                    (),
+                )
+            }
+        ),
+        None,
+    )
+    if source_index is None or source_index == 0:
+        return
+    for values in (observations, tags, teams):
+        values.insert(0, values.pop(source_index))
+    agent.team_unit_obs_list[:] = observations
+    agent.team_unit_tag_list[:] = tags
+    agent.team_unit_team_list[:] = teams
 
 
 def current_team_order(agent: Any) -> tuple[str, ...]:
@@ -701,6 +1224,9 @@ def _available_team_actions(
     unit_names: Mapping[int, str],
     owned_unit_types: set[int],
     action_source_types: Mapping[int, int],
+    rejected_build_world_targets: Mapping[str, Sequence[tuple[float, float]]],
+    actor_tags: Collection[int],
+    raw_action_mode: bool = False,
 ) -> list[dict[str, Any]]:
     action_space = agent.config.AGENTS[agent.name]["action"]
     unit_types = list(team.get("unit_type", ())) or ["EmptyGroup"]
@@ -739,6 +1265,10 @@ def _available_team_actions(
             forbidden_order_ids=(INJECT_RAW_FUNCTION_ID,),
         ):
             continue
+        if action_name == TUMOR_CONTROLLER_ACTION and (
+            available_ids is None or 47 not in available_ids
+        ):
+            continue
         if (
             build_spec is None
             and action_name not in QUEEN_CONTROLLER_ACTIONS
@@ -769,12 +1299,43 @@ def _available_team_actions(
                 continue
         elif required_sources and not required_sources.issubset(owned_unit_types):
             continue
-        argument_candidates = _argument_candidates(
-            observation,
-            action_name,
-            unit_names=unit_names,
-            include_home_minimap=agent.name.startswith("CombatGroup"),
+        argument_candidates: Optional[list[list[Any]]]
+        screen_provenance: list[Any]
+        raw_placement = (
+            getattr(agent, "_rtscortex_raw_placement_service", None)
+            if raw_action_mode and build_spec is not None
+            else None
         )
+        if isinstance(raw_placement, RawPlacementService):
+            placement_candidates = raw_placement.candidates(
+                observation,
+                action_name,
+                builder_tags=actor_tags if agent.name == "Builder" else (),
+            )
+            argument_candidates = placement_candidates.argument_candidates
+            screen_provenance = placement_candidates.screen_provenance
+        else:
+            argument_candidates = _argument_candidates(
+                observation,
+                action_name,
+                unit_names=unit_names,
+                include_home_minimap=agent.name.startswith("CombatGroup"),
+                builder_tags=(
+                    actor_tags if agent.name == "Builder" and build_spec is not None else None
+                ),
+                known_expansion_resources=getattr(
+                    agent,
+                    "_rtscortex_known_expansion_resources",
+                    (),
+                ),
+                excluded_expansion_anchors=getattr(
+                    agent,
+                    "_rtscortex_suppressed_expansion_anchors",
+                    (),
+                ),
+                raw_action_mode=raw_action_mode,
+            )
+            screen_provenance = []
         if (
             agent.name == "Builder"
             and action_name == "Move_Screen"
@@ -791,14 +1352,11 @@ def _available_team_actions(
         needs_screen_provenance = action_name in SCREEN_POINT_ACTIONS or (
             build_spec is not None and build_spec.placement_kind == "screen"
         )
-        screen_provenance = (
-            screen_candidate_provenance(
+        if needs_screen_provenance and not screen_provenance:
+            screen_provenance = screen_candidate_provenance(
                 observation,
                 [candidate[0] for candidate in argument_candidates or []],
             )
-            if needs_screen_provenance
-            else []
-        )
         if argument_candidates and needs_screen_provenance and not screen_provenance:
             continue
         if (
@@ -822,6 +1380,8 @@ def _available_team_actions(
                     "screen_target": list(item.screen_target),
                     "world_target": list(item.world_target),
                     "anchor_tag": item.anchor_tag,
+                    "placement_candidate_id": item.placement_candidate_id,
+                    "placement_revision": item.placement_revision,
                 }
                 for item in screen_provenance
             ]
@@ -841,10 +1401,13 @@ def _available_team_actions(
 
 
 def _completed_own_structures(observation: Any, unit_names: Mapping[int, str]) -> set[str]:
+    raw_units = list(_value(observation, "raw_units", ()))
+    percent_scale = _raw_units_use_percent_build_progress(raw_units)
     return {
         _unit_name(unit, unit_names)
-        for unit in _value(observation, "raw_units", ())
-        if int(_value(unit, "alliance", 0)) == 1 and _build_progress(unit) >= 1.0
+        for unit in raw_units
+        if int(_value(unit, "alliance", 0)) == 1
+        and _normalized_build_progress(unit, percent_scale=percent_scale) >= 1.0
     }
 
 
@@ -915,6 +1478,10 @@ def _argument_candidates(
     *,
     unit_names: Mapping[int, str],
     include_home_minimap: bool,
+    builder_tags: Optional[Collection[int]] = None,
+    known_expansion_resources: Sequence[Any] = (),
+    excluded_expansion_anchors: Collection[int] = (),
+    raw_action_mode: bool = False,
 ) -> Optional[list[list[Any]]]:
     if action_name == INJECT_ACTION:
         return [
@@ -931,12 +1498,27 @@ def _argument_candidates(
                 }
             )
         ]
+    if action_name == MULE_ACTION:
+        return [
+            [[int(_value(unit, "x", 0)), int(_value(unit, "y", 0))]]
+            for unit in _value(observation, "feature_units", ())
+            if int(_value(unit, "alliance", 0)) == 3
+            and bool(_value(unit, "is_on_screen", True))
+            and _is_mineral(_unit_name(unit, unit_names))
+        ][:8]
     if action_name == "Attack_Unit":
+        units = (
+            _value(observation, "raw_units", ())
+            if raw_action_mode
+            else _value(observation, "feature_units", ())
+        )
         return [
             [int(_value(unit, "tag", 0))]
-            for unit in _value(observation, "feature_units", ())
+            for unit in units
             if int(_value(unit, "alliance", 0)) == 4
-            and bool(_value(unit, "is_on_screen", True))
+            and (raw_action_mode or bool(_value(unit, "is_on_screen", True)))
+            and int(_value(unit, "display_type", 1)) == 1
+            and (not raw_action_mode or float(_value(unit, "health", 0.0)) > 0)
             and int(_value(unit, "tag", 0)) > 0
         ]
     if action_name in SCREEN_POINT_ACTIONS:
@@ -974,14 +1556,16 @@ def _argument_candidates(
     if not _build_prerequisites_satisfied(observation, spec, unit_names):
         return []
     if spec.placement_kind == "screen":
-        return [
+        candidates = [
             [candidate]
             for candidate in build_screen_candidates(
                 observation,
                 action_name,
                 unit_names=unit_names,
+                builder_tags=builder_tags,
             )
         ]
+        return candidates
     if spec.placement_kind == "geyser":
         return [
             [tag]
@@ -991,7 +1575,15 @@ def _argument_candidates(
                 target_structure=spec.target_structure,
             )
         ]
-    return [[tag] for tag in _expansion_anchor_candidates(observation, unit_names)]
+    return [
+        [tag]
+        for tag in _expansion_anchor_candidates(
+            observation,
+            unit_names,
+            known_resources=known_expansion_resources,
+            excluded_anchors=excluded_expansion_anchors,
+        )
+    ]
 
 
 def _action_function_ids(action: Mapping[str, Any]) -> tuple[int, ...]:
@@ -1066,6 +1658,7 @@ def _movement_minimap_candidates(
     *,
     limit: int = 8,
     include_home: bool = False,
+    fill_map: bool = False,
 ) -> list[list[int]]:
     """Return stable pathable scouting targets across the minimap.
 
@@ -1113,7 +1706,7 @@ def _movement_minimap_candidates(
     resource_targets.sort()
     desired = [(x, y) for _, y, x in resource_targets]
 
-    if not desired:
+    if fill_map or not desired:
         last_x, last_y = width - 1, height - 1
         desired.extend(
             (round(last_x * x_fraction / 8), round(last_y * y_fraction / 8))
@@ -1243,18 +1836,52 @@ def _build_prerequisites_satisfied(
     spec: BuildSpec,
     unit_names: Mapping[int, str],
 ) -> bool:
+    return raw_build_eligibility(observation, spec, unit_names).eligible
+
+
+def raw_build_eligibility(
+    observation: Any,
+    action_or_spec: str | BuildSpec,
+    unit_names: Mapping[int, str],
+) -> RawBuildEligibility:
+    """Check RAW build costs and completed tech without UI action availability."""
+
+    spec = BUILD_SPECS[action_or_spec] if isinstance(action_or_spec, str) else action_or_spec
     player = _value(observation, "player_common", _value(observation, "player", None))
-    if player is not None:
-        if int(_value(player, "minerals", 0)) < spec.mineral_cost:
-            return False
-        if int(_value(player, "vespene", 0)) < spec.vespene_cost:
-            return False
+    # Synthetic geometry-only callers do not expose economy state. Live RAW
+    # observations always do, and therefore always take the complete contract.
+    if player is None:
+        return RawBuildEligibility(True)
+    minerals = int(_value(player, "minerals", 0))
+    vespene = int(_value(player, "vespene", 0))
+    if minerals < spec.mineral_cost:
+        return RawBuildEligibility(
+            False,
+            "build_insufficient_minerals",
+            f"{spec.target_structure} requires {spec.mineral_cost} minerals; observed {minerals}",
+        )
+    if vespene < spec.vespene_cost:
+        return RawBuildEligibility(
+            False,
+            "build_insufficient_vespene",
+            f"{spec.target_structure} requires {spec.vespene_cost} vespene; observed {vespene}",
+        )
+    raw_units = list(_value(observation, "raw_units", ()))
+    percent_scale = _raw_units_use_percent_build_progress(raw_units)
     completed = {
         _unit_name(unit, unit_names)
-        for unit in _value(observation, "raw_units", ())
-        if int(_value(unit, "alliance", 0)) == 1 and _build_progress(unit) >= 1.0
+        for unit in raw_units
+        if int(_value(unit, "alliance", 0)) == 1
+        and _normalized_build_progress(unit, percent_scale=percent_scale) >= 1.0
     }
-    return all(prerequisite in completed for prerequisite in spec.prerequisites)
+    missing = tuple(item for item in spec.prerequisites if item not in completed)
+    if missing:
+        return RawBuildEligibility(
+            False,
+            "build_missing_prerequisite",
+            f"{spec.target_structure} requires completed {', '.join(missing)}",
+        )
+    return RawBuildEligibility(True)
 
 
 def _gas_structure_candidates(
@@ -1264,12 +1891,13 @@ def _gas_structure_candidates(
     target_structure: str,
 ) -> list[int]:
     raw_units = list(_value(observation, "raw_units", ()))
+    percent_scale = _raw_units_use_percent_build_progress(raw_units)
     townhalls = [
         unit
         for unit in raw_units
         if int(_value(unit, "alliance", 0)) == 1
         and _unit_name(unit, unit_names).casefold() in TOWNHALL_NAMES
-        and _build_progress(unit) >= 1.0
+        and _normalized_build_progress(unit, percent_scale=percent_scale) >= 1.0
     ]
     gas_structures = [
         unit
@@ -1287,6 +1915,7 @@ def _gas_structure_candidates(
         if (
             tag <= 0
             or int(_value(unit, "alliance", 0)) != 3
+            or int(_value(unit, "display_type", 1)) != 1
             or not _is_gas(_unit_name(unit, unit_names))
         ):
             continue
@@ -1301,6 +1930,9 @@ def _gas_structure_candidates(
 def _expansion_anchor_candidates(
     observation: Any,
     unit_names: Mapping[int, str],
+    *,
+    known_resources: Sequence[Any] = (),
+    excluded_anchors: Collection[int] = (),
 ) -> list[int]:
     raw_units = list(_value(observation, "raw_units", ()))
     visible_resource_tags = {
@@ -1310,13 +1942,15 @@ def _expansion_anchor_candidates(
         and bool(_value(unit, "is_on_screen", True))
         and int(_value(unit, "display_type", 1)) == 1
     }
-    resources = [
-        unit
-        for unit in raw_units
+    known_resource_tags = {int(_value(unit, "tag", 0)) for unit in known_resources}
+    resources_by_tag = {
+        int(_value(unit, "tag", 0)): unit
+        for unit in (*known_resources, *raw_units)
         if int(_value(unit, "alliance", 0)) == 3
         and (_is_gas(_unit_name(unit, unit_names)) or _is_mineral(_unit_name(unit, unit_names)))
         and int(_value(unit, "tag", 0)) > 0
-    ]
+    }
+    resources = list(resources_by_tag.values())
     if not resources:
         return []
     parent = list(range(len(resources)))
@@ -1351,15 +1985,6 @@ def _expansion_anchor_candidates(
     for cluster in clusters.values():
         if sum(_is_mineral(_unit_name(unit, unit_names)) for unit in cluster) < 5:
             continue
-        if (
-            sum(
-                _is_mineral(_unit_name(unit, unit_names))
-                and int(_value(unit, "tag", 0)) in visible_resource_tags
-                for unit in cluster
-            )
-            < 5
-        ):
-            continue
         center_x = sum(float(_value(unit, "x", 0.0)) for unit in cluster) / len(cluster)
         center_y = sum(float(_value(unit, "y", 0.0)) for unit in cluster) / len(cluster)
         if any(_point_distance(center_x, center_y, townhall) < 12.0 for townhall in townhalls):
@@ -1372,9 +1997,11 @@ def _expansion_anchor_candidates(
             ),
         )
         anchor_tag = int(_value(anchor, "tag", 0))
-        if anchor_tag not in visible_resource_tags:
+        if anchor_tag in excluded_anchors:
             continue
-        if not _nexus_anchor_has_legal_screen_placement(
+        if anchor_tag not in visible_resource_tags | known_resource_tags:
+            continue
+        if anchor_tag in visible_resource_tags and not _nexus_anchor_has_legal_screen_placement(
             observation,
             anchor_tag,
             unit_names,
@@ -1569,6 +2196,17 @@ def _build_progress(unit: Any) -> float:
     return progress / 100.0 if progress > 1.0 else progress
 
 
+def _raw_units_use_percent_build_progress(raw_units: Sequence[Any]) -> bool:
+    """Infer PySC2 RAW's integer percent scale without breaking normalized fixtures."""
+
+    return any(float(_value(unit, "build_progress", 0.0)) > 1.0 for unit in raw_units)
+
+
+def _normalized_build_progress(unit: Any, *, percent_scale: bool) -> float:
+    progress = float(_value(unit, "build_progress", 0.0))
+    return progress / 100.0 if percent_scale else progress
+
+
 def _health_fraction(unit: Any) -> float:
     health = float(_value(unit, "health", 0.0))
     health_max = float(_value(unit, "health_max", 0.0))
@@ -1735,6 +2373,7 @@ def resolve_screen_point_world_target(
     *,
     preferred_anchor_tag: Optional[int] = None,
     require_power: bool = False,
+    unit_names: Optional[Mapping[int, str]] = None,
 ) -> Optional[list[int]]:
     """Reproject a movement target into the current legal screen candidate domain."""
 
@@ -1751,10 +2390,23 @@ def resolve_screen_point_world_target(
     height, width = dimensions
     if not (0 <= projected[0] < width and 0 <= projected[1] < height):
         return None
-    candidates = _movement_screen_candidates(
-        observation,
-        blink=action_name == "Ability_Blink_Screen",
-        require_power=require_power,
+    candidates = (
+        [
+            candidate[0]
+            for candidate in _argument_candidates(
+                observation,
+                MULE_ACTION,
+                unit_names=unit_names or {},
+                include_home_minimap=False,
+            )
+            or []
+        ]
+        if action_name == MULE_ACTION
+        else _movement_screen_candidates(
+            observation,
+            blink=action_name == "Ability_Blink_Screen",
+            require_power=require_power,
+        )
     )
     if projected in candidates:
         return projected
@@ -1837,9 +2489,10 @@ def _build_screen_candidates(
     )
     reachable_builder_cells = (
         None
-        if action_name == "Build_CreepTumor_Queen_Screen"
+        if action_name in {"Build_CreepTumor_Queen_Screen", TUMOR_CONTROLLER_ACTION}
         else _builder_reachable_cells(
             pathable,
+            player_relative,
             feature_units,
             unit_names,
             screen_size,
@@ -1886,6 +2539,39 @@ def _build_screen_candidates(
                 unit_names,
             )
         ]
+    if action_name == TUMOR_CONTROLLER_ACTION:
+        source_positions = [
+            (float(_value(unit, "x", 0.0)), float(_value(unit, "y", 0.0)))
+            for unit in feature_units
+            if int(_value(unit, "alliance", 0)) == 1
+            and bool(_value(unit, "is_on_screen", True))
+            and bool(_value(unit, "is_selected", False))
+            and _unit_name(unit, unit_names)
+            in {"CreepTumor", "CreepTumorBurrowed", "CreepTumorQueen"}
+        ]
+        if len(source_positions) != 1:
+            return []
+        source_x, source_y = source_positions[0]
+        pixels_per_world = screen_size / SCREEN_WORLD_GRID
+        minimum_distance = 4.0 * pixels_per_world
+        maximum_distance = 9.5 * pixels_per_world
+        candidates = [
+            candidate
+            for candidate in candidates
+            if minimum_distance
+            <= math.dist((float(candidate[0]), float(candidate[1])), (source_x, source_y))
+            <= maximum_distance
+        ]
+        candidates.sort(
+            key=lambda candidate: (
+                -math.dist(
+                    (float(candidate[0]), float(candidate[1])),
+                    semantic_anchor,
+                ),
+                candidate[1],
+                candidate[0],
+            )
+        )
     return candidates if limit is None else candidates[:limit]
 
 
@@ -1993,6 +2679,7 @@ def _build_screen_position_is_legal(
         if spec.target_structure == "CreepTumorQueen"
         else _builder_reachable_cells(
             pathable,
+            player_relative,
             _value(observation, "feature_units", ()),
             unit_names,
             screen_size,
@@ -2123,6 +2810,7 @@ def _valid_build_positions(
 
 def _builder_reachable_cells(
     pathable: Any,
+    player_relative: Any,
     feature_units: Sequence[Any],
     unit_names: Mapping[int, str],
     screen_size: int,
@@ -2132,8 +2820,8 @@ def _builder_reachable_cells(
     """Return screen cells reachable from visible worker builders."""
 
     allowed_tags = None if builder_tags is None else {int(tag) for tag in builder_tags}
-    starts = {
-        (int(_value(unit, "x", 0)), int(_value(unit, "y", 0)))
+    builders = [
+        unit
         for unit in feature_units
         if int(_value(unit, "alliance", 0)) == 1
         and bool(_value(unit, "is_on_screen", True))
@@ -2142,41 +2830,61 @@ def _builder_reachable_cells(
             if allowed_tags is not None
             else _unit_name(unit, unit_names) in {"Probe", "SCV", "Drone"}
         )
-    }
+    ]
+    if allowed_tags is not None and not builders:
+        selected_workers = [
+            unit
+            for unit in feature_units
+            if int(_value(unit, "alliance", 0)) == 1
+            and bool(_value(unit, "is_on_screen", True))
+            and bool(_value(unit, "is_selected", False))
+            and _unit_name(unit, unit_names) in {"Probe", "SCV", "Drone"}
+        ]
+        if len(selected_workers) == 1:
+            builders = selected_workers
+    starts = {(int(_value(unit, "x", 0)), int(_value(unit, "y", 0))) for unit in builders}
     if not starts:
         return frozenset() if builder_tags is not None else None
 
     ratio = max(1, int(screen_size / SCREEN_WORLD_GRID))
-    blocked: set[tuple[int, int]] = set()
-    start_tags = allowed_tags or set()
-    for unit in feature_units:
-        if not bool(_value(unit, "is_on_screen", True)):
-            continue
-        tag = int(_value(unit, "tag", 0))
-        if tag in start_tags:
-            continue
-        alliance = int(_value(unit, "alliance", 0))
-        radius = max(0.0, float(_value(unit, "radius", 0.0)))
-        if alliance != 3 and radius < 1.0:
-            continue
-        unit_x = int(_value(unit, "x", 0))
-        unit_y = int(_value(unit, "y", 0))
-        cell_radius = max(1, math.ceil(radius * ratio))
-        for y in range(max(0, unit_y - cell_radius), min(screen_size, unit_y + cell_radius + 1)):
-            for x in range(
-                max(0, unit_x - cell_radius),
-                min(screen_size, unit_x + cell_radius + 1),
-            ):
-                if (x - unit_x) ** 2 + (y - unit_y) ** 2 <= cell_radius**2:
-                    blocked.add((x, y))
+    builder_footprints: set[tuple[int, int]] = set()
+    for builder in builders:
+        center_x = int(_value(builder, "x", 0))
+        center_y = int(_value(builder, "y", 0))
+        radius = max(1, math.ceil(float(_value(builder, "radius", 0.375)) * ratio))
+        builder_footprints.update(
+            (center_x + dx, center_y + dy)
+            for dx in range(-radius, radius + 1)
+            for dy in range(-radius, radius + 1)
+            if dx * dx + dy * dy <= radius * radius
+        )
 
-    frontier = [
-        point
-        for point in sorted(starts)
-        if 0 <= point[0] < screen_size
-        and 0 <= point[1] < screen_size
-        and pathable[point[1]][point[0]] == 1
-    ]
+    def traversable(x: int, y: int) -> bool:
+        return pathable[y][x] == 1 and (player_relative[y][x] == 0 or (x, y) in builder_footprints)
+
+    frontier: list[tuple[int, int]] = []
+    for start_x, start_y in sorted(starts):
+        if (
+            0 <= start_x < screen_size
+            and 0 <= start_y < screen_size
+            and traversable(start_x, start_y)
+        ):
+            frontier.append((start_x, start_y))
+            continue
+        for radius in range(1, max(2, ratio) + 1):
+            nearby = sorted(
+                (start_x + dx, start_y + dy)
+                for dx in range(-radius, radius + 1)
+                for dy in range(-radius, radius + 1)
+                if max(abs(dx), abs(dy)) == radius
+                and 0 <= start_x + dx < screen_size
+                and 0 <= start_y + dy < screen_size
+                and traversable(start_x + dx, start_y + dy)
+            )
+            if nearby:
+                frontier.extend(nearby)
+                break
+    frontier = sorted(set(frontier))
     reachable = set(frontier)
     index = 0
     while index < len(frontier):
@@ -2195,10 +2903,9 @@ def _builder_reachable_cells(
             neighbor = (x + dx, y + dy)
             if (
                 neighbor in reachable
-                or neighbor in blocked
                 or not 0 <= neighbor[0] < screen_size
                 or not 0 <= neighbor[1] < screen_size
-                or pathable[neighbor[1]][neighbor[0]] != 1
+                or not traversable(neighbor[0], neighbor[1])
             ):
                 continue
             reachable.add(neighbor)
@@ -2416,6 +3123,24 @@ def _scalar(value: Any) -> Any:
     except (TypeError, IndexError):
         pass
     return value
+
+
+def _world_to_minimap_transform(
+    agents: Mapping[str, Any],
+) -> Optional[tuple[float, float, float, float, float]]:
+    for agent in agents.values():
+        world_range = float(getattr(agent, "world_range", 0.0))
+        size_minimap = float(getattr(agent, "size_minimap", 0.0))
+        if world_range <= 0 or size_minimap <= 0:
+            continue
+        return (
+            size_minimap / world_range,
+            float(getattr(agent, "world_x_offset", 0.0)),
+            float(getattr(agent, "world_y_offset", 0.0)),
+            world_range,
+            size_minimap - 1.0,
+        )
+    return None
 
 
 def _alert_name(value: Any) -> str:

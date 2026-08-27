@@ -2,7 +2,13 @@
 
 from __future__ import annotations
 
-from rtscortex.contracts import ActionCommand, ActionSource, ObservationEnvelope
+from rtscortex.contracts import (
+    ActionCommand,
+    ActionSource,
+    AvailableAction,
+    ObservationEnvelope,
+)
+from rtscortex.targeting import current_screen_enemy_targets
 
 
 class ReflexEngine:
@@ -39,15 +45,26 @@ class ReflexEngine:
             for alert in observation.alerts
         )
         if not under_attack:
-            controller_action = available.get("Effect_InjectLarva") or available.get(
-                "Build_CreepTumor_Queen_Screen"
+            controller_action = (
+                available.get("Effect_InjectLarva")
+                or available.get("Build_CreepTumor_Queen_Screen")
+                or available.get("Build_CreepTumor_Tumor_Screen")
+                or available.get("Morph_OrbitalCommand")
+                or available.get("Effect_CalldownMULE_Screen")
+                or (
+                    _available_worker_training_action(available)
+                    if _automatic_worker_is_needed(observation)
+                    else None
+                )
             )
-            if controller_action is not None and controller_action.argument_candidates:
+            if controller_action is not None and (
+                not controller_action.argument_names or controller_action.argument_candidates
+            ):
                 actor = next(
                     (
                         scope
                         for scope in controller_action.actor_scopes
-                        if scope.startswith("CombatGroup")
+                        if scope.startswith(("CombatGroup", "Developer"))
                     ),
                     None,
                 )
@@ -58,14 +75,18 @@ class ReflexEngine:
                             index=len(commands),
                             actor=actor,
                             name=controller_action.name,
-                            arguments=list(controller_action.argument_candidates[0]),
-                            priority=(80 if controller_action.name == "Effect_InjectLarva" else 45),
+                            arguments=(
+                                []
+                                if not controller_action.argument_names
+                                else list((controller_action.argument_candidates or [])[0])
+                            ),
+                            priority=_controller_priority(controller_action.name),
                             ttl_game_loops=8,
                         )
                     )
         enemy_ids = {
             _normalize_tag(enemy.unit_id): enemy.unit_id
-            for enemy in observation.state.visible_enemies
+            for enemy in current_screen_enemy_targets(observation)
         }
         if under_attack and enemy_ids:
             dispatched_actors: set[str] = set()
@@ -128,6 +149,43 @@ class ReflexEngine:
             created_game_loop=observation.game_loop,
             source=ActionSource.REFLEX,
         )
+
+
+def _available_worker_training_action(
+    available: dict[str, AvailableAction],
+) -> AvailableAction | None:
+    return available.get("Train_Probe") or available.get("Train_SCV")
+
+
+def _automatic_worker_is_needed(observation: ObservationEnvelope) -> bool:
+    townhall_types = {
+        "Nexus",
+        "CommandCenter",
+        "OrbitalCommand",
+        "PlanetaryFortress",
+    }
+    completed_townhalls = sum(
+        structure.unit_type in townhall_types and structure.status != "constructing"
+        for structure in observation.state.own_structures
+    )
+    if completed_townhalls <= 0:
+        return False
+    # Keep a strategic worker buffer above one-base mineral saturation so gas
+    # staffing, scouting/builders, and replacement production do not starve tech.
+    target_workers = min(80, completed_townhalls * 28)
+    return observation.state.economy.workers < target_workers
+
+
+def _controller_priority(action_name: str) -> int:
+    return {
+        "Effect_InjectLarva": 80,
+        "Morph_OrbitalCommand": 78,
+        "Effect_CalldownMULE_Screen": 75,
+        "Train_Probe": 65,
+        "Train_SCV": 65,
+        "Build_CreepTumor_Queen_Screen": 45,
+        "Build_CreepTumor_Tumor_Screen": 40,
+    }[action_name]
 
 
 def _normalize_tag(value: object) -> str:

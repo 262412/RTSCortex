@@ -3,17 +3,23 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import importlib
+import json
+import math
 import os
 import time
-from collections.abc import Callable, Collection, Mapping
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, replace
 from functools import partial
-from numbers import Integral
+from numbers import Integral, Real
+from pathlib import Path
 from typing import Any, Optional, Protocol
 
+from rtscortex_llm_pysc2.ability import ABILITY_SPECS, ability_spec
 from rtscortex_llm_pysc2.addon import ADDON_SPECS, addon_spec
 from rtscortex_llm_pysc2.broker import PrimitiveDispatch, SharedDecisionBroker
+from rtscortex_llm_pysc2.circuit_canary import AuthoritativeBuildCircuitCanary
 from rtscortex_llm_pysc2.clock import FixedRateGameClock, InitialPlanningBarrier
 from rtscortex_llm_pysc2.coordinator import BridgeCoordinator
 from rtscortex_llm_pysc2.effect_verifier import (
@@ -21,15 +27,21 @@ from rtscortex_llm_pysc2.effect_verifier import (
     ActionEffectVerifier,
 )
 from rtscortex_llm_pysc2.extractor import (
+    BUILD_RAW_FUNCTION_IDS,
     BUILD_SPECS,
     MINIMAP_POINT_ACTIONS,
+    PRODUCTION_STRUCTURE_NAMES,
     SCREEN_POINT_ACTIONS,
     SELECT_BLINK_ACTION,
+    TOWNHALL_NAMES,
     TimeStepExtractor,
     build_screen_candidates,
     builder_move_requires_power,
+    expansion_anchor_candidates,
     is_source_bound_action,
+    minimap_scout_candidates,
     nexus_placement_footprint_is_visible,
+    production_dispatch_failure,
     production_source_tag,
     resolve_screen_build_world_target,
     resolve_screen_point_world_target,
@@ -44,16 +56,34 @@ from rtscortex_llm_pysc2.production import (
     production_spec,
 )
 from rtscortex_llm_pysc2.protocol import RuntimeClient
+from rtscortex_llm_pysc2.raw_executor import (
+    RawActionExecutor,
+    RawBuildAuthorization,
+    RawDispatch,
+)
+from rtscortex_llm_pysc2.raw_placement import RawPlacementService, _placement_revision
+from rtscortex_llm_pysc2.research import RESEARCH_SPECS, research_spec
+from rtscortex_llm_pysc2.routing import RoutedBuildPreflightRequest, RoutedCommand
+from rtscortex_llm_pysc2.terminal import (
+    TerminalArmyReadiness,
+    TerminalCollapseState,
+    is_terminal_collapse_state,
+)
 
 PRODUCTION_CAMERA_SETTLE_MAX_OBSERVATIONS = 4
-PRODUCTION_SELECTION_MAX_ATTEMPTS = 4
+PRODUCTION_SELECTION_MAX_ATTEMPTS = 8
+ORDER_INTERRUPT_CONTROL_FUNCTION_IDS = frozenset({274, 453, 454, 455, 456, 558, 559, 571})
 BUILD_SELECTION_RETRY_MAX_OBSERVATIONS = 2
 ACTOR_SELECTION_MAX_ATTEMPTS = 8
+DEFAULT_ORCHESTRATION_PRIMITIVE_BUDGET = 16
+DEFAULT_EXPANSION_SCOUT_INTERVAL_GAME_LOOPS = 112
 BUILD_TRANSLATOR_RETRY_FAILURE_CODES = frozenset(
     {"blocked", "need_power", "not_pathable", "no_legal_placement"}
 )
 DEFAULT_OBSERVATION_GAP_WATCHDOG_GAME_LOOPS = 448
 DEFAULT_OBSERVATION_GAP_HARD_LIMIT_GAME_LOOPS = 1792
+DEFAULT_RAW_STABLE_DECISION_INTERVAL_GAME_LOOPS = 16
+DEFAULT_RAW_OUTSTANDING_DECISION_INTERVAL_GAME_LOOPS = 64
 
 
 class _SourceActionSpec(Protocol):
@@ -65,6 +95,101 @@ class _SourceActionSpec(Protocol):
 
     @property
     def race(self) -> str: ...
+
+
+class SC2RawBuildQueryCapability:
+    """Narrow read-only bridge to SC2's exact builder/placement queries."""
+
+    def __init__(self, controller: Any) -> None:
+        self._controller = controller
+        self._legality_states: dict[
+            tuple[int, int, tuple[float, float]],
+            tuple[tuple[bool | None, str | int | None], int],
+        ] = {}
+
+    def authorize_build(
+        self,
+        *,
+        builder_tag: int,
+        ability_id: int,
+        world_target: tuple[float, float],
+    ) -> RawBuildAuthorization:
+        try:
+            from s2clientprotocol import error_pb2, query_pb2  # type: ignore[import-untyped]
+
+            request = query_pb2.RequestQuery()
+            request.abilities.add(unit_tag=int(builder_tag))
+            placement = request.placements.add(
+                ability_id=int(ability_id),
+                placing_unit_tag=int(builder_tag),
+            )
+            placement.target_pos.x = float(world_target[0])
+            placement.target_pos.y = float(world_target[1])
+            response = self._controller.query(request)
+            ability_ids: tuple[int, ...] = ()
+            if response.abilities:
+                ability_ids = tuple(
+                    sorted(int(item.ability_id) for item in response.abilities[0].abilities)
+                )
+            ability_available = int(ability_id) in ability_ids
+            placement_result: str | int | None = None
+            if response.placements:
+                raw_result = int(response.placements[0].result)
+                try:
+                    placement_result = error_pb2.ActionResult.Name(raw_result)
+                except ValueError:
+                    placement_result = raw_result
+            state_key = (
+                int(builder_tag),
+                int(ability_id),
+                (round(float(world_target[0]), 3), round(float(world_target[1]), 3)),
+            )
+            legality_state = (ability_available, placement_result)
+            previous_state = self._legality_states.get(state_key)
+            generation = (
+                0
+                if previous_state is None
+                else previous_state[1] + (previous_state[0] != legality_state)
+            )
+            self._legality_states[state_key] = (legality_state, generation)
+            fingerprint_payload = {
+                "builder_tag": int(builder_tag),
+                "ability_id": int(ability_id),
+                "world_target": [float(world_target[0]), float(world_target[1])],
+                "ability_available": ability_available,
+                "placement_result": placement_result,
+                "legality_generation": generation,
+            }
+            fingerprint = hashlib.sha256(
+                json.dumps(
+                    fingerprint_payload,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+            ).hexdigest()
+            return RawBuildAuthorization(
+                ability_available=ability_available,
+                placement_result=placement_result,
+                target_legality_fingerprint=f"sc2:{fingerprint}",
+                available_ability_ids=ability_ids,
+                details={
+                    "builder_tag": hex(int(builder_tag)),
+                    "ability_id": int(ability_id),
+                    "world_target": [float(world_target[0]), float(world_target[1])],
+                    "available_ability_ids": list(ability_ids),
+                },
+                ability_id=int(ability_id),
+            )
+        except Exception as error:
+            return RawBuildAuthorization(
+                ability_available=None,
+                placement_result=None,
+                details={
+                    "reason": "query_exception",
+                    "error_type": type(error).__name__,
+                },
+                ability_id=int(ability_id),
+            )
 
 
 try:
@@ -86,6 +211,8 @@ class WorkerSettings:
     socket_path: Optional[str]
     runtime_url: str
     seed: int
+    placement_outbox_path: Optional[str] = None
+    execution_action_space: str = "features"
     agent_race: str = "protoss"
     scenario: str = "pvz_task1_level1"
     pending_plan_step_delay_seconds: float = 0.0
@@ -95,9 +222,17 @@ class WorkerSettings:
     action_effect_timeout_game_loops: int = DEFAULT_ACTION_EFFECT_TIMEOUT_GAME_LOOPS
     observation_gap_watchdog_game_loops: int = DEFAULT_OBSERVATION_GAP_WATCHDOG_GAME_LOOPS
     observation_gap_hard_limit_game_loops: int = DEFAULT_OBSERVATION_GAP_HARD_LIMIT_GAME_LOOPS
+    orchestration_primitive_budget: int = DEFAULT_ORCHESTRATION_PRIMITIVE_BUDGET
+    expansion_scout_enabled: bool = True
+    expansion_scout_interval_game_loops: int = DEFAULT_EXPANSION_SCOUT_INTERVAL_GAME_LOOPS
     console_enabled: bool = False
     console_frame_fps: float = 2.0
     console_jpeg_quality: int = 75
+    authoritative_build_circuit_canary: bool = False
+    authoritative_build_circuit_canary_mode: str = "stale_candidate_then_builder_rebind"
+    authoritative_build_circuit_canary_failure_attempts: int = 3
+    authoritative_build_circuit_canary_hold_observations: int = 1
+    authoritative_build_circuit_canary_journal: Optional[str] = None
 
     @classmethod
     def from_environment(cls) -> WorkerSettings:
@@ -142,6 +277,26 @@ class WorkerSettings:
             raise RuntimeError(
                 "RTSCORTEX_OBSERVATION_GAP_HARD_LIMIT_GAME_LOOPS must exceed the watchdog threshold"
             )
+        orchestration_primitive_budget = int(
+            os.environ.get(
+                "RTSCORTEX_ORCHESTRATION_PRIMITIVE_BUDGET",
+                str(DEFAULT_ORCHESTRATION_PRIMITIVE_BUDGET),
+            )
+        )
+        if orchestration_primitive_budget < 4:
+            raise RuntimeError("RTSCORTEX_ORCHESTRATION_PRIMITIVE_BUDGET must be at least 4")
+        expansion_scout_enabled = _environment_bool(
+            "RTSCORTEX_EXPANSION_SCOUT_ENABLED",
+            True,
+        )
+        expansion_scout_interval_game_loops = int(
+            os.environ.get(
+                "RTSCORTEX_EXPANSION_SCOUT_INTERVAL_GAME_LOOPS",
+                str(DEFAULT_EXPANSION_SCOUT_INTERVAL_GAME_LOOPS),
+            )
+        )
+        if expansion_scout_interval_game_loops < 16:
+            raise RuntimeError("RTSCORTEX_EXPANSION_SCOUT_INTERVAL_GAME_LOOPS must be at least 16")
         pause_until_first_plan = _environment_bool("RTSCORTEX_PAUSE_UNTIL_FIRST_PLAN", False)
         console_enabled = _environment_bool("RTSCORTEX_CONSOLE_ENABLED", False)
         console_frame_fps = float(os.environ.get("RTSCORTEX_CONSOLE_FRAME_FPS", "2"))
@@ -153,6 +308,45 @@ class WorkerSettings:
         agent_race = os.environ.get("RTSCORTEX_AGENT_RACE", "protoss").strip().casefold()
         if agent_race not in {"protoss", "terran", "zerg"}:
             raise RuntimeError(f"unsupported RTSCORTEX_AGENT_RACE {agent_race!r}")
+        execution_action_space = (
+            os.environ.get("RTSCORTEX_EXECUTION_ACTION_SPACE", "features").strip().casefold()
+        )
+        if execution_action_space not in {"features", "raw"}:
+            raise RuntimeError("RTSCORTEX_EXECUTION_ACTION_SPACE must be 'features' or 'raw'")
+        authoritative_build_circuit_canary = _environment_bool(
+            "RTSCORTEX_AUTHORITATIVE_BUILD_CIRCUIT_CANARY",
+            False,
+        )
+        authoritative_mode = os.environ.get(
+            "RTSCORTEX_AUTHORITATIVE_BUILD_CIRCUIT_CANARY_MODE",
+            "stale_candidate_then_builder_rebind",
+        )
+        authoritative_failure_attempts = int(
+            os.environ.get(
+                "RTSCORTEX_AUTHORITATIVE_BUILD_CIRCUIT_CANARY_FAILURE_ATTEMPTS",
+                "3",
+            )
+        )
+        authoritative_hold_observations = int(
+            os.environ.get(
+                "RTSCORTEX_AUTHORITATIVE_BUILD_CIRCUIT_CANARY_HOLD_OBSERVATIONS",
+                "1",
+            )
+        )
+        authoritative_journal = os.environ.get(
+            "RTSCORTEX_AUTHORITATIVE_BUILD_CIRCUIT_CANARY_JOURNAL"
+        )
+        if authoritative_build_circuit_canary and (
+            execution_action_space != "raw"
+            or authoritative_mode != "stale_candidate_then_builder_rebind"
+            or authoritative_failure_attempts != 3
+            or authoritative_hold_observations != 1
+            or not authoritative_journal
+        ):
+            raise RuntimeError(
+                "authoritative Build circuit canary requires raw execution, threshold 3, "
+                "one held observation, and a journal path"
+            )
         return cls(
             run_id=run_id,
             episode_id=episode_id,
@@ -160,6 +354,8 @@ class WorkerSettings:
             or os.environ.get("RTSCORTEX_SOCKET"),
             runtime_url=os.environ.get("RTSCORTEX_RUNTIME_URL", "http://127.0.0.1:8765"),
             seed=int(os.environ.get("RTSCORTEX_SEED", "0")),
+            placement_outbox_path=os.environ.get("RTSCORTEX_PLACEMENT_OUTBOX_PATH"),
+            execution_action_space=execution_action_space,
             agent_race=agent_race,
             scenario=os.environ.get("RTSCORTEX_SCENARIO", "pvz_task1_level1"),
             pending_plan_step_delay_seconds=pending_plan_step_delay_seconds,
@@ -171,10 +367,361 @@ class WorkerSettings:
             action_effect_timeout_game_loops=action_effect_timeout_game_loops,
             observation_gap_watchdog_game_loops=observation_gap_watchdog_game_loops,
             observation_gap_hard_limit_game_loops=observation_gap_hard_limit_game_loops,
+            orchestration_primitive_budget=orchestration_primitive_budget,
+            expansion_scout_enabled=expansion_scout_enabled,
+            expansion_scout_interval_game_loops=expansion_scout_interval_game_loops,
             console_enabled=console_enabled,
             console_frame_fps=console_frame_fps,
             console_jpeg_quality=console_jpeg_quality,
+            authoritative_build_circuit_canary=authoritative_build_circuit_canary,
+            authoritative_build_circuit_canary_mode=authoritative_mode,
+            authoritative_build_circuit_canary_failure_attempts=(authoritative_failure_attempts),
+            authoritative_build_circuit_canary_hold_observations=(authoritative_hold_observations),
+            authoritative_build_circuit_canary_journal=authoritative_journal,
         )
+
+
+@dataclass
+class RawDecisionScheduler:
+    """Schedule Runtime decisions independently from per-loop effect polling."""
+
+    stable_interval_game_loops: int = DEFAULT_RAW_STABLE_DECISION_INTERVAL_GAME_LOOPS
+    outstanding_interval_game_loops: int = DEFAULT_RAW_OUTSTANDING_DECISION_INTERVAL_GAME_LOOPS
+    last_decision_game_loop: int | None = None
+    last_emergency_signature: tuple[str, ...] | None = None
+    _terminal_feedback_pending: bool = False
+    _emergency_pending: bool = False
+
+    def __post_init__(self) -> None:
+        if self.stable_interval_game_loops < 1:
+            raise ValueError("stable_interval_game_loops must be positive")
+        if self.outstanding_interval_game_loops < self.stable_interval_game_loops:
+            raise ValueError("outstanding_interval_game_loops must be at least the stable interval")
+
+    def should_decide(
+        self,
+        *,
+        game_loop: int,
+        queued_count: int,
+        inflight_count: int,
+        terminal_feedback: bool = False,
+        emergency_signature: tuple[str, ...] = (),
+    ) -> bool:
+        if terminal_feedback:
+            self._terminal_feedback_pending = True
+        if (
+            self.last_emergency_signature is not None
+            and emergency_signature != self.last_emergency_signature
+            and emergency_signature
+        ):
+            self._emergency_pending = True
+        if queued_count:
+            return False
+        if self.last_decision_game_loop is None:
+            return True
+        if self._terminal_feedback_pending or self._emergency_pending:
+            return True
+        interval = (
+            self.outstanding_interval_game_loops
+            if inflight_count
+            else self.stable_interval_game_loops
+        )
+        return int(game_loop) - self.last_decision_game_loop >= interval
+
+    def record_decision(
+        self,
+        *,
+        game_loop: int,
+        emergency_signature: tuple[str, ...],
+    ) -> None:
+        self.last_decision_game_loop = int(game_loop)
+        self.last_emergency_signature = emergency_signature
+        self._terminal_feedback_pending = False
+        self._emergency_pending = False
+
+
+class ExpansionScoutController:
+    """Issue bounded camera sweeps until a persistent expansion anchor is known."""
+
+    def __init__(self, *, interval_game_loops: int) -> None:
+        self.interval_game_loops = int(interval_game_loops)
+        self.generation_id = 1
+        self.last_scout_game_loop: Optional[int] = None
+        self.soft_blocked_since_game_loop: Optional[int] = None
+        self.visited_waypoints: set[tuple[int, int]] = set()
+        self.waypoint_queue: tuple[tuple[int, int], ...] = ()
+        self.pending_waypoint: tuple[int, int] | None = None
+        self.pending_game_loop: int | None = None
+        self.exhausted = False
+        self.state = "not_discovered_yet"
+        self.available_anchors: tuple[int, ...] = ()
+        self.rejected_anchors: set[int] = set()
+
+    def request_immediate_progress(self, *, game_loop: int) -> None:
+        """Resume the bounded sweep immediately after an anchor is invalidated."""
+
+        if self.exhausted:
+            return
+        self.state = "search_in_progress"
+        self.last_scout_game_loop = None
+        self.soft_blocked_since_game_loop = int(game_loop) - self.interval_game_loops
+
+    def observe_anchors(
+        self,
+        *,
+        available: Collection[int],
+        rejected: Collection[int],
+    ) -> None:
+        self.available_anchors = tuple(sorted({int(tag) for tag in available}))
+        self.rejected_anchors.update(int(tag) for tag in rejected)
+
+    def reject_pending_waypoint(self) -> None:
+        """Keep a waypoint eligible when its camera primitive never reached SC2."""
+
+        self.pending_waypoint = None
+        self.pending_game_loop = None
+        self.last_scout_game_loop = None
+        self.state = "search_in_progress"
+
+    def next_waypoint(
+        self,
+        observation: Any,
+        *,
+        game_loop: int,
+        anchor_available: bool,
+        blocked: bool,
+        soft_blocked: bool = False,
+    ) -> Optional[tuple[int, int]]:
+        if (
+            self.pending_waypoint is not None
+            and self.pending_game_loop is not None
+            and game_loop > self.pending_game_loop
+        ):
+            self.visited_waypoints.add(self.pending_waypoint)
+            self.pending_waypoint = None
+            self.pending_game_loop = None
+        if anchor_available:
+            self.exhausted = False
+            self.state = "candidate_available"
+            self.soft_blocked_since_game_loop = None
+            return None
+        if self.exhausted:
+            self.state = "all_candidates_exhausted"
+            return None
+        if self.pending_waypoint is not None:
+            return None
+        if not self.waypoint_queue:
+            self.waypoint_queue = tuple(
+                (int(candidate[0]), int(candidate[1]))
+                for candidate in minimap_scout_candidates(observation)
+                if len(candidate) == 2
+            )
+        if not self.waypoint_queue:
+            # Missing minimap candidates is not proof that the bounded search
+            # completed. The feature planes may not be ready yet.
+            self.state = "not_discovered_yet"
+            return None
+        self.state = "search_in_progress"
+        waypoint = next(
+            (
+                candidate
+                for candidate in self.waypoint_queue
+                if candidate not in self.visited_waypoints
+            ),
+            None,
+        )
+        if waypoint is None:
+            self.exhausted = True
+            self.state = "all_candidates_exhausted"
+            self.soft_blocked_since_game_loop = None
+            return None
+        if blocked:
+            return None
+        if soft_blocked:
+            if self.soft_blocked_since_game_loop is None:
+                self.soft_blocked_since_game_loop = int(game_loop)
+                return None
+            if game_loop - self.soft_blocked_since_game_loop < self.interval_game_loops:
+                return None
+        else:
+            self.soft_blocked_since_game_loop = None
+        if (
+            self.last_scout_game_loop is not None
+            and game_loop - self.last_scout_game_loop < self.interval_game_loops
+        ):
+            return None
+        self.pending_waypoint = waypoint
+        self.pending_game_loop = int(game_loop)
+        self.last_scout_game_loop = int(game_loop)
+        self.soft_blocked_since_game_loop = None
+        self.state = "search_in_progress"
+        return waypoint
+
+    @property
+    def progress_alerts(self) -> tuple[str, ...]:
+        available = ",".join(hex(tag) for tag in self.available_anchors) or "none"
+        rejected = ",".join(hex(tag) for tag in sorted(self.rejected_anchors)) or "none"
+        return (
+            f"expansion_scout_state={self.state}",
+            f"expansion_scout_generation={self.generation_id}",
+            (f"expansion_scout_waypoints={len(self.visited_waypoints)}/{len(self.waypoint_queue)}"),
+            f"expansion_scout_available_anchors={available}",
+            f"expansion_scout_rejected_anchors={rejected}",
+        )
+
+
+@dataclass
+class _GasAssignment:
+    worker_tag: int
+    gas_tag: int
+    started_game_loop: int
+    phase: str = "select_worker"
+    primitive_count: int = 0
+
+
+class GasWorkerController:
+    """Assign exact non-Builder mineral workers to completed gas structures."""
+
+    def __init__(self, *, timeout_game_loops: int = 112, primitive_budget: int = 8) -> None:
+        self.timeout_game_loops = int(timeout_game_loops)
+        self.primitive_budget = int(primitive_budget)
+        self.assignment: Optional[_GasAssignment] = None
+
+    def next_action(
+        self,
+        main_agent: Any,
+        observation: Any,
+        *,
+        game_loop: int,
+        blocked: bool,
+    ) -> Optional[Any]:
+        if blocked:
+            return None
+        assignment = self.assignment
+        if assignment is None:
+            choice = _gas_assignment_choice(main_agent, observation)
+            if choice is None:
+                return None
+            assignment = _GasAssignment(
+                worker_tag=choice[0],
+                gas_tag=choice[1],
+                started_game_loop=int(game_loop),
+            )
+            self.assignment = assignment
+
+        raw_by_tag = {
+            int(_observation_value(unit, "tag", 0)): unit
+            for unit in _observation_value(observation, "raw_units", ())
+            if int(_observation_value(unit, "tag", 0)) > 0
+        }
+        worker = raw_by_tag.get(assignment.worker_tag)
+        gas = raw_by_tag.get(assignment.gas_tag)
+        if (
+            worker is None
+            or gas is None
+            or assignment.worker_tag in _reserved_builder_worker_tags(main_agent)
+            or game_loop - assignment.started_game_loop > self.timeout_game_loops
+            or assignment.primitive_count >= self.primitive_budget
+        ):
+            self.assignment = None
+            return None
+        if _gas_assignment_is_confirmed(main_agent, worker, gas):
+            self.assignment = None
+            return None
+        if assignment.phase == "confirm":
+            return None
+
+        actions = importlib.import_module("pysc2.lib.actions")
+        available = {
+            int(value) for value in _observation_value(observation, "available_actions", ())
+        }
+        worker_position = _visible_feature_position(observation, assignment.worker_tag)
+        worker_selected = _producer_is_selected(observation, assignment.worker_tag)
+        if not worker_selected:
+            if worker_position is None:
+                assignment.primitive_count += 1
+                return actions.FUNCTIONS.llm_pysc2_move_camera(
+                    _worker_camera_position(main_agent, worker)
+                )
+            if 2 not in available:
+                return None
+            assignment.primitive_count += 1
+            return actions.FUNCTIONS.select_point("select", worker_position)
+
+        gas_position = _visible_feature_position(observation, assignment.gas_tag)
+        if gas_position is None:
+            assignment.phase = "target_gas"
+            assignment.primitive_count += 1
+            return actions.FUNCTIONS.llm_pysc2_move_camera(_worker_camera_position(main_agent, gas))
+        if 264 not in available:
+            return None
+        assignment.phase = "confirm"
+        assignment.primitive_count += 1
+        return actions.FUNCTIONS.Harvest_Gather_screen("now", gas_position)
+
+    def next_raw_action(
+        self,
+        main_agent: Any,
+        observation: Any,
+        *,
+        game_loop: int,
+    ) -> Optional[Any]:
+        """Assign gas with one exact-tag raw primitive and no UI selection."""
+
+        assignment = self.assignment
+        if assignment is not None:
+            reserved_builder_tags = _reserved_builder_worker_tags(main_agent)
+            raw_by_tag = {
+                int(_observation_value(unit, "tag", 0)): unit
+                for unit in _observation_value(observation, "raw_units", ())
+            }
+            worker = raw_by_tag.get(assignment.worker_tag)
+            gas = raw_by_tag.get(assignment.gas_tag)
+            if (
+                worker is None
+                or gas is None
+                or assignment.worker_tag in reserved_builder_tags
+                or _raw_gas_assignment_is_confirmed(worker, gas)
+                or game_loop - assignment.started_game_loop > self.timeout_game_loops
+            ):
+                self.assignment = None
+            return None
+
+        choice = _raw_gas_assignment_choice(main_agent, observation)
+        actions = importlib.import_module("pysc2.lib.actions")
+        if choice is None:
+            mineral_choice = _raw_mineral_assignment_choice(main_agent, observation)
+            if mineral_choice is None:
+                return None
+            worker_tag, mineral_tag = mineral_choice
+            action = actions.RAW_FUNCTIONS.Harvest_Gather_Probe_unit(
+                "now",
+                [worker_tag],
+                mineral_tag,
+            )
+            return self._lease_safe_raw_action(main_agent, action)
+        worker_tag, gas_tag = choice
+        self.assignment = _GasAssignment(
+            worker_tag=worker_tag,
+            gas_tag=gas_tag,
+            started_game_loop=int(game_loop),
+            phase="confirm",
+            primitive_count=1,
+        )
+        action = actions.RAW_FUNCTIONS.Harvest_Gather_Probe_unit(
+            "now",
+            [worker_tag],
+            gas_tag,
+        )
+        return self._lease_safe_raw_action(main_agent, action)
+
+    def _lease_safe_raw_action(self, main_agent: Any, action: Any) -> Optional[Any]:
+        """Return a worker primitive only while all actor tags remain unleased."""
+
+        if _raw_worker_action_has_builder_lease_conflict(main_agent, action):
+            self.assignment = None
+            return None
+        return action
 
 
 class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
@@ -212,6 +759,7 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
         self._rtscortex_production_selection_loop: Optional[int] = None
         self._rtscortex_production_selection_attempts = 0
         self._rtscortex_build_selection_retries = 0
+        self._rtscortex_build_selection_loop: Optional[int] = None
         self._rtscortex_camera_settlement_noop = False
         self._rtscortex_rejected_build_positions: dict[str, set[tuple[int, int]]] = {}
         self._rtscortex_rejected_build_targets: dict[str, set[tuple[float, float]]] = {}
@@ -232,6 +780,7 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
             self._rtscortex_production_selection_loop = None
             self._rtscortex_production_selection_attempts = 0
             self._rtscortex_build_selection_retries = 0
+            self._rtscortex_build_selection_loop = None
             next_action_name = str(self.action_list[0].get("name", ""))
             if _source_action_spec(next_action_name) is None:
                 self._rtscortex_production_source_tag = None
@@ -247,6 +796,9 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
             self._rtscortex_camera_settlement_noop = True
             return 0, _no_op()
         if self._wait_for_production_selection(semantic_action_name, obs):
+            self._rtscortex_camera_settlement_noop = True
+            return 0, _no_op()
+        if self._wait_for_build_selection(obs):
             self._rtscortex_camera_settlement_noop = True
             return 0, _no_op()
         production_reselection = self._reselect_unconfirmed_production_source(
@@ -306,6 +858,7 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
                                     self.unit_names,
                                 )
                             ),
+                            unit_names=self.unit_names,
                         )
             if (is_screen_build or is_screen_point) and resolved is None:
                 if is_screen_build:
@@ -353,9 +906,24 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
                 action,
                 obs.observation,
                 self.unit_names,
+                known_expansion_resources=getattr(
+                    self,
+                    "_rtscortex_known_expansion_resources",
+                    (),
+                ),
+                excluded_expansion_anchors=getattr(
+                    self,
+                    "_rtscortex_suppressed_expansion_anchors",
+                    (),
+                ),
             )
             if semantic_failure is not None:
                 semantic_failure_code, semantic_failure_reason = semantic_failure
+                _suppress_failed_expansion_anchor(
+                    self,
+                    action,
+                    obs.observation,
+                )
                 dispatch = self.broker.claim_primitive(
                     self.name,
                     _execution_team_name(self),
@@ -390,6 +958,10 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
                 return build_reselection
             if _requires_explicit_production_chain(action_name):
                 self._prime_production_chain(action)
+            elif (
+                build_spec := BUILD_SPECS.get(action_name)
+            ) is not None and build_spec.placement_kind == "expansion":
+                _prime_persistent_expansion_chain(self, action)
         if _next_primitive_is_screen_build(semantic_action_name, self.func_list):
             command_id = self.broker.command_id_for(
                 self.name,
@@ -459,6 +1031,7 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
                     self.func_list.clear()
                     self._rtscortex_semantic_action = None
                     self._rtscortex_build_selection_retries = 0
+                    self._rtscortex_build_selection_loop = None
                     return 0, _no_op()
                 self.func_list = list(action["func"])
                 assert command_id is not None
@@ -470,6 +1043,12 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
         self._rtscortex_translation_attempt = None
         if _is_worker_owned_larva_selection(self, semantic_action_name):
             result = _translate_worker_owned_zero_argument_primitive(self, obs)
+        elif _is_persistent_expansion_camera_primitive(self, semantic_action_name):
+            result = _translate_persistent_expansion_camera_primitive(
+                self,
+                obs,
+                candidate_action,
+            )
         elif _is_worker_owned_near_build_final_primitive(self, semantic_action_name):
             result = _translate_worker_owned_near_build_primitive(self, obs)
         else:
@@ -537,6 +1116,7 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
                 producer_tag,
                 source_spec,
                 self.unit_names,
+                required_function_id=requested_id,
             )
             if invalid_reason is not None:
                 self._settle_production_command_failure(
@@ -620,6 +1200,11 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
                 failure_reason="translated expansion footprint is not fully visible",
                 game_loop=_observation_game_loop(obs.observation),
             )
+            _suppress_failed_expansion_anchor(
+                self,
+                candidate_action,
+                obs.observation,
+            )
             self.func_list.clear()
             self._rtscortex_semantic_action = None
             return 0, _no_op()
@@ -643,13 +1228,49 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
                 )
             self._rtscortex_semantic_action = None
             return result
-        if accepted:
+        known_expansion_resources = getattr(
+            self,
+            "_rtscortex_known_expansion_resources",
+            (),
+        )
+        excluded_expansion_anchors = getattr(
+            self,
+            "_rtscortex_suppressed_expansion_anchors",
+            (),
+        )
+        if accepted and dispatch.final_primitive:
+            semantic_failure = _semantic_target_failure(
+                candidate_action,
+                obs.observation,
+                self.unit_names,
+                known_expansion_resources=known_expansion_resources,
+                excluded_expansion_anchors=excluded_expansion_anchors,
+            )
+            if semantic_failure is not None:
+                semantic_failure_code, semantic_failure_reason = semantic_failure
+                self.broker.settle_candidate_invalidation(
+                    dispatch,
+                    failure_code=semantic_failure_code,
+                    failure_reason=semantic_failure_reason,
+                    game_loop=_observation_game_loop(obs.observation),
+                )
+                self.func_list.clear()
+                self._rtscortex_semantic_action = None
+                _suppress_failed_expansion_anchor(
+                    self,
+                    candidate_action,
+                    obs.observation,
+                )
+                return 0, _no_op()
+        if accepted and dispatch.final_primitive:
             candidate_failure = _candidate_dispatch_failure(
                 candidate_action,
                 obs.observation,
                 self.unit_names,
                 final_primitive=dispatch.final_primitive,
                 translated_position=translated_position,
+                known_expansion_resources=known_expansion_resources,
+                excluded_expansion_anchors=excluded_expansion_anchors,
             )
             if candidate_failure is not None:
                 self.broker.reject_candidate_outside_dispatch(
@@ -658,6 +1279,11 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
                     game_loop=_observation_game_loop(obs.observation),
                 )
         if not accepted:
+            _suppress_failed_expansion_anchor(
+                self,
+                candidate_action,
+                obs.observation,
+            )
             self.broker.settle_primitive(
                 dispatch,
                 success=False,
@@ -691,7 +1317,19 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
             self._rtscortex_production_selection_loop = None
             self._rtscortex_production_selection_attempts = 0
             self._rtscortex_build_selection_retries = 0
+            self._rtscortex_build_selection_loop = None
         return result
+
+    def _wait_for_build_selection(self, obs: Any) -> bool:
+        """Do not translate a build against the observation that issued select_point."""
+
+        selected_loop = self._rtscortex_build_selection_loop
+        if selected_loop is None:
+            return False
+        if _observation_game_loop(obs.observation) <= selected_loop:
+            return True
+        self._rtscortex_build_selection_loop = None
+        return False
 
     def _reselect_builder_for_unavailable_build(
         self,
@@ -707,16 +1345,22 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
             return None
         requested_function_id = int(functions[0][0])
         available_actions = set(_observation_value(obs.observation, "available_actions", ()))
-        if requested_function_id in available_actions:
+        builder_tag = _execution_unit_tag(self)
+        if (
+            requested_function_id in available_actions
+            and builder_tag is not None
+            and _producer_is_selected(obs.observation, builder_tag)
+        ):
             self._rtscortex_build_selection_retries = 0
+            self._rtscortex_build_selection_loop = None
             return None
         if self._rtscortex_build_selection_retries >= BUILD_SELECTION_RETRY_MAX_OBSERVATIONS:
             return None
-        builder_tag = _execution_unit_tag(self)
         position = _visible_feature_position(obs.observation, builder_tag)
         if position is None:
             return None
         self._rtscortex_build_selection_retries += 1
+        self._rtscortex_build_selection_loop = _observation_game_loop(obs.observation)
         actions = importlib.import_module("pysc2.lib.actions")
         return 2, actions.FUNCTIONS.select_point("select", position)
 
@@ -829,7 +1473,10 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
             if source_spec is None
             else _selected_production_source_tags(
                 obs.observation,
-                producer_type=source_spec.producer_type,
+                producer_types=(
+                    source_spec.producer_type,
+                    *getattr(source_spec, "alternate_producer_types", ()),
+                ),
                 unit_names=self.unit_names,
             )
         )
@@ -945,6 +1592,10 @@ class RTSCortexLLMAgent(RuntimeQueryMixin, _LLMAgentBase):  # type: ignore[misc]
             if addon_spec(action_name) is not None
             else "morph"
             if morph_spec(action_name) is not None
+            else "research"
+            if research_spec(action_name) is not None
+            else "ability"
+            if ability_spec(action_name) is not None
             else "production"
         )
         source_tag = self._rtscortex_production_source_tag
@@ -1114,15 +1765,22 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
             base_url=self.worker_settings.runtime_url,
             unix_socket=self.worker_settings.socket_path,
             timeout_seconds=self.worker_settings.runtime_request_timeout_seconds,
+            placement_outbox_path=self.worker_settings.placement_outbox_path,
         )
         self.runtime_client.health()
         unit_names, building_types = _unit_metadata()
         upgrade_names = _upgrade_metadata()
+        placement_service = RawPlacementService(
+            unit_names=unit_names,
+            transition_sink=self.runtime_client.placement_transition,
+            effect_timeout_game_loops=self.worker_settings.action_effect_timeout_game_loops,
+        )
         coordinator = BridgeCoordinator(
             self.runtime_client,
             effect_verifier=ActionEffectVerifier(
                 timeout_game_loops=self.worker_settings.action_effect_timeout_game_loops,
                 unit_names=unit_names,
+                placement_service=placement_service,
             ),
         )
         extractor = TimeStepExtractor(
@@ -1132,6 +1790,8 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
             upgrade_names=upgrade_names,
             building_types=building_types,
             action_source_types=_production_action_source_types(self.worker_settings.agent_race),
+            raw_action_mode=self.worker_settings.execution_action_space == "raw",
+            placement_service=placement_service,
         )
         self.decision_broker = SharedDecisionBroker(
             coordinator,
@@ -1140,13 +1800,26 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
         )
         self._pending_primitive: Optional[PrimitiveDispatch] = None
         self._pending_primitive_agent: Optional[Any] = None
+        self._pending_raw_dispatch: Optional[RawDispatch] = None
+        self._pending_raw_observation: Any | None = None
+        self._pending_raw_game_loop: Optional[int] = None
         self._actor_selection_retry_key: Optional[tuple[str, str]] = None
         self._actor_selection_attempts = 0
+        self._orchestration_budget_key: Optional[tuple[str, str]] = None
+        self._orchestration_budget_used = 0
         self.transport_noop_primitives = 0
         self._observation_watchdog_active = False
         self._observation_watchdog_preempted = False
         self._observation_watchdog_baseline_loop: Optional[int] = None
         self._rtscortex_force_runtime_decision = False
+        self._rtscortex_unit_quarantine: set[int] = set()
+        self.expansion_scout = ExpansionScoutController(
+            interval_game_loops=self.worker_settings.expansion_scout_interval_game_loops
+        )
+        self.gas_worker_controller = GasWorkerController(
+            primitive_budget=max(4, self.worker_settings.orchestration_primitive_budget),
+        )
+        self._last_suppressed_expansion_anchors: frozenset[int] = frozenset()
         self._episode_reported = False
         self.initial_planning_barrier = InitialPlanningBarrier()
         self.game_clock = (
@@ -1166,6 +1839,30 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
             player_race=self.worker_settings.agent_race,
         )
         super().__init__(config, subagent)
+        self.raw_executor = RawActionExecutor(
+            self.decision_broker,
+            unit_names=unit_names,
+            placement_service=placement_service,
+        )
+        self.authoritative_build_circuit_canary: AuthoritativeBuildCircuitCanary | None = None
+        if self.worker_settings.authoritative_build_circuit_canary:
+            journal = self.worker_settings.authoritative_build_circuit_canary_journal
+            if journal is None:
+                raise RuntimeError("enabled authoritative Build circuit canary has no journal")
+            self.authoritative_build_circuit_canary = AuthoritativeBuildCircuitCanary(
+                run_id=self.worker_settings.run_id,
+                episode_id=self.worker_settings.episode_id,
+                seed=self.worker_settings.seed,
+                journal_path=Path(journal).expanduser().resolve(),
+                failure_attempts=(
+                    self.worker_settings.authoritative_build_circuit_canary_failure_attempts
+                ),
+                hold_observations=(
+                    self.worker_settings.authoritative_build_circuit_canary_hold_observations
+                ),
+            )
+        self._rtscortex_raw_dispatch_diagnostic_snapshot: dict[str, Any] = {}
+        self.raw_decision_scheduler = RawDecisionScheduler()
         self._rtscortex_accept_visible_team_unit = True
         self._rtscortex_exact_single_unit_selection = True
         self._rtscortex_transport_noop_without_actor_selection = True
@@ -1194,49 +1891,139 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
             raise
 
     def _step(self, obs: Any) -> Any:
+        if self.worker_settings.execution_action_space == "raw":
+            return self._raw_step(obs)
         self._submit_console_frame(obs)
+        observation_loop = _observation_game_loop(obs.observation)
+        watchdog_preempted = self._update_observation_gap_watchdog(
+            observation_loop,
+            obs.observation,
+        )
+        _normalize_new_unit_queue(self)
+        _refresh_combat_team_membership(self, obs.observation)
         _abort_stalled_actor_selection(self)
+        _enforce_orchestration_primitive_budget(self, obs.observation)
         self._settle_previous_primitive(obs)
         self.decision_broker.observe_effects(obs.observation)
         if _is_terminal(obs):
             return _finish_terminal(self, obs, _base_agent_step, _no_op)
+        self.decision_broker.extractor.observe_expansion_resources(
+            obs.observation,
+            self.agents,
+        )
         _rebind_builder_to_selected_worker(self, obs.observation)
         _refresh_consumed_zerg_builder(self, obs.observation)
         _refresh_zerg_morphed_combat_teams(self, obs.observation)
-        observation_loop = _observation_game_loop(obs.observation)
-        # RTSCortex consumes a global raw snapshot. Do not make every Runtime tick
-        # wait for optional upstream camera/selection-based text gathering.
-        _release_runtime_observation_barrier(self)
-        watchdog_preempted = self._update_observation_gap_watchdog(observation_loop)
         runtime_observation_due = _runtime_observation_is_due(
             observation_loop,
             last_decision_game_loop=self.decision_broker.last_decision_game_loop,
             watchdog_game_loops=self.worker_settings.observation_gap_watchdog_game_loops,
         )
+        force_runtime_observation = (
+            self._observation_watchdog_active
+            or self._rtscortex_force_runtime_decision
+            or runtime_observation_due
+        )
+        if force_runtime_observation:
+            # Complete upstream new-unit bookkeeping from the global raw snapshot
+            # before MainAgent.step reaches main_agent_func1. Camera/selection work
+            # is optional and must never delay the next Runtime observation.
+            _prepare_runtime_observation_bypass(self, obs.observation)
+        # RTSCortex consumes a global raw snapshot. Do not make every Runtime tick
+        # wait for optional upstream camera/selection-based text gathering.
+        _release_runtime_observation_barrier(
+            self,
+            include_builder=force_runtime_observation,
+        )
         effect_verification_blocked = (
             self.decision_broker.coordinator.effect_verifier.blocks_auto_worker_management
         )
-        _prime_deterministic_gas_rebalance(
-            self,
-            obs.observation,
-            blocked=_should_block_gas_rebalance(
-                effect_verification_blocked=effect_verification_blocked,
-                observation_watchdog_active=self._observation_watchdog_active,
-                runtime_observation_due=runtime_observation_due,
-            ),
-        )
+        builder_selection_lease_active = _builder_selection_lease_active(self)
         self.select_rect_threshold = min(
             int(self.select_rect_threshold),
             max(1, int(self.size_screen)),
         )
+        scout_action = self._expansion_scout_action(
+            obs,
+            game_loop=observation_loop,
+            blocked=(
+                effect_verification_blocked
+                or builder_selection_lease_active
+                or runtime_observation_due
+                or watchdog_preempted
+            ),
+        )
+        if scout_action is not None:
+            scout_action, primitive_rejected = self._validated_outbound_action(
+                scout_action,
+                obs,
+                source="expansion_scout",
+            )
+            if primitive_rejected:
+                self.transport_noop_primitives += 1
+            if self.game_clock is not None:
+                self.game_clock.wait_for_step()
+            return scout_action
+        gas_action = self.gas_worker_controller.next_action(
+            self,
+            obs.observation,
+            game_loop=observation_loop,
+            blocked=(
+                _should_block_gas_rebalance(
+                    effect_verification_blocked=effect_verification_blocked,
+                    observation_watchdog_active=self._observation_watchdog_active,
+                    runtime_observation_due=runtime_observation_due,
+                )
+                or builder_selection_lease_active
+                or getattr(self, "_pending_primitive", None) is not None
+                or bool(getattr(self, "unit_uid_appear", ()))
+                or any(
+                    bool(getattr(agent, "func_list", ())) or bool(getattr(agent, "action_list", ()))
+                    for agent in getattr(self, "agents", {}).values()
+                )
+            ),
+        )
+        if gas_action is not None:
+            self.main_loop_lock = False
+            gas_action, primitive_rejected = self._validated_outbound_action(
+                gas_action,
+                obs,
+                source="gas_worker_controller",
+            )
+            if primitive_rejected:
+                self.transport_noop_primitives += 1
+            if self.game_clock is not None:
+                self.game_clock.wait_for_step()
+            return gas_action
+        decision_loop_before_upstream = self.decision_broker.last_decision_game_loop
         upstream_step = super().step
         action = _run_with_auto_worker_management_guard(
             self.config,
-            blocked=(effect_verification_blocked or watchdog_preempted or runtime_observation_due),
+            blocked=(
+                effect_verification_blocked
+                or builder_selection_lease_active
+                or watchdog_preempted
+                or runtime_observation_due
+            ),
             upstream_step=lambda: upstream_step(obs),
         )
+        decision_loop_after_upstream = self.decision_broker.last_decision_game_loop
+        if (
+            decision_loop_after_upstream is not None
+            and decision_loop_after_upstream != decision_loop_before_upstream
+        ):
+            self._rtscortex_force_runtime_decision = False
+        action = _suppress_pending_build_control_action(
+            action,
+            blocked=effect_verification_blocked,
+        )
+        action, primitive_rejected = self._validated_outbound_action(
+            action,
+            obs,
+            source="upstream",
+        )
         self._consume_execution_aborts(obs)
-        if getattr(action, "function", None) == 0:
+        if getattr(action, "function", None) == 0 and not primitive_rejected:
             self.transport_noop_primitives += 1
         if (
             self.worker_settings.pause_until_first_plan
@@ -1260,6 +2047,365 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
         elif delay:
             time.sleep(delay)
         return action
+
+    def _raw_step(self, obs: Any) -> Any:
+        """Run the RTSCortex-owned raw path without upstream action orchestration."""
+
+        self._submit_console_frame(obs)
+        self._settle_previous_primitive(obs)
+        with self.runtime_client.profiler.measure("effect_verification"):
+            effect_reports = self.decision_broker.observe_effects(obs.observation)
+        self.raw_executor.observe_reports(
+            effect_reports,
+            self.agents,
+            game_loop=_observation_game_loop(obs.observation),
+        )
+        game_loop = _observation_game_loop(obs.observation)
+        observation_revision = _placement_revision(obs.observation)
+        circuit_canary = self.authoritative_build_circuit_canary
+        if circuit_canary is not None:
+            reservation_count, leased_tags, inflight_count = (
+                _authoritative_canary_execution_ownership(self)
+            )
+            circuit_canary.observe_effect_reports(
+                effect_reports,
+                game_loop=game_loop,
+                observation_revision=observation_revision,
+                reservation_count=reservation_count,
+                leased_builder_tags=leased_tags,
+                effect_inflight_count=inflight_count,
+                authoritative_state=(
+                    None
+                    if circuit_canary.operation_id is None
+                    else self.raw_executor.placement_service.authoritative_pre_dispatch_state(
+                        circuit_canary.operation_id
+                    )
+                ),
+            )
+        if _is_terminal(obs):
+            if circuit_canary is not None:
+                circuit_canary.observe_terminal(
+                    game_loop=game_loop,
+                    observation_revision=observation_revision,
+                )
+            return _finish_terminal(self, obs, _base_agent_step, _raw_no_op)
+
+        _base_agent_step(self, obs)
+        _sync_raw_team_membership(self, obs.observation)
+        canary_builder_ready = True
+        if circuit_canary is not None and circuit_canary.requires_builder_pin:
+            canary_builder_ready = _pin_authoritative_canary_builder(
+                self,
+                obs.observation,
+                circuit_canary,
+                game_loop=game_loop,
+                observation_revision=observation_revision,
+            )
+        self.decision_broker.extractor.observe_expansion_resources(
+            obs.observation,
+            self.agents,
+        )
+
+        emergency_signature = _raw_emergency_signature(obs.observation)
+        suppress_worker_actions = False
+        if canary_builder_ready and self.raw_decision_scheduler.should_decide(
+            game_loop=game_loop,
+            queued_count=self.raw_executor.queued_count,
+            inflight_count=self.raw_executor.effect_inflight_count,
+            terminal_feedback=bool(effect_reports),
+            emergency_signature=emergency_signature,
+        ):
+            decision = self.decision_broker.decide_direct(
+                obs,
+                self.agents,
+                step_id=int(self.steps),
+            )
+            preflight_request_ids: set[str] = set()
+            preflight_records: list[tuple[RoutedBuildPreflightRequest, Mapping[str, Any]]] = []
+            for route in decision.routes.values():
+                for request in route.authoritative_build_preflight_requests:
+                    if request.request_id in preflight_request_ids:
+                        continue
+                    preflight_request_ids.add(request.request_id)
+                    preflight_result = self.raw_executor.preflight_authoritative_build(
+                        request,
+                        obs.observation,
+                        self.agents,
+                    )
+                    preflight_payload = {
+                        **preflight_result.to_dict(),
+                        "run_id": request.run_id,
+                        "episode_id": request.episode_id,
+                        "step_id": request.step_id,
+                    }
+                    preflight_records.append((request, preflight_payload))
+                    self.runtime_client.authoritative_build_preflight(preflight_payload)
+            if preflight_request_ids:
+                suppress_worker_actions = True
+            if circuit_canary is not None:
+                reservation_count, leased_tags, inflight_count = (
+                    _authoritative_canary_execution_ownership(self)
+                )
+                authoritative_state = (
+                    None
+                    if circuit_canary.operation_id is None
+                    else self.raw_executor.placement_service.authoritative_pre_dispatch_state(
+                        circuit_canary.operation_id
+                    )
+                )
+                canary_decision = circuit_canary.observe_runtime_decision(
+                    _routed_decision_commands(decision),
+                    preflight_results=preflight_records,
+                    idle_reason=(
+                        None
+                        if decision.action_batch.get("idle_reason") is None
+                        else str(decision.action_batch["idle_reason"])
+                    ),
+                    planner_pending=decision.action_batch.get("planner_pending"),
+                    game_loop=game_loop,
+                    observation_revision=observation_revision,
+                    builder_tag=_current_raw_builder_tag(self),
+                    reservation_count=reservation_count,
+                    leased_builder_tags=leased_tags,
+                    effect_inflight_count=inflight_count,
+                    authoritative_state=authoritative_state,
+                )
+                suppress_worker_actions = bool(
+                    suppress_worker_actions or canary_decision.core_defer_observed
+                )
+            self.raw_executor.enqueue(decision)
+            self.raw_decision_scheduler.record_decision(
+                game_loop=game_loop,
+                emergency_signature=emergency_signature,
+            )
+
+        hold_raw_dispatch = bool(
+            (
+                circuit_canary is not None
+                and circuit_canary.should_hold_raw_dispatch(
+                    observation_revision=observation_revision
+                )
+            )
+            or (
+                circuit_canary is not None
+                and not canary_builder_ready
+                and self.raw_executor.queued_count > 0
+            )
+        )
+        if hold_raw_dispatch:
+            dispatch = None
+        else:
+            with self.runtime_client.profiler.measure("raw_translate_dispatch"):
+                dispatch = self.raw_executor.next_dispatch(
+                    obs.observation,
+                    self.agents,
+                    terminal_collapse=_raw_terminal_collapse(
+                        obs.observation,
+                        unit_names=self.decision_broker.extractor.unit_names,
+                    ),
+                )
+        self._rtscortex_raw_dispatch_diagnostic_snapshot = dict(
+            self.raw_executor.diagnostic_snapshot
+        )
+        if dispatch is not None:
+            resolved = list(dispatch.resolved_arguments)
+            if resolved:
+                self.decision_broker.resolve_arguments(
+                    dispatch.command.command_id,
+                    resolved,
+                )
+            self._pending_raw_dispatch = dispatch
+            self._pending_raw_observation = obs.observation
+            self._pending_raw_game_loop = game_loop
+            self.raw_executor.mark_primitive_constructed(
+                dispatch.command.command_id,
+                game_loop=game_loop,
+            )
+            self._rtscortex_raw_dispatch_diagnostic_snapshot = dict(
+                self.raw_executor.diagnostic_snapshot
+            )
+            action = dispatch.action
+        else:
+            gas_action = (
+                None
+                if hold_raw_dispatch or suppress_worker_actions
+                else self.gas_worker_controller.next_raw_action(
+                    self,
+                    obs.observation,
+                    game_loop=game_loop,
+                )
+            )
+            if gas_action is not None and _raw_worker_action_has_builder_lease_conflict(
+                self,
+                gas_action,
+            ):
+                self.gas_worker_controller.assignment = None
+                gas_action = None
+            if gas_action is None:
+                action = _raw_no_op()
+                self.transport_noop_primitives += 1
+            else:
+                action = gas_action
+
+        if circuit_canary is not None and not hold_raw_dispatch:
+            authoritative_state = (
+                None
+                if circuit_canary.operation_id is None
+                else self.raw_executor.placement_service.authoritative_pre_dispatch_state(
+                    circuit_canary.operation_id
+                )
+            )
+            reservation_count, leased_tags, inflight_count = (
+                _authoritative_canary_execution_ownership(self)
+            )
+            circuit_canary.observe_raw_result(
+                dispatch=dispatch,
+                diagnostic=self._rtscortex_raw_dispatch_diagnostic_snapshot,
+                game_loop=game_loop,
+                observation_revision=observation_revision,
+                authoritative_state=authoritative_state,
+                reservation_count=reservation_count,
+                leased_builder_tags=leased_tags,
+                effect_inflight_count=inflight_count,
+            )
+
+        if self.initial_planning_barrier.blocks_steps:
+            self.initial_planning_barrier.release()
+            if self.game_clock is not None:
+                self.game_clock.reset()
+        if self.game_clock is not None:
+            self.game_clock.wait_for_step()
+        return action
+
+    def record_environment_step(self, elapsed_seconds: float) -> None:
+        """Receive the patched PySC2 run-loop environment-step duration."""
+
+        pending_raw = self._pending_raw_dispatch
+        if pending_raw is not None and self._pending_primitive is None:
+            submitted_loop = self._pending_raw_game_loop or 0
+            self.raw_executor.mark_primitive_submitted(
+                pending_raw.command.command_id,
+                game_loop=submitted_loop,
+            )
+            if pending_raw.approach_only:
+                self._pending_primitive = pending_raw.primitive
+                self._pending_primitive_agent = None
+                self._rtscortex_raw_dispatch_diagnostic_snapshot = dict(
+                    self.raw_executor.diagnostic_snapshot
+                )
+                self.runtime_client.profiler.observe_milliseconds(
+                    "pysc2_environment_step",
+                    float(elapsed_seconds) * 1_000,
+                )
+                return
+            if self._pending_raw_observation is None:
+                raise RuntimeError("raw dispatch submission has no pre-step observation")
+            self.decision_broker.prepare_effect(
+                pending_raw.primitive,
+                self._pending_raw_observation,
+                builder_tag=pending_raw.builder_tag,
+                producer_tag=pending_raw.producer_tag,
+                actor_tags=pending_raw.actor_tags,
+                minimap_transform=None,
+            )
+            self._pending_primitive = pending_raw.primitive
+            self._pending_primitive_agent = None
+            self._rtscortex_raw_dispatch_diagnostic_snapshot = dict(
+                self.raw_executor.diagnostic_snapshot
+            )
+            circuit_canary = self.authoritative_build_circuit_canary
+            if circuit_canary is not None:
+                reservation_count, leased_tags, inflight_count = (
+                    _authoritative_canary_execution_ownership(self)
+                )
+                circuit_canary.observe_primitive_submitted(
+                    pending_raw,
+                    game_loop=submitted_loop,
+                    diagnostic=self._rtscortex_raw_dispatch_diagnostic_snapshot,
+                    reservation_count=reservation_count,
+                    leased_builder_tags=leased_tags,
+                    effect_inflight_count=inflight_count,
+                )
+        self.runtime_client.profiler.observe_milliseconds(
+            "pysc2_environment_step",
+            float(elapsed_seconds) * 1_000,
+        )
+
+    def _validated_outbound_action(
+        self,
+        action: Any,
+        obs: Any,
+        *,
+        source: str,
+    ) -> tuple[Any, bool]:
+        """Reject malformed feature actions before SC2Env validates them fatally."""
+
+        function_specification = None
+        action_specification = getattr(self, "action_spec", None)
+        active_functions = getattr(action_specification, "functions", None)
+        if active_functions is not None:
+            try:
+                function_specification = active_functions[int(action.function)]
+            except (IndexError, KeyError, TypeError, ValueError):
+                function_specification = None
+        failure_reason = _pysc2_action_argument_failure(
+            action,
+            function_specification=function_specification,
+        )
+        if failure_reason is None:
+            return action, False
+
+        self.main_loop_lock = False
+        self._rtscortex_force_runtime_decision = True
+        self.gas_worker_controller.assignment = None
+        if source == "expansion_scout":
+            self.expansion_scout.reject_pending_waypoint()
+        for name in ("stop_worker", "stop_worker_nexus_tag", "stop_worker_at"):
+            if hasattr(self, name):
+                setattr(self, name, None)
+
+        agent = None
+        if self.AGENT_NAMES:
+            agent = self.agents.get(self.AGENT_NAMES[self.agent_id])
+        if agent is not None:
+            attempt = getattr(agent, "_rtscortex_translation_attempt", None)
+            if isinstance(attempt, Mapping):
+                agent._rtscortex_translation_attempt = None
+                dispatch = replace(
+                    attempt["dispatch"],
+                    final_primitive=True,
+                    failure_code="primitive_argument_out_of_range",
+                )
+                self.decision_broker.settle_primitive(
+                    dispatch,
+                    success=False,
+                    failure_reason=f"{source}: {failure_reason}",
+                    game_loop=_observation_game_loop(obs.observation),
+                )
+            else:
+                team_name = _execution_team_name(agent)
+                action_name = str(getattr(agent, "curr_action_name", "") or "")
+                if team_name and action_name:
+                    dispatch = self.decision_broker.reject_command(
+                        agent.name,
+                        team_name,
+                        action_name,
+                        failure_code="primitive_argument_out_of_range",
+                    )
+                    if dispatch is not None:
+                        self.decision_broker.settle_primitive(
+                            dispatch,
+                            success=False,
+                            failure_reason=f"{source}: {failure_reason}",
+                            game_loop=_observation_game_loop(obs.observation),
+                        )
+            agent.func_list.clear()
+            agent.action_list.clear()
+            agent._rtscortex_semantic_action = None
+            agent._rtscortex_active_build_route = None
+
+        _record_orchestration_recovery(self)
+        return _no_op(), True
 
     def _submit_console_frame(self, obs: Any) -> None:
         publisher = self._frame_publisher
@@ -1322,18 +2468,32 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
             return
         settlement_loop = _observation_game_loop(obs.observation)
         action_results = list(getattr(obs.observation, "action_result", ()))
+        pending_raw_dispatch = getattr(self, "_pending_raw_dispatch", None)
+        if pending_raw_dispatch is not None:
+            self.raw_executor.record_action_result(
+                pending_raw_dispatch.command.command_id,
+                action_results,
+            )
         failure_reason = None
         if action_results:
             failure_reason = ", ".join(
                 f"PySC2 action result {int(value)}" for value in action_results
             )
             if dispatch.origin == "translator":
-                dispatch = replace(
-                    dispatch,
-                    final_primitive=True,
-                    failure_code="pysc2_rejected",
+                approach_rejected = (
+                    pending_raw_dispatch is not None and pending_raw_dispatch.approach_only
                 )
-                if self._pending_primitive_agent is not None:
+                if approach_rejected:
+                    # Keep the approach move non-final: its rejection is a
+                    # primitive trace fact, not a failed build/effect report.
+                    dispatch = replace(dispatch, failure_code="pysc2_rejected")
+                else:
+                    dispatch = replace(
+                        dispatch,
+                        final_primitive=True,
+                        failure_code="pysc2_rejected",
+                    )
+                if self._pending_primitive_agent is not None and not approach_rejected:
                     self._pending_primitive_agent.func_list.clear()
                     route = getattr(
                         self._pending_primitive_agent,
@@ -1349,6 +2509,12 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
                             self._pending_primitive_agent._rtscortex_rejected_build_targets.setdefault(
                                 action_name, set()
                             ).add(world_target)
+                if pending_raw_dispatch is not None and not pending_raw_dispatch.approach_only:
+                    self.raw_executor.record_rejection(
+                        pending_raw_dispatch,
+                        self.agents,
+                        game_loop=settlement_loop,
+                    )
         elif (
             dispatch.origin in {"translator", "orchestration"}
             and not dispatch.final_primitive
@@ -1374,9 +2540,17 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
             game_loop=settlement_loop,
         )
         self._pending_primitive = None
+        self._pending_raw_dispatch = None
+        self._pending_raw_observation = None
+        self._pending_raw_game_loop = None
         if self._pending_primitive_agent is not None:
             self._pending_primitive_agent._rtscortex_active_build_route = None
         self._pending_primitive_agent = None
+
+    def set_raw_build_query_capability(self, capability: Any | None) -> None:
+        """Install the reviewed runner's read-only SC2 build query capability."""
+
+        self.raw_executor.set_build_query_capability(capability)
 
     def _capture_primitive(self, action: Any, obs: Any) -> None:
         if self._pending_primitive is not None or not self.AGENT_NAMES:
@@ -1427,6 +2601,8 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
                     obs.observation,
                     builder_tag=_execution_unit_tag(agent),
                     producer_tag=attempt.get("producer_tag"),
+                    actor_tags=_execution_unit_tags(agent, obs.observation),
+                    minimap_transform=_agent_world_to_minimap_transform(agent),
                 )
             self._pending_primitive = dispatch
             self._pending_primitive_agent = agent
@@ -1454,7 +2630,11 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
         self._pending_primitive = dispatch
         self._pending_primitive_agent = agent
 
-    def _update_observation_gap_watchdog(self, game_loop: int) -> bool:
+    def _update_observation_gap_watchdog(
+        self,
+        game_loop: int,
+        observation: Any = None,
+    ) -> bool:
         """Preempt optional upstream automation when Runtime observations stall."""
 
         last_decision_loop = self.decision_broker.last_decision_game_loop
@@ -1477,6 +2657,7 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
             self._observation_watchdog_baseline_loop = last_decision_loop
             self._rtscortex_force_runtime_decision = True
             self.decision_broker.record_observation_gap_watchdog_trigger()
+            _recover_observation_gap(self, observation)
         if (
             self._observation_watchdog_preempted
             and gap > self.worker_settings.observation_gap_hard_limit_game_loops
@@ -1491,6 +2672,62 @@ class RTSCortexMainAgent(_MainAgentBase):  # type: ignore[misc]
         # worker management resume here can consume every subsequent SC2 step
         # and starve the next Runtime decision again.
         return self._observation_watchdog_preempted
+
+    def _expansion_scout_action(
+        self,
+        obs: Any,
+        *,
+        game_loop: int,
+        blocked: bool,
+    ) -> Optional[Any]:
+        if not self.worker_settings.expansion_scout_enabled:
+            return None
+        extractor = self.decision_broker.extractor
+        suppressed_anchors = extractor.suppressed_expansion_anchors
+        if not suppressed_anchors.issubset(self._last_suppressed_expansion_anchors):
+            self.expansion_scout.request_immediate_progress(game_loop=game_loop)
+        self._last_suppressed_expansion_anchors = suppressed_anchors
+        anchor_candidates = expansion_anchor_candidates(
+            obs.observation,
+            unit_names=extractor.unit_names,
+            known_expansion_resources=extractor.known_expansion_resources,
+            excluded_expansion_anchors=suppressed_anchors,
+        )
+        self.expansion_scout.observe_anchors(
+            available=anchor_candidates,
+            rejected=suppressed_anchors,
+        )
+        anchor_available = bool(anchor_candidates)
+        hard_blocked = (
+            blocked
+            or self.decision_broker.last_decision_game_loop is None
+            or bool(getattr(self, "unit_uid_appear", ()))
+            or getattr(self, "_pending_primitive", None) is not None
+        )
+        soft_blocked = bool(getattr(self, "main_loop_lock", False)) or any(
+            bool(getattr(agent, "func_list", ())) or bool(getattr(agent, "action_list", ()))
+            for agent in getattr(self, "agents", {}).values()
+        )
+        was_exhausted = self.expansion_scout.exhausted
+        waypoint = self.expansion_scout.next_waypoint(
+            obs.observation,
+            game_loop=game_loop,
+            anchor_available=anchor_available,
+            blocked=hard_blocked,
+            soft_blocked=soft_blocked,
+        )
+        extractor.set_expansion_candidates_exhausted(self.expansion_scout.exhausted)
+        extractor.set_expansion_scout_alerts(self.expansion_scout.progress_alerts)
+        if self.expansion_scout.exhausted and not was_exhausted:
+            self.decision_broker.record_expansion_candidate_exhaustion()
+        if waypoint is None:
+            return None
+        actions = importlib.import_module("pysc2.lib.actions")
+        self.main_loop_lock = False
+        _clear_optional_team_gathering(self)
+        self._rtscortex_force_runtime_decision = True
+        self.decision_broker.record_expansion_scout_move()
+        return actions.FUNCTIONS.move_camera(list(waypoint))
 
     def _report_episode(self, obs: Any) -> None:
         reward = float(getattr(obs, "reward", 0.0) or 0.0)
@@ -1716,6 +2953,26 @@ def _production_action_source_types(agent_race: str = "protoss") -> dict[int, in
         )
         if producer is not None:
             result[morph.feature_function_id] = int(producer)
+    for research in RESEARCH_SPECS.values():
+        if research.race != agent_race:
+            continue
+        producer = getattr(
+            getattr(units, agent_race.capitalize()),
+            research.producer_type,
+            None,
+        )
+        if producer is not None:
+            result[research.feature_function_id] = int(producer)
+    for ability in ABILITY_SPECS.values():
+        if ability.race != agent_race:
+            continue
+        producer = getattr(
+            getattr(units, agent_race.capitalize()),
+            ability.producer_type,
+            None,
+        )
+        if producer is not None:
+            result[ability.feature_function_id] = int(producer)
     return result
 
 
@@ -1774,6 +3031,16 @@ def _run_with_auto_worker_management_guard(
         config.ENABLE_AUTO_WORKER_TRAINING = worker_training_enabled
 
 
+def _suppress_pending_build_control_action(action: Any, *, blocked: bool) -> Any:
+    """Do not let upstream Stop/Hold cancel an accepted construction order."""
+
+    if not blocked or int(getattr(action, "function", -1)) not in (
+        ORDER_INTERRUPT_CONTROL_FUNCTION_IDS
+    ):
+        return action
+    return _no_op()
+
+
 def _should_block_gas_rebalance(
     *,
     effect_verification_blocked: bool,
@@ -1797,6 +3064,295 @@ def _runtime_observation_is_due(
         return False
     observation_budget = max(1, watchdog_game_loops // 2)
     return game_loop - last_decision_game_loop >= observation_budget
+
+
+def _gas_assignment_choice(
+    main_agent: Any,
+    observation: Any,
+) -> Optional[tuple[int, int]]:
+    """Return the nearest exact mineral-worker/gas pair outside Builder ownership."""
+
+    if not bool(getattr(main_agent.config, "ENABLE_AUTO_WORKER_MANAGE", False)):
+        return None
+    reserved_builder_tags = _reserved_builder_worker_tags(main_agent)
+    main_agent._rtscortex_reserved_worker_tags = reserved_builder_tags
+    raw_by_tag = {
+        int(_observation_value(unit, "tag", 0)): unit
+        for unit in _observation_value(observation, "raw_units", ())
+        if int(_observation_value(unit, "tag", 0)) > 0
+    }
+    choices: list[tuple[float, int, int]] = []
+    nexus_info_dict = getattr(main_agent, "nexus_info_dict", {})
+    if not isinstance(nexus_info_dict, Mapping):
+        return None
+    for _nexus_key, info in sorted(
+        nexus_info_dict.items(),
+        key=lambda item: int(item[0]),
+    ):
+        if not isinstance(info, Mapping):
+            continue
+        gas_slots = (
+            (info.get("gas_building_1"), info.get("worker_g1_tag_list", ())),
+            (info.get("gas_building_2"), info.get("worker_g2_tag_list", ())),
+        )
+        for gas, gas_workers in gas_slots:
+            assigned_non_builders = {
+                int(tag) for tag in (gas_workers or ()) if int(tag) not in reserved_builder_tags
+            }
+            if gas is None or len(assigned_non_builders) >= 3:
+                continue
+            progress = float(_observation_value(gas, "build_progress", 0.0))
+            progress = progress / 100.0 if progress > 1.0 else progress
+            gas_tag = int(_observation_value(gas, "tag", 0))
+            current_gas = raw_by_tag.get(gas_tag)
+            if progress < 1.0 or current_gas is None:
+                continue
+            for worker_tag in sorted(set(int(tag) for tag in info.get("worker_m_tag_list", ()))):
+                if worker_tag in reserved_builder_tags:
+                    continue
+                worker = raw_by_tag.get(worker_tag)
+                if worker is None or int(_observation_value(worker, "alliance", 0)) != 1:
+                    continue
+                distance = (
+                    float(_observation_value(worker, "x", 0.0))
+                    - float(_observation_value(current_gas, "x", 0.0))
+                ) ** 2 + (
+                    float(_observation_value(worker, "y", 0.0))
+                    - float(_observation_value(current_gas, "y", 0.0))
+                ) ** 2
+                choices.append((distance, worker_tag, gas_tag))
+    if not choices:
+        return None
+    _, worker_tag, gas_tag = min(choices)
+    return worker_tag, gas_tag
+
+
+def _raw_gas_assignment_choice(
+    main_agent: Any,
+    observation: Any,
+) -> Optional[tuple[int, int]]:
+    """Choose a non-Builder Probe and undersaturated completed Assimilator."""
+
+    unit_names = main_agent.decision_broker.extractor.unit_names
+    reserved = _reserved_builder_worker_tags(main_agent)
+    raw_units = list(_observation_value(observation, "raw_units", ()))
+    gases = [
+        unit
+        for unit in raw_units
+        if int(_observation_value(unit, "alliance", 0)) == 1
+        and _worker_unit_name(unit, unit_names) == "Assimilator"
+        and _normalized_worker_build_progress(unit) >= 1.0
+        and int(_observation_value(unit, "assigned_harvesters", 0)) < 3
+    ]
+    workers = [
+        unit
+        for unit in raw_units
+        if int(_observation_value(unit, "alliance", 0)) == 1
+        and _worker_unit_name(unit, unit_names) == "Probe"
+        and int(_observation_value(unit, "tag", 0)) not in reserved
+        and int(_observation_value(unit, "buff_id_0", 0)) != 274
+    ]
+    choices = [
+        (
+            math.dist(
+                (
+                    float(_observation_value(worker, "x", 0.0)),
+                    float(_observation_value(worker, "y", 0.0)),
+                ),
+                (
+                    float(_observation_value(gas, "x", 0.0)),
+                    float(_observation_value(gas, "y", 0.0)),
+                ),
+            ),
+            int(_observation_value(worker, "tag", 0)),
+            int(_observation_value(gas, "tag", 0)),
+        )
+        for gas in gases
+        for worker in workers
+    ]
+    if not choices:
+        return None
+    _, worker_tag, gas_tag = min(choices)
+    return worker_tag, gas_tag
+
+
+def _raw_gas_assignment_is_confirmed(worker: Any, gas: Any) -> bool:
+    return (
+        int(_observation_value(worker, "buff_id_0", 0)) == 274
+        and math.dist(
+            (
+                float(_observation_value(worker, "x", 0.0)),
+                float(_observation_value(worker, "y", 0.0)),
+            ),
+            (
+                float(_observation_value(gas, "x", 0.0)),
+                float(_observation_value(gas, "y", 0.0)),
+            ),
+        )
+        <= 10.0
+    )
+
+
+def _raw_mineral_assignment_choice(
+    main_agent: Any,
+    observation: Any,
+) -> Optional[tuple[int, int]]:
+    """Assign one idle non-Builder Probe to a mineral near an own Nexus."""
+
+    unit_names = main_agent.decision_broker.extractor.unit_names
+    reserved = _reserved_builder_worker_tags(main_agent)
+    raw_units = list(_observation_value(observation, "raw_units", ()))
+    nexuses = [
+        unit
+        for unit in raw_units
+        if int(_observation_value(unit, "alliance", 0)) == 1
+        and _worker_unit_name(unit, unit_names) == "Nexus"
+        and _normalized_worker_build_progress(unit) >= 1.0
+    ]
+    workers = [
+        unit
+        for unit in raw_units
+        if int(_observation_value(unit, "alliance", 0)) == 1
+        and _worker_unit_name(unit, unit_names) == "Probe"
+        and int(_observation_value(unit, "tag", 0)) not in reserved
+        and int(_observation_value(unit, "order_length", 0)) == 0
+        and int(_observation_value(unit, "buff_id_0", 0)) != 274
+    ]
+    minerals = [
+        unit
+        for unit in raw_units
+        if int(_observation_value(unit, "alliance", 0)) == 3
+        and "mineral" in _worker_unit_name(unit, unit_names).casefold()
+        and any(
+            math.dist(
+                (
+                    float(_observation_value(unit, "x", 0.0)),
+                    float(_observation_value(unit, "y", 0.0)),
+                ),
+                (
+                    float(_observation_value(nexus, "x", 0.0)),
+                    float(_observation_value(nexus, "y", 0.0)),
+                ),
+            )
+            <= 12.0
+            for nexus in nexuses
+        )
+    ]
+    choices = [
+        (
+            math.dist(
+                (
+                    float(_observation_value(worker, "x", 0.0)),
+                    float(_observation_value(worker, "y", 0.0)),
+                ),
+                (
+                    float(_observation_value(mineral, "x", 0.0)),
+                    float(_observation_value(mineral, "y", 0.0)),
+                ),
+            ),
+            int(_observation_value(worker, "tag", 0)),
+            int(_observation_value(mineral, "tag", 0)),
+        )
+        for worker in workers
+        for mineral in minerals
+    ]
+    if not choices:
+        return None
+    _, worker_tag, mineral_tag = min(choices)
+    return worker_tag, mineral_tag
+
+
+def _normalized_worker_build_progress(unit: Any) -> float:
+    value = float(_observation_value(unit, "build_progress", 0.0))
+    return value / 100.0 if value > 1.0 else value
+
+
+def _raw_builder_ready(unit: Any) -> bool:
+    """Return whether one observed worker can receive a raw build now."""
+
+    if (
+        int(_observation_value(unit, "alliance", 0)) != 1
+        or float(_observation_value(unit, "health", 1.0)) <= 0
+        or _normalized_worker_build_progress(unit) < 1.0
+        or int(_observation_value(unit, "display_type", 1)) != 1
+    ):
+        return False
+    order_ids: set[int] = set()
+    order_length = max(4, int(_observation_value(unit, "order_length", 0)))
+    for index in range(order_length):
+        order_id = int(_observation_value(unit, f"order_id_{index}", 0))
+        if order_id > 0:
+            order_ids.add(order_id)
+    orders = _observation_value(unit, "orders", ())
+    if isinstance(orders, Mapping):
+        orders = (orders,)
+    for order in orders or ():
+        order_id = int(
+            order.get("ability_id", order.get("abilityId", order.get("order_id", 0)))
+            if isinstance(order, Mapping)
+            else getattr(
+                order,
+                "ability_id",
+                getattr(order, "abilityId", getattr(order, "order_id", 0)),
+            )
+        )
+        if order_id > 0:
+            order_ids.add(order_id)
+    return not order_ids.intersection(BUILD_RAW_FUNCTION_IDS.values())
+
+
+def _worker_camera_position(main_agent: Any, unit: Any) -> tuple[int, int]:
+    return (
+        int(float(_observation_value(unit, "x", 0.0)) + float(main_agent.world_x_offset)),
+        int(
+            max(
+                0.0,
+                float(main_agent.world_range)
+                - float(_observation_value(unit, "y", 0.0))
+                + float(main_agent.world_y_offset),
+            )
+        ),
+    )
+
+
+def _gas_assignment_is_confirmed(
+    main_agent: Any,
+    worker: Any,
+    gas: Any,
+) -> bool:
+    worker_tag = int(_observation_value(worker, "tag", 0))
+    gas_tag = int(_observation_value(gas, "tag", 0))
+    nexus_info_dict = getattr(main_agent, "nexus_info_dict", {})
+    if isinstance(nexus_info_dict, Mapping):
+        for info in nexus_info_dict.values():
+            if not isinstance(info, Mapping):
+                continue
+            for gas_key, worker_key in (
+                ("gas_building_1", "worker_g1_tag_list"),
+                ("gas_building_2", "worker_g2_tag_list"),
+            ):
+                candidate_gas = info.get(gas_key)
+                if (
+                    candidate_gas is not None
+                    and int(_observation_value(candidate_gas, "tag", 0)) == gas_tag
+                    and worker_tag in {int(tag) for tag in info.get(worker_key, ())}
+                ):
+                    return True
+    if int(_observation_value(worker, "buff_id_0", 0)) != 274:
+        return False
+    return (
+        math.dist(
+            (
+                float(_observation_value(worker, "x", 0.0)),
+                float(_observation_value(worker, "y", 0.0)),
+            ),
+            (
+                float(_observation_value(gas, "x", 0.0)),
+                float(_observation_value(gas, "y", 0.0)),
+            ),
+        )
+        <= 10.0
+    )
 
 
 def _prime_deterministic_gas_rebalance(
@@ -1883,15 +3439,42 @@ def _prime_deterministic_gas_rebalance(
     return True
 
 
+def _active_placement_builder_lease_tags(main_agent: Any) -> set[int]:
+    raw_executor = getattr(main_agent, "raw_executor", None)
+    placement_service = getattr(raw_executor, "placement_service", None)
+    return {
+        int(tag) for tag in getattr(placement_service, "leased_builder_tags", ()) if int(tag) > 0
+    }
+
+
+def _raw_worker_action_actor_tags(action: Any) -> tuple[int, ...]:
+    arguments = getattr(action, "arguments", ())
+    if not isinstance(arguments, Sequence) or len(arguments) < 2:
+        return ()
+    raw_tags = arguments[1]
+    if isinstance(raw_tags, Integral):
+        return (int(raw_tags),) if int(raw_tags) > 0 else ()
+    if not isinstance(raw_tags, Sequence) or isinstance(raw_tags, (str, bytes)):
+        return ()
+    return tuple(int(tag) for tag in raw_tags if isinstance(tag, Integral) and int(tag) > 0)
+
+
+def _raw_worker_action_has_builder_lease_conflict(main_agent: Any, action: Any) -> bool:
+    return bool(
+        set(_raw_worker_action_actor_tags(action))
+        & _active_placement_builder_lease_tags(main_agent)
+    )
+
+
 def _reserved_builder_worker_tags(main_agent: Any) -> set[int]:
+    tags = _active_placement_builder_lease_tags(main_agent)
     agents = getattr(main_agent, "agents", {})
     if not isinstance(agents, Mapping):
-        return set()
+        return tags
     builder = agents.get("Builder")
     if builder is None:
-        return set()
+        return tags
 
-    tags: set[int] = set()
     current = getattr(builder, "team_unit_tag_curr", None)
     if current is not None and int(current) > 0:
         tags.add(int(current))
@@ -1904,6 +3487,118 @@ def _reserved_builder_worker_tags(main_agent: Any) -> set[int]:
             continue
         tags.update(int(tag) for tag in team.get("unit_tags", ()) if int(tag) > 0)
     return tags
+
+
+def _authoritative_canary_execution_ownership(
+    main_agent: Any,
+) -> tuple[int, tuple[int, ...], int]:
+    raw_executor = main_agent.raw_executor
+    placement_service = raw_executor.placement_service
+    return (
+        int(placement_service.active_reservation_count),
+        tuple(sorted(int(tag) for tag in placement_service.leased_builder_tags)),
+        int(raw_executor.effect_inflight_count),
+    )
+
+
+def _routed_decision_commands(decision: Any) -> tuple[RoutedCommand, ...]:
+    routed = {
+        command.command_id: command
+        for route in decision.routes.values()
+        for command in route.commands
+    }
+    return tuple(
+        routed[str(value["command_id"])] for value in decision.action_batch.get("commands", ())
+    )
+
+
+def _current_raw_builder_tag(main_agent: Any) -> int | None:
+    builder = getattr(main_agent, "agents", {}).get("Builder")
+    if builder is None:
+        return None
+    value = getattr(builder, "team_unit_tag_curr", None)
+    if value is None or int(value) <= 0:
+        return None
+    return int(value)
+
+
+def _pin_authoritative_canary_builder(
+    main_agent: Any,
+    observation: Any,
+    controller: AuthoritativeBuildCircuitCanary,
+    *,
+    game_loop: int,
+    observation_revision: str,
+) -> bool:
+    """Pin the exact real, feature-visible Builder required by the canary phase."""
+
+    unit_names = main_agent.decision_broker.extractor.unit_names
+    placement_service = main_agent.raw_executor.placement_service
+    desired = controller.required_builder_tag
+    select_replacement = desired is None
+    feature_visible = {
+        int(_observation_value(unit, "tag", 0))
+        for unit in _observation_value(observation, "feature_units", ())
+        if int(_observation_value(unit, "alliance", 0)) == 1
+        and bool(_observation_value(unit, "is_on_screen", True))
+    }
+    candidates = [
+        unit
+        for unit in _observation_value(observation, "raw_units", ())
+        if _worker_unit_name(unit, unit_names) == "Probe"
+        and _raw_builder_ready(unit)
+        and int(_observation_value(unit, "tag", 0)) in feature_visible
+        and (
+            int(_observation_value(unit, "tag", 0)) not in placement_service.leased_builder_tags
+            or placement_service.builder_lease_owner(int(_observation_value(unit, "tag", 0)))
+            in {
+                controller.final_command_id,
+                getattr(controller.current_command, "command_id", None),
+            }
+        )
+        and (
+            not select_replacement
+            or int(_observation_value(unit, "tag", 0)) != controller.initial_builder_tag
+        )
+    ]
+    if desired is not None:
+        candidates = [
+            unit for unit in candidates if int(_observation_value(unit, "tag", 0)) == desired
+        ]
+    if not candidates:
+        return False
+    selected = min(candidates, key=lambda unit: int(_observation_value(unit, "tag", 0)))
+    selected_tag = int(_observation_value(selected, "tag", 0))
+    selected_type = int(_observation_value(selected, "unit_type", 0))
+    builder = getattr(main_agent, "agents", {}).get("Builder")
+    if builder is None:
+        return False
+    team_name: str | None = None
+    for team in getattr(builder, "teams", ()):
+        if not isinstance(team, dict):
+            continue
+        if selected_type in {int(value) for value in team.get("unit_type", ())}:
+            team["unit_tags"] = [selected_tag]
+            team["unit_tags_selected"] = [selected_tag]
+            team_name = str(team.get("name", ""))
+        elif str(team.get("name", "")) != "Empty":
+            team["unit_tags"] = []
+            team["unit_tags_selected"] = []
+    if not team_name:
+        return False
+    builder.team_unit_tag_list = [selected_tag]
+    builder.team_unit_team_list = [team_name]
+    builder.team_unit_obs_list = []
+    builder.team_unit_tag_curr = selected_tag
+    builder.team_unit_team_curr = team_name
+    builder.enable = True
+    if selected_tag != controller.initial_builder_tag:
+        controller.bind_replacement_builder(
+            selected_tag,
+            game_loop=game_loop,
+            observation_revision=observation_revision,
+        )
+    return True
 
 
 def _rebind_builder_to_selected_worker(main_agent: Any, observation: Any) -> bool:
@@ -2196,12 +3891,23 @@ def _abort_stalled_actor_selection(main_agent: Any) -> bool:
         return False
 
     command_id = str(getattr(dispatch, "command_id", ""))
-    team_name = str(getattr(agent, "team_unit_team_curr", "") or "")
+    team_name = _execution_team_name(agent) or ""
     key = (command_id, team_name)
     if key != getattr(main_agent, "_actor_selection_retry_key", None):
         main_agent._actor_selection_retry_key = key
         main_agent._actor_selection_attempts = 0
     main_agent._actor_selection_attempts += 1
+    if (
+        int(getattr(dispatch, "requested_function_id", 0) or 0) == 4
+        and main_agent._actor_selection_attempts >= 2
+        and _switch_team_to_direct_selection(agent, team_name)
+    ):
+        # The control group is stale or was never initialised. Preserve the
+        # command and let the next upstream pass select the living tag directly.
+        main_agent._actor_selection_retry_key = None
+        main_agent._actor_selection_attempts = 0
+        _record_orchestration_recovery(main_agent)
+        return False
     if main_agent._actor_selection_attempts < ACTOR_SELECTION_MAX_ATTEMPTS:
         return False
 
@@ -2225,14 +3931,477 @@ def _abort_stalled_actor_selection(main_agent: Any) -> bool:
     return True
 
 
-def _release_runtime_observation_barrier(main_agent: Any) -> None:
+def _switch_team_to_direct_selection(agent: Any, team_name: str) -> bool:
+    """Permanently replace one failed control-group route with exact tag selection."""
+
+    for team in getattr(agent, "teams", ()):
+        if not isinstance(team, dict) or str(team.get("name", "")) != team_name:
+            continue
+        if str(team.get("select_type", "")) != "group":
+            return False
+        live_tags = [int(tag) for tag in team.get("unit_tags", ()) if int(tag) > 0]
+        if not live_tags:
+            return False
+        team["_rtscortex_original_select_type"] = "group"
+        team["select_type"] = "select"
+        team["unit_tags_selected"] = []
+        team["obs"] = []
+        team["pos"] = []
+        team["minimap_pos"] = []
+        return True
+    return False
+
+
+def _enforce_orchestration_primitive_budget(
+    main_agent: Any,
+    observation: Any,
+) -> bool:
+    """Bound complete camera/selection chains, including repeated camera function 573."""
+
+    _normalize_new_unit_queue(main_agent)
+    dispatch = getattr(main_agent, "_pending_primitive", None)
+    agent = getattr(main_agent, "_pending_primitive_agent", None)
+    if dispatch is None or agent is None:
+        pending_units = getattr(main_agent, "unit_uid_appear", None)
+        function_history = getattr(main_agent, "func_id_history", None)
+        if (
+            not isinstance(pending_units, list)
+            or not pending_units
+            or not isinstance(function_history, list)
+            or not function_history
+            or int(function_history[-1]) not in {2, 3, 4, 573}
+        ):
+            main_agent._orchestration_budget_key = None
+            main_agent._orchestration_budget_used = 0
+            return False
+        key = ("new-unit", str(int(pending_units[0])))
+        if key != getattr(main_agent, "_orchestration_budget_key", None):
+            main_agent._orchestration_budget_key = key
+            main_agent._orchestration_budget_used = 0
+        main_agent._orchestration_budget_used += 1
+        budget = int(main_agent.worker_settings.orchestration_primitive_budget)
+        if main_agent._orchestration_budget_used < budget:
+            return False
+        recovered = _force_group_stalled_new_unit(main_agent, observation)
+        main_agent._orchestration_budget_key = None
+        main_agent._orchestration_budget_used = 0
+        main_agent.main_loop_lock = False
+        main_agent._rtscortex_force_runtime_decision = True
+        if recovered:
+            _record_orchestration_recovery(main_agent)
+        return recovered
+    if str(getattr(dispatch, "origin", "")) == "translator":
+        main_agent._orchestration_budget_key = None
+        main_agent._orchestration_budget_used = 0
+        return False
+    function_id = int(getattr(dispatch, "requested_function_id", 0) or 0)
+    if str(getattr(dispatch, "origin", "")) != "orchestration" or function_id not in {
+        2,
+        3,
+        4,
+        573,
+    }:
+        return False
+    if isinstance(getattr(agent, "last_execution_abort", None), Mapping):
+        return False
+
+    command_id = str(getattr(dispatch, "command_id", ""))
+    team_name = str(getattr(agent, "team_unit_team_curr", "") or "")
+    key = (command_id, team_name)
+    if key != getattr(main_agent, "_orchestration_budget_key", None):
+        main_agent._orchestration_budget_key = key
+        main_agent._orchestration_budget_used = 0
+    main_agent._orchestration_budget_used += 1
+    budget = int(main_agent.worker_settings.orchestration_primitive_budget)
+    if main_agent._orchestration_budget_used < budget:
+        return False
+
+    _abort_orchestration_chain(
+        main_agent,
+        agent,
+        team_name=team_name,
+        failure_code="orchestration_budget_exceeded",
+        failure_reason=(f"camera/selection chain exceeded its {budget}-primitive budget"),
+    )
+    _force_group_stalled_new_unit(main_agent, observation)
+    main_agent._orchestration_budget_key = None
+    main_agent._orchestration_budget_used = 0
+    main_agent._rtscortex_force_runtime_decision = True
+    _record_orchestration_recovery(main_agent)
+    return True
+
+
+def _recover_observation_gap(main_agent: Any, observation: Any) -> bool:
+    """Force-clear optional camera work so the soft watchdog can recover in-place."""
+
+    recovered = _force_group_stalled_new_unit(main_agent, observation)
+    dispatch = getattr(main_agent, "_pending_primitive", None)
+    agent = getattr(main_agent, "_pending_primitive_agent", None)
+    if (
+        dispatch is not None
+        and agent is not None
+        and str(getattr(dispatch, "origin", "")) == "orchestration"
+        and not isinstance(getattr(agent, "last_execution_abort", None), Mapping)
+    ):
+        actor_tag = _execution_unit_tag(agent)
+        if actor_tag is not None and not _own_unit_is_living(observation, actor_tag):
+            _quarantine_unit_tag(main_agent, actor_tag)
+        _abort_orchestration_chain(
+            main_agent,
+            agent,
+            team_name=_execution_team_name(agent) or "",
+            failure_code="observation_gap_watchdog_recovery",
+            failure_reason="watchdog force-cleared a stalled camera/selection chain",
+        )
+        recovered = True
+    main_agent.main_loop_lock = False
+    main_agent._rtscortex_force_runtime_decision = True
+    if recovered:
+        _record_orchestration_recovery(main_agent)
+    return recovered
+
+
+def _refresh_combat_team_membership(main_agent: Any, observation: Any) -> int:
+    """Prune confirmed-dead combat tags and deterministically rebind active heads."""
+
+    agents = getattr(main_agent, "agents", {})
+    if not isinstance(agents, Mapping):
+        return 0
+    living_by_tag = {
+        int(_observation_value(unit, "tag", 0)): unit
+        for unit in _observation_value(observation, "raw_units", ())
+        if int(_observation_value(unit, "tag", 0)) > 0
+        and int(_observation_value(unit, "alliance", 0)) == 1
+        and float(_observation_value(unit, "build_progress", 0.0)) in {1.0, 100.0}
+    }
+    changed = 0
+    for agent_name, agent in sorted(agents.items()):
+        if not str(agent_name).startswith("CombatGroup"):
+            continue
+        teams = [team for team in getattr(agent, "teams", ()) if isinstance(team, dict)]
+        team_by_name = {str(team.get("name", "")): team for team in teams}
+        for team in teams:
+            allowed_types = {int(value) for value in team.get("unit_type", ())}
+            configured = [int(tag) for tag in team.get("unit_tags", ()) if int(tag) > 0]
+            living = [
+                tag
+                for tag in configured
+                if tag in living_by_tag
+                and (
+                    not allowed_types
+                    or int(_observation_value(living_by_tag[tag], "unit_type", -1)) in allowed_types
+                )
+            ]
+            removed = set(configured) - set(living)
+            if not removed:
+                continue
+            for tag in removed:
+                _quarantine_unit_tag(main_agent, tag)
+            team["unit_tags"] = living
+            team["unit_tags_selected"] = [
+                int(tag) for tag in team.get("unit_tags_selected", ()) if int(tag) in living
+            ]
+            team["obs"] = []
+            team["pos"] = []
+            team["minimap_pos"] = []
+            changed += len(removed)
+
+        living_agent_tags = {
+            int(tag)
+            for team in teams
+            for tag in team.get("unit_tags", ())
+            if int(tag) in living_by_tag
+        }
+        agent.unit_tag_list = [
+            int(tag) for tag in getattr(agent, "unit_tag_list", ()) if int(tag) in living_agent_tags
+        ]
+        agent.unit_raw_list = [
+            living_by_tag[tag] for tag in agent.unit_tag_list if tag in living_by_tag
+        ]
+        queued_tags = list(getattr(agent, "team_unit_tag_list", ()))
+        queued_teams = list(getattr(agent, "team_unit_team_list", ()))
+        queued_pairs = []
+        for index in range(min(len(queued_tags), len(queued_teams))):
+            tag = int(queued_tags[index])
+            team_name = str(queued_teams[index])
+            team_tags = {
+                int(value) for value in team_by_name.get(team_name, {}).get("unit_tags", ())
+            }
+            if tag in living_agent_tags and tag in team_tags:
+                queued_pairs.append((tag, team_name))
+        agent.team_unit_tag_list = [tag for tag, _team_name in queued_pairs]
+        agent.team_unit_team_list = [team_name for _tag, team_name in queued_pairs]
+
+        current_tag = _execution_unit_tag(agent)
+        current_team_name = _execution_team_name(agent)
+        if current_tag is None or current_tag in living_agent_tags:
+            continue
+        current_team = team_by_name.get(str(current_team_name or ""))
+        replacements = (
+            []
+            if current_team is None
+            else sorted(
+                int(tag)
+                for tag in current_team.get("unit_tags", ())
+                if int(tag) in living_agent_tags
+            )
+        )
+        if replacements:
+            agent.team_unit_tag_curr = replacements[0]
+            agent._rtscortex_last_combat_rebind = (current_tag, replacements[0])
+            continue
+        action_name = str(getattr(agent, "curr_action_name", "") or "")
+        if action_name and action_name != "No_Operation" and agent._is_executing_actions():
+            _abort_orchestration_chain(
+                main_agent,
+                agent,
+                team_name=str(current_team_name or ""),
+                failure_code="actor_not_available",
+                failure_reason="combat team head disappeared from the raw observation",
+            )
+    return changed
+
+
+def _own_unit_is_living(observation: Any, tag: int) -> bool:
+    return any(
+        int(_observation_value(unit, "tag", 0)) == int(tag)
+        and int(_observation_value(unit, "alliance", 0)) == 1
+        and float(_observation_value(unit, "build_progress", 0.0)) in {1.0, 100.0}
+        for unit in _observation_value(observation, "raw_units", ())
+    )
+
+
+def _quarantine_unit_tag(main_agent: Any, tag: int) -> None:
+    quarantine = getattr(main_agent, "_rtscortex_unit_quarantine", None)
+    if not isinstance(quarantine, set):
+        quarantine = set()
+        main_agent._rtscortex_unit_quarantine = quarantine
+    quarantine.add(int(tag))
+
+
+def _builder_selection_lease_active(main_agent: Any) -> bool:
+    """Keep optional automation from changing selection during a build chain."""
+
+    builder = getattr(main_agent, "agents", {}).get("Builder")
+    if builder is None:
+        return False
+    semantic_action = getattr(builder, "_rtscortex_semantic_action", None)
+    action_name = (
+        str(semantic_action.get("name", ""))
+        if isinstance(semantic_action, Mapping)
+        else str(getattr(builder, "curr_action_name", "") or "")
+    )
+    return action_name.startswith("Build_") and (
+        bool(getattr(builder, "func_list", ()))
+        or bool(getattr(builder, "action_list", ()))
+        or semantic_action is not None
+    )
+
+
+def _abort_orchestration_chain(
+    main_agent: Any,
+    agent: Any,
+    *,
+    team_name: str,
+    failure_code: str,
+    failure_reason: str,
+) -> None:
+    action_name = str(getattr(agent, "curr_action_name", "") or "")
+    agent.last_execution_abort = {
+        "team_name": team_name,
+        "action_name": action_name,
+        "failure_code": failure_code,
+        "failure_reason": failure_reason,
+        "actor_tag": _execution_unit_tag(agent),
+    }
+    agent.func_list.clear()
+    agent.action_list.clear()
+    agent._rtscortex_semantic_action = None
+    agent.team_unit_tag_curr = None
+    agent.team_unit_team_curr = None
+    main_agent._actor_selection_retry_key = None
+    main_agent._actor_selection_attempts = 0
+
+
+def _force_group_stalled_new_unit(main_agent: Any, observation: Any) -> bool:
+    """Finish new-unit bookkeeping without another feature-camera round trip."""
+
+    _normalize_new_unit_queue(main_agent)
+    pending = getattr(main_agent, "unit_uid_appear", None)
+    if not isinstance(pending, list) or not pending:
+        return False
+    tag = int(pending[0])
+    unit = next(
+        (
+            item
+            for item in _observation_value(observation, "raw_units", ())
+            if int(_observation_value(item, "tag", -1)) == tag
+        ),
+        None,
+    )
+    if unit is not None:
+        unit_type = int(_observation_value(unit, "unit_type", -1))
+        destinations: list[tuple[int, str, Any, dict[str, Any]]] = []
+        for agent_name, agent in getattr(main_agent, "agents", {}).items():
+            for team in getattr(agent, "teams", ()):
+                if unit_type in {int(value) for value in team.get("unit_type", ())}:
+                    destinations.append(
+                        (len(team.get("unit_tags", ())), str(agent_name), agent, team)
+                    )
+        if destinations:
+            _, _, destination_agent, team = min(
+                destinations,
+                key=lambda value: (value[0], value[1], str(value[3].get("name", ""))),
+            )
+            team.setdefault("unit_tags", [])
+            if tag not in team["unit_tags"]:
+                team["unit_tags"].append(tag)
+            if tag not in destination_agent.unit_tag_list:
+                destination_agent.unit_tag_list.append(tag)
+                destination_agent.unit_raw_list.append(unit)
+    pending[:] = [value for value in pending if int(value) != tag]
+    _remember_processed_unit_tag(main_agent, tag)
+    return True
+
+
+def _remember_processed_unit_tag(main_agent: Any, tag: int) -> None:
+    """Persist recovered/grouped tags across early returns in upstream func1."""
+
+    normalized_tag = int(tag)
+    quarantine = getattr(main_agent, "_rtscortex_unit_quarantine", None)
+    if not isinstance(quarantine, set):
+        quarantine = set()
+        main_agent._rtscortex_unit_quarantine = quarantine
+    quarantine.add(normalized_tag)
+    total = getattr(main_agent, "unit_uid_total", None)
+    if isinstance(total, set):
+        total.add(normalized_tag)
+    elif isinstance(total, list):
+        if normalized_tag not in total:
+            total.append(normalized_tag)
+    else:
+        main_agent.unit_uid_total = {normalized_tag}
+
+
+def _refresh_unit_quarantine(main_agent: Any) -> set[int]:
+    """Remember every tag already owned by an upstream team or seen set."""
+
+    quarantine = getattr(main_agent, "_rtscortex_unit_quarantine", None)
+    if not isinstance(quarantine, set):
+        quarantine = set()
+        main_agent._rtscortex_unit_quarantine = quarantine
+    total = getattr(main_agent, "unit_uid_total", ())
+    if isinstance(total, (list, tuple, set, frozenset)):
+        quarantine.update(int(tag) for tag in total)
+    for agent in getattr(main_agent, "agents", {}).values():
+        for team in getattr(agent, "teams", ()):
+            quarantine.update(int(tag) for tag in team.get("unit_tags", ()))
+    return quarantine
+
+
+def _normalize_new_unit_queue(main_agent: Any) -> None:
+    """Keep the upstream new-unit queue unique and exclude processed tags."""
+
+    pending = getattr(main_agent, "unit_uid_appear", None)
+    if not isinstance(pending, list):
+        return
+    quarantine = _refresh_unit_quarantine(main_agent)
+    seen: set[int] = set()
+    normalized: list[int] = []
+    for value in pending:
+        tag = int(value)
+        if tag in seen or tag in quarantine:
+            continue
+        seen.add(tag)
+        normalized.append(tag)
+    pending[:] = normalized
+
+
+def _prepare_runtime_observation_bypass(main_agent: Any, observation: Any) -> bool:
+    """Bypass func1 camera work and expose the current raw snapshot to Runtime."""
+
+    _normalize_new_unit_queue(main_agent)
+    pending = getattr(main_agent, "unit_uid_appear", None)
+    if not isinstance(pending, list):
+        pending = []
+        main_agent.unit_uid_appear = pending
+    quarantine = _refresh_unit_quarantine(main_agent)
+    current_tags: list[int] = []
+    previous_tags = {int(tag) for tag in getattr(main_agent, "unit_uid", ())}
+    for unit in _observation_value(observation, "raw_units", ()):
+        if int(_observation_value(unit, "alliance", -1)) != 1:
+            continue
+        if float(_observation_value(unit, "build_progress", 0.0)) < 100.0:
+            continue
+        tag = int(_observation_value(unit, "tag", -1))
+        if tag < 0:
+            continue
+        current_tags.append(tag)
+        if tag not in previous_tags and tag not in quarantine and tag not in pending:
+            pending.append(tag)
+
+    recovered = False
+    for _ in range(len(set(int(tag) for tag in pending))):
+        if not _force_group_stalled_new_unit(main_agent, observation):
+            break
+        recovered = True
+    main_agent.unit_uid = current_tags
+    main_agent.main_loop_lock = False
+    _clear_optional_team_gathering(main_agent)
+    _normalize_new_unit_queue(main_agent)
+    return recovered
+
+
+def _clear_optional_team_gathering(main_agent: Any) -> None:
+    """Prevent upstream func4 camera work from delaying a forced Runtime tick."""
+
+    for agent_name, agent in getattr(main_agent, "agents", {}).items():
+        for team in getattr(agent, "teams", ()):
+            if str(agent_name) == "Builder":
+                # Builder selection is a dispatch-time invariant. Query readiness
+                # can be released from raw state, but this field must only describe
+                # a worker that was actually selected in the feature viewport.
+                continue
+            tags = [int(tag) for tag in team.get("unit_tags", ())]
+            team["unit_tags_selected"] = list(dict.fromkeys(tags))
+    main_agent.temp_head_unit_tag = None
+    main_agent.temp_curr_unit_tag = None
+    main_agent.temp_head_unit = None
+    main_agent.temp_curr_unit = None
+    main_agent.temp_team_unit_tags = []
+    main_agent.flag_locked_func4 = False
+
+
+def _record_orchestration_recovery(main_agent: Any) -> None:
+    recorder = getattr(
+        getattr(main_agent, "decision_broker", None),
+        "record_orchestration_recovery",
+        None,
+    )
+    if callable(recorder):
+        recorder()
+
+
+def _release_runtime_observation_barrier(
+    main_agent: Any,
+    *,
+    include_builder: bool = False,
+) -> bool:
     """Let current raw state reach Runtime when optional team selection stalls."""
 
     disappeared = {int(tag) for tag in getattr(main_agent, "unit_uid_disappear", ())}
     agents = getattr(main_agent, "agents", {})
     if not isinstance(agents, Mapping):
-        return
-    for agent in agents.values():
+        return False
+    released_builder = False
+    for agent_name, agent in agents.items():
+        # Builder screen actions require an observation captured after moving
+        # the camera to and selecting the exact worker. During a forced Runtime
+        # observation we release only query readiness; dispatch still performs
+        # exact selection and fresh-observation placement validation.
+        is_builder = str(agent_name) == "Builder"
+        if is_builder and not include_builder:
+            continue
         if not getattr(agent, "enable", False) or not agent._is_waiting_query():
             continue
         observed_tags = getattr(agent, "team_unit_tag_list", None)
@@ -2252,6 +4421,10 @@ def _release_runtime_observation_barrier(main_agent: Any) -> None:
                 observed_tags.append(tag)
                 if isinstance(observed_teams, list):
                     observed_teams.append(str(team.get("name", "")))
+                released_builder = released_builder or is_builder
+    if released_builder:
+        _record_orchestration_recovery(main_agent)
+    return released_builder
 
 
 def _translated_build_position(
@@ -2260,7 +4433,9 @@ def _translated_build_position(
 ) -> Optional[list[int]]:
     """Return the actual final screen target emitted by an upstream build translator."""
 
-    if not action_name.startswith("Build_") or not isinstance(arguments, (list, tuple)):
+    if (
+        not action_name.startswith("Build_") and action_name != "Effect_CalldownMULE_Screen"
+    ) or not isinstance(arguments, (list, tuple)):
         return None
     for value in reversed(arguments):
         if (
@@ -2291,6 +4466,60 @@ def _execution_team_name(agent: Any) -> Optional[str]:
 def _execution_unit_tag(agent: Any) -> Optional[int]:
     value = getattr(agent, "team_unit_tag_curr", None)
     return None if value is None else int(value)
+
+
+def _execution_unit_tags(agent: Any, observation: Any) -> tuple[int, ...]:
+    """Return the living tags actually selected for the routed actor command."""
+
+    team_name = _execution_team_name(agent)
+    team = next(
+        (
+            value
+            for value in getattr(agent, "teams", ())
+            if isinstance(value, Mapping) and str(value.get("name", "")) == str(team_name or "")
+        ),
+        None,
+    )
+    configured = (
+        () if team is None else tuple(int(tag) for tag in team.get("unit_tags", ()) if int(tag) > 0)
+    )
+    current = _execution_unit_tag(agent)
+    wanted = set(configured)
+    if current is not None:
+        wanted.add(current)
+    living = {
+        int(_observation_value(unit, "tag", 0))
+        for unit in _observation_value(observation, "raw_units", ())
+        if int(_observation_value(unit, "alliance", 0)) == 1
+    }
+    selected = {
+        int(_observation_value(unit, "tag", 0))
+        for unit in _observation_value(observation, "feature_units", ())
+        if int(_observation_value(unit, "alliance", 0)) == 1
+        and bool(_observation_value(unit, "is_selected", False))
+        and int(_observation_value(unit, "tag", 0)) in wanted & living
+    }
+    if selected:
+        return tuple(sorted(selected))
+    if current is not None and current in living:
+        return (current,)
+    return ()
+
+
+def _agent_world_to_minimap_transform(
+    agent: Any,
+) -> Optional[tuple[float, float, float, float, float]]:
+    world_range = float(getattr(agent, "world_range", 0.0))
+    size_minimap = float(getattr(agent, "size_minimap", 0.0))
+    if world_range <= 0 or size_minimap <= 0:
+        return None
+    return (
+        size_minimap / world_range,
+        float(getattr(agent, "world_x_offset", 0.0)),
+        float(getattr(agent, "world_y_offset", 0.0)),
+        world_range,
+        size_minimap - 1.0,
+    )
 
 
 def _worker_unit_name(unit: Any, unit_names: Mapping[int, str]) -> str:
@@ -2324,7 +4553,13 @@ def _selection_primitive_starts_production_barrier(
 
 
 def _source_action_spec(action_name: str) -> Optional[_SourceActionSpec]:
-    return production_spec(action_name) or addon_spec(action_name) or morph_spec(action_name)
+    return (
+        production_spec(action_name)
+        or addon_spec(action_name)
+        or morph_spec(action_name)
+        or research_spec(action_name)
+        or ability_spec(action_name)
+    )
 
 
 def _is_worker_owned_near_build_final_primitive(agent: Any, action_name: str) -> bool:
@@ -2377,6 +4612,121 @@ def _translate_worker_owned_zero_argument_primitive(agent: Any, obs: Any) -> tup
         "accepted": emitted_id == int(requested_id),
         "requested_arguments": requested_arguments,
         "resolved_arguments": [],
+        "reason": reason,
+    }
+    return emitted_id, function_call
+
+
+def _is_persistent_expansion_camera_primitive(agent: Any, action_name: str) -> bool:
+    spec = BUILD_SPECS.get(action_name)
+    return bool(
+        spec is not None
+        and spec.placement_kind == "expansion"
+        and agent.func_list
+        and int(agent.func_list[0][0]) == 573
+    )
+
+
+def _prime_persistent_expansion_chain(
+    agent: Any,
+    action: Mapping[str, Any],
+) -> None:
+    semantic_action = agent.action_list.pop(0)
+    agent.func_list = list(action.get("func", semantic_action.get("func", ())))
+    agent._rtscortex_translation_ordinal = 0
+    agent._rtscortex_translation_total = len(agent.func_list)
+    agent.curr_action_name = str(action.get("name", ""))
+    agent.curr_action_args = list(action.get("arg", ()))
+
+
+def _translate_persistent_expansion_camera_primitive(
+    agent: Any,
+    obs: Any,
+    action: Mapping[str, Any],
+) -> tuple[int, Any]:
+    """Resolve a scouted expansion anchor after it leaves the raw observation."""
+
+    del obs
+    requested_id, function, arguments = agent.func_list.pop(0)
+    requested_arguments = list(arguments)
+    ordinal = int(agent._rtscortex_translation_ordinal)
+    agent._rtscortex_translation_ordinal += 1
+    total = int(agent._rtscortex_translation_total)
+    target_tag = _tag_argument(action)
+    known_resources = tuple(getattr(agent, "_rtscortex_known_expansion_resources", ()))
+    reason: Optional[str] = None
+    camera_position: Optional[tuple[int, int]] = None
+    if target_tag is None:
+        reason = "expansion camera primitive has no anchor tag"
+    else:
+        anchor = next(
+            (
+                resource
+                for resource in known_resources
+                if int(_observation_value(resource, "tag", 0)) == target_tag
+            ),
+            None,
+        )
+        if anchor is None:
+            reason = f"persistent expansion anchor {hex(target_tag)} is unavailable"
+        else:
+            nearby = [
+                resource
+                for resource in known_resources
+                if math.dist(
+                    (
+                        float(_observation_value(resource, "x", 0.0)),
+                        float(_observation_value(resource, "y", 0.0)),
+                    ),
+                    (
+                        float(_observation_value(anchor, "x", 0.0)),
+                        float(_observation_value(anchor, "y", 0.0)),
+                    ),
+                )
+                < 16.0
+            ]
+            mineral_count = sum(
+                "mineral" in _worker_unit_name(resource, agent.unit_names).casefold()
+                for resource in nearby
+            )
+            if mineral_count < 5:
+                reason = (
+                    f"persistent resource cluster for {hex(target_tag)} has fewer than 5 minerals"
+                )
+            else:
+                center_x = sum(
+                    float(_observation_value(resource, "x", 0.0)) for resource in nearby
+                ) / len(nearby)
+                center_y = sum(
+                    float(_observation_value(resource, "y", 0.0)) for resource in nearby
+                ) / len(nearby)
+                camera_position = (
+                    int(center_x + float(agent.world_x_offset)),
+                    int(
+                        max(
+                            0.0,
+                            float(agent.world_range) - center_y + float(agent.world_y_offset),
+                        )
+                    ),
+                )
+    emitted_id = int(requested_id) if reason is None else 0
+    resolved_arguments = [] if camera_position is None else [camera_position]
+    function_call = function(camera_position) if camera_position is not None else _no_op()
+    agent.last_translation_result = {
+        "action_name": agent.curr_action_name,
+        "requested_function_id": int(requested_id),
+        "requested_function_name": str(getattr(function, "name", requested_id)),
+        "emitted_function_id": emitted_id,
+        "emitted_function_name": (
+            str(getattr(function, "name", requested_id))
+            if emitted_id == int(requested_id)
+            else "no_op"
+        ),
+        "ordinal": ordinal,
+        "total": total,
+        "accepted": emitted_id == int(requested_id),
+        "requested_arguments": requested_arguments,
+        "resolved_arguments": resolved_arguments,
         "reason": reason,
     }
     return emitted_id, function_call
@@ -2448,6 +4798,8 @@ def _production_source_invalid_reason(
     source_tag: Optional[int],
     spec: _SourceActionSpec,
     unit_names: Mapping[int, str],
+    *,
+    required_function_id: int | None = None,
 ) -> Optional[str]:
     if source_tag is None:
         return f"{spec.action_name} producer provenance is unavailable at final dispatch"
@@ -2481,19 +4833,58 @@ def _production_source_invalid_reason(
         if isinstance(unit_type, str)
         else unit_names.get(int(unit_type), f"unit:{int(unit_type)}")
     )
-    if int(value("alliance", 0)) != 1 or source_name != spec.producer_type:
+    valid_source_types = {
+        spec.producer_type,
+        *getattr(spec, "alternate_producer_types", ()),
+    }
+    if int(value("alliance", 0)) != 1 or source_name not in valid_source_types:
         return (
             f"{spec.action_name} producer {hex(source_tag)} changed identity to "
             f"{source_name!r} alliance {int(value('alliance', 0))}"
         )
     progress = float(value("build_progress", 0.0))
-    normalized_progress = progress / 100.0 if progress > 1.0 else progress
+    percent_scale = any(
+        float(_observation_value(unit, "build_progress", 0.0)) > 1.0 for unit in raw_units
+    )
+    normalized_progress = progress / 100.0 if percent_scale else progress
     if normalized_progress < 1.0:
         return f"{spec.action_name} producer {hex(source_tag)} is no longer complete"
-    if int(value("active", 0)) != 0 or int(value("order_length", 0)) != 0:
+    minimum_energy = float(getattr(spec, "minimum_energy", 0.0))
+    if float(value("energy", 0.0)) < minimum_energy:
+        return (
+            f"{spec.action_name} producer {hex(source_tag)} has less than {minimum_energy:g} energy"
+        )
+    required_addon = getattr(spec, "required_addon_type", None)
+    if required_addon is not None:
+        addon_tag = int(value("add_on_tag", 0))
+        addon = next(
+            (
+                unit
+                for unit in raw_units
+                if int(
+                    unit.get("tag", -1) if isinstance(unit, Mapping) else getattr(unit, "tag", -1)
+                )
+                == addon_tag
+            ),
+            None,
+        )
+        addon_type = None if addon is None else _worker_unit_name(addon, unit_names)
+        if addon_type != required_addon:
+            return f"{spec.action_name} producer {hex(source_tag)} no longer has {required_addon}"
+    if bool(getattr(spec, "requires_idle", True)) and (
+        int(value("active", 0)) != 0 or int(value("order_length", 0)) != 0
+    ):
         return f"{spec.action_name} producer {hex(source_tag)} became busy before final dispatch"
     if addon_spec(spec.action_name) is not None and int(value("add_on_tag", 0)) != 0:
         return f"{spec.action_name} producer {hex(source_tag)} already has an add-on"
+    contract_failure = production_dispatch_failure(
+        observation,
+        spec.action_name,
+        unit_names=unit_names,
+        required_function_id=required_function_id,
+    )
+    if contract_failure is not None:
+        return contract_failure
     return None
 
 
@@ -2541,14 +4932,15 @@ def _producer_is_selected(observation: Any, producer_tag: int) -> bool:
                 continue
             if int(_observation_value(unit, "alliance", 0)) != 1:
                 return False
-            return bool(_observation_value(unit, "is_selected", False))
+            if bool(_observation_value(unit, "is_selected", False)):
+                return True
     return False
 
 
 def _selected_production_source_tags(
     observation: Any,
     *,
-    producer_type: str,
+    producer_types: Collection[str],
     unit_names: Mapping[int, str],
 ) -> tuple[int, ...]:
     """Return selected producer tags, preferring the feature-action view."""
@@ -2559,7 +4951,7 @@ def _selected_production_source_tags(
             for unit in _observation_value(observation, collection_name, ())
             if int(_observation_value(unit, "alliance", 0)) == 1
             and bool(_observation_value(unit, "is_selected", False))
-            and _worker_unit_name(unit, unit_names) == producer_type
+            and _worker_unit_name(unit, unit_names) in producer_types
             and int(_observation_value(unit, "tag", 0)) > 0
         }
         if selected_tags:
@@ -2628,8 +5020,20 @@ def _production_reselection_position(
         x = int(_observation_value(unit, "x", 0))
         y = int(_observation_value(unit, "y", 0))
         radius = float(_observation_value(unit, "radius", 1.0))
-        offset = max(1, int(round(radius * 0.5)))
-        offsets = ((-offset, -offset), (offset, -offset), (-offset, offset), (offset, offset))
+        offset = max(2, int(round(radius * 0.5)))
+        half = max(1, offset // 2)
+        offsets = (
+            (-offset, -offset),
+            (offset, -offset),
+            (-offset, offset),
+            (offset, offset),
+            (0, -offset),
+            (offset, 0),
+            (0, offset),
+            (-offset, 0),
+            (-half, -half),
+            (half, half),
+        )
         dx, dy = offsets[attempt % len(offsets)]
         return (
             min(max(1, x + dx), size_screen - 2),
@@ -2675,6 +5079,61 @@ def _single_position(arguments: Any) -> Optional[tuple[float, float]]:
         ):
             return float(value[0]), float(value[1])
     return None
+
+
+def _raw_emergency_signature(observation: Any) -> tuple[str, ...]:
+    """Return stable emergency edges that justify an early Runtime decision."""
+
+    alerts = tuple(
+        sorted(
+            {
+                str(_observation_value(alert, "name", alert))
+                for alert in _observation_value(observation, "alerts", ())
+            }
+        )
+    )
+    raw_units = _observation_value(observation, "raw_units", ())
+    critical_own_units = sum(
+        1
+        for unit in raw_units
+        if int(_observation_value(unit, "alliance", 0)) == 1
+        and float(_observation_value(unit, "health_max", 0.0)) > 0.0
+        and float(_observation_value(unit, "health", 0.0))
+        / float(_observation_value(unit, "health_max", 1.0))
+        <= 0.3
+    )
+    return (*alerts, *((f"critical_own_units:{critical_own_units}",) if critical_own_units else ()))
+
+
+def _raw_terminal_collapse(
+    observation: Any,
+    *,
+    unit_names: Mapping[int, str],
+) -> bool:
+    """Re-evaluate the mirrored typed terminal state at the raw queue boundary."""
+
+    player = _observation_value(observation, "player_common", None)
+    army_supply = _observation_value(player, "food_army", None)
+    if army_supply is None:
+        return False
+    own_structure_names = [
+        _worker_unit_name(unit, unit_names).casefold()
+        for unit in _observation_value(observation, "raw_units", ())
+        if int(_observation_value(unit, "alliance", 0)) == 1
+    ]
+    return is_terminal_collapse_state(
+        TerminalCollapseState(
+            army_readiness=(
+                TerminalArmyReadiness.EMPTY
+                if int(army_supply) == 0
+                else TerminalArmyReadiness.FORMING
+            ),
+            own_base_count=sum(unit_name in TOWNHALL_NAMES for unit_name in own_structure_names),
+            own_production_capacity=sum(
+                unit_name in PRODUCTION_STRUCTURE_NAMES for unit_name in own_structure_names
+            ),
+        )
+    )
 
 
 def _observation_game_loop(observation: Any) -> int:
@@ -2857,6 +5316,7 @@ def _resolve_screen_point_action_position(
     world_target: tuple[float, float],
     preferred_anchor_tag: Optional[int],
     require_power: bool,
+    unit_names: Mapping[int, str],
 ) -> Optional[list[int]]:
     position = resolve_screen_point_world_target(
         observation,
@@ -2864,6 +5324,7 @@ def _resolve_screen_point_action_position(
         world_target,
         preferred_anchor_tag=preferred_anchor_tag,
         require_power=require_power,
+        unit_names=unit_names,
     )
     if position is None:
         return None
@@ -2965,6 +5426,9 @@ def _semantic_target_failure(
     action: Mapping[str, Any],
     observation: Any,
     unit_names: Mapping[int, str],
+    *,
+    known_expansion_resources: Sequence[Any] = (),
+    excluded_expansion_anchors: Collection[int] = (),
 ) -> Optional[tuple[str, str]]:
     action_name = str(action.get("name", ""))
     if action_name not in {
@@ -2979,6 +5443,8 @@ def _semantic_target_failure(
         observation,
         action_name,
         unit_names=unit_names,
+        known_expansion_resources=known_expansion_resources,
+        excluded_expansion_anchors=excluded_expansion_anchors,
     )
     if action_name in BUILD_SPECS and action_name.endswith("_Screen"):
         requested = _screen_argument(action)
@@ -3049,6 +5515,21 @@ def _semantic_target_failure(
             None,
         )
         if target is None:
+            raw_target = next(
+                (
+                    unit
+                    for unit in _observation_value(observation, "raw_units", ())
+                    if int(_observation_value(unit, "tag", -1)) == target_tag
+                ),
+                None,
+            )
+            if raw_target is None:
+                return "target_not_visible", f"enemy target {hex(target_tag)} is not visible"
+            if int(_observation_value(raw_target, "alliance", 0)) != 4:
+                return "friendly_target", f"target {hex(target_tag)} is not an enemy"
+            functions = action.get("func", ())
+            if functions and int(functions[0][0]) == 573:
+                return None
             return "target_not_visible", f"enemy target {hex(target_tag)} is not visible"
         if int(_observation_value(target, "alliance", 0)) != 4:
             return "friendly_target", f"target {hex(target_tag)} is not an enemy"
@@ -3063,6 +5544,25 @@ def _semantic_target_failure(
     return failure_code, f"semantic target {hex(target_tag)} is no longer legal"
 
 
+def _suppress_failed_expansion_anchor(
+    agent: Any,
+    action: Mapping[str, Any],
+    observation: Any,
+) -> None:
+    spec = BUILD_SPECS.get(str(action.get("name", "")))
+    target_tag = _tag_argument(action)
+    if spec is None or spec.placement_kind != "expansion" or target_tag is None:
+        return
+    extractor = getattr(getattr(agent, "broker", None), "extractor", None)
+    if not isinstance(extractor, TimeStepExtractor):
+        return
+    extractor.suppress_expansion_anchor(
+        target_tag,
+        game_loop=_observation_game_loop(observation),
+    )
+    agent._rtscortex_suppressed_expansion_anchors = extractor.suppressed_expansion_anchors
+
+
 def _candidate_dispatch_failure(
     action: Mapping[str, Any],
     observation: Any,
@@ -3070,13 +5570,23 @@ def _candidate_dispatch_failure(
     *,
     final_primitive: bool,
     translated_position: Optional[list[int]],
+    known_expansion_resources: Sequence[Any] = (),
+    excluded_expansion_anchors: Collection[int] = (),
 ) -> Optional[str]:
     """Return why an accepted primitive is outside its current semantic domain."""
 
+    if not final_primitive:
+        return None
     action_name = str(action.get("name", ""))
     if not _is_candidate_constrained_action(action_name):
         return None
-    failure = _semantic_target_failure(action, observation, unit_names)
+    failure = _semantic_target_failure(
+        action,
+        observation,
+        unit_names,
+        known_expansion_resources=known_expansion_resources,
+        excluded_expansion_anchors=excluded_expansion_anchors,
+    )
     if failure is not None:
         return f"{failure[1]}; accepted primitive would leave the current candidate set"
     spec = BUILD_SPECS.get(action_name)
@@ -3127,6 +5637,55 @@ def _canonical_pysc2_arguments(_function_id: int, arguments: Any) -> Any:
     """Normalize translator strings and PySC2 enum encodings to one representation."""
 
     return _normalize_pysc2_arguments(arguments)
+
+
+def _pysc2_action_argument_failure(
+    action: Any,
+    *,
+    function_specification: Any = None,
+) -> Optional[str]:
+    """Return why an outbound PySC2 action violates its declared argument domain."""
+
+    function_id = getattr(action, "function", None)
+    if function_id is None:
+        return "action has no function id"
+    if function_specification is None:
+        actions = importlib.import_module("pysc2.lib.actions")
+        try:
+            function_specification = actions.FUNCTIONS[int(function_id)]
+        except (IndexError, KeyError, TypeError, ValueError):
+            return f"unknown function id {function_id!r}"
+
+    expected_arguments = tuple(getattr(function_specification, "args", ()))
+    actual_arguments = tuple(getattr(action, "arguments", ()))
+    if len(actual_arguments) != len(expected_arguments):
+        return (
+            f"function {function_id} expected {len(expected_arguments)} argument groups, "
+            f"received {len(actual_arguments)}"
+        )
+    for argument_index, expected in enumerate(expected_arguments):
+        actual = actual_arguments[argument_index]
+        sizes = tuple(int(size) for size in getattr(expected, "sizes", ()))
+        values = tuple(actual) if isinstance(actual, (list, tuple)) else (actual,)
+        if len(values) != len(sizes):
+            return (
+                f"function {function_id} argument {getattr(expected, 'name', '?')} "
+                f"expected {len(sizes)} values, received {len(values)}"
+            )
+        for value_index, value in enumerate(values):
+            size = sizes[value_index]
+            if isinstance(value, bool) or not isinstance(value, Real):
+                return (
+                    f"function {function_id} argument {getattr(expected, 'name', '?')} "
+                    f"contains non-numeric value {value!r}"
+                )
+            numeric = float(value)
+            if not math.isfinite(numeric) or numeric < 0 or numeric >= size:
+                return (
+                    f"function {function_id} argument {getattr(expected, 'name', '?')} "
+                    f"value {value!r} is outside [0, {size})"
+                )
+    return None
 
 
 def _tag_argument(action: Mapping[str, Any]) -> Optional[int]:
@@ -3226,9 +5785,89 @@ def _base_agent_step(agent: Any, obs: Any) -> None:
     module.BaseAgent.step(agent, obs)
 
 
+def _sync_raw_team_membership(main_agent: Any, observation: Any) -> None:
+    """Project living raw tags into logical teams without UI control groups."""
+
+    raw_units = [
+        unit
+        for unit in _observation_value(observation, "raw_units", ())
+        if int(_observation_value(unit, "alliance", 0)) == 1
+        and int(_observation_value(unit, "tag", 0)) > 0
+        and _normalized_worker_build_progress(unit) >= 1.0
+    ]
+    raw_by_tag = {int(_observation_value(unit, "tag", 0)): unit for unit in raw_units}
+    by_type: dict[int, list[int]] = {}
+    for unit in raw_units:
+        by_type.setdefault(int(_observation_value(unit, "unit_type", 0)), []).append(
+            int(_observation_value(unit, "tag", 0))
+        )
+    gas_worker_tags = {
+        int(_observation_value(unit, "tag", 0))
+        for unit in raw_units
+        if int(_observation_value(unit, "buff_id_0", 0)) == 274
+    }
+    on_screen_tags = {
+        int(_observation_value(unit, "tag", 0))
+        for unit in _observation_value(observation, "feature_units", ())
+        if int(_observation_value(unit, "alliance", 0)) == 1
+        and bool(_observation_value(unit, "is_on_screen", True))
+    }
+
+    for agent_name, agent in getattr(main_agent, "agents", {}).items():
+        observed_tags: list[int] = []
+        observed_teams: list[str] = []
+        has_actor = False
+        for team in getattr(agent, "teams", ()):
+            if not isinstance(team, dict):
+                continue
+            team_name = str(team.get("name", ""))
+            unit_types = [int(value) for value in team.get("unit_type", ())]
+            candidates = sorted(
+                {tag for unit_type in unit_types for tag in by_type.get(unit_type, ())}
+            )
+            existing = [int(tag) for tag in (team.get("unit_tags") or ()) if int(tag) in candidates]
+            if agent_name == "Builder":
+                eligible = [tag for tag in candidates if tag not in gas_worker_tags]
+                ready = [tag for tag in eligible if _raw_builder_ready(raw_by_tag[tag])]
+                visible_ready = [tag for tag in ready if tag in on_screen_tags]
+                if visible_ready:
+                    candidates = visible_ready[:1]
+                elif ready:
+                    candidates = ready[:1]
+                else:
+                    visible = [tag for tag in eligible if tag in on_screen_tags]
+                    retained = [tag for tag in existing if tag in visible]
+                    candidates = retained[:1] or visible[:1] or eligible[:1]
+            team["unit_tags"] = candidates
+            team["unit_tags_selected"] = list(candidates)
+            if candidates:
+                observed_tags.append(candidates[0])
+                observed_teams.append(team_name)
+                has_actor = True
+            elif team_name == "Empty":
+                observed_tags.append(0)
+                observed_teams.append(team_name)
+                has_actor = True
+        agent.team_unit_tag_list = observed_tags
+        agent.team_unit_team_list = observed_teams
+        agent.team_unit_obs_list = []
+        if agent_name == "Builder" and observed_tags:
+            agent.team_unit_tag_curr = observed_tags[0]
+            agent.team_unit_team_curr = observed_teams[0]
+        else:
+            agent.team_unit_tag_curr = None
+            agent.team_unit_team_curr = None
+        agent.enable = has_actor
+
+
 def _no_op() -> Any:
     actions = importlib.import_module("pysc2.lib.actions")
     return actions.FUNCTIONS.no_op()
+
+
+def _raw_no_op() -> Any:
+    actions = importlib.import_module("pysc2.lib.actions")
+    return actions.RAW_FUNCTIONS.no_op()
 
 
 def _is_terminal(obs: Any) -> bool:

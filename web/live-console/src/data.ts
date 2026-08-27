@@ -190,13 +190,18 @@ export function eventCategory(event: StoredEvent): Exclude<EventCategory, "all">
   if (type === "goal_progress") return "planner";
   if (
     action?.startsWith("train_") ||
+    action?.startsWith("research_") ||
+    action === "morph_orbitalcommand" ||
+    action === "effect_calldownmule_screen" ||
     payloadText.includes('"train_') ||
     payloadText.includes('"effect_kind":"production"') ||
+    payloadText.includes('"effect_kind":"research"') ||
+    payloadText.includes('"effect_kind":"ability"') ||
     type.includes("production")
   ) return "production";
   if (action?.includes("build") || payloadText.includes("structure") || type.includes("build")) return "build";
   if (action?.includes("attack") || payloadText.includes("combatgroup") || type.includes("combat")) return "combat";
-  if (["race_profile_activated", "situation_assessed", "situation_shadow_assessed", "tactical_policy_shadow", "macro_plan_accepted", "macro_plan_rejected", "macro_step_updated", "intent_emitted", "role_intent_emitted", "intent_arbitrated", "intent_arbiter_shadow_diff", "candidate_set_built", "executor_selection", "command_lineage", "race_brain_coordinated", "playbook_retrieved", "playbook_rule_applied", "playbook_rule_updated", "playbook_case_recorded", "playbook_lesson_candidate", "playbook_lesson_promoted", "postgame_review_completed"].includes(type)) return "planner";
+  if (["race_profile_activated", "situation_assessed", "situation_shadow_assessed", "tactical_policy_shadow", "tactical_target_state", "macro_plan_accepted", "macro_plan_rejected", "macro_frontier_deferred", "macro_frontier_preempted", "macro_structure_deferred", "macro_step_deduplicated", "macro_step_updated", "expansion_commitment_started", "expansion_anchor_rejected", "expansion_commitment_terminal", "intent_emitted", "role_intent_emitted", "intent_arbitrated", "intent_arbiter_shadow_diff", "candidate_set_built", "executor_selection", "command_lineage", "race_brain_coordinated", "playbook_retrieved", "playbook_rule_applied", "playbook_rule_updated", "playbook_case_recorded", "playbook_lesson_candidate", "playbook_lesson_promoted", "strategic_consequence_attributed", "postgame_review_completed"].includes(type)) return "planner";
   if (["planner", "module", "context", "plan"].some((token) => type.includes(token))) return "planner";
   return "system";
 }

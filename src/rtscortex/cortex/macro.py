@@ -18,12 +18,13 @@ from rtscortex.policy.hima.mapping import (
 from rtscortex.policy.hima.race_vocabulary import resolve_race_hima_action
 from rtscortex.policy.hima.vocabulary import resolve_hima_action
 from rtscortex.policy.models import (
+    MacroActionStep,
     MacroPolicyProposal,
     PolicyActionAssessment,
     PolicyActionClassification,
     PolicyObservationFixture,
 )
-from rtscortex.progress import GoalProgressVerifier, GoalSpec
+from rtscortex.progress import GoalProgressVerifier, GoalRequirementKind, GoalSpec
 from rtscortex.races import PROTOSS_PROFILE_DATA, RaceProfileData
 
 _MAPPINGS_BY_MACRO = {mapping.macro_action: mapping for mapping in HIMA_RUNTIME_MAPPINGS}
@@ -34,6 +35,8 @@ _RUNTIME_TO_HIMA_TOKEN = {
     for runtime_action in mapping.runtime_actions
 }
 _MAX_STRATEGIC_GOAL_CHARACTERS = 240
+_MAX_EXECUTABLE_FRONTIER_STEPS = 5
+_SECONDS_PER_EXECUTABLE_FRONTIER_STEP = 30
 
 
 def macro_plan_from_hima(
@@ -69,27 +72,105 @@ def macro_plan_from_hima(
         raise ValueError("current observation does not match the source episode")
 
     proposal = response.proposal
+    compact_steps, desired_counts = _compact_goal_steps(proposal)
+    frontier_step_limit = _frontier_step_limit(proposal)
+    compact_proposal = proposal.model_copy(
+        update={
+            "steps": compact_steps,
+            "raw_output": "",
+        }
+    )
     assessments = HIMAMacroActionMapper(profile).assess(
-        proposal,
+        compact_proposal,
         _live_fixture(projection_observation),
     )
     assessment_by_step = {
         (assessment.ordinal, assessment.source_action): assessment for assessment in assessments
     }
     mappings_by_macro = _mappings_by_macro(profile)
-    steps = [
-        _macro_step(
-            step.ordinal,
-            step.canonical_action,
-            step.repeat,
-            assessment_by_step.get((step.ordinal, step.canonical_action)),
+    progress_specs = {spec.name: spec for spec in profile.progress_action_specs}
+    projected_counts: dict[tuple[GoalRequirementKind, str], int] = {}
+    steps: list[MacroStep] = []
+    for proposal_step in compact_steps[:frontier_step_limit]:
+        repeat = proposal_step.repeat
+        target_satisfied = False
+        mapping = mappings_by_macro.get(proposal_step.canonical_action)
+        if proposal_step.target_count is not None and mapping is not None:
+            spec = next(
+                (
+                    progress_specs[action]
+                    for action in mapping.runtime_actions
+                    if action in progress_specs
+                ),
+                None,
+            )
+            if spec is not None:
+                key = (spec.effect_kind, spec.effect_target.casefold())
+                current = projected_counts.setdefault(
+                    key,
+                    _state_effect_count(
+                        projection_observation,
+                        spec.effect_kind,
+                        spec.effect_target,
+                    ),
+                )
+                repeat = max(proposal_step.target_count - current, 0)
+                target_satisfied = repeat == 0
+                projected_counts[key] = max(current, proposal_step.target_count)
+        macro_step = _macro_step(
+            proposal_step.ordinal,
+            proposal_step.canonical_action,
+            max(1, repeat),
+            assessment_by_step.get((proposal_step.ordinal, proposal_step.canonical_action)),
             mappings_by_macro=mappings_by_macro,
             managed_worker_action=f"TRAIN {profile.worker_type.upper()}",
+            controller_managed_actions=frozenset(profile.controller_managed_actions),
         )
-        for step in sorted(proposal.steps, key=lambda item: item.ordinal)
+        if target_satisfied:
+            macro_step = macro_step.model_copy(
+                update={
+                    "status": MacroStepStatus.OBSOLETE,
+                    "reason": "cumulative_target_already_satisfied",
+                }
+            )
+        steps.append(macro_step)
+    bounded_assessments = sorted(
+        assessments,
+        key=lambda item: (item.ordinal, item.source_action),
+    )[:frontier_step_limit]
+    assessments_by_ordinal = {
+        assessment.ordinal: (index, assessment)
+        for index, assessment in enumerate(bounded_assessments)
+    }
+    steps = [
+        (
+            step.model_copy(
+                update={
+                    "status": MacroStepStatus.OBSOLETE,
+                    "reason": "unsupported_independent_future",
+                }
+            )
+            if step.status is MacroStepStatus.BLOCKED
+            and step.reason == "unsupported_by_runtime"
+            and (entry := assessments_by_ordinal.get(step.ordinal)) is not None
+            and not _unsupported_is_dependency(
+                entry[1],
+                bounded_assessments[entry[0] + 1 :],
+                profile,
+            )
+            else step
+        )
+        for step in steps
     ]
     metadata = proposal.generation_metadata
-    raw_proposal = response.model_dump(mode="json")
+    raw_response = response.model_dump(mode="json")
+    raw_response_hash = sha256(
+        json.dumps(raw_response, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    raw_proposal = {
+        "proposal": compact_proposal.model_dump(mode="json"),
+        "raw_response_hash": raw_response_hash,
+    }
     plan_digest = sha256(
         json.dumps(
             {
@@ -114,6 +195,12 @@ def macro_plan_from_hima(
         adapter_version=proposal.adapter_version,
         parser_version=proposal.parser_version,
         vocabulary_version=proposal.vocabulary_version,
+        desired_counts=desired_counts,
+        strategic_constraints=_strategic_constraints(proposal),
+        opaque_future_actions=[
+            step.canonical_action for step in compact_steps[frontier_step_limit:]
+        ],
+        raw_response_hash=raw_response_hash,
         raw_proposal=raw_proposal,
     )
 
@@ -138,6 +225,8 @@ def macro_goal_spec(
             break
         if step.status is MacroStepStatus.BLOCKED:
             break
+        if step.status is MacroStepStatus.OBSOLETE:
+            continue
         if not step.runtime_actions:
             # The sole soft unsupported action is TRAIN PROBE, which RTSCortex manages
             # automatically.  Other unsupported actions are marked BLOCKED above.
@@ -191,38 +280,44 @@ def runtime_frontier(
 ) -> PolicyActionAssessment | None:
     """Return the current dependency-safe Runtime frontier for a HIMA proposal.
 
-    Managed Probe production and already-obsolete mapped steps are transparent.  A
-    parse error or any other unsupported HIMA action is a hard blocker and cannot be
-    skipped merely because a later mapped action is legal.
+    Managed worker production and obsolete mapped steps are transparent. Unsupported
+    future nodes only block when the bounded frontier depends on them.
     """
 
     fixture = _live_fixture(observation, previous_actions=previous_actions)
     assessments = HIMAMacroActionMapper(profile).assess(proposal, fixture)
-    mapped_frontier = next(
-        (assessment for assessment in assessments if assessment.is_runtime_frontier),
-        None,
+    ordered = sorted(assessments, key=lambda item: (item.ordinal, item.source_action))
+    frontier_step_limit = _frontier_step_limit(proposal)
+    for index, assessment in enumerate(ordered[:frontier_step_limit]):
+        if assessment.classification is PolicyActionClassification.PARSE_ERROR:
+            return assessment.model_copy(update={"is_runtime_frontier": True, "is_frontier": True})
+        if assessment.classification is PolicyActionClassification.UNSUPPORTED_BY_RUNTIME:
+            if assessment.reason_code == "managed_automatically":
+                continue
+            if _unsupported_is_dependency(
+                assessment,
+                ordered[index + 1 : frontier_step_limit],
+                profile,
+            ):
+                return assessment.model_copy(
+                    update={"is_runtime_frontier": True, "is_frontier": True}
+                )
+            continue
+        if assessment.classification is PolicyActionClassification.OBSOLETE:
+            continue
+        return assessment.model_copy(update={"is_runtime_frontier": True, "is_frontier": True})
+    return None
+
+
+def _frontier_step_limit(proposal: MacroPolicyProposal) -> int:
+    """Translate the declared strategic horizon into a bounded executable prefix."""
+
+    requested = max(
+        1,
+        (proposal.horizon_seconds + _SECONDS_PER_EXECUTABLE_FRONTIER_STEP - 1)
+        // _SECONDS_PER_EXECUTABLE_FRONTIER_STEP,
     )
-    hard_blockers = [
-        assessment
-        for assessment in assessments
-        if assessment.classification is PolicyActionClassification.PARSE_ERROR
-        or (
-            assessment.classification is PolicyActionClassification.UNSUPPORTED_BY_RUNTIME
-            and assessment.reason_code != "managed_automatically"
-        )
-    ]
-    earliest_blocker = min(
-        hard_blockers,
-        key=lambda item: (item.ordinal, item.source_action),
-        default=None,
-    )
-    if earliest_blocker is not None and (
-        mapped_frontier is None or earliest_blocker.ordinal <= mapped_frontier.ordinal
-    ):
-        return earliest_blocker.model_copy(
-            update={"is_runtime_frontier": True, "is_frontier": True}
-        )
-    return mapped_frontier
+    return min(_MAX_EXECUTABLE_FRONTIER_STEPS, requested)
 
 
 def hima_previous_action_for_runtime_action(
@@ -258,6 +353,122 @@ def hima_previous_actions_for_runtime_actions(
     ]
 
 
+def _compact_goal_steps(
+    proposal: MacroPolicyProposal,
+) -> tuple[list[MacroActionStep], dict[str, int]]:
+    ordered = sorted(proposal.steps, key=lambda item: item.ordinal)
+    by_action: dict[str, list[MacroActionStep]] = {}
+    for step in ordered:
+        by_action.setdefault(step.canonical_action, []).append(step)
+    desired_counts: dict[str, int] = {}
+    for action, instances in by_action.items():
+        explicit_targets = [
+            instance.target_count for instance in instances if instance.target_count is not None
+        ]
+        desired_counts[action] = (
+            max(explicit_targets)
+            if explicit_targets
+            else sum(instance.repeat for instance in instances)
+        )
+
+    compact: list[MacroActionStep] = []
+    index = 0
+    while index < len(ordered):
+        first = ordered[index]
+        instances = [first]
+        index += 1
+        while index < len(ordered) and ordered[index].canonical_action == first.canonical_action:
+            instances.append(ordered[index])
+            index += 1
+        explicit_targets = [
+            instance.target_count for instance in instances if instance.target_count is not None
+        ]
+        if explicit_targets:
+            repeat = 1
+            target_count = max(explicit_targets)
+        else:
+            repeat = sum(instance.repeat for instance in instances)
+            target_count = None
+        compact.append(
+            first.model_copy(
+                update={
+                    "repeat": repeat,
+                    "target_count": target_count,
+                }
+            )
+        )
+    return compact, desired_counts
+
+
+def _strategic_constraints(proposal: MacroPolicyProposal) -> list[str]:
+    rationale = " ".join(
+        (
+            proposal.strategic_objective,
+            proposal.tactical_rationale.immediate,
+            proposal.tactical_rationale.short_term,
+            proposal.tactical_rationale.long_term,
+        )
+    ).casefold()
+    candidates = (
+        ("supply", "maintain_supply_margin"),
+        ("anti-air", "prioritize_air_response"),
+        ("air response", "prioritize_air_response"),
+        ("defen", "protect_owned_bases"),
+        ("expand", "expand_economy"),
+    )
+    return list(dict.fromkeys(constraint for token, constraint in candidates if token in rationale))
+
+
+def _unsupported_is_dependency(
+    unsupported: PolicyActionAssessment,
+    later: list[PolicyActionAssessment],
+    profile: RaceProfileData,
+) -> bool:
+    unsupported_target = _semantic_target(unsupported.source_action)
+    specs = {spec.name: spec for spec in profile.progress_action_specs}
+    specs_by_effect = {
+        _normalize_target(spec.effect_target): spec for spec in profile.progress_action_specs
+    }
+
+    def transitive_prerequisites(action_name: str) -> set[str]:
+        discovered: set[str] = set()
+        pending = [action_name]
+        visited_actions: set[str] = set()
+        while pending:
+            current_action = pending.pop()
+            if current_action in visited_actions:
+                continue
+            visited_actions.add(current_action)
+            current_spec = specs.get(current_action)
+            if current_spec is None:
+                continue
+            for prerequisite in current_spec.prerequisites:
+                target = _normalize_target(prerequisite.target)
+                if target in discovered:
+                    continue
+                discovered.add(target)
+                producer = specs_by_effect.get(target)
+                if producer is not None:
+                    pending.append(producer.name)
+        return discovered
+
+    for assessment in later:
+        if assessment.runtime_action is None:
+            continue
+        if unsupported_target in transitive_prerequisites(assessment.runtime_action):
+            return True
+    return False
+
+
+def _semantic_target(action: str) -> str:
+    tokens = action.split(maxsplit=1)
+    return _normalize_target(tokens[-1])
+
+
+def _normalize_target(value: str) -> str:
+    return value.casefold().replace("_", "").replace(" ", "")
+
+
 def _macro_step(
     ordinal: int,
     semantic_action: str,
@@ -266,6 +477,7 @@ def _macro_step(
     *,
     mappings_by_macro: dict[str, HIMAMacroMapping],
     managed_worker_action: str,
+    controller_managed_actions: frozenset[str],
 ) -> MacroStep:
     mapping = mappings_by_macro.get(semantic_action)
     if mapping is None:
@@ -276,6 +488,18 @@ def _macro_step(
             repeat=repeat,
             status=(MacroStepStatus.OBSOLETE if managed else MacroStepStatus.BLOCKED),
             reason="managed_automatically" if managed else "unsupported_by_runtime",
+        )
+
+    if mapping.runtime_actions and all(
+        action in controller_managed_actions for action in mapping.runtime_actions
+    ):
+        return MacroStep(
+            ordinal=ordinal,
+            semantic_action=semantic_action,
+            runtime_actions=list(mapping.runtime_actions),
+            repeat=repeat,
+            status=MacroStepStatus.OBSOLETE,
+            reason="managed_automatically",
         )
 
     classification = assessment.classification if assessment is not None else None
@@ -300,6 +524,24 @@ def _mappings_by_macro(profile: RaceProfileData) -> dict[str, HIMAMacroMapping]:
     if profile is PROTOSS_PROFILE_DATA:
         return _MAPPINGS_BY_MACRO
     return {mapping.macro_action: mapping for mapping in hima_runtime_mappings(profile.race.value)}
+
+
+def _state_effect_count(
+    observation: ObservationEnvelope,
+    effect_kind: GoalRequirementKind,
+    target: str,
+) -> int:
+    canonical_target = target.casefold().replace("_", "")
+    if effect_kind is GoalRequirementKind.STRUCTURE:
+        values = observation.state.own_structures
+    elif effect_kind is GoalRequirementKind.UNIT:
+        values = observation.state.own_units
+    else:
+        return sum(
+            upgrade.casefold().replace("_", "") == canonical_target
+            for upgrade in observation.state.upgrades
+        )
+    return sum(unit.unit_type.casefold().replace("_", "") == canonical_target for unit in values)
 
 
 def _live_fixture(

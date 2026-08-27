@@ -74,6 +74,12 @@ describe("Chinese event presentation", () => {
     expect(semanticScalar("target_not_created", "failure_code")).toBe(
       "目标建筑未出现（target_not_created）",
     );
+    expect(semanticScalar("no_build_start_evidence", "failure_code")).toBe(
+      "未观察到可靠的开工证据（no_build_start_evidence）",
+    );
+    expect(semanticScalar("build_started_effect_missing", "failure_code")).toBe(
+      "已确认开工但目标建筑未出现（build_started_effect_missing）",
+    );
   });
 
   it("reduces observations to useful state and retains canonical protocol names", () => {
@@ -154,9 +160,19 @@ describe("Chinese event presentation", () => {
     expect(actionLabel("Build_CreepTumor_Queen_Screen")).toBe(
       "虫后放置菌毯肿瘤（Build_CreepTumor_Queen_Screen）",
     );
+    expect(actionLabel("Build_CreepTumor_Tumor_Screen")).toBe(
+      "菌毯肿瘤继续扩散（Build_CreepTumor_Tumor_Screen）",
+    );
+    expect(actionLabel("Effect_CalldownMULE_Screen")).toBe(
+      "呼叫矿骡采矿（Effect_CalldownMULE_Screen）",
+    );
+    expect(actionLabel("Train_SCV")).toBe("训练 SCV（Train_SCV）");
+    expect(actionLabel("Morph_OrbitalCommand")).toBe(
+      "升级为轨道指挥部（Morph_OrbitalCommand）",
+    );
     expect(fieldLabel("requested_producer_tag")).toBe("请求生产来源 Tag");
     expect(fieldLabel("producer_tag")).toBe("实际生产来源 Tag");
-    expect(fieldLabel("confirmation_kind")).toBe("生产确认方式");
+    expect(fieldLabel("confirmation_kind")).toBe("效果确认方式");
     expect(semanticScalar("production", "effect_kind")).toBe("生产（production）");
     expect(semanticScalar("producer_order", "confirmation_kind")).toBe(
       "生产订单（producer_order）",
@@ -169,6 +185,18 @@ describe("Chinese event presentation", () => {
     );
     expect(semanticScalar("target_buff", "confirmation_kind")).toBe(
       "目标获得状态效果（target_buff）",
+    );
+    expect(semanticScalar("upgrade_observed", "confirmation_kind")).toBe(
+      "科技升级已完成（upgrade_observed）",
+    );
+    expect(semanticScalar("research", "effect_kind")).toBe("科技研究（research）");
+    expect(semanticScalar("ability", "effect_kind")).toBe("经济技能（ability）");
+    expect(semanticScalar("combat", "effect_kind")).toBe("战斗（combat）");
+    expect(semanticScalar("target_damaged", "confirmation_kind")).toBe(
+      "精确目标已受伤（target_damaged）",
+    );
+    expect(semanticScalar("combat_effect_not_observed", "failure_code")).toBe(
+      "未观察到目标受到伤害（combat_effect_not_observed）",
     );
     expect(semanticScalar("no_inject_effect_observed", "failure_code")).toBe(
       "未观察到幼虫注入订单或状态效果（no_inject_effect_observed）",
@@ -296,6 +324,8 @@ describe("Chinese event presentation", () => {
       assessment: {
         game_phase: "early",
         threat_level: "low",
+        threat_score: 1.5,
+        threat_evidence: ["visible_enemy_contact"],
         army_readiness: "not_ready",
       },
     });
@@ -340,6 +370,11 @@ describe("Chinese event presentation", () => {
         repeat: 1,
       },
     });
+    const structureDeferred = event("macro_structure_deferred", {
+      runtime_action: "Build_Gateway_Screen",
+      target_structure: "Gateway",
+      reason: "same_structure_in_progress",
+    });
     const failure = event("specialist_failed", {
       role: "macro",
       model_id: "hima-a",
@@ -348,7 +383,7 @@ describe("Chinese event presentation", () => {
 
     expect(eventTitle(situation)).toBe("战况分析完成");
     expect(eventSummary(situation)).toBe(
-      "来源：确定性规则（deterministic） · 阶段：开局阶段（early） · 威胁：低（low） · 军队：尚未准备（not_ready）",
+      "来源：确定性规则（deterministic） · 阶段：开局阶段（early） · 威胁：低（low） (1.5) · 证据：visible_enemy_contact · 军队：尚未准备（not_ready）",
     );
     expect(eventSummary(macro)).toBe("计划 plan-1 · hima-a · 2 步 · 当前：建造水晶塔");
     expect(eventSummary(intent)).toBe("宏观决策（macro） · 建造水晶塔 · intent-1");
@@ -358,6 +393,9 @@ describe("Chinese event presentation", () => {
       "command-1 · 计划 plan-1 → 意图 intent-1 → 候选 candidate-1",
     );
     expect(eventSummary(macroStep)).toBe("建造水晶塔 · 已确认 · 1/1");
+    expect(eventTitle(structureDeferred)).toBe("同类建筑在建，动作已延后");
+    expect(eventSummary(structureDeferred)).toContain("建造传送门");
+    expect(eventSummary(structureDeferred)).toContain("等待 Gateway");
     expect(eventSummary(failure)).toBe("宏观决策（macro） · hima-a · request timed out");
     expect(eventSemanticPayload(selection)).toEqual({
       candidate_id: "candidate-1",
@@ -398,6 +436,48 @@ describe("Chinese event presentation", () => {
       current_game_loop: 184,
     });
     expect(eventSummary(revalidated)).toContain("loop 112 → 184");
+  });
+
+  it("translates strategic consequence attribution into a readable post-game record", () => {
+    const consequence = event("strategic_consequence_attributed", {
+      consequence_id: `consequence:${"a".repeat(64)}`,
+      consequence_type: "threat_unanswered",
+      quality: "strategic_error",
+      effect: "prefer",
+      role: "defense",
+      semantic_action: null,
+      objective: "Answer the threat before resuming macro play.",
+      start_game_loop: 1_120,
+      end_game_loop: 1_344,
+      source_event_ids: [22, 31],
+      condition: {
+        phase: "combat",
+        threat_level: "high",
+        economy_status: "stable",
+        army_readiness: "ready",
+      },
+      explanation: "The high threat persisted without a successful defensive response.",
+      evidence: { duration_game_loops: 224 },
+    });
+    const review = event("postgame_review_completed", {
+      strategic_consequence_count: 1,
+      case_count: 1,
+      lesson_update_count: 1,
+    });
+
+    expect(eventTitle(consequence)).toBe("战略后果已归因");
+    expect(eventSummary(consequence)).toContain(
+      "威胁未处理（threat_unanswered） · 防守（defense） · loop 1120–1344",
+    );
+    expect(eventSemanticPayload(consequence)).toMatchObject({
+      consequence_type: "threat_unanswered",
+      role: "defense",
+      condition: { threat_level: "high" },
+    });
+    expect(fieldLabel("consequence_type")).toBe("战略后果类型");
+    expect(eventSummary(review)).toBe(
+      "归因 1 个战略后果 · 复盘 1 个关键决策 · 更新 1 条战术经验",
+    );
   });
 
   it("falls back safely for future event types", () => {

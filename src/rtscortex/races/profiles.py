@@ -12,6 +12,8 @@ from rtscortex.progress import (
 )
 from rtscortex.races.models import (
     ActionDomain,
+    CombatTargetDomain,
+    DefenseDoctrine,
     MacroActionMapping,
     RaceId,
     RaceProfileData,
@@ -101,21 +103,75 @@ PROTOSS_PROFILE_DATA = RaceProfileData(
         "Train_Oracle": ("Stargate",),
         "Research_WarpGate": ("CyberneticsCore",),
     },
+    combat_target_domains={
+        "Zealot": CombatTargetDomain.GROUND,
+        "Stalker": CombatTargetDomain.BOTH,
+        "Adept": CombatTargetDomain.GROUND,
+        "DarkTemplar": CombatTargetDomain.GROUND,
+        "Phoenix": CombatTargetDomain.AIR,
+        "VoidRay": CombatTargetDomain.BOTH,
+        "Oracle": CombatTargetDomain.GROUND,
+    },
+    defense_doctrine=DefenseDoctrine(
+        ground_production_actions=("Train_Stalker", "Train_Adept", "Train_Zealot"),
+        anti_air_production_actions=(
+            "Train_Phoenix",
+            "Train_VoidRay",
+            "Train_Stalker",
+        ),
+        static_defense_actions=("Build_ShieldBattery_Screen",),
+        # Shield Batteries sustain nearby anti-air units but do not deal damage.
+        anti_air_defense_actions=(),
+        prerequisite_actions=(
+            "Build_Pylon_Screen",
+            "Build_Gateway_Screen",
+            "Build_CyberneticsCore_Screen",
+            "Build_Stargate_Screen",
+        ),
+    ),
     hima_vocabulary_version="hima-protoss-60-v2",
+    structure_saturation_limits={
+        "CyberneticsCore": 1,
+        "Forge": 1,
+        "Gateway": 4,
+        "Stargate": 2,
+        "ShieldBattery": 4,
+    },
+    defense_unit_saturation_limits={
+        "Zealot": 8,
+        "Stalker": 12,
+        "Adept": 8,
+        "Phoenix": 6,
+        "VoidRay": 6,
+    },
     runtime_mapping_ready=True,
     live_worker_ready=True,
-    effect_verification_kinds=("build", "production", "move"),
+    effect_verification_kinds=("build", "production", "research", "move"),
     controller_capabilities=(
         "gas_workers",
         "supply_emergency",
         "resource_fallback",
         "prerequisite_closure",
     ),
-    limitations=("research_effect_verification_pending",),
+    limitations=(),
 )
 
 
 TERRAN_PROGRESS_ACTION_SPECS: tuple[ProgressActionSpec, ...] = (
+    ProgressActionSpec(
+        "Train_SCV",
+        GoalRequirementKind.UNIT,
+        "SCV",
+        minerals=50,
+        supply=1,
+    ),
+    ProgressActionSpec(
+        "Morph_OrbitalCommand",
+        GoalRequirementKind.STRUCTURE,
+        "OrbitalCommand",
+        minerals=150,
+        prerequisites=(StatePrerequisite(GoalRequirementKind.STRUCTURE, "Barracks"),),
+    ),
     ProgressActionSpec(
         "Build_SupplyDepot_Screen",
         GoalRequirementKind.STRUCTURE,
@@ -292,6 +348,9 @@ TERRAN_PROGRESS_ACTION_SPECS: tuple[ProgressActionSpec, ...] = (
 _TERRAN_MAPPINGS = tuple(
     MacroActionMapping(_canonical_hima_action(verb, name), (runtime_action,))
     for verb, name, runtime_action in (
+        ("TRAIN", "SCV", "Train_SCV"),
+        ("TRAIN", "MULE", "Effect_CalldownMULE_Screen"),
+        ("BUILD", "OrbitalCommand", "Morph_OrbitalCommand"),
         ("BUILD", "SupplyDepot", "Build_SupplyDepot_Screen"),
         ("BUILD", "Barracks", "Build_Barracks_Screen"),
         ("BUILD", "Refinery", "Build_Refinery_Near"),
@@ -329,6 +388,9 @@ TERRAN_PROFILE_DATA = RaceProfileData(
     action_domains=_domains(
         TERRAN_PROGRESS_ACTION_SPECS,
         economy={
+            "Train_SCV",
+            "Morph_OrbitalCommand",
+            "Effect_CalldownMULE_Screen",
             "Build_SupplyDepot_Screen",
             "Build_Refinery_Near",
             "Build_CommandCenter_Near",
@@ -364,22 +426,68 @@ TERRAN_PROFILE_DATA = RaceProfileData(
         "Train_Medivac": ("Starport",),
         "Train_VikingFighter": ("Starport",),
         "Research_Stimpack": ("BarracksTechLab",),
+        "Train_SCV": ("CommandCenter", "OrbitalCommand", "PlanetaryFortress"),
+        "Morph_OrbitalCommand": ("CommandCenter",),
+        "Effect_CalldownMULE_Screen": ("OrbitalCommand",),
+    },
+    combat_target_domains={
+        "Marine": CombatTargetDomain.BOTH,
+        "Marauder": CombatTargetDomain.GROUND,
+        "Hellion": CombatTargetDomain.GROUND,
+        "SiegeTank": CombatTargetDomain.GROUND,
+        "SiegeTankSieged": CombatTargetDomain.GROUND,
+        "Medivac": CombatTargetDomain.NONE,
+        "VikingFighter": CombatTargetDomain.AIR,
+        "VikingAssault": CombatTargetDomain.GROUND,
+    },
+    defense_doctrine=DefenseDoctrine(
+        ground_production_actions=(
+            "Train_Marine",
+            "Train_Marauder",
+            "Train_Hellion",
+            "Train_SiegeTank",
+        ),
+        anti_air_production_actions=("Train_VikingFighter", "Train_Marine"),
+        static_defense_actions=("Build_Bunker_Screen",),
+        anti_air_defense_actions=("Build_MissileTurret_Screen",),
+        prerequisite_actions=(
+            "Build_SupplyDepot_Screen",
+            "Build_Barracks_Screen",
+            "Build_Factory_Screen",
+            "Build_Starport_Screen",
+            "Build_EngineeringBay_Screen",
+        ),
+    ),
+    defense_unit_saturation_limits={
+        "Marine": 16,
+        "Marauder": 8,
+        "Hellion": 8,
+        "SiegeTank": 6,
+        "VikingFighter": 6,
     },
     hima_vocabulary_version="hima-terran-69-v1",
     runtime_mapping_ready=True,
     live_worker_ready=True,
-    effect_verification_kinds=("build", "production", "addon", "move"),
+    effect_verification_kinds=(
+        "build",
+        "production",
+        "addon",
+        "morph",
+        "research",
+        "ability",
+        "move",
+    ),
     controller_capabilities=(
         "gas_workers",
         "supply_emergency",
         "resource_fallback",
         "prerequisite_closure",
+        "automatic_scv_training",
+        "orbital_command_morph",
+        "mule_calldown",
     ),
-    limitations=(
-        "morph_effect_verification_pending",
-        "research_effect_verification_pending",
-        "automatic_scv_training_pending",
-    ),
+    controller_managed_actions=("Effect_CalldownMULE_Screen",),
+    limitations=(),
 )
 
 
@@ -539,7 +647,11 @@ ZERG_PROFILE_DATA = RaceProfileData(
             "Build_Extractor_Near",
         },
         technology={"Morph_Lair", "Build_EvolutionChamber_Screen"},
-        defense={"Build_SpineCrawler_Screen", "Build_SporeCrawler_Screen"},
+        defense={
+            "Build_SpineCrawler_Screen",
+            "Build_SporeCrawler_Screen",
+            "Build_CreepTumor_Tumor_Screen",
+        },
     ),
     action_producers={
         **{
@@ -554,6 +666,40 @@ ZERG_PROFILE_DATA = RaceProfileData(
         "Train_Zergling": ("Larva",),
         "Train_Roach": ("Larva",),
         "Train_Hydralisk": ("Larva",),
+        "Build_CreepTumor_Tumor_Screen": (
+            "CreepTumor",
+            "CreepTumorBurrowed",
+            "CreepTumorQueen",
+        ),
+    },
+    combat_target_domains={
+        "Queen": CombatTargetDomain.BOTH,
+        "Zergling": CombatTargetDomain.GROUND,
+        "Roach": CombatTargetDomain.GROUND,
+        "Hydralisk": CombatTargetDomain.BOTH,
+    },
+    defense_doctrine=DefenseDoctrine(
+        ground_production_actions=(
+            "Train_Zergling",
+            "Train_Roach",
+            "Train_Hydralisk",
+            "Train_Queen",
+        ),
+        anti_air_production_actions=("Train_Hydralisk", "Train_Queen"),
+        static_defense_actions=("Build_SpineCrawler_Screen",),
+        anti_air_defense_actions=("Build_SporeCrawler_Screen",),
+        prerequisite_actions=(
+            "Build_SpawningPool_Screen",
+            "Build_RoachWarren_Screen",
+            "Build_HydraliskDen_Screen",
+            "Build_EvolutionChamber_Screen",
+        ),
+    ),
+    defense_unit_saturation_limits={
+        "Queen": 6,
+        "Zergling": 24,
+        "Roach": 12,
+        "Hydralisk": 12,
     },
     hima_vocabulary_version="hima-zerg-63-v1",
     runtime_mapping_ready=True,
@@ -566,8 +712,9 @@ ZERG_PROFILE_DATA = RaceProfileData(
         "prerequisite_closure",
         "queen_larva_inject",
         "queen_creep_tumor",
+        "chained_creep_tumor",
     ),
-    limitations=("creep_tumor_chain_spread_pending",),
+    limitations=(),
 )
 
 
@@ -602,3 +749,48 @@ def race_profile(race: RaceId | str) -> BuiltinRaceProfile:
 
 def built_in_race_profiles() -> tuple[BuiltinRaceProfile, ...]:
     return tuple(_RACE_PROFILES[race] for race in RaceId)
+
+
+def combat_target_domain(unit_type: str) -> CombatTargetDomain:
+    """Return the weapon target domain declared by the owning race profile."""
+
+    domains = {
+        data.combat_target_domains[unit_type]
+        for data in (PROTOSS_PROFILE_DATA, TERRAN_PROFILE_DATA, ZERG_PROFILE_DATA)
+        if unit_type in data.combat_target_domains
+    }
+    if not domains:
+        return CombatTargetDomain.NONE
+    if len(domains) != 1:
+        raise ValueError(f"conflicting combat target domains for {unit_type!r}")
+    return domains.pop()
+
+
+_AIRBORNE_UNIT_TYPES = frozenset(
+    {
+        "Banshee",
+        "Battlecruiser",
+        "BroodLord",
+        "Carrier",
+        "Corruptor",
+        "Liberator",
+        "Medivac",
+        "Mothership",
+        "Mutalisk",
+        "Observer",
+        "Oracle",
+        "Overlord",
+        "Overseer",
+        "Phoenix",
+        "Raven",
+        "Tempest",
+        "VikingFighter",
+        "VoidRay",
+    }
+)
+
+
+def is_flying_unit(unit_type: str) -> bool:
+    """Return flight state from race semantics without changing protocol v1.1."""
+
+    return unit_type in _AIRBORNE_UNIT_TYPES

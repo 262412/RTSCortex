@@ -6,6 +6,7 @@ from rtscortex.contracts import (
     ActionArgumentType,
     AvailableAction,
     ObservationEnvelope,
+    UnitState,
 )
 from rtscortex.cortex import (
     MacroStepStatus,
@@ -17,6 +18,7 @@ from rtscortex.cortex import (
 )
 from rtscortex.policy.hima import HIMALiveProposalResponse, HIMAProposalParser
 from rtscortex.policy.models import PolicyActionClassification
+from rtscortex.races import TERRAN_PROFILE_DATA
 from tests.helpers import make_observation
 
 
@@ -50,6 +52,21 @@ def _response(raw_output: str) -> HIMALiveProposalResponse:
     )
 
 
+def _terran_response(
+    raw_output: str,
+    observation: ObservationEnvelope,
+) -> HIMALiveProposalResponse:
+    return HIMALiveProposalResponse(
+        request_id="terran-request-1",
+        run_id=observation.run_id,
+        episode_id=observation.episode_id,
+        step_id=observation.step_id,
+        game_loop=observation.game_loop,
+        projection_hash="b" * 64,
+        proposal=HIMAProposalParser(race="terran").parse(raw_output),
+    )
+
+
 def test_macro_plan_projection_is_deterministic_and_preserves_step_semantics() -> None:
     observation = _pylon_observation()
     response = _response("Actions: ['Probe', 'Pylon', 'Gateway']")
@@ -63,7 +80,9 @@ def test_macro_plan_projection_is_deterministic_and_preserves_step_semantics() -
     assert first.expires_game_loop == 672
     assert first.source_model_id == "hima-live"
     assert first.source_model_revision == "not_recorded"
-    assert first.raw_proposal["request_id"] == "request-1"
+    assert first.raw_response_hash is not None
+    assert first.raw_proposal["raw_response_hash"] == first.raw_response_hash
+    assert first.raw_proposal["proposal"]["raw_output"] == ""
     assert [step.semantic_action for step in first.steps] == [
         "TRAIN PROBE",
         "BUILD PYLON",
@@ -75,6 +94,84 @@ def test_macro_plan_projection_is_deterministic_and_preserves_step_semantics() -
     assert first.steps[1].runtime_actions == ["Build_Pylon_Screen"]
     assert first.steps[2].status is MacroStepStatus.PENDING
     assert first.steps[2].reason == "future_horizon_not_evaluated"
+
+
+def test_counted_hima_action_projects_only_remaining_cumulative_target() -> None:
+    observation = _pylon_observation().model_copy(
+        update={
+            "state": _pylon_observation().state.model_copy(
+                update={
+                    "own_structures": [
+                        UnitState(
+                            unit_id="pylon-1",
+                            unit_type="Pylon",
+                            alliance="self",
+                        )
+                    ]
+                }
+            )
+        }
+    )
+    response = _response('Actions: ["Pylon": 3]').model_copy(
+        update={"step_id": observation.step_id, "game_loop": observation.game_loop}
+    )
+
+    plan = macro_plan_from_hima(response, observation, ttl_game_loops=448)
+
+    assert plan.steps[0].repeat == 2
+    assert plan.steps[0].status is MacroStepStatus.PENDING
+
+
+def test_hima_compaction_preserves_interleaved_order() -> None:
+    observation = _pylon_observation()
+    plan = macro_plan_from_hima(
+        _response("Actions: ['Pylon', 'Gateway', 'Pylon']"),
+        observation,
+        ttl_game_loops=448,
+    )
+
+    assert [step.semantic_action for step in plan.steps] == [
+        "BUILD PYLON",
+        "BUILD GATEWAY",
+        "BUILD PYLON",
+    ]
+    assert plan.desired_counts["BUILD PYLON"] == 2
+
+
+def test_terran_mule_remains_in_lineage_but_is_managed_outside_goal_progress() -> None:
+    observation = make_observation(include_enemy=False, game_loop=224).model_copy(
+        update={
+            "available_actions": [
+                AvailableAction(
+                    name="Train_SCV",
+                    actor_scopes=["Developer/Empty"],
+                )
+            ]
+        }
+    )
+    response = _terran_response(
+        "Actions: ['SCV', 'SupplyDepot', 'OrbitalCommand', 'MULE']",
+        observation,
+    )
+
+    plan = macro_plan_from_hima(
+        response,
+        observation,
+        ttl_game_loops=448,
+        profile=TERRAN_PROFILE_DATA,
+    )
+    goal = macro_goal_spec(plan, observation, profile=TERRAN_PROFILE_DATA)
+
+    mule_step = next(step for step in plan.steps if step.semantic_action == "TRAIN MULE")
+    assert mule_step.runtime_actions == ["Effect_CalldownMULE_Screen"]
+    assert mule_step.status is MacroStepStatus.OBSOLETE
+    assert mule_step.reason == "managed_automatically"
+    assert goal is not None
+    assert [requirement.action_name for requirement in goal.requirements] == [
+        "Train_SCV",
+        "Build_SupplyDepot_Screen",
+        "Morph_OrbitalCommand",
+    ]
 
 
 def test_macro_plan_rejects_uncorrelated_response_and_invalid_ttl() -> None:
@@ -116,6 +213,26 @@ def test_macro_plan_bounds_long_hima_objective_before_goal_projection() -> None:
     assert goal.strategic_goal == plan.strategic_objective
 
 
+def test_macro_plan_horizon_seconds_bounds_the_executable_prefix() -> None:
+    observation = _pylon_observation()
+    response = _response(
+        "Actions: ['Pylon', 'Gateway', 'Assimilator', 'CyberneticsCore', 'Stargate']"
+    )
+    response = response.model_copy(
+        update={"proposal": response.proposal.model_copy(update={"horizon_seconds": 30})}
+    )
+
+    plan = macro_plan_from_hima(response, observation, ttl_game_loops=448)
+
+    assert [step.semantic_action for step in plan.steps] == ["BUILD PYLON"]
+    assert plan.opaque_future_actions == [
+        "BUILD GATEWAY",
+        "BUILD ASSIMILATOR",
+        "BUILD CYBERNETICSCORE",
+        "BUILD STARGATE",
+    ]
+
+
 def test_runtime_frontier_skips_managed_probe() -> None:
     proposal = _response("Actions: ['Probe', 'Pylon']").proposal
 
@@ -132,16 +249,15 @@ def test_runtime_frontier_skips_managed_probe() -> None:
     assert frontier.is_runtime_frontier
 
 
-def test_runtime_frontier_does_not_skip_unsupported_dependency() -> None:
+def test_runtime_frontier_skips_an_unrelated_unsupported_future_node() -> None:
     proposal = _response("Actions: ['Probe', 'Sentry', 'Pylon']").proposal
 
     frontier = runtime_frontier(proposal, _pylon_observation())
 
     assert frontier is not None
-    assert frontier.source_action == "TRAIN SENTRY"
-    assert frontier.classification is PolicyActionClassification.UNSUPPORTED_BY_RUNTIME
-    assert frontier.reason_code == "not_implemented"
-    assert frontier.runtime_action is None
+    assert frontier.source_action == "BUILD PYLON"
+    assert frontier.classification is PolicyActionClassification.MAPPED_LEGAL_NOW
+    assert frontier.runtime_action == "Build_Pylon_Screen"
     assert frontier.is_runtime_frontier
 
 
@@ -156,7 +272,7 @@ def test_runtime_frontier_treats_parse_error_as_hard_blocker() -> None:
     assert frontier.reason_code == "unknown_action_token"
 
 
-def test_macro_goal_uses_measurable_prefix_and_stops_at_hard_blocker() -> None:
+def test_macro_goal_skips_unrelated_unsupported_step() -> None:
     observation = _pylon_observation()
     response = _response("Actions: ['Probe', 'Pylon', 'Pylon', 'Sentry', 'Gateway']")
     plan = macro_plan_from_hima(response, observation, ttl_game_loops=448)
@@ -167,10 +283,13 @@ def test_macro_goal_uses_measurable_prefix_and_stops_at_hard_blocker() -> None:
     assert [item.action_name for item in goal.requirements] == [
         "Build_Pylon_Screen",
         "Build_Pylon_Screen",
+        "Build_Gateway_Screen",
     ]
-    assert [item.count for item in goal.requirements] == [1, 2]
-    assert plan.steps[3].status is MacroStepStatus.BLOCKED
-    assert plan.steps[4].semantic_action == "BUILD GATEWAY"
+    assert [item.count for item in goal.requirements] == [1, 2, 1]
+    sentry = next(step for step in plan.steps if step.semantic_action == "TRAIN SENTRY")
+    gateway = next(step for step in plan.steps if step.semantic_action == "BUILD GATEWAY")
+    assert sentry.status is MacroStepStatus.OBSOLETE
+    assert gateway.status is MacroStepStatus.PENDING
 
 
 def test_macro_goal_stops_before_unknown_token_parse_diagnostic() -> None:

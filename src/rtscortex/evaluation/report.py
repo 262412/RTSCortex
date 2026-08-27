@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -25,6 +27,10 @@ from rtscortex.evaluation.cortex import (
     CortexObservabilityMetrics,
     compute_cortex_observability,
 )
+from rtscortex.evaluation.engineering import (
+    ENGINEERING_GATES_FILENAME,
+    build_engineering_gate_report,
+)
 from rtscortex.evaluation.metrics import (
     EpisodeMetrics,
     ExecutionMetrics,
@@ -45,6 +51,7 @@ class RunReportArtifacts:
 
     timeline_path: Path
     summary_path: Path
+    engineering_gates_path: Path
 
 
 @dataclass(frozen=True)
@@ -85,25 +92,240 @@ def write_timeline_report(run_dir: Path) -> Path:
     return output_path
 
 
-def write_run_reports(run_dir: Path) -> RunReportArtifacts:
+def write_run_reports(
+    run_dir: Path,
+    *,
+    natural_run_baseline_bytes_per_loop: float | None = None,
+    qualification_evidence_path: Path | None = None,
+) -> RunReportArtifacts:
     """Idempotently derive the Markdown timeline and JSON summary from a journal."""
 
     resolved_run_dir, events = _read_run_events(run_dir)
     timeline_path = resolved_run_dir / REPORT_FILENAME
     summary_path = resolved_run_dir / SUMMARY_FILENAME
+    engineering_gates_path = resolved_run_dir / ENGINEERING_GATES_FILENAME
     timeline = render_timeline(events)
     summary = _build_run_summary(events)
+    recovery_evidence: dict[str, Any] | None = None
+    expected_git_sha: str | None = None
+    evidence: dict[str, Any] | None = None
+    if qualification_evidence_path is not None:
+        if natural_run_baseline_bytes_per_loop is not None:
+            raise ReportError(
+                "qualification evidence and an untraceable numeric disk baseline "
+                "cannot be supplied together"
+            )
+        (
+            natural_run_baseline_bytes_per_loop,
+            recovery_evidence,
+            expected_git_sha,
+            evidence,
+        ) = _load_qualification_evidence(qualification_evidence_path)
+    engineering = build_engineering_gate_report(
+        events,
+        run_dir=resolved_run_dir,
+        natural_run_baseline_bytes_per_loop=natural_run_baseline_bytes_per_loop,
+        recovery_evidence=recovery_evidence,
+        expected_git_sha=expected_git_sha,
+        evidence=evidence,
+    )
     try:
         timeline_path.write_text(timeline, encoding="utf-8")
         summary_path.write_text(
             json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
+        engineering_gates_path.write_text(
+            json.dumps(engineering, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
     except OSError as error:
         raise ReportError(
             f"Could not write run reports below {resolved_run_dir}: {error}"
         ) from error
-    return RunReportArtifacts(timeline_path=timeline_path, summary_path=summary_path)
+    return RunReportArtifacts(
+        timeline_path=timeline_path,
+        summary_path=summary_path,
+        engineering_gates_path=engineering_gates_path,
+    )
+
+
+def _load_qualification_evidence(
+    manifest_path: Path,
+) -> tuple[float | None, dict[str, Any] | None, str, dict[str, Any]]:
+    resolved_manifest = manifest_path.expanduser().resolve()
+    manifest = _read_json_object(resolved_manifest, label="qualification evidence manifest")
+    if manifest.get("format_version") != "1.0":
+        raise ReportError("qualification evidence manifest has an unsupported format_version")
+    if manifest.get("evidence_kind") != "three-seed-qualification":
+        raise ReportError("qualification evidence manifest has the wrong evidence_kind")
+    expected_git_sha = str(manifest.get("expected_git_sha", ""))
+    if re.fullmatch(r"[0-9a-f]{40}", expected_git_sha) is None:
+        raise ReportError("qualification evidence expected_git_sha must be a full Git SHA")
+    diagnostic_only = manifest.get("diagnostic_only")
+    if not isinstance(diagnostic_only, bool):
+        raise ReportError("qualification evidence diagnostic_only must be explicit")
+
+    attempt_field_names = (
+        "run_set_id",
+        "expected_git_sha",
+        "attempt_id",
+        "slurm_job_id",
+        "slurm_restart_count",
+        "started_at",
+    )
+    attempt_fields_present = tuple(field for field in attempt_field_names if field in manifest)
+    if not diagnostic_only and len(attempt_fields_present) != len(attempt_field_names):
+        raise ReportError("formal qualification evidence has incomplete attempt provenance")
+    if attempt_fields_present and len(attempt_fields_present) != len(attempt_field_names):
+        raise ReportError("qualification evidence has partial attempt provenance")
+    has_attempt_provenance = len(attempt_fields_present) == len(attempt_field_names)
+    attempt_payload = {field: manifest.get(field) for field in attempt_field_names}
+    if has_attempt_provenance:
+        if (
+            not isinstance(attempt_payload["slurm_restart_count"], int)
+            or isinstance(attempt_payload["slurm_restart_count"], bool)
+            or attempt_payload["slurm_restart_count"] != 0
+            or not all(
+                isinstance(attempt_payload[field], str) and attempt_payload[field]
+                for field in (
+                    "run_set_id",
+                    "expected_git_sha",
+                    "attempt_id",
+                    "slurm_job_id",
+                    "started_at",
+                )
+            )
+            or attempt_payload["run_set_id"] != resolved_manifest.parent.name
+            or re.fullmatch(r"attempt:[0-9a-f]{32}", str(attempt_payload["attempt_id"])) is None
+            or manifest.get("attempt") != attempt_payload
+        ):
+            raise ReportError("qualification evidence attempt provenance is invalid")
+
+    seed_ids = manifest.get("seed_ids")
+    if not diagnostic_only and seed_ids != [0, 1, 2]:
+        raise ReportError("formal qualification evidence must bind source seeds 0, 1, and 2")
+
+    recovery_path, recovery_sha = _verified_evidence_file(
+        resolved_manifest,
+        manifest.get("recovery_evidence"),
+        label="recovery evidence",
+    )
+    recovery = _read_json_object(recovery_path, label="recovery evidence")
+    if (
+        recovery.get("format_version") != "1.1"
+        or recovery.get("git_sha") != expected_git_sha
+        or recovery.get("expected_git_sha") != expected_git_sha
+    ):
+        raise ReportError("recovery evidence is not bound to expected_git_sha")
+
+    if has_attempt_provenance:
+        if (
+            any(recovery.get(field) != value for field, value in attempt_payload.items())
+            or recovery.get("attempt") != attempt_payload
+        ):
+            raise ReportError(
+                "recovery evidence attempt provenance does not match qualification evidence"
+            )
+        if recovery.get("seed_ids") != seed_ids:
+            raise ReportError(
+                "recovery evidence seed provenance does not match qualification evidence"
+            )
+
+    baseline_path, baseline_sha = _verified_evidence_file(
+        resolved_manifest,
+        manifest.get("natural_run_baseline"),
+        label="natural run baseline",
+    )
+    baseline = _read_json_object(baseline_path, label="natural run baseline")
+    source_issue = baseline.get("source_issue")
+    baseline_value = baseline.get("natural_run_bytes_per_game_loop")
+    if not isinstance(source_issue, str) or not source_issue.strip():
+        raise ReportError("natural run baseline has no source_issue")
+    if not isinstance(baseline_value, (int, float)) or float(baseline_value) <= 0:
+        raise ReportError("natural run baseline has no positive bytes-per-game-loop value")
+
+    evidence = {
+        "manifest_path": str(resolved_manifest),
+        "evidence_kind": "three-seed-qualification",
+        "diagnostic_only": diagnostic_only,
+        "expected_git_sha": expected_git_sha,
+        "seed_ids": seed_ids,
+        "recovery_evidence": {
+            "path": str(recovery_path),
+            "sha256": recovery_sha,
+        },
+        "natural_run_baseline": {
+            "path": str(baseline_path),
+            "sha256": baseline_sha,
+            "source_issue": source_issue,
+            "bytes_per_game_loop": float(baseline_value),
+        },
+    }
+    if has_attempt_provenance:
+        evidence.update(attempt_payload)
+        evidence["attempt"] = dict(attempt_payload)
+    source_reference = manifest.get("source_attestation")
+    if source_reference is not None:
+        source_path, source_sha = _verified_evidence_file(
+            resolved_manifest,
+            source_reference,
+            label="source attestation",
+        )
+        source = _read_json_object(source_path, label="source attestation")
+        if source.get("expected_git_sha", source.get("git_sha")) != expected_git_sha:
+            raise ReportError("source attestation is not bound to expected_git_sha")
+        if has_attempt_provenance and (
+            any(source.get(field) != value for field, value in attempt_payload.items())
+            or source.get("attempt") != attempt_payload
+        ):
+            raise ReportError(
+                "source attestation attempt provenance does not match qualification evidence"
+            )
+        evidence["source_attestation"] = {
+            "path": str(source_path),
+            "sha256": source_sha,
+        }
+    if diagnostic_only:
+        return None, None, expected_git_sha, evidence
+    return float(baseline_value), recovery, expected_git_sha, evidence
+
+
+def _verified_evidence_file(
+    manifest_path: Path,
+    reference: Any,
+    *,
+    label: str,
+) -> tuple[Path, str]:
+    if not isinstance(reference, dict):
+        raise ReportError(f"qualification evidence has no {label} reference")
+    raw_path = reference.get("path")
+    expected_sha = reference.get("sha256")
+    if not isinstance(raw_path, str) or not raw_path:
+        raise ReportError(f"{label} path is missing")
+    if not isinstance(expected_sha, str) or re.fullmatch(r"[0-9a-f]{64}", expected_sha) is None:
+        raise ReportError(f"{label} sha256 is missing or invalid")
+    path = Path(raw_path).expanduser()
+    if not path.is_absolute():
+        path = manifest_path.parent / path
+    path = path.resolve()
+    try:
+        observed_sha = hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError as error:
+        raise ReportError(f"Could not read {label} {path}: {error}") from error
+    if observed_sha != expected_sha:
+        raise ReportError(f"{label} sha256 does not match its manifest attestation")
+    return path, observed_sha
+
+
+def _read_json_object(path: Path, *, label: str) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ReportError(f"Could not read {label} {path}: {error}") from error
+    if not isinstance(payload, dict):
+        raise ReportError(f"{label} must contain one JSON object")
+    return payload
 
 
 def _read_run_events(run_dir: Path) -> tuple[Path, list[StoredEvent]]:
@@ -524,6 +746,23 @@ def _render_episode(
     summary = _last_model(events, "episode_summary", EpisodeSummary)
     observations = [event for event in events if event.event_type == "observation"]
     decisions = [event for event in events if event.event_type == "decision"]
+    retention_summary = next(
+        (
+            event.payload
+            for event in reversed(events)
+            if event.event_type == "event_retention_summary"
+        ),
+        {},
+    )
+    retention_counts = retention_summary.get("event_counts", {})
+
+    def logical_count(event_type: str, retained_count: int) -> int:
+        counts = retention_counts.get(event_type)
+        if not isinstance(counts, dict):
+            return retained_count
+        raw = counts.get("raw")
+        return raw if isinstance(raw, int) and not isinstance(raw, bool) else retained_count
+
     legacy_plans = [event for event in events if event.event_type == "plan_accepted"]
     macro_plan_events = [
         event
@@ -540,7 +779,13 @@ def _render_episode(
         for event in events
         if event.event_type == "module_result" and event.payload.get("model_call") is True
     ]
-    rejected = sum(len(_payload_list(event, "batch", "rejected_commands")) for event in decisions)
+    decision_aggregates = retention_summary.get("aggregates", {}).get("decision", {})
+    rejected = (
+        int(decision_aggregates["rejected_command_count"])
+        if isinstance(decision_aggregates, dict)
+        and isinstance(decision_aggregates.get("rejected_command_count"), int)
+        else sum(len(_payload_list(event, "batch", "rejected_commands")) for event in decisions)
+    )
     successful_executions = sum(event.payload.get("success") is True for event in executions)
     execution_metrics = compute_execution_metrics(events)
     cortex_metrics = compute_cortex_observability(events)
@@ -583,7 +828,8 @@ def _render_episode(
         ),
         "|---:|---:|---:|---:|---:|---:|---:|",
         (
-            f"| {len(observations)} | {len(decisions)} | {len(plans)} | {execution_rate} | "
+            f"| {logical_count('observation', len(observations))} | "
+            f"{logical_count('decision', len(decisions))} | {len(plans)} | {execution_rate} | "
             f"{rejected} | {model_call_count} | {total_tokens} |"
         ),
     ]
@@ -710,6 +956,16 @@ def _render_event(
         return _render_execution(event, command_index)
     if event.event_type == "module_result":
         return _render_module_result(event)
+    if event.event_type == "event_retention_summary":
+        raw = event.payload.get("raw_logical_count", 0)
+        retained = event.payload.get("retained_count", 0)
+        suppressed = event.payload.get("suppressed_count", 0)
+        interval = event.payload.get("checkpoint_interval", "unknown")
+        return [
+            f"- Event {event.event_id} · Event retention kept `{retained}/{raw}` "
+            f"high-frequency states and suppressed `{suppressed}` duplicates; "
+            f"full checkpoint interval `{interval}`."
+        ]
     if event.event_type == "planner_cycle":
         status = _inline(event.payload.get("status", "unknown"))
         latency = _milliseconds(event.payload.get("latency_ms"))
@@ -860,8 +1116,24 @@ def _render_execution(
                 "  - Production confirmed by new unit "
                 f"{_code(evidence.new_unit_tag or 'unknown')} ({_code(unit_type)})."
             )
-    elif (
-        report.action_name is not None
+    if report.effect_evidence and report.effect_evidence.effect_kind == "research":
+        evidence = report.effect_evidence
+        lines.append(
+            "  - Research confirmed by "
+            f"{_code(evidence.confirmation_kind or 'unknown')} for "
+            f"{_code(evidence.expected_upgrade or evidence.target_type or 'unknown upgrade')} "
+            f"on {_code(evidence.producer_tag or 'unknown producer')}."
+        )
+    if report.effect_evidence and report.effect_evidence.effect_kind == "ability":
+        evidence = report.effect_evidence
+        lines.append(
+            "  - Economy ability confirmed by new unit "
+            f"{_code(evidence.new_unit_tag or 'unknown')} from "
+            f"{_code(evidence.producer_tag or 'unknown producer')}."
+        )
+    if (
+        report.effect_evidence is None
+        and report.action_name is not None
         and report.action_name.startswith("Train_")
         and report.status.value == "succeeded"
         and report.execution_stage is not None
@@ -885,9 +1157,18 @@ def _render_cortex_event(event: StoredEvent) -> list[str]:
         threat = _payload_text(assessment, "threat_level", "threat") or "unknown"
         readiness = _payload_text(assessment, "army_readiness", "readiness") or "unknown"
         source = _payload_text(payload, "source_kind", "source", "model") or "unknown"
+        score = assessment.get("threat_score")
+        evidence = assessment.get("threat_evidence")
+        evidence_text = (
+            ", ".join(str(item) for item in evidence)
+            if isinstance(evidence, list | tuple) and evidence
+            else "none"
+        )
         return [
             f"- Event {event_id} · Situation assessed by {_code(source)}: phase "
-            f"{_code(phase)}; threat {_code(threat)}; readiness {_code(readiness)}."
+            f"{_code(phase)}; threat {_code(threat)} (score "
+            f"{_code(score if score is not None else 'legacy')}); readiness "
+            f"{_code(readiness)}; evidence {_code(evidence_text)}."
         ]
     if event.event_type in {"macro_plan_accepted", "macro_plan_rejected"}:
         plan = _nested_payload(payload, "plan")
@@ -928,6 +1209,34 @@ def _render_cortex_event(event: StoredEvent) -> list[str]:
         return [
             f"- Event {event_id} · Macro step {_code(action)} is {_code(status)} "
             f"(`{completed}/{repeat}`){suffix}."
+        ]
+    if event.event_type in {
+        "macro_frontier_deferred",
+        "macro_frontier_preempted",
+        "macro_structure_deferred",
+    }:
+        action = (
+            _payload_text(
+                payload,
+                "blocked_runtime_action",
+                "runtime_action",
+                "blocked_action",
+                "semantic_action",
+            )
+            or "unknown"
+        )
+        reason = _payload_text(payload, "reason", "blocked_reason") or "unspecified"
+        fallback = _payload_text(payload, "fallback_runtime_action", "fallback_action")
+        target = _payload_text(payload, "target_structure")
+        details = []
+        if fallback:
+            details.append(f"fallback {_code(fallback)}")
+        if target:
+            details.append(f"target {_code(target)}")
+        suffix = f"; {'; '.join(details)}" if details else ""
+        return [
+            f"- Event {event_id} · Macro action {_code(action)} deferred: "
+            f"{_inline(reason)}{suffix}."
         ]
     if event.event_type == "intent_emitted":
         intent = _nested_payload(payload, "intent")
@@ -975,6 +1284,19 @@ def _render_cortex_event(event: StoredEvent) -> list[str]:
         return [
             f"- Event {event_id} · Playbook rule {_code(rule_id)} applied to "
             f"{_code(target)}: {_code(reason)}."
+        ]
+    if event.event_type == "strategic_consequence_attributed":
+        consequence_type = _payload_text(payload, "consequence_type") or "unknown"
+        role = _payload_text(payload, "role") or "unassigned"
+        consequence_action = _payload_text(payload, "semantic_action")
+        explanation = _payload_text(payload, "explanation") or "no explanation recorded"
+        start_loop = payload.get("start_game_loop", "unknown")
+        end_loop = payload.get("end_game_loop", "unknown")
+        target = f"; action {_code(consequence_action)}" if consequence_action else ""
+        return [
+            f"- Event {event_id} · Strategic consequence {_code(consequence_type)} for "
+            f"role {_code(role)}{target}, loops `{start_loop}–{end_loop}`: "
+            f"{_inline(explanation)}."
         ]
     if event.event_type == "candidate_set_built":
         candidates = payload.get("candidates", [])
@@ -1111,6 +1433,7 @@ def _render_execution_metrics(metrics: ExecutionMetrics) -> list[str]:
                 f"- Meaningful commands: `{metrics.meaningful_commands}` — "
                 f"`{metrics.meaningful_successes}` succeeded, "
                 f"`{metrics.meaningful_failures}` failed, "
+                f"`{metrics.meaningful_satisfied_by_peer}` satisfied by peer, "
                 f"`{metrics.meaningful_cancelled}` cancelled, "
                 f"`{metrics.meaningful_unconfirmed}` unconfirmed."
             ),
@@ -1336,6 +1659,15 @@ def _render_cortex_metrics(metrics: CortexObservabilityMetrics) -> list[str]:
             f"`{metrics.playbook_shadow_block_count}` shadow blocks."
         ),
         (
+            "- Strategic consequences attributed from completed matches: "
+            f"`{sum(metrics.strategic_consequence_counts.values())}`."
+        ),
+        (
+            "- Threat assessment: max score "
+            f"`{metrics.max_threat_score:.2f}`, evidence coverage "
+            f"`{metrics.threat_evidence_coverage:.1%}`."
+        ),
+        (
             f"- Command lineage coverage: {coverage}; missing "
             f"`{metrics.missing_lineage_commands}`, orphan `{metrics.orphan_lineage_commands}`, "
             f"duplicates `{metrics.duplicate_lineage_commands}`, integrity violations "
@@ -1357,6 +1689,12 @@ def _render_cortex_metrics(metrics: CortexObservabilityMetrics) -> list[str]:
         *_render_count_table("Strategic intents by responsibility", metrics.role_intent_counts),
         *_render_count_table("Strategic intent decisions", metrics.intent_decision_counts),
         *_render_count_table("Strategic intent conflicts", metrics.intent_conflict_counts),
+        *_render_count_table(
+            "Strategic consequences",
+            metrics.strategic_consequence_counts,
+        ),
+        *_render_count_table("Threat levels", metrics.threat_level_counts),
+        *_render_count_table("Threat evidence", metrics.threat_evidence_counts),
         *_render_count_table("Cortex selections by executor", metrics.executor_counts),
         *_render_count_table("Specialist failures", metrics.specialist_failure_counts),
         *_render_count_table("Specialists ready", metrics.specialist_ready_counts),

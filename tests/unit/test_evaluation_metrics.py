@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from rtscortex.contracts import EpisodeOutcome, EpisodeResult
+from rtscortex.evaluation.cortex import compute_cortex_observability
 from rtscortex.evaluation.metrics import (
     aggregate_episode_metrics,
     compute_episode_metrics,
@@ -234,6 +235,33 @@ def test_episode_metrics_include_cortex_hima_requests_and_plans() -> None:
     assert metrics.plan_revisions == 1
     assert metrics.plan_accept_gap_game_loops_p50 == 130.0
     assert metrics.plan_accept_gap_samples == 1
+
+
+def test_cortex_metrics_count_strategic_consequences_by_type() -> None:
+    metrics = compute_cortex_observability(
+        [
+            _event(
+                1,
+                "strategic_consequence_attributed",
+                {"consequence_type": "threat_unanswered"},
+            ),
+            _event(
+                2,
+                "strategic_consequence_attributed",
+                {"consequence_type": "threat_unanswered"},
+            ),
+            _event(
+                3,
+                "strategic_consequence_attributed",
+                {"consequence_type": "successful_key_decision"},
+            ),
+        ]
+    )
+
+    assert metrics.strategic_consequence_counts == {
+        "successful_key_decision": 1,
+        "threat_unanswered": 2,
+    }
 
 
 def test_execution_metrics_separate_control_noops_and_terminal_states() -> None:
@@ -1156,6 +1184,62 @@ def test_terminal_coverage_uses_dispatched_lifecycle_not_execution_count() -> No
     assert metrics.duplicate_dispatches == 1
     assert metrics.terminal_report_coverage == 0.5
     assert metrics.failure_classification_coverage == 1.0
+
+
+def test_peer_satisfied_attack_is_not_counted_as_failure_or_duplicate_kill() -> None:
+    first = {
+        "command_id": "attack-a",
+        "name": "Attack_Unit",
+        "actor": "CombatGroup0/Stalker-1",
+    }
+    peer = {
+        "command_id": "attack-b",
+        "name": "Attack_Unit",
+        "actor": "CombatGroup1/Stalker-1",
+    }
+    events = [
+        _event(1, "command_lifecycle", {"command": first, "status": "dispatched"}),
+        _event(2, "command_lifecycle", {"command": peer, "status": "dispatched"}),
+        _event(
+            3,
+            "execution",
+            {
+                **first,
+                "action_name": "Attack_Unit",
+                "success": True,
+                "status": "succeeded",
+                "execution_stage": "effect_verification",
+                "effect_evidence": {"confirmation_kind": "target_removed"},
+            },
+        ),
+        _event(
+            4,
+            "execution",
+            {
+                **peer,
+                "action_name": "Attack_Unit",
+                "success": False,
+                "status": "cancelled",
+                "execution_stage": "effect_verification",
+                "failure_code": "engagement_target_eliminated",
+                "failure_reason": "the exact engagement target was eliminated by a peer actor",
+                "effect_evidence": {"confirmation_kind": "satisfied_by_peer"},
+            },
+        ),
+    ]
+
+    metrics = compute_execution_metrics(events)
+
+    assert metrics.meaningful_commands == 2
+    assert metrics.meaningful_successes == 1
+    assert metrics.meaningful_satisfied_by_peer == 1
+    assert metrics.meaningful_failures == 0
+    assert metrics.meaningful_cancelled == 0
+    assert metrics.failure_reports == 0
+    assert metrics.failure_by_code == {}
+    assert metrics.meaningful_action_success_rate == 1.0
+    assert metrics.completed_execution_success_rate == 1.0
+    assert metrics.terminal_report_coverage == 1.0
 
 
 def test_v11_pending_episode_end_cancellation_is_not_counted_as_dispatched() -> None:

@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import json
 from collections import defaultdict, deque
-from dataclasses import dataclass, field
+from collections.abc import Sequence
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from threading import Condition
 from time import monotonic
@@ -32,6 +33,8 @@ class _DecisionState:
     error: Optional[Exception] = None
     in_flight: bool = False
     consumed: set[str] = field(default_factory=set)
+    participants: set[str] = field(default_factory=set)
+    opened_at: float = field(default_factory=monotonic)
 
 
 @dataclass(frozen=True)
@@ -45,6 +48,7 @@ class PrimitiveDispatch:
     failure_code: Optional[str] = None
     requested_function_id: Optional[int] = None
     emitted_function_id: Optional[int] = None
+    authoritative_pre_dispatch: Optional[dict[str, Any]] = None
 
 
 @dataclass
@@ -70,19 +74,28 @@ class SharedDecisionBroker:
         extractor: TimeStepExtractor,
         *,
         decision_timeout_seconds: float = 60.0,
+        participant_grace_seconds: float = 0.25,
         metrics_path: Optional[str] = None,
     ) -> None:
         if decision_timeout_seconds <= 0:
             raise ValueError("decision_timeout_seconds must be positive")
+        if participant_grace_seconds < 0:
+            raise ValueError("participant_grace_seconds cannot be negative")
         self.coordinator = coordinator
         self.extractor = extractor
         self.decision_timeout_seconds = decision_timeout_seconds
+        self.participant_grace_seconds = min(
+            participant_grace_seconds,
+            decision_timeout_seconds,
+        )
         self._condition = Condition()
         self._agents: dict[str, Any] = {}
         self._states: dict[int, _DecisionState] = {}
+        self._partial_steps: dict[int, frozenset[str]] = {}
         self._command_queues: dict[tuple[str, str, str], deque[str]] = defaultdict(deque)
         self._active_commands: dict[tuple[str, str], _ActiveCommand] = {}
         self._screen_route_provenance: dict[str, ScreenRouteProvenance] = {}
+        self._expansion_anchor_by_command: dict[str, int] = {}
         self._planner_pending = False
         self._last_decision_game_loop: Optional[int] = None
         self._initial_decision_started = False
@@ -91,6 +104,11 @@ class SharedDecisionBroker:
         self.unattributed_primitives = 0
         self.candidate_outside_pysc2_dispatches = 0
         self.observation_gap_watchdog_triggers = 0
+        self.orchestration_recoveries = 0
+        self.partial_runtime_decisions = 0
+        self.skipped_runtime_participants = 0
+        self.expansion_scout_camera_moves = 0
+        self.expansion_candidate_exhaustions = 0
         self._metrics_path = None if metrics_path is None else Path(metrics_path)
         with self._condition:
             self._persist_metrics_locked()
@@ -103,6 +121,11 @@ class SharedDecisionBroker:
                 "unattributed_primitives": self.unattributed_primitives,
                 "candidate_outside_pysc2_dispatches": (self.candidate_outside_pysc2_dispatches),
                 "observation_gap_watchdog_triggers": self.observation_gap_watchdog_triggers,
+                "orchestration_recoveries": self.orchestration_recoveries,
+                "partial_runtime_decisions": self.partial_runtime_decisions,
+                "skipped_runtime_participants": self.skipped_runtime_participants,
+                "expansion_scout_camera_moves": self.expansion_scout_camera_moves,
+                "expansion_candidate_exhaustions": self.expansion_candidate_exhaustions,
             }
 
     @property
@@ -115,6 +138,21 @@ class SharedDecisionBroker:
     def record_observation_gap_watchdog_trigger(self) -> None:
         with self._condition:
             self.observation_gap_watchdog_triggers += 1
+            self._persist_metrics_locked()
+
+    def record_orchestration_recovery(self) -> None:
+        with self._condition:
+            self.orchestration_recoveries += 1
+            self._persist_metrics_locked()
+
+    def record_expansion_scout_move(self) -> None:
+        with self._condition:
+            self.expansion_scout_camera_moves += 1
+            self._persist_metrics_locked()
+
+    def record_expansion_candidate_exhaustion(self) -> None:
+        with self._condition:
+            self.expansion_candidate_exhaustions += 1
             self._persist_metrics_locked()
 
     def record_unattributed_primitive(self) -> None:
@@ -144,6 +182,27 @@ class SharedDecisionBroker:
             game_loop=game_loop,
             requested_function_id=dispatch.requested_function_id,
             emitted_function_id=dispatch.emitted_function_id,
+        )
+
+    def settle_candidate_invalidation(
+        self,
+        dispatch: PrimitiveDispatch,
+        *,
+        failure_code: str,
+        failure_reason: str,
+        game_loop: Optional[int],
+    ) -> None:
+        """Fail one command whose previously valid semantic target became stale."""
+
+        self.settle_primitive(
+            replace(
+                dispatch,
+                failure_code=failure_code,
+                emitted_function_id=0,
+            ),
+            success=False,
+            failure_reason=failure_reason,
+            game_loop=game_loop,
         )
 
     def raise_unattributed_integrity(self, reason: str) -> NoReturn:
@@ -231,6 +290,10 @@ class SharedDecisionBroker:
     def submit(self, agent: Any, timestep: Any, text_observation: str) -> str:
         step_id = int(agent.main_loop_step)
         with self._condition:
+            self._prune_partial_steps_locked(step_id)
+            late_skipped = self._partial_steps.get(step_id, frozenset())
+            if agent.name in late_skipped:
+                return _transport_noop_action_text(agent)
             state = self._states.setdefault(step_id, _DecisionState())
             if state.error is not None:
                 raise RuntimeError(
@@ -244,6 +307,7 @@ class SharedDecisionBroker:
         deadline = monotonic() + self.decision_timeout_seconds
         while state.decision is None and state.error is None:
             leader = False
+            participants: set[str] = set()
             with self._condition:
                 expected = {name for name, value in self._agents.items() if value.enable}
                 # Combat agents can be disabled after losing their final unit while
@@ -251,8 +315,24 @@ class SharedDecisionBroker:
                 # Re-evaluate the live participant set instead of retaining a stale
                 # name until the full decision timeout expires. Submitted agents are
                 # still included in the snapshot even if they become disabled later.
-                if not state.in_flight and expected.issubset(state.submissions):
+                collection_complete = expected.issubset(state.submissions)
+                grace_elapsed = monotonic() - state.opened_at >= self.participant_grace_seconds
+                if (
+                    not state.in_flight
+                    and state.submissions
+                    and (collection_complete or grace_elapsed)
+                ):
                     state.in_flight = True
+                    participants = set(state.submissions).intersection(expected)
+                    if not participants:
+                        participants = set(state.submissions)
+                    state.participants = participants
+                    missing_participants = expected.difference(participants)
+                    if missing_participants:
+                        self.partial_runtime_decisions += 1
+                        self.skipped_runtime_participants += len(missing_participants)
+                        self._partial_steps[step_id] = frozenset(missing_participants)
+                        self._persist_metrics_locked()
                     leader = True
                     if not self._initial_decision_started:
                         self._initial_decision_started = True
@@ -272,7 +352,7 @@ class SharedDecisionBroker:
                     else:
                         self._condition.wait(timeout=min(0.05, remaining))
             if leader:
-                self._decide(step_id)
+                self._decide(step_id, participants)
 
         with self._condition:
             if state.error is not None:
@@ -280,11 +360,52 @@ class SharedDecisionBroker:
                     f"shared runtime decision failed at step {step_id}"
                 ) from state.error
             assert state.decision is not None
-            route = state.decision.routes[agent.name]
+            route = state.decision.routes.get(agent.name)
             state.consumed.add(agent.name)
-            if state.consumed == set(state.submissions):
+            if state.participants.issubset(state.consumed):
                 self._states.pop(step_id, None)
-            return route.action_text
+            return _transport_noop_action_text(agent) if route is None else route.action_text
+
+    def decide_direct(
+        self,
+        timestep: Any,
+        agents: dict[str, Any],
+        *,
+        step_id: int,
+    ) -> BridgeDecision:
+        """Run one Runtime tick without the upstream LLMAgent query barrier.
+
+        Raw-action mode still reuses the upstream agent configuration as the
+        actor/action catalogue, but RTSCortex owns the observation cadence and
+        final dispatch. No camera, selection or translator queue participates.
+        """
+
+        profiler = getattr(self.coordinator.runtime, "profiler", None)
+        if profiler is None:
+            snapshot = self.extractor.extract(
+                timestep,
+                agents,
+                {name: "RTSCortex raw-action observation" for name in agents},
+                step_id=step_id,
+            )
+        else:
+            with profiler.measure("observation_extraction"):
+                snapshot = self.extractor.extract(
+                    timestep,
+                    agents,
+                    {name: "RTSCortex raw-action observation" for name in agents},
+                    step_id=step_id,
+                )
+        team_order = {name: current_team_order(agent) for name, agent in agents.items()}
+        decision = self.coordinator.decide(snapshot, team_order)
+        with self._condition:
+            self._last_decision_game_loop = int(snapshot["game_loop"])
+            self._initial_decision_started = True
+            self._initial_decision_complete = True
+            self._planner_pending = bool(decision.action_batch.get("planner_pending", False))
+            self._remember_decision_provenance(decision)
+            self._condition.notify_all()
+        return decision
 
     def claim_primitive(
         self,
@@ -490,6 +611,9 @@ class SharedDecisionBroker:
     def resolve_arguments(self, command_id: str, arguments: list[Any]) -> None:
         self.coordinator.resolve_arguments(command_id, arguments)
 
+    def record_action_result(self, command_id: str, results: Sequence[Any]) -> None:
+        self.coordinator.record_action_result(command_id, results)
+
     def screen_route_provenance(
         self,
         command_id: str,
@@ -591,6 +715,7 @@ class SharedDecisionBroker:
             total=dispatch.total,
             game_loop=game_loop,
             failure_code=dispatch.failure_code,
+            authoritative_pre_dispatch=dispatch.authoritative_pre_dispatch,
             requested_function_id=dispatch.requested_function_id,
             emitted_function_id=dispatch.emitted_function_id,
         )
@@ -608,20 +733,35 @@ class SharedDecisionBroker:
         *,
         builder_tag: Optional[int],
         producer_tag: Optional[int] = None,
+        actor_tags: tuple[int, ...] = (),
+        minimap_transform: Optional[tuple[float, float, float, float, float]] = None,
     ) -> None:
         self.coordinator.prepare_effect(
             dispatch.command_id,
             observation,
             builder_tag=builder_tag,
             producer_tag=producer_tag,
+            actor_tags=actor_tags,
+            minimap_transform=minimap_transform,
         )
 
-    def observe_effects(self, observation: Any) -> None:
-        self.coordinator.observe_effects(observation)
+    def observe_effects(self, observation: Any) -> list[dict[str, Any]]:
+        reports = self.coordinator.observe_effects(observation)
+        for report in reports:
+            command_id = str(report.get("command_id", ""))
+            anchor_tag = self._expansion_anchor_by_command.pop(command_id, None)
+            if anchor_tag is None or str(report.get("status")) == "succeeded":
+                continue
+            self.extractor.suppress_expansion_anchor(
+                anchor_tag,
+                game_loop=_observation_game_loop(observation),
+            )
+        return reports
 
     def end_episode(self, result: dict[str, Any]) -> None:
         self.coordinator.end_episode(result)
         self._screen_route_provenance.clear()
+        self._expansion_anchor_by_command.clear()
 
     def _command_id_for_actor(
         self,
@@ -690,16 +830,25 @@ class SharedDecisionBroker:
                     "unattributed_primitives": self.unattributed_primitives,
                     "candidate_outside_pysc2_dispatches": (self.candidate_outside_pysc2_dispatches),
                     "observation_gap_watchdog_triggers": (self.observation_gap_watchdog_triggers),
+                    "orchestration_recoveries": self.orchestration_recoveries,
+                    "partial_runtime_decisions": self.partial_runtime_decisions,
+                    "skipped_runtime_participants": self.skipped_runtime_participants,
+                    "expansion_scout_camera_moves": self.expansion_scout_camera_moves,
+                    "expansion_candidate_exhaustions": (self.expansion_candidate_exhaustions),
                 }
             ),
             encoding="utf-8",
         )
         temporary.replace(self._metrics_path)
 
-    def _decide(self, step_id: int) -> None:
+    def _decide(self, step_id: int, participants: set[str]) -> None:
         with self._condition:
             state = self._states[step_id]
-            submissions = dict(state.submissions)
+            submissions = {
+                name: submission
+                for name, submission in state.submissions.items()
+                if name in participants
+            }
         try:
             first = next(iter(submissions.values()))
             agents = {name: item.agent for name, item in submissions.items()}
@@ -727,16 +876,59 @@ class SharedDecisionBroker:
             self._last_decision_game_loop = int(snapshot["game_loop"])
             self._initial_decision_complete = True
             self._planner_pending = bool(decision.action_batch.get("planner_pending", False))
-            for route in decision.routes.values():
-                for command in route.commands:
+            self._remember_decision_provenance(decision, enqueue_commands=True)
+            self._condition.notify_all()
+
+    def _remember_decision_provenance(
+        self,
+        decision: BridgeDecision,
+        *,
+        enqueue_commands: bool = False,
+    ) -> None:
+        for route in decision.routes.values():
+            for command in route.commands:
+                if enqueue_commands:
                     key = (route.agent_name, command.team_name, command.name)
                     self._command_queues[key].append(command.command_id)
-                    if (
-                        command.screen_world_target is not None
-                        and command.screen_anchor_tag is not None
-                    ):
-                        self._screen_route_provenance[command.command_id] = ScreenRouteProvenance(
-                            world_target=command.screen_world_target,
-                            anchor_tag=command.screen_anchor_tag,
-                        )
-            self._condition.notify_all()
+                if (
+                    command.screen_world_target is not None
+                    and command.screen_anchor_tag is not None
+                ):
+                    self._screen_route_provenance[command.command_id] = ScreenRouteProvenance(
+                        world_target=command.screen_world_target,
+                        anchor_tag=command.screen_anchor_tag,
+                    )
+                if command.name == "Build_Nexus_Near" and command.requested_arguments:
+                    anchor = command.requested_arguments[0]
+                    self._expansion_anchor_by_command[command.command_id] = (
+                        int(anchor, 0) if isinstance(anchor, str) else int(anchor)
+                    )
+
+    def _prune_partial_steps_locked(self, current_step_id: int) -> None:
+        stale = [step_id for step_id in self._partial_steps if step_id < current_step_id - 4]
+        for step_id in stale:
+            del self._partial_steps[step_id]
+
+
+def _transport_noop_action_text(agent: Any) -> str:
+    lines = ["Actions:"]
+    for team_name in current_team_order(agent):
+        lines.extend(
+            (
+                f"    Team {team_name}:",
+                "        <No_Operation()>",
+            )
+        )
+    return "\n".join(lines)
+
+
+def _observation_game_loop(observation: Any) -> int:
+    value: Any = (
+        observation.get("game_loop", 0)
+        if isinstance(observation, dict)
+        else getattr(observation, "game_loop", 0)
+    )
+    try:
+        return int(value[0]) if len(value) == 1 else int(value)
+    except (TypeError, IndexError):
+        return int(value)

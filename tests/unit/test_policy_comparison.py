@@ -228,10 +228,10 @@ def test_zerg_corpus_selects_zerg_specialists_and_race_provenance(
     ]
     provenance = json.loads((output_dir / "candidates/hima-zerg-a/provenance.json").read_text())
     assert provenance["vocabulary_version"] == "hima-zerg-63-v1"
-    assert provenance["parser_version"] == "hima-zerg-parser-v2"
+    assert provenance["parser_version"] == "hima-zerg-parser-v3"
     report = artifacts.reports.report_path.read_text()
-    assert "hima-zerg-parser-v2" in report
-    assert "hima-protoss-parser-v5" not in report
+    assert "hima-zerg-parser-v3" in report
+    assert "hima-protoss-parser-v6" not in report
 
 
 def test_comparison_worker_uses_the_manifest_race_for_zerg(

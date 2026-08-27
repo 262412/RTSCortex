@@ -1,0 +1,458 @@
+"""Verify that accepted combat primitives damage or remove their exact target."""
+
+from __future__ import annotations
+
+import hashlib
+from dataclasses import dataclass
+from typing import Any, Optional
+
+from rtscortex_llm_pysc2.effect_types import EffectVerdict
+from rtscortex_llm_pysc2.routing import RoutedCommand
+
+_ATTACK_ABILITY_IDS = frozenset({23, 1682, 2048, 3674, 3771})
+
+
+@dataclass
+class _PendingCombat:
+    command: RoutedCommand
+    target_tag: int
+    target_type: Optional[str] = None
+    dispatched_game_loop: Optional[int] = None
+    accepted_game_loop: Optional[int] = None
+    latest_game_loop: Optional[int] = None
+    baseline_health: Optional[float] = None
+    observed_health: Optional[float] = None
+    actor_tags: tuple[int, ...] = ()
+    engagement_id: Optional[str] = None
+    actor_order_ever_bound: bool = False
+    current_actor_order_bound: bool = False
+    current_actor_order_ability_ids: tuple[int, ...] = ()
+    last_exact_bound_game_loop: Optional[int] = None
+    order_missing_since_game_loop: Optional[int] = None
+    order_replacement_confirmed_game_loop: Optional[int] = None
+
+
+class CombatEffectVerifier:
+    """Require observable damage instead of treating API acceptance as combat success."""
+
+    def __init__(
+        self,
+        *,
+        timeout_game_loops: int,
+        unit_names: Optional[dict[int, str]] = None,
+    ) -> None:
+        self.timeout_game_loops = int(timeout_game_loops)
+        self.unit_names = dict(unit_names or {})
+        self._pending: dict[str, _PendingCombat] = {}
+        self._next_engagement_ordinal = 0
+
+    def track(self, command: RoutedCommand) -> bool:
+        if command.name != "Attack_Unit":
+            return False
+        arguments = command.resolved_arguments or command.requested_arguments
+        if not arguments:
+            raise ValueError("Attack_Unit requires an exact enemy tag")
+        target_tag = _parse_tag(arguments[0])
+        if target_tag is None:
+            raise ValueError("Attack_Unit target must be an integer or hexadecimal tag")
+        self._pending[command.command_id] = _PendingCombat(command, target_tag)
+        return True
+
+    def is_tracked(self, command_id: str) -> bool:
+        return command_id in self._pending
+
+    def resolve_arguments(self, command_id: str, arguments: list[Any]) -> None:
+        pending = self._pending[command_id]
+        target_tag = _parse_tag(arguments[0]) if arguments else None
+        if target_tag is None:
+            raise ValueError("Attack_Unit target must remain an exact tag")
+        pending.target_tag = target_tag
+
+    def prepare(
+        self,
+        command_id: str,
+        observation: Any,
+        actor_tags: tuple[int, ...] = (),
+    ) -> None:
+        pending = self._pending[command_id]
+        pending.actor_tags = tuple(dict.fromkeys(int(tag) for tag in actor_tags if int(tag) > 0))
+        self._assign_engagement(pending)
+        target = _unit_by_tag(observation, pending.target_tag)
+        pending.dispatched_game_loop = _game_loop(observation)
+        pending.latest_game_loop = pending.dispatched_game_loop
+        if target is None or int(_value(target, "alliance", 0)) != 4:
+            return
+        pending.target_type = _unit_name(target, self.unit_names)
+        pending.baseline_health = _health_pool(target)
+        pending.observed_health = pending.baseline_health
+
+    def accept_primitive(self, command_id: str, *, game_loop: int) -> None:
+        pending = self._pending[command_id]
+        if pending.dispatched_game_loop is None:
+            raise RuntimeError(f"combat baseline was not prepared for command {command_id!r}")
+        pending.accepted_game_loop = int(game_loop)
+
+    def observe(self, observation: Any) -> list[EffectVerdict]:
+        game_loop = _game_loop(observation)
+        verdicts: list[EffectVerdict] = []
+        claimed_damage_targets: set[int] = set()
+        dead_tags = _dead_unit_tags(observation)
+        ordered_pending = sorted(
+            self._pending.items(),
+            key=lambda item: (
+                item[1].accepted_game_loop if item[1].accepted_game_loop is not None else 2**63 - 1,
+                item[0],
+            ),
+        )
+        for command_id, pending in ordered_pending:
+            if command_id not in self._pending or pending.accepted_game_loop is None:
+                continue
+            pending.latest_game_loop = game_loop
+            target = _unit_by_tag(observation, pending.target_tag)
+            self._refresh_actor_order(pending, observation, game_loop)
+            if target is not None:
+                pending.target_type = pending.target_type or _unit_name(target, self.unit_names)
+                pending.observed_health = _health_pool(target)
+        removal_claimants = self._removal_claimants(ordered_pending, dead_tags)
+        for command_id, pending in ordered_pending:
+            if command_id not in self._pending:
+                continue
+            if pending.accepted_game_loop is None:
+                continue
+            target = _unit_by_tag(observation, pending.target_tag)
+            target_removed = pending.target_tag in dead_tags
+            damage_observed = (
+                pending.baseline_health is not None
+                and pending.observed_health is not None
+                and pending.observed_health < pending.baseline_health
+            )
+            if (
+                target_removed
+                and removal_claimants.get(pending.target_tag) == command_id
+                or pending.current_actor_order_bound
+                and damage_observed
+            ) and pending.target_tag not in claimed_damage_targets:
+                confirmation_kind = "target_removed" if target_removed else "target_damaged"
+                verdicts.append(
+                    EffectVerdict(
+                        command_id,
+                        True,
+                        status="succeeded",
+                        evidence=self._evidence(pending, confirmation_kind),
+                    )
+                )
+                claimed_damage_targets.add(pending.target_tag)
+                del self._pending[command_id]
+                if target_removed:
+                    for peer_id, peer in ordered_pending:
+                        if (
+                            peer_id not in self._pending
+                            or peer_id == command_id
+                            or peer.accepted_game_loop is None
+                            or peer.target_tag != pending.target_tag
+                            or peer.engagement_id != pending.engagement_id
+                        ):
+                            continue
+                        if (
+                            not peer.actor_order_ever_bound
+                            or peer.order_replacement_confirmed_game_loop is not None
+                        ):
+                            continue
+                        verdicts.append(
+                            EffectVerdict(
+                                peer_id,
+                                False,
+                                (
+                                    "Attack_Unit engagement target was eliminated while "
+                                    "this exact actor had remained part of the engagement"
+                                ),
+                                status="cancelled",
+                                failure_code="engagement_target_eliminated",
+                                evidence=self._evidence(peer, "satisfied_by_peer"),
+                            )
+                        )
+                        del self._pending[peer_id]
+                if damage_observed and pending.observed_health is not None:
+                    for other in self._pending.values():
+                        if other.target_tag == pending.target_tag:
+                            other.baseline_health = pending.observed_health
+                continue
+            if pending.order_replacement_confirmed_game_loop is not None:
+                verdicts.append(
+                    EffectVerdict(
+                        command_id,
+                        False,
+                        "Attack_Unit RAW order was overwritten before the target effect completed",
+                        status="failed",
+                        failure_code="combat_order_replaced",
+                        evidence=self._evidence(pending, None),
+                    )
+                )
+                del self._pending[command_id]
+                continue
+            elapsed = game_loop - pending.accepted_game_loop
+            if elapsed < self.timeout_game_loops:
+                continue
+            if pending.baseline_health is None:
+                failure_code = "combat_target_baseline_missing"
+                failure_reason = (
+                    "Attack_Unit target baseline was unavailable before effect "
+                    f"verification timed out after {elapsed} game loops"
+                )
+            elif not pending.actor_order_ever_bound:
+                failure_code = "combat_actor_order_unbound"
+                failure_reason = (
+                    "Attack_Unit was accepted but the exact actor never exposed an order "
+                    f"bound to target {hex(pending.target_tag)}"
+                )
+            elif target is None:
+                failure_code = "combat_target_lost"
+                failure_reason = (
+                    "Attack_Unit target left observation before damage could be "
+                    f"confirmed after {elapsed} game loops"
+                )
+            else:
+                failure_code = "combat_effect_not_observed"
+                failure_reason = (
+                    f"Attack_Unit produced no observable target damage after {elapsed} game loops"
+                )
+            verdicts.append(
+                EffectVerdict(
+                    command_id,
+                    False,
+                    failure_reason,
+                    status="failed",
+                    failure_code=failure_code,
+                    evidence=self._evidence(pending, None),
+                )
+            )
+            del self._pending[command_id]
+        return verdicts
+
+    def _assign_engagement(self, pending: _PendingCombat) -> None:
+        if pending.engagement_id is not None:
+            return
+        peer = next(
+            (
+                candidate
+                for candidate in self._pending.values()
+                if candidate is not pending
+                and candidate.target_tag == pending.target_tag
+                and candidate.engagement_id is not None
+                and candidate.order_replacement_confirmed_game_loop is None
+            ),
+            None,
+        )
+        if peer is not None:
+            pending.engagement_id = peer.engagement_id
+            return
+        self._next_engagement_ordinal += 1
+        identity = f"{pending.target_tag}:{self._next_engagement_ordinal}".encode()
+        pending.engagement_id = f"engagement:{hashlib.sha256(identity).hexdigest()}"
+
+    @staticmethod
+    def _removal_claimants(
+        ordered_pending: list[tuple[str, _PendingCombat]],
+        dead_tags: set[int],
+    ) -> dict[int, str]:
+        claimants: dict[int, str] = {}
+        candidates = [
+            (command_id, pending)
+            for command_id, pending in ordered_pending
+            if pending.accepted_game_loop is not None
+            and pending.target_tag in dead_tags
+            and pending.actor_order_ever_bound
+            and pending.order_replacement_confirmed_game_loop is None
+        ]
+        for command_id, pending in sorted(
+            candidates,
+            key=lambda item: (
+                not item[1].current_actor_order_bound,
+                item[1].accepted_game_loop,
+                item[0],
+            ),
+        ):
+            claimants.setdefault(pending.target_tag, command_id)
+        return claimants
+
+    @staticmethod
+    def _refresh_actor_order(
+        pending: _PendingCombat,
+        observation: Any,
+        game_loop: int,
+    ) -> None:
+        actors = tuple(
+            unit
+            for tag in pending.actor_tags
+            if (unit := _unit_by_tag(observation, tag)) is not None
+        )
+        bound_ability_ids = tuple(
+            sorted(
+                {
+                    ability_id
+                    for actor in actors
+                    for ability_id in _attack_abilities_targeting_tag(
+                        actor,
+                        pending.target_tag,
+                    )
+                }
+            )
+        )
+        current_order_bound = bool(bound_ability_ids)
+        pending.current_actor_order_bound = current_order_bound
+        pending.current_actor_order_ability_ids = bound_ability_ids
+        pending.actor_order_ever_bound = pending.actor_order_ever_bound or current_order_bound
+        if current_order_bound:
+            pending.last_exact_bound_game_loop = game_loop
+            pending.order_missing_since_game_loop = None
+        elif pending.actor_order_ever_bound:
+            pending.order_missing_since_game_loop = (
+                pending.order_missing_since_game_loop or game_loop
+            )
+            if game_loop - pending.order_missing_since_game_loop >= 4:
+                pending.order_replacement_confirmed_game_loop = (
+                    pending.order_replacement_confirmed_game_loop or game_loop
+                )
+
+    def cancel(self, command_id: str) -> None:
+        self._pending.pop(command_id, None)
+
+    def fail_pending(self, reason: str) -> list[EffectVerdict]:
+        verdicts: list[EffectVerdict] = []
+        for command_id, pending in list(self._pending.items()):
+            if pending.accepted_game_loop is None:
+                continue
+            verdicts.append(
+                EffectVerdict(
+                    command_id,
+                    False,
+                    f"{reason}: combat effect was not observed",
+                    status="unconfirmed",
+                    failure_code="episode_ended_unconfirmed",
+                    evidence=self._evidence(pending, None),
+                )
+            )
+            del self._pending[command_id]
+        return verdicts
+
+    def _evidence(
+        self,
+        pending: _PendingCombat,
+        confirmation_kind: Optional[str],
+    ) -> dict[str, Any]:
+        current_loop = pending.latest_game_loop or pending.dispatched_game_loop
+        elapsed = (
+            0
+            if pending.accepted_game_loop is None or current_loop is None
+            else max(0, current_loop - pending.accepted_game_loop)
+        )
+        delta = (
+            None
+            if pending.baseline_health is None or pending.observed_health is None
+            else max(0.0, pending.baseline_health - pending.observed_health)
+        )
+        return {
+            "effect_kind": "combat",
+            "target_type": pending.target_type,
+            "target_tag": hex(pending.target_tag),
+            "dispatched_loop": pending.dispatched_game_loop,
+            "accepted_loop": pending.accepted_game_loop,
+            "confirmed_loop": current_loop if confirmation_kind is not None else None,
+            "confirmation_kind": confirmation_kind,
+            "baseline_target_health": pending.baseline_health,
+            "observed_target_health": pending.observed_health,
+            "target_health_delta": delta,
+            "actor_tags": [hex(tag) for tag in pending.actor_tags],
+            "engagement_id": pending.engagement_id,
+            "actor_order_bound": pending.current_actor_order_bound,
+            "actor_order_ever_bound": pending.actor_order_ever_bound,
+            "actor_order_ability_ids": list(pending.current_actor_order_ability_ids),
+            "last_exact_bound_game_loop": pending.last_exact_bound_game_loop,
+            "order_replacement_confirmed_game_loop": (
+                pending.order_replacement_confirmed_game_loop
+            ),
+            "elapsed_game_loops": elapsed,
+            "base_timeout_game_loops": self.timeout_game_loops,
+            "effective_timeout_game_loops": self.timeout_game_loops,
+        }
+
+
+def _parse_tag(value: Any) -> Optional[int]:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, str):
+        try:
+            parsed = int(value, 0)
+        except ValueError:
+            return None
+        return parsed if parsed >= 0 else None
+    return None
+
+
+def _unit_by_tag(observation: Any, tag: int) -> Optional[Any]:
+    return next(
+        (
+            unit
+            for unit in _value(observation, "raw_units", ())
+            if int(_value(unit, "tag", -1)) == tag
+        ),
+        None,
+    )
+
+
+def _health_pool(unit: Any) -> float:
+    return max(0.0, float(_value(unit, "health", 0.0))) + max(
+        0.0,
+        float(_value(unit, "shield", 0.0)),
+    )
+
+
+def _unit_name(unit: Any, unit_names: dict[int, str]) -> str:
+    value = _value(unit, "unit_type", "")
+    if isinstance(value, str):
+        return value
+    return unit_names.get(int(value), f"unit:{int(value)}")
+
+
+def _attack_abilities_targeting_tag(unit: Any, target_tag: int) -> set[int]:
+    abilities: set[int] = set()
+    for order in _value(unit, "orders", ()):
+        ability_id = int(_value(order, "ability_id", 0))
+        if (
+            ability_id in _ATTACK_ABILITY_IDS
+            and int(_value(order, "target_unit_tag", 0)) == target_tag
+        ):
+            abilities.add(ability_id)
+    for index in range(4):
+        ability_id = int(_value(unit, f"order_id_{index}", 0))
+        if (
+            ability_id in _ATTACK_ABILITY_IDS
+            and int(_value(unit, f"order_id_{index}_target_unit_tag", 0)) == target_tag
+        ):
+            abilities.add(ability_id)
+    return abilities
+
+
+def _dead_unit_tags(observation: Any) -> set[int]:
+    direct = _value(observation, "dead_units", ())
+    raw_data = _value(observation, "raw_data", None)
+    event = None if raw_data is None else _value(raw_data, "event", None)
+    values = direct or (() if event is None else _value(event, "dead_units", ()))
+    return {int(tag) for tag in values}
+
+
+def _game_loop(observation: Any) -> int:
+    value = _value(observation, "game_loop", 0)
+    if hasattr(value, "item"):
+        value = value.item()
+    if isinstance(value, (list, tuple)):
+        value = value[0] if value else 0
+    return int(value)
+
+
+def _value(value: Any, name: str, default: Any) -> Any:
+    if isinstance(value, dict):
+        return value.get(name, default)
+    return getattr(value, name, default)

@@ -12,6 +12,7 @@ from rtscortex.contracts import (
     SC2State,
     UnitState,
 )
+from rtscortex.cortex import townhall_recovery_runtime_actions
 from rtscortex.policy.hima import (
     HIMA_PARSER_VERSIONS,
     HIMA_PINNED_REVISIONS,
@@ -127,6 +128,21 @@ _OFFICIAL_TERRAN_ACTIONS = (
         )
     ),
 )
+
+
+@pytest.mark.parametrize(
+    ("race", "expected_action"),
+    (
+        ("protoss", "Build_Nexus_Near"),
+        ("terran", "Build_CommandCenter_Near"),
+        ("zerg", "Build_Hatchery_Near"),
+    ),
+)
+def test_townhall_recovery_action_is_derived_from_race_profile(
+    race: str,
+    expected_action: str,
+) -> None:
+    assert townhall_recovery_runtime_actions(race_profile(race).data) == {expected_action}
 
 
 class _FakeTerranGenerator:

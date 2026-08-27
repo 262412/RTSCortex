@@ -81,64 +81,35 @@ jobs:
         with:
           python-version: "3.9"
       - run: uv venv --python 3.9 .worker-venv
-      - run: >-
-          uv pip install --python .worker-venv/bin/python
-          -e integrations/llm_pysc2
-          -e third_party/LLM-PySC2
+      - name: Prepare and install the reviewed Worker source
+        shell: bash
+        run: |
+          set -euo pipefail
+          reviewed_root="${RUNNER_TEMP}/rtscortex-reviewed-source"
+          gitlink="$(git ls-tree HEAD third_party/LLM-PySC2 | awk '{print $3}')"
+          .worker-venv/bin/python scripts/prepare_reviewed_llm_pysc2_runtime.py \
+            --source third_party/LLM-PySC2 \
+            --output-root "${reviewed_root}" \
+            --patch-directory integrations/llm_pysc2/patches \
+            --expected-gitlink "${gitlink}"
+          echo "RTSCORTEX_CI_REVIEWED_SOURCE_ROOT=${reviewed_root}" >> "${GITHUB_ENV}"
+          uv pip install --python .worker-venv/bin/python \
+            -e integrations/llm_pysc2 \
+            -e "${reviewed_root}/third_party/LLM-PySC2"
       - name: Validate reviewed patch chain on Python 3.9
         shell: bash
         run: |
           set -euo pipefail
-          patches=(
-            ../../integrations/llm_pysc2/patches/0001-return-noop-while-awaiting-runtime.patch
-            ../../integrations/llm_pysc2/patches/0002-pass-random-seed-to-sc2env.patch
-            ../../integrations/llm_pysc2/patches/0003-fix-build-feature-plane-coordinate-order.patch
-            ../../integrations/llm_pysc2/patches/0004-expose-structured-translation-results.patch
-            ../../integrations/llm_pysc2/patches/0005-fix-near-base-placement.patch
-            ../../integrations/llm_pysc2/patches/0006-report-pretranslation-action-aborts.patch
-            ../../integrations/llm_pysc2/patches/0007-preserve-transient-team-units.patch
-            ../../integrations/llm_pysc2/patches/0008-enforce-nexus-resource-clearance.patch
-            ../../integrations/llm_pysc2/patches/0009-use-exact-nexus-screen-scale.patch
-            ../../integrations/llm_pysc2/patches/0010-report-max-frame-truncation.patch
-            ../../integrations/llm_pysc2/patches/0011-allocate-log-directories-atomically.patch
-            ../../integrations/llm_pysc2/patches/0012-bind-gas-rebalance-to-worker-management.patch
-            ../../integrations/llm_pysc2/patches/0013-preserve-reserved-builder-worker.patch
-            ../../integrations/llm_pysc2/patches/0014-refresh-worker-workplaces.patch
-            ../../integrations/llm_pysc2/patches/0015-observation-gap-watchdog.patch
-            ../../integrations/llm_pysc2/patches/0016-accept-visible-team-unit.patch
-            ../../integrations/llm_pysc2/patches/0017-return-camera-settlement-noop.patch
-            ../../integrations/llm_pysc2/patches/0018-use-exact-single-unit-selection.patch
-            ../../integrations/llm_pysc2/patches/0019-bypass-actor-selection-for-transport-noop.patch
-            ../../integrations/llm_pysc2/patches/0020-validate-gather-screen-target.patch
-          )
-          applied=()
-          cleanup() {
-            for ((index=${#applied[@]} - 1; index >= 0; index--)); do
-              git -C third_party/LLM-PySC2 apply --reverse "${applied[index]}"
-            done
-          }
-          trap cleanup EXIT
-
-          for patch in "${patches[@]}"; do
-            git -C third_party/LLM-PySC2 apply --check "$patch"
-            git -C third_party/LLM-PySC2 apply "$patch"
-            applied+=("$patch")
-          done
-
+          reviewed_llm_pysc2="${RTSCORTEX_CI_REVIEWED_SOURCE_ROOT}/third_party/LLM-PySC2"
           .worker-venv/bin/python -m compileall -q \
             integrations/llm_pysc2/src \
-            third_party/LLM-PySC2/llm_pysc2
+            "${reviewed_llm_pysc2}/llm_pysc2"
           PYGAME_HIDE_SUPPORT_PROMPT=1 .worker-venv/bin/python -c \
             "import llm_pysc2.agents, pysc2, rtscortex_llm_pysc2.worker"
           PYGAME_HIDE_SUPPORT_PROMPT=1 .worker-venv/bin/python \
             integrations/llm_pysc2/tests/python39_contract_smoke.py
           PYGAME_HIDE_SUPPORT_PROMPT=1 .worker-venv/bin/python -m unittest discover \
-            -s integrations/llm_pysc2/tests -p 'test_frame_stream.py' -v
+            -s integrations/llm_pysc2/tests -p 'test_*.py' -v
 
-          # The legacy editable install writes build metadata into the submodule.
-          rm -rf -- third_party/LLM-PySC2/llm_pysc2.egg-info
-          cleanup
-          applied=()
-          trap - EXIT
           git -C third_party/LLM-PySC2 diff --exit-code
           test -z "$(git -C third_party/LLM-PySC2 status --short)"

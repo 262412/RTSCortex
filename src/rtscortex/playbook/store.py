@@ -3,18 +3,22 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sqlite3
 import threading
 from datetime import UTC, datetime
 from pathlib import Path
 
+from rtscortex.playbook.conditions import condition_matches
 from rtscortex.playbook.models import (
     DecisionCase,
     LessonStatus,
     PlaybookCondition,
+    PlaybookContext,
     PlaybookHit,
     PlaybookLesson,
     PlaybookQuery,
+    PlaybookRetryGuardBinding,
     PlaybookRule,
     PlaybookRuleApplication,
     PlaybookRuleCategory,
@@ -23,18 +27,32 @@ from rtscortex.playbook.models import (
     PlaybookRuleStatus,
     PlaybookRuleStrength,
     PlaybookSelection,
+    StrategicConsequenceType,
+)
+from rtscortex.playbook.selection import (
+    rule_is_unexpired,
+    runtime_hard_rule_candidates,
 )
 
 
 class PlaybookStore:
     """Persist reusable experience outside any individual run directory."""
 
-    def __init__(self, database_path: Path) -> None:
+    def __init__(self, database_path: Path, *, read_only: bool = False) -> None:
         database_path.parent.mkdir(parents=True, exist_ok=True)
+        if read_only and not database_path.is_file():
+            raise ValueError(f"frozen Playbook database does not exist: {database_path}")
         self.database_path = database_path
+        self.read_only = read_only
         self._lock = threading.Lock()
-        self._connection = sqlite3.connect(database_path, check_same_thread=False)
+        self._connection = sqlite3.connect(
+            (f"file:{database_path}?mode=ro" if read_only else str(database_path)),
+            uri=read_only,
+            check_same_thread=False,
+        )
         self._connection.row_factory = sqlite3.Row
+        if read_only:
+            return
         self._connection.executescript(
             """
             CREATE TABLE IF NOT EXISTS decision_cases (
@@ -169,16 +187,33 @@ class PlaybookStore:
     def rules_for_guard(
         self,
         *,
+        context: PlaybookContext | None = None,
         max_hard: int = 8,
         max_soft: int = 8,
+        approved_hard_rule_ids: tuple[str, ...] | None = None,
     ) -> tuple[PlaybookRule, ...]:
-        active = [rule for rule in self.rules() if rule.status is PlaybookRuleStatus.ACTIVE]
-        now = datetime.now(UTC)
-        active = [rule for rule in active if _rule_is_unexpired(rule, now)]
-        hard = sorted(
-            (rule for rule in active if rule.strength is PlaybookRuleStrength.HARD),
-            key=lambda rule: (-rule.confidence, rule.rule_id),
-        )[:max_hard]
+        rules = self.rules()
+        hard_candidates = runtime_hard_rule_candidates(
+            rules,
+            agent_race=context.agent_race if context is not None else None,
+            opponent_race=context.opponent_race if context is not None else None,
+            map_name=context.map_name if context is not None else None,
+        )
+        hard = hard_candidates[:max_hard]
+        if approved_hard_rule_ids is not None:
+            selected_ids = tuple(rule.rule_id for rule in hard)
+            if len(hard_candidates) > max_hard:
+                raise RuntimeError(
+                    "Runtime hard-rule candidate count exceeds the approved max_hard_rules"
+                )
+            if selected_ids != approved_hard_rule_ids:
+                raise RuntimeError(
+                    "Runtime hard-rule selection differs from the readiness-approved rule IDs"
+                )
+        if context is not None:
+            rules = [rule for rule in rules if _rule_matches_context(rule, context)]
+        active = [rule for rule in rules if rule.status is PlaybookRuleStatus.ACTIVE]
+        active = [rule for rule in active if rule_is_unexpired(rule, datetime.now(UTC))]
         soft = sorted(
             (rule for rule in active if rule.strength is PlaybookRuleStrength.SOFT),
             key=lambda rule: (-rule.confidence, rule.rule_id),
@@ -186,15 +221,26 @@ class PlaybookStore:
         advisory = sorted(
             (
                 rule
-                for rule in self.rules()
+                for rule in rules
                 if rule.status is PlaybookRuleStatus.LEGACY
                 and rule.strength is PlaybookRuleStrength.ADVISORY
             ),
             key=lambda rule: (-rule.confidence, rule.rule_id),
         )[:8]
-        return tuple([*hard, *soft, *advisory])
+        candidates = sorted(
+            (
+                rule
+                for rule in rules
+                if rule.status is PlaybookRuleStatus.CANDIDATE
+                and bool(rule.action_names or rule.role_ids)
+            ),
+            key=lambda rule: (-rule.confidence, rule.rule_id),
+        )[:16]
+        return tuple([*hard, *soft, *candidates, *advisory])
 
     def record_rule_application(self, application: PlaybookRuleApplication) -> bool:
+        if self.read_only:
+            return False
         with self._lock:
             cursor = self._connection.execute(
                 """
@@ -210,8 +256,24 @@ class PlaybookStore:
                     application.model_dump_json(),
                 ),
             )
+            inserted = cursor.rowcount == 1
+            if inserted and application.matched:
+                row = self._connection.execute(
+                    "SELECT payload_json FROM playbook_rules_v2 WHERE rule_id = ?",
+                    (application.rule_id,),
+                ).fetchone()
+                if row is not None:
+                    rule = PlaybookRule.model_validate_json(str(row["payload_json"]))
+                    if rule.status is PlaybookRuleStatus.CANDIDATE:
+                        updated = rule.model_copy(
+                            update={"shadow_state_count": rule.shadow_state_count + 1}
+                        )
+                        self._connection.execute(
+                            "UPDATE playbook_rules_v2 SET payload_json = ? WHERE rule_id = ?",
+                            (updated.model_dump_json(), updated.rule_id),
+                        )
             self._connection.commit()
-        return cursor.rowcount == 1
+        return inserted
 
     def rule_applications(
         self,
@@ -299,6 +361,22 @@ class PlaybookStore:
         self._connection.close()
 
 
+def _rule_matches_context(rule: PlaybookRule, context: PlaybookContext) -> bool:
+    values: dict[str, object] = {
+        "agent_race": context.agent_race,
+        "opponent_race": context.opponent_race,
+        "phase": context.phase.value,
+        "map_name": context.map_name,
+        "alert": context.tags,
+    }
+    for condition in rule.conditions:
+        if condition.field not in values:
+            continue
+        if not condition_matches(condition, values):
+            return False
+    return True
+
+
 def _match_score(query: PlaybookQuery, lesson: PlaybookLesson) -> tuple[float, list[str]]:
     expected = query.context
     actual = lesson.context
@@ -332,12 +410,15 @@ def _legacy_rule(lesson: PlaybookLesson) -> PlaybookRule:
     )
     effect = (
         PlaybookRuleEffect.PREFER
-        if lesson.recommended_action is not None
+        if lesson.recommended_action is not None or lesson.recommended_role is not None
         else PlaybookRuleEffect.AVOID
     )
     actions = tuple(
-        action for action in (lesson.recommended_action, lesson.avoid_action) if action is not None
+        action
+        for action in (lesson.recommended_action, lesson.avoid_action)
+        if action is not None and action.strip().casefold() not in {"", "unknown"}
     )
+    roles = tuple(role for role in (lesson.recommended_role, lesson.avoid_role) if role is not None)
     canonical = hashlib.sha256(
         f"legacy|{lesson.signature}|{effect.value}|{'|'.join(actions)}".encode()
     ).hexdigest()
@@ -354,6 +435,7 @@ def _legacy_rule(lesson: PlaybookLesson) -> PlaybookRule:
         strength=PlaybookRuleStrength.ADVISORY,
         status=PlaybookRuleStatus.LEGACY,
         action_names=actions,
+        role_ids=roles,
         confidence=lesson.confidence,
         support_count=lesson.support_count,
         contradiction_count=lesson.contradiction_count,
@@ -366,20 +448,43 @@ def _legacy_rule(lesson: PlaybookLesson) -> PlaybookRule:
 
 
 def _candidate_rule(lesson: PlaybookLesson, source_case: DecisionCase) -> PlaybookRule:
-    conditions = (
+    conditions: tuple[PlaybookCondition, ...] = (
         PlaybookCondition(field="agent_race", value=lesson.context.agent_race),
         PlaybookCondition(field="opponent_race", value=lesson.context.opponent_race),
         PlaybookCondition(field="phase", value=lesson.context.phase.value),
         PlaybookCondition(field="map_name", value=lesson.context.map_name),
     )
+    condition_values = source_case.evidence.get("condition_values")
+    if isinstance(condition_values, dict):
+        conditions = (
+            *conditions,
+            *tuple(
+                PlaybookCondition(field=field, value=str(condition_values[field]))  # type: ignore[arg-type]
+                for field in ("threat_level", "economy_status", "army_readiness")
+                if isinstance(condition_values.get(field), str)
+            ),
+        )
     effect = (
         PlaybookRuleEffect.PREFER
-        if lesson.recommended_action is not None
+        if lesson.recommended_action is not None or lesson.recommended_role is not None
         else PlaybookRuleEffect.AVOID
     )
     actions = tuple(
-        action for action in (lesson.recommended_action, lesson.avoid_action) if action is not None
+        action
+        for action in (lesson.recommended_action, lesson.avoid_action)
+        if action is not None and action.strip().casefold() not in {"", "unknown"}
     )
+    retry_guard = (
+        None
+        if source_case.retry_feedback is None
+        else PlaybookRetryGuardBinding(
+            failure_code=source_case.retry_feedback.failure_code,
+            max_age_game_loops=source_case.retry_feedback.max_age_game_loops,
+        )
+    )
+    if source_case.retry_feedback is not None:
+        actions = (source_case.retry_feedback.action_name,)
+    roles = tuple(role for role in (lesson.recommended_role, lesson.avoid_role) if role is not None)
     canonical_payload = "|".join(
         (
             lesson.rule_kind.value,
@@ -389,30 +494,80 @@ def _candidate_rule(lesson: PlaybookLesson, source_case: DecisionCase) -> Playbo
             ),
             effect.value,
             *actions,
+            *roles,
         )
     )
-    canonical = hashlib.sha256(canonical_payload.encode()).hexdigest()
+    canonical = hashlib.sha256(
+        (
+            canonical_payload
+            if retry_guard is None
+            else json.dumps(
+                {
+                    "predicate": canonical_payload,
+                    "retry_guard": retry_guard.model_dump(mode="json"),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        ).encode()
+    ).hexdigest()
     seed = source_case.evidence.get("seed")
     return PlaybookRule(
         rule_id=f"playbook-rule:{canonical}",
         canonical_key=canonical,
-        category=(
-            PlaybookRuleCategory.EXECUTION_GUARD
-            if lesson.rule_kind is PlaybookRuleKind.EXECUTION_GUARD
-            else PlaybookRuleCategory.MATCHUP_STRATEGY
-        ),
+        category=_rule_category(lesson),
         conditions=conditions,
         effect=effect,
         strength=PlaybookRuleStrength.ADVISORY,
         status=PlaybookRuleStatus.CANDIDATE,
         action_names=actions,
+        role_ids=roles,
+        retry_guard=retry_guard,
         confidence=lesson.confidence,
         support_count=1,
         source_case_ids=(source_case.case_id,),
         source_run_ids=(source_case.run_id,),
         source_seeds=((int(seed),) if isinstance(seed, int) else ()),
-        evidence={"lesson_id": lesson.lesson_id, "statement": lesson.statement},
+        censored_source_run_ids=(
+            (source_case.run_id,) if source_case.evidence.get("censored") is True else ()
+        ),
+        censored_source_seeds=(
+            (int(seed),)
+            if source_case.evidence.get("censored") is True and isinstance(seed, int)
+            else ()
+        ),
+        evidence={
+            "lesson_id": lesson.lesson_id,
+            "statement": lesson.statement,
+            "consequence_type": (
+                None if lesson.consequence_type is None else lesson.consequence_type.value
+            ),
+            "retry_feedback_sources": (
+                {}
+                if source_case.retry_feedback is None
+                else {source_case.case_id: source_case.retry_feedback.model_dump(mode="json")}
+            ),
+        },
     )
+
+
+def _rule_category(lesson: PlaybookLesson) -> PlaybookRuleCategory:
+    if lesson.rule_kind is PlaybookRuleKind.EXECUTION_GUARD:
+        return PlaybookRuleCategory.EXECUTION_GUARD
+    if lesson.consequence_type in {
+        StrategicConsequenceType.EXPANSION_DELAYED,
+        StrategicConsequenceType.PRODUCTION_IMBALANCE,
+    }:
+        return PlaybookRuleCategory.RACE_MACRO
+    if lesson.consequence_type in {
+        StrategicConsequenceType.THREAT_UNANSWERED,
+        StrategicConsequenceType.TIMING_ATTACK_FAILED,
+        StrategicConsequenceType.UNNECESSARY_RETREAT,
+        StrategicConsequenceType.ADVANTAGE_NOT_CONVERTED,
+        StrategicConsequenceType.SUCCESSFUL_KEY_DECISION,
+    }:
+        return PlaybookRuleCategory.TACTICAL_RESPONSE
+    return PlaybookRuleCategory.MATCHUP_STRATEGY
 
 
 def _merge_rule_evidence(existing: PlaybookRule, incoming: PlaybookRule) -> PlaybookRule:
@@ -426,6 +581,12 @@ def _merge_rule_evidence(existing: PlaybookRule, incoming: PlaybookRule) -> Play
         incoming.status is PlaybookRuleStatus.CANDIDATE
         and existing.status is PlaybookRuleStatus.ACTIVE
     )
+    existing_retry_sources = existing.evidence.get("retry_feedback_sources")
+    incoming_retry_sources = incoming.evidence.get("retry_feedback_sources")
+    retry_sources = {
+        **(existing_retry_sources if isinstance(existing_retry_sources, dict) else {}),
+        **(incoming_retry_sources if isinstance(incoming_retry_sources, dict) else {}),
+    }
     return incoming.model_copy(
         update={
             "status": existing.status if preserve_active else incoming.status,
@@ -446,18 +607,29 @@ def _merge_rule_evidence(existing: PlaybookRule, incoming: PlaybookRule) -> Play
             ),
             "source_run_ids": source_run_ids,
             "source_seeds": tuple(dict.fromkeys((*existing.source_seeds, *incoming.source_seeds))),
+            "censored_source_run_ids": tuple(
+                dict.fromkeys(
+                    (
+                        *existing.censored_source_run_ids,
+                        *incoming.censored_source_run_ids,
+                    )
+                )
+            ),
+            "censored_source_seeds": tuple(
+                dict.fromkeys(
+                    (
+                        *existing.censored_source_seeds,
+                        *incoming.censored_source_seeds,
+                    )
+                )
+            ),
             "contradiction_seeds": contradiction_seeds,
             "shadow_state_count": max(existing.shadow_state_count, incoming.shadow_state_count),
             "false_block_count": max(existing.false_block_count, incoming.false_block_count),
-            "evidence": {**existing.evidence, **incoming.evidence},
+            "evidence": {
+                **existing.evidence,
+                **incoming.evidence,
+                "retry_feedback_sources": retry_sources,
+            },
         }
     )
-
-
-def _rule_is_unexpired(rule: PlaybookRule, now: datetime) -> bool:
-    expires_at = rule.expires_at
-    if expires_at is None:
-        return True
-    if expires_at.tzinfo is None:
-        expires_at = expires_at.replace(tzinfo=UTC)
-    return expires_at.astimezone(UTC) > now

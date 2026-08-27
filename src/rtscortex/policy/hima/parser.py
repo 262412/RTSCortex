@@ -19,10 +19,10 @@ from rtscortex.policy.models import (
     TacticalRationale,
 )
 
-MAX_RAW_OUTPUT_CHARS = 32_768
-MAX_ACTION_ITEMS = 128
+MAX_RAW_OUTPUT_CHARS = 16_384
+MAX_ACTION_ITEMS = 64
 MAX_ACTION_REPEAT = 32
-MAX_EXPANDED_ACTIONS = 256
+MAX_EXPANDED_ACTIONS = 128
 
 _FINAL_SUMMARY_RE = re.compile(r"final\s+actions\s+summary\s*:?", re.IGNORECASE)
 _ADVICE_RE = re.compile(r"so\s+my\s+advice\s+is\s*:?\s*", re.IGNORECASE)
@@ -32,9 +32,6 @@ _ACTIONS_LIST_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 _ACTIONS_LIST_START_RE = re.compile(r"\bactions\s*:\s*\[", re.IGNORECASE)
-_TRUNCATED_ACTION_ITEM_RE = re.compile(
-    r"\s*(?P<quote>['\"])(?P<token>[^'\"]+)(?P=quote)\s*(?P<separator>,|$)"
-)
 _NONSTANDARD_ACTION_ITEM_RE = re.compile(
     r"\s*(?P<quote>['\"])(?P<token>[^'\"]+)(?P=quote)\s*:\s*"
     r"(?P<repeat>[+-]?\d+)\s*|"
@@ -84,11 +81,19 @@ class HIMAProposalParser:
         rationale = _parse_rationale(bounded_output)
         tokens, extraction_diagnostics = _extract_tokens(bounded_output)
         if truncated and tokens is None and not extraction_diagnostics:
-            tokens = _extract_truncated_action_prefix(bounded_output)
+            recovered = _extract_truncated_action_prefix(bounded_output)
+            if recovered is not None:
+                tokens, recovery_diagnostics = recovered
+                diagnostics.extend(recovery_diagnostics)
             if tokens:
+                counted = any(target_count is not None for _, _, _, target_count in tokens)
                 extraction_diagnostics.append(
                     ParseDiagnostic(
-                        code="truncated_action_prefix_recovered",
+                        code=(
+                            "truncated_counted_prefix_recovered"
+                            if counted
+                            else "truncated_action_prefix_recovered"
+                        ),
                         message=("Recovered complete action items before the truncated list tail."),
                     )
                 )
@@ -112,7 +117,7 @@ class HIMAProposalParser:
                 )
             )
         else:
-            for ordinal, raw_token, repeat in tokens:
+            for ordinal, raw_token, repeat, target_count in tokens:
                 action = resolve_race_hima_action(raw_token, race=self.race)
                 if action is None:
                     diagnostics.append(
@@ -128,7 +133,8 @@ class HIMAProposalParser:
                         )
                     )
                     continue
-                if expanded_count + repeat > MAX_EXPANDED_ACTIONS:
+                effective_count = target_count if target_count is not None else repeat
+                if expanded_count + effective_count > MAX_EXPANDED_ACTIONS:
                     diagnostics.append(
                         ParseDiagnostic(
                             code="expanded_action_limit_exceeded",
@@ -139,13 +145,14 @@ class HIMAProposalParser:
                         )
                     )
                     continue
-                expanded_count += repeat
+                expanded_count += effective_count
                 steps.append(
                     MacroActionStep(
                         ordinal=ordinal,
                         canonical_action=action.canonical_action,
                         category=action.category,
                         repeat=repeat,
+                        target_count=target_count,
                         raw_token=raw_token,
                     )
                 )
@@ -176,7 +183,7 @@ class HIMAProposalParser:
 
 def _extract_tokens(
     raw_output: str,
-) -> tuple[list[tuple[int, str, int]] | None, list[ParseDiagnostic]]:
+) -> tuple[list[tuple[int, str, int, int | None]] | None, list[ParseDiagnostic]]:
     # The current checkpoint list format wins over explanatory angle examples.
     list_tokens, list_diagnostics = _extract_action_list(raw_output)
     if list_tokens is not None or list_diagnostics:
@@ -198,8 +205,8 @@ def _extract_tokens(
 
 def _scan_angle_sequence(
     candidate: str,
-) -> tuple[list[tuple[int, str, int]], list[ParseDiagnostic]]:
-    tokens: list[tuple[int, str, int]] = []
+) -> tuple[list[tuple[int, str, int, int | None]], list[ParseDiagnostic]]:
+    tokens: list[tuple[int, str, int, int | None]] = []
     diagnostics: list[ParseDiagnostic] = []
     position = 0
     ordinal = 0
@@ -210,7 +217,7 @@ def _scan_angle_sequence(
         raw_token = match.group(1).strip()
         raw_repeat = match.group(2)
         if raw_repeat is None:
-            tokens.append((ordinal, raw_token, 1))
+            tokens.append((ordinal, raw_token, 1, None))
         elif not raw_repeat.isdecimal():
             diagnostics.append(
                 ParseDiagnostic(
@@ -234,7 +241,7 @@ def _scan_angle_sequence(
                     )
                 )
             else:
-                tokens.append((ordinal, raw_token, repeat))
+                tokens.append((ordinal, raw_token, repeat, None))
         ordinal += 1
         position = match.end()
 
@@ -251,17 +258,29 @@ def _scan_angle_sequence(
 
 def _extract_action_list(
     raw_output: str,
-) -> tuple[list[tuple[int, str, int]] | None, list[ParseDiagnostic]]:
+) -> tuple[list[tuple[int, str, int, int | None]] | None, list[ParseDiagnostic]]:
     match = _ACTIONS_LIST_RE.search(raw_output)
     if match is None:
-        return None, []
-    rendered = match.group(1)
+        start = _ACTIONS_LIST_START_RE.search(raw_output)
+        if start is None or not raw_output.rstrip().endswith("}"):
+            return None, []
+        rendered = "[" + raw_output[start.end() :].rstrip()[:-1].rstrip() + "]"
+        recovery_diagnostics = [
+            ParseDiagnostic(
+                code="malformed_actions_closer_recovered",
+                message="Recovered a HIMA counted Actions list closed with '}' instead of ']'.",
+            )
+        ]
+    else:
+        rendered = match.group(1)
+        recovery_diagnostics = []
     try:
         parsed = ast.literal_eval(rendered)
     except (SyntaxError, ValueError):
         nonstandard_tokens = _extract_nonstandard_action_items(rendered)
         if nonstandard_tokens is not None:
-            return nonstandard_tokens
+            recovered_tokens, recovered_diagnostics = nonstandard_tokens
+            return recovered_tokens, [*recovery_diagnostics, *recovered_diagnostics]
         return None, [
             ParseDiagnostic(
                 code="invalid_actions_list",
@@ -278,7 +297,7 @@ def _extract_action_list(
             )
         ]
 
-    tokens: list[tuple[int, str, int]] = []
+    tokens: list[tuple[int, str, int, int | None]] = []
     diagnostics: list[ParseDiagnostic] = []
     for ordinal, item in enumerate(parsed):
         if ordinal >= MAX_ACTION_ITEMS:
@@ -300,42 +319,47 @@ def _extract_action_list(
                 )
             )
             continue
-        tokens.append((ordinal, item.strip(), 1))
-    return tokens, diagnostics
+        tokens.append((ordinal, item.strip(), 1, None))
+    return tokens, [*recovery_diagnostics, *diagnostics]
 
 
 def _extract_truncated_action_prefix(
     raw_output: str,
-) -> list[tuple[int, str, int]] | None:
-    """Recover only fully quoted items from an unterminated official Actions list."""
+) -> (
+    tuple[
+        list[tuple[int, str, int, int | None]],
+        list[ParseDiagnostic],
+    ]
+    | None
+):
+    """Recover complete ordinary or cumulative items before an unterminated tail."""
 
     match = _ACTIONS_LIST_START_RE.search(raw_output)
     if match is None:
         return None
     candidate = raw_output[match.end() :]
-    tokens: list[tuple[int, str, int]] = []
-    position = 0
-    while len(tokens) < MAX_ACTION_ITEMS:
-        item = _TRUNCATED_ACTION_ITEM_RE.match(candidate, position)
-        if item is None:
-            break
-        tokens.append((len(tokens), item.group("token").strip(), 1))
-        position = item.end()
-        if item.group("separator") != ",":
-            break
-    return tokens or None
+    recovered = _extract_nonstandard_action_items(f"[{candidate}]")
+    if recovered is None:
+        return None
+    tokens, diagnostics = recovered
+    diagnostics = [
+        diagnostic
+        for diagnostic in diagnostics
+        if diagnostic.code != "malformed_action_tail_ignored"
+    ]
+    return (tokens, diagnostics) if tokens else None
 
 
 def _extract_nonstandard_action_items(
     rendered: str,
-) -> tuple[list[tuple[int, str, int]], list[ParseDiagnostic]] | None:
+) -> tuple[list[tuple[int, str, int, int | None]], list[ParseDiagnostic]] | None:
     """Parse HIMA's quoted count entries, including mixed bare entries."""
 
     inner = rendered[1:-1].strip()
     if not inner:
         return [], []
     items = inner.split(",")
-    tokens: list[tuple[int, str, int]] = []
+    tokens: list[tuple[int, str, int, int | None]] = []
     diagnostics: list[ParseDiagnostic] = []
     for ordinal, item in enumerate(items):
         if ordinal >= MAX_ACTION_ITEMS:
@@ -349,23 +373,36 @@ def _extract_nonstandard_action_items(
             break
         match = _NONSTANDARD_ACTION_ITEM_RE.fullmatch(item)
         if match is None:
-            return None
-        counted_token = match.group("token")
-        raw_token = (counted_token or match.group("bare_token")).strip()
-        repeat = int(match.group("repeat")) if counted_token is not None else 1
-        if not 1 <= repeat <= MAX_ACTION_REPEAT:
+            if not tokens:
+                return None
             diagnostics.append(
                 ParseDiagnostic(
-                    code="invalid_repeat",
+                    code="malformed_action_tail_ignored",
                     message=(
-                        f"A HIMA macro-action repeat must be between 1 and {MAX_ACTION_REPEAT}."
+                        "Retained the valid cumulative Actions prefix and ignored "
+                        "the malformed tail."
+                    ),
+                    raw_token=item.strip(),
+                    ordinal=ordinal,
+                )
+            )
+            break
+        counted_token = match.group("token")
+        raw_token = (counted_token or match.group("bare_token")).strip()
+        target_count = int(match.group("repeat")) if counted_token is not None else None
+        if target_count is not None and not 1 <= target_count <= MAX_ACTION_REPEAT:
+            diagnostics.append(
+                ParseDiagnostic(
+                    code="invalid_target_count",
+                    message=(
+                        f"A HIMA cumulative action count must be between 1 and {MAX_ACTION_REPEAT}."
                     ),
                     raw_token=raw_token,
                     ordinal=ordinal,
                 )
             )
             continue
-        tokens.append((ordinal, raw_token, repeat))
+        tokens.append((ordinal, raw_token, 1, target_count))
     return tokens, diagnostics
 
 

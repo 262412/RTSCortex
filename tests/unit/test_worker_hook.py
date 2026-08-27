@@ -3,6 +3,8 @@ from __future__ import annotations
 import importlib
 import inspect
 import json
+import os
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -12,10 +14,14 @@ from typing import Any, cast
 import pytest
 from rtscortex_llm_pysc2.addon import ADDON_SPECS
 from rtscortex_llm_pysc2.broker import PrimitiveDispatch, SharedDecisionBroker
+from rtscortex_llm_pysc2.circuit_canary import AuthoritativeBuildCircuitCanary
 from rtscortex_llm_pysc2.coordinator import BridgeCoordinator
 from rtscortex_llm_pysc2.extractor import (
+    PRODUCTION_STRUCTURE_NAMES,
+    TOWNHALL_NAMES,
     TimeStepExtractor,
     _own_unit_has_energy,
+    _prioritize_creep_tumor_source,
     build_screen_candidates,
     current_team_order,
     nexus_placement_footprint_is_visible,
@@ -29,35 +35,64 @@ from rtscortex_llm_pysc2.morph import MORPH_SPECS
 from rtscortex_llm_pysc2.observation import ObservationMapper
 from rtscortex_llm_pysc2.production import PRODUCTION_SPECS
 from rtscortex_llm_pysc2.routing import RoutedActionBatch, RoutedCommand
+from rtscortex_llm_pysc2.terminal import (
+    TerminalArmyReadiness,
+)
+from rtscortex_llm_pysc2.terminal import (
+    TerminalCollapseReason as WorkerTerminalCollapseReason,
+)
+from rtscortex_llm_pysc2.terminal import (
+    TerminalCollapseState as WorkerTerminalCollapseState,
+)
+from rtscortex_llm_pysc2.terminal import (
+    is_terminal_collapse_state as worker_is_terminal_collapse_state,
+)
 from rtscortex_llm_pysc2.worker import (
+    ExpansionScoutController,
+    GasWorkerController,
+    RawDecisionScheduler,
     RTSCortexLLMAgent,
     RTSCortexMainAgent,
     WorkerSettings,
     _abort_stalled_actor_selection,
     _apply_scenario_bootstrap,
     _available_addon_function_id,
+    _builder_selection_lease_active,
     _candidate_dispatch_failure,
     _canonical_pysc2_arguments,
+    _enforce_orchestration_primitive_budget,
     _execution_team_name,
+    _execution_unit_tags,
     _finish_terminal,
     _isolate_next_action,
+    _normalize_new_unit_queue,
     _pending_plan_idle_delay,
+    _pin_authoritative_canary_builder,
+    _prepare_runtime_observation_bypass,
     _prime_deterministic_gas_rebalance,
     _producer_is_visible,
     _production_source_invalid_reason,
+    _pysc2_action_argument_failure,
+    _raw_terminal_collapse,
     _rebind_builder_to_selected_worker,
+    _recover_observation_gap,
     _refresh_build_action_position,
+    _refresh_combat_team_membership,
     _refresh_consumed_zerg_builder,
     _refresh_zerg_morphed_combat_teams,
     _release_runtime_observation_barrier,
     _replace_screen_action_position,
     _requires_explicit_production_chain,
+    _reserved_builder_worker_tags,
     _resolve_build_action_position,
     _run_with_auto_worker_management_guard,
     _runtime_observation_is_due,
     _scenario_config,
     _semantic_target_failure,
     _should_block_gas_rebalance,
+    _suppress_pending_build_control_action,
+    _sync_raw_team_membership,
+    _translate_persistent_expansion_camera_primitive,
     _translate_worker_owned_zero_argument_primitive,
     _translated_build_position,
     _translation_failure_code,
@@ -67,7 +102,311 @@ from rtscortex_llm_pysc2.worker import (
     _zerg_larva_townhall_tag,
 )
 
+from rtscortex.config import load_config
 from rtscortex.contracts import ObservationEnvelope
+from rtscortex.cortex.models import ArmyReadiness
+from rtscortex.cortex.situation import _PRODUCTION_TYPES, _TOWNHALL_TYPES
+from rtscortex.cortex.terminal import (
+    TerminalCollapseReason as CoreTerminalCollapseReason,
+)
+from rtscortex.cortex.terminal import (
+    TerminalCollapseState as CoreTerminalCollapseState,
+)
+from rtscortex.cortex.terminal import (
+    is_terminal_collapse_state as core_is_terminal_collapse_state,
+)
+from rtscortex.runtime.live import _worker_python
+
+
+def test_configured_python39_worker_imports_terminal_boundary_without_core() -> None:
+    project_root = Path(__file__).resolve().parents[2]
+    config = load_config(
+        project_root
+        / "configs/experiments/live_simple64_hima_protoss_ensemble_cortex_v0_5_qualification.yaml"
+    )
+    worker_python = _worker_python(config, os.environ)
+    if not worker_python.is_file():
+        pytest.skip("configured live Worker Python is unavailable")
+    environment = dict(os.environ)
+    environment["PYTHONPATH"] = str(project_root / "integrations/llm_pysc2/src")
+
+    completed = subprocess.run(
+        [
+            str(worker_python),
+            "-c",
+            (
+                "import sys; "
+                "from rtscortex_llm_pysc2.terminal import TerminalArmyReadiness, "
+                "TerminalCollapseState, is_terminal_collapse_state; "
+                "import rtscortex_llm_pysc2.worker; "
+                "assert not any(name == 'rtscortex' or name.startswith('rtscortex.') "
+                "for name in sys.modules); "
+                "assert is_terminal_collapse_state("
+                "TerminalCollapseState(TerminalArmyReadiness.EMPTY, 0, 0))"
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_raw_terminal_collapse_uses_exact_shared_structured_condition() -> None:
+    player = SimpleNamespace(food_army=0)
+    probe = SimpleNamespace(alliance=1, unit_type=1)
+    nexus = SimpleNamespace(alliance=1, unit_type=2)
+    gateway = SimpleNamespace(alliance=1, unit_type=3)
+    unit_names = {1: "Probe", 2: "Nexus", 3: "Gateway"}
+
+    assert _raw_terminal_collapse(
+        SimpleNamespace(player_common=player, raw_units=[probe]),
+        unit_names=unit_names,
+    )
+    assert not _raw_terminal_collapse(
+        SimpleNamespace(player_common=player, raw_units=[probe, nexus]),
+        unit_names=unit_names,
+    )
+    assert not _raw_terminal_collapse(
+        SimpleNamespace(player_common=player, raw_units=[probe, gateway]),
+        unit_names=unit_names,
+    )
+    assert not _raw_terminal_collapse(
+        SimpleNamespace(player_common=SimpleNamespace(food_army=1), raw_units=[probe]),
+        unit_names=unit_names,
+    )
+
+
+@pytest.mark.parametrize(
+    ("readiness", "base_count", "production_capacity"),
+    [
+        ("empty", 0, 0),
+        ("forming", 0, 0),
+        ("ready", 0, 0),
+        ("empty", 1, 0),
+        ("empty", 0, 1),
+    ],
+)
+def test_worker_terminal_contract_matches_core_shared_predicate(
+    readiness: str,
+    base_count: int,
+    production_capacity: int,
+) -> None:
+    core_result = core_is_terminal_collapse_state(
+        CoreTerminalCollapseState(
+            army_readiness=ArmyReadiness(readiness),
+            own_base_count=base_count,
+            own_production_capacity=production_capacity,
+        )
+    )
+    worker_result = worker_is_terminal_collapse_state(
+        WorkerTerminalCollapseState(
+            army_readiness=TerminalArmyReadiness(readiness),
+            own_base_count=base_count,
+            own_production_capacity=production_capacity,
+        )
+    )
+
+    assert worker_result is core_result
+    assert (
+        WorkerTerminalCollapseReason.NON_RECOVERY_MACRO_DISPATCH.value
+        == CoreTerminalCollapseReason.NON_RECOVERY_MACRO_DISPATCH.value
+    )
+
+
+def test_worker_terminal_structure_projection_matches_core_situation_contract() -> None:
+    assert TOWNHALL_NAMES == frozenset(name.casefold() for name in _TOWNHALL_TYPES)
+    assert PRODUCTION_STRUCTURE_NAMES == frozenset(name.casefold() for name in _PRODUCTION_TYPES)
+
+
+@pytest.mark.parametrize(
+    "structure_name",
+    [
+        "Nexus",
+        "Gateway",
+        "WarpGate",
+        "RoboticsFacility",
+        "Stargate",
+        "CommandCenter",
+        "Barracks",
+        "Factory",
+        "Starport",
+        "Hatchery",
+        "Lair",
+        "Hive",
+    ],
+)
+def test_raw_terminal_collapse_is_race_neutral(structure_name: str) -> None:
+    structure = SimpleNamespace(alliance=1, unit_type=1)
+
+    assert not _raw_terminal_collapse(
+        SimpleNamespace(
+            player_common=SimpleNamespace(food_army=0),
+            raw_units=[structure],
+        ),
+        unit_names={1: structure_name},
+    )
+
+
+def test_raw_terminal_collapse_ignores_enemy_and_unknown_units_but_requires_army_data() -> None:
+    enemy_gateway = SimpleNamespace(alliance=4, unit_type=1)
+    own_unknown = SimpleNamespace(alliance=1, unit_type=2)
+
+    assert _raw_terminal_collapse(
+        SimpleNamespace(
+            player_common=SimpleNamespace(food_army=0),
+            raw_units=[enemy_gateway, own_unknown],
+        ),
+        unit_names={1: "Gateway", 2: "UnknownStructure"},
+    )
+    assert not _raw_terminal_collapse(
+        SimpleNamespace(player_common=SimpleNamespace(), raw_units=[]),
+        unit_names={},
+    )
+
+
+def test_raw_decision_scheduler_separates_effect_polling_from_runtime_ticks() -> None:
+    scheduler = RawDecisionScheduler(
+        stable_interval_game_loops=16,
+        outstanding_interval_game_loops=64,
+    )
+
+    assert scheduler.should_decide(game_loop=0, queued_count=0, inflight_count=0)
+    scheduler.record_decision(game_loop=0, emergency_signature=())
+    assert not scheduler.should_decide(game_loop=8, queued_count=0, inflight_count=0)
+    assert scheduler.should_decide(game_loop=16, queued_count=0, inflight_count=0)
+
+    scheduler.record_decision(game_loop=16, emergency_signature=())
+    assert not scheduler.should_decide(game_loop=32, queued_count=0, inflight_count=1)
+    assert scheduler.should_decide(
+        game_loop=33,
+        queued_count=0,
+        inflight_count=1,
+        terminal_feedback=True,
+    )
+    scheduler.record_decision(game_loop=33, emergency_signature=())
+    assert scheduler.should_decide(
+        game_loop=34,
+        queued_count=0,
+        inflight_count=1,
+        emergency_signature=("unit_under_attack",),
+    )
+    assert not scheduler.should_decide(
+        game_loop=128,
+        queued_count=1,
+        inflight_count=0,
+        terminal_feedback=True,
+    )
+
+
+def test_outbound_primitive_argument_validator_uses_half_open_bounds() -> None:
+    specification = SimpleNamespace(
+        args=(
+            SimpleNamespace(name="select_point_act", sizes=(4,)),
+            SimpleNamespace(name="screen", sizes=(128, 128)),
+        )
+    )
+
+    valid = SimpleNamespace(function=2, arguments=((0,), (127, 0)))
+    negative = SimpleNamespace(function=2, arguments=((0,), (2, -85)))
+    upper_edge = SimpleNamespace(function=2, arguments=((0,), (128, 64)))
+
+    assert (
+        _pysc2_action_argument_failure(
+            valid,
+            function_specification=specification,
+        )
+        is None
+    )
+    assert "outside [0, 128)" in str(
+        _pysc2_action_argument_failure(
+            negative,
+            function_specification=specification,
+        )
+    )
+    assert "outside [0, 128)" in str(
+        _pysc2_action_argument_failure(
+            upper_edge,
+            function_specification=specification,
+        )
+    )
+
+
+def test_outbound_primitive_validator_uses_live_action_specification() -> None:
+    specification = SimpleNamespace(
+        args=(
+            SimpleNamespace(name="select_point_act", sizes=(4,)),
+            SimpleNamespace(name="screen", sizes=(128, 128)),
+        )
+    )
+    agent = object.__new__(RTSCortexMainAgent)
+    agent.action_spec = SimpleNamespace(functions={2: specification})
+    action = SimpleNamespace(function=2, arguments=((0,), (127, 0)))
+
+    validated, rejected = agent._validated_outbound_action(
+        action,
+        SimpleNamespace(observation=SimpleNamespace()),
+        source="test",
+    )
+
+    assert validated is action
+    assert rejected is False
+
+
+def test_builder_selection_lease_blocks_optional_selection_changes() -> None:
+    builder = SimpleNamespace(
+        curr_action_name="Build_Gateway_Screen",
+        func_list=[(70, None, ())],
+        action_list=[],
+        _rtscortex_semantic_action={"name": "Build_Gateway_Screen"},
+    )
+    main_agent = SimpleNamespace(agents={"Builder": builder})
+
+    assert _builder_selection_lease_active(main_agent) is True
+
+    builder.func_list.clear()
+    builder._rtscortex_semantic_action = None
+    builder.curr_action_name = ""
+    assert _builder_selection_lease_active(main_agent) is False
+
+
+def _combat_observation(
+    game_loop: int,
+    target_health: dict[int, float],
+    actor_targets: dict[int, int] | None = None,
+) -> dict[str, Any]:
+    actor_targets = actor_targets or {}
+    return {
+        "game_loop": game_loop,
+        "raw_units": [
+            {
+                "tag": tag,
+                "unit_type": "Hatchery" if tag == 0xDEF else "Zergling",
+                "alliance": 4,
+                "health": health,
+                "shield": 0,
+            }
+            for tag, health in target_health.items()
+        ]
+        + [
+            {
+                "tag": actor_tag,
+                "unit_type": "Stalker",
+                "alliance": 1,
+                "health": 80,
+                "shield": 80,
+                "orders": [
+                    {
+                        "ability_id": 23,
+                        "target_unit_tag": target_tag,
+                    }
+                ],
+            }
+            for actor_tag, target_tag in actor_targets.items()
+        ],
+    }
 
 
 def test_timestep_extractor_produces_json_safe_five_part_snapshot() -> None:
@@ -97,6 +436,31 @@ def test_timestep_extractor_produces_json_safe_five_part_snapshot() -> None:
     assert envelope.available_actions[1].argument_names == ["tag"]
     assert envelope.available_actions[1].argument_types == ["tag"]
     assert "Unsupported" not in {action.name for action in envelope.available_actions}
+
+
+def test_timestep_extractor_projects_world_positions_to_minimap() -> None:
+    timestep = _fake_timestep()
+    agent = cast(Any, FakeAgent("CombatGroup7", "Adept-1", timestep, StubBroker()))
+    agent.world_range = 128
+    agent.world_x_offset = 0
+    agent.world_y_offset = 0
+    agent.size_minimap = 64
+
+    snapshot = TimeStepExtractor(
+        "run-worker",
+        "episode-worker",
+        unit_names={311: "Adept", 59: "Nexus", 104: "Drone"},
+        building_types=(59,),
+    ).extract(
+        timestep,
+        {"CombatGroup7": agent},
+        {"CombatGroup7": "ready"},
+        step_id=3,
+    )
+    envelope = ObservationEnvelope.model_validate(ObservationMapper().map(snapshot))
+
+    assert envelope.state.own_units[0].minimap_position == (21.0, 45.0)
+    assert envelope.state.visible_enemies[0].minimap_position == (26.0, 48.0)
 
 
 @pytest.mark.parametrize(
@@ -188,7 +552,13 @@ def test_shared_broker_calls_runtime_once_and_distributes_to_all_agents() -> Non
         total=1,
     )
     assert dispatch is not None
-    broker.settle_primitive(dispatch, success=True)
+    broker.prepare_effect(
+        dispatch,
+        _combat_observation(100, {0x101480001: 35.0}),
+        builder_tag=0x10,
+    )
+    broker.settle_primitive(dispatch, success=True, game_loop=100)
+    broker.observe_effects(_combat_observation(104, {0x101480001: 20.0}))
     broker.end_episode(_episode_result())
 
     assert runtime.execution_reports[0]["command_id"] == "command-attack"
@@ -206,12 +576,18 @@ def test_query_mixin_delegates_to_upstream_base_methods() -> None:
     assert agent.action_lists == [[{"name": "translated"}]]
 
 
-def test_broker_times_out_if_an_enabled_agent_never_submits() -> None:
+def test_broker_uses_partial_snapshot_and_late_agent_gets_transport_noop() -> None:
     runtime = FakeRuntime()
     broker = SharedDecisionBroker(
         BridgeCoordinator(runtime),
-        TimeStepExtractor("run-worker", "episode-worker"),
-        decision_timeout_seconds=0.01,
+        TimeStepExtractor(
+            "run-worker",
+            "episode-worker",
+            unit_names={311: "Adept", 59: "Nexus", 104: "Drone"},
+            building_types=(59,),
+        ),
+        decision_timeout_seconds=1.0,
+        participant_grace_seconds=0.001,
     )
     timestep = _fake_timestep()
     first = FakeAgent("AgentA", "A", timestep, broker)
@@ -219,10 +595,14 @@ def test_broker_times_out_if_an_enabled_agent_never_submits() -> None:
     broker.register(first)
     broker.register(second)
 
-    with pytest.raises(RuntimeError, match="shared runtime decision failed"):
-        broker.submit(first, timestep, "only one submission")
+    first_result = broker.submit(first, timestep, "only one submission")
+    late_result = broker.submit(second, timestep, "late submission")
 
-    assert runtime.tick_calls == 0
+    assert runtime.tick_calls == 1
+    assert "<Attack_Unit(0x101480001)>" in first_result
+    assert late_result == "Actions:\n    Team B:\n        <No_Operation()>"
+    assert broker.metrics()["partial_runtime_decisions"] == 1
+    assert broker.metrics()["skipped_runtime_participants"] == 1
 
 
 def test_broker_releases_barrier_when_missing_combat_agent_is_disabled() -> None:
@@ -315,6 +695,11 @@ def test_worker_error_episode_preserves_bridge_counters() -> None:
                 "unattributed_primitives": 1,
                 "candidate_outside_pysc2_dispatches": 0,
                 "observation_gap_watchdog_triggers": 0,
+                "orchestration_recoveries": 0,
+                "partial_runtime_decisions": 0,
+                "skipped_runtime_participants": 0,
+                "expansion_scout_camera_moves": 0,
+                "expansion_candidate_exhaustions": 0,
             },
             "failure_reason": "RuntimeError: bridge failed",
         }
@@ -361,6 +746,11 @@ def test_worker_max_frame_hook_reports_explicit_truncation() -> None:
                 "unattributed_primitives": 0,
                 "candidate_outside_pysc2_dispatches": 0,
                 "observation_gap_watchdog_triggers": 0,
+                "orchestration_recoveries": 0,
+                "partial_runtime_decisions": 0,
+                "skipped_runtime_participants": 0,
+                "expansion_scout_camera_moves": 0,
+                "expansion_candidate_exhaustions": 0,
             },
             "failure_reason": "max_agent_steps_reached",
         }
@@ -384,6 +774,9 @@ def test_worker_settings_prefer_canonical_runtime_environment(
     monkeypatch.setenv("RTSCORTEX_ACTION_EFFECT_TIMEOUT_GAME_LOOPS", "96")
     monkeypatch.setenv("RTSCORTEX_OBSERVATION_GAP_WATCHDOG_GAME_LOOPS", "448")
     monkeypatch.setenv("RTSCORTEX_OBSERVATION_GAP_HARD_LIMIT_GAME_LOOPS", "1792")
+    monkeypatch.setenv("RTSCORTEX_ORCHESTRATION_PRIMITIVE_BUDGET", "20")
+    monkeypatch.setenv("RTSCORTEX_EXPANSION_SCOUT_ENABLED", "true")
+    monkeypatch.setenv("RTSCORTEX_EXPANSION_SCOUT_INTERVAL_GAME_LOOPS", "96")
 
     settings = WorkerSettings.from_environment()
 
@@ -398,6 +791,65 @@ def test_worker_settings_prefer_canonical_runtime_environment(
     assert settings.action_effect_timeout_game_loops == 96
     assert settings.observation_gap_watchdog_game_loops == 448
     assert settings.observation_gap_hard_limit_game_loops == 1792
+    assert settings.orchestration_primitive_budget == 20
+    assert settings.expansion_scout_enabled is True
+    assert settings.expansion_scout_interval_game_loops == 96
+
+
+def test_worker_settings_accept_exact_authoritative_build_canary_contract(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("RTSCORTEX_RUN_ID", "run-canary")
+    monkeypatch.setenv("RTSCORTEX_EPISODE_ID", "episode-0")
+    monkeypatch.setenv("RTSCORTEX_EXECUTION_ACTION_SPACE", "raw")
+    monkeypatch.setenv("RTSCORTEX_AUTHORITATIVE_BUILD_CIRCUIT_CANARY", "true")
+    monkeypatch.setenv(
+        "RTSCORTEX_AUTHORITATIVE_BUILD_CIRCUIT_CANARY_MODE",
+        "stale_candidate_then_builder_rebind",
+    )
+    monkeypatch.setenv("RTSCORTEX_AUTHORITATIVE_BUILD_CIRCUIT_CANARY_FAILURE_ATTEMPTS", "3")
+    monkeypatch.setenv("RTSCORTEX_AUTHORITATIVE_BUILD_CIRCUIT_CANARY_HOLD_OBSERVATIONS", "1")
+    monkeypatch.setenv(
+        "RTSCORTEX_AUTHORITATIVE_BUILD_CIRCUIT_CANARY_JOURNAL",
+        str(tmp_path / "circuit.jsonl"),
+    )
+
+    settings = WorkerSettings.from_environment()
+
+    assert settings.authoritative_build_circuit_canary is True
+    assert settings.authoritative_build_circuit_canary_failure_attempts == 3
+    assert settings.authoritative_build_circuit_canary_hold_observations == 1
+    assert settings.authoritative_build_circuit_canary_journal == str(tmp_path / "circuit.jsonl")
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("RTSCORTEX_EXECUTION_ACTION_SPACE", "features"),
+        ("RTSCORTEX_AUTHORITATIVE_BUILD_CIRCUIT_CANARY_MODE", "unknown"),
+        ("RTSCORTEX_AUTHORITATIVE_BUILD_CIRCUIT_CANARY_FAILURE_ATTEMPTS", "2"),
+        ("RTSCORTEX_AUTHORITATIVE_BUILD_CIRCUIT_CANARY_HOLD_OBSERVATIONS", "2"),
+    ],
+)
+def test_worker_settings_reject_broader_authoritative_canary_contract(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    name: str,
+    value: str,
+) -> None:
+    monkeypatch.setenv("RTSCORTEX_RUN_ID", "run-canary")
+    monkeypatch.setenv("RTSCORTEX_EPISODE_ID", "episode-0")
+    monkeypatch.setenv("RTSCORTEX_EXECUTION_ACTION_SPACE", "raw")
+    monkeypatch.setenv("RTSCORTEX_AUTHORITATIVE_BUILD_CIRCUIT_CANARY", "true")
+    monkeypatch.setenv(
+        "RTSCORTEX_AUTHORITATIVE_BUILD_CIRCUIT_CANARY_JOURNAL",
+        str(tmp_path / "circuit.jsonl"),
+    )
+    monkeypatch.setenv(name, value)
+
+    with pytest.raises(RuntimeError, match="authoritative Build circuit canary requires"):
+        WorkerSettings.from_environment()
 
 
 def test_production_camera_waits_for_exact_producer_feature_observation() -> None:
@@ -719,10 +1171,18 @@ def test_unavailable_screen_build_reselects_exact_builder(
     assert function_id == 2
     assert function_call.arguments[1] == [45, 52]
     assert agent._rtscortex_build_selection_retries == 1
+    assert agent._rtscortex_build_selection_loop == 224
+    assert agent._wait_for_build_selection(timestep) is True
+
+    next_timestep = _fake_timestep()
+    next_timestep.observation.game_loop = [225]
+    assert agent._wait_for_build_selection(next_timestep) is False
 
     timestep.observation.available_actions.append(57)
+    builder.is_selected = True
     assert agent._reselect_builder_for_unavailable_build(action, timestep) is None
     assert agent._rtscortex_build_selection_retries == 0
+    assert agent._rtscortex_build_selection_loop is None
 
 
 def test_observation_gap_watchdog_latches_lightweight_observations_after_recovery() -> None:
@@ -856,11 +1316,50 @@ def test_observation_gap_watchdog_releases_optional_team_selection_barrier() -> 
     _release_runtime_observation_barrier(main_agent)
     _release_runtime_observation_barrier(main_agent)
 
-    assert exact.team_unit_tag_list == [0xA]
-    assert exact.team_unit_team_list == ["Probe-1"]
+    assert exact.team_unit_tag_list == []
+    assert exact.team_unit_team_list == []
     assert grouped.team_unit_tag_list == [0xC]
     assert grouped.team_unit_team_list == ["Zealot-1"]
     assert busy.team_unit_tag_list == []
+
+
+def test_forced_runtime_observation_releases_builder_query_without_faking_selection() -> None:
+    builder_team = {
+        "name": "Probe-1",
+        "select_type": "select",
+        "unit_tags": [0xA],
+        "unit_tags_selected": [],
+    }
+    builder = SimpleNamespace(
+        enable=True,
+        teams=[builder_team],
+        team_unit_tag_list=[],
+        team_unit_team_list=[],
+        _is_waiting_query=lambda: True,
+    )
+    broker = SimpleNamespace(orchestration_recoveries=0)
+    broker.record_orchestration_recovery = lambda: setattr(
+        broker,
+        "orchestration_recoveries",
+        broker.orchestration_recoveries + 1,
+    )
+    main_agent = SimpleNamespace(
+        agents={"Builder": builder},
+        unit_uid_disappear=set(),
+        decision_broker=broker,
+    )
+
+    assert (
+        _release_runtime_observation_barrier(
+            main_agent,
+            include_builder=True,
+        )
+        is True
+    )
+    assert builder.team_unit_tag_list == [0xA]
+    assert builder.team_unit_team_list == ["Probe-1"]
+    assert builder_team["unit_tags_selected"] == []
+    assert broker.orchestration_recoveries == 1
 
 
 def test_shared_broker_exposes_pending_planner_state() -> None:
@@ -976,6 +1475,21 @@ def test_auto_worker_management_guard_restores_flag_after_upstream_error() -> No
     assert config.ENABLE_AUTO_WORKER_TRAINING is True
 
 
+def test_pending_build_suppresses_order_interrupting_hold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "rtscortex_llm_pysc2.worker._no_op",
+        lambda: SimpleNamespace(function=0),
+    )
+    original = SimpleNamespace(function=274)
+
+    suppressed = _suppress_pending_build_control_action(original, blocked=True)
+
+    assert suppressed.function == 0
+    assert _suppress_pending_build_control_action(original, blocked=False) is original
+
+
 def test_deterministic_gas_rebalance_selects_nearest_stable_mineral_worker() -> None:
     assimilator = SimpleNamespace(tag=500, x=20.0, y=20.0, build_progress=100)
     workers = [
@@ -1054,6 +1568,556 @@ def test_deterministic_gas_rebalance_excludes_reserved_builder_worker() -> None:
     assert selected is True
     assert agent.stop_worker.tag == 20
     assert agent._rtscortex_reserved_worker_tags == {10}
+
+
+def test_gas_worker_controller_executes_bounded_exact_assignment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    functions = SimpleNamespace(
+        llm_pysc2_move_camera=lambda position: SimpleNamespace(
+            function=573,
+            arguments=[position],
+        ),
+        select_point=lambda mode, position: SimpleNamespace(
+            function=2,
+            arguments=[mode, position],
+        ),
+        Harvest_Gather_screen=lambda mode, position: SimpleNamespace(
+            function=264,
+            arguments=[mode, position],
+        ),
+    )
+    real_import = importlib.import_module
+    monkeypatch.setattr(
+        "rtscortex_llm_pysc2.worker.importlib.import_module",
+        lambda name: (
+            SimpleNamespace(FUNCTIONS=functions)
+            if name == "pysc2.lib.actions"
+            else real_import(name)
+        ),
+    )
+    worker_raw = SimpleNamespace(
+        tag=20,
+        x=19.0,
+        y=19.0,
+        alliance=1,
+        is_selected=False,
+        buff_id_0=0,
+    )
+    gas_raw = SimpleNamespace(
+        tag=500,
+        x=20.0,
+        y=20.0,
+        alliance=1,
+        build_progress=100,
+    )
+    builder = SimpleNamespace(
+        unit_tag_list=[10],
+        team_unit_tag_list=[],
+        team_unit_tag_curr=None,
+        teams=[{"unit_tags": [10]}],
+    )
+    main_agent = SimpleNamespace(
+        config=SimpleNamespace(ENABLE_AUTO_WORKER_MANAGE=True),
+        agents={"Builder": builder},
+        nexus_info_dict={
+            "100": {
+                "nexus": SimpleNamespace(tag=100),
+                "gas_building_1": gas_raw,
+                "gas_building_2": None,
+                "worker_g1_tag_list": [],
+                "worker_g2_tag_list": [],
+                "worker_m_tag_list": [10, 20],
+            }
+        },
+        world_x_offset=0,
+        world_y_offset=0,
+        world_range=64,
+    )
+    controller = GasWorkerController(timeout_game_loops=112, primitive_budget=8)
+
+    camera = controller.next_action(
+        main_agent,
+        SimpleNamespace(
+            raw_units=[worker_raw, gas_raw],
+            feature_units=[],
+            available_actions=[2, 264],
+        ),
+        game_loop=100,
+        blocked=False,
+    )
+    assert camera is not None
+    assert camera.function == 573
+    assert controller.assignment is not None
+    assert controller.assignment.worker_tag == 20
+
+    worker_feature = SimpleNamespace(
+        tag=20,
+        x=32,
+        y=32,
+        alliance=1,
+        is_on_screen=True,
+        is_selected=False,
+    )
+    select = controller.next_action(
+        main_agent,
+        SimpleNamespace(
+            raw_units=[worker_raw, gas_raw],
+            feature_units=[worker_feature],
+            available_actions=[2, 264],
+        ),
+        game_loop=108,
+        blocked=False,
+    )
+    assert select is not None
+    assert select.function == 2
+
+    worker_raw.is_selected = True
+    worker_feature.is_selected = True
+    gas_feature = SimpleNamespace(
+        tag=500,
+        x=40,
+        y=40,
+        alliance=1,
+        is_on_screen=True,
+        is_selected=False,
+    )
+    gather = controller.next_action(
+        main_agent,
+        SimpleNamespace(
+            raw_units=[worker_raw, gas_raw],
+            feature_units=[worker_feature, gas_feature],
+            available_actions=[2, 264],
+        ),
+        game_loop=116,
+        blocked=False,
+    )
+    assert gather is not None
+    assert gather.function == 264
+    assert controller.assignment is not None
+    assert controller.assignment.gas_tag == 500
+
+    main_agent.nexus_info_dict["100"]["worker_g1_tag_list"] = [20]
+    assert (
+        controller.next_action(
+            main_agent,
+            SimpleNamespace(
+                raw_units=[worker_raw, gas_raw],
+                feature_units=[worker_feature, gas_feature],
+                available_actions=[2, 264],
+            ),
+            game_loop=124,
+            blocked=False,
+        )
+        is None
+    )
+    assert controller.assignment is None
+
+
+def test_raw_worker_controller_assigns_idle_probe_to_nearby_mineral(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw_functions = SimpleNamespace(
+        Harvest_Gather_Probe_unit=lambda mode, tags, target: SimpleNamespace(
+            function=264,
+            arguments=[mode, tags, target],
+        )
+    )
+    real_import = importlib.import_module
+    monkeypatch.setattr(
+        "rtscortex_llm_pysc2.worker.importlib.import_module",
+        lambda name: (
+            SimpleNamespace(RAW_FUNCTIONS=raw_functions)
+            if name == "pysc2.lib.actions"
+            else real_import(name)
+        ),
+    )
+    builder = SimpleNamespace(
+        unit_tag_list=[10],
+        team_unit_tag_list=[],
+        team_unit_tag_curr=None,
+        teams=[{"unit_tags": [10]}],
+    )
+    main_agent = SimpleNamespace(
+        agents={"Builder": builder},
+        decision_broker=SimpleNamespace(
+            extractor=SimpleNamespace(unit_names={59: "Nexus", 84: "Probe", 341: "MineralField"})
+        ),
+    )
+    observation = SimpleNamespace(
+        raw_units=[
+            SimpleNamespace(
+                tag=100,
+                unit_type=59,
+                alliance=1,
+                x=20.0,
+                y=20.0,
+                build_progress=100,
+                order_length=0,
+                buff_id_0=0,
+            ),
+            SimpleNamespace(
+                tag=10,
+                unit_type=84,
+                alliance=1,
+                x=21.0,
+                y=20.0,
+                build_progress=100,
+                order_length=0,
+                buff_id_0=0,
+            ),
+            SimpleNamespace(
+                tag=20,
+                unit_type=84,
+                alliance=1,
+                x=22.0,
+                y=20.0,
+                build_progress=100,
+                order_length=0,
+                buff_id_0=0,
+            ),
+            SimpleNamespace(
+                tag=500,
+                unit_type=341,
+                alliance=3,
+                x=25.0,
+                y=20.0,
+                build_progress=100,
+                order_length=0,
+                buff_id_0=0,
+            ),
+        ]
+    )
+
+    action = GasWorkerController().next_raw_action(
+        main_agent,
+        observation,
+        game_loop=100,
+    )
+
+    assert action is not None
+    assert action.arguments == ["now", [20], 500]
+
+
+def _patch_raw_gather_action(monkeypatch: pytest.MonkeyPatch) -> None:
+    raw_functions = SimpleNamespace(
+        Harvest_Gather_Probe_unit=lambda mode, tags, target: SimpleNamespace(
+            function=264,
+            arguments=[mode, tags, target],
+        )
+    )
+    real_import = importlib.import_module
+    monkeypatch.setattr(
+        "rtscortex_llm_pysc2.worker.importlib.import_module",
+        lambda name: (
+            SimpleNamespace(RAW_FUNCTIONS=raw_functions)
+            if name == "pysc2.lib.actions"
+            else real_import(name)
+        ),
+    )
+
+
+def _raw_gas_main_agent(
+    *,
+    builder: Any,
+    leased_tags: tuple[int, ...] = (),
+) -> Any:
+    return SimpleNamespace(
+        agents={"Builder": builder},
+        decision_broker=SimpleNamespace(
+            extractor=SimpleNamespace(
+                unit_names={
+                    59: "Nexus",
+                    61: "Assimilator",
+                    84: "Probe",
+                    341: "MineralField",
+                }
+            )
+        ),
+        raw_executor=SimpleNamespace(
+            placement_service=SimpleNamespace(leased_builder_tags=frozenset(leased_tags))
+        ),
+        nexus_info_dict={},
+    )
+
+
+def _raw_gas_observation(*workers: Any, gas_x: float = 24.0) -> Any:
+    return SimpleNamespace(
+        raw_units=[
+            SimpleNamespace(
+                tag=100,
+                unit_type=59,
+                alliance=1,
+                x=20.0,
+                y=20.0,
+                build_progress=100,
+                order_length=0,
+                buff_id_0=0,
+            ),
+            *workers,
+            SimpleNamespace(
+                tag=500,
+                unit_type=61,
+                alliance=1,
+                x=gas_x,
+                y=20.0,
+                build_progress=100,
+                assigned_harvesters=0,
+            ),
+        ]
+    )
+
+
+def _raw_probe(tag: int, x: float) -> Any:
+    return SimpleNamespace(
+        tag=tag,
+        unit_type=84,
+        alliance=1,
+        x=x,
+        y=20.0,
+        build_progress=100,
+        order_length=0,
+        buff_id_0=0,
+        is_selected=False,
+    )
+
+
+def test_raw_worker_controller_preserves_active_placement_lease_after_builder_rebind(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_raw_gather_action(monkeypatch)
+    team = {
+        "name": "Builder-Probe-1",
+        "unit_type": [84],
+        "unit_tags": [10],
+    }
+    builder = SimpleNamespace(
+        team_unit_tag_curr=10,
+        team_unit_team_curr="Builder-Probe-1",
+        teams=[team],
+    )
+    main_agent = _raw_gas_main_agent(builder=builder, leased_tags=(10,))
+    original = _raw_probe(10, 21.0)
+    original.order_length = 1
+    original.order_id_0 = 35
+    rebound = _raw_probe(20, 22.0)
+    spare = _raw_probe(30, 50.0)
+    observation = _raw_gas_observation(original, rebound, spare)
+    observation.feature_units = []
+
+    _sync_raw_team_membership(main_agent, observation)
+
+    assert builder.team_unit_tag_curr == 20
+    assert team["unit_tags"] == [20]
+    assert main_agent.raw_executor.placement_service.leased_builder_tags == frozenset({10})
+    action = GasWorkerController().next_raw_action(main_agent, observation, game_loop=100)
+
+    assert action is not None
+    assert action.arguments == ["now", [30], 500]
+
+
+def test_authoritative_canary_pins_distinct_feature_visible_ready_probe(
+    tmp_path: Path,
+) -> None:
+    controller = AuthoritativeBuildCircuitCanary(
+        run_id="run-canary",
+        episode_id="episode-0",
+        seed=0,
+        journal_path=tmp_path / "journal.jsonl",
+    )
+    controller.initial_builder_tag = 10
+    controller.operation_id = "operation:" + "a" * 64
+    controller.semantic_action = "BUILD PYLON"
+    controller.phase = "rebind_pending"
+    team = {
+        "name": "Builder-Probe-1",
+        "unit_type": [84],
+        "unit_tags": [10],
+        "unit_tags_selected": [10],
+    }
+    builder = SimpleNamespace(
+        teams=[team],
+        team_unit_tag_curr=10,
+        team_unit_team_curr="Builder-Probe-1",
+    )
+    placement = SimpleNamespace(
+        leased_builder_tags=frozenset({30}),
+        builder_lease_owner=lambda _tag: None,
+    )
+    main_agent = SimpleNamespace(
+        agents={"Builder": builder},
+        decision_broker=SimpleNamespace(extractor=SimpleNamespace(unit_names={84: "Probe"})),
+        raw_executor=SimpleNamespace(placement_service=placement),
+    )
+    original = _raw_probe(10, 20.0)
+    replacement = _raw_probe(20, 21.0)
+    leased = _raw_probe(30, 22.0)
+    offscreen = _raw_probe(40, 23.0)
+    observation = SimpleNamespace(
+        raw_units=[original, replacement, leased, offscreen],
+        feature_units=[
+            SimpleNamespace(tag=10, alliance=1, is_on_screen=True),
+            SimpleNamespace(tag=20, alliance=1, is_on_screen=True),
+            SimpleNamespace(tag=30, alliance=1, is_on_screen=True),
+        ],
+    )
+
+    assert _pin_authoritative_canary_builder(
+        main_agent,
+        observation,
+        controller,
+        game_loop=100,
+        observation_revision="revision-100",
+    )
+    assert controller.replacement_builder_tag == 20
+    assert controller.phase == "awaiting_reset_command"
+    assert team["unit_tags"] == [20]
+    assert builder.team_unit_tag_curr == 20
+
+
+def test_authoritative_canary_waits_when_no_distinct_feature_visible_probe(
+    tmp_path: Path,
+) -> None:
+    controller = AuthoritativeBuildCircuitCanary(
+        run_id="run-canary",
+        episode_id="episode-0",
+        seed=0,
+        journal_path=tmp_path / "journal.jsonl",
+    )
+    controller.initial_builder_tag = 10
+    controller.phase = "rebind_pending"
+    builder = SimpleNamespace(teams=[])
+    main_agent = SimpleNamespace(
+        agents={"Builder": builder},
+        decision_broker=SimpleNamespace(extractor=SimpleNamespace(unit_names={84: "Probe"})),
+        raw_executor=SimpleNamespace(
+            placement_service=SimpleNamespace(
+                leased_builder_tags=frozenset(),
+                builder_lease_owner=lambda _tag: None,
+            )
+        ),
+    )
+    observation = SimpleNamespace(
+        raw_units=[_raw_probe(10, 20.0), _raw_probe(20, 21.0)],
+        feature_units=[SimpleNamespace(tag=10, alliance=1, is_on_screen=True)],
+    )
+
+    assert not _pin_authoritative_canary_builder(
+        main_agent,
+        observation,
+        controller,
+        game_loop=100,
+        observation_revision="revision-100",
+    )
+    assert controller.replacement_builder_tag is None
+    assert controller.phase == "rebind_pending"
+
+
+def test_raw_worker_controller_clears_assignment_when_worker_gains_placement_lease(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_raw_gather_action(monkeypatch)
+    builder = SimpleNamespace(teams=[], team_unit_tag_curr=None)
+    main_agent = _raw_gas_main_agent(builder=builder)
+    worker = _raw_probe(10, 23.0)
+    spare = _raw_probe(20, 40.0)
+    observation = _raw_gas_observation(worker, spare)
+    controller = GasWorkerController()
+
+    first = controller.next_raw_action(main_agent, observation, game_loop=100)
+    assert first is not None
+    assert first.arguments == ["now", [10], 500]
+    assert controller.assignment is not None
+
+    main_agent.raw_executor.placement_service.leased_builder_tags = frozenset({10})
+    second = controller.next_raw_action(main_agent, observation, game_loop=108)
+
+    assert second is None
+    assert controller.assignment is None
+
+
+def test_raw_worker_controller_protects_all_active_placement_leases(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_raw_gather_action(monkeypatch)
+    main_agent = _raw_gas_main_agent(
+        builder=SimpleNamespace(teams=[], team_unit_tag_curr=None),
+        leased_tags=(10, 20),
+    )
+    first = _raw_probe(10, 23.0)
+    second = _raw_probe(20, 24.0)
+    spare = _raw_probe(30, 40.0)
+    observation = _raw_gas_observation(first, second, spare)
+
+    assert _reserved_builder_worker_tags(main_agent) == {10, 20}
+    action = GasWorkerController().next_raw_action(main_agent, observation, game_loop=100)
+
+    assert action is not None
+    assert action.arguments == ["now", [30], 500]
+
+
+def test_raw_worker_controller_rechecks_lease_after_action_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_raw_gather_action(monkeypatch)
+
+    class _LeaseView:
+        def __init__(self) -> None:
+            self.reads = 0
+
+        @property
+        def leased_builder_tags(self) -> frozenset[int]:
+            self.reads += 1
+            return frozenset() if self.reads == 1 else frozenset({10})
+
+    main_agent = _raw_gas_main_agent(builder=SimpleNamespace(teams=[], team_unit_tag_curr=None))
+    lease_view = _LeaseView()
+    main_agent.raw_executor.placement_service = lease_view
+    observation = _raw_gas_observation(_raw_probe(10, 23.0), _raw_probe(20, 40.0))
+    controller = GasWorkerController()
+
+    action = controller.next_raw_action(main_agent, observation, game_loop=100)
+
+    assert action is None
+    assert controller.assignment is None
+    assert lease_view.reads >= 2
+
+
+def test_raw_worker_controller_restores_original_worker_after_placement_lease_release(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_raw_gather_action(monkeypatch)
+    builder = SimpleNamespace(
+        teams=[{"name": "Builder-Probe-1", "unit_tags": [20]}],
+        team_unit_tag_curr=20,
+    )
+    main_agent = _raw_gas_main_agent(builder=builder, leased_tags=(10,))
+    leased = _raw_probe(10, 23.0)
+    builder_worker = _raw_probe(20, 24.0)
+    spare = _raw_probe(30, 40.0)
+    observation = _raw_gas_observation(leased, builder_worker, spare)
+
+    while_leased = GasWorkerController().next_raw_action(main_agent, observation, game_loop=100)
+    assert while_leased is not None
+    assert while_leased.arguments == ["now", [30], 500]
+
+    main_agent.raw_executor.placement_service.leased_builder_tags = frozenset()
+    after_release = GasWorkerController().next_raw_action(main_agent, observation, game_loop=108)
+
+    assert after_release is not None
+    assert after_release.arguments == ["now", [10], 500]
+
+
+def test_feature_worker_controller_keeps_original_blocking_with_active_placement_lease() -> None:
+    main_agent = _raw_gas_main_agent(
+        builder=SimpleNamespace(teams=[], team_unit_tag_curr=None),
+        leased_tags=(10,),
+    )
+    observation = _raw_gas_observation(_raw_probe(10, 23.0), _raw_probe(20, 40.0))
+
+    controller = GasWorkerController()
+    assert controller.next_action(main_agent, observation, game_loop=100, blocked=True) is None
+    assert controller.assignment is None
 
 
 def test_deterministic_gas_rebalance_evicts_builder_already_on_gas() -> None:
@@ -1148,6 +2212,55 @@ def test_builder_never_rebinds_to_selected_gas_worker() -> None:
     assert _rebind_builder_to_selected_worker(main_agent, observation) is False
     assert builder.team_unit_tag_curr == 10
     assert team["unit_tags"] == [10]
+
+
+def test_raw_builder_rebind_prefers_a_live_probe_when_route_tag_is_stale() -> None:
+    team = {"name": "Builder-Probe-1", "unit_type": [84], "unit_tags": [10]}
+    builder = SimpleNamespace(
+        teams=[team],
+        team_unit_tag_curr=10,
+        team_unit_team_curr="Builder-Probe-1",
+        team_unit_tag_list=[10],
+        team_unit_team_list=["Builder-Probe-1"],
+    )
+    main_agent = SimpleNamespace(agents={"Builder": builder})
+    fresh_probe = SimpleNamespace(
+        tag=30,
+        unit_type=84,
+        alliance=1,
+        build_progress=100,
+        order_length=0,
+        display_type=1,
+    )
+    snapshot_probe = SimpleNamespace(
+        tag=20,
+        unit_type=84,
+        alliance=1,
+        build_progress=100,
+        order_length=0,
+        display_type=2,
+    )
+    busy_probe = SimpleNamespace(
+        tag=10,
+        unit_type=84,
+        alliance=1,
+        build_progress=100,
+        order_length=1,
+        order_id_0=35,
+        active=1,
+    )
+
+    _sync_raw_team_membership(
+        main_agent,
+        SimpleNamespace(
+            raw_units=[busy_probe, snapshot_probe, fresh_probe],
+            feature_units=[],
+        ),
+    )
+
+    assert team["unit_tags"] == [30]
+    assert builder.team_unit_tag_curr == 30
+    assert builder.team_unit_tag_list == [30]
 
 
 def test_zerg_builder_refreshes_a_consumed_drone_from_mineral_workers() -> None:
@@ -1466,6 +2579,52 @@ def test_actor_selection_retries_abort_only_the_stalled_command() -> None:
     assert agent._rtscortex_semantic_action is None
 
 
+def test_failed_control_group_recall_switches_to_exact_selection_route() -> None:
+    team = {
+        "name": "Zealot-1",
+        "select_type": "group",
+        "game_group": 1,
+        "unit_tags": [0x101],
+        "unit_tags_selected": [0x101],
+        "obs": [object()],
+        "pos": [[1, 1]],
+        "minimap_pos": [[1, 1]],
+    }
+    agent = SimpleNamespace(
+        name="CombatGroup0",
+        teams=[team],
+        team_unit_team_curr="Zealot-1",
+        team_unit_tag_curr=0x101,
+        curr_action_name="Move_Minimap",
+        func_list=[object()],
+        action_list=[object()],
+        last_execution_abort=None,
+        _rtscortex_semantic_action={"name": "Move_Minimap"},
+    )
+    main_agent = SimpleNamespace(
+        _pending_primitive=PrimitiveDispatch(
+            command_id="command-move",
+            function_name="select_control_group",
+            final_primitive=False,
+            origin="orchestration",
+            requested_function_id=4,
+            emitted_function_id=4,
+        ),
+        _pending_primitive_agent=agent,
+        _actor_selection_retry_key=None,
+        _actor_selection_attempts=0,
+    )
+
+    assert _abort_stalled_actor_selection(main_agent) is False
+    assert _abort_stalled_actor_selection(main_agent) is False
+
+    assert team["select_type"] == "select"
+    assert team["_rtscortex_original_select_type"] == "group"
+    assert team["unit_tags_selected"] == []
+    assert team["obs"] == []
+    assert agent.last_execution_abort is None
+
+
 def test_actor_selection_retry_counter_resets_after_translator_primitive() -> None:
     main_agent = SimpleNamespace(
         _pending_primitive=PrimitiveDispatch(
@@ -1484,6 +2643,452 @@ def test_actor_selection_retry_counter_resets_after_translator_primitive() -> No
     assert _abort_stalled_actor_selection(main_agent) is False
     assert main_agent._actor_selection_retry_key is None
     assert main_agent._actor_selection_attempts == 0
+
+
+def test_camera_selection_chain_budget_force_groups_unit_and_aborts_command() -> None:
+    unit = SimpleNamespace(tag=0x44, unit_type=311)
+    team = {"name": "Adept-1", "unit_type": [311], "unit_tags": []}
+    agent = SimpleNamespace(
+        name="CombatGroup7",
+        teams=[team],
+        team_unit_team_curr="Adept-1",
+        team_unit_tag_curr=0x44,
+        curr_action_name="Move_Minimap",
+        func_list=[object()],
+        action_list=[object()],
+        action_lists=[[{"name": "Move_Minimap"}]],
+        unit_tag_list=[],
+        unit_raw_list=[],
+        last_execution_abort=None,
+        _rtscortex_semantic_action={"name": "Move_Minimap"},
+    )
+    main_agent = SimpleNamespace(
+        worker_settings=SimpleNamespace(orchestration_primitive_budget=4),
+        _pending_primitive=PrimitiveDispatch(
+            command_id="command-camera",
+            function_name="llm_pysc2_move_camera",
+            final_primitive=False,
+            origin="orchestration",
+            requested_function_id=573,
+            emitted_function_id=573,
+        ),
+        _pending_primitive_agent=agent,
+        _orchestration_budget_key=None,
+        _orchestration_budget_used=0,
+        _actor_selection_retry_key=None,
+        _actor_selection_attempts=0,
+        _rtscortex_force_runtime_decision=False,
+        agents={"CombatGroup7": agent},
+        unit_uid_appear=[0x44],
+        unit_uid_total=set(),
+    )
+    observation = SimpleNamespace(raw_units=[unit])
+
+    for _ in range(3):
+        assert _enforce_orchestration_primitive_budget(main_agent, observation) is False
+    assert _enforce_orchestration_primitive_budget(main_agent, observation) is True
+
+    assert agent.last_execution_abort["failure_code"] == "orchestration_budget_exceeded"
+    assert agent.func_list == []
+    assert agent.action_list == []
+    assert agent.action_lists == [[{"name": "Move_Minimap"}]]
+    assert team["unit_tags"] == [0x44]
+    assert agent.unit_tag_list == [0x44]
+    assert main_agent.unit_uid_appear == []
+    assert main_agent._rtscortex_force_runtime_decision is True
+
+
+def test_watchdog_recovery_clears_camera_chain_before_hard_timeout() -> None:
+    unit = SimpleNamespace(tag=0x55, unit_type=311)
+    team = {"name": "Adept-1", "unit_type": [311], "unit_tags": []}
+    agent = SimpleNamespace(
+        name="CombatGroup7",
+        teams=[team],
+        team_unit_team_curr="Adept-1",
+        team_unit_tag_curr=0x55,
+        curr_action_name="Move_Minimap",
+        func_list=[object()],
+        action_list=[object()],
+        unit_tag_list=[],
+        unit_raw_list=[],
+        last_execution_abort=None,
+        _rtscortex_semantic_action={"name": "Move_Minimap"},
+    )
+    main_agent = SimpleNamespace(
+        _pending_primitive=PrimitiveDispatch(
+            command_id="command-watchdog-camera",
+            function_name="llm_pysc2_move_camera",
+            final_primitive=False,
+            origin="orchestration",
+            requested_function_id=573,
+            emitted_function_id=573,
+        ),
+        _pending_primitive_agent=agent,
+        _actor_selection_retry_key=None,
+        _actor_selection_attempts=0,
+        _rtscortex_force_runtime_decision=False,
+        main_loop_lock=True,
+        agents={"CombatGroup7": agent},
+        unit_uid_appear=[0x55],
+        unit_uid_total=set(),
+    )
+
+    assert _recover_observation_gap(main_agent, SimpleNamespace(raw_units=[unit])) is True
+    assert agent.last_execution_abort["failure_code"] == "observation_gap_watchdog_recovery"
+    assert agent.team_unit_tag_curr is None
+    assert agent.team_unit_team_curr is None
+    assert main_agent.main_loop_lock is False
+    assert main_agent.unit_uid_appear == []
+
+
+def test_move_provenance_uses_only_selected_living_actor_tags() -> None:
+    team = {
+        "name": "Adept-1",
+        "unit_tags": [0x10, 0x11, 0x12],
+    }
+    agent = SimpleNamespace(
+        teams=[team],
+        team_unit_team_curr="Adept-1",
+        team_unit_tag_curr=0x10,
+    )
+    observation = SimpleNamespace(
+        raw_units=[
+            SimpleNamespace(tag=0x10, alliance=1),
+            SimpleNamespace(tag=0x11, alliance=1),
+            SimpleNamespace(tag=0x12, alliance=1),
+        ],
+        feature_units=[
+            SimpleNamespace(tag=0x10, alliance=1, is_selected=False),
+            SimpleNamespace(tag=0x11, alliance=1, is_selected=True),
+            SimpleNamespace(tag=0x12, alliance=1, is_selected=True),
+        ],
+    )
+
+    assert _execution_unit_tags(agent, observation) == (0x11, 0x12)
+
+
+def test_combat_membership_prunes_dead_head_and_rebinds_living_tag() -> None:
+    team = {
+        "name": "VoidRay-1",
+        "unit_type": [80],
+        "unit_tags": [0x20, 0x21],
+        "unit_tags_selected": [0x20],
+        "obs": [object()],
+        "pos": [[1, 1]],
+        "minimap_pos": [[1, 1]],
+    }
+    living = SimpleNamespace(
+        tag=0x21,
+        unit_type=80,
+        alliance=1,
+        build_progress=100,
+    )
+    agent = SimpleNamespace(
+        teams=[team],
+        unit_tag_list=[0x20, 0x21],
+        unit_raw_list=[],
+        team_unit_tag_list=[0x20],
+        team_unit_team_list=["VoidRay-1"],
+        team_unit_tag_curr=0x20,
+        team_unit_team_curr="VoidRay-1",
+        curr_action_name="Move_Minimap",
+        _is_executing_actions=lambda: True,
+    )
+    main_agent = SimpleNamespace(
+        agents={"CombatGroup3": agent},
+        _rtscortex_unit_quarantine=set(),
+    )
+
+    assert (
+        _refresh_combat_team_membership(
+            main_agent,
+            SimpleNamespace(raw_units=[living]),
+        )
+        == 1
+    )
+    assert team["unit_tags"] == [0x21]
+    assert agent.team_unit_tag_curr == 0x21
+    assert agent.team_unit_tag_list == []
+    assert main_agent._rtscortex_unit_quarantine == {0x20}
+
+
+def test_unclaimed_new_unit_camera_loop_is_also_bounded() -> None:
+    unit = SimpleNamespace(tag=0x66, unit_type=311)
+    team = {"name": "Adept-1", "unit_type": [311], "unit_tags": []}
+    agent = SimpleNamespace(
+        teams=[team],
+        unit_tag_list=[],
+        unit_raw_list=[],
+        func_list=[],
+        action_list=[],
+    )
+    main_agent = SimpleNamespace(
+        worker_settings=SimpleNamespace(orchestration_primitive_budget=4),
+        _pending_primitive=None,
+        _pending_primitive_agent=None,
+        _orchestration_budget_key=None,
+        _orchestration_budget_used=0,
+        _rtscortex_force_runtime_decision=False,
+        main_loop_lock=False,
+        agents={"CombatGroup7": agent},
+        unit_uid_appear=[0x66, 0x66],
+        unit_uid_total=[],
+        func_id_history=[573],
+    )
+    observation = SimpleNamespace(raw_units=[unit])
+
+    for _ in range(3):
+        assert _enforce_orchestration_primitive_budget(main_agent, observation) is False
+    assert _enforce_orchestration_primitive_budget(main_agent, observation) is True
+
+    assert team["unit_tags"] == [0x66]
+    assert main_agent.unit_uid_appear == []
+    assert main_agent.unit_uid_total == [0x66]
+    assert main_agent._rtscortex_unit_quarantine == {0x66}
+    assert main_agent._rtscortex_force_runtime_decision is True
+
+    main_agent.unit_uid_appear[:] = [0x66, 0x66]
+    _normalize_new_unit_queue(main_agent)
+    assert main_agent.unit_uid_appear == []
+
+
+def test_runtime_observation_bypass_groups_each_new_unit_once_before_upstream_func1() -> None:
+    oracle = SimpleNamespace(
+        tag=0x71,
+        unit_type=495,
+        alliance=1,
+        build_progress=100,
+    )
+    phoenix = SimpleNamespace(
+        tag=0x72,
+        unit_type=78,
+        alliance=1,
+        build_progress=100,
+    )
+    team = {
+        "name": "Oracle-1",
+        "unit_type": [495, 78],
+        "unit_tags": [],
+    }
+    agent = SimpleNamespace(
+        teams=[team],
+        unit_tag_list=[],
+        unit_raw_list=[],
+    )
+    main_agent = SimpleNamespace(
+        agents={"CombatGroup8": agent},
+        unit_uid=[],
+        unit_uid_appear=[0x71, 0x71, 0x72],
+        unit_uid_total=[],
+        main_loop_lock=True,
+        temp_head_unit_tag=0x71,
+        temp_curr_unit_tag=0x72,
+        temp_head_unit=oracle,
+        temp_curr_unit=phoenix,
+        temp_team_unit_tags=[0x71, 0x72],
+        flag_locked_func4=True,
+    )
+    observation = SimpleNamespace(raw_units=[oracle, phoenix])
+
+    assert _prepare_runtime_observation_bypass(main_agent, observation) is True
+
+    assert main_agent.unit_uid_appear == []
+    assert main_agent.unit_uid == [0x71, 0x72]
+    assert main_agent.unit_uid_total == [0x71, 0x72]
+    assert main_agent._rtscortex_unit_quarantine == {0x71, 0x72}
+    assert team["unit_tags"] == [0x71, 0x72]
+    assert team["unit_tags_selected"] == [0x71, 0x72]
+    assert agent.unit_tag_list == [0x71, 0x72]
+    assert main_agent.main_loop_lock is False
+    assert main_agent.temp_head_unit_tag is None
+    assert main_agent.temp_curr_unit_tag is None
+    assert main_agent.flag_locked_func4 is False
+
+    main_agent.unit_uid = []
+    main_agent.unit_uid_appear[:] = [0x71, 0x72, 0x72]
+    assert _prepare_runtime_observation_bypass(main_agent, observation) is False
+    assert main_agent.unit_uid_appear == []
+    assert team["unit_tags"] == [0x71, 0x72]
+
+
+def test_expansion_scout_controller_rotates_unexplored_camera_waypoints() -> None:
+    class Plane(list[list[int]]):
+        @property
+        def shape(self) -> tuple[int, int]:
+            return len(self), len(self[0])
+
+    size = 16
+    feature_minimap = SimpleNamespace(
+        pathable=Plane([[1] * size for _ in range(size)]),
+        player_relative=Plane([[0] * size for _ in range(size)]),
+        visibility_map=Plane([[0] * size for _ in range(size)]),
+    )
+    observation = SimpleNamespace(feature_minimap=feature_minimap)
+    controller = ExpansionScoutController(interval_game_loops=16)
+
+    first = controller.next_waypoint(
+        observation,
+        game_loop=100,
+        anchor_available=False,
+        blocked=False,
+    )
+    too_soon = controller.next_waypoint(
+        observation,
+        game_loop=108,
+        anchor_available=False,
+        blocked=False,
+    )
+    second = controller.next_waypoint(
+        observation,
+        game_loop=116,
+        anchor_available=False,
+        blocked=False,
+    )
+
+    assert first is not None
+    assert controller.state == "search_in_progress"
+    assert controller.progress_alerts[0] == "expansion_scout_state=search_in_progress"
+    assert too_soon is None
+    assert second is not None and second != first
+    assert (
+        controller.next_waypoint(
+            observation,
+            game_loop=132,
+            anchor_available=True,
+            blocked=False,
+        )
+        is None
+    )
+
+
+def test_expansion_scout_controller_reports_exhaustion_without_repeating_waypoints() -> None:
+    class Plane(list[list[int]]):
+        @property
+        def shape(self) -> tuple[int, int]:
+            return len(self), len(self[0])
+
+    size = 8
+    feature_minimap = SimpleNamespace(
+        pathable=Plane([[1] * size for _ in range(size)]),
+        player_relative=Plane([[0] * size for _ in range(size)]),
+        visibility_map=Plane([[0] * size for _ in range(size)]),
+    )
+    observation = SimpleNamespace(feature_minimap=feature_minimap)
+    controller = ExpansionScoutController(interval_game_loops=16)
+    visited: list[tuple[int, int]] = []
+    game_loop = 0
+    for _ in range(100):
+        waypoint = controller.next_waypoint(
+            observation,
+            game_loop=game_loop,
+            anchor_available=False,
+            blocked=False,
+        )
+        game_loop += 16
+        if waypoint is not None:
+            visited.append(waypoint)
+        if controller.exhausted:
+            break
+
+    assert controller.exhausted is True
+    assert controller.state == "all_candidates_exhausted"
+    assert controller.progress_alerts == (
+        "expansion_scout_state=all_candidates_exhausted",
+        "expansion_scout_generation=1",
+        f"expansion_scout_waypoints={len(visited)}/{len(visited)}",
+        "expansion_scout_available_anchors=none",
+        "expansion_scout_rejected_anchors=none",
+    )
+    assert visited
+    assert len(visited) == len(set(visited))
+    assert (
+        controller.next_waypoint(
+            observation,
+            game_loop=game_loop + 16,
+            anchor_available=False,
+            blocked=False,
+        )
+        is None
+    )
+
+
+def test_expansion_scout_empty_opening_domain_is_not_final_exhaustion() -> None:
+    observation = SimpleNamespace(feature_minimap=SimpleNamespace())
+    controller = ExpansionScoutController(interval_game_loops=16)
+
+    assert (
+        controller.next_waypoint(
+            observation,
+            game_loop=0,
+            anchor_available=False,
+            blocked=False,
+        )
+        is None
+    )
+    assert controller.exhausted is False
+    assert controller.visited_waypoints == set()
+
+
+def test_expansion_scout_rejected_camera_keeps_waypoint_eligible() -> None:
+    controller = ExpansionScoutController(interval_game_loops=16)
+    controller.waypoint_queue = ((4, 6),)
+    controller.pending_waypoint = (4, 6)
+    controller.pending_game_loop = 32
+    controller.last_scout_game_loop = 32
+
+    controller.reject_pending_waypoint()
+
+    assert controller.pending_waypoint is None
+    assert controller.pending_game_loop is None
+    assert controller.last_scout_game_loop is None
+    assert controller.visited_waypoints == set()
+
+
+def test_expansion_scout_controller_forces_progress_after_soft_block_deadline() -> None:
+    class Plane(list[list[int]]):
+        @property
+        def shape(self) -> tuple[int, int]:
+            return len(self), len(self[0])
+
+    size = 16
+    observation = SimpleNamespace(
+        feature_minimap=SimpleNamespace(
+            pathable=Plane([[1] * size for _ in range(size)]),
+            player_relative=Plane([[0] * size for _ in range(size)]),
+            visibility_map=Plane([[0] * size for _ in range(size)]),
+        )
+    )
+    controller = ExpansionScoutController(interval_game_loops=16)
+
+    assert (
+        controller.next_waypoint(
+            observation,
+            game_loop=100,
+            anchor_available=False,
+            blocked=False,
+            soft_blocked=True,
+        )
+        is None
+    )
+    assert (
+        controller.next_waypoint(
+            observation,
+            game_loop=115,
+            anchor_available=False,
+            blocked=False,
+            soft_blocked=True,
+        )
+        is None
+    )
+    forced = controller.next_waypoint(
+        observation,
+        game_loop=116,
+        anchor_available=False,
+        blocked=False,
+        soft_blocked=True,
+    )
+
+    assert forced is not None
 
 
 def test_deterministic_gas_rebalance_respects_effect_and_main_loop_guards() -> None:
@@ -1599,6 +3204,21 @@ def test_timestep_extractor_maps_sc2_attack_alerts() -> None:
     )
 
     assert snapshot["alerts"] == ["building_under_attack", "unit_under_attack", "alert:3"]
+
+
+def test_timestep_extractor_exposes_expansion_candidate_exhaustion() -> None:
+    agent = FakeAgent("Builder", "Builder-Probe-1", _fake_timestep(), StubBroker())
+    extractor = TimeStepExtractor("run-worker", "episode-worker")
+    extractor.set_expansion_candidates_exhausted(True)
+
+    snapshot = extractor.extract(
+        _fake_timestep(),
+        {"Builder": agent},
+        {"Builder": "no expansion anchor remains"},
+        step_id=1,
+    )
+
+    assert "expansion_candidates_exhausted" in snapshot["alerts"]
 
 
 def test_timestep_extractor_adds_structured_pylon_screen_candidates() -> None:
@@ -2706,6 +4326,98 @@ def test_zerg_build_candidates_require_a_reachable_builder_approach() -> None:
         == []
     )
 
+    semantic = semantic_argument_candidates(
+        observation,
+        "Build_EvolutionChamber_Screen",
+        unit_names=unit_names,
+        builder_tags=[0xD00],
+    )
+    assert semantic
+    assert all(candidate[0][0] < 64 for candidate in semantic)
+
+    # Feature pathability can mark the worker's occupied pixel as blocked even
+    # though adjacent terrain is reachable. Candidate generation must seed the
+    # flood fill from the nearest pathable cells instead of declaring the actor
+    # unreachable.
+    pathable[64][20] = 0
+    occupied_start_candidates = build_screen_candidates(
+        observation,
+        "Build_EvolutionChamber_Screen",
+        unit_names=unit_names,
+        builder_tags=[0xD00],
+    )
+    assert occupied_start_candidates
+    assert all(x < 64 for x, _y in occupied_start_candidates)
+
+    observation.feature_units[0].is_selected = True
+    selected_fallback_candidates = build_screen_candidates(
+        observation,
+        "Build_EvolutionChamber_Screen",
+        unit_names=unit_names,
+        builder_tags=[0xBAD],
+    )
+    assert selected_fallback_candidates
+    assert all(x < 64 for x, _y in selected_fallback_candidates)
+
+
+def test_builder_reachability_does_not_treat_mineral_line_as_a_permanent_wall() -> None:
+    observation = SimpleNamespace(
+        raw_units=[],
+        feature_units=[
+            SimpleNamespace(
+                tag=0xB01,
+                unit_type=84,
+                alliance=1,
+                is_on_screen=True,
+                is_selected=True,
+                x=64,
+                y=64,
+                radius=0.375,
+            ),
+            *[
+                SimpleNamespace(
+                    tag=tag,
+                    unit_type=341,
+                    alliance=3,
+                    is_on_screen=True,
+                    is_selected=False,
+                    x=x,
+                    y=y,
+                    radius=1.5,
+                )
+                for tag, (x, y) in enumerate(
+                    (
+                        (56, 64),
+                        (72, 64),
+                        (64, 56),
+                        (64, 72),
+                        (58, 58),
+                        (70, 58),
+                        (58, 70),
+                        (70, 70),
+                    ),
+                    start=0xC00,
+                )
+            ],
+        ],
+        feature_screen=SimpleNamespace(
+            buildable=UniformGrid(1),
+            pathable=UniformGrid(1),
+            player_relative=UniformGrid(0),
+            power=UniformGrid(0),
+            creep=UniformGrid(0),
+        ),
+    )
+
+    candidates = build_screen_candidates(
+        observation,
+        "Build_Pylon_Screen",
+        unit_names={84: "Probe", 341: "MineralField"},
+        builder_tags=[0xB01],
+    )
+
+    assert candidates
+
 
 def test_zerg_queen_controller_candidates_require_uninjected_townhall_and_creep() -> None:
     creep = [[1 for _ in range(128)] for _ in range(128)]
@@ -2770,6 +4482,69 @@ def test_zerg_queen_controller_candidates_require_uninjected_townhall_and_creep(
         [65, 65],
         unit_names=unit_names,
     )
+
+
+def test_chained_creep_candidates_require_one_selected_mature_tumor_and_cast_range() -> None:
+    observation = SimpleNamespace(
+        player_common=SimpleNamespace(minerals=0, vespene=0),
+        raw_units=[],
+        feature_units=[
+            SimpleNamespace(
+                tag=0xC00,
+                unit_type=137,
+                alliance=1,
+                is_on_screen=True,
+                is_selected=True,
+                radius=0.5,
+                x=64,
+                y=64,
+            )
+        ],
+        feature_screen=SimpleNamespace(
+            buildable=UniformGrid(1),
+            pathable=UniformGrid(1),
+            player_relative=UniformGrid(0),
+            power=UniformGrid(0),
+            creep=UniformGrid(1),
+        ),
+    )
+
+    candidates = build_screen_candidates(
+        observation,
+        "Build_CreepTumor_Tumor_Screen",
+        unit_names={137: "CreepTumorBurrowed"},
+    )
+
+    assert candidates
+    assert all(
+        128 / 6 <= ((x - 64) ** 2 + (y - 64) ** 2) ** 0.5 <= 128 * 9.5 / 24 for x, y in candidates
+    )
+    observation.feature_units[0].is_selected = False
+    assert (
+        build_screen_candidates(
+            observation,
+            "Build_CreepTumor_Tumor_Screen",
+            unit_names={137: "CreepTumorBurrowed"},
+        )
+        == []
+    )
+
+
+def test_chained_creep_prioritizes_the_next_tumor_with_available_ability() -> None:
+    unavailable = SimpleNamespace(observation=SimpleNamespace(available_actions=[0, 2]))
+    available = SimpleNamespace(observation=SimpleNamespace(available_actions=[0, 47]))
+    agent = SimpleNamespace(
+        name="CombatGroup4",
+        team_unit_obs_list=[unavailable, available],
+        team_unit_tag_list=[0xC00, 0xC01],
+        team_unit_team_list=["CreepTumor-1", "CreepTumor-1"],
+    )
+
+    _prioritize_creep_tumor_source(agent)
+
+    assert agent.team_unit_obs_list == [available, unavailable]
+    assert agent.team_unit_tag_list == [0xC01, 0xC00]
+    assert agent.team_unit_team_list == ["CreepTumor-1", "CreepTumor-1"]
 
 
 def test_zerg_queen_controller_availability_uses_the_actor_queen() -> None:
@@ -3173,6 +4948,196 @@ def test_nexus_candidates_require_scouted_visible_resource_cluster() -> None:
     ) == [[101]]
 
 
+def test_nexus_candidate_survives_camera_move_via_persistent_world_anchor() -> None:
+    observation, feature_resources, _ = _nexus_candidate_observation()
+    extractor = TimeStepExtractor(
+        "run",
+        "episode",
+        unit_names={59: "Nexus", 341: "MineralField"},
+    )
+    extractor._remember_expansion_resources(  # noqa: SLF001 - persistence contract test
+        observation.raw_units,
+        feature_resources,
+    )
+    observation.feature_units = []
+
+    assert semantic_argument_candidates(
+        observation,
+        "Build_Nexus_Near",
+        unit_names={59: "Nexus", 341: "MineralField"},
+        known_expansion_resources=tuple(
+            extractor._known_expansion_resources.values()  # noqa: SLF001
+        ),
+    ) == [[101]]
+
+    assert (
+        _candidate_dispatch_failure(
+            {
+                "name": "Build_Nexus_Near",
+                "arg": [hex(101)],
+                "func": [(573, object(), ("world",))],
+            },
+            observation,
+            {59: "Nexus", 341: "MineralField"},
+            final_primitive=False,
+            translated_position=None,
+            known_expansion_resources=tuple(
+                extractor._known_expansion_resources.values()  # noqa: SLF001
+            ),
+        )
+        is None
+    )
+
+
+def test_persistent_nexus_anchor_drives_camera_after_leaving_raw_observation() -> None:
+    observation, feature_resources, _ = _nexus_candidate_observation()
+    known_resources = tuple(
+        {
+            "tag": unit.tag,
+            "unit_type": "MineralField",
+            "alliance": 3,
+            "x": raw.x,
+            "y": raw.y,
+        }
+        for unit, raw in zip(
+            feature_resources,
+            observation.raw_units[-len(feature_resources) :],
+            strict=True,
+        )
+    )
+    calls: list[tuple[int, int]] = []
+
+    def move_camera(position: tuple[int, int]) -> object:
+        calls.append(position)
+        return SimpleNamespace(function=573, arguments=[list(position)])
+
+    move_camera.name = "llm_pysc2_move_camera"  # type: ignore[attr-defined]
+    agent = SimpleNamespace(
+        func_list=[(573, move_camera, (101,)), (0, object(), ())],
+        curr_action_name="Build_Nexus_Near",
+        _rtscortex_translation_ordinal=0,
+        _rtscortex_translation_total=3,
+        _rtscortex_known_expansion_resources=known_resources,
+        unit_names={341: "MineralField"},
+        world_x_offset=4,
+        world_y_offset=6,
+        world_range=128,
+        last_translation_result=None,
+    )
+
+    function_id, _ = _translate_persistent_expansion_camera_primitive(
+        agent,
+        SimpleNamespace(observation=SimpleNamespace(raw_units=[])),
+        {"name": "Build_Nexus_Near", "arg": [101]},
+    )
+
+    assert function_id == 573
+    assert calls == [(54, 84)]
+    assert agent.last_translation_result["accepted"] is True
+    assert agent.last_translation_result["resolved_arguments"] == [(54, 84)]
+
+
+def test_failed_expansion_anchor_is_permanently_suppressed_and_next_cluster_survives() -> None:
+    observation, feature_resources, _ = _nexus_candidate_observation()
+    observation.game_loop = [100]
+    extractor = TimeStepExtractor(
+        "run",
+        "episode",
+        unit_names={59: "Nexus", 341: "MineralField"},
+    )
+    extractor._remember_expansion_resources(  # noqa: SLF001
+        observation.raw_units,
+        feature_resources,
+    )
+    second_cluster: tuple[dict[str, Any], ...] = tuple(
+        {
+            "tag": 201 + index,
+            "unit_type": "MineralField",
+            "alliance": 3,
+            "x": 90 + offset_x,
+            "y": 90 + offset_y,
+        }
+        for index, (offset_x, offset_y) in enumerate(
+            (
+                (7, 0),
+                (5, 5),
+                (0, 7),
+                (-5, 5),
+                (-7, 0),
+                (-5, -5),
+                (0, -7),
+                (5, -5),
+            )
+        )
+    )
+    for resource in second_cluster:
+        extractor._known_expansion_resources[int(resource["tag"])] = resource  # noqa: SLF001
+    extractor.suppress_expansion_anchor(101, game_loop=100)
+
+    assert semantic_argument_candidates(
+        observation,
+        "Build_Nexus_Near",
+        unit_names={59: "Nexus", 341: "MineralField"},
+        known_expansion_resources=extractor.known_expansion_resources,
+        excluded_expansion_anchors=extractor.suppressed_expansion_anchors,
+    ) == [[201]]
+
+    observation.game_loop = [132]
+    extractor.observe_expansion_resources(observation, {})
+    assert semantic_argument_candidates(
+        observation,
+        "Build_Nexus_Near",
+        unit_names={59: "Nexus", 341: "MineralField"},
+        known_expansion_resources=extractor.known_expansion_resources,
+        excluded_expansion_anchors=extractor.suppressed_expansion_anchors,
+    ) == [[201]]
+
+
+def test_raw_expansion_state_opens_new_generation_for_later_anchor() -> None:
+    observation, _, _ = _nexus_candidate_observation()
+    extractor = TimeStepExtractor(
+        "run",
+        "episode",
+        unit_names={59: "Nexus", 341: "MineralField"},
+        raw_action_mode=True,
+    )
+    extractor.observe_expansion_resources(
+        SimpleNamespace(raw_units=[], feature_units=[], game_loop=[1]),
+        {},
+    )
+    assert "expansion_scout_generation=1" in extractor._expansion_scout_alerts  # noqa: SLF001
+    assert "expansion_scout_state=not_discovered_yet" in (  # noqa: SLF001
+        extractor._expansion_scout_alerts
+    )
+
+    observation.game_loop = [224]
+    extractor.observe_expansion_resources(observation, {})
+
+    assert "expansion_scout_generation=2" in extractor._expansion_scout_alerts  # noqa: SLF001
+    assert "expansion_scout_state=candidate_available" in (  # noqa: SLF001
+        extractor._expansion_scout_alerts
+    )
+
+
+def test_failed_expansion_effect_suppresses_command_anchor() -> None:
+    extractor = TimeStepExtractor("run", "episode")
+    coordinator = SimpleNamespace(
+        observe_effects=lambda _observation: [
+            {
+                "command_id": "command-expand",
+                "status": "failed",
+                "failure_code": "target_not_created",
+            }
+        ]
+    )
+    broker = SharedDecisionBroker(cast(Any, coordinator), extractor)
+    broker._expansion_anchor_by_command["command-expand"] = 101  # noqa: SLF001
+
+    broker.observe_effects(SimpleNamespace(game_loop=[224]))
+
+    assert extractor.suppressed_expansion_anchors == frozenset({101})
+
+
 def test_nexus_candidate_requires_the_exact_anchor_to_be_currently_visible() -> None:
     observation, feature_resources, _ = _nexus_candidate_observation()
     observation.feature_units = [unit for unit in feature_resources if unit.tag != 101]
@@ -3356,6 +5321,27 @@ def test_worker_semantic_revalidation_distinguishes_enemy_and_build_targets() ->
         )
         is None
     )
+    raw_only_enemy = SimpleNamespace(tag=9, alliance=4, is_on_screen=False)
+    raw_only_observation = SimpleNamespace(
+        feature_units=[friendly],
+        raw_units=[raw_only_enemy],
+    )
+    assert (
+        _semantic_target_failure(
+            {
+                "name": "Attack_Unit",
+                "arg": [9],
+                "func": [
+                    (573, object(), ("world_tag",)),
+                    (0, object(), ()),
+                    (12, object(), ("queued", "screen_tag")),
+                ],
+            },
+            raw_only_observation,
+            {},
+        )
+        is None
+    )
     assert _translation_failure_code("area not pathable", "Build_Pylon_Screen") == ("not_pathable")
     assert (
         _translation_failure_code(
@@ -3466,6 +5452,22 @@ def test_worker_detects_an_accepted_primitive_outside_current_candidates() -> No
     assert "current candidate set" in failure
 
 
+def test_worker_defers_semantic_candidate_revalidation_until_final_primitive() -> None:
+    observation = _fake_timestep().observation
+    own_tag = observation.feature_units[0].tag
+
+    assert (
+        _candidate_dispatch_failure(
+            {"name": "Attack_Unit", "arg": [hex(own_tag)], "func": []},
+            observation,
+            {104: "Drone", 311: "Adept"},
+            final_primitive=False,
+            translated_position=None,
+        )
+        is None
+    )
+
+
 def test_candidate_outside_dispatch_counter_is_persisted_and_fails_command(
     tmp_path: Path,
 ) -> None:
@@ -3512,6 +5514,11 @@ def test_candidate_outside_dispatch_counter_is_persisted_and_fails_command(
         "unattributed_primitives": 0,
         "candidate_outside_pysc2_dispatches": 0,
         "observation_gap_watchdog_triggers": 0,
+        "orchestration_recoveries": 0,
+        "partial_runtime_decisions": 0,
+        "skipped_runtime_participants": 0,
+        "expansion_scout_camera_moves": 0,
+        "expansion_candidate_exhaustions": 0,
     }
 
     with pytest.raises(RuntimeError, match="outside the current candidate set"):
@@ -3544,6 +5551,62 @@ def test_candidate_outside_dispatch_counter_is_persisted_and_fails_command(
         "failure_code": "bridge_integrity_error",
         "detail": "Attack_Unit target is outside the current candidate set",
     }
+
+
+def test_broker_settles_normal_candidate_invalidation_without_integrity_abort() -> None:
+    runtime = FakeRuntime()
+    coordinator = BridgeCoordinator(runtime)
+    broker = SharedDecisionBroker(
+        coordinator,
+        TimeStepExtractor("run-worker", "episode-worker"),
+    )
+    _register_bridge_route(
+        broker,
+        coordinator,
+        _bridge_route(
+            "Builder",
+            ("Builder-Probe-1",),
+            RoutedCommand(
+                command_id="command-stale-expansion",
+                actor="Builder/Builder-Probe-1",
+                team_name="Builder-Probe-1",
+                name="Build_Nexus_Near",
+                rendered_action="<Build_Nexus_Near(0x100900001)>",
+                requested_arguments=("0x100900001",),
+                resolved_arguments=("0x100900001",),
+            ),
+            step_id=56,
+        ),
+    )
+    dispatch = broker.claim_primitive(
+        "Builder",
+        "Builder-Probe-1",
+        "Build_Nexus_Near",
+        "Build_Nexus_screen",
+        final_primitive=True,
+        ordinal=0,
+        total=1,
+        requested_function_id=65,
+        emitted_function_id=65,
+    )
+    assert dispatch is not None
+
+    broker.settle_candidate_invalidation(
+        dispatch,
+        failure_code="invalid_expansion_anchor",
+        failure_reason="semantic target 0x100900001 is no longer legal",
+        game_loop=900,
+    )
+
+    assert broker.metrics()["candidate_outside_pysc2_dispatches"] == 0
+    assert len(runtime.execution_reports) == 1
+    report = runtime.execution_reports[0]
+    assert report["command_id"] == "command-stale-expansion"
+    assert report["status"] == "failed"
+    assert report["execution_stage"] == "pre_dispatch"
+    assert report["failure_code"] == "invalid_expansion_anchor"
+    assert report["primitive_trace"][0]["accepted"] is False
+    assert report["primitive_trace"][0]["emitted_function_id"] == 0
 
 
 def test_pysc2_argument_normalization_matches_symbolic_and_encoded_enums() -> None:
@@ -3795,8 +5858,105 @@ def test_train_stalker_requires_completed_cybernetics_core() -> None:
     ]
 
 
+def test_train_adept_does_not_treat_one_percent_core_as_complete() -> None:
+    timestep = _fake_timestep()
+    timestep.observation.player.minerals = 500
+    timestep.observation.player.vespene = 500
+    gateway = _unit(0xADE, 62, 1, 35, 35, 500, 255)
+    gateway.build_progress = 100
+    gateway.active = 0
+    core = _unit(0xC0E, 72, 1, 37, 35, 500, 255)
+    core.build_progress = 1
+    timestep.observation.raw_units.extend([gateway, core])
+    action = {"name": "Train_Adept", "arg": [], "func": [(457, None, ())]}
+    agent = _developer_agent(timestep, [action])
+    extractor = TimeStepExtractor(
+        "run-worker",
+        "episode-worker",
+        unit_names={62: "Gateway", 72: "CyberneticsCore"},
+        action_source_types={457: 62},
+    )
+
+    assert (
+        production_source_tag(
+            timestep.observation,
+            action,
+            unit_names={62: "Gateway", 72: "CyberneticsCore"},
+            action_source_types={457: 62},
+        )
+        is None
+    )
+    incomplete = extractor.extract(
+        timestep,
+        {"Developer": agent},
+        {"Developer": "production overview"},
+        step_id=1,
+    )
+    assert [item["name"] for item in incomplete["teams"][0]["available_actions"]] == [
+        "No_Operation"
+    ]
+
+    core.build_progress = 100
+    assert (
+        production_source_tag(
+            timestep.observation,
+            action,
+            unit_names={62: "Gateway", 72: "CyberneticsCore"},
+            action_source_types={457: 62},
+        )
+        == 0xADE
+    )
+    complete = extractor.extract(
+        timestep,
+        {"Developer": agent},
+        {"Developer": "production overview"},
+        step_id=2,
+    )
+    assert [item["name"] for item in complete["teams"][0]["available_actions"]] == [
+        "No_Operation",
+        "Train_Adept",
+    ]
+
+
+def test_train_adept_final_dispatch_revalidates_completed_core_and_capability() -> None:
+    timestep = _fake_timestep()
+    timestep.observation.player.minerals = 500
+    timestep.observation.player.vespene = 500
+    gateway = _unit(0xADE, 62, 1, 35, 35, 500, 255)
+    gateway.build_progress = 100
+    gateway.active = 0
+    core = _unit(0xC0E, 72, 1, 37, 35, 500, 255)
+    core.build_progress = 1
+    timestep.observation.raw_units.extend([gateway, core])
+    timestep.observation.available_actions = [457]
+
+    reason = _production_source_invalid_reason(
+        timestep.observation,
+        0xADE,
+        PRODUCTION_SPECS["Train_Adept"],
+        {62: "Gateway", 72: "CyberneticsCore"},
+        required_function_id=457,
+    )
+
+    assert reason is not None
+    assert "completed CyberneticsCore" in reason
+
+    core.build_progress = 100
+    timestep.observation.available_actions = []
+    reason = _production_source_invalid_reason(
+        timestep.observation,
+        0xADE,
+        PRODUCTION_SPECS["Train_Adept"],
+        {62: "Gateway", 72: "CyberneticsCore"},
+        required_function_id=457,
+    )
+    assert reason is not None
+    assert "not currently available" in reason
+
+
 def test_research_warpgate_requires_its_full_resource_cost() -> None:
     timestep = _fake_timestep()
+    timestep.observation.upgrades = []
     core = _unit(0xDEF, 72, 1, 36, 35, 500, 255)
     core.build_progress = 100
     core.active = 0
@@ -3834,6 +5994,38 @@ def test_research_warpgate_requires_its_full_resource_cost() -> None:
     ]
 
 
+def test_research_warpgate_is_hidden_while_the_upgrade_order_is_in_progress() -> None:
+    timestep = _fake_timestep()
+    timestep.observation.upgrades = []
+    researching_core = _unit(0xDEF, 72, 1, 36, 35, 500, 255)
+    researching_core.build_progress = 100
+    researching_core.active = 1
+    researching_core.order_length = 1
+    researching_core.order_id_0 = 82
+    idle_core = _unit(0xFED, 72, 1, 37, 35, 500, 255)
+    idle_core.build_progress = 100
+    idle_core.active = 0
+    timestep.observation.raw_units.extend([researching_core, idle_core])
+    research = {"name": "Research_WarpGate", "arg": [], "func": [(428, None, ())]}
+    agent = _developer_agent(timestep, [research])
+
+    snapshot = TimeStepExtractor(
+        "run-worker",
+        "episode-worker",
+        unit_names={72: "CyberneticsCore"},
+        action_source_types={428: 72},
+    ).extract(
+        timestep,
+        {"Developer": agent},
+        {"Developer": "production overview"},
+        step_id=1,
+    )
+
+    assert [action["name"] for action in snapshot["teams"][0]["available_actions"]] == [
+        "No_Operation"
+    ]
+
+
 def test_production_source_resolver_returns_the_idle_completed_structure_tag() -> None:
     timestep = _fake_timestep()
     busy_gateway = _unit(0xAAA, 62, 1, 35, 35, 500, 255)
@@ -3852,6 +6044,127 @@ def test_production_source_resolver_returns_the_idle_completed_structure_tag() -
             action_source_types={100: 62},
         )
         == 0xBBB
+    )
+
+
+def test_terran_economy_sources_cover_scv_orbital_mule_and_stimpack() -> None:
+    timestep = _fake_timestep()
+    timestep.observation.upgrades = []
+    barracks = _unit(0xB00, 21, 1, 30, 30, 1000, 255)
+    barracks.build_progress = 100
+    barracks.active = 0
+    barracks.add_on_tag = 0xB01
+    tech_lab = _unit(0xB01, 37, 1, 32, 30, 400, 255)
+    tech_lab.build_progress = 100
+    command_center = _unit(0xC00, 18, 1, 35, 35, 1500, 255)
+    command_center.build_progress = 100
+    command_center.active = 0
+    orbital = _unit(0xC01, 132, 1, 45, 35, 1500, 255)
+    orbital.build_progress = 100
+    orbital.active = 0
+    orbital.energy = 75
+    timestep.observation.raw_units.extend([barracks, tech_lab, command_center, orbital])
+    names = {
+        18: "CommandCenter",
+        21: "Barracks",
+        37: "BarracksTechLab",
+        132: "OrbitalCommand",
+    }
+
+    assert (
+        production_source_tag(
+            timestep.observation,
+            {"name": "Train_SCV", "func": [(490, None, ())]},
+            unit_names=names,
+            action_source_types={490: 18},
+        )
+        == 0xC00
+    )
+    assert (
+        production_source_tag(
+            timestep.observation,
+            {"name": "Morph_OrbitalCommand", "func": [(309, None, ())]},
+            unit_names=names,
+            action_source_types={309: 18},
+        )
+        == 0xC00
+    )
+    assert (
+        production_source_tag(
+            timestep.observation,
+            {"name": "Effect_CalldownMULE_Screen", "func": [(183, None, ())]},
+            unit_names=names,
+            action_source_types={183: 132},
+        )
+        == 0xC01
+    )
+    assert (
+        production_source_tag(
+            timestep.observation,
+            {"name": "Research_Stimpack", "func": [(405, None, ())]},
+            unit_names=names,
+            action_source_types={405: 21},
+        )
+        == 0xB00
+    )
+
+    orbital.active = 1
+    orbital.order_length = 1
+    orbital.order_id_0 = 520
+    assert (
+        production_source_tag(
+            timestep.observation,
+            {"name": "Effect_CalldownMULE_Screen", "func": [(183, None, ())]},
+            unit_names=names,
+            action_source_types={183: 132},
+        )
+        == 0xC01
+    )
+    orbital.energy = 49
+    assert (
+        production_source_tag(
+            timestep.observation,
+            {"name": "Effect_CalldownMULE_Screen", "func": [(183, None, ())]},
+            unit_names=names,
+            action_source_types={183: 132},
+        )
+        is None
+    )
+
+
+def test_stimpack_source_requires_the_exact_barracks_techlab() -> None:
+    timestep = _fake_timestep()
+    timestep.observation.upgrades = []
+    barracks = _unit(0xB00, 21, 1, 30, 30, 1000, 255)
+    barracks.build_progress = 100
+    barracks.active = 0
+    barracks.add_on_tag = 0
+    timestep.observation.raw_units.append(barracks)
+    action = {"name": "Research_Stimpack", "func": [(405, None, ())]}
+    names = {21: "Barracks", 37: "BarracksTechLab"}
+
+    assert (
+        production_source_tag(
+            timestep.observation,
+            action,
+            unit_names=names,
+            action_source_types={405: 21},
+        )
+        is None
+    )
+
+    tech_lab = _unit(0xB01, 37, 1, 32, 30, 400, 255)
+    tech_lab.build_progress = 100
+    barracks.add_on_tag = 0xB01
+    timestep.observation.raw_units.append(tech_lab)
+    assert (
+        production_source_tag(
+            timestep.observation,
+            action,
+            unit_names=names,
+            action_source_types={405: 21},
+        )
+        == 0xB00
     )
 
 
@@ -3876,6 +6189,7 @@ def test_production_source_follows_upstream_raw_order_instead_of_tag_order() -> 
 
 def test_train_registry_pins_multirace_worker_actions_and_raw_orders() -> None:
     assert {action: spec.raw_order_id for action, spec in PRODUCTION_SPECS.items()} == {
+        "Train_Probe": 64,
         "Train_Zealot": 49,
         "Train_Stalker": 50,
         "Train_Adept": 54,
@@ -3888,6 +6202,7 @@ def test_train_registry_pins_multirace_worker_actions_and_raw_orders() -> None:
         "Train_SiegeTank": 521,
         "Train_Medivac": 512,
         "Train_VikingFighter": 525,
+        "Train_SCV": 520,
         "Train_Drone": 503,
         "Train_Overlord": 515,
         "Train_Queen": 516,
@@ -4806,6 +7121,12 @@ def test_broker_attributes_builder_failure_and_combat_success_in_same_step() -> 
 
     assert builder is not None
     assert combat is not None
+    broker.prepare_effect(
+        combat,
+        _combat_observation(20810, {0xDEF: 100.0}, {0x10: 0xDEF}),
+        builder_tag=0x10,
+        actor_tags=(0x10,),
+    )
     broker.settle_primitive(
         builder,
         success=False,
@@ -4813,6 +7134,7 @@ def test_broker_attributes_builder_failure_and_combat_success_in_same_step() -> 
         game_loop=20811,
     )
     broker.settle_primitive(combat, success=True, game_loop=20811)
+    broker.observe_effects(_combat_observation(20812, {0xDEF: 80.0}, {0x10: 0xDEF}))
 
     reports = {report["command_id"]: report for report in runtime.execution_reports}
     assert set(reports) == {"command-builder", "command-combat"}
@@ -4824,6 +7146,57 @@ def test_broker_attributes_builder_failure_and_combat_success_in_same_step() -> 
     assert reports["command-combat"]["status"] == "succeeded"
     assert reports["command-combat"]["pysc2_function"] == "Attack_screen"
     assert reports["command-combat"]["primitive_trace"][0]["failure_code"] is None
+
+
+@pytest.mark.parametrize(
+    "failure_code",
+    ["placement_query_rejected_cached", "operation_no_start_circuit_open"],
+)
+def test_raw_build_authorization_tombstones_remain_pre_dispatch(
+    failure_code: str,
+) -> None:
+    runtime = FakeRuntime()
+    coordinator = BridgeCoordinator(runtime)
+    broker = SharedDecisionBroker(
+        coordinator,
+        TimeStepExtractor("run-worker", "episode-worker"),
+    )
+    _register_bridge_route(
+        broker,
+        coordinator,
+        _bridge_route(
+            "Builder",
+            ("Builder-Probe-1",),
+            RoutedCommand(
+                command_id="command-builder-authorization",
+                actor="Builder/Builder-Probe-1",
+                team_name="Builder-Probe-1",
+                name="Build_Pylon_Screen",
+                rendered_action="<Build_Pylon_Screen([30,25])>",
+                requested_arguments=([30, 25],),
+                resolved_arguments=([30, 25],),
+            ),
+            step_id=903,
+        ),
+    )
+
+    rejected = broker.reject_command(
+        "Builder",
+        "Builder-Probe-1",
+        "Build_Pylon_Screen",
+        failure_code=failure_code,
+    )
+    assert rejected is not None
+    broker.settle_primitive(
+        rejected,
+        success=False,
+        failure_reason=failure_code,
+        game_loop=20812,
+    )
+
+    report = runtime.execution_reports[0]
+    assert report["execution_stage"] == "pre_dispatch"
+    assert report["primitive_trace"][0]["accepted"] is False
 
 
 def test_broker_keeps_same_attack_action_isolated_by_explicit_team() -> None:
@@ -4879,8 +7252,35 @@ def test_broker_keeps_same_attack_action_isolated_by_explicit_team() -> None:
 
     assert beta is not None and beta.command_id == "attack-beta"
     assert alpha is not None and alpha.command_id == "attack-alpha"
+    broker.prepare_effect(
+        beta,
+        _combat_observation(
+            899,
+            {0xAAA: 100.0, 0xBBB: 100.0},
+            {0x20: 0xBBB},
+        ),
+        builder_tag=0x20,
+        actor_tags=(0x20,),
+    )
+    broker.prepare_effect(
+        alpha,
+        _combat_observation(
+            899,
+            {0xAAA: 100.0, 0xBBB: 100.0},
+            {0x10: 0xAAA},
+        ),
+        builder_tag=0x10,
+        actor_tags=(0x10,),
+    )
     broker.settle_primitive(beta, success=True, game_loop=900)
     broker.settle_primitive(alpha, success=True, game_loop=900)
+    broker.observe_effects(
+        _combat_observation(
+            904,
+            {0xAAA: 80.0, 0xBBB: 70.0},
+            {0x10: 0xAAA, 0x20: 0xBBB},
+        )
+    )
 
     reports = {report["command_id"]: report for report in runtime.execution_reports}
     assert reports["attack-alpha"]["actor"] == "Combat/Alpha"
@@ -5027,6 +7427,78 @@ def test_worker_maps_next_action_result_to_pysc2_rejection_and_clears_chain() ->
             "detail": "PySC2 action result 1",
         }
     ]
+
+
+def test_worker_keeps_approach_move_pending_without_build_quarantine() -> None:
+    settled: list[tuple[PrimitiveDispatch, bool, str | None, int]] = []
+    action_results: list[tuple[str, list[int]]] = []
+    rejected: list[str] = []
+
+    class Broker:
+        def settle_primitive(
+            self,
+            dispatch: PrimitiveDispatch,
+            *,
+            success: bool,
+            failure_reason: str | None,
+            game_loop: int,
+        ) -> None:
+            settled.append((dispatch, success, failure_reason, game_loop))
+
+    approach = PrimitiveDispatch(
+        command_id="approach-command",
+        function_name="Move_Move_pt",
+        final_primitive=False,
+        origin="translator",
+        ordinal=0,
+        total=1,
+        requested_function_id=547,
+        emitted_function_id=547,
+    )
+    pending_raw = SimpleNamespace(
+        command=SimpleNamespace(command_id="approach-command"),
+        primitive=approach,
+        approach_only=True,
+    )
+    raw_executor = SimpleNamespace(
+        diagnostic_snapshot={},
+        mark_primitive_submitted=lambda command_id, *, game_loop: None,
+        record_action_result=lambda command_id, values: action_results.append(
+            (command_id, list(values))
+        ),
+        record_rejection=lambda *args, **kwargs: rejected.append("rejected"),
+    )
+    main_agent = cast(Any, object.__new__(RTSCortexMainAgent))
+    main_agent._pending_raw_dispatch = pending_raw
+    main_agent._pending_raw_observation = SimpleNamespace()
+    main_agent._pending_raw_game_loop = 100
+    main_agent._pending_primitive = None
+    main_agent._pending_primitive_agent = None
+    main_agent.raw_executor = raw_executor
+    main_agent.decision_broker = Broker()
+    main_agent.runtime_client = SimpleNamespace(
+        profiler=SimpleNamespace(observe_milliseconds=lambda *args: None)
+    )
+
+    main_agent.record_environment_step(0.1)
+
+    assert main_agent._pending_primitive is approach
+    assert main_agent._pending_raw_dispatch is pending_raw
+
+    main_agent._settle_previous_primitive(
+        SimpleNamespace(observation=SimpleNamespace(game_loop=[116], action_result=[1]))
+    )
+
+    assert action_results == [("approach-command", [1])]
+    assert rejected == []
+    assert len(settled) == 1
+    settled_dispatch, success, failure_reason, game_loop = settled[0]
+    assert settled_dispatch.final_primitive is False
+    assert success is False
+    assert failure_reason == "PySC2 action result 1"
+    assert game_loop == 116
+    assert main_agent._pending_primitive is None
+    assert main_agent._pending_raw_dispatch is None
 
 
 def test_worker_anchors_production_selection_barrier_to_acceptance_observation() -> None:
@@ -5335,7 +7807,7 @@ def test_broker_forwards_raw_observations_for_deferred_effect_verification() -> 
     broker.observe_effects(observation)
 
     assert coordinator.calls == [
-        ("prepare", "command-pylon", observation, 0xABC, None),
+        ("prepare", "command-pylon", observation, 0xABC, None, (), None),
         ("primitive", "command-pylon", "Build_Pylon_screen", True),
         ("complete", "command-pylon", 225),
         ("observe", observation),
@@ -5541,6 +8013,7 @@ class FakeAgent(RuntimeQueryMixin):
         self.action_lists: list[Any] = []
         self.team_unit_team_list = [team_name]
         self.team_unit_obs_list = [timestep]
+        self.team_unit_tag_list = [int(timestep.observation.raw_units[0].tag)]
         self.text_observation_calls = 0
         self.action_translation_calls = 0
         self.action_text = ""
@@ -5665,6 +8138,9 @@ class FakeRuntime:
     def execution(self, report: dict[str, Any]) -> None:
         self.execution_reports.append(report)
 
+    def placement_transition(self, event: dict[str, Any]) -> None:
+        del event
+
     def end_episode(self, result: dict[str, Any]) -> None:
         self.episode_results.append(result)
 
@@ -5692,8 +8168,20 @@ class EffectRecordingCoordinator:
         *,
         builder_tag: int | None,
         producer_tag: int | None = None,
+        actor_tags: tuple[int, ...] = (),
+        minimap_transform: tuple[float, float, float, float, float] | None = None,
     ) -> None:
-        self.calls.append(("prepare", command_id, observation, builder_tag, producer_tag))
+        self.calls.append(
+            (
+                "prepare",
+                command_id,
+                observation,
+                builder_tag,
+                producer_tag,
+                actor_tags,
+                minimap_transform,
+            )
+        )
 
     def record_primitive(
         self,

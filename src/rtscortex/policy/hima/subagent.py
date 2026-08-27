@@ -140,7 +140,7 @@ class TransformersHIMAGenerator:
         model_id: str,
         allow_unlicensed_weights: bool,
         device: str = "cuda",
-        max_new_tokens: int = 2048,
+        max_new_tokens: int = 512,
     ) -> None:
         if not allow_unlicensed_weights:
             raise PermissionError(

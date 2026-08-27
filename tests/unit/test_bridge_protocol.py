@@ -6,11 +6,19 @@ from typing import Any, cast
 
 import pytest
 from rtscortex_llm_pysc2.coordinator import BridgeCoordinator
+from rtscortex_llm_pysc2.effect_verifier import ActionEffectVerifier
 from rtscortex_llm_pysc2.execution import ExecutionTracker
 from rtscortex_llm_pysc2.observation import ObservationMapper, canonical_actor, split_actor
+from rtscortex_llm_pysc2.raw_placement import RawPlacementService
 from rtscortex_llm_pysc2.routing import ActionRouter, RoutedActionBatch
 
-from rtscortex.contracts import ActionBatch, ExecutionReport, ObservationEnvelope
+from rtscortex.contracts import (
+    ActionBatch,
+    ExecutionReport,
+    ObservationEnvelope,
+    PlacementLedgerEvent,
+)
+from rtscortex.cortex.operations import AttemptKey
 from rtscortex.runtime.validation import ActionValidator
 
 FIXTURES = Path(__file__).parents[1] / "fixtures" / "llm_pysc2"
@@ -116,6 +124,128 @@ def test_execution_tracker_aggregates_multiple_pysc2_primitives() -> None:
     assert validated.primitive_trace[1].emitted_function_id == 12
 
 
+def test_execution_tracker_rejects_authoritative_evidence_for_a_different_parent_action() -> None:
+    route = _fixture_route()
+    tracker = ExecutionTracker()
+    tracker.register(route)
+    evidence = {
+        "operation_id": None,
+        "action_name": "Build_Pylon_Screen",
+        "command_id": "command-adept-attack",
+        "failure_code": "placement_query_rejected",
+        "status": "retry",
+        "streak": 1,
+        "threshold": 3,
+        "circuit_open": False,
+        "duplicate_attempt": False,
+        "attempt_ordinal": None,
+        "builder_tag": 0xB1,
+        "ability_id": 881,
+        "world_target": [30.0, 25.0],
+        "material_legality_identity": f"build-legality:{'a' * 64}",
+        "material_evidence_valid": False,
+        "invalid_evidence_reasons": ["operation_id_missing"],
+        "next_action": "retry",
+    }
+    tracker.record_primitive(
+        "command-adept-attack",
+        "raw_pre_dispatch",
+        success=False,
+        failure_code="placement_query_rejected",
+        authoritative_pre_dispatch=evidence,
+    )
+
+    report = tracker.complete("command-adept-attack")
+
+    with pytest.raises(ValueError, match="execution parent identity"):
+        ExecutionReport.model_validate(report)
+
+
+def test_authoritative_success_reset_round_trip_preserves_provenance() -> None:
+    operation_id = f"operation:{'a' * 64}"
+    command_id = "command-pylon-reset"
+    attempt_ordinal = 3
+    attempt_id = AttemptKey(
+        operation_id=operation_id,
+        command_id=command_id,
+        attempt_ordinal=attempt_ordinal,
+    ).attempt_id
+    material_identity = f"build-legality:{'b' * 64}"
+    payload = {
+        "protocol_version": "1.1",
+        "run_id": "run-fixture",
+        "episode_id": "episode-pvz-task1",
+        "step_id": 8,
+        "command_id": command_id,
+        "operation_id": operation_id,
+        "attempt_id": attempt_id,
+        "attempt_ordinal": attempt_ordinal,
+        "action_name": "Build_Pylon_Screen",
+        "transition_id": f"placement-transition:{'c' * 64}",
+        "builder_tag": "0xb1",
+        "builder_lease_state": None,
+        "transition": {
+            "operation_id": operation_id,
+            "command_id": command_id,
+            "action_name": "Build_Pylon_Screen",
+            "attempt_id": attempt_id,
+            "attempt_ordinal": attempt_ordinal,
+            "reservation_id": f"placement:{'d' * 64}",
+            "structure_type": "Pylon",
+            "footprint_cells": [[29, 24], [29, 25], [30, 24], [30, 25]],
+            "previous_state": "reserved",
+            "next_state": "build_started",
+            "failure_class": None,
+            "actor_failure": False,
+            "game_loop": 240,
+            "release_reason": "build_start_observed",
+            "target_state_revision": "target-revalidated",
+            "builder_tag": 0xB1,
+            "ability_id": 881,
+            "world_target": [30.0, 25.0],
+            "material_legality_identity": material_identity,
+            "authoritative_pre_dispatch": {
+                "operation_id": operation_id,
+                "action_name": "Build_Pylon_Screen",
+                "command_id": command_id,
+                "failure_code": "build_started",
+                "status": "reset",
+                "streak": 0,
+                "threshold": 3,
+                "circuit_open": False,
+                "duplicate_attempt": False,
+                "attempt_id": attempt_id,
+                "attempt_ordinal": attempt_ordinal,
+                "builder_tag": 0xB1,
+                "ability_id": 881,
+                "world_target": [30.0, 25.0],
+                "target_state_revision": "target-revalidated",
+                "material_legality_identity": material_identity,
+                "material_evidence_valid": True,
+                "invalid_evidence_reasons": [],
+                "state_transition": "open_to_reset",
+                "reset_reason": "build_started",
+                "next_action": "retry",
+            },
+        },
+    }
+
+    first = PlacementLedgerEvent.model_validate(payload)
+    second = PlacementLedgerEvent.model_validate(first.model_dump(mode="json"))
+
+    assert second == first
+    nested = second.transition.authoritative_pre_dispatch
+    assert nested is not None
+    assert nested.builder_tag == second.transition.builder_tag == 0xB1
+    assert nested.ability_id == second.transition.ability_id == 881
+    assert nested.world_target == second.transition.world_target == (30.0, 25.0)
+    assert (
+        nested.material_legality_identity
+        == second.transition.material_legality_identity
+        == material_identity
+    )
+
+
 def test_coordinator_calls_runtime_once_and_reports_execution() -> None:
     runtime = FakeRuntime(load_fixture("action_batch.json"))
     coordinator = BridgeCoordinator(runtime)
@@ -141,12 +271,27 @@ def test_coordinator_calls_runtime_once_and_reports_execution() -> None:
 def test_coordinator_defers_build_report_until_raw_state_confirms_effect() -> None:
     snapshot = _build_snapshot()
     runtime = FakeRuntime(_build_batch())
-    coordinator = BridgeCoordinator(runtime)
+    placement_service = RawPlacementService(unit_names={})
+    baseline = _raw_effect_observation(game_loop=224, minerals=250)
+    placement_service.resolve(
+        command_id="command-pylon",
+        action_name="Build_Pylon_Screen",
+        requested_arguments=([65, 65],),
+        observation=baseline,
+        world_target=(32.0, 30.0),
+        builder_tag=0xABC,
+    )
+    coordinator = BridgeCoordinator(
+        runtime,
+        effect_verifier=ActionEffectVerifier(
+            placement_service=placement_service,
+        ),
+    )
 
     coordinator.decide(snapshot, {"Builder": ["Builder-Probe-1"]})
     coordinator.prepare_effect(
         "command-pylon",
-        _raw_effect_observation(game_loop=224, minerals=250),
+        baseline,
         builder_tag=0xABC,
     )
     coordinator.record_primitive(
@@ -169,6 +314,11 @@ def test_coordinator_defers_build_report_until_raw_state_confirms_effect() -> No
     assert len(reports) == 1
     assert reports[0]["success"] is True
     assert reports[0]["pysc2_function"] == "Build_Pylon_screen"
+    assert [
+        transition["next_state"]
+        for transition in reports[0]["effect_evidence"]["placement_ledger_transitions"]
+    ] == ["reserved", "build_started", "occupied", "released"]
+    assert placement_service.command_target("command-pylon") is None
     assert runtime.execution_reports == reports
     assert coordinator.observe_effects(_raw_effect_observation(game_loop=268, minerals=175)) == []
 
@@ -263,7 +413,7 @@ def test_coordinator_does_not_report_one_structure_for_two_commands() -> None:
 
     timeout_reports = coordinator.observe_effects(
         _raw_effect_observation(
-            game_loop=337,
+            game_loop=673,
             minerals=300,
             structures=["Nexus", "Pylon"],
         )
@@ -306,16 +456,32 @@ def test_coordinator_defers_move_minimap_until_builder_starts_moving() -> None:
         "command-move",
         _raw_move_observation(game_loop=224, center=(8, 8)),
         builder_tag=0xABC,
+        actor_tags=(0xABC,),
+        minimap_transform=(1.0, 0.0, 0.0, 64.0, 63.0),
     )
     coordinator.record_primitive("command-move", "Move_minimap", success=True)
 
     assert coordinator.complete_command("command-move", game_loop=225) is None
     assert coordinator.effect_verifier.blocks_auto_worker_management is False
     assert runtime.execution_reports == []
-    assert coordinator.observe_effects(_raw_move_observation(game_loop=300, center=(48, 48))) == []
+    assert (
+        coordinator.observe_effects(
+            _raw_move_observation(
+                game_loop=300,
+                center=(48, 48),
+                builder_orders=[13],
+            )
+        )
+        == []
+    )
 
     reports = coordinator.observe_effects(
-        _raw_move_observation(game_loop=320, center=(8, 8), builder_position=(31.5, 30))
+        _raw_move_observation(
+            game_loop=320,
+            center=(8, 8),
+            builder_position=(48, 16),
+            builder_orders=[13],
+        )
     )
 
     assert len(reports) == 1
@@ -327,9 +493,10 @@ def test_coordinator_defers_move_minimap_until_builder_starts_moving() -> None:
     assert report.effect_evidence.target_type == "Move_Minimap"
     assert report.effect_evidence.target_position == (48.0, 48.0)
     assert report.effect_evidence.confirmed_game_loop == 320
-    assert report.effect_evidence.baseline_builder_position == (30.0, 30.0)
-    assert report.effect_evidence.observed_builder_position == (31.5, 30.0)
-    assert report.effect_evidence.builder_displacement == 1.5
+    assert report.effect_evidence.baseline_builder_position == (30.0, 34.0)
+    assert report.effect_evidence.observed_builder_position == (48.0, 48.0)
+    assert report.effect_evidence.builder_displacement is not None
+    assert report.effect_evidence.builder_displacement > 22
 
 
 def test_coordinator_reports_in_transit_move_as_unconfirmed_at_episode_end() -> None:
@@ -340,6 +507,8 @@ def test_coordinator_reports_in_transit_move_as_unconfirmed_at_episode_end() -> 
         "command-move",
         _raw_move_observation(game_loop=224, center=(8, 8)),
         builder_tag=0xABC,
+        actor_tags=(0xABC,),
+        minimap_transform=(1.0, 0.0, 0.0, 64.0, 63.0),
     )
     coordinator.record_primitive("command-move", "Move_minimap", success=True)
     assert coordinator.complete_command("command-move", game_loop=225) is None
@@ -684,6 +853,9 @@ class FakeRuntime:
 
     def execution(self, report: dict[str, Any]) -> None:
         self.execution_reports.append(report)
+
+    def placement_transition(self, event: dict[str, Any]) -> None:
+        del event
 
     def end_episode(self, result: dict[str, Any]) -> None:
         self.episode_results.append(result)

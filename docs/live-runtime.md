@@ -488,6 +488,13 @@ least one world unit from its dispatch position. The global camera mask is diagn
 cannot confirm a team-owned movement command. No order and no displacement within one base
 effect window produces `effect_timeout`.
 
+`Attack_Unit` is also effect-tracked. API acceptance keeps the command pending until the exact
+enemy tag loses health/shields or is removed from the next observation; unchanged health through
+the effect window becomes `combat_effect_not_observed`. Tactical targeting distinguishes the
+current-screen candidate domain from last-known enemies. It attacks current-screen units first,
+then surviving enemy structures, and otherwise advances actor-local combat groups through
+different minimap waypoints instead of leaving a completed army at home.
+
 Asynchronous plans record independent Planner start and acceptance loops. Planner starts use
 a fixed single-flight cadence; accepting a plan does not reset that cadence. Runtime-owned
 command TTL begins at acceptance. Each command then moves once through pending, deferred,
@@ -508,13 +515,22 @@ or duplicate a command. Death confirmation advances on every SC2 observation eve
 upstream action loop is locked, preventing a permanently missing team head from stalling the
 environment worker.
 The Worker also measures the gap from each SC2 observation to the latest Runtime decision. At
-`environment.observation_gap_watchdog_game_loops` it disables optional worker automation and asks
-the reviewed upstream hook to skip team gathering until a new Runtime decision arrives. If the
-gap reaches `environment.observation_gap_hard_limit_game_loops`, the run fails explicitly instead
-of allowing a seed-1-style multi-thousand-loop blind interval.
+`environment.observation_gap_watchdog_game_loops` it disables optional worker automation, asks
+the reviewed upstream hook to skip team gathering, force-clears the stalled camera/selection
+chain, and completes new-unit bookkeeping without another camera round trip. Every command-owned
+camera/selection chain has the independent `environment.orchestration_primitive_budget`;
+exceeding it produces a structured failure instead of starving Runtime. If the gap reaches
+`environment.observation_gap_hard_limit_game_loops`, the run fails explicitly instead of allowing
+a multi-thousand-loop blind interval.
 An actor disappearing while its upstream team is executing transport `No_Operation` clears that
 control action without producing an execution report; unattributed semantic actions remain a
 fatal Bridge integrity violation.
+
+When no remote resource-cluster anchor is known, the Worker runs a bounded, best-effort expansion
+camera scout. It rotates through unexplored pathable minimap waypoints at
+`environment.expansion_scout_interval_game_loops`, updates persistent world anchors on every SC2
+frame, and stops as soon as an expansion anchor is available. Scouting never runs while an action,
+effect verification, watchdog recovery, or Runtime observation is pending.
 
 Live payloads use protocol 1.1. Empty decisions carry an `idle_reason` and no semantic
 NoOp command. SC2 transport NoOps are counted separately and never enter gameplay success

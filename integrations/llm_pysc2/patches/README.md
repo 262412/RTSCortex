@@ -84,12 +84,52 @@ git -C third_party/LLM-PySC2 apply --check \
   ../../integrations/llm_pysc2/patches/0020-validate-gather-screen-target.patch
 git -C third_party/LLM-PySC2 apply \
   ../../integrations/llm_pysc2/patches/0020-validate-gather-screen-target.patch
+git -C third_party/LLM-PySC2 apply --check \
+  ../../integrations/llm_pysc2/patches/0021-use-clamped-stop-worker-selection.patch
+git -C third_party/LLM-PySC2 apply \
+  ../../integrations/llm_pysc2/patches/0021-use-clamped-stop-worker-selection.patch
+git -C third_party/LLM-PySC2 apply --check \
+  ../../integrations/llm_pysc2/patches/0022-bypass-frequency-for-forced-runtime-decision.patch
+git -C third_party/LLM-PySC2 apply \
+  ../../integrations/llm_pysc2/patches/0022-bypass-frequency-for-forced-runtime-decision.patch
+git -C third_party/LLM-PySC2 apply --check \
+  ../../integrations/llm_pysc2/patches/0023-skip-feature-action-printing-in-raw-mode.patch
+git -C third_party/LLM-PySC2 apply \
+  ../../integrations/llm_pysc2/patches/0023-skip-feature-action-printing-in-raw-mode.patch
+git -C third_party/LLM-PySC2 apply --check \
+  ../../integrations/llm_pysc2/patches/0024-route-managed-logs-and-profile-env-step.patch
+git -C third_party/LLM-PySC2 apply \
+  ../../integrations/llm_pysc2/patches/0024-route-managed-logs-and-profile-env-step.patch
+git -C third_party/LLM-PySC2 apply --check \
+  ../../integrations/llm_pysc2/patches/0025-install-read-only-build-query-capability.patch
+git -C third_party/LLM-PySC2 apply \
+  ../../integrations/llm_pysc2/patches/0025-install-read-only-build-query-capability.patch
 ```
 
 After the live run, restore the clean pinned checkout by reversing exactly these reviewed
 patches in reverse order:
 
 ```bash
+git -C third_party/LLM-PySC2 apply --reverse --check \
+  ../../integrations/llm_pysc2/patches/0025-install-read-only-build-query-capability.patch
+git -C third_party/LLM-PySC2 apply --reverse \
+  ../../integrations/llm_pysc2/patches/0025-install-read-only-build-query-capability.patch
+git -C third_party/LLM-PySC2 apply --reverse --check \
+  ../../integrations/llm_pysc2/patches/0024-route-managed-logs-and-profile-env-step.patch
+git -C third_party/LLM-PySC2 apply --reverse \
+  ../../integrations/llm_pysc2/patches/0024-route-managed-logs-and-profile-env-step.patch
+git -C third_party/LLM-PySC2 apply --reverse --check \
+  ../../integrations/llm_pysc2/patches/0023-skip-feature-action-printing-in-raw-mode.patch
+git -C third_party/LLM-PySC2 apply --reverse \
+  ../../integrations/llm_pysc2/patches/0023-skip-feature-action-printing-in-raw-mode.patch
+git -C third_party/LLM-PySC2 apply --reverse --check \
+  ../../integrations/llm_pysc2/patches/0022-bypass-frequency-for-forced-runtime-decision.patch
+git -C third_party/LLM-PySC2 apply --reverse \
+  ../../integrations/llm_pysc2/patches/0022-bypass-frequency-for-forced-runtime-decision.patch
+git -C third_party/LLM-PySC2 apply --reverse --check \
+  ../../integrations/llm_pysc2/patches/0021-use-clamped-stop-worker-selection.patch
+git -C third_party/LLM-PySC2 apply --reverse \
+  ../../integrations/llm_pysc2/patches/0021-use-clamped-stop-worker-selection.patch
 git -C third_party/LLM-PySC2 apply --reverse --check \
   ../../integrations/llm_pysc2/patches/0020-validate-gather-screen-target.patch
 git -C third_party/LLM-PySC2 apply --reverse \
@@ -174,6 +214,15 @@ git -C third_party/LLM-PySC2 apply --reverse \
 
 Do not configure Git to ignore dirty submodules: that would also hide accidental upstream
 edits or gitlink drift.
+
+`0024-route-managed-logs-and-profile-env-step.patch` requires the managed supervisor's
+absolute `RTSCORTEX_LLM_LOG_DIR`, routes all logger outputs and copied templates beneath that
+run-owned root, and reports the PySC2 environment-step duration to the Bridge profiler. It
+prevents runtime writes from changing the attested reviewed source tree.
+
+`0025-install-read-only-build-query-capability.patch` gives RTSCortex agents a narrow
+per-episode wrapper around the SC2 controller's read-only ability and exact placement query.
+The wrapper is installed by the reviewed run loop and never exposes the controller itself.
 
 `0001-return-noop-while-awaiting-runtime.patch` changes one branch in `MainAgent.step`.
 The upstream implementation currently spins inside its bounded `while` loop while an
@@ -268,7 +317,10 @@ when the gap since the latest Runtime decision exceeds the configured game-loop 
 `0016-accept-visible-team-unit.patch` stops camera centering from interrupting selection when a
 team unit is already safely visible. Units on the outer two-percent viewport margin are still
 recentered because PySC2 cannot reliably select a clipped actor at the feature-screen edge.
-RTSCortex enables this behavior because its Runtime observation is global; selection remains
+The Builder is recentered whenever it is off-center so observation-time build candidates and
+dispatch-time placement share one stable viewport. Once it is centered, the current viewport wins
+over a stale cached team camera position instead of moving the camera away again. RTSCortex enables
+the broader visible-unit behavior because its Runtime observation is global; selection remains
 required later for actual feature actions.
 
 `0017-return-camera-settlement-noop.patch` yields the current SC2 step after a production
@@ -290,7 +342,20 @@ coordinates before upstream automatic team gathering emits `Move_screen`. New un
 join their logical team, but orchestration cannot terminate SC2 with a negative or edge-overflow
 screen target.
 
-CI applies all twenty patches in order under Python 3.9, compiles and imports both projects, and
+`0021-use-clamped-stop-worker-selection.patch` fixes the upstream gas-worker stop chain so the
+clamped feature-screen coordinate is the value passed to `select_point`. Its upper bound is
+`size_screen - 1`, matching PySC2's half-open action-space range.
+
+`0022-bypass-frequency-for-forced-runtime-decision.patch` lets the explicit RTSCortex watchdog
+force flag bypass only the upstream LLM decision-frequency throttle. Normal main-loop cadence is
+unchanged, while a recovery observation can reach Runtime in the tick that preempts a stalled
+camera or selection chain.
+
+`0023-skip-feature-action-printing-in-raw-mode.patch` makes PySC2's optional diagnostic wrapper
+ignore the feature-only `available_actions` field when the environment is configured for RAW
+actions. Feature-action runs retain the original printing behavior.
+
+CI applies all twenty-three patches in order under Python 3.9, compiles and imports both projects, and
 runs `integrations/llm_pysc2/tests/python39_contract_smoke.py`. The smoke locks the v1.1
 candidate mapping, multi-argument translator rejection, Nexus camera-settlement primitive,
 exact Nexus anchor, floating-point resource clearance, visible complete-footprint behavior,

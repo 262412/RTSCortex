@@ -14,6 +14,8 @@ class ScreenCandidateMetadata:
 
     world_target: tuple[float, float]
     anchor_tag: int
+    placement_candidate_id: str | None = None
+    placement_revision: str | None = None
 
 
 class BridgeAvailableAction(dict[str, Any]):
@@ -52,12 +54,16 @@ class ObservationMapper:
     def map(self, snapshot: Mapping[str, Any]) -> dict[str, Any]:
         player = _mapping(snapshot["player_common"], "player_common")
         units = [_mapping(item, "units item") for item in _list(snapshot["units"], "units")]
+        actors_by_tag = _actors_by_unit_tag(snapshot["teams"])
 
         own_units: list[dict[str, Any]] = []
         own_structures: list[dict[str, Any]] = []
         visible_enemies: list[dict[str, Any]] = []
         for unit in units:
-            mapped = _map_unit(unit)
+            mapped = _map_unit(
+                unit,
+                actor_scopes=actors_by_tag.get(int(unit["tag"]), ()),
+            )
             if unit["alliance"] == "enemy":
                 visible_enemies.append(mapped)
             elif unit["alliance"] == "self" and bool(unit["is_structure"]):
@@ -114,14 +120,33 @@ def split_actor(actor: str) -> tuple[str, str]:
     return parts[0], parts[1]
 
 
-def _map_unit(unit: Mapping[str, Any]) -> dict[str, Any]:
+def _map_unit(
+    unit: Mapping[str, Any],
+    *,
+    actor_scopes: tuple[str, ...] = (),
+) -> dict[str, Any]:
     health = float(unit["health"])
     health_max = float(unit["health_max"])
     health_fraction = health / health_max if health_max > 0 else 0.0
+    shield = float(unit.get("shield", 0.0))
+    shield_max = float(unit.get("shield_max", 0.0))
+    shield_fraction = shield / shield_max if shield_max > 0 else None
+    total_max = health_max + shield_max
+    durability_fraction = (health + shield) / total_max if total_max > 0 else 0.0
     position = _list(unit["position"], "unit position")
     if len(position) != 2:
         raise ValueError("unit position must contain exactly two coordinates")
-    return {
+    raw_minimap_position = unit.get("minimap_position")
+    minimap_position = None
+    if raw_minimap_position is not None:
+        mapped_minimap_position = _list(raw_minimap_position, "unit minimap position")
+        if len(mapped_minimap_position) != 2:
+            raise ValueError("unit minimap position must contain exactly two coordinates")
+        minimap_position = [
+            float(mapped_minimap_position[0]),
+            float(mapped_minimap_position[1]),
+        ]
+    mapped = {
         "unit_id": _format_tag(unit["tag"]),
         "unit_type": str(unit["unit_type"]),
         "alliance": str(unit["alliance"]),
@@ -130,6 +155,27 @@ def _map_unit(unit: Mapping[str, Any]) -> dict[str, Any]:
         "energy": None if unit["energy"] is None else float(unit["energy"]),
         "status": None if unit["status"] is None else str(unit["status"]),
     }
+    if shield_max > 0:
+        mapped["shield_fraction"] = shield_fraction
+        mapped["durability_fraction"] = durability_fraction
+    if actor_scopes:
+        mapped["actor_scopes"] = list(actor_scopes)
+    if minimap_position is not None:
+        mapped["minimap_position"] = minimap_position
+    return mapped
+
+
+def _actors_by_unit_tag(value: Any) -> dict[int, tuple[str, ...]]:
+    result: dict[int, list[str]] = {}
+    for team_value in _list(value, "teams"):
+        team = _mapping(team_value, "teams item")
+        actor = canonical_actor(str(team["agent_name"]), str(team["team_name"]))
+        for tag in _list(team.get("unit_tags", []), "unit_tags"):
+            parsed = int(tag)
+            if parsed <= 0:
+                continue
+            result.setdefault(parsed, []).append(actor)
+    return {tag: tuple(dict.fromkeys(actors)) for tag, actors in result.items()}
 
 
 def _map_production_item(item: Mapping[str, Any]) -> dict[str, Any]:
@@ -204,6 +250,14 @@ def _map_screen_provenance(
         result[target] = ScreenCandidateMetadata(
             world_target=(float(world[0]), float(world[1])),
             anchor_tag=int(item["anchor_tag"]),
+            placement_candidate_id=(
+                None
+                if item.get("placement_candidate_id") is None
+                else str(item["placement_candidate_id"])
+            ),
+            placement_revision=(
+                None if item.get("placement_revision") is None else str(item["placement_revision"])
+            ),
         )
     return result
 

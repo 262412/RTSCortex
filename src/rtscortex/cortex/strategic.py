@@ -12,6 +12,7 @@ from pydantic import Field, model_validator
 from rtscortex.contracts import ObservationEnvelope
 from rtscortex.contracts.models import ContractModel
 from rtscortex.cortex.models import CortexIntent, MacroIntent, ReflexIntent, TacticalIntent
+from rtscortex.cortex.operations import OperationKey
 from rtscortex.races import ActionDomain, RaceProfile
 
 
@@ -52,6 +53,7 @@ class ResourceClaim(ContractModel):
 class StrategicIntent(ContractModel):
     schema_version: str = "2.0"
     intent_id: str = Field(min_length=1)
+    operation_id: str | None = Field(default=None, pattern=r"^operation:[0-9a-f]{64}$")
     continuity_key: str = Field(min_length=1)
     run_id: str = Field(min_length=1)
     episode_id: str = Field(min_length=1)
@@ -62,9 +64,11 @@ class StrategicIntent(ContractModel):
     desired_effect: str = Field(min_length=1)
     action_names: tuple[str, ...] = Field(min_length=1)
     actor_scopes: tuple[str, ...] = ()
+    semantic_target_key: str = Field(min_length=1)
     producer_types: tuple[str, ...] = ()
     resource_claim: ResourceClaim = Field(default_factory=ResourceClaim)
     dependency_intent_ids: tuple[str, ...] = ()
+    dependency_semantic_keys: tuple[str, ...] = ()
     mutually_exclusive_groups: tuple[str, ...] = ()
     hard_blockers: tuple[str, ...] = ()
     urgency: float = Field(default=0.5, ge=0.0, le=1.0)
@@ -90,11 +94,17 @@ class StrategicIntent(ContractModel):
             ("actor_scopes", self.actor_scopes),
             ("producer_types", self.producer_types),
             ("dependency_intent_ids", self.dependency_intent_ids),
+            ("dependency_semantic_keys", self.dependency_semantic_keys),
             ("mutually_exclusive_groups", self.mutually_exclusive_groups),
             ("playbook_rule_ids", self.playbook_rule_ids),
         ):
             if len(values) != len(set(values)):
                 raise ValueError(f"{name} must be unique")
+        if len(self.dependency_intent_ids) != len(self.dependency_semantic_keys):
+            raise ValueError(
+                "dependency_intent_ids and dependency_semantic_keys must identify "
+                "the same dependencies"
+            )
         return self
 
 
@@ -178,11 +188,20 @@ class StrategicIntentAdapter:
         identity = hashlib.sha256(
             f"{intent.intent_id}|{role.value}|strategic-v2".encode()
         ).hexdigest()
+        target_key = _intent_target_key(intent)
+        semantic_actor = ",".join(sorted(intent.actor_scopes)) or "unbound"
+        operation_id = OperationKey(
+            run_id=intent.run_id,
+            episode_id=intent.episode_id,
+            role=role.value,
+            action_family=first_action,
+            semantic_actor=semantic_actor,
+            target_key=target_key,
+        ).operation_id
         return StrategicIntent(
             intent_id=f"strategic:{identity}",
-            continuity_key="|".join(
-                (role.value, first_action, intent.target.kind.value, intent.target.region or "")
-            ),
+            operation_id=operation_id,
+            continuity_key=operation_id,
             run_id=intent.run_id,
             episode_id=intent.episode_id,
             step_id=intent.step_id,
@@ -192,6 +211,7 @@ class StrategicIntentAdapter:
             desired_effect=intent.objective,
             action_names=tuple(intent.action_names),
             actor_scopes=tuple(intent.actor_scopes),
+            semantic_target_key=target_key,
             producer_types=self.profile.data.producers_for_action(first_action),
             resource_claim=ResourceClaim(
                 minerals=0 if spec is None else spec.minerals,
@@ -211,7 +231,15 @@ class StrategicIntentAdapter:
             emergency=(
                 role is RoleId.RETREAT
                 or isinstance(intent, ReflexIntent)
-                and first_action not in {"Effect_InjectLarva", "Build_CreepTumor_Queen_Screen"}
+                and first_action
+                not in {
+                    "Effect_InjectLarva",
+                    "Build_CreepTumor_Queen_Screen",
+                    "Build_CreepTumor_Tumor_Screen",
+                    "Train_SCV",
+                    "Morph_OrbitalCommand",
+                    "Effect_CalldownMULE_Screen",
+                }
             ),
             horizon_game_loops=commitment,
             ttl_game_loops=intent.ttl_game_loops,
@@ -235,6 +263,19 @@ class StrategicIntentAdapter:
                 return RoleId.FOCUS_FIRE
             return RoleId.OFFENSE
         return RoleId.PRODUCTION
+
+
+def _intent_target_key(intent: CortexIntent) -> str:
+    target = intent.target
+    if target.unit_tag is not None:
+        return f"unit:{target.unit_tag.casefold()}"
+    if target.position is not None:
+        return "position:" + ",".join(f"{float(value):.3f}" for value in target.position)
+    if target.structure_type is not None:
+        return f"structure:{target.structure_type.casefold()}:{target.region or 'any'}"
+    if target.unit_type is not None:
+        return f"type:{target.unit_type.casefold()}:{target.region or 'any'}"
+    return f"{target.kind.value}:{target.region or 'global'}"
 
 
 class IntentArbiter:
@@ -266,7 +307,6 @@ class IntentArbiter:
         conflicts = _build_conflicts(intents)
         rejected: dict[str, tuple[IntentDecisionStatus, str]] = {}
         eligible: list[StrategicIntent] = []
-        role_winners: dict[RoleId, StrategicIntent] = {}
         for intent in sorted(intents, key=lambda item: (-item.priority, item.intent_id)):
             if observation.game_loop - intent.created_game_loop >= intent.ttl_game_loops:
                 rejected[intent.intent_id] = (IntentDecisionStatus.REJECTED, "intent_expired")
@@ -277,13 +317,6 @@ class IntentArbiter:
                     "hard_precondition_failed",
                 )
                 continue
-            if intent.role in role_winners:
-                rejected[intent.intent_id] = (
-                    IntentDecisionStatus.DEFERRED,
-                    "lower_priority_same_role",
-                )
-                continue
-            role_winners[intent.role] = intent
             eligible.append(intent)
         eligible = eligible[: self.max_intents]
         scores = {
@@ -428,10 +461,9 @@ def _build_conflicts(intents: Sequence[StrategicIntent]) -> list[IntentConflict]
     for left, right in itertools.combinations(intents, 2):
         kind: IntentConflictKind | None = None
         detail = ""
-        if left.role is right.role:
-            kind = IntentConflictKind.ROLE
-            detail = f"both intents own role {left.role.value}"
-        elif set(left.actor_scopes).intersection(right.actor_scopes):
+        left_actors = set(left.actor_scopes)
+        right_actors = set(right.actor_scopes)
+        if left_actors.intersection(right_actors):
             kind = IntentConflictKind.ACTOR
             detail = "actor scopes overlap"
         elif set(left.producer_types).intersection(right.producer_types):
@@ -440,6 +472,9 @@ def _build_conflicts(intents: Sequence[StrategicIntent]) -> list[IntentConflict]
         elif set(left.mutually_exclusive_groups).intersection(right.mutually_exclusive_groups):
             kind = IntentConflictKind.OBJECTIVE
             detail = "strategic objective groups are mutually exclusive"
+        elif left.role is right.role and (not left_actors or not right_actors):
+            kind = IntentConflictKind.ROLE
+            detail = f"actor-free intents both own role {left.role.value}"
         if kind is None:
             continue
         pair = tuple(sorted((left.intent_id, right.intent_id)))

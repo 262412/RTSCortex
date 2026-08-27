@@ -97,3 +97,11 @@ sources:
     journal_path: ~/scratch/outputs/RTSCortex/cortex-20260719T023618898910Z-fff37260/events.jsonl
     seed: 2
     map_name: Simple64
+  - source_id: seed-0-targeted-capture
+    journal_path: ~/scratch/outputs/RTSCortex/cortex-20260719T092258929609Z-fa2a29c3/events.jsonl
+    seed: 0
+    map_name: Simple64
+  - source_id: seed-2-targeted-capture
+    journal_path: ~/scratch/outputs/RTSCortex/cortex-20260719T092631592073Z-16fda5b2/events.jsonl
+    seed: 2
+    map_name: Simple64

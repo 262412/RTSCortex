@@ -1,0 +1,68 @@
+--- a/pysc2/env/run_loop.py
++++ b/pysc2/env/run_loop.py
+@@ -14,7 +14,57 @@
+ """A run loop for agent/environment interaction."""
+ 
++import json
+ import time
+ 
++from pysc2.env import base_env_wrapper
++
++
++def _unwrap_base_env(env):
++  """Return the concrete environment without exposing wrapper internals."""
++  wrapper_types = []
++  while isinstance(env, base_env_wrapper.BaseEnvWrapper):
++    wrapper_types.append(type(env).__name__)
++    env = env._env  # pylint: disable=protected-access
++  return env, wrapper_types
++
++
++def _install_raw_build_query_capabilities(agents, env):
++  """Bind each opted-in agent to its narrow read-only SC2 query capability."""
++  concrete_env, wrapper_types = _unwrap_base_env(env)
++  controllers = getattr(concrete_env, "_controllers", ()) or ()
++  for index, agent in enumerate(agents):
++    setter = getattr(agent, "set_raw_build_query_capability", None)
++    if setter is None:
++      continue
++    if index >= len(controllers) or controllers[index] is None:
++      raise RuntimeError(
++          "raw build query capability startup failed: "
++          "controller unavailable for agent index %s" % index)
++    try:
++      from rtscortex_llm_pysc2.worker import SC2RawBuildQueryCapability
++      capability = SC2RawBuildQueryCapability(controllers[index])
++    except Exception as error:
++      raise RuntimeError(
++          "raw build query capability startup failed: "
++          "capability construction failed for agent index %s (%s)" %
++          (index, type(error).__name__)) from error
++    try:
++      setter(capability)
++    except Exception as error:
++      raise RuntimeError(
++          "raw build query capability startup failed: "
++          "agent installation failed for agent index %s (%s)" %
++          (index, type(error).__name__)) from error
++    print(json.dumps({
++        "event": "raw_build_query_capability_startup",
++        "raw_build_query_capability_installed": True,
++        "controller_count": len(controllers),
++        "agent_index": index,
++        "controller_index": index,
++        "wrapper_depth": len(wrapper_types),
++        "wrapper_types": wrapper_types,
++    }, sort_keys=True, separators=(",", ":")))
++
+ 
+ def run_loop(agents, env, max_frames=0, max_episodes=0):
+   """A run loop to have agents and an environment interact."""
+@@ -31,6 +81,7 @@
+       timesteps = env.reset()
+       for a in agents:
+         a.reset()
++      _install_raw_build_query_capabilities(agents, env)
+       while True:
+         total_frames += 1
+         actions = [agent.step(timestep)

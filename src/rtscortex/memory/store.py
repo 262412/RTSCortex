@@ -2,18 +2,72 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import queue
 import sqlite3
 import threading
+import time
+from collections import deque
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel
 
 from rtscortex.contracts import EpisodeResult, EpisodeSummary
+
+_HIGH_FREQUENCY_EVENT_TYPES = frozenset(
+    {
+        "observation",
+        "situation_assessed",
+        "situation_shadow_assessed",
+        "decision",
+        "candidate_set_built",
+        "intent_emitted",
+        "role_intent_emitted",
+        "intent_arbitrated",
+    }
+)
+_IDENTITY_SENSITIVE_EVENT_TYPES = frozenset(
+    {
+        "candidate_set_built",
+        "intent_emitted",
+        "role_intent_emitted",
+        "intent_arbitrated",
+    }
+)
+_RETENTION_CHECKPOINT_INTERVAL = 64
+_RETENTION_CHECKPOINT_GAME_LOOPS = 224
+_VOLATILE_STATE_KEYS = frozenset(
+    {
+        "protocol_version",
+        "run_id",
+        "episode_id",
+        "step_id",
+        "game_loop",
+        "created_at",
+        "created_game_loop",
+        "selected_game_loop",
+        "latency_ms",
+        "tick_latency_ms",
+        "planner_latency_ms",
+        "reflex_latency_ms",
+    }
+)
+_VOLATILE_DECISION_ID_KEYS = frozenset(
+    {
+        "decision_id",
+        "command_id",
+        "operation_id",
+        "attempt_id",
+        "intent_id",
+        "candidate_id",
+        "selection_id",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -37,30 +91,250 @@ class StoredLesson:
     created_at: str
 
 
+@dataclass(frozen=True)
+class StoredSnapshot:
+    run_id: str
+    episode_id: str
+    snapshot_type: str
+    through_event_id: int
+    step_id: int
+    created_at: str
+    payload: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class EventStorePerformance:
+    enqueued_events: int
+    written_events: int
+    max_queue_depth: int
+    current_queue_depth: int
+    queue_capacity: int
+    append_latency_ms_mean: float
+    writer_lag_ms_p95: float
+    writer_lag_ms_max: float
+    blocked_append_count: int
+    sampled_drop_supported: bool
+    subscriber_dropped_events: int
+    subscriber_callbacks_under_durable_lock: int
+    journal_bytes: int
+
+
+class IdempotencyConflictError(RuntimeError):
+    """A durable idempotency key was retried with a different payload."""
+
+
+@dataclass(frozen=True)
+class PlacementTransitionAppendResult:
+    status: Literal["recorded", "already_recorded"]
+    event_id: int
+
+
+@dataclass(frozen=True)
+class _FlushBarrier:
+    completed: threading.Event
+
+
+@dataclass(frozen=True)
+class _StopWriter:
+    pass
+
+
+@dataclass(frozen=True)
+class _SnapshotRecord:
+    snapshot: StoredSnapshot
+
+
+@dataclass
+class _IdempotentPlacementRecord:
+    record: StoredEvent
+    transition_id: str
+    payload_hash: str
+    completed: threading.Event
+    result: PlacementTransitionAppendResult | None = None
+    error: BaseException | None = None
+
+
+@dataclass
+class _SubscriberWorker:
+    callback: Callable[[StoredEvent], None]
+    queue: queue.Queue[StoredEvent | None]
+    thread: threading.Thread
+    dropped_events: int = 0
+
+
 def _json_payload(payload: BaseModel | dict[str, Any]) -> dict[str, Any]:
     if isinstance(payload, BaseModel):
         return payload.model_dump(mode="json")
     return payload
 
 
+def _placement_payload_hash(
+    *,
+    run_id: str,
+    episode_id: str,
+    step_id: int,
+    payload: dict[str, Any],
+) -> str:
+    encoded = json.dumps(
+        {
+            "run_id": run_id,
+            "episode_id": episode_id,
+            "step_id": step_id,
+            "event_type": "placement_ledger_transition",
+            "payload": payload,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _require_matching_transition_id(payload: dict[str, Any], transition_id: str) -> None:
+    if not transition_id or payload.get("transition_id") != transition_id:
+        raise ValueError("placement payload transition_id does not match idempotency key")
+
+
+def _retention_fingerprint(event_type: str, payload: dict[str, Any]) -> str:
+    drop_identity = event_type not in _IDENTITY_SENSITIVE_EVENT_TYPES
+
+    def normalize(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {
+                key: normalize(item)
+                for key, item in sorted(value.items())
+                if key not in _VOLATILE_STATE_KEYS
+                and (not drop_identity or key not in _VOLATILE_DECISION_ID_KEYS)
+            }
+        if isinstance(value, list):
+            return [normalize(item) for item in value]
+        return value
+
+    encoded = json.dumps(
+        normalize(payload),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _update_retention_aggregates(
+    aggregates: dict[str, Any],
+    event_type: str,
+    payload: dict[str, Any],
+) -> None:
+    event = aggregates.setdefault(event_type, {})
+    event["logical_count"] = int(event.get("logical_count", 0)) + 1
+    if event_type == "decision":
+        raw_batch = payload.get("batch")
+        batch: dict[str, Any] = raw_batch if isinstance(raw_batch, dict) else payload
+        commands = batch.get("commands", [])
+        rejected = batch.get("rejected_commands", [])
+        event["command_count"] = int(event.get("command_count", 0)) + (
+            len(commands) if isinstance(commands, list) else 0
+        )
+        event["rejected_command_count"] = int(event.get("rejected_command_count", 0)) + (
+            len(rejected) if isinstance(rejected, list) else 0
+        )
+    if event_type not in {"situation_assessed", "situation_shadow_assessed"}:
+        return
+    raw_assessment = payload.get("assessment")
+    assessment: dict[str, Any] = raw_assessment if isinstance(raw_assessment, dict) else payload
+    level = str(assessment.get("threat_level", "unknown"))
+    levels = event.setdefault("threat_level_counts", {})
+    levels[level] = int(levels.get(level, 0)) + 1
+    evidence = assessment.get("threat_evidence", [])
+    if isinstance(evidence, (list, tuple)) and evidence:
+        event["threat_with_evidence_count"] = int(event.get("threat_with_evidence_count", 0)) + 1
+        evidence_counts = event.setdefault("threat_evidence_counts", {})
+        for item in evidence:
+            if isinstance(item, str):
+                evidence_counts[item] = int(evidence_counts.get(item, 0)) + 1
+    score = assessment.get("threat_score")
+    if isinstance(score, (int, float)) and not isinstance(score, bool):
+        event["max_threat_score"] = max(float(event.get("max_threat_score", 0.0)), float(score))
+    state = {
+        key: assessment[key]
+        for key in ("phase", "threat_level", "economy_status", "army_readiness")
+        if key in assessment
+    }
+    state_key = json.dumps(state, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    state_counts = event.setdefault("state_counts", {})
+    state_counts[state_key] = int(state_counts.get(state_key, 0)) + 1
+
+
 class EventStore:
     """Store runtime events in SQLite and mirror each event to JSONL."""
 
-    def __init__(self, database_path: Path, journal_path: Path) -> None:
+    def __init__(
+        self,
+        database_path: Path,
+        journal_path: Path,
+        *,
+        flush_event_limit: int = 64,
+        flush_interval_seconds: float = 0.25,
+        writer_queue_size: int = 8192,
+        subscriber_queue_size: int = 256,
+    ) -> None:
+        if flush_event_limit < 1:
+            raise ValueError("flush_event_limit must be positive")
+        if flush_interval_seconds <= 0:
+            raise ValueError("flush_interval_seconds must be positive")
+        if writer_queue_size < 1:
+            raise ValueError("writer_queue_size must be positive")
+        if subscriber_queue_size < 1:
+            raise ValueError("subscriber_queue_size must be positive")
         database_path.parent.mkdir(parents=True, exist_ok=True)
         journal_path.parent.mkdir(parents=True, exist_ok=True)
         self.database_path = database_path
         self.journal_path = journal_path
-        self._lock = threading.Lock()
+        self._id_lock = threading.Lock()
+        self._metadata_lock = threading.Lock()
         self._reader_lock = threading.Lock()
         self._subscriber_lock = threading.Lock()
-        self._subscribers: dict[int, Callable[[StoredEvent], None]] = {}
+        self._retention_lock = threading.Lock()
+        self._retention_counts: dict[tuple[str, str, str], dict[str, int]] = {}
+        self._retention_fingerprints: dict[tuple[str, str, str], str] = {}
+        self._retention_checkpoint_game_loops: dict[tuple[str, str, str], int] = {}
+        self._retention_aggregates: dict[tuple[str, str], dict[str, Any]] = {}
+        self._subscribers: dict[int, _SubscriberWorker] = {}
         self._next_subscriber_id = 0
+        self._flush_event_limit = flush_event_limit
+        self._flush_interval_seconds = flush_interval_seconds
+        self._writer_queue_size = writer_queue_size
+        self._subscriber_queue_size = subscriber_queue_size
         self._connection = sqlite3.connect(database_path, check_same_thread=False)
         self._connection.row_factory = sqlite3.Row
         self._initialize()
+        self._backfill_placement_transition_idempotency()
         self._reader_connection = sqlite3.connect(database_path, check_same_thread=False)
         self._reader_connection.row_factory = sqlite3.Row
+        self._reader_connection.execute("PRAGMA busy_timeout=5000")
+        row = self._connection.execute("SELECT MAX(event_id) AS event_id FROM events").fetchone()
+        self._next_event_id = (
+            1 if row is None or row["event_id"] is None else int(row["event_id"]) + 1
+        )
+        self._reconcile_journal()
+        self._write_queue: queue.Queue[
+            StoredEvent | _SnapshotRecord | _IdempotentPlacementRecord | _FlushBarrier | _StopWriter
+        ] = queue.Queue(maxsize=writer_queue_size)
+        self._writer_error: BaseException | None = None
+        self._closed = False
+        self._enqueued_events = 0
+        self._written_events = 0
+        self._max_queue_depth = 0
+        self._append_latency_ns = 0
+        self._event_enqueued_ns: dict[int, int] = {}
+        self._writer_lag_ns_max = 0
+        self._writer_lag_samples_ns: deque[int] = deque(maxlen=8192)
+        self._blocked_append_count = 0
+        self._writer = threading.Thread(
+            target=self._writer_main,
+            name=f"rtscortex-event-writer-{id(self):x}",
+            daemon=True,
+        )
+        self._writer.start()
 
     def _initialize(self) -> None:
         self._connection.executescript(
@@ -76,6 +350,8 @@ class EventStore:
             );
             CREATE INDEX IF NOT EXISTS idx_events_episode
                 ON events (run_id, episode_id, event_id);
+            CREATE INDEX IF NOT EXISTS idx_events_episode_type
+                ON events (run_id, episode_id, event_type, event_id);
             CREATE TABLE IF NOT EXISTS lessons (
                 lesson_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 run_id TEXT NOT NULL,
@@ -98,8 +374,81 @@ class EventStore:
                 payload_json TEXT NOT NULL,
                 UNIQUE (run_id, episode_id)
             );
+            CREATE TABLE IF NOT EXISTS runtime_snapshots (
+                run_id TEXT NOT NULL,
+                episode_id TEXT NOT NULL,
+                snapshot_type TEXT NOT NULL,
+                through_event_id INTEGER NOT NULL,
+                step_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                PRIMARY KEY (run_id, episode_id, snapshot_type)
+            );
+            CREATE TABLE IF NOT EXISTS placement_transition_idempotency (
+                run_id TEXT NOT NULL,
+                episode_id TEXT NOT NULL,
+                transition_id TEXT NOT NULL,
+                event_id INTEGER NOT NULL,
+                payload_hash TEXT NOT NULL,
+                PRIMARY KEY (run_id, episode_id, transition_id)
+            );
             """
         )
+        self._connection.execute("PRAGMA journal_mode=WAL")
+        self._connection.execute("PRAGMA busy_timeout=5000")
+        self._connection.commit()
+
+    def _backfill_placement_transition_idempotency(self) -> None:
+        """Migrate durable transitions written before the idempotency table existed."""
+
+        rows = self._connection.execute(
+            """
+            SELECT event_id, run_id, episode_id, step_id, payload_json
+            FROM events
+            WHERE event_type = 'placement_ledger_transition'
+            ORDER BY event_id
+            """
+        ).fetchall()
+        for row in rows:
+            payload = json.loads(str(row["payload_json"]))
+            transition_id = payload.get("transition_id")
+            if not isinstance(transition_id, str) or not transition_id:
+                continue
+            payload_hash = _placement_payload_hash(
+                run_id=str(row["run_id"]),
+                episode_id=str(row["episode_id"]),
+                step_id=int(row["step_id"]),
+                payload=payload,
+            )
+            existing = self._connection.execute(
+                """
+                SELECT event_id, payload_hash
+                FROM placement_transition_idempotency
+                WHERE run_id = ? AND episode_id = ? AND transition_id = ?
+                """,
+                (str(row["run_id"]), str(row["episode_id"]), transition_id),
+            ).fetchone()
+            if existing is not None:
+                if str(existing["payload_hash"]) != payload_hash:
+                    raise RuntimeError(
+                        "conflicting durable placement transitions already exist for "
+                        f"{row['run_id']!r}/{row['episode_id']!r}/{transition_id!r}"
+                    )
+                continue
+            self._connection.execute(
+                """
+                INSERT INTO placement_transition_idempotency (
+                    run_id, episode_id, transition_id, event_id, payload_hash
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    str(row["run_id"]),
+                    str(row["episode_id"]),
+                    transition_id,
+                    int(row["event_id"]),
+                    payload_hash,
+                ),
+            )
         self._connection.commit()
 
     def append_event(
@@ -111,21 +460,30 @@ class EventStore:
         event_type: str,
         payload: BaseModel | dict[str, Any],
     ) -> StoredEvent:
+        append_started = time.perf_counter_ns()
         created_at = datetime.now(UTC).isoformat()
         normalized = _json_payload(payload)
-        encoded = json.dumps(normalized, ensure_ascii=False, sort_keys=True)
-        with self._lock:
-            cursor = self._connection.execute(
-                """
-                INSERT INTO events (
-                    run_id, episode_id, step_id, event_type, created_at, payload_json
-                ) VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (run_id, episode_id, step_id, event_type, created_at, encoded),
+        self._raise_writer_error()
+        if self._closed:
+            raise RuntimeError("event store is closed")
+        if event_type in _HIGH_FREQUENCY_EVENT_TYPES and not self._retain_high_frequency_event(
+            run_id=run_id,
+            episode_id=episode_id,
+            event_type=event_type,
+            payload=normalized,
+        ):
+            return StoredEvent(
+                event_id=0,
+                run_id=run_id,
+                episode_id=episode_id,
+                step_id=step_id,
+                event_type=event_type,
+                created_at=created_at,
+                payload=normalized,
             )
-            self._connection.commit()
-            assert cursor.lastrowid is not None
-            event_id = cursor.lastrowid
+        with self._id_lock:
+            event_id = self._next_event_id
+            self._next_event_id += 1
             record = StoredEvent(
                 event_id=event_id,
                 run_id=run_id,
@@ -135,29 +493,578 @@ class EventStore:
                 created_at=created_at,
                 payload=normalized,
             )
-            with self.journal_path.open("a", encoding="utf-8") as journal:
-                journal.write(
-                    json.dumps(record.__dict__, ensure_ascii=False, sort_keys=True) + "\n"
-                )
-            # Sinks enqueue only; publishing under the write lock preserves event-id order.
-            self._publish(record)
+            self._event_enqueued_ns[event_id] = time.perf_counter_ns()
+            self._enqueue(record)
+        self._enqueued_events += 1
+        self._max_queue_depth = max(self._max_queue_depth, self._write_queue.qsize())
+        # Console and other best-effort observers must never share the durable
+        # writer lock or delay the SC2 tick path.
+        self._publish(record)
+        self._append_latency_ns += time.perf_counter_ns() - append_started
         return record
+
+    def append_durable_event(
+        self,
+        *,
+        run_id: str,
+        episode_id: str,
+        step_id: int,
+        event_type: str,
+        payload: BaseModel | dict[str, Any],
+    ) -> StoredEvent:
+        """Append one low-frequency event and wait for its durability barrier."""
+
+        record = self.append_event(
+            run_id=run_id,
+            episode_id=episode_id,
+            step_id=step_id,
+            event_type=event_type,
+            payload=payload,
+        )
+        self.flush()
+        return record
+
+    def placement_transition_retry_status(
+        self,
+        *,
+        run_id: str,
+        episode_id: str,
+        step_id: int,
+        transition_id: str,
+        payload: BaseModel | dict[str, Any],
+    ) -> Literal["new", "already_recorded"]:
+        """Check a durable retry without relying on Runtime process memory."""
+
+        normalized = _json_payload(payload)
+        _require_matching_transition_id(normalized, transition_id)
+        payload_hash = _placement_payload_hash(
+            run_id=run_id,
+            episode_id=episode_id,
+            step_id=step_id,
+            payload=normalized,
+        )
+        with self._reader_lock:
+            row = self._reader_connection.execute(
+                """
+                SELECT payload_hash
+                FROM placement_transition_idempotency
+                WHERE run_id = ? AND episode_id = ? AND transition_id = ?
+                """,
+                (run_id, episode_id, transition_id),
+            ).fetchone()
+        if row is None:
+            return "new"
+        if str(row["payload_hash"]) != payload_hash:
+            raise IdempotencyConflictError(
+                "placement transition idempotency key was retried with a different payload"
+            )
+        return "already_recorded"
+
+    def append_placement_transition(
+        self,
+        *,
+        run_id: str,
+        episode_id: str,
+        step_id: int,
+        transition_id: str,
+        payload: BaseModel | dict[str, Any],
+    ) -> PlacementTransitionAppendResult:
+        """Atomically commit one placement event and its persistent retry identity."""
+
+        append_started = time.perf_counter_ns()
+        normalized = _json_payload(payload)
+        _require_matching_transition_id(normalized, transition_id)
+        payload_hash = _placement_payload_hash(
+            run_id=run_id,
+            episode_id=episode_id,
+            step_id=step_id,
+            payload=normalized,
+        )
+        self._raise_writer_error()
+        if self._closed:
+            raise RuntimeError("event store is closed")
+        with self._id_lock:
+            event_id = self._next_event_id
+            self._next_event_id += 1
+            record = StoredEvent(
+                event_id=event_id,
+                run_id=run_id,
+                episode_id=episode_id,
+                step_id=step_id,
+                event_type="placement_ledger_transition",
+                created_at=datetime.now(UTC).isoformat(),
+                payload=normalized,
+            )
+            pending = _IdempotentPlacementRecord(
+                record=record,
+                transition_id=transition_id,
+                payload_hash=payload_hash,
+                completed=threading.Event(),
+            )
+            self._event_enqueued_ns[event_id] = time.perf_counter_ns()
+            self._enqueue(pending)
+        self._max_queue_depth = max(self._max_queue_depth, self._write_queue.qsize())
+        if not pending.completed.wait(timeout=30):
+            raise TimeoutError(
+                "event writer did not acknowledge the placement idempotency transaction"
+            )
+        if pending.error is not None:
+            raise pending.error
+        if pending.result is None:
+            raise RuntimeError("placement idempotency transaction returned no result")
+        if pending.result.status == "recorded":
+            self._enqueued_events += 1
+            self._publish(record)
+        self._append_latency_ns += time.perf_counter_ns() - append_started
+        return pending.result
+
+    def performance_snapshot(self) -> EventStorePerformance:
+        mean_ms = (
+            0.0
+            if self._enqueued_events == 0
+            else self._append_latency_ns / self._enqueued_events / 1_000_000
+        )
+        lag_samples = sorted(self._writer_lag_samples_ns)
+        lag_p95_ns = (
+            0
+            if not lag_samples
+            else lag_samples[
+                max(0, min(len(lag_samples) - 1, (len(lag_samples) * 95 + 99) // 100 - 1))
+            ]
+        )
+        return EventStorePerformance(
+            enqueued_events=self._enqueued_events,
+            written_events=self._written_events,
+            max_queue_depth=self._max_queue_depth,
+            current_queue_depth=self._write_queue.qsize(),
+            queue_capacity=self._writer_queue_size,
+            append_latency_ms_mean=mean_ms,
+            writer_lag_ms_p95=lag_p95_ns / 1_000_000,
+            writer_lag_ms_max=self._writer_lag_ns_max / 1_000_000,
+            blocked_append_count=self._blocked_append_count,
+            sampled_drop_supported=True,
+            subscriber_dropped_events=sum(
+                subscriber.dropped_events for subscriber in self._subscribers.values()
+            ),
+            # Subscriber callbacks run on dedicated workers after `_id_lock`
+            # has been released by append_event().
+            subscriber_callbacks_under_durable_lock=0,
+            journal_bytes=(self.journal_path.stat().st_size if self.journal_path.exists() else 0),
+        )
+
+    def append_retention_summary(
+        self,
+        *,
+        run_id: str,
+        episode_id: str,
+        step_id: int,
+    ) -> StoredEvent:
+        """Persist the logical/retained/suppressed accounting for one episode."""
+
+        with self._retention_lock:
+            event_counts = {
+                event_type: dict(counts)
+                for (candidate_run, candidate_episode, event_type), counts in sorted(
+                    self._retention_counts.items()
+                )
+                if candidate_run == run_id and candidate_episode == episode_id
+            }
+            aggregates = json.loads(
+                json.dumps(self._retention_aggregates.get((run_id, episode_id), {}))
+            )
+        raw_total = sum(item["raw"] for item in event_counts.values())
+        retained_total = sum(item["retained"] for item in event_counts.values())
+        payload = {
+            "policy": "change_based_with_periodic_full_checkpoint",
+            "checkpoint_interval": _RETENTION_CHECKPOINT_INTERVAL,
+            "checkpoint_game_loops": _RETENTION_CHECKPOINT_GAME_LOOPS,
+            "lossless_event_classes": [
+                "execution",
+                "command_lifecycle",
+                "command_lineage",
+                "executor_selection",
+                "placement_ledger_transition",
+                "retreat_commitment",
+                "defense_inventory",
+                "postgame",
+                "recovery",
+                "attestation",
+                "performance",
+            ],
+            "event_counts": event_counts,
+            "aggregates": aggregates,
+            "raw_logical_count": raw_total,
+            "retained_count": retained_total,
+            "suppressed_count": raw_total - retained_total,
+        }
+        return self.append_event(
+            run_id=run_id,
+            episode_id=episode_id,
+            step_id=step_id,
+            event_type="event_retention_summary",
+            payload=payload,
+        )
+
+    def _retain_high_frequency_event(
+        self,
+        *,
+        run_id: str,
+        episode_id: str,
+        event_type: str,
+        payload: dict[str, Any],
+    ) -> bool:
+        key = (run_id, episode_id, event_type)
+        fingerprint = _retention_fingerprint(event_type, payload)
+        raw_game_loop = payload.get("game_loop")
+        game_loop = (
+            int(raw_game_loop)
+            if isinstance(raw_game_loop, int) and not isinstance(raw_game_loop, bool)
+            else None
+        )
+        with self._retention_lock:
+            counts = self._retention_counts.setdefault(
+                key,
+                {"raw": 0, "retained": 0, "suppressed": 0},
+            )
+            counts["raw"] += 1
+            logical_count = counts["raw"]
+            retain = (
+                counts["retained"] == 0
+                or fingerprint != self._retention_fingerprints.get(key)
+                or (logical_count - 1) % _RETENTION_CHECKPOINT_INTERVAL == 0
+                or game_loop is not None
+                and game_loop - self._retention_checkpoint_game_loops.get(key, game_loop)
+                >= _RETENTION_CHECKPOINT_GAME_LOOPS
+            )
+            self._retention_fingerprints[key] = fingerprint
+            if retain:
+                counts["retained"] += 1
+                if game_loop is not None:
+                    self._retention_checkpoint_game_loops[key] = game_loop
+            else:
+                counts["suppressed"] += 1
+            _update_retention_aggregates(
+                self._retention_aggregates.setdefault((run_id, episode_id), {}),
+                event_type,
+                payload,
+            )
+            return retain
+
+    def record_snapshot(
+        self,
+        *,
+        run_id: str,
+        episode_id: str,
+        snapshot_type: str,
+        step_id: int,
+        payload: BaseModel | dict[str, Any],
+    ) -> StoredSnapshot:
+        """Queue a compact recovery snapshot after all currently assigned events.
+
+        The writer processes snapshots in queue order, so ``through_event_id`` is
+        a durable replay boundary: recovery only needs the snapshot plus events
+        with a greater id.
+        """
+
+        if not snapshot_type:
+            raise ValueError("snapshot_type must not be empty")
+        self._raise_writer_error()
+        if self._closed:
+            raise RuntimeError("event store is closed")
+        with self._id_lock:
+            through_event_id = self._next_event_id - 1
+            snapshot = StoredSnapshot(
+                run_id=run_id,
+                episode_id=episode_id,
+                snapshot_type=snapshot_type,
+                through_event_id=through_event_id,
+                step_id=step_id,
+                created_at=datetime.now(UTC).isoformat(),
+                payload=_json_payload(payload),
+            )
+            self._enqueue(_SnapshotRecord(snapshot))
+        self._max_queue_depth = max(self._max_queue_depth, self._write_queue.qsize())
+        return snapshot
+
+    def flush(self) -> None:
+        """Wait until every event queued before this call is durable."""
+
+        self._raise_writer_error()
+        if self._closed:
+            return
+        barrier = _FlushBarrier(threading.Event())
+        self._enqueue(barrier)
+        if not barrier.completed.wait(timeout=30):
+            raise TimeoutError("event writer did not acknowledge the durability barrier")
+        self._raise_writer_error()
+
+    def _enqueue(
+        self,
+        item: (
+            StoredEvent | _SnapshotRecord | _IdempotentPlacementRecord | _FlushBarrier | _StopWriter
+        ),
+    ) -> None:
+        """Bound memory while applying explicit backpressure to durable events."""
+
+        try:
+            self._write_queue.put_nowait(item)
+            return
+        except queue.Full:
+            self._blocked_append_count += 1
+        try:
+            self._write_queue.put(item, timeout=30)
+        except queue.Full as error:
+            raise TimeoutError("event writer queue remained saturated for 30 seconds") from error
+
+    def _writer_main(self) -> None:
+        connection = sqlite3.connect(self.database_path)
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA busy_timeout=5000")
+        journal = self.journal_path.open("a", encoding="utf-8", buffering=1024 * 1024)
+        batch: list[StoredEvent] = []
+        try:
+            while True:
+                try:
+                    item = self._write_queue.get(
+                        timeout=self._flush_interval_seconds if batch else None
+                    )
+                except queue.Empty:
+                    self._write_batch(connection, journal, batch)
+                    batch.clear()
+                    continue
+                if isinstance(item, StoredEvent):
+                    batch.append(item)
+                    if len(batch) >= self._flush_event_limit:
+                        self._write_batch(connection, journal, batch)
+                        batch.clear()
+                    continue
+                self._write_batch(connection, journal, batch)
+                batch.clear()
+                if isinstance(item, _IdempotentPlacementRecord):
+                    try:
+                        self._write_idempotent_placement(connection, journal, item)
+                    except BaseException as error:
+                        item.error = error
+                        item.completed.set()
+                        raise
+                    continue
+                if isinstance(item, _SnapshotRecord):
+                    self._write_snapshot(connection, item.snapshot)
+                    continue
+                if isinstance(item, _FlushBarrier):
+                    item.completed.set()
+                    continue
+                if isinstance(item, _StopWriter):
+                    return
+        except BaseException as error:
+            self._writer_error = error
+            while True:
+                try:
+                    pending = self._write_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if isinstance(pending, _FlushBarrier):
+                    pending.completed.set()
+                elif isinstance(pending, _IdempotentPlacementRecord):
+                    pending.error = error
+                    pending.completed.set()
+        finally:
+            journal.close()
+            connection.close()
+
+    def _write_batch(
+        self,
+        connection: sqlite3.Connection,
+        journal: Any,
+        records: list[StoredEvent],
+    ) -> None:
+        if not records:
+            return
+        encoded = [
+            (
+                record.event_id,
+                record.run_id,
+                record.episode_id,
+                record.step_id,
+                record.event_type,
+                record.created_at,
+                json.dumps(record.payload, ensure_ascii=False, sort_keys=True),
+            )
+            for record in records
+        ]
+        connection.executemany(
+            """
+            INSERT INTO events (
+                event_id, run_id, episode_id, step_id, event_type, created_at, payload_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            encoded,
+        )
+        # SQLite is the canonical durable authority. The JSONL stream is its
+        # ordered compatibility mirror and may only lag, never lead, a commit.
+        connection.commit()
+        now = time.perf_counter_ns()
+        for record in records:
+            enqueued = self._event_enqueued_ns.pop(record.event_id, now)
+            lag = now - enqueued
+            self._writer_lag_ns_max = max(self._writer_lag_ns_max, lag)
+            self._writer_lag_samples_ns.append(lag)
+        for record in records:
+            journal.write(json.dumps(record.__dict__, ensure_ascii=False, sort_keys=True) + "\n")
+        journal.flush()
+        self._written_events += len(records)
+
+    def _write_idempotent_placement(
+        self,
+        connection: sqlite3.Connection,
+        journal: Any,
+        pending: _IdempotentPlacementRecord,
+    ) -> None:
+        record = pending.record
+        existing = connection.execute(
+            """
+            SELECT event_id, payload_hash
+            FROM placement_transition_idempotency
+            WHERE run_id = ? AND episode_id = ? AND transition_id = ?
+            """,
+            (record.run_id, record.episode_id, pending.transition_id),
+        ).fetchone()
+        if existing is not None:
+            self._event_enqueued_ns.pop(record.event_id, None)
+            if str(existing[1]) != pending.payload_hash:
+                pending.error = IdempotencyConflictError(
+                    "placement transition idempotency key was retried with a different payload"
+                )
+            else:
+                pending.result = PlacementTransitionAppendResult(
+                    status="already_recorded",
+                    event_id=int(existing[0]),
+                )
+            pending.completed.set()
+            return
+        encoded_payload = json.dumps(
+            record.payload,
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                INSERT INTO placement_transition_idempotency (
+                    run_id, episode_id, transition_id, event_id, payload_hash
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    record.run_id,
+                    record.episode_id,
+                    pending.transition_id,
+                    record.event_id,
+                    pending.payload_hash,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO events (
+                    event_id, run_id, episode_id, step_id,
+                    event_type, created_at, payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.event_id,
+                    record.run_id,
+                    record.episode_id,
+                    record.step_id,
+                    record.event_type,
+                    record.created_at,
+                    encoded_payload,
+                ),
+            )
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        journal.write(json.dumps(record.__dict__, ensure_ascii=False, sort_keys=True) + "\n")
+        journal.flush()
+        now = time.perf_counter_ns()
+        enqueued = self._event_enqueued_ns.pop(record.event_id, now)
+        lag = now - enqueued
+        self._writer_lag_ns_max = max(self._writer_lag_ns_max, lag)
+        self._writer_lag_samples_ns.append(lag)
+        self._written_events += 1
+        pending.result = PlacementTransitionAppendResult(
+            status="recorded",
+            event_id=record.event_id,
+        )
+        pending.completed.set()
+
+    @staticmethod
+    def _write_snapshot(
+        connection: sqlite3.Connection,
+        snapshot: StoredSnapshot,
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO runtime_snapshots (
+                run_id, episode_id, snapshot_type, through_event_id,
+                step_id, created_at, payload_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(run_id, episode_id, snapshot_type) DO UPDATE SET
+                through_event_id = excluded.through_event_id,
+                step_id = excluded.step_id,
+                created_at = excluded.created_at,
+                payload_json = excluded.payload_json
+            WHERE excluded.through_event_id >= runtime_snapshots.through_event_id
+            """,
+            (
+                snapshot.run_id,
+                snapshot.episode_id,
+                snapshot.snapshot_type,
+                snapshot.through_event_id,
+                snapshot.step_id,
+                snapshot.created_at,
+                json.dumps(snapshot.payload, ensure_ascii=False, sort_keys=True),
+            ),
+        )
+        connection.commit()
+
+    def _raise_writer_error(self) -> None:
+        if self._writer_error is not None:
+            raise RuntimeError("event writer failed") from self._writer_error
 
     def subscribe(self, subscriber: Callable[[StoredEvent], None]) -> Callable[[], None]:
         """Subscribe a non-blocking event sink and return its unsubscribe function.
 
-        Subscribers run after the event is durable. Their failures never affect the
-        runtime write path. Subscribers should only enqueue work and return immediately.
+        Subscribers receive events in event-id order before the next bounded durable
+        flush. Their failures never affect the runtime write path. Subscribers should
+        only enqueue work and return immediately.
         """
 
         with self._subscriber_lock:
             subscriber_id = self._next_subscriber_id
             self._next_subscriber_id += 1
-            self._subscribers[subscriber_id] = subscriber
+            subscriber_queue: queue.Queue[StoredEvent | None] = queue.Queue(
+                maxsize=self._subscriber_queue_size
+            )
+            worker = _SubscriberWorker(
+                callback=subscriber,
+                queue=subscriber_queue,
+                thread=threading.Thread(),
+            )
+            worker.thread = threading.Thread(
+                target=self._subscriber_main,
+                args=(worker,),
+                name=f"rtscortex-event-subscriber-{subscriber_id}",
+                daemon=True,
+            )
+            self._subscribers[subscriber_id] = worker
+            worker.thread.start()
 
         def unsubscribe() -> None:
             with self._subscriber_lock:
-                self._subscribers.pop(subscriber_id, None)
+                worker = self._subscribers.pop(subscriber_id, None)
+            if worker is not None:
+                self._stop_subscriber(worker)
 
         return unsubscribe
 
@@ -166,10 +1073,30 @@ class EventStore:
             subscribers = tuple(self._subscribers.values())
         for subscriber in subscribers:
             try:
-                subscriber(event)
+                subscriber.queue.put_nowait(event)
+            except queue.Full:
+                subscriber.dropped_events += 1
+
+    @staticmethod
+    def _subscriber_main(worker: _SubscriberWorker) -> None:
+        while True:
+            event = worker.queue.get()
+            if event is None:
+                return
+            try:
+                worker.callback(event)
             except Exception:
-                # Console and other observers are best-effort and must never stop a run.
                 continue
+
+    @staticmethod
+    def _stop_subscriber(worker: _SubscriberWorker) -> None:
+        try:
+            worker.queue.put_nowait(None)
+        except queue.Full:
+            with worker.queue.mutex:
+                worker.queue.queue.clear()
+            worker.queue.put_nowait(None)
+        worker.thread.join(timeout=5)
 
     def events_after(
         self,
@@ -185,6 +1112,7 @@ class EventStore:
             raise ValueError("after_event_id must be non-negative")
         if limit < 1:
             raise ValueError("limit must be positive")
+        self.flush()
         if episode_id is None:
             query = """
                 SELECT * FROM events
@@ -204,6 +1132,7 @@ class EventStore:
         return [self._row_to_event(row) for row in rows]
 
     def latest_event_id(self, run_id: str, *, episode_id: str | None = None) -> int:
+        self.flush()
         if episode_id is None:
             query = "SELECT MAX(event_id) AS event_id FROM events WHERE run_id = ?"
             parameters: tuple[object, ...] = (run_id,)
@@ -218,25 +1147,39 @@ class EventStore:
         return 0 if row is None or row["event_id"] is None else int(row["event_id"])
 
     def recent_events(self, run_id: str, episode_id: str, limit: int) -> list[StoredEvent]:
-        rows = self._connection.execute(
-            """
-            SELECT * FROM events
-            WHERE run_id = ? AND episode_id = ?
-            ORDER BY event_id DESC LIMIT ?
-            """,
-            (run_id, episode_id, limit),
-        ).fetchall()
+        self.flush()
+        with self._reader_lock:
+            rows = self._reader_connection.execute(
+                """
+                SELECT * FROM events
+                WHERE run_id = ? AND episode_id = ?
+                ORDER BY event_id DESC LIMIT ?
+                """,
+                (run_id, episode_id, limit),
+            ).fetchall()
         return [self._row_to_event(row) for row in reversed(rows)]
 
-    def last_event(self, run_id: str, episode_id: str, event_type: str) -> StoredEvent | None:
-        row = self._connection.execute(
-            """
-            SELECT * FROM events
-            WHERE run_id = ? AND episode_id = ? AND event_type = ?
-            ORDER BY event_id DESC LIMIT 1
-            """,
-            (run_id, episode_id, event_type),
-        ).fetchone()
+    def last_event(
+        self,
+        run_id: str,
+        episode_id: str,
+        event_type: str,
+        *,
+        after_event_id: int = 0,
+    ) -> StoredEvent | None:
+        if after_event_id < 0:
+            raise ValueError("after_event_id must be non-negative")
+        self.flush()
+        with self._reader_lock:
+            row = self._reader_connection.execute(
+                """
+                SELECT * FROM events
+                WHERE run_id = ? AND episode_id = ? AND event_type = ?
+                    AND event_id > ?
+                ORDER BY event_id DESC LIMIT 1
+                """,
+                (run_id, episode_id, event_type, after_event_id),
+            ).fetchone()
         return None if row is None else self._row_to_event(row)
 
     def events_of_type(
@@ -244,16 +1187,50 @@ class EventStore:
         run_id: str,
         episode_id: str,
         event_type: str,
+        *,
+        after_event_id: int = 0,
     ) -> list[StoredEvent]:
-        rows = self._connection.execute(
-            """
-            SELECT * FROM events
-            WHERE run_id = ? AND episode_id = ? AND event_type = ?
-            ORDER BY event_id
-            """,
-            (run_id, episode_id, event_type),
-        ).fetchall()
+        if after_event_id < 0:
+            raise ValueError("after_event_id must be non-negative")
+        self.flush()
+        with self._reader_lock:
+            rows = self._reader_connection.execute(
+                """
+                SELECT * FROM events
+                WHERE run_id = ? AND episode_id = ? AND event_type = ?
+                    AND event_id > ?
+                ORDER BY event_id
+                """,
+                (run_id, episode_id, event_type, after_event_id),
+            ).fetchall()
         return [self._row_to_event(row) for row in rows]
+
+    def latest_snapshot(
+        self,
+        run_id: str,
+        episode_id: str,
+        snapshot_type: str,
+    ) -> StoredSnapshot | None:
+        self.flush()
+        with self._reader_lock:
+            row = self._reader_connection.execute(
+                """
+                SELECT * FROM runtime_snapshots
+                WHERE run_id = ? AND episode_id = ? AND snapshot_type = ?
+                """,
+                (run_id, episode_id, snapshot_type),
+            ).fetchone()
+        if row is None:
+            return None
+        return StoredSnapshot(
+            run_id=str(row["run_id"]),
+            episode_id=str(row["episode_id"]),
+            snapshot_type=str(row["snapshot_type"]),
+            through_event_id=int(row["through_event_id"]),
+            step_id=int(row["step_id"]),
+            created_at=str(row["created_at"]),
+            payload=json.loads(str(row["payload_json"])),
+        )
 
     @staticmethod
     def _row_to_event(row: sqlite3.Row) -> StoredEvent:
@@ -277,15 +1254,16 @@ class EventStore:
     ) -> None:
         if not content.strip():
             return
-        self._connection.execute(
-            """
-            INSERT INTO lessons (
-                run_id, episode_id, source_step_id, content, created_at
-            ) VALUES (?, ?, ?, ?, ?)
-            """,
-            (run_id, episode_id, source_step_id, content, datetime.now(UTC).isoformat()),
-        )
-        self._connection.commit()
+        with self._metadata_lock:
+            self._connection.execute(
+                """
+                INSERT INTO lessons (
+                    run_id, episode_id, source_step_id, content, created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (run_id, episode_id, source_step_id, content, datetime.now(UTC).isoformat()),
+            )
+            self._connection.commit()
 
     def lessons(self, run_id: str, episode_id: str, limit: int = 10) -> list[str]:
         return [lesson.content for lesson in self.lesson_records(run_id, episode_id, limit)]
@@ -296,14 +1274,15 @@ class EventStore:
         episode_id: str,
         limit: int = 10,
     ) -> list[StoredLesson]:
-        rows = self._connection.execute(
-            """
-            SELECT * FROM lessons
-            WHERE run_id = ? AND episode_id = ?
-            ORDER BY lesson_id DESC LIMIT ?
-            """,
-            (run_id, episode_id, limit),
-        ).fetchall()
+        with self._metadata_lock:
+            rows = self._connection.execute(
+                """
+                SELECT * FROM lessons
+                WHERE run_id = ? AND episode_id = ?
+                ORDER BY lesson_id DESC LIMIT ?
+                """,
+                (run_id, episode_id, limit),
+            ).fetchall()
         return [
             StoredLesson(
                 lesson_id=int(row["lesson_id"]),
@@ -318,15 +1297,16 @@ class EventStore:
 
     def record_episode(self, result: EpisodeResult) -> None:
         encoded = result.model_dump_json()
-        self._connection.execute(
-            """
-            INSERT INTO episode_results (run_id, episode_id, payload_json)
-            VALUES (?, ?, ?)
-            ON CONFLICT(run_id, episode_id) DO UPDATE SET payload_json = excluded.payload_json
-            """,
-            (result.run_id, result.episode_id, encoded),
-        )
-        self._connection.commit()
+        with self._metadata_lock:
+            self._connection.execute(
+                """
+                INSERT INTO episode_results (run_id, episode_id, payload_json)
+                VALUES (?, ?, ?)
+                ON CONFLICT(run_id, episode_id) DO UPDATE SET payload_json = excluded.payload_json
+                """,
+                (result.run_id, result.episode_id, encoded),
+            )
+            self._connection.commit()
         self.append_event(
             run_id=result.run_id,
             episode_id=result.episode_id,
@@ -336,23 +1316,24 @@ class EventStore:
         )
 
     def record_episode_summary(self, summary: EpisodeSummary) -> None:
-        self._connection.execute(
-            """
-            INSERT INTO episode_summaries (
-                run_id, episode_id, created_at, payload_json
-            ) VALUES (?, ?, ?, ?)
-            ON CONFLICT(run_id, episode_id) DO UPDATE SET
-                created_at = excluded.created_at,
-                payload_json = excluded.payload_json
-            """,
-            (
-                summary.run_id,
-                summary.episode_id,
-                summary.created_at.isoformat(),
-                summary.model_dump_json(),
-            ),
-        )
-        self._connection.commit()
+        with self._metadata_lock:
+            self._connection.execute(
+                """
+                INSERT INTO episode_summaries (
+                    run_id, episode_id, created_at, payload_json
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(run_id, episode_id) DO UPDATE SET
+                    created_at = excluded.created_at,
+                    payload_json = excluded.payload_json
+                """,
+                (
+                    summary.run_id,
+                    summary.episode_id,
+                    summary.created_at.isoformat(),
+                    summary.model_dump_json(),
+                ),
+            )
+            self._connection.commit()
         self.append_event(
             run_id=summary.run_id,
             episode_id=summary.episode_id,
@@ -362,35 +1343,82 @@ class EventStore:
         )
 
     def episode_summary(self, run_id: str, episode_id: str) -> EpisodeSummary | None:
-        row = self._connection.execute(
-            """
-            SELECT payload_json FROM episode_summaries
-            WHERE run_id = ? AND episode_id = ?
-            """,
-            (run_id, episode_id),
-        ).fetchone()
+        with self._metadata_lock:
+            row = self._connection.execute(
+                """
+                SELECT payload_json FROM episode_summaries
+                WHERE run_id = ? AND episode_id = ?
+                """,
+                (run_id, episode_id),
+            ).fetchone()
         if row is None:
             return None
         return EpisodeSummary.model_validate_json(str(row["payload_json"]))
 
     def recent_episode_summaries(self, run_id: str, limit: int = 5) -> list[EpisodeSummary]:
-        rows = self._connection.execute(
-            """
-            SELECT payload_json FROM episode_summaries
-            WHERE run_id = ?
-            ORDER BY summary_id DESC LIMIT ?
-            """,
-            (run_id, limit),
-        ).fetchall()
+        with self._metadata_lock:
+            rows = self._connection.execute(
+                """
+                SELECT payload_json FROM episode_summaries
+                WHERE run_id = ?
+                ORDER BY summary_id DESC LIMIT ?
+                """,
+                (run_id, limit),
+            ).fetchall()
         return [
             EpisodeSummary.model_validate_json(str(row["payload_json"])) for row in reversed(rows)
         ]
 
     def close(self) -> None:
+        if self._closed:
+            return
+        self.flush()
+        self._closed = True
+        self._enqueue(_StopWriter())
+        self._writer.join(timeout=30)
+        if self._writer.is_alive():
+            raise TimeoutError("event writer did not stop")
+        self._raise_writer_error()
         with self._subscriber_lock:
+            subscribers = tuple(self._subscribers.values())
             self._subscribers.clear()
+        for subscriber in subscribers:
+            self._stop_subscriber(subscriber)
         self._reader_connection.close()
         self._connection.close()
+
+    def _reconcile_journal(self) -> None:
+        """Repair the compatibility JSONL mirror from canonical SQLite rows."""
+
+        last_event_id = 0
+        valid_prefix = True
+        if self.journal_path.exists():
+            try:
+                with self.journal_path.open(encoding="utf-8") as stream:
+                    for line in stream:
+                        if not line.strip():
+                            continue
+                        payload = json.loads(line)
+                        event_id = int(payload["event_id"])
+                        if event_id != last_event_id + 1:
+                            valid_prefix = False
+                            break
+                        last_event_id = event_id
+            except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+                valid_prefix = False
+        database_max = self._next_event_id - 1
+        if not valid_prefix or last_event_id > database_max:
+            last_event_id = 0
+            self.journal_path.write_text("", encoding="utf-8")
+        rows = self._connection.execute(
+            "SELECT * FROM events WHERE event_id > ? ORDER BY event_id",
+            (last_event_id,),
+        )
+        mode = "a" if last_event_id else "w"
+        with self.journal_path.open(mode, encoding="utf-8") as journal:
+            for row in rows:
+                event = self._row_to_event(row)
+                journal.write(json.dumps(event.__dict__, ensure_ascii=False, sort_keys=True) + "\n")
 
 
 def read_event_log(path: Path) -> Iterable[StoredEvent]:

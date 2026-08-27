@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import inspect
+import io
+import json
+import sys
 import tempfile
+from contextlib import redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -16,13 +20,19 @@ from llm_pysc2.agents.main_agent_funcs import (
     main_agent_func4,
 )
 from llm_pysc2.lib import llm_action
-from pysc2.env import run_loop
+from pysc2.env import available_actions_printer, base_env_wrapper, run_loop
 from pysc2.lib import actions, features
 from rtscortex_llm_pysc2.addon import ADDON_SPECS
 from rtscortex_llm_pysc2.extractor import BUILD_RAW_FUNCTION_IDS
+from rtscortex_llm_pysc2.melee import RTSCortexMeleeConfig
 from rtscortex_llm_pysc2.observation import _map_argument_candidates
 from rtscortex_llm_pysc2.production import PRODUCTION_SPECS
 from rtscortex_llm_pysc2.terran_melee import RTSCortexTerranMeleeConfig
+from rtscortex_llm_pysc2.worker import (
+    SC2RawBuildQueryCapability,
+    _pysc2_action_argument_failure,
+    _raw_terminal_collapse,
+)
 from rtscortex_llm_pysc2.zerg_melee import (
     QUEEN_CONTROLLER_ACTIONS,
     RTSCortexZergMeleeConfig,
@@ -43,6 +53,58 @@ def _assert_candidate_mapping() -> None:
     main_step_source = inspect.getsource(MainAgent.step)
     assert "return translator settlement no_op" in main_step_source
     assert "_rtscortex_transport_noop_without_actor_selection" in main_step_source
+
+
+def _assert_terminal_collapse_boundary_is_worker_isolated() -> None:
+    assert not any(name == "rtscortex" or name.startswith("rtscortex.") for name in sys.modules)
+    empty_army = SimpleNamespace(food_army=0)
+    assert _raw_terminal_collapse(
+        SimpleNamespace(player_common=empty_army, raw_units=[]),
+        unit_names={},
+    )
+
+    for structure_name in (
+        "Nexus",
+        "Gateway",
+        "WarpGate",
+        "RoboticsFacility",
+        "Stargate",
+        "CommandCenter",
+        "OrbitalCommand",
+        "PlanetaryFortress",
+        "Barracks",
+        "Factory",
+        "Starport",
+        "Hatchery",
+        "Lair",
+        "Hive",
+    ):
+        assert not _raw_terminal_collapse(
+            SimpleNamespace(
+                player_common=empty_army,
+                raw_units=[SimpleNamespace(alliance=1, unit_type=1)],
+            ),
+            unit_names={1: structure_name},
+        )
+
+    assert _raw_terminal_collapse(
+        SimpleNamespace(
+            player_common=empty_army,
+            raw_units=[
+                SimpleNamespace(alliance=4, unit_type=1),
+                SimpleNamespace(alliance=1, unit_type=2),
+            ],
+        ),
+        unit_names={1: "Gateway", 2: "UnknownStructure"},
+    )
+    assert not _raw_terminal_collapse(
+        SimpleNamespace(player_common=SimpleNamespace(), raw_units=[]),
+        unit_names={},
+    )
+    assert not _raw_terminal_collapse(
+        SimpleNamespace(player_common=SimpleNamespace(food_army=1), raw_units=[]),
+        unit_names={},
+    )
 
 
 def _assert_reserved_builder_worker_guard() -> None:
@@ -95,6 +157,222 @@ def _assert_max_frame_hook() -> None:
     assert calls == [1]
 
 
+class _BuildQueryFakeTimeStep:
+    def __init__(self, *, terminal: bool = False) -> None:
+        self._terminal = terminal
+        self.observation = {}
+
+    def last(self) -> bool:
+        return self._terminal
+
+
+class _BuildQueryFakeSC2Env:
+    def __init__(
+        self,
+        controllers: list[object],
+        *,
+        terminal_on_reset: bool = False,
+    ) -> None:
+        self._controllers = controllers
+        self._agent_count = len(controllers)
+        self._terminal_on_reset = terminal_on_reset
+
+    def observation_spec(self) -> list[object]:
+        return [object() for _ in range(self._agent_count)]
+
+    def action_spec(self) -> list[object]:
+        return [SimpleNamespace(functions={}) for _ in range(self._agent_count)]
+
+    def reset(self) -> list[_BuildQueryFakeTimeStep]:
+        return [
+            _BuildQueryFakeTimeStep(terminal=self._terminal_on_reset)
+            for _ in range(self._agent_count)
+        ]
+
+    def step(self, actions: list[object]) -> list[_BuildQueryFakeTimeStep]:
+        return [_BuildQueryFakeTimeStep(terminal=True) for _ in actions]
+
+    def close(self) -> None:
+        pass
+
+
+class _BuildQueryAwareAgent:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+        self.capabilities: list[SC2RawBuildQueryCapability] = []
+
+    def setup(self, observation_spec: object, action_spec: object) -> None:
+        del observation_spec, action_spec
+
+    def reset(self) -> None:
+        self.events.append("reset")
+
+    def set_raw_build_query_capability(
+        self,
+        capability: SC2RawBuildQueryCapability,
+    ) -> None:
+        self.events.append("install")
+        self.capabilities.append(capability)
+
+    def step(self, timestep: _BuildQueryFakeTimeStep) -> str:
+        del timestep
+        self.events.append("step")
+        return "noop"
+
+
+def _startup_evidence(output: str) -> list[dict[str, object]]:
+    evidence = []
+    for line in output.splitlines():
+        try:
+            payload = json.loads(line)
+        except (TypeError, ValueError):
+            continue
+        if payload.get("event") == "raw_build_query_capability_startup":
+            evidence.append(payload)
+    return evidence
+
+
+def _run_build_query_wiring(
+    environment: object,
+    agents: list[_BuildQueryAwareAgent],
+    *,
+    max_frames: int = 1,
+    max_episodes: int = 1,
+) -> list[dict[str, object]]:
+    output = io.StringIO()
+    with redirect_stdout(output):
+        run_loop.run_loop(
+            agents,
+            environment,
+            max_frames=max_frames,
+            max_episodes=max_episodes,
+        )
+    return _startup_evidence(output.getvalue())
+
+
+def _assert_build_query_capability_wiring() -> None:
+    controller = object()
+    events: list[str] = []
+    agent = _BuildQueryAwareAgent(events)
+    inner = _BuildQueryFakeSC2Env([controller])
+    environment = available_actions_printer.AvailableActionsPrinter(inner)
+
+    evidence = _run_build_query_wiring(environment, [agent])
+
+    assert events == ["reset", "install", "step"]
+    assert len(agent.capabilities) == 1
+    assert isinstance(agent.capabilities[0], SC2RawBuildQueryCapability)
+    assert agent.capabilities[0]._controller is controller
+    assert evidence == [
+        {
+            "agent_index": 0,
+            "controller_count": 1,
+            "controller_index": 0,
+            "event": "raw_build_query_capability_startup",
+            "raw_build_query_capability_installed": True,
+            "wrapper_depth": 1,
+            "wrapper_types": ["AvailableActionsPrinter"],
+        }
+    ]
+
+
+def _assert_build_query_capability_direct_and_nested_wiring() -> None:
+    for environment_factory, expected_depth, expected_types in (
+        (lambda inner: inner, 0, []),
+        (
+            lambda inner: available_actions_printer.AvailableActionsPrinter(
+                base_env_wrapper.BaseEnvWrapper(inner)
+            ),
+            2,
+            ["AvailableActionsPrinter", "BaseEnvWrapper"],
+        ),
+    ):
+        controller = object()
+        agent = _BuildQueryAwareAgent([])
+        environment = environment_factory(_BuildQueryFakeSC2Env([controller]))
+
+        evidence = _run_build_query_wiring(environment, [agent])
+
+        assert agent.capabilities[0]._controller is controller
+        assert evidence[0]["wrapper_depth"] == expected_depth
+        assert evidence[0]["wrapper_types"] == expected_types
+
+
+def _assert_build_query_capability_multi_agent_and_episode_wiring() -> None:
+    controllers = [object(), object()]
+    agents = [_BuildQueryAwareAgent([]), _BuildQueryAwareAgent([])]
+
+    evidence = _run_build_query_wiring(_BuildQueryFakeSC2Env(controllers), agents)
+
+    assert [agent.capabilities[0]._controller for agent in agents] == controllers
+    assert [item["controller_index"] for item in evidence] == [0, 1]
+
+    repeated_controller = object()
+    repeated_agent = _BuildQueryAwareAgent([])
+    _run_build_query_wiring(
+        _BuildQueryFakeSC2Env([repeated_controller], terminal_on_reset=True),
+        [repeated_agent],
+        max_frames=0,
+        max_episodes=2,
+    )
+    assert len(repeated_agent.capabilities) == 2
+    assert all(
+        capability._controller is repeated_controller for capability in repeated_agent.capabilities
+    )
+    assert repeated_agent.events == [
+        "reset",
+        "install",
+        "step",
+        "reset",
+        "install",
+        "step",
+    ]
+
+
+def _assert_build_query_capability_missing_controller_fails_before_step() -> None:
+    class EnvironmentWithoutController(_BuildQueryFakeSC2Env):
+        def __init__(self) -> None:
+            super().__init__([object()])
+            del self._controllers
+
+    agent = _BuildQueryAwareAgent([])
+    try:
+        _run_build_query_wiring(EnvironmentWithoutController(), [agent])
+    except RuntimeError as error:
+        assert "raw build query capability startup failed" in str(error)
+        assert "controller" in str(error)
+    else:
+        raise AssertionError("missing controller did not fail before the first step")
+    assert agent.events == ["reset"]
+
+
+def _assert_plain_agent_run_loop_is_unchanged() -> None:
+    events: list[str] = []
+
+    class PlainAgent:
+        def setup(self, observation_spec: object, action_spec: object) -> None:
+            del observation_spec, action_spec
+
+        def reset(self) -> None:
+            events.append("reset")
+
+        def step(self, timestep: _BuildQueryFakeTimeStep) -> str:
+            del timestep
+            events.append("step")
+            return "noop"
+
+    output = io.StringIO()
+    with redirect_stdout(output):
+        run_loop.run_loop(
+            [PlainAgent()],
+            _BuildQueryFakeSC2Env([object()]),
+            max_frames=1,
+            max_episodes=1,
+        )
+    assert events == ["reset", "step"]
+    assert _startup_evidence(output.getvalue()) == []
+
+
 def _assert_atomic_log_directory_allocation() -> None:
     source = inspect.getsource(MainAgent._initialize_logger)
     assert "except FileExistsError:" in source
@@ -108,6 +386,9 @@ def _assert_gas_rebalance_uses_worker_management_flag() -> None:
 
 def _assert_observation_gap_watchdog_preempts_optional_gathering() -> None:
     assert "_rtscortex_force_runtime_decision" in inspect.getsource(main_agent_func4)
+    main_step = inspect.getsource(MainAgent.step)
+    frequency_guard = main_step[main_step.index("# LLM decision frequency control") :]
+    assert "not getattr(self, '_rtscortex_force_runtime_decision', False)" in frequency_guard
 
 
 def _assert_gather_target_is_visible_and_in_bounds() -> None:
@@ -115,6 +396,44 @@ def _assert_gather_target_is_visible_and_in_bounds() -> None:
     assert "_rtscortex_validate_gather_target" in source
     assert "0 <= unit.x < self.size_screen" in source
     assert "0 <= unit.y < self.size_screen" in source
+
+
+def _assert_stop_worker_selection_uses_clamped_coordinate() -> None:
+    source = inspect.getsource(main_agent_func2)
+    assert "min(max(0, unit.x), self.size_screen - 1)" in source
+    assert "select_point('select', (x, y))" in source
+
+
+def _assert_outbound_primitive_validator_runs_on_python39() -> None:
+    specification = SimpleNamespace(
+        args=(
+            SimpleNamespace(name="select_point_act", sizes=(4,)),
+            SimpleNamespace(name="screen", sizes=(128, 128)),
+        )
+    )
+    valid = SimpleNamespace(function=2, arguments=((0,), (127, 0)))
+    negative = SimpleNamespace(function=2, arguments=((0,), (2, -85)))
+    upper_edge = SimpleNamespace(function=2, arguments=((0,), (128, 64)))
+
+    assert (
+        _pysc2_action_argument_failure(
+            valid,
+            function_specification=specification,
+        )
+        is None
+    )
+    assert "outside [0, 128)" in str(
+        _pysc2_action_argument_failure(
+            negative,
+            function_specification=specification,
+        )
+    )
+    assert "outside [0, 128)" in str(
+        _pysc2_action_argument_failure(
+            upper_edge,
+            function_specification=specification,
+        )
+    )
 
 
 def _assert_single_unit_selection_uses_exact_point() -> None:
@@ -129,7 +448,7 @@ def _assert_single_unit_selection_uses_exact_point() -> None:
 
 def _assert_visible_team_unit_bypasses_camera_recentering() -> None:
     assert "_rtscortex_accept_visible_team_unit" in inspect.getsource(get_camera_func_smart)
-    unit = SimpleNamespace(tag=0xA, x=90, y=65)
+    unit = SimpleNamespace(tag=0xA, unit_type=84, x=90, y=65)
     observation = SimpleNamespace(
         observation=SimpleNamespace(raw_units=[unit], feature_units=[unit])
     )
@@ -137,11 +456,57 @@ def _assert_visible_team_unit_bypasses_camera_recentering() -> None:
         log_id=0,
         size_screen=128,
         _rtscortex_accept_visible_team_unit=True,
+        AGENT_NAMES=["CombatGroup0"],
+        agent_id=0,
     )
 
     function_id, _ = get_camera_func_smart(main_agent, observation, unit.tag)
 
     assert function_id == 0
+
+    builder = SimpleNamespace(
+        log_id=0,
+        size_screen=128,
+        _rtscortex_accept_visible_team_unit=True,
+        AGENT_NAMES=["Builder"],
+        agent_id=0,
+        world_x_offset=0,
+        world_y_offset=0,
+        world_range=128,
+        last_two_camera_pos=[],
+    )
+    builder_function_id, _ = get_camera_func_smart(builder, observation, unit.tag)
+
+    assert builder_function_id == 573
+
+    centered_builder_unit = SimpleNamespace(
+        tag=0xA,
+        unit_type=84,
+        x=64,
+        y=63,
+        is_selected=True,
+        alliance=1,
+    )
+    centered_builder_observation = SimpleNamespace(
+        observation=SimpleNamespace(
+            raw_units=[centered_builder_unit],
+            feature_units=[centered_builder_unit],
+        )
+    )
+    stale_team = {
+        "name": "Builder-Probe-1",
+        "obs": [centered_builder_observation],
+        "pos": [[60.5, 23.0]],
+        "unit_tags": [centered_builder_unit.tag],
+    }
+    centered_builder_function_id, _ = get_camera_func_smart(
+        builder,
+        centered_builder_observation,
+        centered_builder_unit.tag,
+        team=stale_team,
+    )
+
+    assert centered_builder_function_id == 0
 
     edge_unit = SimpleNamespace(tag=0xB, unit_type=126, x=0, y=65)
     edge_observation = SimpleNamespace(
@@ -169,6 +534,27 @@ def _assert_zerg_queen_uses_exact_single_actor_selection() -> None:
     assert queen_team["name"] == "Queen-1"
     assert queen_team["select_type"] == "select"
     assert roach_team["select_type"] == "select_all_type"
+
+
+def _assert_all_races_reacquire_attack_targets() -> None:
+    for config_type in (
+        RTSCortexMeleeConfig,
+        RTSCortexTerranMeleeConfig,
+        RTSCortexZergMeleeConfig,
+    ):
+        config = config_type()
+        attacks = [
+            action
+            for agent in config.AGENTS.values()
+            for actions in agent["action"].values()
+            for action in actions
+            if action["name"] == "Attack_Unit"
+        ]
+        assert attacks
+        assert all(
+            [function_id for function_id, _, _ in action["func"]] == [573, 0, 12]
+            for action in attacks
+        )
 
 
 def _assert_build_order_ids_use_raw_function_domain() -> None:
@@ -199,6 +585,7 @@ def _assert_build_order_ids_use_raw_function_domain() -> None:
         "SpineCrawler": 1166,
         "SporeCrawler": 1167,
         "CreepTumorQueen": 1694,
+        "CreepTumor": 1733,
     }
     assert BUILD_RAW_FUNCTION_IDS == {
         structure: int(actions.RAW_ABILITY_ID_TO_FUNC_ID[ability_id])
@@ -208,6 +595,7 @@ def _assert_build_order_ids_use_raw_function_domain() -> None:
 
 def _assert_direct_production_contract() -> None:
     expected = {
+        "Train_Probe": (485, 64, "Nexus", "Probe", 50, 0, 1, ("Nexus",)),
         "Train_Zealot": (503, 49, "Gateway", "Zealot", 100, 0, 2, ("Gateway",)),
         "Train_Stalker": (
             493,
@@ -232,6 +620,7 @@ def _assert_direct_production_contract() -> None:
         "Train_Phoenix": (484, 55, "Stargate", "Phoenix", 150, 100, 2, ("Stargate",)),
         "Train_VoidRay": (500, 57, "Stargate", "VoidRay", 250, 150, 4, ("Stargate",)),
         "Train_Oracle": (482, 58, "Stargate", "Oracle", 150, 150, 3, ("Stargate",)),
+        "Train_SCV": (490, 520, "CommandCenter", "SCV", 50, 0, 1, ()),
         "Train_Marine": (477, 511, "Barracks", "Marine", 50, 0, 1, ("Barracks",)),
         "Train_Marauder": (
             476,
@@ -888,16 +1277,25 @@ def _assert_exact_anchor_and_footprint() -> None:
 
 def main() -> None:
     _assert_candidate_mapping()
+    _assert_terminal_collapse_boundary_is_worker_isolated()
     _assert_reserved_builder_worker_guard()
     _assert_worker_assignment_revalidates_workplaces()
     _assert_max_frame_hook()
+    _assert_build_query_capability_wiring()
+    _assert_build_query_capability_direct_and_nested_wiring()
+    _assert_build_query_capability_multi_agent_and_episode_wiring()
+    _assert_build_query_capability_missing_controller_fails_before_step()
+    _assert_plain_agent_run_loop_is_unchanged()
     _assert_atomic_log_directory_allocation()
     _assert_gas_rebalance_uses_worker_management_flag()
     _assert_observation_gap_watchdog_preempts_optional_gathering()
     _assert_gather_target_is_visible_and_in_bounds()
+    _assert_stop_worker_selection_uses_clamped_coordinate()
+    _assert_outbound_primitive_validator_runs_on_python39()
     _assert_single_unit_selection_uses_exact_point()
     _assert_visible_team_unit_bypasses_camera_recentering()
     _assert_zerg_queen_uses_exact_single_actor_selection()
+    _assert_all_races_reacquire_attack_targets()
     _assert_build_order_ids_use_raw_function_domain()
     _assert_direct_production_contract()
     _assert_terran_addon_contract()

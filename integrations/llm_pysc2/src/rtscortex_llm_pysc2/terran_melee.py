@@ -54,6 +54,11 @@ UNIT_ACTIONS = [
     _action("Move_Screen", ["screen"], F.Move_screen, "queued", "screen"),
     _action("Attack_Unit", ["tag"], F.Attack_screen, "queued", "screen_tag"),
 ]
+UNIT_ACTIONS[-1]["func"] = [
+    (573, F.llm_pysc2_move_camera, ("world_tag",)),
+    (0, F.no_op, ()),
+    (int(F.Attack_screen.id), F.Attack_screen, ("queued", "screen_tag")),
+]
 NON_ATTACKING_UNIT_ACTIONS = [
     _action("Stop", [], F.Stop_quick, "now"),
     NO_OPERATION,
@@ -102,12 +107,26 @@ BUILD_ACTIONS[3]["func"] = [
 ]
 
 PRODUCTION_ACTIONS = [
+    _action("Train_SCV", [], F.Train_SCV_quick, "queued"),
     _action("Train_Marine", [], F.Train_Marine_quick, "queued"),
     _action("Train_Marauder", [], F.Train_Marauder_quick, "queued"),
     _action("Train_Hellion", [], F.Train_Hellion_quick, "queued"),
     _action("Train_SiegeTank", [], F.Train_SiegeTank_quick, "queued"),
     _action("Train_Medivac", [], F.Train_Medivac_quick, "queued"),
     _action("Train_VikingFighter", [], F.Train_VikingFighter_quick, "queued"),
+]
+ECONOMY_ACTIONS = [
+    _action("Morph_OrbitalCommand", [], F.Morph_OrbitalCommand_quick, "queued"),
+    _action(
+        "Effect_CalldownMULE_Screen",
+        ["screen"],
+        F.Effect_CalldownMULE_screen,
+        "queued",
+        "screen",
+    ),
+]
+RESEARCH_ACTIONS = [
+    _action("Research_Stimpack", [], F.Research_Stimpack_quick, "queued"),
 ]
 ADDON_ACTIONS = [
     _action("Build_BarracksTechLab", [], F.Build_TechLab_Barracks_quick, "queued"),
@@ -178,7 +197,15 @@ class RTSCortexTerranMeleeConfig(AgentConfig):  # type: ignore[misc]
                         "select_type": "select",
                     }
                 ],
-                "action": {"EmptyGroup": [NO_OPERATION, *PRODUCTION_ACTIONS, *ADDON_ACTIONS]},
+                "action": {
+                    "EmptyGroup": [
+                        NO_OPERATION,
+                        *ECONOMY_ACTIONS,
+                        *PRODUCTION_ACTIONS,
+                        *ADDON_ACTIONS,
+                        *RESEARCH_ACTIONS,
+                    ]
+                },
             },
             "CombatGroup0": _combat_agent(self, "Marine-1", units.Terran.Marine),
             "CombatGroup1": _combat_agent(self, "Marauder-1", units.Terran.Marauder),

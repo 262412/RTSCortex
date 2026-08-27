@@ -9,6 +9,7 @@ from rtscortex.cortex.benchmark import (
 from rtscortex.cortex.candidates import (
     CandidateCompilationError,
     CandidateCompiler,
+    counterfactual_observation_fingerprint,
     observation_fingerprint,
 )
 from rtscortex.cortex.dataset import (
@@ -38,6 +39,7 @@ from rtscortex.cortex.dataset import (
 )
 from rtscortex.cortex.executor import DeterministicCandidateExecutor
 from rtscortex.cortex.interfaces import (
+    ExecutionAwareTacticalPolicyProvider,
     FastExecutor,
     IntentCandidateCompiler,
     SituationAnalyzer,
@@ -73,12 +75,23 @@ from rtscortex.cortex.models import (
     MacroStep,
     MacroStepStatus,
     ReflexIntent,
+    ResourcePressure,
     ScoutingAssessment,
     SituationAssessment,
     SituationFact,
     SpatialAssessment,
     TacticalIntent,
     ThreatLevel,
+)
+from rtscortex.cortex.operations import (
+    AttemptKey,
+    AuthoritativeBuildCircuitState,
+    EngagementKey,
+    ExpansionGoalKey,
+    ExpansionGoalState,
+    OperationKey,
+    PlacementReservationKey,
+    RetreatCommitmentKey,
 )
 from rtscortex.cortex.race_brain import (
     EnsembleSchedule,
@@ -121,12 +134,22 @@ from rtscortex.cortex.strategic import (
     StrategicIntentAdapter,
 )
 from rtscortex.cortex.tactical import DeterministicTacticalAgent
+from rtscortex.cortex.terminal import (
+    TerminalCollapseReason,
+    TerminalCollapseState,
+    is_terminal_collapse,
+    is_terminal_collapse_state,
+    townhall_recovery_runtime_actions,
+)
 
 __all__ = [
     "ArmyReadiness",
+    "AuthoritativeBuildCircuitState",
+    "AttemptKey",
     "BaseAssessment",
     "CandidateCompilationError",
     "CandidateCompiler",
+    "counterfactual_observation_fingerprint",
     "CandidateFeatures",
     "CandidateSelection",
     "CandidateSelectionStatus",
@@ -141,7 +164,9 @@ __all__ = [
     "DeterministicTacticalAgent",
     "DefenseAgent",
     "EconomyStatus",
+    "ExecutionAwareTacticalPolicyProvider",
     "EconomyAgent",
+    "EngagementKey",
     "EnsembleSchedule",
     "ExecutableCandidate",
     "ExecutorCandidateSample",
@@ -157,6 +182,8 @@ __all__ = [
     "ExecutorCorpusSource",
     "ExecutorCorpusVerification",
     "ExecutorSelectionLabel",
+    "ExpansionGoalKey",
+    "ExpansionGoalState",
     "ExecutorSplit",
     "ExecutorTerminalOutcome",
     "FastExecutor",
@@ -183,14 +210,18 @@ __all__ = [
     "MacroStepStatus",
     "KnowledgeStatus",
     "ReflexIntent",
+    "ResourcePressure",
     "OffenseAgent",
+    "OperationKey",
     "ProductionAgent",
+    "PlacementReservationKey",
     "ResourceClaim",
     "RoleId",
     "RoleAgent",
     "RoleAgentContext",
     "RoleAgentCoordinator",
     "RetreatAgent",
+    "RetreatCommitmentKey",
     "RaceBrainHealth",
     "RaceBrainMemberHealth",
     "RaceBrainMemberProposal",
@@ -210,6 +241,8 @@ __all__ = [
     "StrategicIntentAdapter",
     "TacticalIntent",
     "TechnologyAgent",
+    "TerminalCollapseReason",
+    "TerminalCollapseState",
     "ThreatLevel",
     "DEFAULT_EXECUTOR_SPLIT_SEED",
     "EXECUTOR_CORPUS_BUILDER_VERSION",
@@ -219,11 +252,14 @@ __all__ = [
     "executor_episode_split",
     "hima_previous_action_for_runtime_action",
     "hima_previous_actions_for_runtime_actions",
+    "is_terminal_collapse",
+    "is_terminal_collapse_state",
     "macro_goal_spec",
     "macro_plan_from_hima",
     "load_executor_corpus",
     "observation_fingerprint",
     "runtime_frontier",
     "selected_hima_response",
+    "townhall_recovery_runtime_actions",
     "verify_executor_corpus",
 ]

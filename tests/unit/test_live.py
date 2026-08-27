@@ -57,6 +57,14 @@ def test_prepare_live_worker_builds_fixed_pysc2_command(tmp_path: Path) -> None:
         'flags.DEFINE_integer("random_seed", None, "Random seed")\nrandom_seed=FLAGS.random_seed\n',
         encoding="utf-8",
     )
+    printer_source = tmp_path / "third_party/LLM-PySC2/pysc2/env/available_actions_printer.py"
+    printer_source.parent.mkdir(parents=True, exist_ok=True)
+    printer_source.write_text(
+        'available_actions = obs.observation.get("available_actions")\n'
+        "if available_actions is None:\n"
+        "    continue\n",
+        encoding="utf-8",
+    )
     run_loop_source = tmp_path / "third_party/LLM-PySC2/pysc2/env/run_loop.py"
     run_loop_source.parent.mkdir(parents=True, exist_ok=True)
     run_loop_source.write_text(
@@ -83,7 +91,9 @@ def test_prepare_live_worker_builds_fixed_pysc2_command(tmp_path: Path) -> None:
         "if len(working_place_unit_list) == 0:\n"
         "_rtscortex_force_runtime_decision\n"
         "_rtscortex_accept_visible_team_unit\n"
-        "_rtscortex_validate_gather_target\n",
+        "_rtscortex_validate_gather_target\n"
+        "min(max(0, unit.x), self.size_screen - 1)\n"
+        "select_point('select', (x, y))\n",
         encoding="utf-8",
     )
 
@@ -121,6 +131,8 @@ def test_prepare_live_worker_builds_fixed_pysc2_command(tmp_path: Path) -> None:
         "random",
         "--step_mul",
         "1",
+        "--action_space",
+        "FEATURES",
         "--parallel",
         "1",
         "--render=false",
@@ -130,6 +142,16 @@ def test_prepare_live_worker_builds_fixed_pysc2_command(tmp_path: Path) -> None:
         "--random_seed",
         "0",
     )
+
+    reviewed_root = tmp_path / "reviewed"
+    reviewed_root.mkdir()
+    (tmp_path / "third_party").rename(reviewed_root / "third_party")
+    reviewed_spec = prepare_live_worker(
+        config,
+        tmp_path,
+        environment={"RTSCORTEX_REVIEWED_SOURCE_ROOT": str(reviewed_root)},
+    )
+    assert reviewed_spec.python_path == (reviewed_root / "third_party" / "LLM-PySC2",)
 
     executable.unlink()
     old_executable = sc2_path / "Versions/Base75689/SC2_x64"
@@ -265,6 +287,8 @@ def test_prepare_live_worker_builds_official_melee_bot_command(tmp_path: Path) -
         "macro",
         "--step_mul",
         "1",
+        "--action_space",
+        "FEATURES",
         "--game_steps_per_episode",
         "28800",
         "--parallel",
@@ -290,6 +314,94 @@ def test_prepare_live_worker_builds_official_melee_bot_command(tmp_path: Path) -
     assert console_spec.command[console_spec.command.index("--rgb_screen_size") + 1] == "320"
     assert console_spec.command[console_spec.command.index("--rgb_minimap_size") + 1] == "160"
     assert console_spec.command[console_spec.command.index("--action_space") + 1] == "FEATURES"
+
+    raw_config = console_config.model_copy(
+        update={
+            "environment": console_config.environment.model_copy(
+                update={"execution_action_space": "raw"}
+            )
+        }
+    )
+    raw_spec = prepare_live_worker(raw_config, tmp_path, environment={})
+    assert raw_spec.command[raw_spec.command.index("--action_space") + 1] == "RAW"
+    assert "--rgb_screen_size" in raw_spec.command
+    assert "--rgb_minimap_size" in raw_spec.command
+
+
+def test_prepare_live_worker_omits_step_limits_for_natural_terminal(tmp_path: Path) -> None:
+    base_python = tmp_path / "python3.9"
+    base_python.write_text("#!/bin/sh\necho 'Python 3.9.99'\n", encoding="utf-8")
+    base_python.chmod(base_python.stat().st_mode | stat.S_IXUSR)
+    worker_python = tmp_path / "worker-venv/bin/python"
+    worker_python.parent.mkdir(parents=True)
+    worker_python.symlink_to(base_python)
+
+    sc2_path = tmp_path / "StarCraftII"
+    executable = sc2_path / "Versions/Base92440/SC2_x64"
+    executable.parent.mkdir(parents=True)
+    executable.touch()
+    executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
+    scenario_map = sc2_path / "Maps/Melee/Simple64.SC2Map"
+    scenario_map.parent.mkdir(parents=True)
+    scenario_map.touch()
+    _write_worker_patch_sources(tmp_path)
+
+    config = make_config(tmp_path).model_copy(
+        update={
+            "environment": EnvironmentSettings(
+                adapter="llm_pysc2",
+                scenario="Simple64",
+                sc2_path=sc2_path,
+                worker_python=worker_python,
+                max_steps=None,
+                game_steps_per_episode=None,
+            )
+        }
+    )
+
+    command = prepare_live_worker(config, tmp_path, environment={}).command
+
+    assert "--max_agent_steps" not in command
+    assert "--game_steps_per_episode" not in command
+
+
+def test_prepare_live_worker_passes_explicit_pysc2_no_limit_sentinel(
+    tmp_path: Path,
+) -> None:
+    base_python = tmp_path / "python3.9"
+    base_python.write_text("#!/bin/sh\necho 'Python 3.9.99'\n", encoding="utf-8")
+    base_python.chmod(base_python.stat().st_mode | stat.S_IXUSR)
+    worker_python = tmp_path / "worker-venv/bin/python"
+    worker_python.parent.mkdir(parents=True)
+    worker_python.symlink_to(base_python)
+
+    sc2_path = tmp_path / "StarCraftII"
+    executable = sc2_path / "Versions/Base92440/SC2_x64"
+    executable.parent.mkdir(parents=True)
+    executable.touch()
+    executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
+    scenario_map = sc2_path / "Maps/Melee/Simple64.SC2Map"
+    scenario_map.parent.mkdir(parents=True)
+    scenario_map.touch()
+    _write_worker_patch_sources(tmp_path)
+
+    config = make_config(tmp_path).model_copy(
+        update={
+            "environment": EnvironmentSettings(
+                adapter="llm_pysc2",
+                scenario="Simple64",
+                sc2_path=sc2_path,
+                worker_python=worker_python,
+                max_steps=None,
+                game_steps_per_episode=0,
+            )
+        }
+    )
+
+    command = prepare_live_worker(config, tmp_path, environment={}).command
+
+    assert "--max_agent_steps" not in command
+    assert command[command.index("--game_steps_per_episode") + 1] == "0"
 
 
 def test_worker_entrypoint_forwards_melee_environment(
@@ -370,6 +482,14 @@ def _write_worker_patch_sources(project_root: Path) -> None:
         'flags.DEFINE_integer("random_seed", None, "Random seed")\nrandom_seed=FLAGS.random_seed\n',
         encoding="utf-8",
     )
+    printer_source = project_root / "third_party/LLM-PySC2/pysc2/env/available_actions_printer.py"
+    printer_source.parent.mkdir(parents=True, exist_ok=True)
+    printer_source.write_text(
+        'available_actions = obs.observation.get("available_actions")\n'
+        "if available_actions is None:\n"
+        "    continue\n",
+        encoding="utf-8",
+    )
     run_loop_source = project_root / "third_party/LLM-PySC2/pysc2/env/run_loop.py"
     run_loop_source.parent.mkdir(parents=True, exist_ok=True)
     run_loop_source.write_text(
@@ -396,7 +516,9 @@ def _write_worker_patch_sources(project_root: Path) -> None:
         "if len(working_place_unit_list) == 0:\n"
         "_rtscortex_force_runtime_decision\n"
         "_rtscortex_accept_visible_team_unit\n"
-        "_rtscortex_validate_gather_target\n",
+        "_rtscortex_validate_gather_target\n"
+        "min(max(0, unit.x), self.size_screen - 1)\n"
+        "select_point('select', (x, y))\n",
         encoding="utf-8",
     )
 

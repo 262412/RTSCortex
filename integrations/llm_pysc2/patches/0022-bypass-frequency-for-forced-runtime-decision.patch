@@ -1,0 +1,14 @@
+diff --git a/llm_pysc2/agents/llm_pysc2_agent_main.py b/llm_pysc2/agents/llm_pysc2_agent_main.py
+--- a/llm_pysc2/agents/llm_pysc2_agent_main.py
++++ b/llm_pysc2/agents/llm_pysc2_agent_main.py
+@@ -279,7 +279,9 @@ class MainAgent(base_agent.BaseAgent):
+ 
+     # LLM decision frequency control
+     game_time_s = obs.observation.game_loop / 22.4
+-    if not self.main_loop_lock and game_time_s - self.game_time_last < 1 / self.config.MAX_LLM_DECISION_FREQUENCY:
++    if not self.main_loop_lock and \
++        not getattr(self, '_rtscortex_force_runtime_decision', False) and \
++        game_time_s - self.game_time_last < 1 / self.config.MAX_LLM_DECISION_FREQUENCY:
+       logger.warning(f"[ID {self.log_id}] Reach MAX_LLM_DECISION_FREQUENCY! return no_op()")
+       func_id, func_call = (0, actions.FUNCTIONS.no_op())
+       self.func_id_history.append(func_id)

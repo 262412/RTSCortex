@@ -19,6 +19,7 @@ class PrimitiveResult:
     total: Optional[int] = None
     game_loop: Optional[int] = None
     failure_code: Optional[str] = None
+    authoritative_pre_dispatch: Optional[dict[str, Any]] = None
     requested_function_id: Optional[int] = None
     emitted_function_id: Optional[int] = None
 
@@ -75,6 +76,7 @@ class ExecutionTracker:
         total: Optional[int] = None,
         game_loop: Optional[int] = None,
         failure_code: Optional[str] = None,
+        authoritative_pre_dispatch: Optional[dict[str, Any]] = None,
         requested_function_id: Optional[int] = None,
         emitted_function_id: Optional[int] = None,
     ) -> None:
@@ -90,6 +92,7 @@ class ExecutionTracker:
                 total=total,
                 game_loop=game_loop,
                 failure_code=failure_code,
+                authoritative_pre_dispatch=authoritative_pre_dispatch,
                 requested_function_id=requested_function_id,
                 emitted_function_id=emitted_function_id,
             )
@@ -186,11 +189,18 @@ class ExecutionTracker:
                 "actor_not_available",
                 "actor_not_visible",
                 "actor_selection_timeout",
+                "authoritative_pre_dispatch_circuit_open",
+                "builder_ability_unavailable",
                 "candidate_invalidated",
                 "friendly_target",
                 "invalid_expansion_anchor",
                 "invalid_geyser_tag",
                 "no_legal_placement",
+                "operation_no_start_circuit_open",
+                "placement_candidate_stale",
+                "placement_query_rejected",
+                "placement_query_rejected_cached",
+                "placement_query_unavailable",
                 "production_source_invalidated",
                 "production_source_unavailable",
                 "target_not_visible",
@@ -208,6 +218,9 @@ class ExecutionTracker:
             "episode_id": tracked.route.episode_id,
             "step_id": tracked.route.step_id,
             "command_id": tracked.command.command_id,
+            "operation_id": tracked.command.operation_id,
+            "attempt_id": tracked.command.attempt_id,
+            "attempt_ordinal": tracked.command.attempt_ordinal,
             "action_name": tracked.command.name,
             "actor": tracked.command.actor,
             "source": tracked.command.source,
@@ -218,6 +231,14 @@ class ExecutionTracker:
             "failure_reason": "; ".join(failure_reasons) if failure_reasons else None,
             "execution_stage": stage,
             "failure_code": terminal_failure_code or primitive_failure_code,
+            "authoritative_pre_dispatch": next(
+                (
+                    item.authoritative_pre_dispatch
+                    for item in terminal_primitives
+                    if item.authoritative_pre_dispatch is not None
+                ),
+                None,
+            ),
             "pysc2_function": " -> ".join(item.function_name for item in primitives) or None,
             "primitive_trace": [
                 {

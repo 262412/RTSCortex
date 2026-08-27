@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from types import MappingProxyType
 from typing import Protocol
@@ -27,6 +27,25 @@ class ActionDomain(StrEnum):
     RETREAT = "retreat"
 
 
+class CombatTargetDomain(StrEnum):
+    GROUND = "ground"
+    AIR = "air"
+    BOTH = "both"
+    NONE = "none"
+
+
+@dataclass(frozen=True, slots=True)
+class DefenseDoctrine:
+    """Race-specific actions an emergency DefenseAgent may compile."""
+
+    ground_production_actions: tuple[str, ...] = ()
+    anti_air_production_actions: tuple[str, ...] = ()
+    static_defense_actions: tuple[str, ...] = ()
+    anti_air_defense_actions: tuple[str, ...] = ()
+    prerequisite_actions: tuple[str, ...] = ()
+    worker_defense_actions: tuple[str, ...] = ("Attack_Unit",)
+
+
 @dataclass(frozen=True, slots=True)
 class MacroActionMapping:
     semantic_action: str
@@ -45,12 +64,17 @@ class RaceProfileData:
     macro_action_mappings: tuple[MacroActionMapping, ...]
     action_domains: Mapping[str, ActionDomain]
     action_producers: Mapping[str, tuple[str, ...]]
+    combat_target_domains: Mapping[str, CombatTargetDomain]
     hima_vocabulary_version: str
+    defense_doctrine: DefenseDoctrine = field(default_factory=DefenseDoctrine)
+    structure_saturation_limits: Mapping[str, int] = field(default_factory=dict)
+    defense_unit_saturation_limits: Mapping[str, int] = field(default_factory=dict)
     macro_contract_ready: bool = True
     runtime_mapping_ready: bool = False
     live_worker_ready: bool = False
     effect_verification_kinds: tuple[str, ...] = ()
     controller_capabilities: tuple[str, ...] = ()
+    controller_managed_actions: tuple[str, ...] = ()
     limitations: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
@@ -60,11 +84,34 @@ class RaceProfileData:
         semantic_actions = [mapping.semantic_action for mapping in self.macro_action_mappings]
         if len(semantic_actions) != len(set(semantic_actions)):
             raise ValueError(f"{self.race.value} macro mappings must be unique")
+        if len(self.controller_managed_actions) != len(set(self.controller_managed_actions)):
+            raise ValueError(f"{self.race.value} controller-managed actions must be unique")
+        mapped_runtime_actions = {
+            action for mapping in self.macro_action_mappings for action in mapping.runtime_actions
+        }
+        unknown_managed_actions = set(self.controller_managed_actions) - mapped_runtime_actions
+        if unknown_managed_actions:
+            rendered = ", ".join(sorted(unknown_managed_actions))
+            raise ValueError(
+                f"{self.race.value} controller-managed actions lack macro mappings: {rendered}"
+            )
         object.__setattr__(self, "action_domains", MappingProxyType(dict(self.action_domains)))
         object.__setattr__(
             self,
             "action_producers",
             MappingProxyType(dict(self.action_producers)),
+        )
+        object.__setattr__(
+            self,
+            "combat_target_domains",
+            MappingProxyType(dict(self.combat_target_domains)),
+        )
+        if any(limit < 1 for limit in self.structure_saturation_limits.values()):
+            raise ValueError("structure saturation limits must be positive")
+        object.__setattr__(
+            self,
+            "structure_saturation_limits",
+            MappingProxyType(dict(self.structure_saturation_limits)),
         )
 
     def domain_for_action(self, action_name: str) -> ActionDomain | None:
@@ -82,6 +129,8 @@ class RaceProfileData:
             "live_worker_ready": self.live_worker_ready,
             "effect_verification_kinds": list(self.effect_verification_kinds),
             "controller_capabilities": list(self.controller_capabilities),
+            "controller_managed_actions": list(self.controller_managed_actions),
+            "structure_saturation_limits": dict(self.structure_saturation_limits),
             "limitations": list(self.limitations),
         }
 

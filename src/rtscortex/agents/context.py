@@ -166,6 +166,7 @@ def compact_execution_payload(
                 "target_position",
                 "target_tag",
                 "builder_tag",
+                "actor_tag",
                 "new_structure_tag",
                 "dispatch_game_loop",
                 "accepted_game_loop",
@@ -181,7 +182,7 @@ def compact_execution_payload(
                 "effective_timeout_game_loops",
                 "active_order_extension",
             ):
-                if key in raw_evidence:
+                if key in raw_evidence and (key != "actor_tag" or raw_evidence[key] is not None):
                     evidence[key] = _bounded_json_value(raw_evidence[key])
             payload["effect_evidence"] = evidence
     return payload

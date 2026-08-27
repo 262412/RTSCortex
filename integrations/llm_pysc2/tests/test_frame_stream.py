@@ -204,6 +204,7 @@ class WorkerFrameIntegrationTests(unittest.TestCase):
             "RTSCORTEX_CONSOLE_ENABLED": "true",
             "RTSCORTEX_CONSOLE_FRAME_FPS": "2.5",
             "RTSCORTEX_CONSOLE_JPEG_QUALITY": "81",
+            "RTSCORTEX_PLACEMENT_OUTBOX_PATH": "/tmp/placement-outbox.sqlite3",
         }
         with mock.patch.dict("os.environ", environment, clear=True):
             settings = WorkerSettings.from_environment()
@@ -211,6 +212,10 @@ class WorkerFrameIntegrationTests(unittest.TestCase):
         self.assertTrue(settings.console_enabled)
         self.assertEqual(settings.console_frame_fps, 2.5)
         self.assertEqual(settings.console_jpeg_quality, 81)
+        self.assertEqual(
+            settings.placement_outbox_path,
+            "/tmp/placement-outbox.sqlite3",
+        )
 
     def test_agent_submission_and_close_are_best_effort(self) -> None:
         class FailingPublisher:

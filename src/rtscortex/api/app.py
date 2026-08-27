@@ -1,5 +1,6 @@
 """FastAPI transport for environment workers."""
 
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Annotated
@@ -13,10 +14,13 @@ from rtscortex.console.models import FrameKind
 from rtscortex.contracts import (
     CURRENT_PROTOCOL_VERSION,
     ActionBatch,
+    AuthoritativeBuildPreflightResult,
     EpisodeResult,
     ExecutionReport,
     ObservationEnvelope,
+    PlacementLedgerEvent,
 )
+from rtscortex.memory import IdempotencyConflictError
 from rtscortex.runtime import RuntimeEngine
 
 
@@ -49,15 +53,48 @@ def create_app(
         }
 
     @app.post("/v1/tick", response_model=ActionBatch)
-    async def tick(observation: ObservationEnvelope) -> ActionBatch:
+    async def tick(observation: ObservationEnvelope, response: Response) -> ActionBatch:
         _require_current_protocol(observation.protocol_version)
-        return await engine.tick(observation)
+        started = time.perf_counter()
+        batch = await engine.tick(observation)
+        response.headers["X-RTSCortex-Runtime-Tick-Ms"] = (
+            f"{(time.perf_counter() - started) * 1_000:.6f}"
+        )
+        return batch
+
+    @app.post("/v1/performance")
+    async def performance(payload: dict[str, object]) -> dict[str, str]:
+        _require_current_protocol(str(payload.get("protocol_version", "")))
+        engine.record_performance_profile(payload)
+        return {"status": "recorded"}
 
     @app.post("/v1/execution")
     async def execution(report: ExecutionReport) -> dict[str, str]:
         _require_current_protocol(report.protocol_version)
         engine.record_execution(report)
         return {"status": "recorded"}
+
+    @app.post("/v1/build/preflight")
+    async def authoritative_build_preflight(
+        result: AuthoritativeBuildPreflightResult,
+    ) -> dict[str, str]:
+        _require_current_protocol(result.protocol_version)
+        try:
+            engine.record_authoritative_build_preflight(result)
+        except RuntimeError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        return {"status": "recorded"}
+
+    @app.post("/v1/placement/transition")
+    async def placement_transition(event: PlacementLedgerEvent) -> dict[str, str]:
+        _require_current_protocol(event.protocol_version)
+        try:
+            status = engine.record_placement_transition(event)
+        except IdempotencyConflictError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        except RuntimeError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        return {"status": status}
 
     @app.post("/v1/episode/end")
     async def end_episode(result: EpisodeResult) -> dict[str, str]:

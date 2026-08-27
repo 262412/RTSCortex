@@ -8,35 +8,70 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 from rtscortex_llm_pysc2.addon_effect_verifier import AddonEffectVerifier
+from rtscortex_llm_pysc2.combat_effect_verifier import CombatEffectVerifier
+from rtscortex_llm_pysc2.effect_lifecycle import (
+    DEFAULT_ACTION_EFFECT_TIMEOUT_GAME_LOOPS as DEFAULT_ACTION_EFFECT_TIMEOUT_GAME_LOOPS,
+)
+from rtscortex_llm_pysc2.effect_lifecycle import (
+    POST_ORDER_EFFECT_GRACE_GAME_LOOPS,
+    build_effect_max_lifetime,
+)
 from rtscortex_llm_pysc2.effect_types import EffectVerdict
 from rtscortex_llm_pysc2.extractor import BUILD_RAW_FUNCTION_IDS, BUILD_SPECS
 from rtscortex_llm_pysc2.inject_effect_verifier import InjectEffectVerifier
 from rtscortex_llm_pysc2.morph_effect_verifier import MorphEffectVerifier
+from rtscortex_llm_pysc2.mule_effect_verifier import MuleEffectVerifier
 from rtscortex_llm_pysc2.production_effect_verifier import ProductionEffectVerifier
+from rtscortex_llm_pysc2.raw_placement import (
+    RawPlacementReservation,
+    RawPlacementService,
+    _circle_intersects_cells,
+    _occupied_cells_for_spec,
+    _placement_revision,
+)
+from rtscortex_llm_pysc2.research_effect_verifier import ResearchEffectVerifier
 from rtscortex_llm_pysc2.routing import RoutedCommand
 
-DEFAULT_ACTION_EFFECT_TIMEOUT_GAME_LOOPS = 112
-ACTIVE_BUILD_ORDER_TIMEOUT_MULTIPLIER = 4
-NEXUS_ACTIVE_BUILD_ORDER_TIMEOUT_MULTIPLIER = 12
-MOVE_RAW_FUNCTION_ID = 13
-MOVE_MINIMAP_DISPLACEMENT_TOLERANCE_WORLD = 1.0
-POST_ORDER_EFFECT_GRACE_GAME_LOOPS = 32
+# PySC2 projects SC2's concrete Move ability (16) to Move_Move_pt. The generic
+# smart-move function 13 represents a different ability and never appears in
+# the raw unit order stream for normal movement.
+MOVE_RAW_FUNCTION_ID = 547
+MOVE_RAW_FUNCTION_IDS = frozenset({13, MOVE_RAW_FUNCTION_ID})
+MOVE_MINIMAP_ARRIVAL_RADIUS = 4.0
+MOVE_GAME_LOOPS_PER_MINIMAP_UNIT = 10.0
+MOVE_SETTLEMENT_GRACE_GAME_LOOPS = 32
+MOVE_ORDER_ACQUISITION_TIMEOUT_GAME_LOOPS = 16
 
 
 @dataclass(frozen=True)
 class _BuilderEvidence:
     tag: int
+    alliance: int
     status: str
     orders: tuple[int, ...]
     selected: bool
+    position: tuple[float, float]
+    health: float
+    health_max: float
+
+
+@dataclass(frozen=True)
+class _DynamicUnitEvidence:
+    tag: int
+    alliance: int
+    position: tuple[float, float]
+    radius: float
 
 
 @dataclass(frozen=True)
 class _Evidence:
     game_loop: int
+    observation_revision: str
     structures: tuple[_StructureEvidence, ...]
+    occupants: tuple[tuple[int, tuple[float, float]], ...]
     minerals: int
     builder: Optional[_BuilderEvidence]
+    dynamic_units: tuple[_DynamicUnitEvidence, ...]
 
 
 @dataclass(frozen=True)
@@ -61,7 +96,14 @@ class _PendingBuild:
     coordinate_space: Optional[str] = None
     order_seen: bool = False
     order_last_seen_game_loop: Optional[int] = None
+    build_started: bool = False
+    build_start_confirmation_kind: Optional[str] = None
+    build_start_confirmed_game_loop: Optional[int] = None
+    resource_debit_seen: bool = False
+    builder_approach_seen: bool = False
+    target_occupancy_seen: bool = False
     active_order_extension: bool = False
+    reservation_snapshot: RawPlacementReservation | None = None
 
 
 @dataclass
@@ -69,13 +111,15 @@ class _PendingMove:
     command: RoutedCommand
     resolved_arguments: tuple[Any, ...]
     target_position: tuple[float, float]
-    builder_tag: Optional[int] = None
+    actor_tag: Optional[int] = None
+    actor_tags: tuple[int, ...] = ()
+    minimap_transform: Optional[tuple[float, float, float, float, float]] = None
     dispatched_game_loop: Optional[int] = None
     accepted_game_loop: Optional[int] = None
     latest_game_loop: Optional[int] = None
-    baseline_builder_position: Optional[tuple[float, float]] = None
-    latest_builder_position: Optional[tuple[float, float]] = None
-    latest_builder_orders: tuple[int, ...] = ()
+    baseline_actor_position: Optional[tuple[float, float]] = None
+    latest_actor_position: Optional[tuple[float, float]] = None
+    latest_actor_orders: tuple[int, ...] = ()
     move_order_seen: bool = False
 
 
@@ -87,11 +131,13 @@ class ActionEffectVerifier:
         *,
         timeout_game_loops: int = DEFAULT_ACTION_EFFECT_TIMEOUT_GAME_LOOPS,
         unit_names: Optional[Mapping[int, str]] = None,
+        placement_service: Optional[RawPlacementService] = None,
     ) -> None:
         if timeout_game_loops <= 0:
             raise ValueError("timeout_game_loops must be positive")
         self.timeout_game_loops = timeout_game_loops
         self.unit_names = {int(key): str(value) for key, value in (unit_names or {}).items()}
+        self.placement_service = placement_service
         self._pending: dict[str, _PendingBuild] = {}
         self._pending_moves: dict[str, _PendingMove] = {}
         self._claimed_structure_tags: set[int] = set()
@@ -111,6 +157,18 @@ class ActionEffectVerifier:
             timeout_game_loops=timeout_game_loops,
             unit_names=self.unit_names,
         )
+        self.research = ResearchEffectVerifier(
+            timeout_game_loops=timeout_game_loops,
+            unit_names=self.unit_names,
+        )
+        self.mules = MuleEffectVerifier(
+            timeout_game_loops=timeout_game_loops,
+            unit_names=self.unit_names,
+        )
+        self.combat = CombatEffectVerifier(
+            timeout_game_loops=timeout_game_loops,
+            unit_names=self.unit_names,
+        )
 
     def track(self, command: RoutedCommand) -> bool:
         """Register an effectful command, returning false for immediate actions."""
@@ -124,6 +182,12 @@ class ActionEffectVerifier:
         if self.morphs.track(command):
             return True
         if self.injects.track(command):
+            return True
+        if self.research.track(command):
+            return True
+        if self.mules.track(command):
+            return True
+        if self.combat.track(command):
             return True
         target = _target_structure(command.name)
         if target is None and command.name != "Move_Minimap":
@@ -155,6 +219,9 @@ class ActionEffectVerifier:
             or self.addons.is_tracked(command_id)
             or self.morphs.is_tracked(command_id)
             or self.injects.is_tracked(command_id)
+            or self.research.is_tracked(command_id)
+            or self.mules.is_tracked(command_id)
+            or self.combat.is_tracked(command_id)
         )
 
     @property
@@ -172,6 +239,14 @@ class ActionEffectVerifier:
             return
         if self.injects.is_tracked(command_id):
             return
+        if self.research.is_tracked(command_id):
+            return
+        if self.mules.is_tracked(command_id):
+            self.mules.resolve_arguments(command_id, arguments)
+            return
+        if self.combat.is_tracked(command_id):
+            self.combat.resolve_arguments(command_id, arguments)
+            return
         pending_move = self._pending_moves.get(command_id)
         if pending_move is not None:
             target_position = _position_argument(arguments)
@@ -182,6 +257,14 @@ class ActionEffectVerifier:
             return
         self._get(command_id).resolved_arguments = tuple(arguments)
 
+    def record_action_result(self, command_id: str, results: Sequence[Any]) -> None:
+        """Refresh the pending reservation snapshot with SC2 acceptance evidence."""
+
+        del results
+        pending = self._pending.get(command_id)
+        if pending is not None and self.placement_service is not None:
+            pending.reservation_snapshot = self.placement_service.command_target(command_id)
+
     def prepare(
         self,
         command_id: str,
@@ -189,6 +272,8 @@ class ActionEffectVerifier:
         builder_tag: Optional[int],
         *,
         producer_tag: Optional[int] = None,
+        actor_tags: Sequence[int] = (),
+        minimap_transform: Optional[tuple[float, float, float, float, float]] = None,
     ) -> None:
         """Capture state immediately before the final effectful primitive."""
 
@@ -204,19 +289,43 @@ class ActionEffectVerifier:
         if self.injects.is_tracked(command_id):
             self.injects.prepare(command_id, observation, builder_tag)
             return
+        if self.research.is_tracked(command_id):
+            self.research.prepare(command_id, observation, producer_tag)
+            return
+        if self.mules.is_tracked(command_id):
+            self.mules.prepare(command_id, observation, producer_tag)
+            return
+        if self.combat.is_tracked(command_id):
+            self.combat.prepare(
+                command_id,
+                observation,
+                tuple(int(tag) for tag in actor_tags),
+            )
+            return
         pending_move = self._pending_moves.get(command_id)
         if pending_move is not None:
-            pending_move.builder_tag = None if builder_tag is None else int(builder_tag)
+            normalized_tags = tuple(
+                dict.fromkeys(
+                    int(tag)
+                    for tag in (actor_tags or (() if builder_tag is None else (int(builder_tag),)))
+                    if int(tag) > 0
+                )
+            )
+            pending_move.actor_tags = normalized_tags
+            pending_move.actor_tag = normalized_tags[0] if normalized_tags else None
+            pending_move.minimap_transform = minimap_transform
             pending_move.dispatched_game_loop = _game_loop(observation)
             pending_move.latest_game_loop = pending_move.dispatched_game_loop
-            builder = _unit_by_tag(observation, pending_move.builder_tag)
-            pending_move.baseline_builder_position = _unit_position(builder)
-            pending_move.latest_builder_position = pending_move.baseline_builder_position
-            pending_move.latest_builder_orders = () if builder is None else _unit_orders(builder)
+            actors = _units_by_tags(observation, pending_move.actor_tags)
+            pending_move.baseline_actor_position = _movement_centroid(actors, minimap_transform)
+            pending_move.latest_actor_position = pending_move.baseline_actor_position
+            pending_move.latest_actor_orders = _combined_unit_orders(actors)
             return
 
         pending = self._get(command_id)
         pending.builder_tag = None if builder_tag is None else int(builder_tag)
+        if self.placement_service is not None:
+            pending.reservation_snapshot = self.placement_service.command_target(command_id)
         self._resolve_target(pending, observation)
         pending.baseline = self._evidence(pending, observation)
         pending.latest = pending.baseline
@@ -236,6 +345,15 @@ class ActionEffectVerifier:
         if self.injects.is_tracked(command_id):
             self.injects.accept_primitive(command_id, game_loop=game_loop)
             return
+        if self.research.is_tracked(command_id):
+            self.research.accept_primitive(command_id, game_loop=game_loop)
+            return
+        if self.mules.is_tracked(command_id):
+            self.mules.accept_primitive(command_id, game_loop=game_loop)
+            return
+        if self.combat.is_tracked(command_id):
+            self.combat.accept_primitive(command_id, game_loop=game_loop)
+            return
         pending_move = self._pending_moves.get(command_id)
         if pending_move is not None:
             if pending_move.dispatched_game_loop is None:
@@ -251,10 +369,15 @@ class ActionEffectVerifier:
     def cancel(self, command_id: str) -> None:
         self._pending.pop(command_id, None)
         self._pending_moves.pop(command_id, None)
+        if self.placement_service is not None:
+            self.placement_service.release_command(command_id)
         self.production.cancel(command_id)
         self.addons.cancel(command_id)
         self.morphs.cancel(command_id)
         self.injects.cancel(command_id)
+        self.research.cancel(command_id)
+        self.mules.cancel(command_id)
+        self.combat.cancel(command_id)
 
     def observe(self, observation: Any) -> list[EffectVerdict]:
         """Evaluate all accepted effectful commands against one observation."""
@@ -263,6 +386,9 @@ class ActionEffectVerifier:
         verdicts.extend(self.addons.observe(observation))
         verdicts.extend(self.morphs.observe(observation))
         verdicts.extend(self.injects.observe(observation))
+        verdicts.extend(self.research.observe(observation))
+        verdicts.extend(self.mules.observe(observation))
+        verdicts.extend(self.combat.observe(observation))
         verdicts.extend(self._observe_moves(observation))
         accepted = [
             pending
@@ -283,18 +409,35 @@ class ActionEffectVerifier:
             ):
                 pending.order_seen = True
                 pending.order_last_seen_game_loop = current.game_loop
+                self._confirm_build_started(
+                    pending,
+                    current,
+                    confirmation_kind="builder_order",
+                )
+            self._update_supporting_build_start_evidence(pending, current)
         assignments = self._match_new_structures(accepted, current_by_command)
         self._claimed_structure_tags.update(structure.tag for structure in assignments.values())
         for command_id, structure in assignments.items():
             pending = self._pending.pop(command_id)
             current = current_by_command[command_id]
             pending.latest = current
+            self._confirm_build_started(
+                pending,
+                current,
+                confirmation_kind="new_structure",
+            )
+            evidence = self._effect_evidence(pending, current, structure)
+            if self.placement_service is not None:
+                self.placement_service.confirm_command(
+                    command_id,
+                    game_loop=current.game_loop,
+                )
             verdicts.append(
                 EffectVerdict(
                     command_id,
                     True,
                     status="succeeded",
-                    evidence=self._effect_evidence(pending, current, structure),
+                    evidence=evidence,
                 )
             )
 
@@ -317,11 +460,41 @@ class ActionEffectVerifier:
                 and current.game_loop - pending.order_last_seen_game_loop
                 < POST_ORDER_EFFECT_GRACE_GAME_LOOPS
             )
-            if elapsed < hard_timeout and (order_is_active or within_order_grace):
+            if elapsed < hard_timeout and (
+                pending.build_started or order_is_active or within_order_grace
+            ):
                 pending.active_order_extension = True
                 continue
             if elapsed >= self.timeout_game_loops:
                 failure_code = self._timeout_code(pending, current)
+                evidence = self._effect_evidence(pending, current, None)
+                if self.placement_service is not None:
+                    reservation = pending.reservation_snapshot
+                    self.placement_service.quarantine_command(
+                        command_id=command_id,
+                        action_name=pending.command.name,
+                        requested_arguments=pending.command.requested_arguments,
+                        world_target=pending.target_position,
+                        failure_code=failure_code,
+                        game_loop=current.game_loop,
+                        operation_id=pending.command.operation_id,
+                        attempt_ordinal=(
+                            None if reservation is None else reservation.attempt_ordinal
+                        ),
+                        builder_tag=pending.builder_tag,
+                        placement_revision=(
+                            None if reservation is None else reservation.placement_revision
+                        ),
+                        target_state_revision=(
+                            None if reservation is None else reservation.target_state_revision
+                        ),
+                        material_legality_identity=(
+                            None if reservation is None else reservation.material_legality_identity
+                        ),
+                        failure_classification=evidence.get("failure_classification"),
+                        classification_basis=evidence.get("classification_basis", ()),
+                        observation=observation,
+                    )
                 verdicts.append(
                     EffectVerdict(
                         command_id,
@@ -329,7 +502,7 @@ class ActionEffectVerifier:
                         self._timeout_reason(pending, current),
                         status="failed",
                         failure_code=failure_code,
-                        evidence=self._effect_evidence(pending, current, None),
+                        evidence=evidence,
                     )
                 )
                 del self._pending[command_id]
@@ -342,19 +515,16 @@ class ActionEffectVerifier:
             if pending.accepted_game_loop is None:
                 continue
             pending.latest_game_loop = game_loop
-            builder = _unit_by_tag(observation, pending.builder_tag)
-            pending.latest_builder_position = _unit_position(builder)
-            pending.latest_builder_orders = () if builder is None else _unit_orders(builder)
-            if MOVE_RAW_FUNCTION_ID in pending.latest_builder_orders:
+            actors = _units_by_tags(observation, pending.actor_tags)
+            pending.latest_actor_position = _movement_centroid(actors, pending.minimap_transform)
+            pending.latest_actor_orders = _combined_unit_orders(actors)
+            if MOVE_RAW_FUNCTION_IDS.intersection(pending.latest_actor_orders):
                 pending.move_order_seen = True
-            displacement = _optional_position_distance(
-                pending.baseline_builder_position,
-                pending.latest_builder_position,
+            distance_to_target = _optional_position_distance(
+                pending.latest_actor_position,
+                pending.target_position,
             )
-            if pending.move_order_seen or (
-                displacement is not None
-                and displacement >= MOVE_MINIMAP_DISPLACEMENT_TOLERANCE_WORLD
-            ):
+            if distance_to_target is not None and distance_to_target <= MOVE_MINIMAP_ARRIVAL_RADIUS:
                 verdicts.append(
                     EffectVerdict(
                         command_id,
@@ -366,22 +536,56 @@ class ActionEffectVerifier:
                 del self._pending_moves[command_id]
                 continue
             elapsed = game_loop - pending.accepted_game_loop
-            if elapsed < self.timeout_game_loops:
+            if not actors and elapsed >= self.timeout_game_loops:
+                verdicts.append(
+                    EffectVerdict(
+                        command_id,
+                        False,
+                        (
+                            "Move_Minimap did not arrive after "
+                            f"{elapsed} game loops (actor is not observable)"
+                        ),
+                        status="failed",
+                        failure_code="actor_not_observable",
+                        evidence=self._move_effect_evidence(pending, confirmed=False),
+                    )
+                )
+                del self._pending_moves[command_id]
                 continue
-            builder_detail = (
-                "builder is not observable"
-                if builder is None
-                else f"builder position remained {pending.latest_builder_position}"
+            if not pending.move_order_seen and elapsed >= MOVE_ORDER_ACQUISITION_TIMEOUT_GAME_LOOPS:
+                verdicts.append(
+                    EffectVerdict(
+                        command_id,
+                        False,
+                        (
+                            "Move_Minimap was accepted but no bound actor received "
+                            f"raw move order {MOVE_RAW_FUNCTION_ID}"
+                        ),
+                        status="failed",
+                        failure_code="move_order_not_observed",
+                        evidence=self._move_effect_evidence(pending, confirmed=False),
+                    )
+                )
+                del self._pending_moves[command_id]
+                continue
+            effective_timeout = self._move_effective_timeout(pending)
+            if elapsed < effective_timeout:
+                continue
+            actor_detail = (
+                "actor is not observable"
+                if not actors
+                else (
+                    f"group centroid {pending.latest_actor_position} remained "
+                    f"{distance_to_target!r} minimap units from {pending.target_position}"
+                )
             )
             verdicts.append(
                 EffectVerdict(
                     command_id,
                     False,
-                    f"Move_Minimap did not start after {elapsed} game loops ({builder_detail})",
+                    f"Move_Minimap did not arrive after {elapsed} game loops ({actor_detail})",
                     status="failed",
-                    failure_code=(
-                        "builder_not_observable" if builder is None else "effect_timeout"
-                    ),
+                    failure_code="actor_not_observable" if not actors else "effect_timeout",
                     evidence=self._move_effect_evidence(pending, confirmed=False),
                 )
             )
@@ -395,6 +599,9 @@ class ActionEffectVerifier:
         verdicts.extend(self.addons.fail_pending(reason))
         verdicts.extend(self.morphs.fail_pending(reason))
         verdicts.extend(self.injects.fail_pending(reason))
+        verdicts.extend(self.research.fail_pending(reason))
+        verdicts.extend(self.mules.fail_pending(reason))
+        verdicts.extend(self.combat.fail_pending(reason))
         for command_id, pending in list(self._pending.items()):
             if pending.accepted_game_loop is None:
                 continue
@@ -413,6 +620,12 @@ class ActionEffectVerifier:
                     ),
                 )
             )
+            if self.placement_service is not None:
+                self.placement_service.release_command(
+                    command_id,
+                    game_loop=(0 if current is None else current.game_loop),
+                    reason="episode_ended_unconfirmed",
+                )
             del self._pending[command_id]
         for command_id, pending_move in list(self._pending_moves.items()):
             if pending_move.accepted_game_loop is None:
@@ -448,13 +661,15 @@ class ActionEffectVerifier:
             "target_type": "Move_Minimap",
             "target_position": pending.target_position,
             "target_tag": None,
-            "builder_tag": None if pending.builder_tag is None else hex(pending.builder_tag),
+            "actor_tag": None if pending.actor_tag is None else hex(pending.actor_tag),
+            "actor_tags": [hex(tag) for tag in pending.actor_tags],
+            "builder_tag": None if pending.actor_tag is None else hex(pending.actor_tag),
             "baseline_structure_tags": [],
             "observed_structure_tag": None,
             "dispatched_loop": pending.dispatched_game_loop,
             "accepted_loop": pending.accepted_game_loop,
             "confirmed_loop": current_loop if confirmed else None,
-            "worker_orders": [str(order) for order in pending.latest_builder_orders],
+            "worker_orders": [str(order) for order in pending.latest_actor_orders],
             "resource_delta": {},
             "order_seen": pending.move_order_seen,
             "order_last_seen_game_loop": None,
@@ -462,16 +677,34 @@ class ActionEffectVerifier:
             "mineral_delta": None,
             "elapsed_game_loops": elapsed,
             "base_timeout_game_loops": self.timeout_game_loops,
-            "effective_timeout_game_loops": self.timeout_game_loops,
+            "effective_timeout_game_loops": self._move_effective_timeout(pending),
             "active_order_extension": False,
-            "baseline_builder_position": pending.baseline_builder_position,
-            "observed_builder_position": pending.latest_builder_position,
+            "baseline_actor_position": pending.baseline_actor_position,
+            "observed_actor_position": pending.latest_actor_position,
+            "actor_displacement": _optional_position_distance(
+                pending.baseline_actor_position,
+                pending.latest_actor_position,
+            ),
+            "baseline_builder_position": pending.baseline_actor_position,
+            "observed_builder_position": pending.latest_actor_position,
             "builder_displacement": _optional_position_distance(
-                pending.baseline_builder_position,
-                pending.latest_builder_position,
+                pending.baseline_actor_position,
+                pending.latest_actor_position,
             ),
             "move_order_seen": pending.move_order_seen,
         }
+
+    def _move_effective_timeout(self, pending: _PendingMove) -> int:
+        distance = _optional_position_distance(
+            pending.baseline_actor_position,
+            pending.target_position,
+        )
+        if distance is None:
+            return self.timeout_game_loops
+        travel_budget = math.ceil(
+            distance * MOVE_GAME_LOOPS_PER_MINIMAP_UNIT + MOVE_SETTLEMENT_GRACE_GAME_LOOPS
+        )
+        return max(self.timeout_game_loops, travel_budget)
 
     def _evidence(self, pending: _PendingBuild, observation: Any) -> _Evidence:
         raw_units = list(_value(observation, "raw_units", ()))
@@ -487,7 +720,7 @@ class ActionEffectVerifier:
             unit
             for unit in raw_units
             if int(_value(unit, "alliance", 0)) == 1
-            and self._unit_name(unit) == pending.target_structure
+            and self._unit_name(unit) in _target_structure_names(pending.target_structure)
         ]
         builder = next(
             (
@@ -507,6 +740,7 @@ class ActionEffectVerifier:
             raise ValueError("raw SC2 observation has no player data")
         return _Evidence(
             game_loop=_game_loop(observation),
+            observation_revision=_placement_revision(observation),
             structures=tuple(
                 _StructureEvidence(
                     tag=int(_value(unit, "tag", 0)),
@@ -519,8 +753,38 @@ class ActionEffectVerifier:
                 )
                 for unit in target_units
             ),
+            occupants=tuple(
+                (
+                    int(_value(unit, "tag", 0)),
+                    (
+                        float(_value(unit, "x", 0.0)),
+                        float(_value(unit, "y", 0.0)),
+                    ),
+                )
+                for unit in raw_units
+                if int(_value(unit, "alliance", 0)) == 1
+            ),
             minerals=int(_value(player, "minerals", 0)),
             builder=None if builder is None else _builder_evidence(builder),
+            dynamic_units=tuple(
+                _DynamicUnitEvidence(
+                    tag=int(_value(unit, "tag", 0)),
+                    alliance=int(_value(unit, "alliance", 0)),
+                    position=(
+                        float(_value(unit, "x", 0.0)),
+                        float(_value(unit, "y", 0.0)),
+                    ),
+                    radius=max(0.0, float(_value(unit, "radius", 0.5))),
+                )
+                for unit in raw_units
+                if int(_value(unit, "tag", 0)) > 0
+                and int(_value(unit, "tag", 0)) != pending.builder_tag
+                and int(_value(unit, "tag", 0)) != pending.target_tag
+                and int(_value(unit, "display_type", 1)) == 1
+                and not bool(_value(unit, "is_structure", False))
+                and not bool(_value(unit, "is_flying", False))
+                and not _is_resource_name(self._unit_name(unit))
+            ),
         )
 
     def _unit_name(self, unit: Any) -> str:
@@ -530,6 +794,20 @@ class ActionEffectVerifier:
         return self.unit_names.get(int(value), f"unit:{int(value)}")
 
     def _resolve_target(self, pending: _PendingBuild, observation: Any) -> None:
+        if self.placement_service is not None:
+            placement = self.placement_service.command_target(pending.command.command_id)
+            if placement is not None:
+                pending.target_position = placement.world_target
+                pending.target_tag = placement.anchor_tag
+                pending.coordinate_space = "world"
+                return
+        if pending.command.screen_world_target is not None:
+            pending.target_position = (
+                float(pending.command.screen_world_target[0]),
+                float(pending.command.screen_world_target[1]),
+            )
+            pending.coordinate_space = "world"
+            return
         if not pending.resolved_arguments:
             return
         raw_units = list(_value(observation, "raw_units", ()))
@@ -661,15 +939,10 @@ class ActionEffectVerifier:
 
     @staticmethod
     def _timeout_code(pending: _PendingBuild, current: _Evidence) -> str:
-        baseline = pending.baseline
-        if baseline is None or baseline.builder is None or current.builder is None:
-            return "builder_not_observable"
-        if not pending.order_seen:
-            return "no_build_order_observed"
-        expected_order = BUILD_RAW_FUNCTION_IDS.get(pending.target_structure)
-        if current.builder.orders and expected_order not in current.builder.orders:
-            return "worker_order_replaced"
-        return "target_not_created"
+        del current
+        if pending.build_started:
+            return "build_started_effect_missing"
+        return "no_build_start_evidence"
 
     @staticmethod
     def _diagnostic(pending: _PendingBuild, current: _Evidence) -> str:
@@ -698,12 +971,92 @@ class ActionEffectVerifier:
         structure: Optional[_StructureEvidence],
     ) -> dict[str, Any]:
         baseline = pending.baseline
+        reservation = pending.reservation_snapshot
+        failure_classification, classification_basis = self._failure_classification(
+            pending,
+            current,
+            structure,
+        )
+        nearby_units = self._nearby_dynamic_units(pending, current)
+        nearby_enemies = self._nearby_enemy_units(pending, current)
         return {
             "effect_kind": "build",
             "target_type": pending.target_structure,
             "target_position": pending.target_position,
+            "requested_target_position": (
+                None if reservation is None else reservation.requested_world_target
+            ),
+            "final_validated_target_position": (
+                None if reservation is None else reservation.final_validated_world_target
+            ),
+            "validated_target_position": (
+                None if reservation is None else reservation.final_validated_world_target
+            ),
+            "emitted_target_position": (None if reservation is None else reservation.world_target),
+            "verified_target_position": pending.target_position,
             "target_tag": None if pending.target_tag is None else hex(pending.target_tag),
             "builder_tag": None if pending.builder_tag is None else hex(pending.builder_tag),
+            "reservation_id": None if reservation is None else reservation.reservation_id,
+            "placement_revision": (None if reservation is None else reservation.placement_revision),
+            "placement_state": (None if reservation is None else reservation.placement_state),
+            "placement_episode_id": (None if reservation is None else reservation.episode_id),
+            "footprint_width": (None if reservation is None else reservation.footprint_width),
+            "footprint_height": (None if reservation is None else reservation.footprint_height),
+            "occupied_grid_cells": (
+                [] if reservation is None else sorted(reservation.occupied_grid_cells)
+            ),
+            "baseline_builder_orders": (
+                list(baseline.builder.orders)
+                if baseline is not None and baseline.builder is not None
+                else []
+            ),
+            "failure_classification": failure_classification,
+            "classification_basis": classification_basis,
+            "nearby_enemy_units": [hex(unit.tag) for unit in nearby_enemies],
+            "nearby_dynamic_occupants": [hex(unit.tag) for unit in nearby_units],
+            "builder_status": (None if current.builder is None else current.builder.status),
+            "baseline_builder_status": (
+                None if baseline is None or baseline.builder is None else baseline.builder.status
+            ),
+            "builder_alliance": (None if current.builder is None else current.builder.alliance),
+            "builder_health": (None if current.builder is None else current.builder.health),
+            "builder_health_max": (None if current.builder is None else current.builder.health_max),
+            "observation_revision": (None if baseline is None else baseline.observation_revision),
+            "failure_observation_revision": current.observation_revision,
+            "available_ability_query": (
+                "unavailable_no_controller_access"
+                if reservation is None or reservation.available_ability_query is None
+                else reservation.available_ability_query
+            ),
+            "placement_query_result": (
+                "unavailable_no_controller_access"
+                if reservation is None or reservation.placement_query_result is None
+                else reservation.placement_query_result
+            ),
+            "ability_id": None if reservation is None else reservation.ability_id,
+            "target_legality_fingerprint": (
+                None if reservation is None else reservation.target_legality_fingerprint
+            ),
+            "material_legality_identity": (
+                None if reservation is None else reservation.material_legality_identity
+            ),
+            "build_authorization_details": (
+                {} if reservation is None else dict(reservation.build_authorization_details)
+            ),
+            "primitive_constructed_game_loop": (
+                None if reservation is None else reservation.primitive_constructed_game_loop
+            ),
+            "primitive_submitted_game_loop": (
+                None if reservation is None else reservation.primitive_submitted_game_loop
+            ),
+            "action_result": (
+                []
+                if reservation is None or reservation.action_result is None
+                else list(reservation.action_result)
+            ),
+            "action_result_seen": (
+                reservation is not None and reservation.action_result is not None
+            ),
             "baseline_structure_tags": (
                 [] if baseline is None else [hex(item.tag) for item in baseline.structures]
             ),
@@ -718,6 +1071,12 @@ class ActionEffectVerifier:
                 "minerals": 0 if baseline is None else current.minerals - baseline.minerals,
             },
             "order_seen": pending.order_seen,
+            "build_started": pending.build_started,
+            "build_start_confirmation_kind": pending.build_start_confirmation_kind,
+            "build_start_confirmed_game_loop": pending.build_start_confirmed_game_loop,
+            "resource_debit_seen": pending.resource_debit_seen,
+            "builder_approach_seen": pending.builder_approach_seen,
+            "target_occupancy_seen": pending.target_occupancy_seen,
             "order_last_seen_game_loop": pending.order_last_seen_game_loop,
             "post_order_grace_game_loops": POST_ORDER_EFFECT_GRACE_GAME_LOOPS,
             "mineral_delta": 0 if baseline is None else baseline.minerals - current.minerals,
@@ -733,18 +1092,176 @@ class ActionEffectVerifier:
                 else self.timeout_game_loops
             ),
             "active_order_extension": pending.active_order_extension,
+            "baseline_builder_position": (
+                None if baseline is None or baseline.builder is None else baseline.builder.position
+            ),
+            "observed_builder_position": (
+                None if current.builder is None else current.builder.position
+            ),
+            "builder_displacement": (
+                None
+                if baseline is None or baseline.builder is None or current.builder is None
+                else _position_distance(
+                    baseline.builder.position,
+                    current.builder.position,
+                )
+            ),
+            "confirmation_kind": (
+                "new_structure" if structure is not None else pending.build_start_confirmation_kind
+            ),
         }
 
-    def _active_order_timeout(self, pending: _PendingBuild) -> int:
-        multiplier = (
-            NEXUS_ACTIVE_BUILD_ORDER_TIMEOUT_MULTIPLIER
-            if (
-                (spec := BUILD_SPECS.get(pending.command.name)) is not None
-                and spec.placement_kind == "expansion"
-            )
-            else ACTIVE_BUILD_ORDER_TIMEOUT_MULTIPLIER
+    def _failure_classification(
+        self,
+        pending: _PendingBuild,
+        current: _Evidence,
+        structure: Optional[_StructureEvidence],
+    ) -> tuple[str | None, list[str]]:
+        if structure is not None:
+            return None, []
+        if pending.build_started:
+            return "gameplay_effect_missing_after_start", ["build_start_evidence_without_structure"]
+        baseline_builder = None if pending.baseline is None else pending.baseline.builder
+        if baseline_builder is None:
+            return "builder_not_ready", ["builder_missing_at_dispatch"]
+        if baseline_builder.alliance != 1:
+            return "builder_not_ready", ["builder_not_owned_at_dispatch"]
+        if baseline_builder.health <= 0 or current.builder is None:
+            return "builder_not_ready", ["builder_unavailable_after_dispatch"]
+        build_order_ids = frozenset(BUILD_RAW_FUNCTION_IDS.values())
+        if build_order_ids.intersection(baseline_builder.orders):
+            return "builder_not_ready", ["builder_had_prior_build_order"]
+        if self._nearby_dynamic_units(pending, current):
+            return "dynamic_target_obstruction", ["dynamic_unit_inside_footprint"]
+        if self._nearby_enemy_units(pending, current):
+            return "gameplay_no_start_unknown", [
+                "nearby_enemy_threat_without_target_obstruction",
+                "no_authoritative_rejection_evidence",
+            ]
+        return "gameplay_no_start_unknown", ["no_authoritative_rejection_evidence"]
+
+    @staticmethod
+    def _nearby_dynamic_units(
+        pending: _PendingBuild,
+        current: _Evidence,
+    ) -> tuple[_DynamicUnitEvidence, ...]:
+        target = pending.target_position
+        if target is None:
+            return ()
+        spec = BUILD_SPECS.get(pending.command.name)
+        if pending.reservation_snapshot is not None:
+            footprint_cells = pending.reservation_snapshot.occupied_grid_cells
+        elif spec is not None:
+            footprint_cells = _occupied_cells_for_spec(target, spec)
+        else:
+            return ()
+        candidates = (
+            (*pending.baseline.dynamic_units, *current.dynamic_units)
+            if pending.baseline is not None
+            else current.dynamic_units
         )
-        return self.timeout_game_loops * multiplier
+        by_tag: dict[int, _DynamicUnitEvidence] = {}
+        for unit in candidates:
+            if _circle_intersects_cells(unit.position, unit.radius, footprint_cells):
+                by_tag[unit.tag] = unit
+        return tuple(by_tag[tag] for tag in sorted(by_tag))
+
+    @staticmethod
+    def _nearby_enemy_units(
+        pending: _PendingBuild,
+        current: _Evidence,
+    ) -> tuple[_DynamicUnitEvidence, ...]:
+        anchors = [pending.target_position]
+        if pending.baseline is not None and pending.baseline.builder is not None:
+            anchors.append(pending.baseline.builder.position)
+        if current.builder is not None:
+            anchors.append(current.builder.position)
+        positions = [anchor for anchor in anchors if anchor is not None]
+        if not positions:
+            return ()
+        candidates = (
+            (*pending.baseline.dynamic_units, *current.dynamic_units)
+            if pending.baseline is not None
+            else current.dynamic_units
+        )
+        by_tag = {
+            unit.tag: unit
+            for unit in candidates
+            if unit.alliance == 4
+            and any(
+                _position_distance(unit.position, anchor) <= 8.0 + unit.radius
+                for anchor in positions
+            )
+        }
+        return tuple(by_tag[tag] for tag in sorted(by_tag))
+
+    def _confirm_build_started(
+        self,
+        pending: _PendingBuild,
+        current: _Evidence,
+        *,
+        confirmation_kind: str,
+    ) -> None:
+        if pending.build_started:
+            return
+        pending.build_started = True
+        pending.build_start_confirmation_kind = confirmation_kind
+        pending.build_start_confirmed_game_loop = current.game_loop
+        if self.placement_service is not None:
+            accepted = pending.accepted_game_loop or current.game_loop
+            self.placement_service.mark_build_started(
+                pending.command.command_id,
+                game_loop=current.game_loop,
+                expires_game_loop=(
+                    accepted
+                    + build_effect_max_lifetime(
+                        self.timeout_game_loops,
+                        pending.command.name,
+                    )
+                    + POST_ORDER_EFFECT_GRACE_GAME_LOOPS
+                ),
+            )
+
+    def _update_supporting_build_start_evidence(
+        self,
+        pending: _PendingBuild,
+        current: _Evidence,
+    ) -> None:
+        baseline = pending.baseline
+        target = pending.target_position
+        if baseline is None:
+            return
+        spec = BUILD_SPECS.get(pending.command.name)
+        mineral_cost = 0 if spec is None else spec.mineral_cost
+        pending.resource_debit_seen = pending.resource_debit_seen or (
+            mineral_cost > 0 and baseline.minerals - current.minerals >= mineral_cost
+        )
+        if baseline.builder is not None and current.builder is not None and target is not None:
+            baseline_distance = _position_distance(baseline.builder.position, target)
+            current_distance = _position_distance(current.builder.position, target)
+            pending.builder_approach_seen = pending.builder_approach_seen or (
+                current_distance + 1.0 <= baseline_distance
+                or current_distance <= max(3.0, float(spec.footprint if spec else 2))
+            )
+        if target is not None:
+            baseline_tags = {tag for tag, _ in baseline.occupants}
+            footprint_radius = max(1.5, float(spec.footprint if spec else 2) / 2.0)
+            pending.target_occupancy_seen = pending.target_occupancy_seen or any(
+                tag not in baseline_tags
+                and _position_distance(position, target) <= footprint_radius
+                for tag, position in current.occupants
+            )
+        if pending.resource_debit_seen and (
+            pending.builder_approach_seen or pending.target_occupancy_seen
+        ):
+            self._confirm_build_started(
+                pending,
+                current,
+                confirmation_kind="supporting_quorum",
+            )
+
+    def _active_order_timeout(self, pending: _PendingBuild) -> int:
+        return build_effect_max_lifetime(self.timeout_game_loops, pending.command.name)
 
     def _get(self, command_id: str) -> _PendingBuild:
         try:
@@ -764,6 +1281,12 @@ def _target_structure(action_name: str) -> Optional[str]:
         if stem.endswith(suffix):
             return stem.removesuffix(suffix)
     return None
+
+
+def _target_structure_names(target_structure: str) -> frozenset[str]:
+    if target_structure.startswith("CreepTumor"):
+        return frozenset({"CreepTumor", "CreepTumorBurrowed", "CreepTumorQueen"})
+    return frozenset({target_structure})
 
 
 def _position_argument(values: Sequence[Any]) -> Optional[tuple[float, float]]:
@@ -793,6 +1316,64 @@ def _unit_by_tag(observation: Any, tag: Optional[int]) -> Optional[Any]:
     )
 
 
+def _units_by_tags(observation: Any, tags: Sequence[int]) -> tuple[Any, ...]:
+    wanted = set(tags)
+    return tuple(
+        unit
+        for unit in _value(observation, "raw_units", ())
+        if int(_value(unit, "tag", -1)) in wanted and int(_value(unit, "alliance", 1)) == 1
+    )
+
+
+def _combined_unit_orders(units: Sequence[Any]) -> tuple[int, ...]:
+    return tuple(dict.fromkeys(order for unit in units for order in _unit_orders(unit)))
+
+
+def _minimap_centroid(
+    units: Sequence[Any],
+    transform: tuple[float, float, float, float, float],
+) -> Optional[tuple[float, float]]:
+    positions = [_world_to_minimap_position(_unit_position(unit), transform) for unit in units]
+    present = [position for position in positions if position is not None]
+    if not present:
+        return None
+    return (
+        sum(position[0] for position in present) / len(present),
+        sum(position[1] for position in present) / len(present),
+    )
+
+
+def _movement_centroid(
+    units: Sequence[Any],
+    transform: Optional[tuple[float, float, float, float, float]],
+) -> Optional[tuple[float, float]]:
+    """Use raw-grid positions directly in raw mode, transform legacy world data."""
+
+    if transform is None:
+        positions = [_unit_position(unit) for unit in units]
+        present = [position for position in positions if position is not None]
+        if not present:
+            return None
+        return (
+            sum(position[0] for position in present) / len(present),
+            sum(position[1] for position in present) / len(present),
+        )
+    return _minimap_centroid(units, transform)
+
+
+def _world_to_minimap_position(
+    position: Optional[tuple[float, float]],
+    transform: tuple[float, float, float, float, float],
+) -> Optional[tuple[float, float]]:
+    if position is None:
+        return None
+    scale, x_offset, y_offset, world_range, maximum = transform
+    return (
+        max(0.0, min(maximum, (position[0] + x_offset) * scale)),
+        max(0.0, min(maximum, (world_range - position[1] + y_offset) * scale)),
+    )
+
+
 def _unit_position(unit: Optional[Any]) -> Optional[tuple[float, float]]:
     if unit is None:
         return None
@@ -810,9 +1391,16 @@ def _builder_evidence(unit: Any) -> _BuilderEvidence:
     orders = _unit_orders(unit)
     return _BuilderEvidence(
         tag=int(_value(unit, "tag", 0)),
+        alliance=int(_value(unit, "alliance", 0)),
         status="active" if int(_value(unit, "order_length", len(orders))) > 0 else "idle",
         orders=orders,
         selected=bool(_value(unit, "is_selected", False)),
+        position=(
+            float(_value(unit, "x", 0.0)),
+            float(_value(unit, "y", 0.0)),
+        ),
+        health=float(_value(unit, "health", 1.0)),
+        health_max=float(_value(unit, "health_max", 1.0)),
     )
 
 
@@ -895,8 +1483,7 @@ def _builder_change(
         return f"builder {hex(baseline.tag)} missing from current observation"
     return (
         f"builder {hex(baseline.tag)} status {baseline.status}->{current.status}, "
-        f"orders {list(baseline.orders)}->{list(current.orders)}, "
-        f"selected {baseline.selected}->{current.selected}"
+        f"orders {list(baseline.orders)}->{list(current.orders)}"
     )
 
 
@@ -908,11 +1495,9 @@ def _diagnosis(
     order_seen: bool,
 ) -> str:
     if baseline.builder is None:
-        return "builder tag was unavailable at dispatch; worker selection could not be verified"
-    if not baseline.builder.selected:
-        return "builder was not selected when the build primitive was dispatched"
+        return "builder tag was unavailable at RAW dispatch"
     if current.builder is None:
-        return "selected builder disappeared before construction became visible"
+        return "RAW builder disappeared before construction became visible"
 
     expected_order = BUILD_RAW_FUNCTION_IDS.get(target_structure)
     if expected_order is not None and expected_order in current.builder.orders:

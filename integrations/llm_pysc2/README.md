@@ -66,7 +66,7 @@ only be applied for live sessions, then reversed to restore the clean gitlink. E
 semantics, camera control, team management, automatic economy, text-action translation,
 and PySC2 action validation remain upstream-owned.
 
-Seventeen reviewed patches cover the waiting-response transport no-op, real SC2 random seed,
+Twenty-four reviewed patches cover the waiting-response transport no-op, real SC2 random seed,
 row-major feature planes, structured translator provenance, exact Near placement,
 pre-translation abort attribution, transient-unit disappearance grace, and Nexus resource
 clearance with exact screen-to-world scaling and visibility checks, plus episode truncation,

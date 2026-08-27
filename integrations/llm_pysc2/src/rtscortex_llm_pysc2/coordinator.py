@@ -21,6 +21,8 @@ class RuntimeAPI(Protocol):
 
     def execution(self, report: dict[str, Any]) -> None: ...
 
+    def placement_transition(self, event: dict[str, Any]) -> None: ...
+
     def end_episode(self, result: dict[str, Any]) -> None: ...
 
 
@@ -57,7 +59,20 @@ class BridgeCoordinator:
         snapshot: Mapping[str, Any],
         agent_team_order: Mapping[str, Sequence[str]],
     ) -> BridgeDecision:
-        observation = self.mapper.map(snapshot)
+        profiler = getattr(self.runtime, "profiler", None)
+        if profiler is None:
+            observation = self.mapper.map(snapshot)
+        else:
+            with profiler.measure("observation_extraction"):
+                observation = self.mapper.map(snapshot)
+        service = self.effect_verifier.placement_service
+        if service is not None:
+            service.set_runtime_context(
+                run_id=str(observation["run_id"]),
+                episode_id=str(observation["episode_id"]),
+                step_id=int(observation["step_id"]),
+                game_loop=int(observation["game_loop"]),
+            )
         batch = self.runtime.tick(observation)
         duplicate_ids = [
             str(command["command_id"])
@@ -106,6 +121,8 @@ class BridgeCoordinator:
         *,
         builder_tag: Optional[int],
         producer_tag: Optional[int] = None,
+        actor_tags: tuple[int, ...] = (),
+        minimap_transform: Optional[tuple[float, float, float, float, float]] = None,
     ) -> None:
         if self.effect_verifier.is_tracked(command_id):
             self.effect_verifier.prepare(
@@ -113,6 +130,8 @@ class BridgeCoordinator:
                 observation,
                 builder_tag,
                 producer_tag=producer_tag,
+                actor_tags=actor_tags,
+                minimap_transform=minimap_transform,
             )
 
     def record_primitive(
@@ -128,6 +147,7 @@ class BridgeCoordinator:
         total: Optional[int] = None,
         game_loop: Optional[int] = None,
         failure_code: Optional[str] = None,
+        authoritative_pre_dispatch: Optional[dict[str, Any]] = None,
         requested_function_id: Optional[int] = None,
         emitted_function_id: Optional[int] = None,
     ) -> None:
@@ -142,6 +162,7 @@ class BridgeCoordinator:
             total=total,
             game_loop=game_loop,
             failure_code=failure_code,
+            authoritative_pre_dispatch=authoritative_pre_dispatch,
             requested_function_id=requested_function_id,
             emitted_function_id=emitted_function_id,
         )
@@ -150,6 +171,10 @@ class BridgeCoordinator:
         self.tracker.resolve_arguments(command_id, arguments)
         if self.effect_verifier.is_tracked(command_id):
             self.effect_verifier.resolve_arguments(command_id, arguments)
+
+    def record_action_result(self, command_id: str, results: Sequence[Any]) -> None:
+        if self.effect_verifier.is_tracked(command_id):
+            self.effect_verifier.record_action_result(command_id, results)
 
     def complete_command(
         self,
@@ -166,6 +191,7 @@ class BridgeCoordinator:
                 return None
             self.effect_verifier.cancel(command_id)
         report = self.tracker.complete(command_id, game_result=game_result)
+        report = self._attach_placement_transitions(report)
         self.runtime.execution(report)
         return report
 
@@ -207,6 +233,7 @@ class BridgeCoordinator:
             execution_stage=execution_stage,
             failure_code="bridge_integrity_error",
         )
+        report = self._attach_placement_transitions(report)
         self.runtime.execution(report)
         return report
 
@@ -224,6 +251,7 @@ class BridgeCoordinator:
             failure_reason="episode ended before command completion",
             game_result=normalized_result,
         ):
+            report = self._attach_placement_transitions(report)
             self.runtime.execution(report)
         self.runtime.end_episode(result)
 
@@ -233,8 +261,9 @@ class BridgeCoordinator:
         *,
         game_result: Optional[str] = None,
     ) -> list[dict[str, Any]]:
-        reports = [
-            self.tracker.complete(
+        reports: list[dict[str, Any]] = []
+        for verdict in verdicts:
+            report = self.tracker.complete(
                 verdict.command_id,
                 game_result=game_result,
                 failure_reason=verdict.failure_reason if not verdict.success else None,
@@ -245,8 +274,37 @@ class BridgeCoordinator:
                 failure_code=verdict.failure_code,
                 effect_evidence=verdict.evidence,
             )
-            for verdict in verdicts
-        ]
+            service = self.effect_verifier.placement_service
+            if (
+                verdict.success
+                and service is not None
+                and service.command_target(verdict.command_id) is not None
+            ):
+                evidence = verdict.evidence or {}
+                confirmed_loop = evidence.get("confirmed_game_loop")
+                service.release_command(
+                    verdict.command_id,
+                    game_loop=(int(confirmed_loop) if isinstance(confirmed_loop, int) else 0),
+                    reason="effect_terminal_persisted",
+                )
+            reports.append(self._attach_placement_transitions(report))
         for report in reports:
             self.runtime.execution(report)
         return reports
+
+    def _attach_placement_transitions(
+        self,
+        report: dict[str, Any],
+    ) -> dict[str, Any]:
+        service = self.effect_verifier.placement_service
+        if service is None:
+            return report
+        if service.transitions_are_durable:
+            return report
+        transitions = service.drain_transition_history(str(report.get("command_id", "")))
+        if not transitions:
+            return report
+        evidence = report.get("effect_evidence")
+        merged = dict(evidence) if isinstance(evidence, dict) else {"effect_kind": "build"}
+        merged["placement_ledger_transitions"] = transitions
+        return {**report, "effect_evidence": merged}

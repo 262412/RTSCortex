@@ -15,12 +15,14 @@ from rtscortex.cortex.models import (
     ForceComposition,
     GamePhase,
     KnowledgeStatus,
+    ResourcePressure,
     ScoutingAssessment,
     SituationAssessment,
     SituationFact,
     SpatialAssessment,
     ThreatLevel,
 )
+from rtscortex.targeting import living_targetable_enemies
 
 _TECH_STRUCTURES = frozenset(
     {
@@ -99,6 +101,43 @@ _AIR_TYPES = frozenset(
         "WarpPrism",
     }
 )
+_ANTI_AIR_TYPES = frozenset(
+    {
+        "Archon",
+        "Battlecruiser",
+        "Carrier",
+        "Corruptor",
+        "Cyclone",
+        "Hydralisk",
+        "Marine",
+        "Mothership",
+        "Mutalisk",
+        "Phoenix",
+        "Queen",
+        "Stalker",
+        "Tempest",
+        "Thor",
+        "VikingFighter",
+        "VoidRay",
+    }
+)
+_AIR_COMBAT_THREAT_TYPES = frozenset(
+    {
+        "Banshee",
+        "Battlecruiser",
+        "BroodLord",
+        "Carrier",
+        "Corruptor",
+        "Liberator",
+        "Mothership",
+        "Mutalisk",
+        "Oracle",
+        "Phoenix",
+        "Tempest",
+        "VikingFighter",
+        "VoidRay",
+    }
+)
 _UNIT_RESOURCE_VALUES = {
     "Adept": 125,
     "Baneling": 75,
@@ -144,14 +183,28 @@ _ENEMY_TECH_SIGNALS = {
 
 class DeterministicSituationAnalyzer:
     analyzer_id = "deterministic-situation-analyzer"
-    analyzer_version = "2.0.0"
+    analyzer_version = "2.2.0"
 
-    def __init__(self, *, valid_for_game_loops: int = 1) -> None:
+    def __init__(
+        self,
+        *,
+        valid_for_game_loops: int = 1,
+        threat_hysteresis_game_loops: int = 32,
+    ) -> None:
         if valid_for_game_loops < 1:
             raise ValueError("valid_for_game_loops must be positive")
+        if threat_hysteresis_game_loops < 1:
+            raise ValueError("threat_hysteresis_game_loops must be positive")
         self.valid_for_game_loops = valid_for_game_loops
+        self.threat_hysteresis_game_loops = threat_hysteresis_game_loops
         self._episode_key: tuple[str, str] | None = None
         self._last_enemy_seen_game_loop: int | None = None
+        self._held_threat_level = ThreatLevel.NONE
+        self._threat_hold_until_game_loop: int | None = None
+        self._previous_own_health: dict[str, float] = {}
+        self._previous_worker_count: int | None = None
+        self._previous_army_supply: int | None = None
+        self._previous_base_count: int | None = None
 
     def assess(
         self,
@@ -163,28 +216,48 @@ class DeterministicSituationAnalyzer:
         if episode_key != self._episode_key:
             self._episode_key = episode_key
             self._last_enemy_seen_game_loop = None
-        enemies = observation.state.visible_enemies
+            self._held_threat_level = ThreatLevel.NONE
+            self._threat_hold_until_game_loop = None
+            self._previous_own_health.clear()
+            self._previous_worker_count = None
+            self._previous_army_supply = None
+            self._previous_base_count = None
+        enemies = living_targetable_enemies(observation.state.visible_enemies)
         if enemies:
             self._last_enemy_seen_game_loop = observation.game_loop
         alerts = {alert.casefold() for alert in observation.alerts}
-        under_attack = any(
+        building_under_attack = any(
             marker in alert
             for alert in alerts
-            for marker in ("under_attack", "under attack", "base_attack")
+            for marker in ("building_under_attack", "building under attack", "base_attack")
         )
+        unit_under_attack = any(
+            marker in alert
+            for alert in alerts
+            for marker in ("unit_under_attack", "unit under attack", "under_attack", "under attack")
+        )
+        under_attack = unit_under_attack or building_under_attack
         army_supply = observation.state.economy.army_supply
-        phase = self._phase(observation, under_attack=under_attack)
-        threat_level = self._threat_level(len(enemies), under_attack=under_attack)
         economy = observation.state.economy
-        if economy.minerals >= 800 or economy.vespene >= 500:
-            economy_status = EconomyStatus.FLOATING
-        elif economy.minerals < 100 and economy.vespene < 100:
+        mineral_pressure = _resource_pressure(
+            economy.minerals,
+            starved_below=100,
+            floating_at=800,
+        )
+        gas_pressure = _resource_pressure(
+            economy.vespene,
+            starved_below=50,
+            floating_at=500,
+        )
+        if mineral_pressure is ResourcePressure.STARVED:
             economy_status = EconomyStatus.CONSTRAINED
+        elif mineral_pressure is ResourcePressure.FLOATING or (
+            gas_pressure is ResourcePressure.FLOATING and economy.minerals >= 400
+        ):
+            economy_status = EconomyStatus.FLOATING
         else:
             economy_status = EconomyStatus.STABLE
-        if enemies and army_supply > 0:
-            readiness = ArmyReadiness.ENGAGED
-        elif army_supply >= 10:
+        if army_supply >= 10:
             readiness = ArmyReadiness.READY
         elif army_supply > 0:
             readiness = ArmyReadiness.FORMING
@@ -206,6 +279,31 @@ class DeterministicSituationAnalyzer:
             ),
         )
         nearest_distance = _nearest_enemy_distance(own_structures, enemies)
+        damage_evidence = self._damage_and_loss_evidence(observation)
+        threat_level, threat_score, threat_evidence = self._assess_threat(
+            observation,
+            enemies=enemies,
+            own_force=own_force,
+            enemy_force=enemy_force,
+            bases=bases,
+            nearest_distance=nearest_distance,
+            unit_under_attack=unit_under_attack,
+            building_under_attack=building_under_attack,
+            damage_evidence=damage_evidence,
+        )
+        if army_supply > 0 and threat_level in {ThreatLevel.HIGH, ThreatLevel.CRITICAL}:
+            readiness = ArmyReadiness.ENGAGED
+        crisis = (
+            bases.own_base_count == 0
+            and bool(enemies)
+            and bool(observation.state.own_structures or observation.state.economy.workers)
+        )
+        phase = self._phase(
+            observation,
+            under_attack=under_attack,
+            crisis=crisis,
+            threat_level=threat_level,
+        )
         confirmed_tech = tuple(
             sorted(
                 {
@@ -224,6 +322,8 @@ class DeterministicSituationAnalyzer:
             phase=phase,
             threat_level=threat_level,
             economy_status=economy_status,
+            mineral_pressure=mineral_pressure,
+            gas_pressure=gas_pressure,
             army_readiness=readiness,
             own_force=own_force,
             enemy_force=enemy_force,
@@ -232,6 +332,9 @@ class DeterministicSituationAnalyzer:
             confirmed_tech=confirmed_tech,
             nearest_distance=nearest_distance,
             possible_transitions=possible_transitions,
+            threat_score=threat_score,
+            threat_evidence=threat_evidence,
+            crisis=crisis,
         )
         identity = "|".join(
             (
@@ -252,7 +355,12 @@ class DeterministicSituationAnalyzer:
             valid_until_game_loop=observation.game_loop + self.valid_for_game_loops,
             phase=phase,
             threat_level=threat_level,
+            threat_score=threat_score,
+            threat_evidence=threat_evidence,
+            threat_hysteresis_until_game_loop=self._threat_hold_until_game_loop,
             economy_status=economy_status,
+            mineral_pressure=mineral_pressure,
+            gas_pressure=gas_pressure,
             army_readiness=readiness,
             threats=threats,
             information_gaps=information_gaps,
@@ -280,26 +388,168 @@ class DeterministicSituationAnalyzer:
         )
 
     @staticmethod
-    def _phase(observation: ObservationEnvelope, *, under_attack: bool) -> GamePhase:
+    def _phase(
+        observation: ObservationEnvelope,
+        *,
+        under_attack: bool,
+        crisis: bool,
+        threat_level: ThreatLevel,
+    ) -> GamePhase:
         state = observation.state
-        if under_attack or (state.visible_enemies and state.economy.army_supply > 0):
+        if crisis or under_attack or threat_level in {ThreatLevel.HIGH, ThreatLevel.CRITICAL}:
+            return GamePhase.COMBAT
+        if state.economy.army_supply >= 24:
             return GamePhase.COMBAT
         structure_types = {structure.unit_type for structure in state.own_structures}
+        if state.production_queue:
+            return GamePhase.PRODUCTION
+        if state.economy.army_supply >= 8 and structure_types.intersection(
+            _PRODUCTION_TYPES - _TOWNHALL_TYPES
+        ):
+            return GamePhase.PRODUCTION
         if state.upgrades or structure_types.intersection(_TECH_STRUCTURES):
             return GamePhase.TECHNOLOGY
-        if state.production_queue or "Gateway" in structure_types:
+        if structure_types.intersection(_PRODUCTION_TYPES - _TOWNHALL_TYPES):
             return GamePhase.PRODUCTION
         return GamePhase.EARLY
 
-    @staticmethod
-    def _threat_level(enemy_count: int, *, under_attack: bool) -> ThreatLevel:
-        if under_attack and enemy_count >= 6:
-            return ThreatLevel.CRITICAL
-        if under_attack:
-            return ThreatLevel.HIGH
-        if enemy_count:
-            return ThreatLevel.LOW
-        return ThreatLevel.NONE
+    def _damage_and_loss_evidence(
+        self,
+        observation: ObservationEnvelope,
+    ) -> tuple[str, ...]:
+        current_health = {
+            unit.unit_id: unit.health_fraction
+            for unit in (
+                *observation.state.own_units,
+                *observation.state.own_structures,
+            )
+        }
+        evidence: list[str] = []
+        damaged = sum(
+            previous - current_health[tag] >= 0.05
+            for tag, previous in self._previous_own_health.items()
+            if tag in current_health
+        )
+        if damaged:
+            evidence.append(f"recent_damage:{damaged}")
+        economy = observation.state.economy
+        base_count = _count_types(observation.state.own_structures, _TOWNHALL_TYPES)
+        if (
+            self._previous_worker_count is not None
+            and economy.workers < self._previous_worker_count
+        ):
+            evidence.append(f"worker_losses:{self._previous_worker_count - economy.workers}")
+        if (
+            self._previous_army_supply is not None
+            and economy.army_supply < self._previous_army_supply
+        ):
+            evidence.append(f"army_supply_loss:{self._previous_army_supply - economy.army_supply}")
+        if self._previous_base_count is not None and base_count < self._previous_base_count:
+            evidence.append(f"base_losses:{self._previous_base_count - base_count}")
+        self._previous_own_health = current_health
+        self._previous_worker_count = economy.workers
+        self._previous_army_supply = economy.army_supply
+        self._previous_base_count = base_count
+        return tuple(evidence)
+
+    def _assess_threat(
+        self,
+        observation: ObservationEnvelope,
+        *,
+        enemies: Sequence[UnitState],
+        own_force: ForceComposition,
+        enemy_force: ForceComposition,
+        bases: BaseAssessment,
+        nearest_distance: float | None,
+        unit_under_attack: bool,
+        building_under_attack: bool,
+        damage_evidence: tuple[str, ...],
+    ) -> tuple[ThreatLevel, float, tuple[str, ...]]:
+        if not enemies:
+            if (
+                self._held_threat_level in {ThreatLevel.HIGH, ThreatLevel.CRITICAL}
+                and self._threat_hold_until_game_loop is not None
+                and observation.game_loop <= self._threat_hold_until_game_loop
+            ):
+                level = self._held_threat_level
+                score = 4.0 if level is ThreatLevel.HIGH else 7.0
+                return level, score, (f"hysteresis:{level.value}", "enemy_temporarily_unseen")
+            self._held_threat_level = ThreatLevel.NONE
+            self._threat_hold_until_game_loop = None
+            return ThreatLevel.NONE, 0.0, ()
+
+        score = 1.0
+        evidence = [f"living_enemies:{len(enemies)}"]
+        if unit_under_attack:
+            score = max(score, 4.0)
+            evidence.append("unit_under_attack")
+        if building_under_attack:
+            score = max(score, 7.0)
+            evidence.append("building_under_attack")
+        own_combat_value = _combat_value(own_force)
+        enemy_combat_value = _combat_value(enemy_force)
+        if nearest_distance is not None:
+            evidence.append(f"nearest_distance:{nearest_distance:.3f}")
+            if nearest_distance <= 8.0 and enemy_combat_value:
+                score += 3.0
+                evidence.append("base_proximity:immediate")
+            elif nearest_distance <= 16.0 and enemy_combat_value:
+                score += 2.0
+                evidence.append("base_proximity:near")
+        if enemy_combat_value:
+            ratio = enemy_combat_value / max(1, own_combat_value)
+            evidence.append(f"enemy_own_combat_ratio:{ratio:.3f}")
+            if own_combat_value == 0:
+                score = max(score, 7.0)
+                evidence.append("empty_army_overwhelmed")
+            elif ratio >= 2.0:
+                score += 4.0
+                evidence.append("enemy_force_overwhelming")
+            elif ratio >= 0.75:
+                score += 3.0
+                evidence.append("enemy_force_comparable")
+        if any(
+            enemy_force.counts.get(unit_type, 0) for unit_type in _AIR_COMBAT_THREAT_TYPES
+        ) and not any(own_force.counts.get(unit_type, 0) for unit_type in _ANTI_AIR_TYPES):
+            score += 2.0
+            evidence.append("capability_mismatch:no_anti_air")
+        if bases.own_base_count == 0 and (
+            observation.state.own_structures or observation.state.economy.workers
+        ):
+            score = max(score, 7.0)
+            evidence.append("no_surviving_townhall")
+        if damage_evidence:
+            score += min(3.0, float(len(damage_evidence)))
+            evidence.extend(damage_evidence)
+
+        computed = _threat_level_for_score(score)
+        held = self._held_threat_level
+        within_hold = (
+            held in {ThreatLevel.HIGH, ThreatLevel.CRITICAL}
+            and self._threat_hold_until_game_loop is not None
+            and observation.game_loop <= self._threat_hold_until_game_loop
+        )
+        if _threat_severity(computed) > _threat_severity(held):
+            self._held_threat_level = computed
+            self._threat_hold_until_game_loop = (
+                observation.game_loop + self.threat_hysteresis_game_loops
+            )
+        elif within_hold and _threat_severity(computed) < _threat_severity(held):
+            computed = held
+            score = max(score, 4.0 if computed is ThreatLevel.HIGH else 7.0)
+            evidence.append(f"hysteresis:{computed.value}")
+        elif computed in {ThreatLevel.HIGH, ThreatLevel.CRITICAL}:
+            # A stable same-severity observation refreshes the hold. A lower
+            # observation never does, so downgrade requires persistence through
+            # the original window.
+            self._held_threat_level = computed
+            self._threat_hold_until_game_loop = (
+                observation.game_loop + self.threat_hysteresis_game_loops
+            )
+        else:
+            self._held_threat_level = computed
+            self._threat_hold_until_game_loop = None
+        return computed, score, tuple(evidence)
 
 
 def _force_composition(units: Sequence[UnitState]) -> ForceComposition:
@@ -316,6 +566,48 @@ def _force_composition(units: Sequence[UnitState]) -> ForceComposition:
         ),
         unknown_unit_types=unknown,
     )
+
+
+def _combat_value(force: ForceComposition) -> int:
+    worker_value = sum(
+        force.counts.get(worker_type, 0) * _UNIT_RESOURCE_VALUES[worker_type]
+        for worker_type in ("Drone", "Probe", "SCV")
+    )
+    return max(0, force.estimated_resource_value - worker_value)
+
+
+def _threat_level_for_score(score: float) -> ThreatLevel:
+    if score >= 7.0:
+        return ThreatLevel.CRITICAL
+    if score >= 4.0:
+        return ThreatLevel.HIGH
+    if score > 0.0:
+        return ThreatLevel.LOW
+    return ThreatLevel.NONE
+
+
+def _threat_severity(level: ThreatLevel | None) -> int:
+    if level is None:
+        return -1
+    return {
+        ThreatLevel.NONE: 0,
+        ThreatLevel.LOW: 1,
+        ThreatLevel.HIGH: 2,
+        ThreatLevel.CRITICAL: 3,
+    }[level]
+
+
+def _resource_pressure(
+    amount: int,
+    *,
+    starved_below: int,
+    floating_at: int,
+) -> ResourcePressure:
+    if amount < starved_below:
+        return ResourcePressure.STARVED
+    if amount >= floating_at:
+        return ResourcePressure.FLOATING
+    return ResourcePressure.BALANCED
 
 
 def _count_types(units: Sequence[UnitState], unit_types: frozenset[str]) -> int:
@@ -363,6 +655,8 @@ def _situation_facts(
     phase: GamePhase,
     threat_level: ThreatLevel,
     economy_status: EconomyStatus,
+    mineral_pressure: ResourcePressure,
+    gas_pressure: ResourcePressure,
     army_readiness: ArmyReadiness,
     own_force: ForceComposition,
     enemy_force: ForceComposition,
@@ -371,6 +665,9 @@ def _situation_facts(
     confirmed_tech: tuple[str, ...],
     nearest_distance: float | None,
     possible_transitions: tuple[str, ...],
+    threat_score: float,
+    threat_evidence: tuple[str, ...],
+    crisis: bool,
 ) -> list[SituationFact]:
     return [
         SituationFact(
@@ -378,14 +675,22 @@ def _situation_facts(
             status=KnowledgeStatus.CONFIRMED,
             confidence=1.0,
             source="deterministic_phase_rules",
-            evidence=(phase.value,),
+            evidence=(
+                (phase.value, "terminal_collapse:no_surviving_townhall")
+                if crisis
+                else (phase.value,)
+            ),
         ),
         SituationFact(
             name="threat_level",
             status=KnowledgeStatus.CONFIRMED,
             confidence=1.0,
-            source="visible_enemies_and_alerts",
-            evidence=(threat_level.value,),
+            source="stateful_threat_rules",
+            evidence=(
+                threat_level.value,
+                f"score:{threat_score:.3f}",
+                *threat_evidence,
+            ),
         ),
         SituationFact(
             name="economy_status",
@@ -393,6 +698,20 @@ def _situation_facts(
             confidence=1.0,
             source="observed_resources",
             evidence=(economy_status.value,),
+        ),
+        SituationFact(
+            name="mineral_pressure",
+            status=KnowledgeStatus.CONFIRMED,
+            confidence=1.0,
+            source="observed_minerals",
+            evidence=(mineral_pressure.value,),
+        ),
+        SituationFact(
+            name="gas_pressure",
+            status=KnowledgeStatus.CONFIRMED,
+            confidence=1.0,
+            source="observed_vespene",
+            evidence=(gas_pressure.value,),
         ),
         SituationFact(
             name="army_readiness",

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import asdict
 from pathlib import Path
@@ -24,6 +25,7 @@ from rtscortex.evaluation.report import (
     AcceptanceGate,
     ReportError,
     _hard_acceptance_summary,
+    _load_qualification_evidence,
     render_timeline,
     write_run_reports,
     write_timeline_report,
@@ -56,6 +58,337 @@ def _write_journal(run_dir: Path, events: list[StoredEvent]) -> None:
         "".join(json.dumps(asdict(event), sort_keys=True) + "\n" for event in events),
         encoding="utf-8",
     )
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _qualification_evidence(
+    tmp_path: Path,
+    *,
+    expected_git_sha: str,
+    diagnostic_only: bool = False,
+) -> Path:
+    attempt = {
+        "run_set_id": tmp_path.name,
+        "expected_git_sha": expected_git_sha,
+        "attempt_id": "attempt:" + "a" * 32,
+        "slurm_job_id": "test-job",
+        "slurm_restart_count": 0,
+        "started_at": "2026-01-01T00:00:00+00:00",
+    }
+    recovery = tmp_path / "recovery-canary.json"
+    recovery.write_text(
+        json.dumps(
+            {
+                "format_version": "1.1",
+                **attempt,
+                "attempt": attempt,
+                "git_sha": expected_git_sha,
+                "expected_git_sha": expected_git_sha,
+                "seed_ids": [0, 1, 2],
+                "passed": True,
+                "recovery_evidence_present": True,
+                "checkpoint_tail_recovery_bounded": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    baseline = tmp_path / "engineering-baseline.json"
+    baseline.write_text(
+        json.dumps(
+            {
+                "format_version": "1.0",
+                "source_issue": "SCX-PT-034",
+                "natural_run_bytes_per_game_loop": 10_000.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    manifest = tmp_path / "qualification-evidence.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "format_version": "1.0",
+                "evidence_kind": "three-seed-qualification",
+                "diagnostic_only": diagnostic_only,
+                **attempt,
+                "attempt": attempt,
+                "seed_ids": [0, 1, 2],
+                "recovery_evidence": {
+                    "path": str(recovery),
+                    "sha256": _sha256(recovery),
+                },
+                "natural_run_baseline": {
+                    "path": str(baseline),
+                    "sha256": _sha256(baseline),
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    return manifest
+
+
+def test_formal_qualification_evidence_requires_complete_attempt_provenance(
+    tmp_path: Path,
+) -> None:
+    manifest_path = _qualification_evidence(tmp_path, expected_git_sha="f" * 40)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    for field in (
+        "run_set_id",
+        "attempt_id",
+        "slurm_job_id",
+        "slurm_restart_count",
+        "started_at",
+        "attempt",
+    ):
+        manifest.pop(field)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ReportError, match="attempt provenance"):
+        _load_qualification_evidence(manifest_path)
+
+
+def test_qualification_evidence_reaches_engineering_report_call_path(
+    tmp_path: Path,
+) -> None:
+    expected_git_sha = "a" * 40
+    run_dir = tmp_path / "qualified"
+    _write_journal(
+        run_dir,
+        [
+            _event(
+                1,
+                "observation",
+                make_observation(
+                    run_id="live-run",
+                    episode_id="episode-0",
+                    game_loop=100,
+                ).model_dump(mode="json"),
+            ),
+            _event(
+                2,
+                "postgame_review_completed",
+                {"strategic_consequence_count": 0},
+            ),
+        ],
+    )
+    manifest = _qualification_evidence(
+        tmp_path,
+        expected_git_sha=expected_git_sha,
+    )
+
+    artifacts = write_run_reports(
+        run_dir,
+        qualification_evidence_path=manifest,
+    )
+    report = json.loads(artifacts.engineering_gates_path.read_text(encoding="utf-8"))
+
+    assert report["metrics"]["recovery_evidence_present"] is True
+    assert report["metrics"]["checkpoint_tail_recovery_bounded"] is True
+    assert report["metrics"]["postgame_semantic_event_coverage"] == 1.0
+    assert report["metrics"]["natural_run_disk_reduction_ratio"] is not None
+    assert report["evidence"]["expected_git_sha"] == expected_git_sha
+    assert report["evidence"]["recovery_evidence"]["sha256"] == _sha256(
+        tmp_path / "recovery-canary.json"
+    )
+    assert report["evidence"]["natural_run_baseline"] == {
+        "path": str((tmp_path / "engineering-baseline.json").resolve()),
+        "sha256": _sha256(tmp_path / "engineering-baseline.json"),
+        "source_issue": "SCX-PT-034",
+        "bytes_per_game_loop": 10_000.0,
+    }
+
+
+def test_semantic_build_gate_is_serialized_by_run_report_writer(tmp_path: Path) -> None:
+    expected_git_sha = "d" * 40
+    run_dir = tmp_path / "semantic-build"
+    operation_id = "operation:" + "a" * 64
+    attempt_id = "attempt:" + "b" * 64
+    _write_journal(
+        run_dir,
+        [
+            _event(
+                1,
+                "command_lifecycle",
+                {
+                    "status": "dispatched",
+                    "command": {
+                        "command_id": "build-1",
+                        "operation_id": operation_id,
+                        "attempt_id": attempt_id,
+                        "actor": "Builder/Builder-Probe-1",
+                        "name": "Build_Pylon_Screen",
+                        "arguments": [[20, 20]],
+                        "created_game_loop": 0,
+                        "source": "planner",
+                    },
+                },
+            ),
+            _event(
+                2,
+                "execution",
+                {
+                    "protocol_version": "1.1",
+                    "run_id": "live-run",
+                    "episode_id": "episode-0",
+                    "step_id": 0,
+                    "command_id": "build-1",
+                    "operation_id": operation_id,
+                    "attempt_id": attempt_id,
+                    "action_name": "Build_Pylon_Screen",
+                    "actor": "Builder/Builder-Probe-1",
+                    "source": "planner",
+                    "requested_arguments": [[20, 20]],
+                    "resolved_arguments": [[20, 20]],
+                    "success": False,
+                    "status": "failed",
+                    "execution_stage": "effect_verification",
+                    "failure_code": "no_build_start_evidence",
+                    "effect_evidence": {
+                        "effect_kind": "build",
+                        "failure_classification": "gameplay_no_start_unknown",
+                        "classification_basis": ["no_authoritative_rejection_evidence"],
+                    },
+                },
+            ),
+        ],
+    )
+    manifest = _qualification_evidence(
+        tmp_path,
+        expected_git_sha=expected_git_sha,
+    )
+
+    artifacts = write_run_reports(
+        run_dir,
+        qualification_evidence_path=manifest,
+    )
+    report = json.loads(artifacts.engineering_gates_path.read_text(encoding="utf-8"))
+
+    assert report["diagnostics"]["semantic_build_operation_max_failure_streak"] == 1
+    assert report["diagnostics"]["semantic_build_failure_classification"] == {
+        "gameplay_no_start_unknown": 1
+    }
+    assert report["gates"]["semantic_build_failure_streak_bounded"]["passed"] is True
+
+
+def test_terminal_collapse_macro_dispatch_gate_is_serialized_by_run_report_writer(
+    tmp_path: Path,
+) -> None:
+    expected_git_sha = "e" * 40
+    run_dir = tmp_path / "terminal-collapse-macro"
+    _write_journal(
+        run_dir,
+        [
+            _event(
+                1,
+                "command_lifecycle",
+                {
+                    "command": {"command_id": "unsafe-macro-build"},
+                    "status": "dispatched",
+                },
+            ),
+            _event(
+                2,
+                "command_lineage",
+                {
+                    "command_id": "unsafe-macro-build",
+                    "lineage": {
+                        "command_id": "unsafe-macro-build",
+                        "source_role": "macro",
+                    },
+                    "semantic_action": "BUILD PYLON",
+                    "terminal_collapse": True,
+                    "townhall_recovery": False,
+                },
+            ),
+        ],
+    )
+    manifest = _qualification_evidence(
+        tmp_path,
+        expected_git_sha=expected_git_sha,
+    )
+
+    artifacts = write_run_reports(
+        run_dir,
+        qualification_evidence_path=manifest,
+    )
+    report = json.loads(artifacts.engineering_gates_path.read_text(encoding="utf-8"))
+
+    assert report["metrics"]["terminal_collapse_non_recovery_macro_dispatch_count"] == 1
+    assert report["gates"]["terminal_collapse_non_recovery_macro_dispatch_count"]["passed"] is False
+
+
+def test_diagnostic_manifest_cannot_populate_formal_engineering_evidence(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "diagnostic"
+    _write_journal(
+        run_dir,
+        [
+            _event(
+                1,
+                "observation",
+                make_observation(
+                    run_id="live-run",
+                    episode_id="episode-0",
+                    game_loop=100,
+                ).model_dump(mode="json"),
+            )
+        ],
+    )
+    manifest = _qualification_evidence(
+        tmp_path,
+        expected_git_sha="b" * 40,
+        diagnostic_only=True,
+    )
+
+    artifacts = write_run_reports(run_dir, qualification_evidence_path=manifest)
+    report = json.loads(artifacts.engineering_gates_path.read_text(encoding="utf-8"))
+
+    assert report["metrics"]["recovery_evidence_present"] is False
+    assert report["metrics"]["checkpoint_tail_recovery_bounded"] is None
+    assert report["metrics"]["natural_run_disk_reduction_ratio"] is None
+    assert report["accepted"] is False
+
+
+def test_missing_recovery_claims_remain_fail_closed(tmp_path: Path) -> None:
+    run_dir = tmp_path / "missing-recovery-claims"
+    _write_journal(
+        run_dir,
+        [
+            _event(
+                1,
+                "observation",
+                make_observation(
+                    run_id="live-run",
+                    episode_id="episode-0",
+                    game_loop=100,
+                ).model_dump(mode="json"),
+            )
+        ],
+    )
+    manifest_path = _qualification_evidence(tmp_path, expected_git_sha="c" * 40)
+    recovery_path = tmp_path / "recovery-canary.json"
+    recovery = json.loads(recovery_path.read_text(encoding="utf-8"))
+    del recovery["recovery_evidence_present"]
+    del recovery["checkpoint_tail_recovery_bounded"]
+    recovery_path.write_text(json.dumps(recovery), encoding="utf-8")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["recovery_evidence"]["sha256"] = _sha256(recovery_path)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    artifacts = write_run_reports(
+        run_dir,
+        qualification_evidence_path=manifest_path,
+    )
+    report = json.loads(artifacts.engineering_gates_path.read_text(encoding="utf-8"))
+
+    assert report["metrics"]["recovery_evidence_present"] is False
+    assert report["metrics"]["checkpoint_tail_recovery_bounded"] is None
+    assert report["accepted"] is False
 
 
 def test_hard_acceptance_allows_not_applicable_gates() -> None:
@@ -228,6 +561,8 @@ def test_timeline_renders_live_state_reasoning_actions_and_execution(tmp_path: P
 
     assert artifacts.timeline_path == run_dir / "timeline.md"
     assert artifacts.summary_path == run_dir / "summary.json"
+    assert artifacts.engineering_gates_path == run_dir / "engineering-gates.json"
+    assert artifacts.engineering_gates_path.is_file()
     assert episode["complete"] is True
     assert episode["result"]["outcome"] == "victory"
     assert episode["result"]["scenario"] == "2s3z"
@@ -683,6 +1018,34 @@ def test_real_legacy_full_match_report_freezes_baseline_lines() -> None:
     assert "Completed execution success: `30/103` (29.1%)" in report
     assert "Terminal cancelled: `71`" in report
     assert "Legacy execution-report rate: `759/903` (84.1%) (deprecated)" in report
+
+
+def test_timeline_renders_strategic_consequence_and_aggregate() -> None:
+    report = render_timeline(
+        [
+            _event(
+                1,
+                "strategic_consequence_attributed",
+                {
+                    "consequence_type": "advantage_not_converted",
+                    "role": "offense",
+                    "semantic_action": None,
+                    "start_game_loop": 8_000,
+                    "end_game_loop": 8_896,
+                    "explanation": (
+                        "A verified army advantage persisted without offensive execution"
+                    ),
+                },
+                step_id=100,
+            )
+        ]
+    )
+
+    assert "Strategic consequence `advantage_not_converted`" in report
+    assert "loops `8000–8896`" in report
+    assert "Strategic consequences attributed from completed matches: `1`" in report
+    assert "#### Strategic consequences" in report
+    assert "| `advantage_not_converted` | 1 |" in report
 
 
 def test_legacy_incomplete_mock_journal_still_writes_report_and_cli_succeeds(

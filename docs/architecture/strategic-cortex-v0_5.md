@@ -51,13 +51,13 @@ not perform strategic reasoning.
 | Runtime action mapping | Ready | Ready for current Simple64 frontier | Ready for current Simple64 frontier |
 | Live LLM-PySC2 Worker | Ready | Ready | Ready |
 | Effect verification | Build, production and move | Build, production, add-on and move | Build, production, morph, inject and move |
-| Live 48-state corpus | Protoss v0.2 | Source coverage incomplete | Zerg v0.3 |
+| Live 48-state corpus | Protoss v0.2 | Terran v0.3 | Zerg v0.3 |
 | Seeds 0/1/2 engineering regression | Ready | Ready | Ready |
 
 The pinned LLM-PySC2 environment remains unchanged, while reviewed Bridge adapters provide
 race-specific observation, actor routing and action/effect semantics. All three races use the
 same Cortex runtime. Current explicit gaps are Terran research/morph verification, chained
-Zerg creep spread, a complete Terran corpus, and the 27-match tactical-quality suite.
+Zerg creep spread, and the 27-match tactical-quality suite.
 
 The installed specialist checkpoints are pinned and loaded with `local_files_only=True`:
 
@@ -107,9 +107,64 @@ hard and eight soft matches per decision.
 
 Legacy lessons are preserved as advisory. New evidence is merged by canonical
 condition/effect rather than by text, and repeated evidence from the same run does not inflate
-support. Candidate-to-soft promotion requires independent runs. Hard promotion additionally
+support. Candidate-to-soft promotion requires independent runs and independent seeds. Hard promotion additionally
 requires the configured seed, revision, false-block and paired A/B gates. Independent
 contradictions reduce confidence and eventually suspend or retire a rule.
+
+Before any production causal experiment, run:
+
+```bash
+rtscortex playbook hard-readiness \
+  --database <frozen-baseline.sqlite3> \
+  --config <production-config.yaml> \
+  --expected-git-sha <40-char-sha> \
+  --sc2-patch 4.10 \
+  --evaluation-seed <held-out-seed> \
+  --output playbook-hard-readiness.json
+```
+
+Exit status 2 means no Recovery, SC2, or model process may start. A production baseline needs
+at least one context-applicable, reachable, provenance-complete hard blocking rule. A
+qualification command creates a `HARD + FORBID` child from a `SOFT + AVOID` parent instead of
+mutating its soft parent, and rejects
+overlap between qualification and held-out evaluation seeds. The bounded fixture canary uses
+an isolated `evidence.canary_fixture=true` database; formal evaluation rejects that artifact.
+
+### Strategic consequence attribution and self-iteration
+
+Post-game attribution runs only for completed `victory`, `defeat`, or `draw` episodes. A
+truncated smoke, Worker error, or incomplete journal cannot teach strategy. The deterministic
+attributor extracts at most one instance of each strategic error and at most three successful
+key decisions from an evidence chain of Situation, command lineage, terminal execution, later
+Situation, and final outcome. It currently detects:
+
+- an unanswered persistent high/critical threat;
+- an affordable expansion delayed beyond the configured strategic window;
+- production capacity that remains too low while resources float;
+- a timing attack followed by a large unfavorable army-value trade;
+- a retreat despite low threat, healthy units, and an observed force advantage;
+- an observed army advantage that persists without offensive conversion;
+- a successful key decision followed by a verified threat, base, production, force, or trade
+  improvement in a victory.
+
+Missing force or base facts are treated as unknown and suppress the affected detector. Resource
+changes alone do not prove strategic causality. Each `StrategicConsequence` records its source
+event IDs, loop interval, typed Situation condition, role/action, explanation, evidence, and
+confidence.
+
+Every consequence becomes a versioned case and a canonical candidate rule. After support from
+at least two distinct runs and two distinct seeds, a non-execution rule may become an active soft
+rule. On the next matching game state, `PlaybookIntentGuard` adjusts the corresponding role or
+action before Intent arbitration; `PlaybookCandidateGuard` applies exact candidate constraints
+before Fast Executor. Execution failures remain advisory until a typed failure precondition exists,
+so historical Bridge bugs cannot become strategic penalties. Contradicting independent seeds lower
+confidence, suspend, and eventually retire rules.
+
+The full-match learning profile is
+`configs/experiments/live_simple64_hima_protoss_ensemble_cortex_v0_5_playbook_learning.yaml`.
+Its 40,000-step ceiling allows SC2 to produce a terminal result while all seeds share one
+cross-run Playbook database. Short smoke/regression profiles remain truncated and intentionally
+produce no strategic lessons.
 
 ## Event lineage
 
@@ -124,6 +179,7 @@ intent_arbitrated
 intent_arbiter_shadow_diff
 playbook_rule_applied
 playbook_rule_updated
+strategic_consequence_attributed
 command_lineage
 ```
 
@@ -135,12 +191,31 @@ intent, arbitration decision, Playbook rules, candidate and terminal execution r
 1. Run the Protoss a/b/c ensemble with Arbiter and Playbook in shadow mode on seeds 0, 1 and
    2; verify deterministic replay, reservations, ownership and no command-success regression.
 2. Promote the Arbiter to active only after the shadow engineering gates pass.
-3. Run paired Playbook on/off seeds; promote only the rules that satisfy the published gates.
+3. Validate the Active/Shadow mechanism with the bounded fixture canary. Qualify real hard
+   rules on a dedicated seed set, freeze the resulting baseline, run one production
+   natural-terminal Active/Shadow canary, then use disjoint held-out seeds for paired
+   Playbook evaluation.
 4. Completed: Terran Worker, add-on effects, smoke and seed regression.
 5. Completed: Zerg larva, inject, creep/morph provenance, seed regression, and 48-state corpus.
-6. Capture the missing real Terran blocked-production and blocked-combat states, then
-   materialize and verify its 48-state corpus.
-7. Complete the remaining race-effect gaps, then run the 27-match tactical-quality suite.
+6. Completed: Terran blocked-production and blocked-combat coverage and its verified
+   48-state corpus.
+7. Completed: exact-source Terran Stimpack research verification, RTSCortex-owned automatic
+   SCV production, Orbital morphing, MULE calldown verification, and mature-tumor Zerg creep
+   chaining. HIMA MULE steps remain in plan lineage but are marked controller-managed and stay
+   outside persistent GoalProgress; the Economy controller owns their dispatch. These actions
+   all pass through Runtime, Bridge and terminal effect verification; none use the untracked
+   upstream worker-training switch.
+8. Run the 27-match tactical-quality suite after the new race-economy controllers pass the
+   staged Simple64 smoke and seeds `[0, 1, 2]` engineering regression.
 
 This order intentionally keeps “model can produce a proposal” separate from “the race is safe
 to execute in PySC2.”
+
+## Current acceptance issues
+
+The open gameplay-control defects confirmed by the 2026-07-23 Protoss natural-terminal
+regression are tracked in
+[Protoss natural-terminal regression issue register](protoss-natural-terminal-regression-issues.md).
+They cover worker and gas economy, macro-frontier blocking and structure saturation,
+expansion search terminality, combat-target retry quarantine, terminal-crisis phase
+classification, and threat-level escalation/persistence.

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any, Literal
@@ -10,6 +12,87 @@ from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
 
 ProtocolVersion = Literal["1.0", "1.1"]
 CURRENT_PROTOCOL_VERSION: Literal["1.1"] = "1.1"
+
+
+def _expected_attempt_identity(
+    operation_id: str,
+    command_id: str,
+    attempt_ordinal: int,
+) -> str:
+    encoded = json.dumps(
+        {
+            "operation_id": operation_id,
+            "command_id": command_id,
+            "attempt_ordinal": attempt_ordinal,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    return f"attempt:{hashlib.sha256(encoded).hexdigest()}"
+
+
+def authoritative_build_preflight_request_id(
+    *,
+    operation_id: str,
+    operation_epoch: int,
+    action_name: str,
+    actor: str,
+    requested_arguments: list[Any],
+    opened_command_id: str,
+    opened_attempt_id: str,
+    opened_attempt_ordinal: int,
+    blocked_material_legality_identity: str,
+    observation_revision: str,
+    observation_game_loop: int,
+) -> str:
+    payload = {
+        "operation_id": operation_id,
+        "operation_epoch": operation_epoch,
+        "action_name": action_name,
+        "actor": actor,
+        "requested_arguments": requested_arguments,
+        "opened_command_id": opened_command_id,
+        "opened_attempt_id": opened_attempt_id,
+        "opened_attempt_ordinal": opened_attempt_ordinal,
+        "blocked_material_legality_identity": blocked_material_legality_identity,
+        "observation_revision": observation_revision,
+        "observation_game_loop": observation_game_loop,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return f"build-preflight:{hashlib.sha256(encoded).hexdigest()}"
+
+
+def authoritative_build_preflight_authorization_id(
+    *,
+    request_id: str,
+    operation_id: str,
+    operation_epoch: int,
+    action_name: str,
+    builder_tag: int,
+    ability_id: int,
+    world_target: tuple[float, float],
+    target_state_revision: str,
+    material_legality_identity: str,
+    observation_revision: str,
+    observation_game_loop: int,
+    expires_game_loop: int,
+) -> str:
+    payload = {
+        "request_id": request_id,
+        "operation_id": operation_id,
+        "operation_epoch": operation_epoch,
+        "action_name": action_name,
+        "builder_tag": builder_tag,
+        "ability_id": ability_id,
+        "world_target": [float(world_target[0]), float(world_target[1])],
+        "target_state_revision": target_state_revision,
+        "material_legality_identity": material_legality_identity,
+        "observation_revision": observation_revision,
+        "observation_game_loop": observation_game_loop,
+        "expires_game_loop": expires_game_loop,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return f"build-preflight-authorization:{hashlib.sha256(encoded).hexdigest()}"
 
 
 class ContractModel(BaseModel):
@@ -91,7 +174,24 @@ class UnitState(ContractModel):
     unit_type: str
     alliance: Literal["self", "ally", "enemy", "neutral"]
     position: tuple[float, float] | None = None
+    minimap_position: tuple[float, float] | None = Field(default=None, exclude=True)
     health_fraction: float = Field(default=1.0, ge=0.0, le=1.0)
+    shield_fraction: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        exclude_if=lambda value: value is None,
+    )
+    durability_fraction: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        exclude_if=lambda value: value is None,
+    )
+    actor_scopes: tuple[str, ...] = Field(
+        default=(),
+        exclude_if=lambda value: not value,
+    )
     energy: float | None = Field(default=None, ge=0.0)
     status: str | None = None
 
@@ -184,8 +284,157 @@ class ObservationEnvelope(ContractModel):
         return self
 
 
+class AuthoritativeBuildPreflightRequest(ContractModel):
+    """Core request for a side-effect-free Raw circuit reset decision."""
+
+    protocol_version: ProtocolVersion = CURRENT_PROTOCOL_VERSION
+    request_id: str = Field(pattern=r"^build-preflight:[0-9a-f]{64}$")
+    run_id: str = Field(min_length=1)
+    episode_id: str = Field(min_length=1)
+    step_id: int = Field(ge=0)
+    operation_id: str = Field(pattern=r"^operation:[0-9a-f]{64}$")
+    operation_epoch: int = Field(default=0, ge=0)
+    action_name: str = Field(pattern=r"^Build_.+")
+    actor: str = Field(min_length=1)
+    requested_arguments: list[Any] = Field(default_factory=list)
+    opened_command_id: str = Field(min_length=1)
+    opened_attempt_id: str = Field(pattern=r"^attempt:[0-9a-f]{64}$")
+    opened_attempt_ordinal: int = Field(ge=0)
+    blocked_material_legality_identity: str = Field(pattern=r"^build-legality:[0-9a-f]{64}$")
+    observation_revision: str = Field(min_length=1)
+    observation_game_loop: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def validate_canonical_identity(self) -> AuthoritativeBuildPreflightRequest:
+        if self.opened_attempt_id != _expected_attempt_identity(
+            self.operation_id,
+            self.opened_command_id,
+            self.opened_attempt_ordinal,
+        ):
+            raise ValueError("preflight opener attempt identity is not canonical")
+        expected = authoritative_build_preflight_request_id(
+            operation_id=self.operation_id,
+            operation_epoch=self.operation_epoch,
+            action_name=self.action_name,
+            actor=self.actor,
+            requested_arguments=self.requested_arguments,
+            opened_command_id=self.opened_command_id,
+            opened_attempt_id=self.opened_attempt_id,
+            opened_attempt_ordinal=self.opened_attempt_ordinal,
+            blocked_material_legality_identity=self.blocked_material_legality_identity,
+            observation_revision=self.observation_revision,
+            observation_game_loop=self.observation_game_loop,
+        )
+        if self.request_id != expected:
+            raise ValueError("preflight request identity is not canonical")
+        return self
+
+
+class AuthoritativeBuildPreflightResult(ContractModel):
+    """Raw result that either keeps the circuit open or authorizes one command."""
+
+    protocol_version: ProtocolVersion = CURRENT_PROTOCOL_VERSION
+    request_id: str = Field(pattern=r"^build-preflight:[0-9a-f]{64}$")
+    authorization_id: str | None = Field(
+        default=None,
+        pattern=r"^build-preflight-authorization:[0-9a-f]{64}$",
+    )
+    run_id: str = Field(min_length=1)
+    episode_id: str = Field(min_length=1)
+    step_id: int = Field(ge=0)
+    operation_id: str = Field(pattern=r"^operation:[0-9a-f]{64}$")
+    operation_epoch: int = Field(default=0, ge=0)
+    action_name: str = Field(pattern=r"^Build_.+")
+    actor: str = Field(min_length=1)
+    requested_arguments: list[Any] = Field(default_factory=list)
+    opened_command_id: str = Field(min_length=1)
+    opened_attempt_id: str = Field(pattern=r"^attempt:[0-9a-f]{64}$")
+    opened_attempt_ordinal: int = Field(ge=0)
+    blocked_material_legality_identity: str = Field(pattern=r"^build-legality:[0-9a-f]{64}$")
+    status: Literal["authorized", "deferred"]
+    authorized: bool
+    reason: str = Field(min_length=1)
+    circuit_open: bool
+    builder_tag: int | None = Field(default=None, gt=0)
+    ability_id: int | None = Field(default=None, gt=0)
+    world_target: tuple[float, float] | None = None
+    target_state_revision: str | None = None
+    material_legality_identity: str | None = Field(
+        default=None,
+        pattern=r"^build-legality:[0-9a-f]{64}$",
+    )
+    observation_revision: str | None = None
+    observation_game_loop: int | None = Field(default=None, ge=0)
+    expires_game_loop: int | None = Field(default=None, ge=0)
+    state_transition: Literal["open_to_reset"] | None = None
+    material_change_reason: (
+        Literal[
+            "builder_changed",
+            "ability_changed",
+            "target_state_changed",
+            "operation_epoch_changed",
+        ]
+        | None
+    ) = None
+    invalid_evidence_reasons: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_preflight_result(self) -> AuthoritativeBuildPreflightResult:
+        if self.opened_attempt_id != _expected_attempt_identity(
+            self.operation_id,
+            self.opened_command_id,
+            self.opened_attempt_ordinal,
+        ):
+            raise ValueError("preflight result opener identity is not canonical")
+        if self.authorized:
+            if (
+                self.status != "authorized"
+                or self.circuit_open
+                or self.authorization_id is None
+                or self.builder_tag is None
+                or self.ability_id is None
+                or self.world_target is None
+                or self.target_state_revision is None
+                or self.material_legality_identity is None
+                or self.observation_revision is None
+                or self.observation_game_loop is None
+                or self.expires_game_loop is None
+                or self.expires_game_loop < self.observation_game_loop
+                or self.state_transition != "open_to_reset"
+                or self.material_change_reason is None
+                or self.invalid_evidence_reasons
+            ):
+                raise ValueError("authorized preflight requires complete exact Raw identity")
+            expected = authoritative_build_preflight_authorization_id(
+                request_id=self.request_id,
+                operation_id=self.operation_id,
+                operation_epoch=self.operation_epoch,
+                action_name=self.action_name,
+                builder_tag=self.builder_tag,
+                ability_id=self.ability_id,
+                world_target=self.world_target,
+                target_state_revision=self.target_state_revision,
+                material_legality_identity=self.material_legality_identity,
+                observation_revision=self.observation_revision,
+                observation_game_loop=self.observation_game_loop,
+                expires_game_loop=self.expires_game_loop,
+            )
+            if self.authorization_id != expected:
+                raise ValueError("preflight authorization identity is not canonical")
+        elif (
+            self.status != "deferred"
+            or self.authorization_id is not None
+            or self.state_transition is not None
+        ):
+            raise ValueError("deferred preflight cannot carry an authorization transition")
+        return self
+
+
 class ActionCommand(ContractModel):
     command_id: str
+    operation_id: str | None = Field(default=None, pattern=r"^operation:[0-9a-f]{64}$")
+    attempt_id: str | None = Field(default=None, pattern=r"^attempt:[0-9a-f]{64}$")
+    attempt_ordinal: int | None = Field(default=None, ge=0)
     actor: str
     name: str
     arguments: list[Any] = Field(default_factory=list)
@@ -194,6 +443,35 @@ class ActionCommand(ContractModel):
     created_game_loop: int = Field(ge=0)
     source: ActionSource
     preconditions: dict[str, Any] = Field(default_factory=dict)
+    semantic_source_role: Literal["macro", "tactical", "reflex"] | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    semantic_action: str | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    townhall_recovery: bool | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    authoritative_build_preflight: AuthoritativeBuildPreflightResult | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+
+    @model_validator(mode="after")
+    def validate_authoritative_build_preflight(self) -> ActionCommand:
+        authorization = self.authoritative_build_preflight
+        if authorization is not None and (
+            not authorization.authorized
+            or authorization.operation_id != self.operation_id
+            or authorization.action_name != self.name
+            or authorization.actor != self.actor
+            or authorization.requested_arguments != self.arguments
+        ):
+            raise ValueError("command does not exactly match its Build preflight authorization")
+        return self
 
 
 class ActionBatch(ContractModel):
@@ -207,6 +485,9 @@ class ActionBatch(ContractModel):
     planner_pending: bool = False
     idle_reason: IdleReason | None = None
     commands: list[ActionCommand] = Field(default_factory=list)
+    authoritative_build_preflight_requests: list[AuthoritativeBuildPreflightRequest] = Field(
+        default_factory=list
+    )
     rejected_commands: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
@@ -238,6 +519,204 @@ class PrimitiveTraceEntry(ContractModel):
     )
 
 
+class PlacementNoStartEvidence(ContractModel):
+    """Auditable operation-level disposition for an accepted build that never started."""
+
+    operation_id: str | None = None
+    command_id: str = Field(min_length=1)
+    failure_code: str = Field(min_length=1)
+    status: Literal["retry", "defer_replan", "duplicate", "reset"]
+    streak: int = Field(ge=0)
+    threshold: int = Field(ge=1)
+    circuit_open: bool
+    duplicate_attempt: bool
+    suppressed_target: bool
+    target_side_evidence: bool
+    material_duplicate: bool = False
+    next_action: str = Field(min_length=1)
+    attempt_ordinal: int | None = Field(default=None, ge=0)
+    failure_classification: str | None = None
+    classification_basis: list[str] = Field(default_factory=list)
+    evidence: dict[str, Any] = Field(default_factory=dict)
+
+
+class AuthoritativePreDispatchEvidence(ContractModel):
+    """Typed operation-level result from an authoritative Build boundary."""
+
+    operation_id: str | None = Field(default=None, pattern=r"^operation:[0-9a-f]{64}$")
+    action_name: str = Field(min_length=1)
+    command_id: str = Field(min_length=1)
+    failure_code: str = Field(min_length=1)
+    status: Literal["retry", "defer_replan", "duplicate", "reset"]
+    streak: int = Field(ge=0)
+    threshold: Literal[3] = 3
+    circuit_open: bool
+    duplicate_attempt: bool
+    attempt_id: str | None = Field(default=None, pattern=r"^attempt:[0-9a-f]{64}$")
+    attempt_ordinal: int | None = Field(default=None, ge=0)
+    builder_tag: int | None = Field(default=None, gt=0)
+    ability_id: int | None = Field(default=None, ge=0)
+    world_target: tuple[float, float] | None = None
+    placement_revision: str | None = None
+    target_state_revision: str | None = None
+    observation_revision: str | None = None
+    observation_game_loop: int | None = Field(default=None, ge=0)
+    material_legality_identity: str | None = Field(
+        default=None,
+        pattern=r"^build-legality:[0-9a-f]{64}$",
+    )
+    material_evidence_valid: bool = False
+    invalid_evidence_reasons: list[str] = Field(default_factory=list)
+    material_duplicate: bool = False
+    state_transition: Literal["closed_to_open", "open_to_reset"] | None = None
+    reset_reason: str | None = None
+    material_change_reason: str | None = None
+    operation_epoch_changed: bool = False
+    next_action: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_authoritative_circuit_transition(self) -> AuthoritativePreDispatchEvidence:
+        if self.state_transition == "closed_to_open" and (
+            not self.circuit_open or self.streak != 3 or self.duplicate_attempt
+        ):
+            raise ValueError("closed_to_open requires the unique third non-duplicate failure")
+        if self.state_transition == "open_to_reset" and self.circuit_open:
+            raise ValueError("open_to_reset cannot remain circuit-open")
+        if self.circuit_open and self.streak < 3:
+            raise ValueError("authoritative circuit cannot open before the third failure")
+        if self.status == "reset" and (
+            self.failure_code != "build_started"
+            or self.reset_reason not in {"build_started", "effect_confirmed"}
+            or not self.material_evidence_valid
+            or self.invalid_evidence_reasons
+            or not self.target_state_revision
+        ):
+            raise ValueError("authoritative success reset requires valid build material evidence")
+        if self.operation_id is None:
+            if self.attempt_id is not None:
+                raise ValueError("attempt identity cannot be bound without an operation identity")
+        elif (
+            self.attempt_id is None
+            or self.attempt_ordinal is None
+            or self.attempt_id
+            != _expected_attempt_identity(
+                self.operation_id,
+                self.command_id,
+                self.attempt_ordinal,
+            )
+        ):
+            raise ValueError("authoritative attempt identity does not match its parent fields")
+        if self.material_evidence_valid and (
+            self.operation_id is None
+            or self.attempt_id is None
+            or self.builder_tag is None
+            or self.ability_id is None
+            or self.ability_id <= 0
+            or self.world_target is None
+            or self.material_legality_identity is None
+            or self.invalid_evidence_reasons
+        ):
+            raise ValueError("valid material evidence requires complete typed identity")
+        if (
+            not self.material_evidence_valid
+            and self.status != "reset"
+            and not self.invalid_evidence_reasons
+        ):
+            raise ValueError("invalid material evidence requires typed reasons")
+        return self
+
+
+class PlacementLedgerTransition(ContractModel):
+    operation_id: str | None = Field(default=None, pattern=r"^operation:[0-9a-f]{64}$")
+    command_id: str | None = Field(default=None, min_length=1)
+    action_name: str | None = Field(default=None, min_length=1)
+    attempt_id: str | None = Field(default=None, pattern=r"^attempt:[0-9a-f]{64}$")
+    attempt_ordinal: int | None = Field(default=None, ge=0)
+    reservation_id: str = Field(min_length=1)
+    structure_type: str = Field(min_length=1)
+    footprint_cells: list[tuple[int, int]] = Field(min_length=1)
+    previous_state: str = Field(min_length=1)
+    next_state: str = Field(min_length=1)
+    failure_class: str | None = None
+    actor_failure: bool = False
+    game_loop: int = Field(ge=0)
+    release_reason: str | None = None
+    target_state_revision: str | None = None
+    builder_tag: int | None = Field(default=None, gt=0)
+    ability_id: int | None = Field(default=None, ge=0)
+    world_target: tuple[float, float] | None = None
+    available_ability_query: str | None = None
+    placement_query_result: str | None = None
+    target_legality_fingerprint: str | None = None
+    material_legality_identity: str | None = Field(
+        default=None,
+        pattern=r"^build-legality:[0-9a-f]{64}$",
+    )
+    primitive_constructed_game_loop: int | None = Field(default=None, ge=0)
+    primitive_submitted_game_loop: int | None = Field(default=None, ge=0)
+    action_result: list[int] | None = None
+    placement_no_start: PlacementNoStartEvidence | None = None
+    authoritative_pre_dispatch: AuthoritativePreDispatchEvidence | None = None
+
+    @model_validator(mode="after")
+    def validate_authoritative_parent_identity(self) -> PlacementLedgerTransition:
+        evidence = self.authoritative_pre_dispatch
+        if evidence is not None and (
+            evidence.operation_id != self.operation_id
+            or evidence.command_id != self.command_id
+            or evidence.action_name != self.action_name
+            or evidence.attempt_id != self.attempt_id
+            or evidence.attempt_ordinal != self.attempt_ordinal
+            or evidence.builder_tag != self.builder_tag
+            or evidence.ability_id != self.ability_id
+            or evidence.world_target != self.world_target
+            or evidence.target_state_revision != self.target_state_revision
+            or evidence.material_legality_identity != self.material_legality_identity
+        ):
+            raise ValueError(
+                "nested authoritative evidence does not match its transition parent provenance"
+            )
+        return self
+
+
+class PlacementLedgerEvent(ContractModel):
+    """One durable placement state change emitted when the change occurs."""
+
+    protocol_version: ProtocolVersion = CURRENT_PROTOCOL_VERSION
+    run_id: str = Field(min_length=1)
+    episode_id: str = Field(min_length=1)
+    step_id: int = Field(ge=0)
+    command_id: str = Field(min_length=1)
+    operation_id: str | None = Field(default=None, pattern=r"^operation:[0-9a-f]{64}$")
+    attempt_id: str | None = Field(default=None, pattern=r"^attempt:[0-9a-f]{64}$")
+    attempt_ordinal: int | None = Field(default=None, ge=0)
+    action_name: str = Field(min_length=1)
+    transition_id: str = Field(pattern=r"^placement-transition:[0-9a-f]{64}$")
+    builder_tag: str | None = None
+    builder_lease_state: Literal["acquired", "released"] | None = None
+    transition: PlacementLedgerTransition
+
+    @model_validator(mode="after")
+    def validate_authoritative_parent_identity(self) -> PlacementLedgerEvent:
+        evidence = self.transition.authoritative_pre_dispatch
+        try:
+            envelope_builder_tag = None if self.builder_tag is None else int(self.builder_tag, 0)
+        except ValueError:
+            envelope_builder_tag = None
+        if evidence is not None and (
+            evidence.operation_id != self.operation_id
+            or evidence.command_id != self.command_id
+            or evidence.action_name != self.action_name
+            or evidence.attempt_id != self.attempt_id
+            or evidence.attempt_ordinal != self.attempt_ordinal
+            or evidence.builder_tag != envelope_builder_tag
+        ):
+            raise ValueError(
+                "placement authoritative evidence does not match its parent provenance"
+            )
+        return self
+
+
 class EffectEvidence(ContractModel):
     effect_kind: (
         Literal[
@@ -247,13 +726,68 @@ class EffectEvidence(ContractModel):
             "addon",
             "morph",
             "inject",
+            "research",
+            "ability",
+            "combat",
         ]
         | None
     ) = None
     target_type: str | None = None
     target_position: tuple[float, float] | None = None
+    requested_target_position: tuple[float, float] | None = None
+    final_validated_target_position: tuple[float, float] | None = None
+    validated_target_position: tuple[float, float] | None = None
+    emitted_target_position: tuple[float, float] | None = None
+    verified_target_position: tuple[float, float] | None = None
     target_tag: str | None = None
+    actor_tag: str | None = None
+    actor_tags: list[str] = Field(default_factory=list)
+    engagement_id: str | None = Field(default=None, pattern=r"^engagement:[0-9a-f]{64}$")
+    actor_order_bound: bool = False
+    actor_order_ever_bound: bool = False
+    actor_order_ability_ids: list[int] = Field(default_factory=list)
+    last_exact_bound_game_loop: int | None = Field(default=None, ge=0)
+    order_replacement_confirmed_game_loop: int | None = Field(default=None, ge=0)
     builder_tag: str | None = None
+    reservation_id: str | None = None
+    placement_revision: str | None = None
+    placement_state: str | None = None
+    placement_episode_id: str | None = None
+    footprint_width: int | None = Field(default=None, ge=1)
+    footprint_height: int | None = Field(default=None, ge=1)
+    occupied_grid_cells: list[tuple[int, int]] = Field(default_factory=list)
+    placement_ledger_transitions: list[PlacementLedgerTransition] = Field(default_factory=list)
+    baseline_builder_orders: list[int] = Field(default_factory=list)
+    failure_classification: (
+        Literal[
+            "builder_not_ready",
+            "dynamic_target_obstruction",
+            "placement_invalid",
+            "gameplay_no_start_unknown",
+            "gameplay_effect_missing_after_start",
+        ]
+        | None
+    ) = None
+    classification_basis: list[str] = Field(default_factory=list)
+    nearby_enemy_units: list[str] = Field(default_factory=list)
+    nearby_dynamic_occupants: list[str] = Field(default_factory=list)
+    builder_status: str | None = None
+    baseline_builder_status: str | None = None
+    builder_alliance: int | None = None
+    builder_health: float | None = Field(default=None, ge=0)
+    builder_health_max: float | None = Field(default=None, ge=0)
+    observation_revision: str | None = None
+    failure_observation_revision: str | None = None
+    available_ability_query: str | None = None
+    placement_query_result: str | None = None
+    ability_id: int | None = Field(default=None, ge=0)
+    target_legality_fingerprint: str | None = None
+    material_legality_identity: str | None = None
+    build_authorization_details: dict[str, Any] = Field(default_factory=dict)
+    primitive_constructed_game_loop: int | None = Field(default=None, ge=0)
+    primitive_submitted_game_loop: int | None = Field(default=None, ge=0)
+    action_result: list[int] = Field(default_factory=list)
+    action_result_seen: bool = False
     requested_producer_tag: str | None = None
     producer_tag: str | None = None
     producer_type: str | None = None
@@ -288,15 +822,34 @@ class EffectEvidence(ContractModel):
     producer_orders: list[int] = Field(default_factory=list)
     resource_delta: dict[str, int] = Field(default_factory=dict)
     order_seen: bool = False
+    build_started: bool = False
+    build_start_confirmation_kind: (
+        Literal[
+            "builder_order",
+            "supporting_quorum",
+            "new_structure",
+        ]
+        | None
+    ) = None
+    build_start_confirmed_game_loop: int | None = Field(default=None, ge=0)
+    resource_debit_seen: bool = False
+    builder_approach_seen: bool = False
+    target_occupancy_seen: bool = False
     production_order_seen: bool = False
     confirmation_kind: (
         Literal[
             "producer_order",
             "producer_morph",
             "source_morph",
+            "builder_order",
+            "supporting_quorum",
             "target_buff",
             "new_unit",
             "new_structure",
+            "upgrade_observed",
+            "target_damaged",
+            "target_removed",
+            "satisfied_by_peer",
         ]
         | None
     ) = None
@@ -310,10 +863,20 @@ class EffectEvidence(ContractModel):
     source_build_progress: float | None = Field(default=None, ge=0.0, le=1.0)
     baseline_target_buff_ids: list[int] = Field(default_factory=list)
     target_buff_ids: list[int] = Field(default_factory=list)
+    expected_upgrade: str | None = None
+    expected_upgrade_id: int | None = Field(default=None, ge=0)
+    baseline_upgrade_ids: list[int] = Field(default_factory=list)
+    upgrade_ids: list[int] = Field(default_factory=list)
     baseline_builder_position: tuple[float, float] | None = None
     observed_builder_position: tuple[float, float] | None = None
     builder_displacement: float | None = Field(default=None, ge=0)
+    baseline_actor_position: tuple[float, float] | None = None
+    observed_actor_position: tuple[float, float] | None = None
+    actor_displacement: float | None = Field(default=None, ge=0)
     move_order_seen: bool = False
+    baseline_target_health: float | None = Field(default=None, ge=0)
+    observed_target_health: float | None = Field(default=None, ge=0)
+    target_health_delta: float | None = Field(default=None, ge=0)
 
 
 class ExecutionReport(ContractModel):
@@ -322,6 +885,9 @@ class ExecutionReport(ContractModel):
     episode_id: str
     step_id: int = Field(ge=0)
     command_id: str
+    operation_id: str | None = Field(default=None, pattern=r"^operation:[0-9a-f]{64}$")
+    attempt_id: str | None = Field(default=None, pattern=r"^attempt:[0-9a-f]{64}$")
+    attempt_ordinal: int | None = Field(default=None, ge=0)
     success: bool
     action_name: str | None = None
     actor: str | None = None
@@ -331,6 +897,7 @@ class ExecutionReport(ContractModel):
     status: ExecutionStatus = ExecutionStatus.FAILED
     execution_stage: ExecutionStage | None = None
     failure_code: str | None = None
+    authoritative_pre_dispatch: AuthoritativePreDispatchEvidence | None = None
     primitive_trace: list[PrimitiveTraceEntry] = Field(default_factory=list)
     effect_evidence: EffectEvidence | None = None
     failure_reason: str | None = None
@@ -376,6 +943,30 @@ class ExecutionReport(ContractModel):
                 raise ValueError("protocol 1.1 execution report is missing: " + ", ".join(missing))
             if self.status is not ExecutionStatus.SUCCEEDED and self.failure_code is None:
                 raise ValueError("protocol 1.1 non-success execution reports require failure_code")
+        authoritative_evidence = [
+            evidence
+            for evidence in (
+                self.authoritative_pre_dispatch,
+                *(
+                    transition.authoritative_pre_dispatch
+                    for transition in (
+                        ()
+                        if self.effect_evidence is None
+                        else self.effect_evidence.placement_ledger_transitions
+                    )
+                ),
+            )
+            if evidence is not None
+        ]
+        if any(
+            evidence.operation_id != self.operation_id
+            or evidence.command_id != self.command_id
+            or evidence.action_name != self.action_name
+            or evidence.attempt_id != self.attempt_id
+            or evidence.attempt_ordinal != self.attempt_ordinal
+            for evidence in authoritative_evidence
+        ):
+            raise ValueError("authoritative evidence does not match its execution parent identity")
         return self
 
 

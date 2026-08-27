@@ -23,6 +23,7 @@ RTSCORTEX_MELEE_NATIVE_ACTIONS = frozenset(
         "Research_WarpGate",
         "Select_Unit_Blink_Screen",
         "Stop",
+        "Train_Probe",
         "Train_Stalker",
         "Train_Zealot",
         "Train_Adept",

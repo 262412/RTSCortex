@@ -21,6 +21,7 @@ from rtscortex.runtime.live import (
     camera_settlement_noop_patch_is_applied,
     exact_single_unit_selection_patch_is_applied,
     gas_rebalance_worker_management_patch_is_applied,
+    gas_stop_selection_patch_is_applied,
     gather_screen_target_patch_is_applied,
     live_scenario_spec,
     max_frames_episode_hook_patch_is_applied,
@@ -30,6 +31,7 @@ from rtscortex.runtime.live import (
     observation_gap_watchdog_patch_is_applied,
     pretranslation_abort_patch_is_applied,
     random_seed_patch_is_applied,
+    raw_available_actions_printer_patch_is_applied,
     reserved_builder_worker_patch_is_applied,
     sc2_build,
     transient_unit_grace_patch_is_applied,
@@ -264,6 +266,10 @@ def _worker_patch_check(project_root: Path, *, required: bool) -> Check:
         missing.append("0019-bypass-actor-selection-for-transport-noop.patch")
     if not gather_screen_target_patch_is_applied(project_root):
         missing.append("0020-validate-gather-screen-target.patch")
+    if not gas_stop_selection_patch_is_applied(project_root):
+        missing.append("0021-use-clamped-stop-worker-selection.patch")
+    if not raw_available_actions_printer_patch_is_applied(project_root):
+        missing.append("0023-skip-feature-action-printing-in-raw-mode.patch")
     status = "ok" if not missing else ("error" if required else "optional")
     detail = "all worker patches applied" if not missing else "apply " + ", ".join(missing)
     return Check("worker_patch", status, detail)

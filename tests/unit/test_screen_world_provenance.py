@@ -125,7 +125,7 @@ def test_screen_movement_relocation_rejects_world_target_outside_current_window(
     assert resolved is None
 
 
-def test_screen_world_target_stays_private_while_route_keeps_provenance() -> None:
+def test_screen_world_target_round_trips_through_route_serialization() -> None:
     snapshot = {
         "run_id": "run",
         "episode_id": "episode",
@@ -222,7 +222,10 @@ def test_screen_world_target_stays_private_while_route_keeps_provenance() -> Non
     assert len(route.commands) == 2
     assert all(command.screen_world_target == (103.0, 53.0) for command in route.commands)
     assert all(command.screen_anchor_tag == 1 for command in route.commands)
-    assert all("screen_world_target" not in command.to_dict() for command in route.commands)
+    assert all(
+        command.to_dict()["screen_world_target"] == [103.0, 53.0] for command in route.commands
+    )
+    assert all(command.to_dict()["screen_anchor_tag"] == 1 for command in route.commands)
 
 
 def test_agent_reprojects_before_current_candidate_domain_check(
@@ -429,6 +432,7 @@ def test_agent_reprojects_screen_build_again_after_selection_chain(
     agent._rtscortex_active_build_route = None
     agent._rtscortex_camera_settlement_noop = False
     agent._rtscortex_build_selection_retries = 0
+    agent._rtscortex_build_selection_loop = None
     agent.size_screen = 128
 
     result = agent.get_func(SimpleNamespace(observation=observation))
@@ -524,6 +528,7 @@ def test_agent_resamples_screen_build_after_translator_rejects_candidate(
     agent._rtscortex_active_build_route = None
     agent._rtscortex_camera_settlement_noop = False
     agent._rtscortex_build_selection_retries = 0
+    agent._rtscortex_build_selection_loop = None
     agent.size_screen = 128
 
     first = agent.get_func(SimpleNamespace(observation=observation))
@@ -637,7 +642,7 @@ def _observation(
     buildable_values = buildable or [[1 for _ in range(128)] for _ in range(128)]
     pathable_values = pathable or [[1 for _ in range(128)] for _ in range(128)]
     return SimpleNamespace(
-        raw_units=[SimpleNamespace(tag=1, x=100.0, y=50.0, alliance=1)],
+        raw_units=[SimpleNamespace(tag=1, x=100.0, y=50.0, alliance=1, is_selected=True)],
         feature_units=[
             SimpleNamespace(
                 tag=1,
@@ -645,6 +650,7 @@ def _observation(
                 y=anchor_screen[1],
                 alliance=1,
                 is_on_screen=True,
+                is_selected=True,
                 radius=0.5,
             )
         ],

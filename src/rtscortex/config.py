@@ -47,14 +47,16 @@ class RunSettings(SettingsModel):
 
 class EnvironmentSettings(SettingsModel):
     adapter: Literal["mock", "llm_pysc2"] = "mock"
+    execution_action_space: Literal["features", "raw"] = "features"
     scenario: str = "pvz_task1_level1"
-    max_steps: int = Field(default=6, ge=1)
+    max_steps: int | None = Field(default=6, ge=1)
     agent_race: RaceName = "protoss"
     opponent_race: RaceName = "random"
     opponent_difficulty: BotDifficulty = "very_hard"
     opponent_build: BotBuild = "random"
     step_mul: int = Field(default=1, ge=1)
-    game_steps_per_episode: int | None = Field(default=None, ge=1)
+    # PySC2 uses zero as the explicit "no episode step limit" sentinel.
+    game_steps_per_episode: int | None = Field(default=None, ge=0)
     simulation_speed_multiplier: float | None = Field(default=None, gt=0.0, le=1.0)
     pause_until_first_plan: bool = False
     sc2_path: Path | None = None
@@ -63,6 +65,9 @@ class EnvironmentSettings(SettingsModel):
     action_effect_timeout_game_loops: int = Field(default=112, ge=1)
     observation_gap_watchdog_game_loops: int = Field(default=448, ge=1)
     observation_gap_hard_limit_game_loops: int = Field(default=1792, ge=2)
+    orchestration_primitive_budget: int = Field(default=16, ge=4)
+    expansion_scout_enabled: bool = True
+    expansion_scout_interval_game_loops: int = Field(default=112, ge=16)
     server_ready_timeout_seconds: float = Field(default=15.0, gt=0.0)
     shutdown_timeout_seconds: float = Field(default=10.0, gt=0.0)
 
@@ -72,6 +77,8 @@ class EnvironmentSettings(SettingsModel):
             raise ValueError(
                 "observation_gap_hard_limit_game_loops must exceed the watchdog threshold"
             )
+        if self.adapter == "mock" and self.max_steps is None:
+            raise ValueError("mock environments require a finite max_steps")
         return self
 
 
@@ -195,6 +202,7 @@ class CortexExplanationSettings(SettingsModel):
 class CortexPlaybookSettings(SettingsModel):
     enabled: bool = False
     database_path: Path = Path("~/scratch/outputs/RTSCortex/cortex-playbook.sqlite3")
+    learning_mode: Literal["evolving", "frozen"] = "evolving"
     top_k: int = Field(default=6, ge=1, le=20)
     min_confidence: float = Field(default=0.6, ge=0.0, le=1.0)
     promotion_support: int = Field(default=2, ge=1)
@@ -202,6 +210,8 @@ class CortexPlaybookSettings(SettingsModel):
     rule_mode: Literal["disabled", "shadow", "active"] = "shadow"
     max_hard_rules: int = Field(default=8, ge=1, le=8)
     max_soft_rules: int = Field(default=8, ge=1, le=8)
+    allow_canary_fixture: bool = False
+    hard_readiness_required: bool = False
 
 
 class CortexSettings(SettingsModel):
@@ -243,8 +253,20 @@ class ProviderSettings(SettingsModel):
     completion_cost_per_million_tokens: float = Field(default=0.0, ge=0.0)
 
 
+class AuthoritativeBuildCircuitCanarySettings(SettingsModel):
+    """Explicitly gated live stimulus for the authoritative Build circuit."""
+
+    enabled: bool = False
+    mode: Literal["stale_candidate_then_builder_rebind"] = "stale_candidate_then_builder_rebind"
+    failure_attempts: Literal[3] = 3
+    hold_observations: Literal[1] = 1
+
+
 class EvaluationSettings(SettingsModel):
     seeds: list[int] = Field(default_factory=lambda: [0, 1, 2], min_length=1)
+    authoritative_build_circuit_canary: AuthoritativeBuildCircuitCanarySettings = Field(
+        default_factory=AuthoritativeBuildCircuitCanarySettings
+    )
 
 
 class ConsoleSettings(SettingsModel):
@@ -273,6 +295,28 @@ class ExperimentConfig(SettingsModel):
 
     @model_validator(mode="after")
     def validate_race_brain_matches_agent(self) -> ExperimentConfig:
+        canary = self.evaluation.authoritative_build_circuit_canary
+        if canary.enabled:
+            if (
+                self.environment.adapter != "llm_pysc2"
+                or self.environment.execution_action_space != "raw"
+                or self.environment.max_steps is None
+                or self.environment.agent_race != "protoss"
+                or self.agent.variant != "cortex"
+                or self.cortex.macro.kind != "scripted"
+                or self.cortex.macro.scripted_actions != ["Pylon"]
+                or not self.cortex.macro.required
+                or self.runtime.max_actions != 1
+                or self.environment.expansion_scout_enabled
+                or self.cortex.playbook.enabled
+                or self.reflex.enabled
+                or len(self.evaluation.seeds) != 1
+            ):
+                raise ValueError(
+                    "authoritative Build circuit canary requires one bounded raw Protoss "
+                    "Cortex Pylon action, max_actions=1, one seed, and scout/Playbook/reflex "
+                    "disabled"
+                )
         if self.agent.variant == "cortex" and self.environment.agent_race == "random":
             raise ValueError("Cortex live mode requires a concrete agent_race")
         if self.cortex.macro.kind == "hima":

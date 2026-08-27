@@ -55,6 +55,7 @@ _STEP_PARSE_ERROR_CODES = frozenset(
         "invalid_action_item",
         "invalid_actions_list",
         "invalid_repeat",
+        "invalid_target_count",
         "output_too_long",
         "output_truncated",
         "unknown_action",
@@ -92,7 +93,11 @@ class HIMAMacroActionMapper:
         fixture: PolicyObservationFixture,
     ) -> list[PolicyActionAssessment]:
         recovered_truncated_prefix = any(
-            diagnostic.code == "truncated_action_prefix_recovered"
+            diagnostic.code
+            in {
+                "truncated_action_prefix_recovered",
+                "truncated_counted_prefix_recovered",
+            }
             for diagnostic in proposal.diagnostics
         )
         parse_errors = [

@@ -36,6 +36,12 @@ class EconomyStatus(StrEnum):
     FLOATING = "floating"
 
 
+class ResourcePressure(StrEnum):
+    STARVED = "starved"
+    BALANCED = "balanced"
+    FLOATING = "floating"
+
+
 class ArmyReadiness(StrEnum):
     EMPTY = "empty"
     FORMING = "forming"
@@ -104,7 +110,12 @@ class SituationAssessment(ContractModel):
     valid_until_game_loop: int = Field(ge=0)
     phase: GamePhase
     threat_level: ThreatLevel
+    threat_score: float = Field(default=0.0, ge=0.0)
+    threat_evidence: tuple[str, ...] = ()
+    threat_hysteresis_until_game_loop: int | None = Field(default=None, ge=0)
     economy_status: EconomyStatus
+    mineral_pressure: ResourcePressure = ResourcePressure.BALANCED
+    gas_pressure: ResourcePressure = ResourcePressure.BALANCED
     army_readiness: ArmyReadiness
     threats: list[str] = Field(default_factory=list)
     information_gaps: list[str] = Field(default_factory=list)
@@ -162,6 +173,11 @@ class MacroPlan(ContractModel):
     episode_id: str
     source_step_id: int = Field(ge=0)
     created_game_loop: int = Field(ge=0)
+    proposal_source_game_loop: int | None = Field(
+        default=None,
+        ge=0,
+        exclude_if=lambda value: value is None,
+    )
     expires_game_loop: int = Field(ge=0)
     strategic_objective: str = Field(min_length=1)
     steps: list[MacroStep] = Field(default_factory=list)
@@ -170,12 +186,21 @@ class MacroPlan(ContractModel):
     adapter_version: str = Field(min_length=1)
     parser_version: str = Field(min_length=1)
     vocabulary_version: str = Field(min_length=1)
+    desired_counts: dict[str, int] = Field(default_factory=dict)
+    strategic_constraints: list[str] = Field(default_factory=list)
+    opaque_future_actions: list[str] = Field(default_factory=list)
+    raw_response_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     raw_proposal: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def validate_plan(self) -> MacroPlan:
         if self.expires_game_loop <= self.created_game_loop:
             raise ValueError("macro plan must expire after it is created")
+        if (
+            self.proposal_source_game_loop is not None
+            and self.proposal_source_game_loop > self.created_game_loop
+        ):
+            raise ValueError("macro proposal source cannot follow plan acceptance")
         ordinals = [step.ordinal for step in self.steps]
         if len(ordinals) != len(set(ordinals)):
             raise ValueError("macro plan step ordinals must be unique")
@@ -196,9 +221,11 @@ class IntentTargetKind(StrEnum):
 
 class IntentTarget(ContractModel):
     kind: IntentTargetKind = IntentTargetKind.NONE
+    unit_tag: str | None = None
     unit_type: str | None = None
     structure_type: str | None = None
     region: str | None = None
+    position: tuple[int, int] | None = None
 
 
 class _IntentBase(ContractModel):
@@ -347,6 +374,9 @@ class CommandLineage(ContractModel):
     """Trace one wire command back to its specialist intent and motor selection."""
 
     command_id: str = Field(min_length=1)
+    operation_id: str | None = Field(default=None, pattern=r"^operation:[0-9a-f]{64}$")
+    attempt_id: str | None = Field(default=None, pattern=r"^attempt:[0-9a-f]{64}$")
+    attempt_ordinal: int | None = Field(default=None, ge=0)
     intent_id: str = Field(min_length=1)
     candidate_id: str = Field(pattern=r"^candidate:[0-9a-f]{64}$")
     selection_id: str = Field(pattern=r"^selection:[0-9a-f]{64}$")

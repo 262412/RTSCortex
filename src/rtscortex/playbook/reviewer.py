@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Sequence
+from typing import cast
 
 from rtscortex.contracts import EpisodeOutcome, EpisodeResult, ExecutionReport
 from rtscortex.game_phase import GamePhase
 from rtscortex.memory import StoredEvent
+from rtscortex.playbook.attribution import StrategicConsequenceAttributor
+from rtscortex.playbook.guards import candidate_signature
 from rtscortex.playbook.lifecycle import PlaybookRuleLifecycle
 from rtscortex.playbook.models import (
     DecisionCase,
@@ -16,29 +19,54 @@ from rtscortex.playbook.models import (
     LessonStatus,
     PlaybookContext,
     PlaybookLesson,
+    PlaybookRetryFeedbackEvidence,
+    PlaybookRoleId,
     PlaybookRule,
     PlaybookRuleCategory,
     PlaybookRuleEffect,
     PlaybookRuleKind,
     PlaybookRuleStatus,
+    PlaybookRuleStrength,
+    StrategicConsequence,
 )
+from rtscortex.playbook.promotion import PlaybookPromotionSweep, PromotionSweepResult
 from rtscortex.playbook.store import PlaybookStore
 
 
 class CortexPlaybookReviewer:
     """Record evidence first and promote only repeated, outcome-backed lessons."""
 
-    def __init__(self, store: PlaybookStore, *, promotion_support: int = 2) -> None:
+    def __init__(
+        self,
+        store: PlaybookStore,
+        *,
+        promotion_support: int = 2,
+        read_only: bool = False,
+    ) -> None:
         self.store = store
         self.promotion_support = promotion_support
+        self.read_only = read_only or store.read_only
         self._rule_lifecycle = PlaybookRuleLifecycle()
+        self._attributor = StrategicConsequenceAttributor()
+        self._frozen_cases: list[DecisionCase] = []
+        self._frozen_case_ids = (
+            {case.case_id for case in store.cases()} if self.read_only else set()
+        )
+        self._reviewed_episode_keys: set[tuple[str, str]] = set()
         self.last_rule_updates: tuple[PlaybookRule, ...] = ()
-        self.rebuild_lessons()
-        self._repair_unscoped_execution_candidates()
+        self.last_consequences: tuple[StrategicConsequence, ...] = ()
+        self.last_promotion_sweep = PromotionSweepResult(0, (), (), (), {}, {})
+        if not self.read_only:
+            self.rebuild_lessons()
+            self._repair_unscoped_execution_candidates()
+            self._quarantine_unsafe_execution_penalties()
+            self.last_promotion_sweep = PlaybookPromotionSweep(self.store).run()
 
     def _repair_unscoped_execution_candidates(self) -> None:
         """Retire early v2 candidates that accidentally targeted every action."""
 
+        if self.read_only:
+            return
         cases_by_id = {case.case_id: case for case in self.store.cases()}
         for rule in self.store.rules():
             if (
@@ -68,9 +96,37 @@ class CortexPlaybookReviewer:
                 )
             )
 
+    def _quarantine_unsafe_execution_penalties(self) -> None:
+        """Prevent historical engine failures from becoming strategy penalties."""
+
+        if self.read_only:
+            return
+        for rule in self.store.rules():
+            if (
+                rule.category is not PlaybookRuleCategory.EXECUTION_GUARD
+                or rule.status is not PlaybookRuleStatus.ACTIVE
+                or rule.strength is PlaybookRuleStrength.ADVISORY
+                or rule.effect not in {PlaybookRuleEffect.AVOID, PlaybookRuleEffect.FORBID}
+                or rule.retry_guard is not None
+            ):
+                continue
+            evidence = dict(rule.evidence)
+            evidence["suspension_reason"] = "missing_typed_retry_binding"
+            self.store.upsert_rule(
+                rule.model_copy(
+                    update={
+                        "status": PlaybookRuleStatus.SUSPENDED,
+                        "strength": PlaybookRuleStrength.ADVISORY,
+                        "evidence": evidence,
+                    }
+                )
+            )
+
     def rebuild_lessons(self) -> list[PlaybookLesson]:
         """Backfill deduplicated rules from cases written by earlier runtime versions."""
 
+        if self.read_only:
+            return []
         representatives: dict[str, DecisionCase] = {}
         for case in self.store.cases():
             signature = _case_signature(case)
@@ -90,8 +146,27 @@ class CortexPlaybookReviewer:
         agent_race: str,
         opponent_race: str,
     ) -> tuple[list[DecisionCase], list[PlaybookLesson]]:
+        episode_key = (result.run_id, result.episode_id)
+        if self.read_only and episode_key in self._reviewed_episode_keys:
+            self.last_rule_updates = ()
+            self.last_consequences = ()
+            return [], []
         self.last_rule_updates = ()
-        rules_before = {rule.canonical_key: rule.model_dump_json() for rule in self.store.rules()}
+        promotion_eligible = result.outcome not in {
+            EpisodeOutcome.ERROR,
+            EpisodeOutcome.TRUNCATED,
+        }
+        self.last_consequences = self._attributor.attribute(
+            events,
+            result,
+            agent_race=agent_race,
+            opponent_race=opponent_race,
+        )
+        rules_before = (
+            {rule.canonical_key: rule.model_dump_json() for rule in self.store.rules()}
+            if not self.read_only
+            else {}
+        )
         lineages = {
             str(event.payload.get("command_id")): event
             for event in events
@@ -99,21 +174,47 @@ class CortexPlaybookReviewer:
             and _source_role(event.payload) in {"macro", "tactical"}
         }
         phases = _phase_timeline(events)
+        situations = _situation_timeline(events)
         cases: list[DecisionCase] = []
         lessons: list[PlaybookLesson] = []
-        for event in events:
-            if event.event_type != "macro_plan_rejected":
-                continue
-            rejected = _rejected_proposal_case(
-                event,
+        for consequence in self.last_consequences:
+            case = _consequence_case(
+                consequence,
                 result,
-                phase=_phase_at(phases, event.event_id),
+                events=events,
                 agent_race=agent_race,
                 opponent_race=opponent_race,
             )
-            if self.store.add_case(rejected):
+            if not self._record_case(case):
+                continue
+            cases.append(case)
+            lesson = (
+                self._consolidate(case, update_executable_rule=True) if promotion_eligible else None
+            )
+            if lesson is not None:
+                lessons.append(lesson)
+        for event in events:
+            if event.event_type != "macro_plan_rejected":
+                continue
+            if event.payload.get("classification") not in {"illegal_action", "parse_error"}:
+                continue
+            rejected = _mark_case_episode_eligibility(
+                _rejected_proposal_case(
+                    event,
+                    result,
+                    phase=_phase_at(phases, event.event_id),
+                    agent_race=agent_race,
+                    opponent_race=opponent_race,
+                ),
+                result,
+            )
+            if self._record_case(rejected):
                 cases.append(rejected)
-                lesson = self._consolidate(rejected, update_executable_rule=True)
+                lesson = (
+                    self._consolidate(rejected, update_executable_rule=True)
+                    if promotion_eligible
+                    else None
+                )
                 if lesson is not None:
                     lessons.append(lesson)
         for event in events:
@@ -127,7 +228,8 @@ class CortexPlaybookReviewer:
             semantic_action = str(
                 lineage_event.payload.get("semantic_action") or report.action_name or "unknown"
             )
-            quality, owner, confidence, consequence = _assess(report, result)
+            quality, owner, confidence, consequence_text = _assess(report)
+            condition_values = _condition_values_at(situations, event.event_id)
             context = PlaybookContext(
                 agent_race=agent_race,
                 opponent_race=opponent_race,
@@ -135,50 +237,92 @@ class CortexPlaybookReviewer:
                 map_name=result.scenario,
                 tags=(semantic_action.lower().replace(" ", "_"),),
             )
-            case = DecisionCase(
-                case_id=_stable_id("case", result.run_id, result.episode_id, report.command_id),
-                run_id=result.run_id,
-                episode_id=result.episode_id,
-                source_event_id=event.event_id,
-                source_step_id=event.step_id,
-                command_id=report.command_id,
-                macro_plan_id=_macro_plan_id(lineage_event.payload),
-                semantic_action=semantic_action,
-                objective=None,
-                context=context,
-                quality=quality,
-                failure_owner=owner,
-                consequence=consequence,
-                evidence={
-                    "seed": result.seed,
-                    "execution_status": report.status.value,
-                    "execution_stage": (
-                        None if report.execution_stage is None else report.execution_stage.value
+            case = _mark_case_episode_eligibility(
+                DecisionCase(
+                    case_id=_stable_id("case", result.run_id, result.episode_id, report.command_id),
+                    run_id=result.run_id,
+                    episode_id=result.episode_id,
+                    source_event_id=event.event_id,
+                    source_step_id=event.step_id,
+                    command_id=report.command_id,
+                    macro_plan_id=_macro_plan_id(lineage_event.payload),
+                    semantic_action=semantic_action,
+                    objective=None,
+                    context=context,
+                    quality=quality,
+                    failure_owner=owner,
+                    consequence=consequence_text,
+                    retry_feedback=(
+                        _retry_feedback_evidence(report)
+                        if quality is DecisionQuality.EXECUTION_ERROR
+                        else None
                     ),
-                    "failure_code": report.failure_code,
-                    "failure_reason": report.failure_reason,
-                    "effect_evidence": (
-                        None
-                        if report.effect_evidence is None
-                        else report.effect_evidence.model_dump(mode="json")
-                    ),
-                },
-                episode_outcome=result.outcome.value,
-                confidence=confidence,
+                    evidence={
+                        "seed": result.seed,
+                        "execution_status": report.status.value,
+                        "execution_stage": (
+                            None if report.execution_stage is None else report.execution_stage.value
+                        ),
+                        "failure_code": report.failure_code,
+                        "failure_reason": report.failure_reason,
+                        "effect_evidence": (
+                            None
+                            if report.effect_evidence is None
+                            else report.effect_evidence.model_dump(mode="json")
+                        ),
+                        "condition_values": condition_values,
+                    },
+                    episode_outcome=result.outcome.value,
+                    confidence=confidence,
+                ),
+                result,
             )
-            if not self.store.add_case(case):
+            if not self._record_case(case):
                 continue
             cases.append(case)
-            lesson = self._consolidate(case, update_executable_rule=True)
+            lesson = (
+                self._consolidate(case, update_executable_rule=True) if promotion_eligible else None
+            )
             if lesson is not None:
                 lessons.append(lesson)
-        self._record_contradictions(cases, seed=result.seed)
-        self.last_rule_updates = tuple(
-            rule
-            for rule in self.store.rules()
-            if rules_before.get(rule.canonical_key) != rule.model_dump_json()
+        if promotion_eligible and not self.read_only:
+            self._record_contradictions(cases, seed=result.seed)
+        if promotion_eligible and not self.read_only:
+            self._promote_eligible_rules()
+        self.last_rule_updates = (
+            ()
+            if self.read_only
+            else tuple(
+                rule
+                for rule in self.store.rules()
+                if rules_before.get(rule.canonical_key) != rule.model_dump_json()
+            )
         )
-        return cases, lessons
+        deduplicated_lessons = {(lesson.signature, result.episode_id): lesson for lesson in lessons}
+        if self.read_only:
+            self._reviewed_episode_keys.add(episode_key)
+        return cases, list(deduplicated_lessons.values())
+
+    def _record_case(self, case: DecisionCase) -> bool:
+        if not self.read_only:
+            return self.store.add_case(case)
+        if case.case_id in self._frozen_case_ids:
+            return False
+        self._frozen_case_ids.add(case.case_id)
+        self._frozen_cases.append(case)
+        return True
+
+    def _promote_eligible_rules(self) -> None:
+        if self.read_only:
+            return
+        for rule in self.store.rules():
+            if rule.status is not PlaybookRuleStatus.CANDIDATE:
+                continue
+            try:
+                promoted = self._rule_lifecycle.promote_to_soft(rule)
+            except ValueError:
+                continue
+            self.store.upsert_rule(promoted)
 
     def _record_contradictions(
         self,
@@ -186,6 +330,8 @@ class CortexPlaybookReviewer:
         *,
         seed: int,
     ) -> None:
+        if self.read_only:
+            return
         for rule in self.store.rules():
             if rule.status is not PlaybookRuleStatus.ACTIVE:
                 continue
@@ -207,18 +353,35 @@ class CortexPlaybookReviewer:
         if signature is None:
             return None
         matching = [
-            candidate for candidate in self.store.cases() if _case_signature(candidate) == signature
+            candidate
+            for candidate in (*self.store.cases(), *self._frozen_cases)
+            if _case_signature(candidate) == signature
         ]
         source_ids = tuple(dict.fromkeys(candidate.case_id for candidate in matching))
         source_episode_ids = tuple(
             dict.fromkeys(f"{candidate.run_id}/{candidate.episode_id}" for candidate in matching)
         )
         support = len(source_episode_ids)
+        source_seeds = {
+            seed
+            for candidate in matching
+            if isinstance((seed := candidate.evidence.get("seed")), int)
+        }
+        independent_seed_gate = case.consequence_type is None or len(source_seeds) >= 2
         status = (
-            LessonStatus.PROMOTED if support >= self.promotion_support else LessonStatus.CANDIDATE
+            LessonStatus.PROMOTED
+            if support >= self.promotion_support and independent_seed_gate
+            else LessonStatus.CANDIDATE
         )
         confidence = min(0.95, 0.65 + support * 0.1)
-        rule_kind, statement, recommended_action, avoid_action = _rule_content(case)
+        (
+            rule_kind,
+            statement,
+            recommended_action,
+            avoid_action,
+            recommended_role,
+            avoid_role,
+        ) = _rule_content(case)
         lesson = PlaybookLesson(
             lesson_id=_stable_id("lesson", signature),
             signature=signature,
@@ -227,6 +390,9 @@ class CortexPlaybookReviewer:
             statement=statement,
             recommended_action=recommended_action,
             avoid_action=avoid_action,
+            recommended_role=recommended_role,
+            avoid_role=avoid_role,
+            consequence_type=case.consequence_type,
             status=status,
             confidence=confidence,
             support_count=support,
@@ -234,21 +400,45 @@ class CortexPlaybookReviewer:
             source_case_ids=source_ids,
             source_episode_ids=source_episode_ids,
         )
+        if self.read_only:
+            return lesson
         self.store.upsert_lesson(lesson)
         if update_executable_rule:
             rule = self.store.upsert_lesson_rule_candidate(lesson, case)
             if (
-                rule.status is PlaybookRuleStatus.CANDIDATE
-                and rule.action_names
+                bool(rule.action_names or rule.role_ids)
+                and rule.status is PlaybookRuleStatus.CANDIDATE
                 and len(set(rule.source_run_ids)) >= 2
+                and len(set(rule.source_seeds)) >= 2
                 and rule.confidence >= 0.75
                 and rule.contradiction_count == 0
+                and rule.shadow_state_count >= 48
+                and rule.false_block_rate <= 0.05
             ):
-                self.store.upsert_rule(self._rule_lifecycle.promote_to_soft(rule))
+                try:
+                    promoted = self._rule_lifecycle.promote_to_soft(rule)
+                except ValueError:
+                    pass
+                else:
+                    self.store.upsert_rule(promoted)
         return lesson
 
 
 def _case_signature(case: DecisionCase) -> str | None:
+    if case.consequence_type is not None:
+        role = str(case.evidence.get("role") or "none")
+        effect = str(case.evidence.get("effect") or "unknown")
+        return "|".join(
+            (
+                case.context.agent_race,
+                case.context.opponent_race,
+                case.context.phase.value,
+                case.consequence_type.value,
+                role,
+                case.semantic_action,
+                effect,
+            )
+        )
     if case.quality is DecisionQuality.ADVANTAGE_GAINED:
         return "|".join(
             (
@@ -273,10 +463,13 @@ def _case_signature(case: DecisionCase) -> str | None:
         )
     if case.quality is DecisionQuality.EXECUTION_ERROR:
         failure_code = str(case.evidence.get("failure_code") or "unknown")
+        action_name = (
+            case.semantic_action if case.retry_feedback is None else case.retry_feedback.action_name
+        )
         return "|".join(
             (
                 case.context.agent_race,
-                case.semantic_action,
+                action_name,
                 failure_code,
                 "execution_guard",
             )
@@ -286,13 +479,31 @@ def _case_signature(case: DecisionCase) -> str | None:
 
 def _rule_content(
     case: DecisionCase,
-) -> tuple[PlaybookRuleKind, str, str | None, str | None]:
+) -> tuple[
+    PlaybookRuleKind,
+    str,
+    str | None,
+    str | None,
+    PlaybookRoleId | None,
+    PlaybookRoleId | None,
+]:
+    if case.consequence_type is not None:
+        effect = str(case.evidence.get("effect") or "prefer")
+        role = case.evidence.get("role")
+        typed_role = cast(PlaybookRoleId, role) if isinstance(role, str) else None
+        action = None if case.semantic_action.startswith("ROLE:") else case.semantic_action
+        statement = case.consequence[:360]
+        if effect == "prefer":
+            return PlaybookRuleKind.STRATEGY, statement, action, None, typed_role, None
+        return PlaybookRuleKind.STRATEGY, statement, None, action, None, typed_role
     if case.quality is DecisionQuality.ADVANTAGE_GAINED:
         return (
             PlaybookRuleKind.STRATEGY,
             f"In {case.context.opponent_race} {case.context.phase.value}, "
             f"{case.semantic_action} had a verified effect in a winning episode.",
             case.semantic_action,
+            None,
+            None,
             None,
         )
     if case.quality is DecisionQuality.STRATEGIC_ERROR:
@@ -303,6 +514,8 @@ def _rule_content(
             "prefer a currently legal frontier.",
             None,
             case.semantic_action,
+            None,
+            None,
         )
     failure_code = str(case.evidence.get("failure_code") or "unknown")
     action = case.semantic_action
@@ -333,19 +546,18 @@ def _rule_content(
     # Keep execution experience scoped to the exact failed semantic action.  An
     # empty action set would match every Intent and Candidate in this phase and
     # could penalize unrelated play after promotion.
-    return PlaybookRuleKind.EXECUTION_GUARD, statement, None, action
+    return PlaybookRuleKind.EXECUTION_GUARD, statement, None, action, None, None
 
 
 def _assess(
     report: ExecutionReport,
-    result: EpisodeResult,
 ) -> tuple[DecisionQuality, FailureOwner, float, str]:
-    if report.success and result.outcome is EpisodeOutcome.VICTORY:
+    if report.failure_code == "engagement_target_eliminated":
         return (
-            DecisionQuality.ADVANTAGE_GAINED,
+            DecisionQuality.INCONCLUSIVE,
             FailureOwner.NONE,
-            0.85,
-            "The action produced a verified effect and the episode ended in victory.",
+            0.8,
+            "The engagement target was eliminated by a peer actor; this command is neutral.",
         )
     if report.success:
         return (
@@ -373,6 +585,107 @@ def _assess(
         0.9 if quality is DecisionQuality.EXECUTION_ERROR else 0.4,
         f"The action ended as {report.status.value} at {stage or 'unknown'}: "
         f"{report.failure_code or report.failure_reason or 'no detail'}.",
+    )
+
+
+def _retry_feedback_evidence(
+    report: ExecutionReport,
+) -> PlaybookRetryFeedbackEvidence | None:
+    if (
+        report.action_name is None
+        or report.actor is None
+        or report.failure_code is None
+        or report.operation_id is None
+        or report.attempt_ordinal is None
+    ):
+        return None
+    loops = [entry.game_loop for entry in report.primitive_trace if entry.game_loop is not None]
+    if report.effect_evidence is not None:
+        loops.extend(
+            loop
+            for loop in (
+                report.effect_evidence.dispatch_game_loop,
+                report.effect_evidence.accepted_game_loop,
+                report.effect_evidence.confirmed_game_loop,
+            )
+            if loop is not None
+        )
+    return PlaybookRetryFeedbackEvidence(
+        action_name=report.action_name,
+        failure_code=report.failure_code,
+        candidate_signature=candidate_signature(
+            report.action_name,
+            report.actor,
+            report.requested_arguments or report.resolved_arguments,
+        ),
+        operation_id=report.operation_id,
+        attempt_ordinal=report.attempt_ordinal,
+        terminal_game_loop=max(loops, default=report.step_id),
+        max_age_game_loops=112,
+    )
+
+
+def _consequence_case(
+    consequence: StrategicConsequence,
+    result: EpisodeResult,
+    *,
+    events: Sequence[StoredEvent],
+    agent_race: str,
+    opponent_race: str,
+) -> DecisionCase:
+    source_event_id = max(consequence.source_event_ids)
+    source = next((event for event in events if event.event_id == source_event_id), None)
+    semantic_action = consequence.semantic_action or f"ROLE:{consequence.role}"
+    role = consequence.role
+    condition_values = consequence.condition.model_dump(mode="json")
+    tags = tuple(
+        value
+        for value in (
+            consequence.consequence_type.value,
+            role,
+            f"threat_{consequence.condition.threat_level}",
+            f"readiness_{consequence.condition.army_readiness}",
+        )
+        if value is not None
+    )
+    return DecisionCase(
+        case_id=_stable_id("case", consequence.consequence_id),
+        run_id=result.run_id,
+        episode_id=result.episode_id,
+        source_event_id=source_event_id,
+        source_step_id=result.steps if source is None else source.step_id,
+        command_id=consequence.consequence_id,
+        semantic_action=semantic_action,
+        objective=consequence.objective,
+        context=PlaybookContext(
+            agent_race=agent_race,
+            opponent_race=opponent_race,
+            phase=consequence.condition.phase,
+            map_name=result.scenario,
+            tags=tags,
+        ),
+        quality=consequence.quality,
+        failure_owner=(
+            FailureOwner.NONE
+            if consequence.quality is DecisionQuality.ADVANTAGE_GAINED
+            else FailureOwner.CORTEX
+        ),
+        consequence=consequence.explanation,
+        evidence={
+            **consequence.evidence,
+            "seed": result.seed,
+            "reason": consequence.consequence_type.value,
+            "consequence_type": consequence.consequence_type.value,
+            "effect": consequence.effect.value,
+            "role": role,
+            "condition_values": condition_values,
+            "source_event_ids": list(consequence.source_event_ids),
+            "censored": consequence.censored,
+        },
+        episode_outcome=result.outcome.value,
+        confidence=consequence.confidence,
+        consequence_id=consequence.consequence_id,
+        consequence_type=consequence.consequence_type,
     )
 
 
@@ -415,6 +728,30 @@ def _rejected_proposal_case(
     )
 
 
+def _mark_case_episode_eligibility(
+    case: DecisionCase,
+    result: EpisodeResult,
+) -> DecisionCase:
+    if result.outcome not in {EpisodeOutcome.ERROR, EpisodeOutcome.TRUNCATED}:
+        return case
+    reason = (
+        "episode_outcome_error"
+        if result.outcome is EpisodeOutcome.ERROR
+        else "episode_outcome_truncated"
+    )
+    return case.model_copy(
+        update={
+            "evidence": {
+                **case.evidence,
+                "censored": True,
+                "promotion_eligible": False,
+                "promotion_exclusion_reason": reason,
+                "episode_failure_reason": result.failure_reason,
+            }
+        }
+    )
+
+
 def _phase_timeline(events: Sequence[StoredEvent]) -> list[tuple[int, GamePhase]]:
     timeline: list[tuple[int, GamePhase]] = []
     for event in events:
@@ -424,6 +761,31 @@ def _phase_timeline(events: Sequence[StoredEvent]) -> list[tuple[int, GamePhase]
         if isinstance(phase, str):
             timeline.append((event.event_id, GamePhase(phase)))
     return timeline
+
+
+def _situation_timeline(
+    events: Sequence[StoredEvent],
+) -> list[tuple[int, dict[str, object]]]:
+    return [
+        (event.event_id, event.payload)
+        for event in events
+        if event.event_type == "situation_assessed"
+    ]
+
+
+def _condition_values_at(
+    timeline: list[tuple[int, dict[str, object]]],
+    event_id: int,
+) -> dict[str, str]:
+    payload = next(
+        (payload for source_id, payload in reversed(timeline) if source_id <= event_id),
+        {},
+    )
+    return {
+        field: value
+        for field in ("threat_level", "economy_status", "army_readiness")
+        if isinstance((value := payload.get(field)), str)
+    }
 
 
 def _phase_at(timeline: list[tuple[int, GamePhase]], event_id: int) -> GamePhase:
@@ -444,11 +806,17 @@ def _source_role(payload: dict[str, object]) -> str | None:
 def _rule_matches_case(rule: PlaybookRule, case: DecisionCase) -> bool:
     if rule.action_names and case.semantic_action not in rule.action_names:
         return False
+    role = case.evidence.get("role")
+    if rule.role_ids and role not in rule.role_ids:
+        return False
+    condition_values = case.evidence.get("condition_values")
+    typed_conditions = condition_values if isinstance(condition_values, dict) else {}
     expected = {
         "agent_race": case.context.agent_race,
         "opponent_race": case.context.opponent_race,
         "phase": case.context.phase.value,
         "map_name": case.context.map_name,
+        **typed_conditions,
     }
     return all(
         condition.field in expected
@@ -459,6 +827,17 @@ def _rule_matches_case(rule: PlaybookRule, case: DecisionCase) -> bool:
 
 
 def _case_contradicts_rule(case: DecisionCase, rule: PlaybookRule) -> bool:
+    consequence_effect = case.evidence.get("effect")
+    if case.consequence_type is not None and isinstance(consequence_effect, str):
+        try:
+            case_effect = PlaybookRuleEffect(consequence_effect)
+        except ValueError:
+            return False
+        positive = {PlaybookRuleEffect.PREFER, PlaybookRuleEffect.REQUIRE}
+        negative = {PlaybookRuleEffect.AVOID, PlaybookRuleEffect.FORBID}
+        return (case_effect in positive and rule.effect in negative) or (
+            case_effect in negative and rule.effect in positive
+        )
     if case.quality is DecisionQuality.ADVANTAGE_GAINED:
         return rule.effect in {PlaybookRuleEffect.AVOID, PlaybookRuleEffect.FORBID}
     if case.quality is DecisionQuality.STRATEGIC_ERROR:
